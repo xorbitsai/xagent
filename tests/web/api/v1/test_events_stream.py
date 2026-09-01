@@ -494,6 +494,7 @@ async def test_events_paused_attach_does_not_take_a_fast_path():
         initial_snapshot=snapshot,
         read_task_snapshot=v1_tasks._load_task_info_snapshot,
         read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
+        read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
         **_long_intervals(),
     )
     first = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
@@ -535,6 +536,7 @@ async def test_sse_responses_disable_proxy_buffering(task_state):
         initial_snapshot=snapshot,
         read_task_snapshot=v1_tasks._load_task_info_snapshot,
         read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
+        read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
         **_long_intervals(),
     )
     try:
@@ -591,6 +593,7 @@ async def test_fast_path_failure_sends_the_response_start_before_its_close_frame
         initial_snapshot=snapshot,
         read_task_snapshot=_unreachable_read_task_snapshot,
         read_task_steps_response=_broken_read_task_steps_response,
+        read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
     )
 
     messages: list[dict] = []
@@ -732,6 +735,7 @@ async def test_generator_read_path_keeps_queued_wire_bytes_at_zero_between_frame
         initial_snapshot=snapshot,
         read_task_snapshot=v1_tasks._load_task_info_snapshot,
         read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
+        read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
         **_long_intervals(),
     )
     first = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
@@ -960,6 +964,7 @@ async def test_real_delete_route_closes_stream_with_task_deleted():
         initial_snapshot=snapshot,
         read_task_snapshot=v1_tasks._load_task_info_snapshot,
         read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
+        read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
         **_long_intervals(watchdog_interval_seconds=0.01),
     )
     first = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
@@ -1013,6 +1018,7 @@ async def test_watchdog_survives_transient_check_failure_and_still_closes():
         initial_snapshot=snapshot,
         read_task_snapshot=flaky_reader,
         read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
+        read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
         **_long_intervals(watchdog_interval_seconds=0.01),
     )
     first = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
@@ -1101,6 +1107,7 @@ async def test_sink_unregistered_after_generator_teardown():
         initial_snapshot=snapshot,
         read_task_snapshot=v1_tasks._load_task_info_snapshot,
         read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
+        read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
         **_long_intervals(),
     )
     first = await resp.body_iterator.__anext__()
@@ -1139,6 +1146,7 @@ async def test_unstarted_generator_leaves_no_registration_or_reservation():
         initial_snapshot=snapshot,
         read_task_snapshot=v1_tasks._load_task_info_snapshot,
         read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
+        read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
         **_long_intervals(),
     )
     # No __anext__() call at all -- the generator body has never run.
@@ -1195,6 +1203,7 @@ async def test_principal_slot_released_after_real_stream_teardown():
         initial_snapshot=snapshot,
         read_task_snapshot=v1_tasks._load_task_info_snapshot,
         read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
+        read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
         **_long_intervals(),
     )
     await resp.body_iterator.__anext__()
@@ -1282,6 +1291,7 @@ async def test_absolute_deadline_emits_expired_then_closes():
         initial_snapshot=snapshot,
         read_task_snapshot=v1_tasks._load_task_info_snapshot,
         read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
+        read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
         **_long_intervals(
             stream_max_duration_seconds=0.05, heartbeat_interval_seconds=0.01
         ),
@@ -1316,6 +1326,7 @@ async def test_deadline_wait_budget_shrinks_below_the_heartbeat():
         initial_snapshot=snapshot,
         read_task_snapshot=v1_tasks._load_task_info_snapshot,
         read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
+        read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
         **_long_intervals(
             stream_max_duration_seconds=0.05, heartbeat_interval_seconds=5.0
         ),
@@ -1420,6 +1431,7 @@ async def test_close_exactly_once_under_watchdog_deadline_race():
         initial_snapshot=snapshot,
         read_task_snapshot=v1_tasks._load_task_info_snapshot,
         read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
+        read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
         watchdog_interval_seconds=0.001,
         stream_max_duration_seconds=0.001,
         heartbeat_interval_seconds=0.001,
@@ -1457,6 +1469,7 @@ async def test_events_per_task_cap_third_stream_429():
             initial_snapshot=snapshot,
             read_task_snapshot=v1_tasks._load_task_info_snapshot,
             read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
+            read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
             **_long_intervals(),
         )
         # Real delivery (Starlette) always pulls the first chunk before a
@@ -1473,6 +1486,7 @@ async def test_events_per_task_cap_third_stream_429():
             initial_snapshot=snapshot,
             read_task_snapshot=v1_tasks._load_task_info_snapshot,
             read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
+            read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
         )
     assert exc_info.value.code is V1ErrorCode.RATE_LIMITED
     assert exc_info.value.http_status == 429
@@ -1544,6 +1558,7 @@ async def test_fast_path_attach_exempt_from_both_caps(fast_path_status, closing_
                 initial_snapshot=running_snapshot,
                 read_task_snapshot=v1_tasks._load_task_info_snapshot,
                 read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
+                read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
                 **_long_intervals(),
             )
             await resp.body_iterator.__anext__()
@@ -1664,6 +1679,7 @@ async def test_heartbeat_actually_sent_when_idle():
         initial_snapshot=snapshot,
         read_task_snapshot=v1_tasks._load_task_info_snapshot,
         read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
+        read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
         **_long_intervals(heartbeat_interval_seconds=0.01),
     )
     pings = 0
@@ -1717,6 +1733,7 @@ async def test_broadcast_frame_reaches_generator_output_as_task_status():
         initial_snapshot=snapshot,
         read_task_snapshot=v1_tasks._load_task_info_snapshot,
         read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
+        read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
         **_long_intervals(),
     )
     first = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
@@ -1771,6 +1788,7 @@ async def test_broadcast_content_frames_reach_generator_output_as_step_and_messa
         initial_snapshot=snapshot,
         read_task_snapshot=v1_tasks._load_task_info_snapshot,
         read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
+        read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
         **_long_intervals(),
     )
     first = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
@@ -1917,6 +1935,7 @@ async def test_completion_hint_wakes_watchdog_before_its_next_periodic_tick():
         initial_snapshot=snapshot,
         read_task_snapshot=v1_tasks._load_task_info_snapshot,
         read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
+        read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
         **_long_intervals(),
     )
     await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
@@ -2785,6 +2804,9 @@ async def test_fast_path_step_read_failure_closes_with_resync_required_not_a_bar
             "the generation reread must not run when the steps read itself failed"
         )
 
+    def _read_task_steps_version(task_id_, principal_):
+        return SimpleNamespace(max_event_id=1)
+
     terminal_snapshot = SimpleNamespace(
         task_id=1, agent_id=1, status=TaskStatus.COMPLETED, output="done", error=None
     )
@@ -2795,6 +2817,7 @@ async def test_fast_path_step_read_failure_closes_with_resync_required_not_a_bar
             principal=None,
             read_task_steps_response=_broken_read_task_steps_response,
             read_task_snapshot=_unused_read_task_snapshot,
+            read_task_steps_version=_read_task_steps_version,
         )
     ]
     terminal_body = "".join(terminal_frames)
@@ -2826,6 +2849,7 @@ async def test_fast_path_step_read_failure_closes_with_resync_required_not_a_bar
             principal=None,
             read_task_steps_response=_broken_read_task_steps_response,
             read_task_snapshot=_unused_read_task_snapshot,
+            read_task_steps_version=_read_task_steps_version,
         )
     ]
     waiting_body = "".join(waiting_frames)
@@ -2869,6 +2893,9 @@ async def test_fast_path_task_not_found_closes_with_task_deleted_not_resync_requ
             "the generation reread must not run when the steps read itself failed"
         )
 
+    def _read_task_steps_version(task_id_, principal_):
+        return SimpleNamespace(max_event_id=1)
+
     terminal_snapshot = SimpleNamespace(
         task_id=1, agent_id=1, status=TaskStatus.COMPLETED, output="done", error=None
     )
@@ -2879,6 +2906,7 @@ async def test_fast_path_task_not_found_closes_with_task_deleted_not_resync_requ
             principal=None,
             read_task_steps_response=_deleted_read_task_steps_response,
             read_task_snapshot=_unused_read_task_snapshot,
+            read_task_steps_version=_read_task_steps_version,
         )
     ]
     terminal_body = "".join(terminal_frames)
@@ -2901,6 +2929,7 @@ async def test_fast_path_task_not_found_closes_with_task_deleted_not_resync_requ
             principal=None,
             read_task_steps_response=_deleted_read_task_steps_response,
             read_task_snapshot=_unused_read_task_snapshot,
+            read_task_steps_version=_read_task_steps_version,
         )
     ]
     waiting_body = "".join(waiting_frames)
@@ -2972,6 +3001,9 @@ async def test_fast_path_step_snapshot_is_bounded_by_replay_max_steps(
     def _unchanged_read_task_snapshot(task_id_, principal_):
         return SimpleNamespace(run_id="run-1", state_version=1)
 
+    def _unchanged_read_task_steps_version(task_id_, principal_):
+        return SimpleNamespace(max_event_id=1)
+
     snapshot = SimpleNamespace(
         task_id=1,
         agent_id=1,
@@ -2987,6 +3019,7 @@ async def test_fast_path_step_snapshot_is_bounded_by_replay_max_steps(
             principal=None,
             read_task_steps_response=_read_task_steps_response,
             read_task_snapshot=_unchanged_read_task_snapshot,
+            read_task_steps_version=_unchanged_read_task_steps_version,
         )
     ]
     body = "".join(frames)
@@ -3079,6 +3112,9 @@ async def test_fast_path_step_snapshot_applies_the_replay_cap_before_the_byte_bu
     def _unchanged_read_task_snapshot(task_id_, principal_):
         return SimpleNamespace(run_id="run-1", state_version=1)
 
+    def _unchanged_read_task_steps_version(task_id_, principal_):
+        return SimpleNamespace(max_event_id=1)
+
     snapshot = SimpleNamespace(
         task_id=1,
         agent_id=1,
@@ -3094,6 +3130,7 @@ async def test_fast_path_step_snapshot_applies_the_replay_cap_before_the_byte_bu
             principal=None,
             read_task_steps_response=_read_task_steps_response,
             read_task_snapshot=_unchanged_read_task_snapshot,
+            read_task_steps_version=_unchanged_read_task_steps_version,
         )
     ]
     body = "".join(frames)
@@ -3168,6 +3205,9 @@ async def test_fast_path_step_snapshot_replay_max_steps_boundary(
     def _unchanged_read_task_snapshot(task_id_, principal_):
         return SimpleNamespace(run_id="run-1", state_version=1)
 
+    def _unchanged_read_task_steps_version(task_id_, principal_):
+        return SimpleNamespace(max_event_id=1)
+
     snapshot = SimpleNamespace(
         task_id=1,
         agent_id=1,
@@ -3183,6 +3223,7 @@ async def test_fast_path_step_snapshot_replay_max_steps_boundary(
             principal=None,
             read_task_steps_response=_read_task_steps_response,
             read_task_snapshot=_unchanged_read_task_snapshot,
+            read_task_steps_version=_unchanged_read_task_steps_version,
         )
     ]
     body = "".join(frames)
@@ -3249,6 +3290,9 @@ async def test_fast_path_step_snapshot_is_bounded_by_the_wire_byte_budget(
     def _unchanged_read_task_snapshot(task_id_, principal_):
         return SimpleNamespace(run_id="run-1", state_version=1)
 
+    def _unchanged_read_task_steps_version(task_id_, principal_):
+        return SimpleNamespace(max_event_id=1)
+
     snapshot = SimpleNamespace(
         task_id=1,
         agent_id=1,
@@ -3264,6 +3308,7 @@ async def test_fast_path_step_snapshot_is_bounded_by_the_wire_byte_budget(
             principal=None,
             read_task_steps_response=_read_task_steps_response,
             read_task_snapshot=_unchanged_read_task_snapshot,
+            read_task_steps_version=_unchanged_read_task_steps_version,
         )
     ]
     body = "".join(frames)
@@ -3349,6 +3394,9 @@ async def test_fast_path_snapshot_marks_truncation_when_the_budget_admits_no_ste
             "the generation reread must not run when no step was admitted"
         )
 
+    def _read_task_steps_version(task_id_, principal_):
+        return SimpleNamespace(max_event_id=1)
+
     snapshot = SimpleNamespace(
         task_id=1,
         agent_id=1,
@@ -3364,6 +3412,7 @@ async def test_fast_path_snapshot_marks_truncation_when_the_budget_admits_no_ste
             principal=None,
             read_task_steps_response=_read_task_steps_response,
             read_task_snapshot=_unused_read_task_snapshot,
+            read_task_steps_version=_read_task_steps_version,
         )
     ]
     body = "".join(frames)
@@ -3547,6 +3596,9 @@ async def test_fast_path_generation_change_withholds_steps_but_still_concludes(
         reread_calls.append((task_id_, principal_))
         return SimpleNamespace(**{**original, changed_field: changed_value})
 
+    def _read_task_steps_version(task_id_, principal_):
+        return SimpleNamespace(max_event_id=1)
+
     snapshot = SimpleNamespace(
         task_id=1, agent_id=1, status=status, **original, **extra_snapshot
     )
@@ -3557,6 +3609,7 @@ async def test_fast_path_generation_change_withholds_steps_but_still_concludes(
             principal=_FENCE_PRINCIPAL,
             read_task_steps_response=_read_task_steps_response,
             read_task_snapshot=_reread_task_snapshot,
+            read_task_steps_version=_read_task_steps_version,
         )
     ]
     body = "".join(frames)
@@ -3753,6 +3806,9 @@ async def test_fast_path_failure_exits_never_carry_the_truncation_marker(
         def _read_task_snapshot(task_id_, principal_):
             return SimpleNamespace(run_id="run-new", state_version=1)
 
+    def _read_task_steps_version(task_id_, principal_):
+        return SimpleNamespace(max_event_id=1)
+
     snapshot = SimpleNamespace(
         task_id=1,
         agent_id=1,
@@ -3768,6 +3824,7 @@ async def test_fast_path_failure_exits_never_carry_the_truncation_marker(
             principal=None,
             read_task_steps_response=_read_task_steps_response,
             read_task_snapshot=_read_task_snapshot,
+            read_task_steps_version=_read_task_steps_version,
         )
     ]
     body = "".join(frames)
@@ -4218,6 +4275,9 @@ async def test_fast_path_empty_steps_skips_the_generation_reread(
         reread_calls.append((task_id_, principal_))
         return SimpleNamespace(run_id="run-1", state_version=1)
 
+    def _read_task_steps_version(task_id_, principal_):
+        return SimpleNamespace(max_event_id=1)
+
     snapshot = SimpleNamespace(
         task_id=1,
         agent_id=1,
@@ -4233,6 +4293,7 @@ async def test_fast_path_empty_steps_skips_the_generation_reread(
             principal=_FENCE_PRINCIPAL,
             read_task_steps_response=_read_task_steps_response,
             read_task_snapshot=_reread_task_snapshot,
+            read_task_steps_version=_read_task_steps_version,
         )
     ]
     body = "".join(frames)
@@ -4272,11 +4333,14 @@ async def test_fast_path_generation_reread_failure_concludes_then_closes_for_res
     this path read is withheld since its generation was never confirmed,
     and the accompanying ``stream.error`` must describe what actually
     happened -- the reread itself failed -- not claim the task moved to a
-    new run, which was never established either way. ``read_task_steps_version``
-    is not supplied here, so this exercises
-    ``_fast_path_generation_reread_error_frame``'s generic wording on
-    its own, independent of the cursor recheck that can also route
-    through it (see ``test_fast_path_steps_cursor_recheck_failure_closes_for_resync_or_deleted``).
+    new run, which was never established either way. The raise happens
+    on the run_id/state_version reread itself, before the cursor recheck
+    that can also route through the same error frame ever runs (see
+    ``_fast_path_snapshot_stream``'s ``if not changed:`` guard), so this
+    exercises ``_fast_path_generation_reread_error_frame``'s generic
+    wording for that reread on its own (see
+    ``test_fast_path_steps_cursor_recheck_failure_closes_for_resync_or_deleted``
+    for the cursor-recheck leg of the same error frame).
     """
     base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
     step = es.PublicStep(
@@ -4299,6 +4363,9 @@ async def test_fast_path_generation_reread_failure_concludes_then_closes_for_res
         reread_calls.append((task_id_, principal_))
         raise RuntimeError("transient DB error rereading task snapshot")
 
+    def _read_task_steps_version(task_id_, principal_):
+        return SimpleNamespace(max_event_id=1)
+
     snapshot = SimpleNamespace(
         task_id=1,
         agent_id=1,
@@ -4314,6 +4381,7 @@ async def test_fast_path_generation_reread_failure_concludes_then_closes_for_res
             principal=_FENCE_PRINCIPAL,
             read_task_steps_response=_read_task_steps_response,
             read_task_snapshot=_raising_reread,
+            read_task_steps_version=_read_task_steps_version,
         )
     ]
     body = "".join(frames)
@@ -4387,6 +4455,9 @@ async def test_fast_path_generation_reread_task_deleted_closes_with_task_deleted
         reread_calls.append((task_id_, principal_))
         raise V1ApiError(V1ErrorCode.TASK_NOT_FOUND, 404)
 
+    def _read_task_steps_version(task_id_, principal_):
+        return SimpleNamespace(max_event_id=1)
+
     snapshot = SimpleNamespace(
         task_id=1,
         agent_id=1,
@@ -4402,6 +4473,7 @@ async def test_fast_path_generation_reread_task_deleted_closes_with_task_deleted
             principal=_FENCE_PRINCIPAL,
             read_task_steps_response=_read_task_steps_response,
             read_task_snapshot=_deleted_reread,
+            read_task_steps_version=_read_task_steps_version,
         )
     ]
     body = "".join(frames)
@@ -4490,6 +4562,9 @@ async def test_fast_path_unserializable_step_concludes_then_closes_for_resync(
     def _reread_task_snapshot(task_id_, principal_):
         return SimpleNamespace(run_id="run-1", state_version=1)
 
+    def _read_task_steps_version(task_id_, principal_):
+        return SimpleNamespace(max_event_id=1)
+
     snapshot = SimpleNamespace(
         task_id=1,
         agent_id=1,
@@ -4505,6 +4580,7 @@ async def test_fast_path_unserializable_step_concludes_then_closes_for_resync(
             principal=None,
             read_task_steps_response=_read_task_steps_response,
             read_task_snapshot=_reread_task_snapshot,
+            read_task_steps_version=_read_task_steps_version,
         )
     ]
     body = "".join(frames)
@@ -4519,6 +4595,79 @@ async def test_fast_path_unserializable_step_concludes_then_closes_for_resync(
     # The wording names serialization, not a read and not a restart.
     assert "Serializing the task's steps failed" in body
     assert "moved to a new run" not in body
+
+
+def test_fast_paths_without_a_steps_version_reader_is_a_call_error():
+    """``read_task_steps_version`` is a required argument on all three
+    attach-time fast-path entry points -- ``_terminal_snapshot_stream``,
+    ``_input_required_snapshot_stream``, and the
+    ``_fast_path_snapshot_stream`` body they share -- not one carrying a
+    default.
+
+    ``build_event_stream_response`` always forwards its own reader into
+    whichever of the three it picks, so no caller inside this module can
+    reach one of them without a reader in hand. Requiredness is what
+    keeps that true for a caller outside it: the cursor baseline read
+    and its recheck are the only signal that catches a trace row landing
+    between the steps read and the fence, and a reader-less call would
+    otherwise run the fast path with that signal silently absent. This
+    pins the call itself as the failure point -- a ``TypeError`` naming
+    the argument, raised before any reader runs.
+
+    ``build_event_stream_response`` is pinned the same way. It is the
+    only entry point a caller outside this module reaches, so a default
+    restored there would accept reader-less attaches even with all three
+    inner entry points still required. Its own missing-argument
+    ``TypeError`` is raised at the call, not at the await: binding
+    happens before the coroutine object exists, so nothing is left
+    un-awaited by the assertion below."""
+
+    def _unused(task_id_, principal_):
+        raise AssertionError("must not run before the missing-argument TypeError")
+
+    terminal_snapshot = SimpleNamespace(
+        task_id=1, agent_id=1, status=TaskStatus.COMPLETED, output="done", error=None
+    )
+    with pytest.raises(TypeError, match="read_task_steps_version"):
+        es._terminal_snapshot_stream(
+            terminal_snapshot,
+            principal=None,
+            read_task_steps_response=_unused,
+            read_task_snapshot=_unused,
+        )
+
+    waiting_snapshot = SimpleNamespace(
+        task_id=1,
+        agent_id=1,
+        status=TaskStatus.WAITING_FOR_USER,
+        pending_question="what next?",
+    )
+    with pytest.raises(TypeError, match="read_task_steps_version"):
+        es._input_required_snapshot_stream(
+            waiting_snapshot,
+            principal=None,
+            read_task_steps_response=_unused,
+            read_task_snapshot=_unused,
+        )
+
+    with pytest.raises(TypeError, match="read_task_steps_version"):
+        es._fast_path_snapshot_stream(
+            terminal_snapshot,
+            principal=None,
+            read_task_steps_response=_unused,
+            read_task_snapshot=_unused,
+            build_conclusion=lambda snapshot_total_steps: "",
+            path_name="terminal",
+        )
+
+    with pytest.raises(TypeError, match="read_task_steps_version"):
+        es.build_event_stream_response(
+            task_id=1,
+            principal=None,
+            initial_snapshot=terminal_snapshot,
+            read_task_snapshot=_unused,
+            read_task_steps_response=_unused,
+        )
 
 
 # ===== single-frame content byte cap =====

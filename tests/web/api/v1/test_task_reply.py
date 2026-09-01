@@ -20,6 +20,7 @@ from xagent.core.agent.checkpoint import (
     CheckpointReadError,
     CheckpointUnavailableError,
 )
+from xagent.core.agent.runner import UserMessageInjectionOutcome
 from xagent.web.api.v1 import task_reply as task_reply_module
 from xagent.web.models.agent import Agent
 from xagent.web.models.chat_message import TaskChatMessage
@@ -203,7 +204,7 @@ def test_reply_happy_path_resumes_the_same_run(mock_start_task):
     task_id = _create_waiting_task(full_key, agent_id, run_id="run-original")
     _insert_question_message(task_id)
 
-    post_user_message = AsyncMock(return_value=True)
+    post_user_message = AsyncMock(return_value=UserMessageInjectionOutcome.POSTED_FRESH)
     agent_patch, agent_service = _patch_agent_service(post_user_message)
     with (
         agent_patch,
@@ -247,6 +248,74 @@ def test_reply_happy_path_resumes_the_same_run(mock_start_task):
         db.close()
 
 
+def test_reply_turn_id_is_never_reused_across_retries(mock_start_task):
+    """Documents a known structural boundary, not a behavior this endpoint
+    is expected to provide: every call mints ``turn_id`` from a fresh
+    ``uuid4()``, so even a client retry that resubmits the identical reply
+    body can never land on the same turn id twice. That means this call
+    site can never trigger AgentRunner.inject_user_message's turn_id
+    short-circuit and can never observe a POSTED_REPLAY outcome -- there is
+    no replay-skip guard to add here, and none should be, because the
+    condition it would guard against is unreachable through this path."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_waiting_task(full_key, agent_id, run_id="run-original")
+    _insert_question_message(task_id)
+
+    first_post = AsyncMock(return_value=UserMessageInjectionOutcome.POSTED_FRESH)
+    agent_patch, agent_service = _patch_agent_service(first_post)
+    with (
+        agent_patch,
+        patch(
+            "xagent.web.api.v1.task_reply._schedule_waiting_reply_resume",
+            new=AsyncMock(),
+        ),
+    ):
+        first_resp = client.post(
+            f"/v1/chat/tasks/{task_id}/reply",
+            headers=_bearer(full_key),
+            json=_reply_body(agent_id),
+        )
+    assert first_resp.status_code == 202, first_resp.text
+    first_turn_id = agent_service.post_user_message.call_args.kwargs["turn_id"]
+
+    # Simulate a client retry: the same task, back in the same
+    # waiting_for_user state with the same run, resubmitting the identical
+    # reply body -- the only thing a real retry could differ on is nothing
+    # at all from this endpoint's point of view.
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        task.status = TaskStatus.WAITING_FOR_USER
+        task.control_state = TaskControlState.WAITING_FOR_USER.value
+        task.run_id = "run-original"
+        task.runner_id = None
+        task.lease_expires_at = None
+        db.commit()
+    finally:
+        db.close()
+
+    second_post = AsyncMock(return_value=UserMessageInjectionOutcome.POSTED_FRESH)
+    agent_patch, agent_service = _patch_agent_service(second_post)
+    with (
+        agent_patch,
+        patch(
+            "xagent.web.api.v1.task_reply._schedule_waiting_reply_resume",
+            new=AsyncMock(),
+        ),
+    ):
+        second_resp = client.post(
+            f"/v1/chat/tasks/{task_id}/reply",
+            headers=_bearer(full_key),
+            json=_reply_body(agent_id),
+        )
+    assert second_resp.status_code == 202, second_resp.text
+    second_turn_id = agent_service.post_user_message.call_args.kwargs["turn_id"]
+
+    assert first_turn_id.startswith(f"v1:reply:{task_id}:")
+    assert second_turn_id.startswith(f"v1:reply:{task_id}:")
+    assert first_turn_id != second_turn_id
+
+
 # ===== status matrix =====
 
 
@@ -288,7 +357,7 @@ def test_reply_waiting_status_is_not_rejected_by_the_status_gate(mock_start_task
     task_id = _create_waiting_task(full_key, agent_id)
     _insert_question_message(task_id)
 
-    post_user_message = AsyncMock(return_value=True)
+    post_user_message = AsyncMock(return_value=UserMessageInjectionOutcome.POSTED_FRESH)
     agent_patch, _ = _patch_agent_service(post_user_message)
     with (
         agent_patch,
@@ -508,7 +577,7 @@ def test_reply_closes_the_legacy_resume_interaction_row_on_successful_injection(
         task_id, run_id="run-close-success", idempotency_key="reply-close-success-q1"
     )
 
-    post_user_message = AsyncMock(return_value=True)
+    post_user_message = AsyncMock(return_value=UserMessageInjectionOutcome.POSTED_FRESH)
     agent_patch, agent_service = _patch_agent_service(post_user_message)
     with (
         agent_patch,
@@ -573,9 +642,11 @@ def test_reply_reads_the_interaction_row_before_injecting(mock_start_task):
         order.append("read")
         return _OBSERVED_INTERACTION_ID
 
-    async def record_injection(*_args: object, **_kwargs: object) -> bool:
+    async def record_injection(
+        *_args: object, **_kwargs: object
+    ) -> UserMessageInjectionOutcome:
         order.append("inject")
-        return True
+        return UserMessageInjectionOutcome.POSTED_FRESH
 
     agent_patch, _agent_service = _patch_agent_service(
         AsyncMock(side_effect=record_injection)
@@ -883,7 +954,7 @@ async def test_concurrent_reply_race_exactly_one_winner(mock_start_task):
     finally:
         db.close()
 
-    post_user_message = AsyncMock(return_value=True)
+    post_user_message = AsyncMock(return_value=UserMessageInjectionOutcome.POSTED_FRESH)
     agent_patch, _ = _patch_agent_service(post_user_message)
 
     from xagent.web.api.v1.deps import (

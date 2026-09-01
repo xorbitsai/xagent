@@ -87,6 +87,9 @@ SELECTED_FILE_IDS_AGENT_CONFIG_KEY = "selected_file_ids"
 MCP_RUNTIME_AUTHORIZATION_POLICY_REQUIRED_KEY = (
     "__xagent_mcp_runtime_authorization_policy_required"
 )
+MCP_RUNTIME_AUTHORIZATION_POLICY_IDENTITY_KEY = (
+    "mcp_runtime_authorization_policy_identity"
+)
 # Keys in ``tasks.agent_config`` that only the server may write. Task-create
 # request bodies carry a free-form ``agent_config`` dict that endpoints copy
 # wholesale, so anything the server later reads back as authoritative has to
@@ -194,6 +197,7 @@ CLIENT_RESERVED_AGENT_CONFIG_KEYS: frozenset[str] = frozenset(
         TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY,
         EXECUTION_SCOPE_AGENT_CONFIG_KEY,
         MCP_RUNTIME_AUTHORIZATION_POLICY_REQUIRED_KEY,
+        MCP_RUNTIME_AUTHORIZATION_POLICY_IDENTITY_KEY,
         SELECTED_FILE_IDS_AGENT_CONFIG_KEY,
         FILE_OPERATION_ACCESS_VERSION_KEY,
         "auth_mode",
@@ -216,6 +220,17 @@ def mcp_runtime_authorization_policy_required(agent_config: Any) -> bool:
         isinstance(agent_config, Mapping)
         and agent_config.get(MCP_RUNTIME_AUTHORIZATION_POLICY_REQUIRED_KEY) is True
     )
+
+
+def mcp_runtime_authorization_policy_identity(agent_config: Any) -> str | None:
+    """Return the durable actor-policy identity for one task."""
+
+    if not isinstance(agent_config, Mapping):
+        return None
+    value = agent_config.get(MCP_RUNTIME_AUTHORIZATION_POLICY_IDENTITY_KEY)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value
 
 
 def sanitize_client_agent_config(agent_config: Any) -> dict[str, Any]:

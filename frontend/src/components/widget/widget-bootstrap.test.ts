@@ -39,6 +39,16 @@ describe("widget bootstrap", () => {
     // test anywhere in the file that touches these can't leak into another.
     document.body.style.userSelect = ""
     document.body.style.cursor = ""
+    // The scroll lock targets document.scrollingElement -- <html> in jsdom
+    // (it has no scrollingElement at all) and in any real standards-mode
+    // browser regardless of which element's CSS actually governs page
+    // scrolling (see scrollLockTarget's own comment in widget.js).
+    document.documentElement.style.overflow = ""
+    document.documentElement.classList.remove("xagent-widget-scroll-locked")
+    // A test that leaves the widget open at the end (deliberately, to assert
+    // the lock is still held) would otherwise leak the scroll lock's
+    // ref-count expando into the next test via the shared element.
+    delete (document.documentElement as unknown as Record<string, unknown>).__xagentScrollLockV2
     localStorage.setItem("xagent_guest_id", "guest-fixed")
     vi.stubGlobal("fetch", fetchMock)
     fetchMock.mockReset()
@@ -415,6 +425,25 @@ describe("widget bootstrap", () => {
       )
     })
 
+    it("declares the closed-panel rule that stops it swallowing clicks during its fade-out", () => {
+      // Same visibility-transition gap as the resize-handle rule above, but
+      // for the panel itself: without pointer-events: none here, a closed
+      // panel stays hit-testable for the whole ~300ms fade, silently
+      // intercepting input meant for the host page underneath -- the full
+      // viewport on mobile, not just the small desktop popup's footprint.
+      runWidget({ "data-widget-key": "widget-secret" })
+      const css = document.head.querySelector("style")!.textContent!
+
+      expect(css).toMatch(/\.xagent-widget-panel:not\(\.open\)\s*\{[^}]*pointer-events:\s*none;/)
+    })
+
+    it("declares the scroll-lock class rule with !important, so it wins over a host page's own inline overflow", () => {
+      runWidget({ "data-widget-key": "widget-secret" })
+      const css = document.head.querySelector("style")!.textContent!
+
+      expect(css).toMatch(/\.xagent-widget-scroll-locked\s*\{[^}]*overflow:\s*hidden\s*!important;/)
+    })
+
     it("ignores a drag start below the mobile breakpoint", () => {
       setInnerWidth(400)
       runWidget({ "data-widget-key": "widget-secret" })
@@ -431,6 +460,66 @@ describe("widget bootstrap", () => {
       // particular side effects happen to be unset.
       firePointerEvent(handle(), "pointermove", { pointerId: 1, clientX: 250 })
       expect(panel().style.width).toBe("")
+    })
+
+    it("ignores a drag start while expanded", () => {
+      // The expanded rule's own width would otherwise get fought over an
+      // inline width from a drag that isn't blocked here.
+      runWidget({ "data-widget-key": "widget-secret" })
+      openPanel()
+      window.dispatchEvent(new MessageEvent("message", {
+        data: { xagent: true, v: 1, type: "widget_expand" },
+        origin: "https://chat.example",
+        source: widgetIframe().contentWindow as Window,
+      }))
+      expect(panel()).toHaveClass("expanded")
+
+      firePointerEvent(handle(), "pointerdown", { pointerId: 1, clientX: 100 })
+
+      expect(document.body.style.userSelect).toBe("")
+      // Proves dragState was never created, not just that userSelect happens
+      // to be unset: a real drag would set an inline width here, clobbering
+      // the .expanded rule's own width.
+      firePointerEvent(handle(), "pointermove", { pointerId: 1, clientX: 250 })
+      expect(panel().style.width).toBe("")
+    })
+
+    it("cancels an already-active drag when expand arrives mid-drag", () => {
+      // isMobileViewport()/isExpanded in the pointerdown guard only block a
+      // *new* drag from starting once expanded -- they don't touch a drag
+      // already under way. That's reachable in practice: this drag's
+      // pointerId is independent of whatever pointer taps "Expand window"
+      // inside the iframe (e.g. a second finger, on a touch-capable
+      // desktop-width device, while the first still holds the handle down).
+      // Without expandPanel() cancelling it, this pointerId's next
+      // pointermove would go on setting an inline width, desyncing the
+      // panel's rendered width from the .expanded class it now also carries.
+      runWidget({ "data-widget-key": "widget-secret" })
+      openPanel()
+
+      firePointerEvent(handle(), "pointerdown", { pointerId: 30, clientX: 300 })
+      firePointerEvent(handle(), "pointermove", { pointerId: 30, clientX: 200 })
+      expect(panel().style.width).toBe("480px")
+      expect(document.body.style.userSelect).toBe("none")
+
+      window.dispatchEvent(new MessageEvent("message", {
+        data: { xagent: true, v: 1, type: "widget_expand" },
+        origin: "https://chat.example",
+        source: widgetIframe().contentWindow as Window,
+      }))
+
+      expect(panel()).toHaveClass("expanded")
+      expect(panel().style.width).toBe("")
+      expect(document.body.style.userSelect).toBe("")
+      // The abandoned in-progress width (480) must not have been committed
+      // as the user's stored preference -- cancelDrag(), not endDrag().
+      expect(localStorage.getItem("xagent_widget_width")).toBeNull()
+
+      // The drag is over: this pointerId's continuation is a no-op, not a
+      // desync between an inline width and the .expanded class.
+      firePointerEvent(handle(), "pointermove", { pointerId: 30, clientX: 50 })
+      expect(panel().style.width).toBe("")
+      expect(panel()).toHaveClass("expanded")
     })
 
     it("boundary: applies the mobile CSS at exactly the breakpoint width, not just below it", () => {
@@ -883,6 +972,35 @@ describe("widget bootstrap", () => {
       expect(document.body.style.userSelect).toBe("text")
     })
 
+    it("starts fully closed if the same open panel node is later re-inserted into the DOM", async () => {
+      // Regression coverage: fab.onclick and the iframe's own postMessage
+      // close channel are BOTH permanently guarded by the torndown flag, so
+      // a reinserted node that still carried a stale 'open'/readiness class
+      // from before teardown would render an unclosable full-screen mobile
+      // overlay -- the FAB hidden by CSS, and neither remaining "close" path
+      // able to do anything about it.
+      runWidget({ "data-widget-key": "widget-secret" })
+      openPanel()
+      window.dispatchEvent(new MessageEvent("message", {
+        data: { xagent: true, v: 1, type: "widget_chrome_ready" },
+        origin: "https://chat.example",
+        source: widgetIframe().contentWindow as Window,
+      }))
+      expect(panel()).toHaveClass("open")
+      expect(panel()).toHaveClass("xagent-widget-chrome-ready")
+      const container = document.querySelector(".xagent-widget-container")!
+      const detachedFab = document.querySelector<HTMLButtonElement>(".xagent-widget-fab")!
+
+      container.remove()
+      await Promise.resolve() // teardown observer fires and disconnects
+
+      document.body.appendChild(container)
+
+      expect(panel()).not.toHaveClass("open")
+      expect(panel()).not.toHaveClass("xagent-widget-chrome-ready")
+      expect(detachedFab.style.display).toBe("none")
+    })
+
     it("stops reacting to window/document listeners once the panel leaves the DOM", async () => {
       // Spy without mockImplementation so these still call through -- we
       // want the real listeners attached, just also recorded.
@@ -943,6 +1061,445 @@ describe("widget bootstrap", () => {
 
       window.dispatchEvent(new Event("blur"))
       expect(document.body.style.userSelect).toBe("text")
+    })
+  })
+
+  describe("mobile full screen", () => {
+    function styleText() {
+      return document.head.querySelector("style")!.innerHTML
+    }
+
+    // Slices from the @media marker to the end of the stylesheet text (it's
+    // the last block in the template) rather than trying to match a precise
+    // closing brace -- formatting drift inside the block (added/reordered
+    // declarations) then can't make this fragile.
+    function mobileBlock() {
+      const text = styleText()
+      const index = text.indexOf('@media (max-width: 480px)')
+      if (index === -1) throw new Error("mobile media query block not found in generated <style>")
+      return text.slice(index)
+    }
+
+    beforeEach(() => {
+      fetchMock.mockResolvedValue(new Response(JSON.stringify({
+        ticket: "ticket/one",
+        agent_id: 17,
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }))
+    })
+
+    it("makes the panel a true edge-to-edge overlay under the 480px breakpoint", () => {
+      runWidget({ "data-widget-key": "widget-secret" })
+
+      const block = mobileBlock()
+      expect(block).toMatch(/\.xagent-widget-panel\s*\{[^}]*position:\s*fixed;/)
+      expect(block).toMatch(/\.xagent-widget-panel\s*\{[^}]*inset:\s*0;/)
+      expect(block).toMatch(/\.xagent-widget-panel\s*\{[^}]*border-radius:\s*0;/)
+      // inset: 0 alone does not override the base rule's explicit
+      // width: 380px / height: 600px / max-height: calc(100vh - 100px) --
+      // these three overrides are what actually makes it edge-to-edge.
+      expect(block).toMatch(/\.xagent-widget-panel\s*\{[^}]*width:\s*100%;/)
+      // Anchored to a declaration boundary (start of the rule body, or right
+      // after a preceding ';\n'), not just "not preceded by max-" -- a bare
+      // negative lookbehind on "max-" still matches inside line-height,
+      // min-height, or a custom property like --panel-height, any of which
+      // could satisfy this if the real height: declaration were removed.
+      expect(block).toMatch(/\.xagent-widget-panel\s*\{[^}]*(?:^|\n)\s*height:\s*100%;/)
+      expect(block).toMatch(/\.xagent-widget-panel\s*\{[^}]*max-height:\s*100%;/)
+      // Progressive enhancement over the two 100% fallbacks above -- tracks
+      // a mobile browser's address-bar show/hide instead of leaving a gap
+      // or an overflow against the "large" viewport 100% resolves against.
+      expect(block).toMatch(/\.xagent-widget-panel\s*\{[^}]*(?:^|\n)\s*height:\s*100dvh;/)
+      expect(block).toMatch(/\.xagent-widget-panel\s*\{[^}]*max-height:\s*100dvh;/)
+      // Order matters, not just presence: on equal specificity the LAST
+      // declaration wins, so the 100dvh enhancement must come after its 100%
+      // fallback -- reordering them would still make every assertion above
+      // pass while silently breaking the fallback for browsers that don't
+      // parse dvh at all (they'd apply 100dvh as an unrecognized value, no
+      // fallback left behind it).
+      const panelRule = block.match(/\.xagent-widget-panel\s*\{([^}]*)\}/)![1]
+      expect(panelRule.search(/(?:^|\n)\s*height:\s*100dvh;/)).toBeGreaterThan(panelRule.search(/(?:^|\n)\s*height:\s*100%;/))
+      expect(panelRule.search(/max-height:\s*100dvh;/)).toBeGreaterThan(panelRule.search(/max-height:\s*100%;/))
+    })
+
+    it("respects device safe areas instead of drawing under a notch or home indicator", () => {
+      runWidget({ "data-widget-key": "widget-secret" })
+
+      // Scoped to the panel rule's own body, not the whole mobile media
+      // block -- an unscoped match would still pass if these declarations
+      // were ever moved into an unrelated rule in the same block.
+      const panelRule = mobileBlock().match(/\.xagent-widget-panel\s*\{([^}]*)\}/)![1]
+      // Match the whole env() expression, fallback included -- a regex that
+      // stops at the property name would still pass if the ", 0px" fallback
+      // (the only thing keeping non-supporting browsers at zero padding) were
+      // ever dropped.
+      expect(panelRule).toMatch(/padding-top:\s*env\(safe-area-inset-top,\s*0px\)/)
+      expect(panelRule).toMatch(/padding-bottom:\s*env\(safe-area-inset-bottom,\s*0px\)/)
+      // Landscape can put a side notch on either edge.
+      expect(panelRule).toMatch(/padding-left:\s*env\(safe-area-inset-left,\s*0px\)/)
+      expect(panelRule).toMatch(/padding-right:\s*env\(safe-area-inset-right,\s*0px\)/)
+    })
+
+    it("stops the safe-area padding strips from chaining a touch-scroll through to the host page", () => {
+      runWidget({ "data-widget-key": "widget-secret" })
+
+      const panelRule = mobileBlock().match(/\.xagent-widget-panel\s*\{([^}]*)\}/)![1]
+      expect(panelRule).toMatch(/overscroll-behavior:\s*none;/)
+    })
+
+    it("hides the FAB only once the iframe has confirmed its own close control is mounted", () => {
+      runWidget({ "data-widget-key": "widget-secret" })
+
+      const block = mobileBlock()
+      // Gated on .xagent-widget-chrome-ready (toggled by onChromeMessage in response
+      // to widget_chrome_ready/widget_chrome_not_ready), not just .open --
+      // see widget-chrome.test.ts for the message-driven class toggling this
+      // selector depends on. Without that gate, a loading/auth-failure/
+      // degraded Session state (none of which render a header) would hide
+      // the parent's only close control on a full-screen mobile panel with
+      // nothing to replace it.
+      expect(block).toMatch(/\.xagent-widget-panel\.open\.xagent-widget-chrome-ready\s*~\s*\.xagent-widget-fab\s*\{[^}]*display:\s*none;/)
+    })
+
+    it("stacks the fallback FAB above the fixed panel instead of letting it paint underneath", () => {
+      // The FAB is a plain in-flow (position: static) element by default;
+      // the panel becomes position: fixed at this breakpoint. A positioned
+      // element always paints above a non-positioned sibling regardless of
+      // DOM order, so without an explicit stacking rule here the fixed
+      // full-screen panel would visually cover -- and fail hit-testing
+      // against -- the FAB in every state above that intentionally keeps it
+      // as the fallback close control.
+      runWidget({ "data-widget-key": "widget-secret" })
+
+      const block = mobileBlock()
+      expect(block).toMatch(/\.xagent-widget-fab\s*\{[^}]*position:\s*relative;/)
+      expect(block).toMatch(/\.xagent-widget-fab\s*\{[^}]*z-index:\s*1;/)
+    })
+
+    it("offsets the fallback FAB's anchor point for device safe areas too", () => {
+      // The panel's own safe-area padding has no effect on the FAB, which
+      // is anchored by the container's bottom/right instead -- without this,
+      // a safe-area inset wider than the base 20px can leave part of the
+      // touch target inside a notch/home-indicator/gesture area while the
+      // child hasn't confirmed readiness.
+      runWidget({ "data-widget-key": "widget-secret" })
+
+      const block = mobileBlock()
+      expect(block).toMatch(/\.xagent-widget-container\s*\{[^}]*bottom:\s*calc\(20px \+ env\(safe-area-inset-bottom,\s*0px\)\);/)
+      expect(block).toMatch(/\.xagent-widget-container\s*\{[^}]*right:\s*calc\(20px \+ env\(safe-area-inset-right,\s*0px\)\);/)
+    })
+
+    it("keeps the panel and FAB as siblings, with the panel first, which the FAB-hiding sibling selector depends on", () => {
+      // .xagent-widget-panel.open.xagent-widget-chrome-ready ~ .xagent-widget-fab
+      // is a general sibling combinator: it requires the panel and FAB to
+      // share the same parent AND the panel to precede the FAB. Document
+      // order alone (compareDocumentPosition) doesn't prove same-parent
+      // membership -- a future wrapper around just the FAB (or just the
+      // panel) could keep the panel textually first while making this
+      // selector permanently inert, leaving the ready-state FAB visible
+      // forever with no other test catching it.
+      runWidget({ "data-widget-key": "widget-secret" })
+
+      const panel = document.querySelector(".xagent-widget-panel")!
+      const fab = document.querySelector(".xagent-widget-fab")!
+      expect(panel.parentElement).toBe(fab.parentElement)
+      const panelComesFirst = Boolean(panel.compareDocumentPosition(fab) & Node.DOCUMENT_POSITION_FOLLOWING)
+      expect(panelComesFirst).toBe(true)
+    })
+  })
+
+  describe("matchMedia-driven viewport detection", () => {
+    let originalInnerWidth: number
+
+    beforeEach(() => {
+      originalInnerWidth = window.innerWidth
+      fetchMock.mockResolvedValue(new Response(JSON.stringify({
+        ticket: "ticket/one",
+        agent_id: 17,
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }))
+    })
+
+    afterEach(() => {
+      setInnerWidth(originalInnerWidth)
+    })
+
+    function setInnerWidth(value: number) {
+      Object.defineProperty(window, "innerWidth", { configurable: true, value })
+    }
+
+    // isMobileViewport() prefers window.matchMedia over window.innerWidth,
+    // but jsdom (every other test in this file) has no matchMedia at all --
+    // that only exercises the innerWidth fallback branch. These tests stub
+    // matchMedia in so the primary branch itself is actually covered, not
+    // just assumed correct from reading the source.
+    function stubMatchMedia() {
+      let matches = false
+      const mql = {
+        get matches() {
+          return matches
+        },
+        media: "",
+      }
+      const matchMediaSpy = vi.fn((query: string) => {
+        mql.media = query
+        return mql as unknown as MediaQueryList
+      })
+      vi.stubGlobal("matchMedia", matchMediaSpy)
+      return { matchMediaSpy, set: (value: boolean) => { matches = value } }
+    }
+
+    function panelWidthStyle() {
+      return document.querySelector<HTMLDivElement>(".xagent-widget-panel")!.style.width
+    }
+
+    it("queries the exact mobile breakpoint media string", () => {
+      const { matchMediaSpy } = stubMatchMedia()
+
+      runWidget({ "data-widget-key": "widget-secret" })
+
+      expect(matchMediaSpy).toHaveBeenCalledWith("(max-width: 480px)")
+    })
+
+    it("prefers matchMedia over a conflicting innerWidth when deciding mobile behavior", () => {
+      // A genuine innerWidth-vs-CSS-viewport-width disagreement (see
+      // isMobileViewport()'s own comment) is exactly why matchMedia exists
+      // here -- innerWidth alone would say "desktop" at this width.
+      setInnerWidth(1280)
+      const { set } = stubMatchMedia()
+      set(true) // the CSS engine says mobile
+
+      runWidget({ "data-widget-key": "widget-secret" })
+
+      // Mobile means the CSS media query owns sizing -- no inline width.
+      expect(panelWidthStyle()).toBe("")
+    })
+
+    it("re-reads a stubbed matchMedia's answer on resize, not just at initial load", () => {
+      setInnerWidth(1280)
+      const { set } = stubMatchMedia()
+      set(false)
+      runWidget({ "data-widget-key": "widget-secret" })
+      expect(panelWidthStyle()).not.toBe("")
+
+      set(true)
+      setInnerWidth(1281) // must actually change, or onWindowResize no-ops
+      window.dispatchEvent(new Event("resize"))
+
+      expect(panelWidthStyle()).toBe("")
+    })
+  })
+
+  describe("mobile scroll lock", () => {
+    let originalInnerWidth: number
+
+    beforeEach(() => {
+      originalInnerWidth = window.innerWidth
+      fetchMock.mockResolvedValue(new Response(JSON.stringify({
+        ticket: "ticket/one",
+        agent_id: 17,
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }))
+    })
+
+    afterEach(() => {
+      setInnerWidth(originalInnerWidth)
+    })
+
+    function setInnerWidth(value: number) {
+      Object.defineProperty(window, "innerWidth", { configurable: true, value })
+    }
+
+    function openViaFab() {
+      document.querySelector<HTMLButtonElement>(".xagent-widget-fab")!.click()
+    }
+
+    function isLocked() {
+      return document.documentElement.classList.contains("xagent-widget-scroll-locked")
+    }
+
+    it("locks the host page's scroll on mobile while the panel is open", () => {
+      setInnerWidth(400)
+      runWidget({ "data-widget-key": "widget-secret" })
+
+      openViaFab()
+
+      expect(isLocked()).toBe(true)
+    })
+
+    it("locks document.scrollingElement (documentElement, where jsdom has no scrollingElement), not body specifically", () => {
+      // Regression coverage: a host page that sets its own overflow
+      // directly on <html> (e.g. html { overflow-y: scroll }, a common
+      // technique to avoid scrollbar-width layout shift) breaks the usual
+      // body-to-viewport overflow propagation -- a body-only lock would do
+      // nothing at all on such a page, leaving the background scrollable
+      // behind the "full-screen" panel.
+      setInnerWidth(400)
+      runWidget({ "data-widget-key": "widget-secret" })
+
+      openViaFab()
+
+      expect(document.documentElement).toHaveClass("xagent-widget-scroll-locked")
+      expect(document.body).not.toHaveClass("xagent-widget-scroll-locked")
+    })
+
+    it("never touches the host page's own overflow value, before, during, or after the lock", () => {
+      // The lock is a namespaced class, not a read/write of the shared
+      // overflow value a host page might independently use for its own
+      // scroll-locking -- there's nothing to "restore" because nothing is
+      // ever captured or written to that value in the first place.
+      setInnerWidth(400)
+      document.documentElement.style.overflow = "auto"
+      runWidget({ "data-widget-key": "widget-secret" })
+
+      openViaFab()
+      expect(isLocked()).toBe(true)
+      expect(document.documentElement.style.overflow).toBe("auto")
+
+      openViaFab()
+      expect(isLocked()).toBe(false)
+      expect(document.documentElement.style.overflow).toBe("auto")
+    })
+
+    it("leaves a host page's own overflow value alone even if it independently uses the same value the old lock used to write", () => {
+      // Regression coverage for the bug the class-based lock replaced: the
+      // previous overflow='hidden' implementation could not tell its own
+      // value apart from a host page's own, separately-managed modal using
+      // the same string -- closing the widget could silently unlock that
+      // still-open host modal. A class-only lock can't make that mistake
+      // because it never inspects this value at all.
+      setInnerWidth(400)
+      runWidget({ "data-widget-key": "widget-secret" })
+      openViaFab()
+      expect(isLocked()).toBe(true)
+
+      // The host page's own, unrelated modal also locks scroll the same way.
+      document.documentElement.style.overflow = "hidden"
+
+      openViaFab() // closes the widget
+
+      expect(isLocked()).toBe(false)
+      // The host's own value is untouched -- not silently cleared by the
+      // widget's release.
+      expect(document.documentElement.style.overflow).toBe("hidden")
+    })
+
+    it("keeps its own lock in force even if the host page changes its own overflow value while still open", () => {
+      // The reverse interleaving: the host releasing (or otherwise
+      // changing) its own overflow value must not be able to accidentally
+      // unlock the widget's still-open full-screen panel.
+      setInnerWidth(400)
+      runWidget({ "data-widget-key": "widget-secret" })
+      openViaFab()
+      expect(isLocked()).toBe(true)
+
+      document.documentElement.style.overflow = ""
+
+      expect(isLocked()).toBe(true)
+    })
+
+    it("never locks on desktop", () => {
+      setInnerWidth(1280)
+      runWidget({ "data-widget-key": "widget-secret" })
+
+      openViaFab()
+
+      expect(isLocked()).toBe(false)
+    })
+
+    it("unlocks if a device rotation crosses the breakpoint while the panel stays open", () => {
+      setInnerWidth(400)
+      runWidget({ "data-widget-key": "widget-secret" })
+      openViaFab()
+      expect(isLocked()).toBe(true)
+
+      setInnerWidth(800)
+      window.dispatchEvent(new Event("resize"))
+
+      expect(isLocked()).toBe(false)
+    })
+
+    it("locks if a device rotation crosses the breakpoint the other way while open", () => {
+      setInnerWidth(800)
+      runWidget({ "data-widget-key": "widget-secret" })
+      openViaFab()
+      expect(isLocked()).toBe(false)
+
+      setInnerWidth(400)
+      window.dispatchEvent(new Event("resize"))
+
+      expect(isLocked()).toBe(true)
+    })
+
+    it("releases the lock if a host SPA removes the widget while open on mobile", async () => {
+      setInnerWidth(400)
+      runWidget({ "data-widget-key": "widget-secret" })
+      openViaFab()
+      expect(isLocked()).toBe(true)
+
+      document.querySelector(".xagent-widget-container")?.remove()
+      // The teardown observer's callback fires as a microtask.
+      await Promise.resolve()
+
+      expect(isLocked()).toBe(false)
+    })
+
+    it("keeps the lock held while a second widget instance on the same page still needs it", () => {
+      // Ref-counted on the lock target element, precisely so one instance closing
+      // can't unlock scrolling out from under another instance still open.
+      setInnerWidth(400)
+      // A single shared Response instance (the describe-level default) can
+      // only have its body read once -- give each of the two instances'
+      // embed-ticket fetch its own fresh Response so the second doesn't log
+      // a spurious "Body is unusable" failure unrelated to what's under test.
+      fetchMock.mockImplementation(() => Promise.resolve(new Response(JSON.stringify({
+        ticket: "ticket/one",
+        agent_id: 17,
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      })))
+      runWidget({ "data-widget-key": "widget-secret" })
+      runWidget({ "data-widget-key": "widget-secret-2" })
+      const fabs = document.querySelectorAll<HTMLButtonElement>(".xagent-widget-fab")
+      expect(fabs.length).toBe(2)
+
+      fabs[0]!.click()
+      fabs[1]!.click()
+      expect(isLocked()).toBe(true)
+
+      fabs[0]!.click() // closes only the first instance
+      expect(isLocked()).toBe(true)
+
+      fabs[1]!.click() // closes the second and last instance
+      expect(isLocked()).toBe(false)
+    })
+
+    it("does not re-lock scroll on a FAB click after the panel is torn down while open", async () => {
+      // Regression coverage: the panel can be removed directly while the
+      // container/FAB stay in the DOM (see the "tears down when the panel is
+      // removed directly" test elsewhere in this file). Teardown itself
+      // releases the lock, but the FAB's click handler used to have no
+      // torndown guard, so a later click could still call openPanel() on the
+      // now-detached panel and reacquire the lock -- with the teardown
+      // observer already disconnected, nothing would ever release it again.
+      setInnerWidth(400)
+      runWidget({ "data-widget-key": "widget-secret" })
+      openViaFab()
+      expect(isLocked()).toBe(true)
+
+      document.querySelector(".xagent-widget-panel")?.remove()
+      await Promise.resolve() // teardown observer's callback fires as a microtask
+      expect(isLocked()).toBe(false)
+
+      openViaFab() // the FAB is still in the DOM and clickable
+      expect(isLocked()).toBe(false)
     })
   })
 })

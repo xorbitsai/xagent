@@ -15,7 +15,7 @@ from .attachments import build_image_context_references
 from .pattern import AutoPattern, DAGPattern, LLMPlanGenerator, ReActPattern
 from .registry import ExecutionRegistry
 from .result import NO_OUTPUT_PLACEHOLDER
-from .runner import AgentRunner
+from .runner import AgentRunner, UserMessageInjectionOutcome
 from .tracing import TraceEventCallback
 
 logger = logging.getLogger(__name__)
@@ -203,7 +203,7 @@ class AgentExecutionAdapter:
         turn_id: str | None = None,
         request_interrupt: bool = True,
         reason: str | None = None,
-    ) -> bool:
+    ) -> UserMessageInjectionOutcome:
         if self.registry.get(execution_id) is None:
             runner, execution_type = self._build_runner()
             self.registry.register(
@@ -211,7 +211,7 @@ class AgentExecutionAdapter:
                 runner,
                 metadata=self._execution_metadata(execution_type=execution_type),
             )
-        context = await self.registry.post_user_message(
+        result = await self.registry.post_user_message(
             execution_id,
             message,
             execution_message=execution_message,
@@ -221,7 +221,7 @@ class AgentExecutionAdapter:
             request_interrupt=request_interrupt,
             reason=reason,
         )
-        return context is not None
+        return result.outcome
 
     def cancel(self, execution_id: str, reason: str | None = None) -> bool:
         return self.registry.cancel(execution_id, reason=reason)

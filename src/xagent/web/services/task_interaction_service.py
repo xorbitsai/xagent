@@ -13,20 +13,33 @@ shape on every one of those points: it owns its own session end to end
 caller's transaction -- the one savepoint it opens
 (``db.begin_nested()``, around staging its own resume command) is its
 own, not a caller's. ``create()``, by contrast, takes a caller-owned
-session and only reads through it, never opening or committing one of its
-own. Putting ``respond()`` in the same file as the staging primitive would
-make that staging module's merge-reason docstring false. What this module
-reuses from the staging module instead of duplicating is narrow and
-one-directional: the private kind vocabulary (``_KIND_VOCABULARY``),
-imported by name. Neither ``create()`` nor ``respond()`` calls
-``stage_interaction_request`` and neither raises or catches any of that
-module's nine exception classes, and this module's own read-direction
-anchor resolver validates a real ``trace_events`` row against a stored
-interaction row's fields -- a different check from the staging module's
-``_validate_anchor_fields``, which validates an ``InteractionAnchor``
-value object before an INSERT -- so it is not reused here either. See
-``create()``'s own docstring for the exception-family accounting, and
-``_resolve_read_direction_anchor``'s for the anchor-check distinction.
+session throughout: it never opens or commits a session of its own, and
+the one place it writes is inside ``interaction_handoff``'s own savepoint
+on that same caller-owned session, never a savepoint of its own. Putting
+``respond()`` in the same file as the staging primitive would make that
+staging module's merge-reason docstring false. What this module reuses
+from the staging module instead of duplicating is narrow: the private
+kind vocabulary (``_KIND_VOCABULARY``), ``InteractionAnchor``,
+``interaction_handoff``, and the four exception classes
+``interaction_handoff`` can swallow that this module maps to a distinct
+outcome (``InteractionAnchorCorrupt``, ``InteractionRequestClosed``,
+``InteractionRunPartitionMismatch``, ``InteractionSlotTaken``), all
+imported by name (the ``StagedInteractionRequest`` values
+``interaction_handoff`` produces flow through as ``handoff.staged``, never
+imported as a name of their own here). ``respond()`` calls none of them
+and raises or catches none of that module's nine exception classes; this
+module's own read-direction anchor resolver validates a real
+``trace_events`` row against a stored interaction row's fields -- a
+different check from the staging module's ``_validate_anchor_fields``,
+which validates an ``InteractionAnchor`` value object before an INSERT --
+so it is not reused there either. ``create()`` is the one direction of
+reuse: it enters ``interaction_handoff`` on the system principal's write
+path and reads which of the primitive's own swallowed exceptions the call
+degraded on (``InteractionHandoff.degraded_as``) rather than duplicating
+the primitive's own validation ahead of the call (see
+``_DEGRADED_AS_OUTCOME``'s own docstring for that decision), and
+``_resolve_read_direction_anchor``'s docstring covers the read-direction
+anchor-check distinction.
 
 Concurrency precondition, stated once here because every rowcount-based
 branch this service will grow depends on it: every rowcount-based branch
@@ -45,10 +58,13 @@ authoritative and ``responder_user_id`` as a convenience join that can go
 missing under normal account deletion, not a corruption signal.
 
 This module now delivers the full answer side: the ``InteractionPrincipal``
-value object and the shared public-chat ownership predicate extracted from
+value object (now a closed-enum ``kind``, admitting a system principal
+alongside the two person-facing ones -- see that dataclass's own
+docstring) and the shared public-chat ownership predicate extracted from
 ``public_chat_access.py``; the ``RespondOutcome`` and ``CreateOutcome``
-discriminated unions; the ``create()`` typed seam (validates and returns,
-does not stage a row); ``get()``/``list_active()``; the three-tier
+discriminated unions; the ``create()`` typed seam (validates, and, once a
+system principal reaches the write point, stages the row);
+``get()``/``list_active()``; the three-tier
 compatibility materialization view; the answer fence and its active-row
 predicate; ``respond()``'s own call body (validation, authorization, the
 idempotency pre-read, anchor resolution, the answer fence and its
@@ -69,9 +85,10 @@ same series and has already merged -- the seam now reads through
 ``task_interaction_close.active_interaction_id_sync``, which imports
 ``_active_native_row_criteria`` from this module; ``websocket.py`` itself
 no longer imports it directly -- but is not part of this
-change. ``create()``'s own call body -- the write
-that actually stages a row -- is not delivered here either; its own
-zero-production-caller gate
+change. ``create()``'s call body is delivered here, but it is still given
+no production caller in this change: no finalizer, HTTP endpoint, or any
+other production code constructs a system principal or calls ``create()``
+with one. Its own zero-production-caller gate
 (``tests/web/services/test_task_interaction_service_create_gate.py``)
 watches both ``create()`` and ``respond()``: zero production code calls
 either name today, and the change that wires a caller is the change that
@@ -89,6 +106,7 @@ import logging
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 import sqlalchemy as sa
@@ -100,6 +118,7 @@ from ...core.agent.checkpoint import (
     READABLE_CHECKPOINT_TYPES,
     checkpoint_execution_id,
 )
+from ...core.agent.pattern.react.react import _normalize_interaction_text
 from ...core.tools.adapters.vibe.ask_user_tool import AskUserQuestionArgs
 from ...core.tools.adapters.vibe.interaction_types import INTERACTION_TYPES
 from ..models.task import Task, TaskStatus, TaskStatusPredicate, TraceEvent
@@ -127,6 +146,7 @@ from .task_command_transport import (
     _canonical_payload,
     _matches_existing,
     _normalize_command_id,
+    _resolve_actor_subject,
     classify_task_command_conflict,
     notify_task_command_dispatcher,
     stage_task_command,
@@ -136,8 +156,16 @@ from .task_execution_controller import (
     apply_task_control_transition,
 )
 from .task_interaction_schema import interaction_requests_table_exists
-from .task_interaction_staging import _KIND_VOCABULARY
-from .task_lease_service import TASK_RUN_ID_TRACE_FIELD
+from .task_interaction_staging import (
+    _KIND_VOCABULARY,
+    InteractionAnchor,
+    InteractionAnchorCorrupt,
+    InteractionRequestClosed,
+    InteractionRunPartitionMismatch,
+    InteractionSlotTaken,
+    interaction_handoff,
+)
+from .task_lease_service import TASK_RUN_ID_TRACE_FIELD, TaskLease
 
 logger = logging.getLogger(__name__)
 
@@ -151,12 +179,34 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+class InteractionPrincipalKind(str, Enum):
+    """The closed set of caller identities ``InteractionPrincipal`` accepts.
+
+    ``USER`` and ``GUEST`` back the two principal shapes this module has
+    always recognized -- see ``InteractionPrincipal``'s own docstring.
+    ``SYSTEM`` backs the finalizer-only identity ``create()``'s write path
+    admits (see ``_assert_write_point_admissible``): the finalizer layer
+    acts on a task without owning it, so it needs an identity distinct from
+    both a real user and a widget/share guest, one that can never be
+    confused with either in an audit trail.
+
+    A ``str`` subclass on purpose: every ``principal.kind == "guest"`` /
+    ``principal.kind in ("user", "guest")`` comparison already written
+    against a plain string, elsewhere in this module, keeps comparing equal
+    against a member of this enum without being rewritten.
+    """
+
+    USER = "user"
+    GUEST = "guest"
+    SYSTEM = "system"
+
+
 @dataclass(frozen=True)
 class InteractionPrincipal:
-    """A resolved caller identity: either an authenticated web user or an
-    anonymous widget/share guest, carrying every field the public-chat
-    ownership predicate below and the future answer-side authorization
-    predicate need.
+    """A resolved caller identity: an authenticated web user, an anonymous
+    widget/share guest, or the finalizer layer acting as the system,
+    carrying every field the public-chat ownership predicate below and the
+    answer-side authorization predicate need.
 
     This is not a transport-authentication object -- it does not verify a
     JWT, a widget key, or an embed ticket. Callers resolve those themselves
@@ -167,28 +217,58 @@ class InteractionPrincipal:
     module's callers need: the four public-chat entry points already decode
     their own credentials before ever calling the ownership predicate.
 
-    ``kind`` is ``"user"`` for an authenticated web session or ``"guest"``
-    for a widget/share visitor. ``user_id`` is populated for both kinds --
-    an authenticated user is also the task owner or an admin acting on it,
-    and a guest's owning user is the entity (agent/workforce) owner the
-    guest is chatting through, not the guest itself. ``is_admin`` records
-    whether this is an admin acting on someone else's task (the turn still
-    runs as the task owner; ``is_admin`` is audit-only). ``auth_mode``, the
-    four ``*_id`` entity-binding fields, and ``guest_id`` mirror the fields
+    ``kind`` is one of ``InteractionPrincipalKind``'s three members:
+    ``USER`` for an authenticated web session, ``GUEST`` for a widget/share
+    visitor, or ``SYSTEM`` for the finalizer layer, which owns no task and
+    never reaches this object's ownership predicates at all (see
+    ``_assert_write_point_admissible``). ``__post_init__`` coerces whatever
+    value the caller passed through ``InteractionPrincipalKind(...)`` and
+    rejects any value outside the three members at construction -- a
+    frozen dataclass's fields are not otherwise type-checked at
+    construction, so without this coercion an unrecognized ``kind`` would
+    construct silently and only surface later, at whichever call site
+    happens to compare against it. ``user_id`` is populated for the first
+    two kinds -- an authenticated user is also the task owner or an admin
+    acting on it, and a guest's owning user is the entity (agent/workforce)
+    owner the guest is chatting through, not the guest itself -- and is
+    ``None`` for a system principal by convention, which has no owning user
+    to name. That convention is not enforced at construction: this
+    ``__post_init__`` validates each field against its own domain and
+    leaves cross-field agreement to the call sites, the same way it leaves
+    a missing ``user_id`` on a user principal to ``create()``/``respond()``.
+    A system principal's ``user_id`` is inert either way -- ``identity_string``
+    renders the fixed ``"system:finalizer"`` without reading it, and
+    ``_assert_write_point_admissible`` checks ``kind`` alone.
+    ``__post_init__`` also rejects a populated ``user_id`` that is not a
+    positive ``int`` (``bool`` included, since ``bool`` is a subclass of
+    ``int``); ``None`` remains legal for every kind, since ``create()`` and
+    ``respond()`` both treat a missing ``user_id`` as its own rejection
+    condition, not a construction-time one. ``is_admin`` records whether
+    this is an admin acting on someone else's task (the turn still runs as
+    the task owner; ``is_admin`` is audit-only). ``auth_mode``, the four
+    ``*_id`` entity-binding fields, and ``guest_id`` mirror the fields
     ``public_chat_access.py``'s access-context dataclasses already carry
     (see that module's ``PublicChatAccessContext`` and
     ``ShareChatAccessContext``); exactly one of ``widget_agent_id`` /
     ``widget_workforce_id`` / ``share_agent_id`` / ``share_workforce_id`` is
-    populated for a guest principal, none for a ``"user"`` principal.
+    populated for a guest principal, none for a ``"user"`` or ``"system"``
+    principal.
 
     ``identity_string`` produces the same ``"user:{id}"`` / ``"guest:{gid}"``
     namespacing the ``responder_identity`` column comment documents
-    (``models/task_interaction.py``): the prefix is a namespace, not
-    decoration, because a bare user id and a bare guest id share no type and
-    must never compare equal by accident.
+    (``models/task_interaction.py``), plus a fixed ``"system:finalizer"``
+    for the system kind: every prefix is a namespace, not decoration,
+    because a bare user id, a bare guest id, and the system's own constant
+    share no type and must never compare equal by accident.
     """
 
-    kind: str  # "user" | "guest"
+    # Typed to accept a plain str too, not narrowed to InteractionPrincipalKind
+    # alone: every existing production call site (public_chat_access.py)
+    # passes a string literal ("guest"), which __post_init__ below coerces
+    # and validates -- narrowing this annotation to the enum type only
+    # would make every one of those call sites a static type error for no
+    # runtime benefit, since the coercion happens either way.
+    kind: "InteractionPrincipalKind | str"
     user_id: int | None
     is_admin: bool
     auth_mode: str | None  # "widget" | "share" | None
@@ -197,6 +277,26 @@ class InteractionPrincipal:
     share_agent_id: int | None = None
     share_workforce_id: int | None = None
     guest_id: str | None = None
+
+    def __post_init__(self) -> None:
+        try:
+            kind = InteractionPrincipalKind(self.kind)
+        except ValueError as exc:
+            raise ValueError(
+                "InteractionPrincipal kind must be one of "
+                f"{[member.value for member in InteractionPrincipalKind]}, "
+                f"got {self.kind!r}"
+            ) from exc
+        object.__setattr__(self, "kind", kind)
+
+        if self.user_id is not None and (
+            isinstance(self.user_id, bool)
+            or not isinstance(self.user_id, int)
+            or self.user_id <= 0
+        ):
+            raise ValueError(
+                f"user_id must be a positive int or None, got {self.user_id!r}"
+            )
 
     def identity_string(self) -> str:
         """The ``responder_identity`` value for this principal.
@@ -207,7 +307,14 @@ class InteractionPrincipal:
         an identity and is not one: a missing id interpolated into the
         literal ``"user:None"`` / ``"guest:None"``, and an unrecognized
         ``kind`` falling through to the user branch and being recorded as a
-        user.
+        user. ``__post_init__`` now makes the second of those two gaps
+        unreachable through this object's own constructor -- ``self.kind``
+        can only ever be one of ``InteractionPrincipalKind``'s three
+        members -- but the check below stays: a frozen dataclass can still
+        be produced by means that skip ``__post_init__`` (``object.__new__``
+        plus direct attribute assignment, or a future subclass), and this
+        method has no way to tell such an instance apart from one built
+        through the normal constructor.
 
         Nothing downstream stops either --
         ``ck_task_interaction_requests_responder_identity_nonempty``
@@ -226,6 +333,15 @@ class InteractionPrincipal:
         admits a guest id that is only spaces, so stripping here would
         start rejecting principals that path produces today.
 
+        The system kind renders to the fixed string ``"system:finalizer"``,
+        never derived from ``task``, ``lease``, or any other caller-supplied
+        value: it does not own the task it acts on (see
+        ``_assert_write_point_admissible``), so nothing about the task it is
+        writing to belongs in its own identity, and a constant is
+        indistinguishable from every real ``"user:{id}"`` / ``"guest:{gid}"``
+        value by construction -- neither prefix a real principal renders to
+        is ``"system"``.
+
         ``ValueError``, not a typed rejection, because this is a pure
         function of the principal: reaching it with one this incomplete
         means the caller built the principal wrong, which is a programming
@@ -236,6 +352,8 @@ class InteractionPrincipal:
         position to see this raise.
         """
 
+        if self.kind == InteractionPrincipalKind.SYSTEM:
+            return "system:finalizer"
         if self.kind == "guest":
             if not self.guest_id:
                 raise ValueError("guest principal carries no guest_id")
@@ -703,25 +821,37 @@ RespondOutcome = (
 # outcomes declare each reason as a ``Literal`` on the dataclass field, so
 # the type is the vocabulary. Create's still carry ``reason: str`` beside
 # the runtime dictionaries below, which record something a ``Literal``
-# cannot: which reasons are *producible* in this delivery as opposed to
-# merely declared, a distinction that exists only because create()'s call
-# body is not delivered yet. The two vocabularies overlap in nine strings
-# and are deliberately not shared -- ``"not_task_principal"`` appears in
-# both because both seams reuse the shared ownership predicate's verdict,
-# not because the two outcome types share a base class, and a change to
-# one side's word list must never silently move the other's. When
-# create()'s call body lands and the producible/declared distinction
-# disappears with it, that side converts to the Literal mechanism and this
-# note goes away.
+# cannot: which (outcome, reason) pairs are *producible* -- this function
+# body has a code path that returns them -- as opposed to merely declared
+# in the closed word list. That distinction does not go away once this
+# seam's call body is filled in: some declared pairs stay unreachable from
+# any caller this delivery actually wires (see
+# ``CREATE_OUTCOME_PRODUCIBLE_REASONS``'s own docstring for which two, and
+# why), so a ``Literal`` -- which can only express "declared", not
+# "producible from here" -- would still lose that information. The two
+# vocabularies overlap in nine strings and are deliberately not shared --
+# ``"not_task_principal"`` appears in both because both seams reuse the
+# shared ownership predicate's verdict, not because the two outcome types
+# share a base class, and a change to one side's word list must never
+# silently move the other's.
 # ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class CreatedInteractionReceipt:
     """Same family as ``InteractionResponseReceipt``: taken before commit,
-    never from a lazy relationship read after it. Produced only once
-    ``CreateCreated`` becomes producible -- not in this delivery (see
-    ``create()``'s own docstring)."""
+    never from a lazy relationship read after it. Produced by every
+    successful ``create()`` call, whether it staged a fresh row or replayed
+    an existing one under the same idempotency key.
+
+    On a replay -- ``CreateCreated`` carrying a receipt built from a row
+    this call did not insert -- the receipt reports the *existing* row's
+    ``expires_at``, not the value this call proposed: the identity
+    pre-read that finds the row matches on the identity key alone and never
+    compares expiry, so the two can differ and the row may already be
+    expired. This receipt states what the row is, not that it is still
+    usable -- deciding that is the consumer's job.
+    """
 
     interaction_id: int
     task_id: int
@@ -762,22 +892,6 @@ class CreateStale:
     reason: str
 
 
-@dataclass(frozen=True)
-class CreateNotWired:
-    """A well-formed, authorized create() call has nothing to report but
-    that fact: this seam validates and returns, it does not stage a row.
-
-    Retired by the change that fills this seam's call
-    body. Until then a well-formed, authorized request has nothing to
-    report but that fact: this seam validates and returns, it does not
-    stage. That later change deletes this variant and its reason constant
-    together; the vocabulary guard then asserts one fewer pair, which is
-    what makes the deletion impossible to forget.
-    """
-
-    reason: str  # always "seam_not_wired" in this delivery
-
-
 CreateOutcome = (
     CreateCreated
     | CreateValidationRejected
@@ -785,12 +899,9 @@ CreateOutcome = (
     | CreateUnavailable
     | CreateConflict
     | CreateStale
-    | CreateNotWired
 )
 
-# The reason word list is defined once, for both delivery periods, because
-# it is the same closed vocabulary either way -- only which pairs are
-# *producible* changes (see CREATE_OUTCOME_PRODUCIBLE_REASONS below). 13
+# The full closed vocabulary create() can ever return a reason from. 12
 # reasons total (the "Created" / None pair is not a reason string and is
 # counted separately). Do not update this number by recounting the set
 # literal below -- it is pinned as part of the vocabulary's contract.
@@ -808,20 +919,50 @@ CREATE_OUTCOME_REASON_WORDS: frozenset[str] = frozenset(
         "idempotency_key_reused",
         "anchor_dangling",
         "run_ended",
-        "seam_not_wired",
     }
 )
 
-# The (outcome type, reason) pairs this delivery's create() can actually
-# produce today: validation and authorization run, but the seam never
-# stages a row, so nothing past those two categories -- plus NotWired
-# itself -- is reachable. 7 pairs. Once a later change fills create()'s
-# call body, this dict is replaced by one covering all 13 reasons (minus
-# seam_not_wired, which is deleted along with CreateNotWired) -- not
-# extended in place, so the guard's expected count changes atomically with
-# the variant it is pinned to.
-CREATE_OUTCOME_REASON_VOCABULARY: dict[str, frozenset[str]] = {
-    "CreateValidationRejected": frozenset(
+# The (outcome type, reason) pairs this function body has a code path that
+# returns. 9 of the 12 words in CREATE_OUTCOME_REASON_WORDS are producible
+# by that definition; the other three (checkpoint_unavailable,
+# anchor_dangling, run_ended) stay in the closed word list without a
+# producing code path here today:
+#
+# * checkpoint_unavailable / anchor_dangling both name half of anchor
+#   resolution this seam does not perform -- a database read against
+#   ``trace_events``, layered into absence/unavailable/corrupt outcomes
+#   (see ``InteractionAnchor``'s own docstring). ``create()`` takes an
+#   already-resolved ``anchor`` argument and only re-validates its fields
+#   for internal consistency (``invalid_values``, below); the database
+#   read that could produce either of these two belongs to whichever
+#   caller resolves the anchor before calling create(), or to the change
+#   that gives create() an HTTP entry point with no caller-resolved anchor
+#   to hand it (#1079).
+# * run_ended names a request whose target is closed because its *run* has
+#   ended, distinct from idempotency_key_reused (a request whose target is
+#   closed for any terminal reason, including one where the run is still
+#   live). No caller-facing consumer needs that finer distinction yet; one
+#   that does is what would give this word its own producing branch.
+#
+# Producible here means this function body has a code path that returns
+# the pair -- not that the path is reachable from any wired production
+# caller. Two entries make the distinction load-bearing rather than
+# academic:
+#
+# * ``task_missing`` is returned only from the id-only lookup branch,
+#   which a non-system principal reaches; the write-point assertion
+#   refuses every non-system principal, so no wired caller produces it
+#   today.
+# * ``invalid_values`` is returned for a malformed ``anchor``, and the
+#   only wired caller passes an anchor built by ``resolve_interaction_anchor``,
+#   which cannot emit a malformed one.
+#
+# Both stay in this set because the code path exists and is covered. A set
+# defined by production reachability instead would be a different, smaller
+# set, and the exhaustion test would have to be rewritten with it -- which
+# is why the criterion is stated here rather than left to be inferred.
+CREATE_OUTCOME_PRODUCIBLE_REASONS: dict[type, frozenset[str]] = {
+    CreateValidationRejected: frozenset(
         {
             "unknown_kind",
             "unknown_protocol_version",
@@ -829,9 +970,10 @@ CREATE_OUTCOME_REASON_VOCABULARY: dict[str, frozenset[str]] = {
             "invalid_values",
         }
     ),
-    "CreateUnauthorized": frozenset({"not_task_principal"}),
-    "CreateUnavailable": frozenset({"task_missing"}),
-    "CreateNotWired": frozenset({"seam_not_wired"}),
+    CreateUnauthorized: frozenset({"not_task_principal"}),
+    CreateUnavailable: frozenset({"task_missing"}),
+    CreateConflict: frozenset({"slot_taken", "idempotency_key_reused"}),
+    CreateStale: frozenset({"anchor_run_mismatch"}),
 }
 
 
@@ -927,24 +1069,123 @@ def build_v1_request_payload(parsed: AskUserQuestionArgs) -> dict[str, Any]:
 # is what keeps either surface from having to.
 _V1_INTERACTION_TYPES = frozenset(INTERACTION_TYPES)
 
-# The three types whose whole purpose is picking from a supplied list, and
-# the four that render their own control and have nothing to pick from.
-# The split is the render surface's, not this module's: ``select_one``,
-# ``select_multiple``, and ``action_cards`` iterate ``interaction.options``
+# The types whose whole purpose is picking from a supplied list -- one set,
+# per #1314 item 2 ("key rules by interaction type, rather than one flat
+# list"), read below as a total function of membership rather than the two
+# independent flat sets this replaces. The split is the render surface's,
+# not this module's: ``select_one``, ``select_multiple``, and
+# ``action_cards`` iterate ``interaction.options``
 # (``frontend/src/components/chat/clarification-form.tsx``), while
 # ``confirm`` renders a switch, ``text_input`` a field, ``number_input`` a
 # spinner, and ``file_upload`` a picker -- none of which read ``options``.
 _V1_TYPES_REQUIRING_OPTIONS = frozenset(
     {"select_one", "select_multiple", "action_cards"}
 )
-_V1_TYPES_REJECTING_OPTIONS = _V1_INTERACTION_TYPES - _V1_TYPES_REQUIRING_OPTIONS
+
+
+@dataclass(frozen=True)
+class InteractionWriteRefusal:
+    """One write-side admissibility rule's structured refusal: a stable
+    rule identifier plus the position it fired at (``#1314`` item 3 --
+    "a stable rule identifier plus the position, so the diagnostic does
+    not depend on interpolating producer-supplied text"). Never carries
+    producer-supplied text itself -- ``rule`` is always one of this
+    module's own fixed identifiers, and ``position`` is a path built from
+    indices and fixed field names, never a value out of the payload.
+
+    Position format: ``request_payload.<field>`` for an envelope-level
+    field, ``request_payload.interactions[i].<field>`` for an
+    interaction-level one, and ``anchor.<field>`` for the ``anchor``
+    argument's own fields -- matching ``_validate_anchor_fields``'s
+    existing message shape (``task_interaction_staging.py``) rather than
+    inventing a second naming convention for the same kind of value.
+    """
+
+    rule: str
+    position: str
+
+
+class InteractionWritePayloadRejected(ValueError):
+    """Raised by the write-side admissibility rules below for a
+    shape-valid, JSON-serializable payload this service is not willing to
+    persist. A ``ValueError`` subclass so every existing
+    ``except ValueError`` around a call into this module's validation
+    functions still catches it; carries the structured refusal
+    (``.refusal``) a caller should log and act on instead of this
+    exception's own message, which exists only for a human reading a
+    traceback.
+    """
+
+    def __init__(self, refusal: InteractionWriteRefusal) -> None:
+        self.refusal = refusal
+        super().__init__(f"{refusal.position}: {refusal.rule}")
+
+
+# The full key set build_clarification_payload (task_clarification_draft.py)
+# ever emits, beyond the two AskUserQuestionArgs fields (message/
+# interactions) parse_v1_request_payload validates -- verified against that
+# function's own source, which is the only producer of a payload carrying
+# any of these keys today. All six are metadata the v1 question-shape
+# readers intentionally ignore (see that module's own docstring on
+# ``event_id``); pydantic's default ``model_validate`` behavior already
+# drops every one of them silently, which is not a rule a reader can find
+# by looking at this module -- naming them here instead means a seventh,
+# genuinely unknown key does not vanish the same silent way. ``event_id``
+# is the one that matters most to get right: it is the authoritative
+# staging identity (#1800), carried on every legitimate payload, so
+# treating it as an unknown field would refuse every legitimate write.
+_V1_ENVELOPE_METADATA_KEYS = frozenset(
+    {
+        "event_id",
+        "message_type",
+        "source",
+        "requests",
+        "message_truncated",
+        "interactions_dropped",
+    }
+)
+
+
+def _reject_unknown_envelope_keys(values: Any) -> None:
+    """Raise ``InteractionWritePayloadRejected`` if ``values`` is a dict
+    carrying a top-level key outside the v1 question shape
+    (``message``/``interactions``) and outside
+    ``_V1_ENVELOPE_METADATA_KEYS``. A non-dict ``values`` is left alone --
+    ``parse_v1_request_payload`` rejects the shape mismatch itself, with
+    its own reason, immediately after this call returns.
+    """
+
+    if not isinstance(values, dict):
+        return
+    # The refusal names the container, never the offending key: this
+    # refusal reaches a WARNING log line (see create()'s two logger.warning
+    # call sites), and InteractionWriteRefusal's own docstring -- per #1314
+    # item 3 -- promises position is built from fixed field names and
+    # indices, never a value out of the payload. Naming the key was this
+    # module's one violation of that promise.
+    #
+    # No ordering is computed here any more, which also retires the reason
+    # the previous `sorted(..., key=str)` existed: with no key selected, a
+    # payload mixing str and non-str top-level keys can no longer reach a
+    # comparison at all.
+    if set(values) - {"message", "interactions"} - _V1_ENVELOPE_METADATA_KEYS:
+        raise InteractionWritePayloadRejected(
+            InteractionWriteRefusal(rule="unknown_field", position="request_payload")
+        )
 
 
 def validate_v1_write_payload(parsed: AskUserQuestionArgs) -> None:
     """Reject a shape-valid v1 payload that must not be persisted.
 
-    Raises ``ValueError`` describing the first violation found; returns
-    ``None`` when the payload may be written.
+    Raises ``InteractionWritePayloadRejected`` -- carrying a stable rule
+    identifier and the position it fired at, never producer-supplied text
+    (``#1314`` item 3) -- describing the first violation found; returns
+    ``None`` when the payload may be written. Each rule below is scoped by
+    ``interaction.type`` through ``_V1_TYPES_REQUIRING_OPTIONS`` where a
+    rule is type-specific at all (``#1314`` item 2); the rules that apply
+    to every
+    type (blank/duplicate field, blank/duplicate option) are not, because
+    they are not about what a given type renders.
 
     Deliberately separate from ``parse_v1_request_payload`` rather than
     folded into it, because the two directions have different failure
@@ -1011,14 +1252,22 @@ def validate_v1_write_payload(parsed: AskUserQuestionArgs) -> None:
     malformed-but-dict-shaped answer is stored as submitted.
     """
 
-    if not parsed.message.strip():
-        raise ValueError("request_payload.message is blank")
+    if not _normalize_interaction_text(parsed.message):
+        raise InteractionWritePayloadRejected(
+            InteractionWriteRefusal(
+                rule="message_blank", position="request_payload.message"
+            )
+        )
 
     seen_fields: set[str] = set()
     for index, interaction in enumerate(parsed.interactions):
         where = f"request_payload.interactions[{index}]"
         if interaction.type not in _V1_INTERACTION_TYPES:
-            raise ValueError(f"{where}.type {interaction.type!r} is not a v1 type")
+            raise InteractionWritePayloadRejected(
+                InteractionWriteRefusal(
+                    rule="unsupported_type", position=f"{where}.type"
+                )
+            )
         # A blank field is refused for the same reason a duplicated one is,
         # and not for the reason the rules above exist. The renderer copes
         # with both: clarification-form.tsx substitutes ``response_{index}``
@@ -1031,84 +1280,84 @@ def validate_v1_write_payload(parsed: AskUserQuestionArgs) -> None:
         # the write is the only point at which the stored key can still be
         # made to be the key the answer will carry.
         #
-        # Two checks, not one: blank (including all-whitespace) and
-        # surrounding whitespace on an otherwise non-blank field are both
-        # refused, for the same key-integrity reason -- ``" a "`` never
-        # equal-matches an answer keyed ``"a"``, so a stored field with
-        # leading or trailing whitespace is exactly as unmatchable against
-        # #1368 as a blank one. Stripped here only to test, not to
-        # normalize what gets stored: the model-facing producer
-        # (``_normalize_ask_user_interactions``, ``react.py``) already
-        # trims a field -- against a table covering every code point
-        # either Python's ``str.strip()`` or JavaScript's ``trim()``
-        # treats as whitespace, including a leading BOM (U+FEFF), which
-        # ``str.strip()`` alone does not -- and substitutes for a blank
-        # one before it ever reaches this validator, so a well-formed
-        # field arrives here pre-trimmed and this pair of checks costs
-        # that producer nothing. These two checks themselves use plain
-        # ``str.strip()``, though, not that table: they exist for
-        # whatever reaches this write side some other way, and for a
-        # field that does, a leading or trailing BOM would pass both of
-        # them unnoticed even though it would not survive the producer's
-        # own trim. Narrowing these two checks to match would mean
-        # importing that same table here.
-        #
-        # Both react.py paths run that normalizer, so both arrive
-        # pre-trimmed, and there the resemblance stops -- whoever wires the
-        # first production writer is wiring one of two different producers.
-        # The single-tool ``ask_user_question`` path calls the normalizer
-        # and stops: it does not deduplicate, so two interactions the model
-        # named the same field reach this validator unchanged and the
-        # duplicate rule below refuses the write, costing that path the
-        # whole question rather than one field. The multi-tool waiting path
-        # (``_pause_for_tool_results``) runs its own dedup loop afterwards
-        # across every waiting tool, appending ``_2``, ``_3`` to a repeated
-        # base: it cannot trip that rule, and the field it hands over is
-        # the renamed one, so the key stored for #1368 to match answers
-        # against is not the key the tool asked under.
-        if not interaction.field.strip():
-            raise ValueError(f"{where}.field is blank")
-        if interaction.field != interaction.field.strip():
-            raise ValueError(f"{where}.field carries surrounding whitespace")
+        # Two checks, not one: blank (including all-whitespace and a
+        # BOM-only value) and surrounding whitespace on an otherwise
+        # non-blank field are both refused, for the same key-integrity
+        # reason -- ``" a "`` never equal-matches an answer keyed ``"a"``,
+        # so a stored field with leading or trailing whitespace is exactly
+        # as unmatchable against #1368 as a blank one. Judged here only,
+        # not normalized into what gets stored: ``interaction.field`` keeps
+        # whatever the caller sent, and the two checks below compare it
+        # against ``_normalize_interaction_text`` -- the same 30-code-point
+        # trim table the model-facing producer
+        # (``_normalize_ask_user_interactions``, ``react.py``) already runs
+        # a field through before this validator ever sees it, pinned to one
+        # canonical contract per #1314's comment on this item (Python's
+        # ``str.strip()`` alone keeps a leading BOM; this table does not).
+        # A well-formed field therefore arrives here already equal to its
+        # own normalized form, and this pair of checks costs that producer
+        # nothing; a field that reaches this write side some other way,
+        # not already normalized, is refused rather than silently fixed.
+        normalized_field = _normalize_interaction_text(interaction.field)
+        if not normalized_field:
+            raise InteractionWritePayloadRejected(
+                InteractionWriteRefusal(rule="field_blank", position=f"{where}.field")
+            )
+        if interaction.field != normalized_field:
+            raise InteractionWritePayloadRejected(
+                InteractionWriteRefusal(
+                    rule="field_whitespace", position=f"{where}.field"
+                )
+            )
         if interaction.field in seen_fields:
-            raise ValueError(f"{where}.field {interaction.field!r} is duplicated")
+            raise InteractionWritePayloadRejected(
+                InteractionWriteRefusal(
+                    rule="field_duplicate", position=f"{where}.field"
+                )
+            )
         seen_fields.add(interaction.field)
-        if interaction.type in _V1_TYPES_REQUIRING_OPTIONS and not interaction.options:
-            raise ValueError(f"{where} is a {interaction.type} carrying no options")
-        if interaction.type in _V1_TYPES_REJECTING_OPTIONS and interaction.options:
-            raise ValueError(f"{where} is a {interaction.type} carrying options")
+        # One set, read as a total function of membership: every type in
+        # _V1_INTERACTION_TYPES either requires options or forbids them,
+        # with no third case. #1314 item 2's concern was two independent
+        # flat sets that could drift apart; a single set with a derived
+        # rule cannot drift from itself. interaction.type is provably in
+        # _V1_INTERACTION_TYPES by here -- the unsupported_type check
+        # above rejects anything else.
+        requires_options = interaction.type in _V1_TYPES_REQUIRING_OPTIONS
+        if requires_options and not interaction.options:
+            raise InteractionWritePayloadRejected(
+                InteractionWriteRefusal(
+                    rule="options_required", position=f"{where}.options"
+                )
+            )
+        if not requires_options and interaction.options:
+            raise InteractionWritePayloadRejected(
+                InteractionWriteRefusal(
+                    rule="options_forbidden", position=f"{where}.options"
+                )
+            )
         # Either half blank, not both: an option the user can see but not
         # submit, and one they can submit but not see, are both unusable.
-        # The renderer's own filter (clarification-form.tsx) keeps an
-        # option only when value and label are non-blank under
-        # JavaScript's own ``trim()``. The model-facing producer
-        # (``_normalize_ask_user_interactions``, react.py) keeps an option
-        # only when both are non-blank under a wider table -- every code
-        # point either Python's ``str.strip()`` or JavaScript's ``trim()``
-        # treats as whitespace, a strict superset of what the renderer
-        # checks. The two are not equivalent: a value like a single
-        # ``"\x1c"`` (a control code point Python treats as whitespace but
-        # JavaScript's ``trim()`` does not) survives the renderer's filter
-        # but is dropped by the producer, so the producer is the stricter
-        # of the two, not the looser one. This check here does not rely on
-        # either of them: it is falsy, not trim-aware, and
-        # ``InteractionOption.label``/``value`` (ask_user_tool.py) are
-        # required ``str`` with no ``min_length`` or whitespace
-        # constraint, so a whitespace-only label or value -- not just the
-        # empty string -- reaches this line, and this line lets it
-        # through. A payload that reaches this validator some way other
-        # than the react.py producer could still carry one past it;
-        # catching that here too would mean checking against the same
-        # trim table the producer uses, which this validator does not
-        # import today. An option dropped by the renderer's own filter
-        # leaves a select the user cannot complete, or, if it was the
-        # only one, a form with an empty control; refusing the write is
-        # the only place that outcome can still be prevented for whatever
-        # this check does catch.
+        # Strip-aware per #1314's comment on this item, against the same
+        # trim table the field check above uses -- not the falsy-only
+        # check this replaces, which let a whitespace-only or BOM-only
+        # label or value through. ``InteractionOption.label``/``value``
+        # (ask_user_tool.py) are required ``str`` with no ``min_length`` or
+        # whitespace constraint, so such a value can reach this line; an
+        # option dropped by the renderer's own filter (clarification-
+        # form.tsx, which drops a blank-after-``trim()`` label or value)
+        # leaves a select the user cannot complete, or, if it was the only
+        # one, a form with an empty control -- refusing the write is the
+        # only place that can still be prevented.
         for option_index, option in enumerate(interaction.options or ()):
-            if not option.label or not option.value:
-                raise ValueError(
-                    f"{where}.options[{option_index}] has a blank label or value"
+            if not _normalize_interaction_text(
+                option.label
+            ) or not _normalize_interaction_text(option.value):
+                raise InteractionWritePayloadRejected(
+                    InteractionWriteRefusal(
+                        rule="option_blank",
+                        position=f"{where}.options[{option_index}]",
+                    )
                 )
         # Values, not labels: the renderer resolves a submitted answer back
         # to an option by matching on ``value`` and taking the first hit
@@ -1120,9 +1369,11 @@ def validate_v1_write_payload(parsed: AskUserQuestionArgs) -> None:
         seen_option_values: set[str] = set()
         for option_index, option in enumerate(interaction.options or ()):
             if option.value in seen_option_values:
-                raise ValueError(
-                    f"{where}.options[{option_index}].value "
-                    f"{option.value!r} is duplicated"
+                raise InteractionWritePayloadRejected(
+                    InteractionWriteRefusal(
+                        rule="option_value_duplicate",
+                        position=f"{where}.options[{option_index}].value",
+                    )
                 )
             seen_option_values.add(option.value)
         # Scoped to ``number_input`` deliberately -- this function's
@@ -1134,7 +1385,9 @@ def validate_v1_write_payload(parsed: AskUserQuestionArgs) -> None:
             and interaction.max is not None
             and interaction.min > interaction.max
         ):
-            raise ValueError(f"{where} has min greater than max")
+            raise InteractionWritePayloadRejected(
+                InteractionWriteRefusal(rule="number_range_inverted", position=where)
+            )
 
 
 # The interval a create() envelope's optional ttl_seconds override must
@@ -1179,27 +1432,145 @@ class CreateInteractionEnvelope:
     ttl_seconds: float | int | None = None
 
 
+class InteractionWritePointUnfenced(RuntimeError):
+    """Raised by ``_assert_write_point_admissible`` for a principal that
+    reached this seam's write point without being the system principal.
+
+    Not part of ``CreateOutcome``: see that function's own docstring for
+    why this is a raise, not a reason word.
+    """
+
+
+def _assert_write_point_admissible(
+    principal: InteractionPrincipal, task: "Task"
+) -> None:
+    """The only production caller of this seam's write path is the finalizer
+    layer, which acts as the system principal and owns no task. A principal
+    that represents a person reaching this point means an entry point was
+    wired without the ownership fence the answer path carries at its own
+    write point, so refuse rather than write.
+
+    This raises rather than returning an outcome: it guards against an entry
+    point being wired wrong, which is a programming error, not a runtime
+    condition a caller may swallow. It is therefore deliberately absent from
+    the outcome/reason vocabulary.
+    """
+
+    if principal.kind is not InteractionPrincipalKind.SYSTEM:
+        raise InteractionWritePointUnfenced(
+            f"task {task.id}: this write path admits only the system "
+            f"principal, got {principal.kind!r}"
+        )
+
+
+# The four of interaction_handoff's six swallowed exceptions this seam
+# reports as a distinct outcome, keyed by the exact exception type
+# InteractionHandoff.degraded_as records (see that attribute's own
+# docstring). Read after the `with interaction_handoff(...)` block, in the
+# same place `handoff.staged` is read, rather than pre-checked ahead of
+# entering the block: the swallow handler is the one place that actually
+# saw which exception fired, and reporting from there costs no additional
+# statement, unlike a caller-side pre-check duplicating the same check.
+#
+# The two remaining swallowed types, InteractionAttemptMismatch and
+# InteractionOriginUnknown, are not keys here. Both stay unreachable from
+# every wired caller for a caller-side structural reason: the finalizers
+# that call this seam hold their task row's own lock for the span of the
+# call (a SELECT ... FOR UPDATE on PostgreSQL; single-writer serialization
+# on SQLite -- see InteractionHandoff._assert_current_attempt for the same
+# backend-specific distinction stated where the comparison is actually
+# made), which keeps the attempt comparison's window closed before this
+# call is ever reached; and the gating layer in front of native
+# publication (interaction_rollout.evaluate_native_publication) already
+# refuses an out-of-vocabulary task.source before a finalizer would ever
+# call this seam. A caller that cannot provide either property must not
+# use this path. If either exception somehow fires anyway, create() falls
+# back to the single default classification below (slot_taken).
+_DEGRADED_AS_OUTCOME: dict[type[BaseException], "CreateOutcome"] = {
+    InteractionSlotTaken: CreateConflict(reason="slot_taken"),
+    InteractionRequestClosed: CreateConflict(reason="idempotency_key_reused"),
+    InteractionAnchorCorrupt: CreateValidationRejected(reason="invalid_values"),
+    InteractionRunPartitionMismatch: CreateStale(reason="anchor_run_mismatch"),
+}
+
+
+@dataclass(frozen=True)
+class SystemWriteContext:
+    """The already-loaded, already-locked state a system-principal
+    ``create()`` call supplies instead of loading it itself.
+
+    One parameter, not five: the five values are meaningless for a
+    user/guest principal and mandatory for the system principal, and five
+    independent ``| None`` parameters cannot express that all-or-nothing
+    relationship -- only a runtime check could, and a runtime check is
+    what this replaces. Passing four of the five is now unrepresentable
+    rather than rejected.
+
+    ``__post_init__`` validates the two lease preconditions the staging
+    layer would otherwise reject far downstream, with a bare ``ValueError``
+    that escapes ``create()``'s typed-outcome contract entirely
+    (``_validate_request_fields`` on ``run_id``, ``InteractionHandoff.stage``
+    on the task id). Judging them here means the error names the caller's
+    own construction site, which is where the bug is, rather than
+    surfacing from inside a context manager three layers down. Length is
+    deliberately NOT re-checked here: ``_MAX_LENGTHS["run_id"]`` is the
+    staging layer's column-domain constant and copying it here would be a
+    second, drift-capable copy of the same rule.
+    """
+
+    task: "Task"
+    lease: TaskLease
+    anchor: InteractionAnchor
+    now: datetime
+    expires_at: datetime
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.lease.run_id, str) or not self.lease.run_id:
+            raise ValueError(
+                "SystemWriteContext requires lease.run_id to be a non-empty "
+                f"str, got {self.lease.run_id!r}"
+            )
+        if self.lease.task_id != int(self.task.id):
+            raise ValueError(
+                f"SystemWriteContext lease names task {self.lease.task_id} "
+                f"but the task supplied is {int(self.task.id)}"
+            )
+
+
 def create(
     db: "Session",
     *,
     task_id: int,
     principal: InteractionPrincipal,
     envelope: CreateInteractionEnvelope,
+    system_context: SystemWriteContext | None = None,
 ) -> CreateOutcome:
     """Typed seam for publishing a native clarification interaction.
 
-    The body validates the envelope and returns a typed outcome. It does
-    NOT call ``stage_interaction_request``: that call is what retires the
-    zero-production-caller gate in
-    ``tests/web/services/test_interaction_staging_production_gate.py``, and
-    that gate retires only for the change that wires all three finalizers,
-    adds the Task-side protocol marker, and switches the read surface
-    together -- i.e. the wiring change that supplies this seam's call body,
-    not this one.
+    The body validates the envelope and, once a system principal reaches
+    the write point, calls ``interaction_handoff`` + ``handoff.stage()`` to
+    stage a row -- never ``stage_interaction_request`` directly, the same
+    way every other caller of the staging primitive goes through that
+    context manager rather than around it. This is the change that made
+    ``interaction_handoff``'s production use point a legitimate one,
+    watched by
+    ``tests/web/services/test_interaction_handoff_production_surface.py``
+    (see ``test_handoff_is_entered_only_from_the_create_seam`` and its two
+    sibling guards). It is not, on its own, the change
+    that gives this seam a production caller: the three finalizers that
+    will call it, the Task-side protocol marker, and the read-surface
+    switch are a separate change (see
+    ``tests/web/services/test_task_interaction_service_create_gate.py``,
+    which continues to watch ``create()`` and ``respond()`` for exactly
+    that -- zero production code calls either name yet).
 
-    Authorization runs first, against a task this call itself loads. Only a
-    caller that has been authorized against a real task row reaches the
-    envelope checks below, so a rejection reason describing the payload
+    Authorization runs first. For a ``user``/``guest`` principal it runs
+    against a task this call loads itself, by id, the same way it always
+    has; for the system principal it runs against the caller-supplied
+    ``task`` argument, and this function issues no query of its own on
+    that path (see the `system_context` paragraph below).
+    Only a caller that has been authorized against a real task row reaches
+    the envelope checks below, so a rejection reason describing the payload
     shape is never returned to a caller that is not entitled to the task in
     the first place. Validation order within that step, each step
     short-circuiting on the first failure: ``kind`` against ``str`` first (a
@@ -1265,9 +1636,22 @@ def create(
     - A ``"user"`` or ``"guest"`` principal carrying no ``user_id`` is
       unauthorized before the lookup is even built; the guard itself
       carries why it is placed there.
+    - The ``system`` principal has no ownership relationship to a task at
+      all -- it acts on behalf of the finalizer layer, which has already
+      loaded and locked the row itself before ever calling this function
+      (see the `system_context` paragraph below). It is
+      authorized unconditionally at this step, the same as an admin
+      ``"user"`` principal, and for the identical reason "authorized here
+      is not allowed to write": ``_assert_write_point_admissible``, called
+      after every check in this docstring, is the actual fence, and it
+      admits only this one kind.
 
-    A principal whose ``kind`` is neither ``"user"`` nor ``"guest"`` is
-    always unauthorized -- there is no third branch that defaults to allow
+    A principal whose ``kind`` is none of ``"user"``, ``"guest"``, or
+    ``"system"`` is always unauthorized -- ``InteractionPrincipalKind`` is
+    now a closed enum, so ``InteractionPrincipal.__post_init__`` refuses to
+    construct one with any other value in the first place (see that
+    dataclass's own docstring); the check below is this function's own
+    defense in depth against a value that skipped that construction path
     -- and is rejected before the lookup is built rather than at the end of
     the branch chain, because an unrecognized kind is not owner-scoped, so
     the lookup it would have reached is the id-only one that reports
@@ -1308,32 +1692,106 @@ def create(
     consumer built on this module, not only ``create()``'s own two
     variants.
 
-    ``origin`` is deliberately not part of this envelope or this
-    validation step in this delivery: the reason vocabulary deliberately
-    has no origin-related entry, and ``stage_interaction_request``
-    (which this seam does not call) already validates it against the
-    model's public vocabulary once a production write path calls it. Adding an
-    origin check here now would validate a field this seam never uses for
-    anything.
+    ``origin`` is deliberately not part of this envelope: the reason
+    vocabulary has no origin-related entry, and ``interaction_handoff``'s
+    own ``stage()`` derives ``origin`` from ``task.source`` itself (never
+    from anything this seam's caller supplies) and validates it against
+    the model's public vocabulary before ever staging a row. A caller
+    reaching the write point has no origin of its own to get wrong here.
 
     This seam does not consult the native-publication gate
     (``interaction_rollout.evaluate_native_publication``): that gate's own
     docstring scopes it to "a finalizer is about to transition a task into
     WAITING_FOR_USER", and this seam is not a finalizer -- gating belongs to
-    the finalizer layer that will supply this seam's call body, not to the
-    validation-and-authorization facade in front of it.
+    the finalizer layer that calls this seam, not to the
+    validation-and-authorization facade in front of the write point.
 
-    Of the staging module's nine exception classes, three
-    (``InteractionAttemptMismatch``, ``InteractionHandoffMisuse``,
-    ``InteractionOriginUnknown``) are raised only from inside
-    ``_InteractionHandoff``'s own call path and are therefore unreachable
-    from this function, which never enters that context manager -- this
-    function has no call to any of the staging module's exception-raising
-    code at all in this delivery, since it never calls
-    ``stage_interaction_request``.
+    ``system_context``: a ``SystemWriteContext``, meaningful only on the
+    system-principal path (every other principal kind is refused by
+    ``_assert_write_point_admissible`` before it is read, so it may be
+    left ``None`` for a ``user``/``guest`` caller). ``system_context.task``
+    is the finalizer's own already-loaded, already-locked row -- this
+    function never issues a ``Task`` query of its own to reach it, and it
+    is the exact object handed to ``interaction_handoff``, never a
+    re-derived one. ``system_context.lease`` is the finalizer's held
+    lease; ``lease.run_id`` is what this call stages under and what its
+    own run-partition pre-check (below) compares against
+    ``anchor.resume_run_partition`` -- both preconditions judged at
+    ``SystemWriteContext`` construction, not here. ``system_context.anchor``
+    is the already-resolved resume anchor (the caller's own database read
+    against ``trace_events`` has already happened -- see
+    ``InteractionAnchor``'s docstring on why that half of anchor
+    resolution is not this module's job). ``system_context.now`` and
+    ``system_context.expires_at`` are the caller's own clock reading and
+    proposed expiry; this facade's ``ttl_seconds`` bound-check (above)
+    validates the shape of an optional caller-requested override but does
+    not derive ``expires_at`` from it in this delivery -- the finalizer
+    computes ``expires_at`` itself (``now + CLARIFICATION_REQUEST_TTL``,
+    ``task_clarification_draft.py``) and passes the result straight
+    through; a future caller that wants ``ttl_seconds`` actually consulted
+    is an explicit bypass this delivery does not add, not a silent gap.
+
+    No pre-check runs ahead of ``interaction_handoff`` for any of the six
+    exceptions it can swallow: entering the block always issues the same
+    statements (see ``_DEGRADED_AS_OUTCOME``'s own docstring for why a
+    caller-side pre-check duplicating the primitive's own validation was
+    rejected). Four of the six are reported as a distinct, caller-visible
+    outcome instead of a generic degradation:
+
+    * ``InteractionAnchorCorrupt`` (a malformed ``anchor`` argument) maps to
+      ``CreateValidationRejected(reason="invalid_values")``. ``invalid_values``
+      therefore covers two different caller-supplied shapes this seam
+      validates: the envelope's ``values`` against the v1
+      ``request_payload`` contract, and the ``anchor`` argument against the
+      anchor field rules the staging primitive shares.
+    * ``InteractionRunPartitionMismatch`` (``lease.run_id`` disagreeing with
+      ``anchor.resume_run_partition``) maps to
+      ``CreateStale(reason="anchor_run_mismatch")``.
+    * ``InteractionRequestClosed`` (this call's idempotency key already
+      naming a closed -- ``answered``/``terminated`` -- request on this run)
+      maps to ``CreateConflict(reason="idempotency_key_reused")``. A hit
+      whose row is still ``active`` does not raise this at all -- that is a
+      legitimate replay, returned normally (``created=False``) by
+      ``stage_interaction_request``'s own step-3 pre-read, which this
+      function turns into ``CreateCreated`` the same as a fresh insert (see
+      this function's own body for why a replay is not a distinct outcome).
+    * ``InteractionSlotTaken`` (a concurrent INSERT that won a race against
+      this call's own, discoverable only by attempting the write) maps to
+      ``CreateConflict(reason="slot_taken")``.
+
+    ``request_idempotency_key`` is normalized once, via
+    ``task_command_transport._normalize_command_id``, and that normalized
+    value -- never the envelope's original, possibly differently-whitespaced
+    string -- is what this function stages under, looks up under, and
+    reports back on ``CreatedInteractionReceipt.request_idempotency_key``:
+    the receipt must name the identity actually written, which is the
+    normalized key, not whatever the caller happened to send.
+
+    ``InteractionAttemptMismatch`` and ``InteractionOriginUnknown`` are the
+    two of the staging primitive's six swallowed exceptions this seam does
+    not map to a distinct outcome, and stay unreachable from every wired
+    caller for a caller-side structural reason: the finalizers that call
+    this seam hold their task row's own lock for the span of the call (a
+    ``SELECT ... FOR UPDATE`` on PostgreSQL; single-writer serialization on
+    SQLite -- see ``InteractionHandoff._assert_current_attempt`` for the
+    same backend-specific distinction stated where the comparison is
+    actually made), which keeps the attempt comparison's window closed
+    before this call is ever reached; and the gating layer in front of
+    native publication (``interaction_rollout.evaluate_native_publication``)
+    already refuses an out-of-vocabulary ``task.source`` before a finalizer
+    would ever call this seam. A caller that cannot provide either property
+    must not use this path. When ``interaction_handoff``'s ``with`` block
+    exits with ``handoff.staged`` still ``None`` and ``handoff.degraded_as``
+    is one of these two, or is unrecognized, this function reports
+    ``CreateConflict(reason="slot_taken")``, the single default
+    classification for that state.
     """
 
-    if principal.kind in ("user", "guest") and principal.user_id is None:
+    if (
+        principal.kind
+        in (InteractionPrincipalKind.USER, InteractionPrincipalKind.GUEST)
+        and principal.user_id is None
+    ):
         # Rejected before the lookup, on every branch that carries a
         # user_id at all. An admin passing on the flag alone would reach
         # the write point with no identity to record as who acted. An
@@ -1344,52 +1802,78 @@ def create(
         # detail to mean it.
         return CreateUnauthorized(reason="not_task_principal")
 
-    if principal.kind not in ("user", "guest"):
+    if principal.kind not in (
+        InteractionPrincipalKind.USER,
+        InteractionPrincipalKind.GUEST,
+        InteractionPrincipalKind.SYSTEM,
+    ):
         # Rejected before the lookup, beside the missing-id guard above and
         # for the same kind of reason. Such a principal is unauthorized
-        # either way -- the branch chain below has no third arm that
-        # authorizes -- but reaching that chain means the lookup ran first,
-        # and an unrecognized kind is not owner-scoped, so it would have run
-        # by id alone and answered CreateUnavailable(reason="task_missing")
-        # for a task that does not exist. That is the existence oracle the
+        # either way -- the branch chain below has no arm that authorizes
+        # it -- but reaching that chain means the lookup ran first, and an
+        # unrecognized kind is not owner-scoped, so it would have run by id
+        # alone and answered CreateUnavailable(reason="task_missing") for a
+        # task that does not exist. That is the existence oracle the
         # owner-scoped branches are written to withhold, handed to a
-        # principal this module cannot even name.
+        # principal this module cannot even name. In practice
+        # ``InteractionPrincipalKind`` being a closed enum means no such
+        # principal can be constructed at all -- see this function's own
+        # docstring.
         return CreateUnauthorized(reason="not_task_principal")
 
-    owner_scoped = principal.kind == "guest" or (
-        principal.kind == "user" and not principal.is_admin
-    )
-
-    task_lookup = db.query(Task).filter(Task.id == task_id)
-    if owner_scoped:
-        task_lookup = task_lookup.filter(Task.user_id == principal.user_id)
-    task = task_lookup.first()
-    if task is None:
-        # An owner-scoped lookup cannot tell "no such task" from "not your
-        # task", and must not appear to -- see the consequence paragraph in
-        # this function's docstring.
-        if owner_scoped:
-            return CreateUnauthorized(reason="not_task_principal")
-        return CreateUnavailable(reason="task_missing")
-
-    if principal.kind == "user":
-        # A non-admin reached this line only by matching the owner
-        # predicate in SQL; an admin reached it without one and is
-        # authorized on the flag alone.
-        authorized = True
-    elif principal.kind == "guest":
-        # The owner term is already proved by the lookup above, the same
-        # way the three public-chat entry points prove it; what is left for
-        # the Python predicate is the agent_config conjunction, which no
-        # WHERE clause can express.
-        try:
-            authorized = task_is_owned_by_public_principal(task, principal)
-        except ValueError:
-            authorized = False
+    authorized_task: "Task | None"
+    resolved_context: SystemWriteContext | None = None
+    if principal.kind == InteractionPrincipalKind.SYSTEM:
+        # No Task query issued on this path: the caller's own
+        # already-loaded, already-locked row is trusted as-is, and its id
+        # must agree with the id the caller separately named.
+        if system_context is None or int(system_context.task.id) != task_id:
+            raise ValueError(
+                "create() requires a `system_context` whose task matches "
+                f"task_id={task_id!r} for a system principal, got "
+                f"{system_context!r}"
+            )
+        resolved_context = system_context
+        authorized_task = system_context.task
     else:
-        authorized = False
-    if not authorized:
-        return CreateUnauthorized(reason="not_task_principal")
+        owner_scoped = principal.kind == "guest" or (
+            principal.kind == "user" and not principal.is_admin
+        )
+
+        task_lookup = db.query(Task).filter(Task.id == task_id)
+        if owner_scoped:
+            task_lookup = task_lookup.filter(Task.user_id == principal.user_id)
+        authorized_task = task_lookup.first()
+        if authorized_task is None:
+            # An owner-scoped lookup cannot tell "no such task" from "not
+            # your task", and must not appear to -- see the consequence
+            # paragraph in this function's docstring.
+            if owner_scoped:
+                return CreateUnauthorized(reason="not_task_principal")
+            return CreateUnavailable(reason="task_missing")
+
+        if principal.kind == "user":
+            # A non-admin reached this line only by matching the owner
+            # predicate in SQL; an admin reached it without one and is
+            # authorized on the flag alone.
+            authorized = True
+        elif principal.kind == "guest":
+            # The owner term is already proved by the lookup above, the same
+            # way the three public-chat entry points prove it; what is left
+            # for the Python predicate is the agent_config conjunction,
+            # which no WHERE clause can express.
+            try:
+                authorized = task_is_owned_by_public_principal(
+                    authorized_task, principal
+                )
+            except ValueError:
+                authorized = False
+        else:
+            authorized = False
+        if not authorized:
+            return CreateUnauthorized(reason="not_task_principal")
+
+    _assert_write_point_admissible(principal, authorized_task)
 
     if not isinstance(envelope.kind, str) or envelope.kind not in _KIND_VOCABULARY:
         return CreateValidationRejected(reason="unknown_kind")
@@ -1402,15 +1886,27 @@ def create(
     if not isinstance(envelope.request_idempotency_key, str):
         return CreateValidationRejected(reason="malformed_idempotency_key")
     try:
-        _normalize_command_id(envelope.request_idempotency_key)
+        normalized_idempotency_key = _normalize_command_id(
+            envelope.request_idempotency_key
+        )
     except ValueError:
         return CreateValidationRejected(reason="malformed_idempotency_key")
+    try:
+        _reject_unknown_envelope_keys(envelope.values)
+    except InteractionWritePayloadRejected as exc:
+        logger.warning(
+            "v1 interaction write payload refused for task_id=%s: rule=%s position=%s",
+            task_id,
+            exc.refusal.rule,
+            exc.refusal.position,
+        )
+        return CreateValidationRejected(reason="invalid_values")
     try:
         parsed_values = parse_v1_request_payload(envelope.values)
     except _PydanticValidationError:
         return CreateValidationRejected(reason="invalid_values")
     try:
-        build_v1_request_payload(parsed_values)
+        request_payload = build_v1_request_payload(parsed_values)
     except ValueError:
         # e.g. a NaN/Infinity default_value: shape-valid per
         # AskUserQuestionArgs, but not JSON-serializable with
@@ -1418,7 +1914,7 @@ def create(
         return CreateValidationRejected(reason="invalid_values")
     try:
         validate_v1_write_payload(parsed_values)
-    except ValueError as exc:
+    except InteractionWritePayloadRejected as exc:
         # Shape-valid and serializable, but not a question this service is
         # willing to persist -- an unrenderable interaction type, a select
         # with nothing to select, a blank or duplicated field name, two
@@ -1428,28 +1924,17 @@ def create(
         # front of them said so.
         #
         # The precise diagnostic is not lost, only kept server-side: this
-        # validator names the exact position it refused
-        # ("request_payload.interactions[3].options[1] has a blank label or
-        # value"), which is the only thing an operator debugging a rejected
-        # write has to go on. Logged at warning, unconditionally -- an
-        # observability line that can be switched off is one that is off
-        # when it is needed.
-        #
-        # What the message can contain: positions, and three identifiers
-        # the question's author chose -- an interaction's ``type`` (quoted
-        # by the rule that refuses a type outside the v1 vocabulary), an
-        # interaction's ``field``, and an option's ``value`` (the latter
-        # two quoted by the rules that refuse a duplicate of either). All
-        # three are unconstrained ``str`` on the tool model, so nothing at
-        # the type level keeps caller text out of them; what keeps it out
-        # today is that no production path puts user input in any of the
-        # three, and the response side is not reachable from here at all.
-        # Constraining them belongs at the schema, not here. The payload
-        # is never logged whole.
+        # validator's structured refusal names the exact rule and position
+        # it refused (never producer-supplied text -- #1314 item 3), which
+        # is the only thing an operator debugging a rejected write has to
+        # go on. Logged at warning, unconditionally -- an observability
+        # line that can be switched off is one that is off when it is
+        # needed. The payload is never logged whole.
         logger.warning(
-            "v1 interaction write payload refused for task_id=%s: %s",
+            "v1 interaction write payload refused for task_id=%s: rule=%s position=%s",
             task_id,
-            exc,
+            exc.refusal.rule,
+            exc.refusal.position,
         )
         return CreateValidationRejected(reason="invalid_values")
     if envelope.ttl_seconds is not None:
@@ -1464,7 +1949,81 @@ def create(
         ):
             return CreateValidationRejected(reason="invalid_values")
 
-    return CreateNotWired(reason="seam_not_wired")
+    # Every check above ran regardless of principal kind; everything from
+    # here on is reachable only by the system principal (the assertion
+    # above raised for anything else), so the context is exactly the one
+    # argument the caller must have supplied. The lease preconditions the
+    # staging layer would otherwise reject with a bare ValueError -- run_id
+    # a non-empty str, task_id agreeing with the task -- are
+    # SystemWriteContext.__post_init__'s, judged when the caller built it;
+    # by here they hold, which is what lets every use of
+    # ``context.lease.run_id`` below be treated as the str it provably is.
+    if resolved_context is None:
+        raise ValueError("create() requires a `system_context` for a system principal")
+    context = resolved_context
+    # SystemWriteContext.__post_init__ already proved this non-None -- in a
+    # different function's scope, which the type checker cannot see across.
+    # Re-asserted here, not re-validated: TaskLease.run_id is str | None for
+    # lease shapes this dataclass does not accept, and this is what lets
+    # every use of ``context.lease.run_id`` below be treated as the str it
+    # provably is.
+    assert context.lease.run_id is not None
+
+    with interaction_handoff(
+        db, context.lease, task=authorized_task, anchor=context.anchor, now=context.now
+    ) as handoff:
+        handoff.stage(
+            kind=envelope.kind,
+            protocol_version=envelope.protocol_version,
+            request_payload=request_payload,
+            request_idempotency_key=normalized_idempotency_key,
+            expires_at=context.expires_at,
+        )
+
+    if handoff.staged is None:
+        # interaction_handoff swallowed one of its six expected failures.
+        # handoff.degraded_as records which one -- read here, in the same
+        # place handoff.staged itself is read -- and _DEGRADED_AS_OUTCOME
+        # maps four of the six to a distinct outcome each. The remaining
+        # two (see that dict's own docstring), and an unset/unrecognized
+        # degraded_as, fall through to this default.
+        #
+        # issubclass, not an exact-type key lookup: the ``except _SWALLOWED``
+        # clause that produced this value matches subclasses, so a future
+        # subclass of any mapped type would miss an exact lookup and be
+        # silently reclassified as the default below. Same reasoning, same
+        # linear scan, as interaction_handoff's own signal lookup
+        # (task_interaction_staging.py:1633-1640) -- that one scans the
+        # caught exception *instance* with isinstance, this one scans the
+        # recorded *type* with issubclass. The six swallowed types are
+        # mutually unrelated (each subclasses InteractionHandoffError
+        # directly, none subclasses another -- see
+        # test_swallowed_exception_types_are_mutually_unrelated), so scan
+        # order carries no ambiguity.
+        mapped_outcome = (
+            next(
+                (
+                    outcome
+                    for exc_type, outcome in _DEGRADED_AS_OUTCOME.items()
+                    if issubclass(handoff.degraded_as, exc_type)
+                ),
+                None,
+            )
+            if handoff.degraded_as is not None
+            else None
+        )
+        return mapped_outcome or CreateConflict(reason="slot_taken")
+
+    receipt = CreatedInteractionReceipt(
+        interaction_id=handoff.staged.staged_db_id,
+        task_id=int(authorized_task.id),
+        run_id=context.lease.run_id,
+        active_slot=handoff.staged.active_slot,
+        protocol_version=handoff.staged.protocol_version,
+        request_idempotency_key=normalized_idempotency_key,
+        expires_at=handoff.staged.expires_at,
+    )
+    return CreateCreated(receipt=receipt)
 
 
 # ---------------------------------------------------------------------------
@@ -2399,6 +2958,7 @@ def _verify_respond_durable_graph(
     command_kind: TaskCommandKind,
     command_payload: dict[str, Any],
     actor_user_id: int | None,
+    actor_subject: str | None,
 ) -> InteractionResponseReceipt | None:
     """Check the complete accepted answer graph in a fresh, owned Session,
     up to three times with a short sleep between attempts. Same retry shape
@@ -2472,6 +3032,7 @@ def _verify_respond_durable_graph(
                     if len(commands) == 1 and _matches_existing(
                         commands[0],
                         actor_user_id=actor_user_id,
+                        actor_subject=actor_subject,
                         kind=command_kind,
                         payload=command_payload,
                     ):
@@ -2733,8 +3294,8 @@ def respond(
        transaction -- see ``classify_task_command_conflict``'s own
        docstring for why a savepoint rollback satisfies the
        post-rollback-state precondition it documents) and asks one
-       question about the row that won: does it carry this call's own
-       ``actor_user_id``, kind and canonical payload? The
+       question about the row that won: does it carry this call's stable
+       actor subject, kind and canonical payload? The
        ``IntegrityError`` door answers it through
        ``classify_task_command_conflict``, the ``created=False`` door
        through the ``payload_matches`` ``stage_task_command`` already
@@ -2896,6 +3457,7 @@ def respond(
         )
         canonical_submitted_values = _canonical_payload(envelope.values)
         actor_user_id = principal.user_id
+        actor_subject = _resolve_actor_subject(db, actor_user_id)
 
         # Runs before anchor resolution below, not after it. Answering
         # clears ``active_slot``, and the checkpoint retention pruner only
@@ -2923,6 +3485,7 @@ def respond(
             if _matches_existing(
                 existing_command,
                 actor_user_id=actor_user_id,
+                actor_subject=actor_subject,
                 kind=TaskCommandKind.RESUME,
                 payload=command_payload,
             ):
@@ -3046,6 +3609,7 @@ def respond(
                     if _matches_existing(
                         fresh_command,
                         actor_user_id=actor_user_id,
+                        actor_subject=actor_subject,
                         kind=TaskCommandKind.RESUME,
                         payload=command_payload,
                     ):
@@ -3287,6 +3851,7 @@ def respond(
                     command_kind=TaskCommandKind.RESUME,
                     command_payload=command_payload,
                     actor_user_id=actor_user_id,
+                    actor_subject=actor_subject,
                 )
                 if receipt is not None:
                     return RespondReplayed(receipt=receipt)
@@ -3340,6 +3905,7 @@ def respond(
                 command_kind=TaskCommandKind.RESUME,
                 command_payload=command_payload,
                 actor_user_id=actor_user_id,
+                actor_subject=actor_subject,
             )
             if receipt is not None:
                 _notify_dispatcher_best_effort(

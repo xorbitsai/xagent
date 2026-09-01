@@ -58,6 +58,15 @@ from ..user_isolated_memory import UserContext
 
 logger = logging.getLogger(__name__)
 
+# Single source of truth for the connection-test wait budget: how long this
+# endpoint waits for a provider to answer before giving up, not a statement
+# about the provider's own health. Shared by the per-category probes in
+# ``test_model_connection`` and by ``_validate_provider_model_listing``,
+# which those probes call for the "image"/"speech" categories -- passing it
+# through as a parameter there keeps this the only literal, so the two
+# layers of ``asyncio.wait_for`` around a listing call can never diverge.
+_CONNECTION_TEST_TIMEOUT_SECONDS = 60.0
+
 # ---------------------------------------------------------------------------
 # Hook infrastructure for dynamic model sharing
 # ---------------------------------------------------------------------------
@@ -320,9 +329,20 @@ async def _validate_provider_model_listing(
     model_name: str,
     api_key: Optional[str],
     base_url: Optional[str],
+    timeout_seconds: float,
     requested_abilities: Optional[List[str]] = None,
 ) -> None:
-    """Validate provider connectivity by fetching the provider model list."""
+    """Validate provider connectivity by fetching the provider model list.
+
+    ``timeout_seconds`` is the caller's connection-test budget
+    (``_CONNECTION_TEST_TIMEOUT_SECONDS`` in ``test_model_connection``), not
+    a separate value owned by this function -- it must be threaded through
+    rather than re-hardcoded here, or the outer ``wait_for`` around this call
+    and this one can silently diverge. The aiohttp transport-level ``total``
+    timeout inside ``fetch_models_from_provider`` (30s, in
+    ``model_list_service.py``) is a different, lower-level bound and is
+    unaffected by this parameter.
+    """
 
     import asyncio
 
@@ -339,7 +359,7 @@ async def _validate_provider_model_listing(
 
     models = await asyncio.wait_for(
         fetch_models_from_provider(provider, api_key or "", base_url),
-        timeout=10.0,
+        timeout=timeout_seconds,
     )
     # "auto" is a virtual OpenRouter model routed in-process by xrouter-llm; it is
     # not a real OpenRouter slug, so the fetch above only confirms connectivity —
@@ -678,7 +698,7 @@ async def test_model_connection(
     from xagent.core.model.xinference_base import BaseXinferenceModel
 
     start_time = time.time()
-    timeout_seconds = 10.0
+    timeout_seconds = _CONNECTION_TEST_TIMEOUT_SECONDS
     try:
         provider = canonical_provider_name(request.model_provider)
         base_url = request.base_url or default_base_url_for_provider(provider)
@@ -775,6 +795,7 @@ async def test_model_connection(
                     model_name=request.model_name,
                     api_key=request.api_key,
                     base_url=base_url,
+                    timeout_seconds=timeout_seconds,
                     requested_abilities=request.abilities,
                 ),
                 timeout=timeout_seconds,
@@ -822,6 +843,7 @@ async def test_model_connection(
                     model_name=request.model_name,
                     api_key=request.api_key,
                     base_url=base_url,
+                    timeout_seconds=timeout_seconds,
                     requested_abilities=requested_abilities,
                 ),
                 timeout=timeout_seconds,
@@ -955,7 +977,11 @@ async def test_model_connection(
             status="failed",
             response_time=response_time,
             message="Connection timed out",
-            error=f"Connection timed out after {int(timeout_seconds)} seconds. Please check your network connection and provider status.",
+            error=(
+                f"The model did not respond within {int(timeout_seconds)} seconds "
+                "(this application's waiting limit). Slow or reasoning-heavy "
+                "models may need longer; the provider may still be healthy."
+            ),
         )
     except Exception as e:
         logger.error(f"Model connection test failed: {e}")

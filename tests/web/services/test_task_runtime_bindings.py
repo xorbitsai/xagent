@@ -20,6 +20,7 @@ from xagent.core.task_runtime import (
 )
 from xagent.web.services.task_runtime import (
     CLIENT_RESERVED_AGENT_CONFIG_KEYS,
+    MCP_RUNTIME_AUTHORIZATION_POLICY_IDENTITY_KEY,
     MCP_RUNTIME_AUTHORIZATION_POLICY_REQUIRED_KEY,
     SELECTED_FILE_IDS_AGENT_CONFIG_KEY,
     TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY,
@@ -259,14 +260,15 @@ async def test_delete_reports_bindings_whose_provider_is_no_longer_registered(
 def test_actor_policy_marker_is_reserved_from_client_config() -> None:
     forged = {
         MCP_RUNTIME_AUTHORIZATION_POLICY_REQUIRED_KEY: True,
+        MCP_RUNTIME_AUTHORIZATION_POLICY_IDENTITY_KEY: "actor:forged",
         "keep": "client value",
     }
 
     assert sanitize_client_agent_config(forged) == {"keep": "client value"}
-    assert (
-        MCP_RUNTIME_AUTHORIZATION_POLICY_REQUIRED_KEY
-        in CLIENT_RESERVED_AGENT_CONFIG_KEYS
-    )
+    assert {
+        MCP_RUNTIME_AUTHORIZATION_POLICY_REQUIRED_KEY,
+        MCP_RUNTIME_AUTHORIZATION_POLICY_IDENTITY_KEY,
+    }.issubset(CLIENT_RESERVED_AGENT_CONFIG_KEYS)
 
 
 def test_execution_scope_is_reserved_so_a_request_cannot_choose_a_namespace() -> None:
@@ -306,6 +308,7 @@ def test_the_reserved_key_set_has_exactly_the_audited_members() -> None:
             "runtime_extension_bindings",
             "execution_scope",
             "__xagent_mcp_runtime_authorization_policy_required",
+            "mcp_runtime_authorization_policy_identity",
             "selected_file_ids",
             "__xagent_file_operation_access_version",
             # Public-channel identity/quota markers (#1108).

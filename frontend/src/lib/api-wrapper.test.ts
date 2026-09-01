@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 
 import {
   apiRequest,
+  classifyUploadError,
   getApiErrorMessage,
   getUploadErrorMessage,
   parseApiResponse,
@@ -199,6 +200,50 @@ describe("api-wrapper upload helpers", () => {
     }, MESSAGES)
 
     expect(message).toBe("Upload failed")
+  })
+
+  it("classifies public upload failures without exposing raw bodies", () => {
+    const response = new Response(null, { status: 500 })
+    const classified = classifyUploadError(response, {
+      data: { detail: "storage path /srv/private/uploads" },
+      text: "upstream token=secret",
+      isHtml: false,
+    })
+
+    expect(classified).toEqual({
+      errorCode: "upload_failed",
+      message: "Upload failed. Please try again.",
+    })
+    expect(JSON.stringify(classified)).not.toContain("/srv/private")
+    expect(JSON.stringify(classified)).not.toContain("token=secret")
+  })
+
+  it.each([
+    [413, false, "upload_too_large"],
+    [502, true, "upload_proxy_error"],
+  ] as const)("classifies status %s safely", (status, isHtml, errorCode) => {
+    const classified = classifyUploadError(new Response(null, { status }), {
+      data: null,
+      text: "raw proxy response",
+      isHtml,
+    })
+
+    expect(classified.errorCode).toBe(errorCode)
+    expect(classified.message).not.toContain("raw proxy response")
+  })
+
+  it("honors a recognized backend error code but rejects arbitrary codes", () => {
+    const response = new Response(null, { status: 400 })
+    expect(classifyUploadError(response, {
+      data: { error_code: "upload_too_large", detail: "private detail" },
+      text: null,
+      isHtml: false,
+    }).errorCode).toBe("upload_too_large")
+    expect(classifyUploadError(response, {
+      data: { error_code: "private_backend_fault" },
+      text: null,
+      isHtml: false,
+    }).errorCode).toBe("upload_failed")
   })
 })
 

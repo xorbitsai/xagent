@@ -36,7 +36,7 @@ from ...core.utils.encryption import decrypt_value, encrypt_value
 from ..auth_dependencies import get_current_user, is_admin_user
 from ..mcp_apps import (
     get_all_mcp_apps,
-    get_app_by_name,
+    get_app_for_mcp_server,
     restrict_to_app_scoped_oauth_grant,
 )
 from ..models.custom_api import CustomApi, UserCustomApi
@@ -1234,33 +1234,45 @@ def _validate_mcp_runtime_config(
     )
 
 
+# Every MCPServer field a generic server update/create request can set.
+# name==value on both sides (config attribute name equals the DB column
+# name for all of these) -- kept as a single source both
+# _update_server_from_config and _server_has_policy_beyond_catalog_identity
+# read, rather than each hand-listing its own subset: an earlier fix round
+# hand-picked env/cwd/concurrent_tools/runtime_input_schema/
+# runtime_bindings/concurrency_safe for the latter and missed docker_*,
+# auth, headers, timeout, volumes, bind_ports, managed, and restart_policy
+# entirely, letting a row carrying any of those alone slip past that gate.
+_MCP_SERVER_CONFIGURABLE_FIELDS = (
+    "name",
+    "description",
+    "transport",
+    "managed",
+    "command",
+    "args",
+    "url",
+    "env",
+    "cwd",
+    "headers",
+    "timeout",
+    "auth",
+    "concurrency_safe",
+    "concurrent_tools",
+    "docker_url",
+    "docker_image",
+    "docker_environment",
+    "docker_working_dir",
+    "volumes",
+    "bind_ports",
+    "restart_policy",
+    "auto_start",
+)
+
+
 def _update_server_from_config(server: MCPServer, config: MCPServerConfig) -> None:
     """Update database server object from MCPServerConfig."""
     # Map config fields to database fields
-    field_mapping = {
-        "name": "name",
-        "description": "description",
-        "transport": "transport",
-        "managed": "managed",
-        "command": "command",
-        "args": "args",
-        "url": "url",
-        "env": "env",
-        "cwd": "cwd",
-        "headers": "headers",
-        "timeout": "timeout",
-        "auth": "auth",
-        "concurrency_safe": "concurrency_safe",
-        "concurrent_tools": "concurrent_tools",
-        "docker_url": "docker_url",
-        "docker_image": "docker_image",
-        "docker_environment": "docker_environment",
-        "docker_working_dir": "docker_working_dir",
-        "volumes": "volumes",
-        "bind_ports": "bind_ports",
-        "restart_policy": "restart_policy",
-        "auto_start": "auto_start",
-    }
+    field_mapping = {field: field for field in _MCP_SERVER_CONFIGURABLE_FIELDS}
 
     for config_field, db_field in field_mapping.items():
         if hasattr(config, config_field) and hasattr(server, db_field):
@@ -1553,7 +1565,10 @@ def _enrich_oauth_server_info(
     if server.transport != "oauth":
         return None, None, None
 
-    app_info = get_app_by_name(db, str(server.name))
+    # Stable identity, not the mutable display name: an id-named row (the
+    # catalog-connect convention) resolved to nothing here, so its app_id,
+    # provider and connected account were all reported as absent.
+    app_info = get_app_for_mcp_server(db, server)
     if not app_info:
         return None, None, None
 
@@ -2673,6 +2688,49 @@ def _reject_user_owned_catalog_squat(db: Session, server: MCPServer) -> None:
         )
 
 
+def _server_has_policy_beyond_catalog_identity(server: MCPServer) -> bool:
+    """Whether `server` carries any configured field beyond what a fresh
+    catalog-created row would have (name/transport/command already proved
+    as the identity; args is what the caller is about to heal).
+
+    Used to decide whether an existing row under a catalog app_id is safe
+    to heal in place: "no current owner" can't make that call by itself
+    (see _ensure_catalog_app_server) since it's the normal state of every
+    legitimate catalog row too, not just an orphan's. Checking every OTHER
+    configurable field is the fallback signal -- a row healing would
+    otherwise touch could hold a real admin-configured value (e.g.
+    MCPServer.env as a platform-global key, read directly by
+    _app_platform_env_available) or a pre-catalog orphan's own policy;
+    either way, healing must refuse rather than guess.
+
+    Walks _MCP_SERVER_CONFIGURABLE_FIELDS (the same list
+    _update_server_from_config uses) rather than a hand-picked subset --
+    an earlier fix round hand-picked env/cwd/concurrent_tools/
+    runtime_input_schema/runtime_bindings/concurrency_safe here and missed
+    docker_*, auth, headers, timeout, volumes, bind_ports, managed, and
+    restart_policy, letting a row carrying any of those alone slip past.
+    """
+    if server.managed != "external":
+        return True
+    if str(server.restart_policy or "no") != "no":
+        return True
+    if any(
+        getattr(server, field, None)
+        for field in (
+            "runtime_input_schema",
+            "runtime_bindings",
+        )
+    ):
+        return True
+    identity_fields = {"name", "description", "transport", "command", "args"}
+    already_checked = identity_fields | {"managed", "restart_policy"}
+    return any(
+        getattr(server, field, None)
+        for field in _MCP_SERVER_CONFIGURABLE_FIELDS
+        if field not in already_checked
+    )
+
+
 def _add_catalog_server_with_race_recovery(
     db: Session, config: Any, server_name: str
 ) -> MCPServer:
@@ -2775,19 +2833,74 @@ def _ensure_catalog_app_server(db: Session, app_id: str) -> tuple[MCPServer, dic
     server = db.query(MCPServer).filter(MCPServer.name == server_name).first()
     # Server names are a single global namespace. A row under this catalog id may
     # be a hijack — a custom server someone created with their own command — so
-    # only reuse it if it matches the official launch config. Otherwise a victim
-    # would run a foreign command with their own key attached.
+    # only reuse it if the command/transport match the official launch config.
+    # Otherwise a victim would run a foreign command with their own key attached.
     if server:
-        if (
-            server.command != command
-            or (server.args or []) != (launch.get("args") or [])
-            or str(server.transport or "").lower() != "stdio"
-        ):
+        if server.command != command or str(server.transport or "").lower() != "stdio":
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="A server with this name already exists with a different configuration",
             )
         _reject_user_owned_catalog_squat(db, server)
+        # Unlike command/transport, args is not an identity check: the
+        # catalog stays the source of truth for it (mirroring how
+        # _ensure_catalog_mcp_oauth_server treats its "auth" config below),
+        # so a shared row created before a legitimate registry args change
+        # (a version bump, a new flag) is healed here instead of 409ing
+        # every connect attempt until an operator manually intervenes.
+        # Safe only because command/transport already proved this is the
+        # official row, not a hijack, and the owned-check above proved it
+        # isn't a user's own row.
+        #
+        # `or []` would also launder a malformed-but-falsy launch_config.args
+        # (a custom app's launch_config is admin-editable with no shape
+        # check) -- {}, 0, and False -- into a validation-passing empty
+        # list, silently wiping a row's real args. Only a genuinely absent
+        # value means "no args".
+        raw_args = launch.get("args")
+        current_args = raw_args if raw_args is not None else []
+        if (server.args or []) != current_args:
+            # This row is ownerless (the check above only rejects a
+            # *currently* owned row), which is also the normal, expected
+            # state of every legitimately catalog-connected row -- connect
+            # never marks an association is_owner=True. So ownerless alone
+            # can't distinguish "the official row, just pre-dating a
+            # registry args bump" (safe to heal) from "a pre-catalog
+            # orphan" (a user created a custom server under this name
+            # before the catalog app existed, matching today's command/
+            # transport, then was deleted, leaving policy we have no way to
+            # safely canonicalize here) or from "a real admin-configured
+            # platform key" (_app_platform_env_available reads MCPServer.env
+            # directly -- healing must never destroy it). Only heal a row
+            # that carries no other configured policy beyond command/
+            # transport/args; otherwise fall through to the same 409 every
+            # such row already got before this change, leaving it and
+            # whatever it holds untouched for an operator to resolve.
+            if _server_has_policy_beyond_catalog_identity(server):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="A server with this name already exists with a different configuration",
+                )
+            # Validated the same way a fresh row would be, rather than
+            # raw-assigning launch_config.args -- an unvalidated assignment
+            # could persist a non-list-of-strings value the MCP SDK later
+            # rejects at session-init time instead of at this request.
+            try:
+                healed_config = _build_server_config(
+                    MCPServerCreate(
+                        name=server_name,
+                        transport="stdio",
+                        description=app_info.get("description"),
+                        config={"command": command, "args": current_args},
+                    )
+                )
+            except ValueError as e:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid app configuration: {str(e)}",
+                )
+            cast(Any, server).args = healed_config.args or []
+            db.commit()
     if not server:
         try:
             config = _build_server_config(
@@ -3471,10 +3584,20 @@ async def delete_mcp_server(
 
         # If it's an OAuth server, also delete the corresponding OAuth tokens
         if server.transport == "oauth":
-            from ..mcp_apps import get_app_by_name
-
-            # Find the corresponding app_id and provider
-            app_info = get_app_by_name(db, str(server.name))
+            # Resolve by stable identity rather than by ``server.name``.
+            # ``PublicMCPApp.name`` is mutable and carries no uniqueness
+            # constraint, so a name lookup here decided whose credentials to
+            # delete using a value an admin rename can change out from under an
+            # in-flight disconnect -- and it resolved nothing at all for rows
+            # named after the app id, silently skipping the cleanup below and
+            # leaving usable tokens behind after a successful teardown.
+            # ``get_app_for_mcp_server`` prefers the row's own ``auth.app_id``
+            # stamp; an unstamped row resolves only when the id and display
+            # name namespaces agree on one owner, and answers ``None`` when
+            # they do not -- which lands on the ``if app_info:`` guard below
+            # and leaves the credentials in place rather than deleting some
+            # other app's.
+            app_info = get_app_for_mcp_server(db, server)
             if app_info:
                 provider = app_info.get("provider")
                 app_id = app_info.get("id")
@@ -3503,8 +3626,6 @@ async def delete_mcp_server(
                 # that row anymore — delete it too rather than leaving an
                 # inert orphan token behind.
                 if provider and provider not in providers_to_delete:
-                    from ..mcp_apps import get_app_for_mcp_server
-
                     other_servers = (
                         db.query(MCPServer)
                         .join(

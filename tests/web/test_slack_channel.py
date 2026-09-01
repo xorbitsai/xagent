@@ -1212,6 +1212,7 @@ async def test_successful_slack_turn_reuses_channel_runtime(
     bot._save_active_tasks = lambda: None  # type: ignore[method-assign]
     lease = TaskLease(task_id=45, runner_id="runner-a", run_id="run-a")
     finalized: list[tuple[TaskStatus, str]] = []
+    finalized_execution_results: list[Any] = []
 
     class FakeManagedLease:
         heartbeat_task = None
@@ -1225,9 +1226,11 @@ async def test_successful_slack_turn_reuses_channel_runtime(
             *,
             status: TaskStatus,
             assistant_content: str = "",
+            execution_result: Any = None,
             **_kwargs: Any,
         ) -> bool:
             finalized.append((status, assistant_content))
+            finalized_execution_results.append(execution_result)
             return True
 
         async def close(self) -> bool:
@@ -1259,12 +1262,14 @@ async def test_successful_slack_turn_reuses_channel_runtime(
         set_recovered_skill_context=lambda _context: None,
     )
 
+    execution_result = {"success": True, "output": "Slack reply"}
+
     class FakeAgentManager:
         async def get_agent_for_task(self, *_args: Any, **_kwargs: Any) -> Any:
             return agent_service
 
         async def execute_task(self, **_kwargs: Any) -> dict[str, Any]:
-            return {"success": True, "output": "Slack reply"}
+            return execution_result
 
     persisted: list[dict[str, Any]] = []
     final_messages: list[dict[str, Any]] = []
@@ -1323,6 +1328,7 @@ async def test_successful_slack_turn_reuses_channel_runtime(
     assert bot.active_tasks == {"T1:D1:U1:direct": 45}
     assert persisted[0]["content"] == "hello"
     assert finalized == [(TaskStatus.COMPLETED, "Slack reply")]
+    assert finalized_execution_results == [execution_result]
     assert final_messages == [
         {
             "channel_id": "D1",

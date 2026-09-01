@@ -17,6 +17,10 @@ from ...context_ref import (
     split_tool_result_supersedes_scope,
 )
 from ...file_ref import FILE_REF_MODEL_INSTRUCTIONS
+from ...model.chat.types import (
+    CONTENT_SOURCE_KEY,
+    CONTENT_SOURCE_REASONING_FALLBACK,
+)
 from ...tools.artifacts import (
     format_tool_result_for_observation,
     sanitize_tool_result_for_public_context,
@@ -48,8 +52,29 @@ from .skill_tool import (
 )
 
 READ_FILE_CONTEXT_LIMIT = 12_000
-COMPACT_SUMMARY_MAX_TOKENS = 1024
+COMPACT_SUMMARY_MAX_TOKENS = 8192
 COMPACT_SUMMARY_MIN_TOKENS = 256
+# Budgets to fall back through when the requested one is refused, largest
+# first. The request is derived from the model's *input* window while
+# providers cap the *output* separately and much lower, and that limit is not
+# recorded anywhere -- so the budget is a guess and this ladder lets the
+# provider correct it.
+#
+# The rungs are dense between the ceiling and the floor because the first
+# budget the provider *accepts* is the one the summary gets written with, and
+# a reasoning model draws its reasoning from that same allowance: accepted is
+# not the same as sufficient. A ladder of only (1024, 256) meant a model
+# capped at 4096 fell from 8192 straight to 1024 -- the very allowance this
+# change raised the ceiling to get away from -- and produced a reasoning trace
+# instead of a summary. Halving keeps the first accepted rung as large as the
+# cap allows.
+#
+# Descending stops at the first accepted budget even when its response turns
+# out to be unusable. Usability is monotone in the budget: a response is
+# unusable because the allowance was too small for the model to finish, so
+# every smaller rung is unusable too and stepping further down only spends
+# requests to reach the same truncation.
+COMPACT_SUMMARY_FALLBACK_BUDGETS = (4096, 2048, 1024, COMPACT_SUMMARY_MIN_TOKENS)
 COMPACT_CONTEXT_REF_MAX_TOKENS = 2048
 COMPACT_DROPPED_REF_NOTICE_MAX_CHARS = 2048
 COMPACT_DROPPED_TOOL_NOTICE_MAX_CHARS = 1024
@@ -79,11 +104,16 @@ class MergeStrategy(str, Enum):
 
 @dataclass
 class CompactConfig:
-    """Compaction policy for message history."""
+    """Compaction policy for message history.
+
+    There is no strategy knob. ``PatternRuntime`` is expected to summarize
+    first and to fall back to dropping messages only when it cannot; this
+    dataclass configures the threshold that triggers either, and
+    ``max_messages`` sizes the retained tail when messages are dropped.
+    """
 
     enabled: bool = True
     threshold: int = 32000
-    strategy: str = "truncate"
     max_messages: int = 20
 
 
@@ -947,10 +977,15 @@ class ExecutionContext:
                 }
                 for call in self.llm_calls
             ],
+            # ``strategy`` used to be emitted here and is deliberately not
+            # replaced: an older reader defaults the missing key to
+            # ``"truncate"``, which is the only value this field was ever
+            # written with, so it rebuilds the identical config. That makes
+            # dropping it safe in both rolling-deploy directions, unlike the
+            # fields kept for compatibility just below.
             "compact_config": {
                 "enabled": self.compact_config.enabled,
                 "threshold": self.compact_config.threshold,
-                "strategy": self.compact_config.strategy,
                 "max_messages": self.compact_config.max_messages,
             },
             # Backward compatibility for older serialized payloads.
@@ -994,7 +1029,6 @@ class ExecutionContext:
         compact_config = CompactConfig(
             enabled=compact.get("enabled", True),
             threshold=compact.get("threshold", CompactConfig().threshold),
-            strategy=compact.get("strategy", "truncate"),
             max_messages=compact.get("max_messages", 20),
         )
         created_at = (
@@ -1044,7 +1078,15 @@ class ExecutionContext:
 
         return context
 
-    def compact_if_needed(self, llm: Any = None) -> CompactResult:
+    def compact_if_needed(self) -> CompactResult:
+        """Shrink the context by dropping old messages, if it is over budget.
+
+        This is the backstop, not a strategy the caller chooses. It does not
+        summarize and does not check whether anything tried to: ``PatternRuntime``
+        is expected to have summarized first and to call this only when that
+        was unavailable or produced nothing usable. Everything removed here is
+        lost outright, so a caller that can summarize should.
+        """
         if not self.compact_config.enabled:
             return CompactResult(
                 compacted=False,
@@ -1055,7 +1097,7 @@ class ExecutionContext:
 
         total_tokens = self._get_total_tokens()
         if total_tokens > self.compact_config.threshold:
-            result = self._compact(llm)
+            result = self._drop_oldest_messages()
             return self._annotate_compact_result(result, total_tokens)
 
         return CompactResult(
@@ -1089,40 +1131,40 @@ class ExecutionContext:
             },
         }
 
-    def _compact(self, llm: Any = None) -> CompactResult:
-        original_count = len(self.messages)
-        if self.compact_config.strategy == "truncate":
-            keep_count = min(max(0, self.compact_config.max_messages), original_count)
-            retained = self._tail_window_preserving_tool_pairs(keep_count)
-            removed = max(0, original_count - len(retained))
-            # The window is a suffix minus any interior tool fragments sanitized
-            # out of it, so diff by object identity rather than slicing a prefix.
-            retained_ids = {id(message) for message in retained}
-            dropped_tool_counts = self._dropped_tool_result_counts(
-                [
-                    message
-                    for message in self.messages
-                    if id(message) not in retained_ids
-                ]
-            )
-            self.messages = retained
-            return CompactResult(
-                compacted=True,
-                original_count=original_count,
-                final_count=len(self.messages),
-                strategy="truncate",
-                metadata={
-                    "removed_count": removed,
-                    "dropped_tool_result_count": sum(dropped_tool_counts.values()),
-                    "dropped_tool_results_by_name": dropped_tool_counts,
-                },
-            )
+    def _drop_oldest_messages(self) -> CompactResult:
+        """Keep a tail window and discard everything before it.
 
+        Lossy: the dropped turns are not summarized, recorded, or recoverable
+        from the context. ``strategy="truncate"`` on the result is the trace
+        label for that outcome, not a mode.
+
+        Note that ``compacted=True`` does not imply anything was removed. When
+        the context is over budget but holds no more than ``max_messages``
+        messages -- a handful of very large tool results, say -- the window
+        keeps all of them and ``removed_count`` is 0. Callers that need to know
+        whether the context actually shrank must read ``removed_count``.
+        """
+        original_count = len(self.messages)
+        keep_count = min(max(0, self.compact_config.max_messages), original_count)
+        retained = self._tail_window_preserving_tool_pairs(keep_count)
+        removed = max(0, original_count - len(retained))
+        # The window is a suffix minus any interior tool fragments sanitized
+        # out of it, so diff by object identity rather than slicing a prefix.
+        retained_ids = {id(message) for message in retained}
+        dropped_tool_counts = self._dropped_tool_result_counts(
+            [message for message in self.messages if id(message) not in retained_ids]
+        )
+        self.messages = retained
         return CompactResult(
-            compacted=False,
+            compacted=True,
             original_count=original_count,
             final_count=len(self.messages),
-            strategy="none",
+            strategy="truncate",
+            metadata={
+                "removed_count": removed,
+                "dropped_tool_result_count": sum(dropped_tool_counts.values()),
+                "dropped_tool_results_by_name": dropped_tool_counts,
+            },
         )
 
     def _annotate_compact_result(
@@ -1146,7 +1188,11 @@ class ExecutionContext:
         original_tokens: int | None = None,
     ) -> CompactResult:
         original_count = len(self.messages)
-        summary = self._compact_response_text(response).strip()
+        summary = (
+            ""
+            if self._is_reasoning_fallback(response)
+            else self._compact_response_text(response).strip()
+        )
         if not summary:
             return CompactResult(
                 compacted=False,
@@ -1399,6 +1445,25 @@ class ExecutionContext:
         ]
 
     def _llm_compact_max_tokens(self) -> int:
+        """Output budget for the compaction summary.
+
+        Two bounds, both load-bearing. ``threshold // 4`` is what keeps
+        compaction from looping: the post-compaction context is the summary
+        plus the latest user message, so a summary bounded by a quarter of the
+        threshold is necessarily well under the threshold that triggered this
+        pass. ``COMPACT_SUMMARY_MAX_TOKENS`` bounds it in absolute terms,
+        because the threshold scales with the *input* window while providers
+        cap the *output* separately and much lower -- at a 1M-token window,
+        ``threshold // 4`` alone would ask for ~187k output tokens and the
+        request would simply be rejected, collapsing compaction to the
+        message-dropping fallback it exists to avoid.
+
+        The absolute ceiling was 1024, which bound at every realistic window
+        and left no room for a reasoning model, whose reasoning is drawn from
+        this same allowance and could consume it entirely before any summary
+        text was emitted. 8192 clears that while staying under the output
+        limits mainstream providers actually enforce.
+        """
         return max(
             COMPACT_SUMMARY_MIN_TOKENS,
             min(COMPACT_SUMMARY_MAX_TOKENS, self.compact_config.threshold // 4),
@@ -1422,6 +1487,28 @@ class ExecutionContext:
                 if context_refs_text:
                     chunks.append(context_refs_text)
         return "\n".join(chunks)
+
+    @staticmethod
+    def _is_reasoning_fallback(response: Any) -> bool:
+        """True when the client substituted a reasoning trace for content.
+
+        A reasoning model that spends its whole output budget thinking returns
+        no content, and the OpenAI-compatible client surfaces the trace in its
+        place so a caller does not read a truncated-but-healthy response as an
+        empty one -- reasonable for a connection test, wrong here. The summary
+        replaces every prior message, so accepting a chain of thought as the
+        summary rewrites the agent's history into deliberation it never
+        concluded. Better to have no summary and fall back to dropping
+        messages, which at least leaves real ones.
+
+        The client declares the substitution rather than leaving it to be
+        recognised by shape, so this cannot drift apart from the code that
+        performs it.
+        """
+        return (
+            isinstance(response, dict)
+            and response.get(CONTENT_SOURCE_KEY) == CONTENT_SOURCE_REASONING_FALLBACK
+        )
 
     def _compact_response_text(self, response: Any) -> str:
         if isinstance(response, str):

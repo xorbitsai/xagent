@@ -734,3 +734,66 @@ def test_dry_run_never_initializes_the_db(
     assert cli.run(args) == 0
     out = capsys.readouterr().out
     assert "dry-run: no changes made." in out
+
+
+def test_loader_reports_skills_refused_by_the_shared_validation_gate(
+    db_session,
+) -> None:
+    """A bundle the archive layer refuses becomes a report error, not a crash.
+
+    ``_write_skill`` delegates to Skill Hub's ``_write_personal_skill``, so the
+    validation added to that shared boundary — blank ``SKILL.md``, duplicate
+    canonical paths, over-long paths, unparsable bundles — now governs
+    migration too. That is intended, but it changes what an import does with a
+    bundle the source platform happily held, so the per-skill error path needs
+    to hold: one bad skill is reported and skipped, and the good ones around it
+    still import.
+    """
+    from xagent.web.models.skill import UserSkill
+
+    user = _make_user(db_session)
+    good = SkillItem(
+        name="keeper",
+        files={"SKILL.md": b"---\ndescription: fine\n---\n# Keeper\n"},
+        source_path="/src/keeper",
+    )
+    blank = SkillItem(
+        name="blank-one",
+        files={"SKILL.md": b"   \n\t"},
+        source_path="/src/blank-one",
+    )
+    unparsable = SkillItem(
+        name="bad-template",
+        files={
+            "SKILL.md": b"---\ndescription: fine\n---\n# Bad\n",
+            "template.md": b"\xff\xfe not utf-8",
+        },
+        source_path="/src/bad-template",
+    )
+    # Ordered so a valid skill follows both rejections. With the good one
+    # first, the only successful write precedes every failure and the test
+    # cannot fail if a rejection left the session unusable for what comes
+    # after it -- which is the half that actually needs guarding.
+    trailing = SkillItem(
+        name="after-the-failures",
+        files={"SKILL.md": b"---\ndescription: fine\n---\n# After\n"},
+        source_path="/src/after-the-failures",
+    )
+    bundle = MigrationBundle(
+        source="openclaw",
+        source_root="/src",
+        skills=[good, blank, unparsable, trailing],
+    )
+
+    report = MigrationLoader(db_session, user=user).load(bundle)
+
+    assert report.skills_imported == ["keeper", "after-the-failures"]
+    stored = db_session.query(UserSkill).filter(UserSkill.user_id == user.id).all()
+    assert {s.name for s in stored} == {"keeper", "after-the-failures"}
+
+    errors = "\n".join(report.errors)
+    assert "blank-one" in errors
+    assert "bad-template" in errors
+    # The rejection reason has to survive into the operator-facing report.
+    assert "empty" in errors.lower()
+    assert "template.md" in errors

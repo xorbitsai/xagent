@@ -347,7 +347,9 @@ import {
   type WebSocketConnectionFailure,
 } from "@/hooks/use-websocket"
 import { generateClientMessageId, getApiUrl, getUploadApiUrl, shouldAutoOpenTaskPreview } from "@/lib/utils"
-import { apiRequest, getApiErrorMessage, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper"
+import { apiRequest, classifyUploadError, getApiErrorMessage, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper"
+import { clientErrorTranslationKey, readClientErrorCode } from "@/lib/client-errors"
+import { normalizeUploadFileIds } from "@/lib/upload-file-ids"
 import { useI18n } from "@/contexts/i18n-context"
 import { normalizeTimestampMs } from "@/lib/time-utils"
 import { unwrapFinalAnswerContent } from "@/lib/final-answer"
@@ -885,10 +887,35 @@ const taskFromTaskInfoData = (
   controlState: taskData.control_state as TaskControlState | undefined,
 })
 
-const getWebSocketErrorMessage = (message: WebSocketMessage): string => {
+const getWebSocketErrorCodeField = (message: WebSocketMessage): {
+  present: boolean
+  value: unknown
+} => {
   const root = message as unknown as Record<string, unknown>
   const data = isJsonRecord(message.data) ? message.data : null
+  if (data && Object.prototype.hasOwnProperty.call(data, "error_code")) {
+    return { present: true, value: data.error_code }
+  }
+  if (Object.prototype.hasOwnProperty.call(root, "error_code")) {
+    return { present: true, value: root.error_code }
+  }
+  return { present: false, value: undefined }
+}
+
+const getWebSocketErrorMessage = (
+  message: WebSocketMessage,
+  trustLegacyErrorProse: boolean,
+): string => {
+  const root = message as unknown as Record<string, unknown>
+  const data = isJsonRecord(message.data) ? message.data : null
+  if (getWebSocketErrorCodeField(message).present) return "Unknown error"
+  if (!trustLegacyErrorProse) return "Unknown error"
   return getString(data?.message) || getString(data?.error) || getString(root.message) || getString(root.error) || "Unknown error"
+}
+
+const getWebSocketErrorCode = (message: WebSocketMessage) => {
+  const errorCode = getWebSocketErrorCodeField(message)
+  return errorCode.present ? readClientErrorCode(errorCode.value) : null
 }
 
 const getWebSocketTaskStatus = (message: WebSocketMessage): Task["status"] | null => {
@@ -1821,6 +1848,12 @@ export interface AppProviderTransportCapabilities {
 }
 
 export interface AppProviderTransportConfig {
+  /**
+   * Whether no-code error frames may render server prose during a temporary
+   * old-backend/new-frontend deployment skew. Public and external-credential
+   * transports must opt out; the authenticated page keeps its legacy default.
+   */
+  legacyErrorProse?: "trusted" | "untrusted"
   buildWebSocketUrl?: (params: { baseUrl: string; taskId: number; token?: string }) => string
   /**
    * Owns every file URL and request made below this provider. Public
@@ -1968,6 +2001,7 @@ export function AppProvider({
     }
   }, [])
   const sessionTransport = transport?.session
+  const trustLegacyErrorProse = transport?.legacyErrorProse !== "untrusted"
   const filesDisabled = !resolveTransportCapability(
     sessionTransport,
     sessionTransport?.files,
@@ -2324,6 +2358,7 @@ export function AppProvider({
       sessionTransport === undefined
         ? undefined
         : deliveryGeneration,
+    legacyErrorProse: trustLegacyErrorProse ? "trusted" : "untrusted",
     onSessionConnectionClose: sessionTransport?.onConnectionClose,
     onSessionConnectionFailure: sessionTransport?.onConnectionFailure,
     onMessage: (message) => {
@@ -5575,7 +5610,10 @@ export function AppProvider({
 
       case "agent_error":
         console.trace('Original message:', JSON.stringify(message), 'Handler: handleMessage (agent_error)')
-        const agentErrorMessage = getWebSocketErrorMessage(message)
+        const agentErrorCode = getWebSocketErrorCode(message)
+        const agentErrorMessage = agentErrorCode
+          ? t(clientErrorTranslationKey(agentErrorCode))
+          : getWebSocketErrorMessage(message, trustLegacyErrorProse)
         const agentErrorTaskStatus = getWebSocketTaskStatus(message)
 
         if (agentErrorTaskStatus) {
@@ -5619,7 +5657,10 @@ export function AppProvider({
       case "error":
       case "task_error":
         console.trace('Original message:', JSON.stringify(message), 'Handler: handleMessage (error)')
-        const websocketErrorMessage = getWebSocketErrorMessage(message)
+        const websocketErrorCode = getWebSocketErrorCode(message)
+        const websocketErrorMessage = websocketErrorCode
+          ? t(clientErrorTranslationKey(websocketErrorCode))
+          : getWebSocketErrorMessage(message, trustLegacyErrorProse)
         const websocketTaskStatus = getWebSocketTaskStatus(message)
 
         if (websocketTaskStatus) {
@@ -5665,7 +5706,7 @@ export function AppProvider({
         }
         break
     }
-  }, [])
+  }, [trustLegacyErrorProse])
 
   const handleSessionMessage = (
     message: WebSocketMessage,
@@ -6179,28 +6220,37 @@ export function AppProvider({
 
               const parsed = await parseApiResponse(uploadResponse)
 
-              if (uploadResponse.ok && isJsonRecord(parsed.data)) {
-                const uploadData = parsed.data
-                if (uploadData.success && Array.isArray(uploadData.files)) {
-                  uploadData.files
-                    .filter((f): f is { file_id: string } => isJsonRecord(f) && typeof f.file_id === 'string')
-                    .forEach(f => uploadedFileIds.push(f.file_id))
-                }
-              } else {
-                throw new Error(getUploadErrorMessage(uploadResponse, parsed, {
-                  generic: t("files.uploadFailed") || "Upload failed",
-                  ...UPLOAD_ERROR_MESSAGES,
-                }))
+              if (
+                !uploadResponse.ok
+                || !isJsonRecord(parsed.data)
+                || parsed.data.success !== true
+                || !Array.isArray(parsed.data.files)
+              ) {
+                const uploadError = classifyUploadError(uploadResponse, parsed)
+                throw new Error(t(clientErrorTranslationKey(uploadError.errorCode)))
               }
+              const newFileIds = normalizeUploadFileIds(
+                parsed.data.files.map(f => isJsonRecord(f) ? f.file_id : null),
+                filesToUpload.length,
+              )
+              if (!newFileIds) {
+                throw new Error(t("clientErrors.uploadFailed"))
+              }
+              uploadedFileIds.push(...newFileIds)
             } catch (e) {
               console.error('Error uploading files before task creation:', e)
               throw e
             }
           }
 
-          if (uploadedFileIds.length > 0) {
-            requestBody.files = uploadedFileIds
+          const normalizedFileIds = normalizeUploadFileIds(
+            uploadedFileIds,
+            files.length,
+          )
+          if (!normalizedFileIds) {
+            throw new Error(t("clientErrors.uploadFailed"))
           }
+          requestBody.files = normalizedFileIds
         }
 
         // Agent chats should use the published agent's own model configuration.

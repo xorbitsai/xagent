@@ -1,20 +1,28 @@
 from __future__ import annotations
 
+import ast
 import asyncio
+import inspect
+import logging
 import threading
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
+import xagent.config as config
+import xagent.web.services.interaction_rollout as ir
+import xagent.web.services.managed_task_lease as managed_task_lease
 from xagent.web.models.agent import Agent
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import Base, get_db, get_engine, init_db
 from xagent.web.models.task import Task, TaskStatus
+from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.models.user import User
 from xagent.web.models.workforce import Workforce, WorkforceRun
 from xagent.web.services.managed_task_lease import (
     ManagedTaskLease,
+    _finalize_managed_task_lease_result_sync,
     claim_managed_task_lease,
     claim_managed_task_lease_isolated,
     finalize_managed_task_lease_result,
@@ -512,3 +520,314 @@ async def test_managed_lease_close_drains_heartbeat_before_cancellation() -> Non
             await closing
 
     release.assert_called_once_with(managed.lease)
+
+
+# ---------------------------------------------------------------------------
+# execution_result: identity threading through all five finalize layers.
+# ---------------------------------------------------------------------------
+
+
+def test_execution_result_identity_at_finalize_core() -> None:
+    """The base layer accepts execution_result and binds it unchanged."""
+
+    sentinel: dict[str, object] = {"marker": object()}
+    bound = inspect.signature(finalize_managed_task_lease_result).bind(
+        db=object(),
+        lease=TaskLease(task_id=201, runner_id="runner-a", run_id="run-a"),
+        status=TaskStatus.COMPLETED,
+        execution_result=sentinel,
+    )
+    assert bound.arguments["execution_result"] is sentinel
+
+
+def test_execution_result_identity_at_finalize_sync(
+    db_session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sentinel: dict[str, object] = {"marker": object()}
+    received: list[object] = []
+
+    def capture_core(_db, _lease, *, execution_result=None, **_kwargs):
+        received.append(execution_result)
+        return True
+
+    monkeypatch.setattr(
+        managed_task_lease, "finalize_managed_task_lease_result", capture_core
+    )
+
+    assert (
+        _finalize_managed_task_lease_result_sync(
+            TaskLease(task_id=202, runner_id="runner-a", run_id="run-a"),
+            status=TaskStatus.COMPLETED,
+            execution_result=sentinel,
+        )
+        is True
+    )
+    assert received == [sentinel]
+    assert received[0] is sentinel
+
+
+@pytest.mark.asyncio
+async def test_execution_result_identity_at_finalize_isolated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sentinel: dict[str, object] = {"marker": object()}
+    received: list[object] = []
+
+    def capture_sync(_lease, *, execution_result=None, **_kwargs):
+        received.append(execution_result)
+        return True
+
+    monkeypatch.setattr(
+        managed_task_lease,
+        "_finalize_managed_task_lease_result_sync",
+        capture_sync,
+    )
+
+    assert (
+        await finalize_managed_task_lease_result_isolated(
+            TaskLease(task_id=203, runner_id="runner-a", run_id="run-a"),
+            status=TaskStatus.COMPLETED,
+            execution_result=sentinel,
+        )
+        is True
+    )
+    assert received == [sentinel]
+    assert received[0] is sentinel
+
+
+@pytest.mark.asyncio
+async def test_execution_result_identity_at_finalize_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    heartbeat_task = asyncio.create_task(asyncio.sleep(0))
+    managed = ManagedTaskLease(
+        lease=TaskLease(task_id=204, runner_id="runner-a", run_id="run-a"),
+        stop_event=asyncio.Event(),
+        heartbeat_task=heartbeat_task,  # type: ignore[arg-type]
+    )
+    sentinel: dict[str, object] = {"marker": object()}
+    received: list[object] = []
+
+    async def capture_finalize_resources(_self, *, execution_result=None, **_kwargs):
+        received.append(execution_result)
+        return True
+
+    monkeypatch.setattr(
+        ManagedTaskLease, "_finalize_resources", capture_finalize_resources
+    )
+
+    assert (
+        await managed.finalize_result(
+            status=TaskStatus.COMPLETED,
+            execution_result=sentinel,
+        )
+        is True
+    )
+    assert received == [sentinel]
+    assert received[0] is sentinel
+
+
+@pytest.mark.asyncio
+async def test_execution_result_identity_at_finalize_resources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    heartbeat_task = asyncio.create_task(asyncio.sleep(0))
+    managed = ManagedTaskLease(
+        lease=TaskLease(task_id=205, runner_id="runner-a", run_id="run-a"),
+        stop_event=asyncio.Event(),
+        heartbeat_task=heartbeat_task,  # type: ignore[arg-type]
+    )
+    sentinel: dict[str, object] = {"marker": object()}
+    received: list[object] = []
+
+    async def stop_heartbeat(*_args, **_kwargs) -> TaskLeaseHeartbeatOutcome:
+        return TaskLeaseHeartbeatOutcome()
+
+    async def capture_isolated(_lease, *, execution_result=None, **_kwargs):
+        received.append(execution_result)
+        return True
+
+    monkeypatch.setattr(managed_task_lease, "stop_task_lease_heartbeat", stop_heartbeat)
+    monkeypatch.setattr(
+        managed_task_lease,
+        "finalize_managed_task_lease_result_isolated",
+        capture_isolated,
+    )
+
+    assert (
+        await managed._finalize_resources(
+            status=TaskStatus.COMPLETED,
+            assistant_content=None,
+            turn_id=None,
+            interactions=None,
+            message_type="assistant_response",
+            error_message=None,
+            execution_result=sentinel,
+        )
+        is True
+    )
+    assert received == [sentinel]
+    assert received[0] is sentinel
+
+
+# ---------------------------------------------------------------------------
+# execution_result: it must never reach a log call or an exception message.
+# ---------------------------------------------------------------------------
+
+
+def test_execution_result_never_reaches_a_log_or_exception_message() -> None:
+    """This module must never hand execution_result to a logger call
+    or an exception constructor. finalize_managed_task_lease_result_isolated
+    hands its call off to a worker thread, so a lambda closure holds this
+    mapping across that thread boundary; it may carry large, untruncated
+    structures such as file_outputs, so logging it would leak that payload.
+    """
+
+    source = inspect.getsource(managed_task_lease)
+    tree = ast.parse(source)
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        is_logger_call = (
+            isinstance(func, ast.Attribute)
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "logger"
+        )
+        is_exception_construction = (
+            isinstance(func, ast.Name) and func.id.endswith("Error")
+        ) or (isinstance(func, ast.Attribute) and func.attr.endswith("Error"))
+        if not (is_logger_call or is_exception_construction):
+            continue
+        for value in list(node.args) + [kw.value for kw in node.keywords]:
+            for sub in ast.walk(value):
+                if isinstance(sub, ast.Name) and sub.id == "execution_result":
+                    offenders.append(ast.dump(node))
+    assert offenders == []
+
+
+def test_finalize_core_never_logs_the_execution_result_payload(
+    db_session, caplog: pytest.LogCaptureFixture
+) -> None:
+    task = _create_task(db_session)
+    lease = acquire_task_lease(db_session, int(task.id), new_run=True)
+    assert lease is not None
+    sentinel_marker = "EXECUTION-RESULT-SENTINEL-4f2c9"
+
+    with caplog.at_level(logging.DEBUG):
+        assert (
+            finalize_managed_task_lease_result(
+                db_session,
+                lease,
+                status=TaskStatus.COMPLETED,
+                assistant_content="done",
+                execution_result={"marker": sentinel_marker},
+            )
+            is True
+        )
+
+    assert sentinel_marker not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# execution_result: draft publication must be dominated by its presence.
+# ---------------------------------------------------------------------------
+
+
+def test_managed_lease_publication_requires_an_execution_result() -> None:
+    """Any resolve_publishable_clarification call inside
+    finalize_managed_task_lease_result must be dominated by an
+    `execution_result is not None` guard.
+
+    This PR adds no such call -- publication is wired up separately -- so
+    this pin currently passes on absence. Do not rewrite it to assert the
+    call exists: the smallest way to turn this red is adding the call
+    without the guard, which is exactly the mistake it exists to catch.
+
+    Two mutations were run against this assertion and both turn it red: a
+    mutation adding an unguarded call, and one demoting the guard to
+    truthiness (``if execution_result:``).
+
+    One guard shape only is recognized -- an ``if execution_result is not
+    None:`` block dominating the call. An early-return ``is None`` guard
+    is equally safe at runtime and still turns this red, so the change
+    that wires the resolver has to use the block shape.
+    """
+
+    source = inspect.getsource(finalize_managed_task_lease_result)
+    tree = ast.parse(source)
+    func_node = tree.body[0]
+    assert isinstance(func_node, ast.FunctionDef)
+
+    def _is_execution_result_not_none_guard(test: ast.expr) -> bool:
+        return (
+            isinstance(test, ast.Compare)
+            and isinstance(test.left, ast.Name)
+            and test.left.id == "execution_result"
+            and len(test.ops) == 1
+            and isinstance(test.ops[0], ast.IsNot)
+            and len(test.comparators) == 1
+            and isinstance(test.comparators[0], ast.Constant)
+            and test.comparators[0].value is None
+        )
+
+    def _publish_calls(node: ast.AST) -> list[ast.Call]:
+        return [
+            n
+            for n in ast.walk(node)
+            if isinstance(n, ast.Call)
+            and (
+                (
+                    isinstance(n.func, ast.Name)
+                    and n.func.id == "resolve_publishable_clarification"
+                )
+                or (
+                    isinstance(n.func, ast.Attribute)
+                    and n.func.attr == "resolve_publishable_clarification"
+                )
+            )
+        ]
+
+    all_calls = {id(call) for call in _publish_calls(func_node)}
+    guarded_calls: set[int] = set()
+    for node in ast.walk(func_node):
+        if isinstance(node, ast.If) and _is_execution_result_not_none_guard(node.test):
+            for stmt in node.body:
+                guarded_calls.update(id(call) for call in _publish_calls(stmt))
+
+    assert all_calls - guarded_calls == set()
+
+
+def test_finalize_without_execution_result_creates_no_interaction_row_in_native_mode(
+    db_session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Omitting execution_result must not publish a clarification even when
+    native-mode rollout would otherwise allow one.
+    """
+
+    monkeypatch.delenv(config.INTERACTION_PROTOCOL_MODE, raising=False)
+    monkeypatch.delenv(config.INTERACTION_NATIVE_SOURCES, raising=False)
+    monkeypatch.setattr(ir, "_policy", None)
+    monkeypatch.setenv(config.INTERACTION_PROTOCOL_MODE, "native")
+    monkeypatch.setenv(config.INTERACTION_NATIVE_SOURCES, "sdk")
+    policy = ir.validate_interaction_rollout_at_startup()
+    assert policy.mode == "native"
+
+    task = _create_task(db_session)
+    task.source = "sdk"
+    db_session.commit()
+    lease = acquire_task_lease(db_session, int(task.id), new_run=True)
+    assert lease is not None
+
+    assert (
+        finalize_managed_task_lease_result(
+            db_session,
+            lease,
+            status=TaskStatus.WAITING_FOR_USER,
+            assistant_content="Please confirm",
+        )
+        is True
+    )
+
+    assert db_session.query(TaskInteractionRequest).count() == 0

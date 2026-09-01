@@ -2814,7 +2814,11 @@ async def test_schedule_bg_forwards_execution_message_to_execute_task_background
     assert kwargs["context"]["turn_id"] == payload.turn_id
     assert kwargs["context"]["existing"] == "value"
     assert kwargs["mcp_runtime_authorization_policy"] is actor_policy
-    agent_manager.remove_agent.assert_called_once_with(int(task.id), int(user.id))
+    agent_manager.remove_agent.assert_called_once_with(
+        int(task.id),
+        int(user.id),
+        expected_run_id=fake_lease.run_id,
+    )
     assert get_ephemeral_runtime_values(payload.turn_id) is None
     assert pop_ephemeral_runtime_values(payload.turn_id) is None
 

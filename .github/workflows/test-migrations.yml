@@ -73,7 +73,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -177,11 +177,11 @@ jobs:
 
       - name: Checkout code
         if: needs.detect-migration-changes.outputs.should-test == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
         if: needs.detect-migration-changes.outputs.should-test == 'true'
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -262,11 +262,11 @@ jobs:
 
       - name: Checkout code
         if: needs.detect-migration-changes.outputs.should-test == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
         if: needs.detect-migration-changes.outputs.should-test == 'true'
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 

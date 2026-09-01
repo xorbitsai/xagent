@@ -2112,6 +2112,9 @@ def _schedule_bg(
                         lambda: _get_agent_manager().remove_agent(
                             task_id,
                             task_owner_user_id,
+                            expected_run_id=(
+                                task_lease.run_id if task_lease is not None else run_id
+                            ),
                         )
                     )
                 except asyncio.CancelledError as exc:

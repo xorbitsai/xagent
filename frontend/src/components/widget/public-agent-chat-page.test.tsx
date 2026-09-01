@@ -20,6 +20,7 @@ const app = vi.hoisted(() => ({
     transport?: AppProviderTransportConfig
   },
   startScreenProps: null as null | {
+    onSend?: (message: string, files: File[], config?: Record<string, string>) => Promise<void>
     voiceInputEnabled?: boolean
   },
 }))
@@ -162,11 +163,16 @@ async function expectWidgetAuthFailure(detail: string) {
   expect(screen.queryByRole("button", { name: /start:/ })).toBeNull()
   expect(sessionStorage.getItem("xagent_public_access_token")).toBeNull()
   expect(app.setTaskId).not.toHaveBeenCalled()
+  // This early-return branch renders no header at all -- widget.js's mobile
+  // full-screen FAB-hiding guard depends on WidgetChromeControls never
+  // rendering (and thus never announcing chrome-ready) here.
+  expect(screen.queryByRole("button", { name: "widgetChat.close" })).toBeNull()
 }
 
 function expectPublicProviderToken() {
   expect(sessionStorage.getItem("xagent_public_access_token")).toBeNull()
   expect(app.provider).toMatchObject({ token: "public-access-token" })
+  expect(app.provider?.transport?.legacyErrorProse).toBe("untrusted")
   expect(app.provider?.transport?.capabilities).toEqual({
     agentCards: "disabled",
     voice: "disabled",
@@ -247,6 +253,22 @@ describe("PublicAgentChatPage", () => {
     cleanup()
     vi.unstubAllGlobals()
     vi.restoreAllMocks()
+  })
+
+  it("renders no header, and thus no close control, while auth is still in flight", () => {
+    // Same underlying risk as expectWidgetAuthFailure's assertion below, but
+    // for the *other* early-return branch (isInitializing) -- this widget
+    // mode result never resolves within the test, keeping it in that state.
+    fetchMock.mockReturnValueOnce(new Promise(() => {}))
+
+    renderWidgetPage({ embedTicket: "embed-ticket", widgetKey: "widget-secret" })
+
+    expect(screen.queryByRole("button", { name: "widgetChat.close" })).toBeNull()
+    // Pin a positive assertion too, not just the negative above -- otherwise
+    // a bug that made this branch render nothing at all would pass this test
+    // undetected. The loading spinner has no accessible role/text of its own
+    // to query by.
+    expect(document.querySelector("svg.animate-spin")).not.toBeNull()
   })
 
   it("authenticates embedded widgets with the ticket and never sends the widget key", async () => {
@@ -397,10 +419,11 @@ describe("PublicAgentChatPage", () => {
 
     expect(await screen.findByRole("button", { name: "start:Support Agent" })).toBeInTheDocument()
     expect(fetchMock).toHaveBeenCalledTimes(1)
-    // No conversation yet — nothing to end, so the "..." menu (which would
-    // only ever hold the new-conversation action) doesn't render either.
+    // No conversation yet — nothing to end, so that particular menu item is
+    // absent, but the "..." trigger itself still renders since expand/
+    // collapse is always offered regardless of conversation state.
     expect(screen.queryByRole("button", { name: "widgetChat.newConversation" })).toBeNull()
-    expect(screen.queryByRole("button", { name: "widgetChat.moreOptions" })).toBeNull()
+    expect(screen.getByRole("button", { name: "widgetChat.moreOptions" })).toBeInTheDocument()
     // The close control still renders — it toggles the host panel, not the
     // chat itself, so it's independent of whether a conversation exists.
     expect(screen.getByRole("button", { name: "widgetChat.close" })).toBeInTheDocument()
@@ -584,6 +607,29 @@ describe("PublicAgentChatPage", () => {
     })
   })
 
+  it("rejects duplicate workforce upload identifiers before task creation", async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(successfulWorkforceAuth))
+      .mockResolvedValueOnce(jsonResponse({ success: true, file_id: "file-1" }))
+      .mockResolvedValueOnce(jsonResponse({ success: true, file_id: " file-1 " }))
+
+    renderWidgetPage({ searchAgentId: null, widgetKey: "widget-secret" })
+
+    await screen.findByRole("button", { name: "start:Support Workforce" })
+    await expect(app.startScreenProps?.onSend?.(
+      "analyze attachments",
+      [
+        new File(["first"], "first.txt"),
+        new File(["second"], "second.txt"),
+      ],
+    )).rejects.toThrow("clientErrors.uploadFailed")
+
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+    expect(fetchMock.mock.calls.some(([url]) => (
+      url === "https://api.example/api/widget/chat/task/create"
+    ))).toBe(false)
+  })
+
   it("authenticates a share link and persists the guest token for reuse", async () => {
     localStorage.clear()
     fetchMock.mockResolvedValueOnce(jsonResponse(successfulAgentAuth))
@@ -607,6 +653,7 @@ describe("PublicAgentChatPage", () => {
       access_token: "public-access-token",
     })
     expect(app.provider).toMatchObject({ token: "public-access-token" })
+    expect(app.provider?.transport?.legacyErrorProse).toBe("untrusted")
     expect(app.provider?.transport?.buildWebSocketUrl?.({
       baseUrl: "wss://api.example",
       taskId: 42,
@@ -711,8 +758,10 @@ describe("PublicAgentChatPage", () => {
     expect(panel).toHaveAttribute("data-show-process-view", "true")
     // The share/widget exclusion only means something once there's an active
     // conversation -- in widget mode this same state renders the "..." menu
-    // (see the standalone-newConversation share button asserted below).
+    // and close button (see the standalone-newConversation share button
+    // asserted below).
     expect(screen.queryByRole("button", { name: "widgetChat.moreOptions" })).toBeNull()
+    expect(screen.queryByRole("button", { name: "widgetChat.close" })).toBeNull()
     expect(screen.getByRole("button", { name: "widgetChat.newConversation" })).toBeInTheDocument()
   })
 

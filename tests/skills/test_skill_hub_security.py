@@ -3,16 +3,25 @@
 from __future__ import annotations
 
 import io
+import struct
+import tracemalloc
 import zipfile
 
 import pytest
 from fastapi import HTTPException
 
 from xagent.web.api.skill_hub import (
+    _MAX_ARCHIVE_ENTRIES,
+    _MAX_SKILL_FILE_PATH_CHARS,
+    _MAX_SKILL_MD_CHARS,
+    _NAME_RE,
     _check_registry_security_gate,
+    _derive_upload_skill_name,
     _normalize_skill_files,
     _safe_zip_extract,
     _safe_zip_to_files,
+    _slugify_skill_name,
+    _validate_skill_name,
 )
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -440,6 +449,851 @@ class TestArchiveCruft:
         assert "hidden file" in exc.value.detail
 
 
+# ── POST /upload — naming ────────────────────────────────────────────────────
+
+
+SKILL_MD_NAMED = b"""---
+name: pdf-tools
+description: Work with PDFs.
+---
+
+# PDF Tools
+"""
+
+
+class TestDeriveUploadSkillName:
+    def test_zip_root_wins(self):
+        name = _derive_upload_skill_name("archive.zip", "my-skill", SKILL_MD_NAMED)
+        assert name == "my-skill"
+
+    def test_frontmatter_name_beats_filename(self):
+        name = _derive_upload_skill_name("archive.zip", "", SKILL_MD_NAMED)
+        assert name == "pdf-tools"
+
+    def test_filename_stem_is_last_resort(self):
+        name = _derive_upload_skill_name("My Skill.zip", "", SKILL_MD)
+        assert name == "My-Skill"
+
+    def test_no_candidate_raises(self):
+        with pytest.raises(HTTPException) as exc:
+            _derive_upload_skill_name("---.zip", "", SKILL_MD)
+        assert exc.value.status_code == 400
+
+    def test_slugify(self):
+        assert _slugify_skill_name("  Café menu skill!  ") == "Caf-menu-skill"
+        assert _slugify_skill_name("ok_name-1") == "ok_name-1"
+        assert _slugify_skill_name("///") == ""
+
+
+class TestUploadNameOverride:
+    """An explicit name is honoured or refused, never silently rewritten.
+
+    Two separate bugs converge here. End-to-end testing found the server
+    slugifying an override, so ``name=bad name!`` returned 200 with a skill
+    called ``bad-name``. Refusing instead is only half the fix: the check then
+    round-tripped through the slugifier, which strips leading and trailing
+    "-"/"_", so ``_foo`` and ``my_skill_`` were refused citing the very pattern
+    they match — while the frontend and ``POST /create`` both accept them.
+    Validate against ``_NAME_RE`` directly and the three agree.
+    """
+
+    def test_valid_override_wins(self):
+        assert (
+            _derive_upload_skill_name("a.zip", "zip-root", SKILL_MD, override="mine")
+            == "mine"
+        )
+
+    @pytest.mark.parametrize("override", ["  mine  ", "   "])
+    def test_override_is_not_silently_trimmed_or_derived(self, override):
+        with pytest.raises(HTTPException) as exc:
+            _derive_upload_skill_name("a.zip", "root", SKILL_MD, override=override)
+        assert exc.value.status_code == 400
+
+    def test_empty_override_falls_back_to_zip_root(self):
+        assert (
+            _derive_upload_skill_name("a.zip", "root", SKILL_MD, override="") == "root"
+        )
+
+    def test_no_override_falls_back_to_zip_root(self):
+        assert _derive_upload_skill_name("a.zip", "root", SKILL_MD) == "root"
+
+    @pytest.mark.parametrize(
+        "name", ["_foo", "foo_", "my-skill-", "__init__", "my_skill_", "ok-name"]
+    )
+    def test_names_matching_the_pattern_are_accepted(self, name):
+        assert _NAME_RE.match(name), "test premise: this matches the documented rule"
+        assert (
+            _derive_upload_skill_name("a.zip", "root", SKILL_MD, override=name) == name
+        )
+
+    @pytest.mark.parametrize("bad", ["bad name!", "../evil", "my/skill", "x" * 65])
+    def test_names_breaking_the_pattern_are_refused(self, bad):
+        with pytest.raises(HTTPException) as exc:
+            _derive_upload_skill_name("a.zip", "root", SKILL_MD, override=bad)
+        assert exc.value.status_code == 400
+
+    @pytest.mark.parametrize(
+        "filename",
+        [
+            "../../evil.md",
+            "/etc/passwd.md",
+            "....//evil.md",
+            "a/../../b.md",
+            "~/.ssh/authorized_keys.md",
+            "C:\\Windows\\evil.md",
+        ],
+    )
+    def test_hostile_filenames_cannot_smuggle_a_path(self, filename):
+        """The filename is attacker-controlled and feeds the name of a
+        directory, so nothing resembling a path may survive into it.
+
+        Two independent stages hold this: the stem is taken and slugified to
+        [A-Za-z0-9_-]+, then ``_write_personal_skill`` validates the result
+        again. Asserting on the charset rather than on specific outputs keeps
+        this honest if the slugifier is ever changed.
+        """
+        derived = _derive_upload_skill_name(filename, "", SKILL_MD)
+        assert _NAME_RE.match(derived), f"{derived!r} escaped the charset"
+        assert not {"/", "\\"} & set(derived)
+        assert ".." not in derived
+        # The writer re-validates independently of the deriving step.
+        _validate_skill_name(derived)
+
+
+# ── POST /upload — route ─────────────────────────────────────────────────────
+
+
+def _make_upload(filename: str, data: bytes):
+    from fastapi import UploadFile
+
+    return UploadFile(file=io.BytesIO(data), filename=filename)
+
+
+def _upload_args():
+    from types import SimpleNamespace
+
+    from xagent.skills.library import SkillScopeContext
+
+    return (
+        SimpleNamespace(),
+        SkillScopeContext(user_id=7, metadata={}),
+        object(),
+        SimpleNamespace(id=7),
+    )
+
+
+def _stub_write_and_manager(monkeypatch, skill_hub):
+    """Record what the route would persist, and report it back as loaded."""
+    written: dict = {}
+
+    def _fake_write(*, db, user, name, files, origin="custom", **kwargs):
+        written.update(name=name, files=files, origin=origin)
+
+    class _Manager:
+        async def get_skill(self, name):
+            return {"name": name, "scope": "personal", "path": ""}
+
+    async def _scoped(*args):
+        return _Manager()
+
+    monkeypatch.setattr(skill_hub, "_write_personal_skill", _fake_write)
+    monkeypatch.setattr(skill_hub, "_get_scoped_manager", _scoped)
+    return written
+
+
+class TestUploadRoute:
+    @pytest.mark.asyncio
+    async def test_zip_with_traversal_rejected(self):
+        from xagent.web.api import skill_hub
+
+        data = _make_zip({"skill/SKILL.md": SKILL_MD, "skill/../../escape.py": b"evil"})
+        request, scope, db, user = _upload_args()
+        with pytest.raises(HTTPException) as exc:
+            await skill_hub.upload_skill(
+                request,
+                file=_make_upload("skill.zip", data),
+                scope="personal",
+                name=None,
+                context=scope,
+                db=db,
+                _user=user,
+            )
+        assert exc.value.status_code == 400
+        assert "unsafe" in exc.value.detail.lower()
+
+    @pytest.mark.asyncio
+    async def test_unsupported_extension_rejected(self):
+        from xagent.web.api import skill_hub
+
+        request, scope, db, user = _upload_args()
+        with pytest.raises(HTTPException) as exc:
+            await skill_hub.upload_skill(
+                request,
+                file=_make_upload("skill.tar.gz", b"x"),
+                scope="personal",
+                name=None,
+                context=scope,
+                db=db,
+                _user=user,
+            )
+        assert exc.value.status_code == 400
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad_scope", ["", "global", "PERSONAL", "team; drop"])
+    async def test_unknown_scope_rejected(self, bad_scope):
+        from xagent.web.api import skill_hub
+
+        request, scope, db, user = _upload_args()
+        with pytest.raises(HTTPException) as exc:
+            await skill_hub.upload_skill(
+                request,
+                file=_make_upload("skill.md", SKILL_MD),
+                scope=bad_scope,
+                name=None,
+                context=scope,
+                db=db,
+                _user=user,
+            )
+        assert exc.value.status_code == 400
+        assert "scope" in exc.value.detail
+
+    @pytest.mark.asyncio
+    async def test_configured_upload_limit_is_honoured(self, monkeypatch):
+        """A deployment that lowers XAGENT_MAX_UPLOAD_SIZE must actually get
+        the lower bound, and the message must quote the bound in force.
+
+        The route used to read the fixed 50 MiB registry-download budget, so a
+        1 MiB configured limit was ignored entirely and the detail advertised
+        whichever number the route happened to hold.
+        """
+        from xagent.web.api import skill_hub
+
+        monkeypatch.setenv("XAGENT_MAX_UPLOAD_SIZE", "1M")
+        request, scope, db, user = _upload_args()
+        with pytest.raises(HTTPException) as exc:
+            await skill_hub.upload_skill(
+                request,
+                file=_make_upload("skill.zip", b"x" * (1024 * 1024 + 1)),
+                scope="personal",
+                name=None,
+                context=scope,
+                db=db,
+                _user=user,
+            )
+        assert exc.value.status_code == 413
+        assert "1 MiB" in exc.value.detail, exc.value.detail
+
+    @pytest.mark.asyncio
+    async def test_configured_limit_cannot_exceed_the_decompression_budget(
+        self, monkeypatch
+    ):
+        """A configured limit above the extractor's own budget must clamp to
+        it, or the route would advertise a ceiling the extractor then refuses.
+        """
+        from xagent.web.api import skill_hub
+
+        monkeypatch.setenv("XAGENT_MAX_UPLOAD_SIZE", "4G")
+        request, scope, db, user = _upload_args()
+        with pytest.raises(HTTPException) as exc:
+            await skill_hub.upload_skill(
+                request,
+                file=_make_upload("s.txt", b"x"),
+                scope="personal",
+                name=None,
+                context=scope,
+                db=db,
+                _user=user,
+            )
+        # Falls through to the extension check, proving the 4G limit did not
+        # make the route try to buffer 4 GiB first.
+        assert exc.value.status_code == 400
+        assert "Unsupported upload" in exc.value.detail
+
+    @pytest.mark.asyncio
+    async def test_oversized_upload_rejected(self, monkeypatch):
+        from xagent.web.api import skill_hub
+
+        monkeypatch.setattr(skill_hub, "_MAX_DOWNLOAD_BYTES", 64)
+        request, scope, db, user = _upload_args()
+        with pytest.raises(HTTPException) as exc:
+            await skill_hub.upload_skill(
+                request,
+                file=_make_upload("skill.zip", b"x" * 65),
+                scope="personal",
+                name=None,
+                context=scope,
+                db=db,
+                _user=user,
+            )
+        assert exc.value.status_code == 413
+
+    @pytest.mark.asyncio
+    async def test_zip_happy_path_persists_with_upload_origin(self, monkeypatch):
+        from xagent.web.api import skill_hub
+
+        written = _stub_write_and_manager(monkeypatch, skill_hub)
+        data = _make_zip({"pdf-tools/SKILL.md": SKILL_MD, "pdf-tools/ref.md": b"r"})
+        request, scope, db, user = _upload_args()
+        summary = await skill_hub.upload_skill(
+            request,
+            file=_make_upload("archive.zip", data),
+            scope="personal",
+            name=None,
+            context=scope,
+            db=db,
+            _user=user,
+        )
+        assert summary.name == "pdf-tools"
+        assert written["name"] == "pdf-tools"
+        assert written["origin"] == "upload"
+        assert set(written["files"]) == {"SKILL.md", "ref.md"}
+
+    @pytest.mark.asyncio
+    async def test_bare_markdown_uses_frontmatter_name(self, monkeypatch):
+        from xagent.web.api import skill_hub
+
+        written = _stub_write_and_manager(monkeypatch, skill_hub)
+        request, scope, db, user = _upload_args()
+        summary = await skill_hub.upload_skill(
+            request,
+            file=_make_upload("whatever.md", SKILL_MD_NAMED),
+            scope="personal",
+            name=None,
+            context=scope,
+            db=db,
+            _user=user,
+        )
+        assert summary.name == "pdf-tools"
+        assert written["files"] == {"SKILL.md": SKILL_MD_NAMED}
+
+    @pytest.mark.asyncio
+    async def test_non_utf8_markdown_rejected(self):
+        from xagent.web.api import skill_hub
+
+        request, scope, db, user = _upload_args()
+        with pytest.raises(HTTPException) as exc:
+            await skill_hub.upload_skill(
+                request,
+                file=_make_upload("skill.md", b"\xff\xfe\x00bad"),
+                scope="personal",
+                name=None,
+                context=scope,
+                db=db,
+                _user=user,
+            )
+        assert exc.value.status_code == 400
+
+
+# ── POST /upload — no ghost rows ─────────────────────────────────────────────
+
+
+class TestNoGhostRows:
+    """A row that commits must be one the skill machinery can read.
+
+    ``_write_personal_skill`` validates the bundle *before* it commits, so an
+    unloadable bundle never reaches the table and there is nothing to undo.
+    That is what retired the old commit-then-rollback tail: a name-keyed
+    compensating delete had to identify the row it was undoing, and got it
+    wrong whenever the name had been reused by a concurrent attempt.
+
+    A read side that is merely behind is therefore not a failure -- the write
+    is durable and was parsed -- so the route answers from the validated
+    bundle instead of rolling back. These drive the real
+    ``_write_personal_skill`` against a live SQLite session and assert on the
+    table, so they can tell a genuine refusal from one that left a row.
+    """
+
+    @staticmethod
+    def _session(tmp_path):
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+
+        from xagent.web.models.database import Base
+        from xagent.web.models.skill import UserSkill, UserSkillFile
+        from xagent.web.models.user import User
+
+        engine = create_engine(f"sqlite:///{tmp_path / 'skills.db'}")
+        Base.metadata.create_all(
+            engine,
+            tables=[User.__table__, UserSkill.__table__, UserSkillFile.__table__],
+        )
+        session_factory = sessionmaker(bind=engine)
+        db = session_factory()
+        db.execute(
+            User.__table__.insert().values(
+                id=7, username="uploader", password_hash="hash", is_admin=False
+            )
+        )
+        db.commit()
+        return db
+
+    @staticmethod
+    def _rows(db):
+        from xagent.web.models.skill import UserSkill
+
+        return sorted(name for (name,) in db.query(UserSkill.name).all())
+
+    @classmethod
+    async def _upload(
+        cls,
+        monkeypatch,
+        db,
+        members,
+        *,
+        breaks_parse=False,
+        shadowed_by=None,
+        override=None,
+        filename="bundle.zip",
+    ):
+        """Drive the route with a manager that can model any cache outcome.
+
+        ``shadowed_by`` returns a record from another scope under the uploaded
+        name — what really happens when a personal record fails to parse and a
+        same-named builtin stays resident in the cache. A stub that can only
+        answer ``None`` or the skill's own dict cannot express that case at
+        all, which is why it went unnoticed.
+        """
+        from types import SimpleNamespace
+
+        from xagent.skills.library import SkillScopeContext
+        from xagent.web.api import skill_hub
+
+        class _Manager:
+            async def get_skill(self, name):
+                if shadowed_by is not None:
+                    # A record from another scope survives under this name.
+                    return {
+                        "name": name,
+                        "scope": None,
+                        "source": shadowed_by,
+                        "path": f"/{shadowed_by}/{name}",
+                        "description": "someone else's skill",
+                    }
+                # Model reload()'s log-and-skip: an unloadable record is simply
+                # absent, which is exactly what produced the ghost row.
+                return None if breaks_parse else {"name": name, "scope": "personal"}
+
+        async def _scoped(*args):
+            return _Manager()
+
+        monkeypatch.setattr(skill_hub, "_get_scoped_manager", _scoped)
+
+        data = members if isinstance(members, bytes) else _make_zip(members)
+        return await skill_hub.upload_skill(
+            SimpleNamespace(),
+            file=_make_upload(filename, data),
+            scope="personal",
+            name=override,
+            context=SkillScopeContext(user_id=7, metadata={}),
+            db=db,
+            _user=SimpleNamespace(id=7),
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad_file", ["SKILL.md", "template.md"])
+    async def test_non_utf8_is_refused_before_any_write(
+        self, monkeypatch, tmp_path, bad_file
+    ):
+        # A SKILL.md saved as Latin-1 by a Windows editor is enough to hit this.
+        db = self._session(tmp_path)
+        members = {"s/SKILL.md": SKILL_MD, f"s/{bad_file}": b"\xe9\xff\xfe latin-1"}
+        with pytest.raises(HTTPException) as exc:
+            await self._upload(monkeypatch, db, members)
+        assert exc.value.status_code == 400
+        assert bad_file in exc.value.detail
+        assert self._rows(db) == [], "nothing may be written when parsing fails"
+
+    @pytest.mark.asyncio
+    async def test_lagging_read_side_answers_from_the_validated_bundle(
+        self, monkeypatch, tmp_path
+    ):
+        """A cache that cannot serve the write yet is not a failed upload.
+
+        The bundle was parsed before the commit, so the row is durable and
+        loadable; only the manager's view is behind. Answering 5xx here would
+        be a lie the client cannot act on -- a replay re-enters the
+        ``(user, name)`` pre-check and gets a deterministic 409, so "retry" is
+        guidance that cannot work.
+        """
+        db = self._session(tmp_path)
+        summary = await self._upload(
+            monkeypatch, db, {"s/SKILL.md": SKILL_MD}, breaks_parse=True
+        )
+        assert summary.name == "s"
+        assert self._rows(db) == ["s"], "the durable row must survive untouched"
+
+    @pytest.mark.asyncio
+    async def test_unparsable_bundle_never_reaches_the_table(
+        self, monkeypatch, tmp_path
+    ):
+        """Validation happens before the commit, so there is nothing to undo.
+
+        This is the invariant that replaced the rollback: refuse at the gate
+        rather than commit, discover, and compensate by name.
+        """
+        db = self._session(tmp_path)
+        with pytest.raises(HTTPException) as exc:
+            await self._upload(monkeypatch, db, {"s/SKILL.md": b"\xff\xfe not utf-8"})
+        assert exc.value.status_code == 400
+        assert self._rows(db) == [], "nothing may be written when parsing fails"
+
+    @pytest.mark.asyncio
+    async def test_identical_upload_retry_replays_the_result(
+        self, monkeypatch, tmp_path
+    ):
+        """A lost success response can retry without becoming a false 409."""
+        db = self._session(tmp_path)
+        assert (
+            await self._upload(monkeypatch, db, {"s/SKILL.md": SKILL_MD})
+        ).name == "s"
+        replay = await self._upload(monkeypatch, db, {"s/SKILL.md": SKILL_MD})
+        assert replay.name == "s"
+        assert self._rows(db) == ["s"], "a replay must not create another row"
+
+    @pytest.mark.asyncio
+    async def test_same_name_with_different_content_is_still_409(
+        self, monkeypatch, tmp_path
+    ):
+        db = self._session(tmp_path)
+        await self._upload(monkeypatch, db, {"s/SKILL.md": SKILL_MD})
+        with pytest.raises(HTTPException) as exc:
+            await self._upload(
+                monkeypatch,
+                db,
+                {"s/SKILL.md": SKILL_MD + b"\nDifferent instructions.\n"},
+            )
+        assert exc.value.status_code == 409
+        assert self._rows(db) == ["s"], "the first skill must survive untouched"
+
+    @pytest.mark.asyncio
+    async def test_same_bundle_from_another_write_path_is_not_an_upload_replay(
+        self, monkeypatch, tmp_path
+    ):
+        from types import SimpleNamespace
+
+        from xagent.web.api import skill_hub
+
+        db = self._session(tmp_path)
+        skill_hub._write_personal_skill(
+            db=db,
+            user=SimpleNamespace(id=7),
+            name="s",
+            files={"SKILL.md": SKILL_MD},
+            origin="custom",
+        )
+        with pytest.raises(HTTPException) as exc:
+            await self._upload(monkeypatch, db, {"s/SKILL.md": SKILL_MD})
+        assert exc.value.status_code == 409
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("override", [None, "my-name"])
+    async def test_parser_failure_refused_on_both_naming_paths(
+        self, monkeypatch, tmp_path, override
+    ):
+        """Validation must not depend on which naming branch runs.
+
+        Deriving the name parses frontmatter itself, so a check placed after it
+        never sees a bundle that breaks the parser — and an explicit name
+        short-circuits that derivation entirely. Both branches must refuse.
+
+        The trigger is injected rather than crafted: a payload deep enough to
+        exhaust the stack is a property of the runner's recursion limit, not of
+        this code, so a fixed depth passes locally and parses fine on a runner
+        with more headroom. What matters is that *any* parser failure is
+        refused before the write, whatever provokes it.
+        """
+        from xagent.skills.parser import SkillParser
+
+        db = self._session(tmp_path)
+
+        # Explode inside _extract_frontmatter: that is what deep YAML actually
+        # blows up, and — crucially — what the *naming* step calls. Injecting
+        # at parse_bundle instead would still pass with the check placed after
+        # naming, so it would not pin the ordering this test exists for.
+        real_extract = SkillParser._extract_frontmatter
+
+        def exploding_extract(content):
+            if "BOOM" in content:
+                raise RecursionError("simulated deep-YAML stack exhaustion")
+            return real_extract(content)
+
+        monkeypatch.setattr(
+            SkillParser, "_extract_frontmatter", staticmethod(exploding_extract)
+        )
+
+        with pytest.raises(HTTPException) as exc:
+            await self._upload(
+                monkeypatch,
+                db,
+                {"s/SKILL.md": SKILL_MD + b"\nBOOM\n"},
+                override=override,
+            )
+        assert exc.value.status_code == 400
+        assert self._rows(db) == [], "an unparsable bundle must never be written"
+
+    @pytest.mark.asyncio
+    async def test_name_override_does_not_skip_the_parse_check(
+        self, monkeypatch, tmp_path
+    ):
+        """An explicit name must not opt out of the pre-write parse.
+
+        Naming used to be the only thing that parsed frontmatter, so passing
+        ``name=`` skipped it: deeply nested YAML (valid UTF-8, so the old check
+        passed it) then reached the database.
+        """
+        # Non-UTF-8 rather than deep YAML: it fails the parser identically but
+        # deterministically, without depending on the runner's stack depth.
+        db = self._session(tmp_path)
+        with pytest.raises(HTTPException) as exc:
+            await self._upload(
+                monkeypatch,
+                db,
+                {"s/SKILL.md": b"\xff\xfe not utf-8"},
+                override="my-name",
+            )
+        assert exc.value.status_code == 400
+        assert self._rows(db) == [], "an unparsable bundle must never be written"
+
+    @pytest.mark.asyncio
+    async def test_shadowing_record_is_not_reported_as_success(
+        self, monkeypatch, tmp_path
+    ):
+        """A same-named builtin must not satisfy the post-write check.
+
+        ``reload`` keys the cache by name with filesystem records first, so a
+        builtin survives when the personal record fails to parse. A bare
+        ``is None`` test returned 200 carrying that unrelated skill's content
+        instead of the bundle that was actually written.
+
+        The write itself is valid and durable, so the answer comes from the
+        validated bundle -- what must never happen is reporting the *builtin*
+        back as though it were the upload.
+        """
+        db = self._session(tmp_path)
+        summary = await self._upload(
+            monkeypatch,
+            db,
+            {"s/SKILL.md": SKILL_MD},
+            shadowed_by="builtin",
+            override="agent-builder",
+        )
+        assert summary.name == "agent-builder"
+        assert summary.source != "builtin", "the shadowing record must not be returned"
+        assert self._rows(db) == ["agent-builder"], "our own row must survive"
+
+    @pytest.mark.asyncio
+    async def test_personal_success_does_not_depend_on_post_commit_readback(
+        self, monkeypatch, tmp_path
+    ):
+        """A provider failure after commit cannot turn success into a 500."""
+        from types import SimpleNamespace
+
+        from xagent.skills.library import SkillScopeContext
+        from xagent.web.api import skill_hub
+
+        db = TestNoGhostRows._session(tmp_path)
+
+        async def explode(*args, **kwargs):
+            raise RuntimeError("post-commit readback must not run")
+
+        monkeypatch.setattr(skill_hub, "_get_scoped_manager", explode)
+
+        summary = await skill_hub.upload_skill(
+            SimpleNamespace(),
+            file=_make_upload("bundle.zip", _make_zip({"s/SKILL.md": SKILL_MD})),
+            scope="personal",
+            name=None,
+            context=SkillScopeContext(user_id=7, metadata={}),
+            db=db,
+            _user=SimpleNamespace(id=7),
+        )
+        assert summary.name == "s"
+        assert TestNoGhostRows._rows(db) == ["s"], (
+            "the validated row must remain durable"
+        )
+
+
+# ── resource bounds on untrusted archives ────────────────────────────────────
+
+
+class TestArchiveResourceBounds:
+    """The byte budget does not bound the entry *count*, and the database
+    columns bound things the normalizer never checked."""
+
+    def test_entry_count_is_capped_before_any_member_is_read(self):
+        # 60k empty members fit in ~6 MiB: well inside the byte budget, but a
+        # synchronous walk over every entry plus one ORM insert per file.
+        members = {"root/SKILL.md": SKILL_MD}
+        members.update({f"root/f{i}.md": b"" for i in range(_MAX_ARCHIVE_ENTRIES + 50)})
+        data = _make_zip(members)
+        assert len(data) < 50 * 1024 * 1024, "test premise: within the byte budget"
+        with pytest.raises(HTTPException) as exc:
+            _safe_zip_extract(data, bad_zip_status=400)
+        assert exc.value.status_code == 400
+        assert "entries" in exc.value.detail
+
+    def test_padding_directories_count_towards_the_cap(self):
+        """Directories are skipped for content but still cost an entry to walk,
+        so excluding them would make the cap evadable with empty folders."""
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("root/SKILL.md", SKILL_MD)
+            for i in range(_MAX_ARCHIVE_ENTRIES + 50):
+                zf.writestr(f"root/d{i}/", b"")
+        with pytest.raises(HTTPException) as exc:
+            _safe_zip_extract(buf.getvalue(), bad_zip_status=400)
+        assert exc.value.status_code == 400
+        assert "entries" in exc.value.detail
+
+    def test_an_ordinary_bundle_is_unaffected(self):
+        data = _make_zip(
+            {"root/SKILL.md": SKILL_MD, **{f"root/r{i}.md": b"x" for i in range(20)}}
+        )
+        files, root = _safe_zip_extract(data, bad_zip_status=400)
+        assert root == "root"
+        assert len(files) == 21
+
+    def test_path_longer_than_the_column_is_refused(self):
+        """UserSkillFile.path is String(500). PostgreSQL raises DataError at
+        commit and the request dies as a 500; SQLite accepts it silently, so
+        the bound cannot be left to the database."""
+        long_rel = "/".join(["d" * 90] * 6) + "/ref.md"
+        assert len(long_rel) > _MAX_SKILL_FILE_PATH_CHARS, "test premise"
+        data = _make_zip({"root/SKILL.md": SKILL_MD, f"root/{long_rel}": b"x"})
+        with pytest.raises(HTTPException) as exc:
+            _safe_zip_extract(data, bad_zip_status=400)
+        assert exc.value.status_code == 400
+        assert "longer than" in exc.value.detail
+
+    def test_path_at_the_column_boundary_is_accepted(self):
+        exact = "d" * (_MAX_SKILL_FILE_PATH_CHARS - len("x.md") - 1) + "/x.md"
+        assert len(exact) == _MAX_SKILL_FILE_PATH_CHARS
+        files = _normalize_skill_files({"SKILL.md": SKILL_MD, exact: b"x"})
+        assert exact in files
+
+    def test_skill_md_over_the_character_cap_is_refused(self):
+        """Create/Edit cap skill_md at 200,000 characters. SKILL.md is injected
+        into the system prompt on every model turn, so an upload that skipped
+        the cap would fail at inference time instead of here."""
+        big = ("# Big\n\n## Description\n" + "x" * _MAX_SKILL_MD_CHARS).encode()
+        with pytest.raises(HTTPException) as exc:
+            _normalize_skill_files({"SKILL.md": big})
+        assert exc.value.status_code == 400
+        assert "200000" in exc.value.detail
+
+    def test_multibyte_content_is_counted_in_characters_not_bytes(self):
+        """The Create/Edit cap is a character count, so a bundle whose UTF-8
+        encoding is three times the limit still passes when its character
+        count does not. Counting bytes here would reject it and put the two
+        write paths back out of step."""
+        body = "汉" * (_MAX_SKILL_MD_CHARS - 100)
+        content = f"# S\n\n## Description\n{body}\n".encode()
+        assert len(content) > _MAX_SKILL_MD_CHARS * 2, "test premise: bytes >> chars"
+        files = _normalize_skill_files({"SKILL.md": content})
+        assert files["SKILL.md"] == content
+
+
+# ── concurrent duplicate names ───────────────────────────────────────────────
+
+
+class TestDuplicateNameRace:
+    """The pre-check SELECT and the write are not atomic across sessions."""
+
+    @staticmethod
+    def _engine(tmp_path):
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+
+        from xagent.web.models.database import Base
+        from xagent.web.models.skill import UserSkill, UserSkillFile
+        from xagent.web.models.user import User
+
+        engine = create_engine(f"sqlite:///{tmp_path / 'race.db'}")
+        Base.metadata.create_all(
+            engine,
+            tables=[User.__table__, UserSkill.__table__, UserSkillFile.__table__],
+        )
+        factory = sessionmaker(bind=engine)
+        with factory() as db:
+            db.execute(
+                User.__table__.insert().values(
+                    id=7, username="racer", password_hash="h", is_admin=False
+                )
+            )
+            db.commit()
+        return factory
+
+    def test_loser_of_the_race_gets_409_not_500(self, tmp_path):
+        """Both sessions pass the pre-check, so one hits the unique constraint
+        at flush. Without the guard it escapes as IntegrityError and the API
+        answers 500 where the contract says 409."""
+        import threading
+        from types import SimpleNamespace
+
+        from xagent.web.api import skill_hub
+
+        factory = self._engine(tmp_path)
+        files = {"SKILL.md": SKILL_MD}
+        barrier = threading.Barrier(2)
+        flushed: dict[str, bool] = {}
+        results: dict[str, str] = {}
+
+        def attempt(tag: str) -> None:
+            db = factory()
+            original_flush = db.flush
+
+            def flush_then_sync(*args, **kwargs):
+                out = original_flush(*args, **kwargs)
+                if tag not in flushed:
+                    flushed[tag] = True
+                    # Both rows are now pending, neither committed.
+                    barrier.wait(timeout=10)
+                return out
+
+            db.flush = flush_then_sync
+            try:
+                skill_hub._write_personal_skill(
+                    db=db, user=SimpleNamespace(id=7), name="dup", files=files
+                )
+                results[tag] = "committed"
+            except HTTPException as exc:
+                results[tag] = f"http-{exc.status_code}"
+            finally:
+                db.close()
+
+        threads = [threading.Thread(target=attempt, args=(t,)) for t in ("a", "b")]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert sorted(results.values()) == ["committed", "http-409"], results
+
+    def test_an_unrelated_integrity_error_is_not_reported_as_a_duplicate(
+        self, tmp_path, monkeypatch
+    ):
+        """The guard must not swallow every IntegrityError. A foreign-key
+        violation is a bug, not a name conflict, and has to stay loud."""
+        from types import SimpleNamespace
+
+        from sqlalchemy.exc import IntegrityError
+
+        from xagent.web.api import skill_hub
+
+        factory = self._engine(tmp_path)
+        db = factory()
+        boom = IntegrityError("INSERT", {}, Exception("FOREIGN KEY constraint failed"))
+        monkeypatch.setattr(db, "flush", lambda *a, **k: (_ for _ in ()).throw(boom))
+        with pytest.raises(IntegrityError):
+            skill_hub._write_personal_skill(
+                db=db,
+                user=SimpleNamespace(id=9999),
+                name="orphan",
+                files={"SKILL.md": SKILL_MD},
+            )
+        db.close()
+
+
 # ── _check_registry_security_gate ────────────────────────────────────────────
 
 
@@ -605,3 +1459,592 @@ async def test_team_write_routes_adopt_the_central_provider_invoker(
     assert context.user_id == scope.user_id
     assert context.metadata == scope.metadata
     assert kwargs["scope"] == "team"
+
+
+# ── hostile-archive bounds (P2a) ──────────────────────────────────────────────
+
+
+def _archive_with_padded_directory(*, entries: int, padding: int) -> bytes:
+    """An archive whose central directory is inflated by per-entry extra fields.
+
+    Names stay short and the count stays under the cap, so the only bound that
+    can reject it is the one on bytes read during construction.
+    """
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("SKILL.md", SKILL_MD)
+        for i in range(entries):
+            info = zipfile.ZipInfo(f"f{i}.md")
+            # 0xFFFF is an unassigned extra-field header id, so readers carry
+            # the block along without interpreting it.
+            info.extra = b"\xff\xff" + padding.to_bytes(2, "little") + b"\x00" * padding
+            zf.writestr(info, b"x")
+    return buf.getvalue()
+
+
+def _zip64_archive_under_the_byte_cap(entries: int) -> bytes:
+    """A genuine Zip64 archive whose directory stays under the byte cap.
+
+    Assembled by hand: the stdlib only emits a Zip64 end record past 65,535
+    entries, and such an archive's directory is far over the byte cap, so the
+    byte bound answers it before the entry count is ever consulted. This shape
+    -- short names, a small directory, a real Zip64 record made authoritative
+    by pinning the legacy count to the sentinel -- is the one that exercises
+    the Zip64 read path against the *entry* cap.
+    """
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("SKILL.md", SKILL_MD)
+        for i in range(entries - 1):
+            zf.writestr(str(i), b"")
+    base = buf.getvalue()
+    eocd_start = base.rfind(_EOCD_SIGNATURE)
+    _sig, _d1, _d2, _eth, total, size_cd, offset_cd, _cl = struct.unpack(
+        "<4s4H2LH", base[eocd_start : eocd_start + 22]
+    )
+    body = base[:eocd_start]
+    eocd = bytearray(base[eocd_start:])
+    zip64_eocd = struct.pack(
+        "<4sQ2H2L4Q",
+        b"PK\x06\x06",
+        44,
+        45,
+        45,
+        0,
+        0,
+        total,
+        total,
+        size_cd,
+        offset_cd,
+    )
+    locator = struct.pack("<4sLQL", b"PK\x06\x07", 0, len(body), 1)
+    struct.pack_into("<H", eocd, 10, 0xFFFF)
+    return body + zip64_eocd + locator + bytes(eocd)
+
+
+def _comment_boundary_archive() -> bytes:
+    """An archive whose EOCD sits exactly 65536 bytes from EOF.
+
+    CPython 3.11 searches ``filesize - 65536 - 22`` and 3.12+ searches
+    ``filesize - 65535 - 22``, so this shape is findable on one and not the
+    other. Any hand-written window had to pick a side and be wrong on the
+    rest; the bounded reader never searches, so it is right on both.
+    """
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("SKILL.md", SKILL_MD)
+        for i in range(20000):
+            zf.writestr(str(i), b"")
+        zf.comment = b"C" * 65535
+    return buf.getvalue() + b"X"
+
+
+def _archive_with_entries(count: int, *, dirs: bool = False) -> bytes:
+    """``count`` entries under one-character names, keeping the directory small.
+
+    Short names are the point: an archive can then be far over the *entry* cap
+    while its central directory stays under the *byte* cap, which is the shape
+    that separates the two bounds.
+    """
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", allowZip64=True) as zf:
+        zf.writestr("SKILL.md", SKILL_MD)
+        for i in range(count - 1):
+            zf.writestr(str(i) + ("/" if dirs else ""), b"")
+    return buf.getvalue()
+
+
+def _with_eocd_count_decoy(zip_bytes: bytes, *, size_cd: int | None = None) -> bytes:
+    """Rewrite the legacy EOCD counts to small, non-sentinel decoys.
+
+    EOCD layout (``<4s4H2LH``): entries-this-disk at +8, entries-total at +10,
+    central-directory size at +12.
+    """
+    raw = bytearray(zip_bytes)
+    eocd = raw.rfind(_EOCD_SIGNATURE)
+    struct.pack_into("<HH", raw, eocd + 8, 10, 10)
+    if size_cd is not None:
+        struct.pack_into("<L", raw, eocd + 12, size_cd)
+    return bytes(raw)
+
+
+# A self-extracting archive's stub: arbitrary bytes before the logical ZIP.
+_STUB_PREFIX = b"MZ" + b"\x00" * 4094
+_EOCD_SIGNATURE = b"PK\x05\x06"
+
+
+class TestEntryCap:
+    """The entry cap, and what it does and does not promise.
+
+    It is applied to ``zf.infolist()`` after ``ZipFile`` has parsed the
+    directory, so it bounds the per-entry work that follows -- one ORM insert
+    per file, the walk over every member -- but *not* the construction itself.
+    Bounding construction is a separate problem, tracked in #1941; these tests
+    assert the cap that exists rather than one that does not.
+    """
+
+    @pytest.mark.parametrize(
+        "label,build",
+        [
+            ("plain", lambda: _archive_with_entries(2001)),
+            ("directories count too", lambda: _archive_with_entries(2001, dirs=True)),
+            (
+                "count decoyed in the EOCD",
+                lambda: _with_eocd_count_decoy(_archive_with_entries(2001)),
+            ),
+            ("behind an SFX stub", lambda: _STUB_PREFIX + _archive_with_entries(2001)),
+            (
+                "zip64, directory under the old byte cap",
+                lambda: _zip64_archive_under_the_byte_cap(2001),
+            ),
+        ],
+    )
+    def test_over_the_cap_is_refused(self, label, build):
+        with pytest.raises(HTTPException) as exc:
+            _safe_zip_extract(build(), bad_zip_status=400)
+        assert exc.value.status_code == 400
+        assert "entries" in exc.value.detail
+
+    @pytest.mark.parametrize(
+        "label,build",
+        [
+            ("exactly at the cap", lambda: _archive_with_entries(2000)),
+            (
+                "ordinary bundle",
+                lambda: _make_zip({"SKILL.md": SKILL_MD, "n.md": b"h"}),
+            ),
+            (
+                "behind an SFX stub",
+                lambda: _STUB_PREFIX + _make_zip({"SKILL.md": SKILL_MD, "n.md": b"h"}),
+            ),
+            ("zip64 at the cap", lambda: _zip64_archive_under_the_byte_cap(2000)),
+        ],
+    )
+    def test_within_the_cap_is_accepted(self, label, build):
+        files, _root = _safe_zip_extract(build(), bad_zip_status=400)
+        assert files["SKILL.md"] == SKILL_MD
+
+    def test_valid_comments_do_not_affect_the_count(self):
+        """A comment is not entries, whatever it contains.
+
+        Worth keeping even though nothing counts byte patterns any more: an
+        earlier revision bounded the count by scanning the byte stream for
+        central-header signatures, and rejected a valid 2,000-entry archive
+        carrying a one-byte comment (the end-record scan overlaps the
+        directory, so the same headers were counted twice) as well as a
+        one-entry archive whose comment legally contained 2,001 copies of that
+        signature.
+        """
+        for comment in (b"x", b"C" * 65535, b"PK\x01\x02" * 2001):
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w") as zf:
+                zf.writestr("SKILL.md", SKILL_MD)
+                for i in range(1999):
+                    zf.writestr(str(i), b"")
+                zf.comment = comment
+            data = buf.getvalue()
+            assert len(zipfile.ZipFile(io.BytesIO(data)).namelist()) == 2000
+            files, _root = _safe_zip_extract(data, bad_zip_status=400)
+            assert files["SKILL.md"] == SKILL_MD
+
+    def test_signatures_inside_member_content_do_not_affect_the_count(self):
+        data = _make_zip({"SKILL.md": SKILL_MD, "decoy.bin": b"PK\x01\x02" * 100000})
+        files, _root = _safe_zip_extract(data, bad_zip_status=400)
+        assert len(files["decoy.bin"]) == 400000
+
+    def test_non_zip_is_left_to_zipfile_to_reject(self):
+        with pytest.raises(HTTPException) as exc:
+            _safe_zip_extract(b"not a zip", bad_zip_status=400)
+        assert exc.value.status_code == 400
+        assert "readable ZIP" in exc.value.detail
+
+
+class TestCanonicalizationAndDuplicates:
+    """N2 — canonicalize before root selection; refuse duplicates."""
+
+    def test_dot_slash_prefix_does_not_lose_the_root(self):
+        """ "./SKILL.md" must count as depth 0, not lose to a nested root."""
+        data = _make_zip(
+            {"./SKILL.md": SKILL_MD, "nested/SKILL.md": b"# wrong", "./notes.md": b"n"}
+        )
+        files, root = _safe_zip_extract(data)
+        assert files["SKILL.md"] == SKILL_MD
+        assert "notes.md" in files
+        assert root == ""
+
+    def test_backslash_member_stays_inside_the_root(self):
+        """A Windows-written path must not fall outside the containment check."""
+        data = _make_zip({"my-skill/SKILL.md": SKILL_MD, "my-skill\\notes.md": b"kept"})
+        files, root = _safe_zip_extract(data)
+        assert root == "my-skill"
+        # Before canonicalization moved ahead of root selection this file did
+        # not start with "my-skill/" and was silently dropped, with a 200.
+        assert files["notes.md"] == b"kept"
+
+    def test_duplicate_canonical_paths_in_zip_rejected(self):
+        data = _make_zip({"SKILL.md": SKILL_MD, "./SKILL.md": b"# other"})
+        with pytest.raises(HTTPException) as exc:
+            _safe_zip_extract(data)
+        assert exc.value.status_code == 400
+        assert "two entries" in exc.value.detail
+
+    def test_duplicate_via_backslash_rejected(self):
+        data = _make_zip({"a/b.md": b"one", "a\\b.md": b"two", "SKILL.md": SKILL_MD})
+        with pytest.raises(HTTPException) as exc:
+            _safe_zip_extract(data)
+        assert exc.value.status_code == 400
+
+    def test_duplicate_canonical_paths_in_normalizer_rejected(self):
+        with pytest.raises(HTTPException) as exc:
+            _normalize_skill_files(
+                {"SKILL.md": SKILL_MD, "docs/a.md": b"one", "docs//a.md": b"two"}
+            )
+        assert exc.value.status_code == 400
+        assert "two entries" in exc.value.detail
+
+    def test_redundant_separators_collapse(self):
+        result = _normalize_skill_files({"SKILL.md": SKILL_MD, "a//./b.md": b"hi"})
+        assert result["a/b.md"] == b"hi"
+
+    @pytest.mark.parametrize("raw", ["///", ".", "./", "/", "\\\\"])
+    def test_degenerate_paths_never_reach_the_bundle(self, raw):
+        """A path that canonicalizes to nothing must be refused, not stored.
+
+        Asserted on the resulting keys as well as the status. Without the
+        check the empty string is written as a key and the bundle is returned
+        with it -- a shape no consumer expects -- and a status-only assertion
+        cannot see that, because a second degenerate entry would be caught by
+        the duplicate check and a single one is simply accepted.
+        """
+        with pytest.raises(HTTPException) as exc:
+            _normalize_skill_files({"SKILL.md": SKILL_MD, raw: b"x"})
+        assert exc.value.status_code == 400
+        assert "empty file path" in exc.value.detail
+
+    def test_a_bundle_never_carries_an_empty_key(self):
+        """The invariant behind the check above, stated directly."""
+        result = _normalize_skill_files({"SKILL.md": SKILL_MD, "docs/a.md": b"a"})
+        assert all(key for key in result), result
+        assert set(result) == {"SKILL.md", "docs/a.md"}
+
+    def test_traversal_still_refused_not_resolved(self):
+        """Canonicalization must not quietly resolve ".." into somewhere else."""
+        with pytest.raises(HTTPException) as exc:
+            _normalize_skill_files({"SKILL.md": SKILL_MD, "a/../../x.md": b"e"})
+        assert exc.value.status_code == 400
+        assert "traversal" in exc.value.detail.lower()
+
+
+class TestSkillMdContentBounds:
+    """N7 / H4 / H5 — the shared preparation boundary's content contract."""
+
+    @pytest.mark.parametrize("body", [b"", b"   ", b"\n\t \r\n"])
+    def test_empty_skill_md_rejected(self, body):
+        with pytest.raises(HTTPException) as exc:
+            _normalize_skill_files({"SKILL.md": body})
+        assert exc.value.status_code == 400
+        assert "empty" in exc.value.detail.lower()
+
+    def test_empty_skill_md_rejected_from_zip(self):
+        with pytest.raises(HTTPException) as exc:
+            _safe_zip_extract(_make_zip({"SKILL.md": b"  \n"}))
+        assert exc.value.status_code == 400
+        assert "empty" in exc.value.detail.lower()
+
+    def test_oversized_skill_md_rejected(self):
+        from xagent.web.api.skill_hub import _MAX_SKILL_MD_CHARS
+
+        with pytest.raises(HTTPException) as exc:
+            _normalize_skill_files({"SKILL.md": b"x" * (_MAX_SKILL_MD_CHARS + 1)})
+        assert exc.value.status_code == 400
+        assert str(_MAX_SKILL_MD_CHARS) in exc.value.detail
+
+    def test_oversized_skill_md_is_rejected_without_decoding_it(self):
+        """Finding #3: the rejection must not cost a full decoded copy.
+
+        Asserted on peak allocation, not on the status code. The character cap
+        returns the same 400 either way, so a status-only test stays green
+        with the byte bound deleted -- measured, 120 MiB instead of 80 MiB.
+        """
+        payload = b"a" * (40 * 1024 * 1024)
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("SKILL.md", payload)
+        data = buf.getvalue()
+        # A high-compression archive: tiny on the wire, huge once inflated.
+        assert len(data) < 1024 * 1024
+
+        tracemalloc.start()
+        try:
+            with pytest.raises(HTTPException) as exc:
+                _safe_zip_extract(data, bad_zip_status=400)
+            _peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        assert exc.value.status_code == 400
+        # The inflated member and the joined copy are unavoidable here; a
+        # third full-size string is not. Threshold measured, not guessed: with
+        # the byte bound the peak is ~80 MiB, without it 120 MiB, so it has to
+        # sit between them. The first version of this used 3.5x (140 MiB) --
+        # above *both* -- and could not fail.
+        assert _peak < 2.5 * len(payload), (
+            f"peak {_peak / 1048576:.1f} MiB suggests SKILL.md was decoded "
+            "before the byte bound rejected it"
+        )
+
+    def test_skill_md_at_the_cap_is_accepted(self):
+        from xagent.web.api.skill_hub import _MAX_SKILL_MD_CHARS
+
+        result = _normalize_skill_files({"SKILL.md": b"x" * _MAX_SKILL_MD_CHARS})
+        assert len(result["SKILL.md"]) == _MAX_SKILL_MD_CHARS
+
+    def test_skill_md_cap_counts_characters_not_bytes(self):
+        """Matches the Create/Edit schemas, which bound characters."""
+        from xagent.web.api.skill_hub import _MAX_SKILL_MD_CHARS
+
+        # 3 bytes per character in UTF-8: over the byte count, under the cap.
+        body = ("€" * _MAX_SKILL_MD_CHARS).encode("utf-8")
+        assert len(body) == 3 * _MAX_SKILL_MD_CHARS
+        assert _normalize_skill_files({"SKILL.md": body})["SKILL.md"] == body
+
+    def test_oversized_template_md_is_also_bounded(self):
+        """The same byte bound applies to every parser-decoded key.
+
+        ``template.md`` is decoded in full by ``parse_bundle`` exactly as
+        ``SKILL.md`` is, so leaving it unbounded reproduced the allocation
+        spike SKILL.md had just been fixed for -- 120 MiB peak for a 41 KiB
+        archive.
+        """
+        payload = b"t" * (40 * 1024 * 1024)
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("SKILL.md", SKILL_MD)
+            zf.writestr("template.md", payload)
+        data = buf.getvalue()
+        assert len(data) < 1024 * 1024
+
+        tracemalloc.start()
+        try:
+            with pytest.raises(HTTPException) as exc:
+                _safe_zip_extract(data, bad_zip_status=400)
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        assert exc.value.status_code == 400
+        assert "template.md" in exc.value.detail
+        assert peak < 2.5 * len(payload), f"peak {peak / 1048576:.1f} MiB"
+
+    @pytest.mark.parametrize(
+        "label,body",
+        [
+            ("ascii spaces", "   \t\n"),
+            ("ideographic space U+3000", "\u3000" * 9),
+            ("no-break space U+00A0", "\u00a0" * 9),
+            ("zero-width space U+200B", "\u200b" * 9),
+            ("zero-width non-joiner U+200C", "\u200c" * 9),
+            ("word joiner U+2060", "\u2060" * 9),
+            ("bare BOM", "\ufeff"),
+            ("mixed invisible", "  \ufeff\u200b\u3000\n\t"),
+        ],
+    )
+    def test_invisible_only_skill_md_rejected(self, label, body):
+        """``bytes.strip()`` knew only ASCII, so all of these read as content.
+
+        The zero-width ones are not Unicode whitespace either -- ``isspace()``
+        is False for every one of them -- so ``str.strip()`` alone does not
+        cover them, but a SKILL.md made of them carries no more meaning than
+        an empty one.
+        """
+        with pytest.raises(HTTPException) as exc:
+            _normalize_skill_files({"SKILL.md": body.encode("utf-8")})
+        assert exc.value.status_code == 400
+        assert "empty" in exc.value.detail.lower()
+
+    @pytest.mark.parametrize(
+        "label,body",
+        [
+            ("ascii", "# Hi\n\n## Description\nd\n"),
+            ("cjk", "# 技能\n\n## Description\nd\n"),
+            ("content behind a BOM", "\ufeff# Hi\n\n## Description\nd\n"),
+            ("emoji", "😀"),
+        ],
+    )
+    def test_real_content_is_not_mistaken_for_blank(self, label, body):
+        """The other direction: widening the strip must not eat real content."""
+        raw = body.encode("utf-8")
+        assert _normalize_skill_files({"SKILL.md": raw})["SKILL.md"] == raw
+
+    def test_overlong_path_rejected(self):
+        from xagent.web.api.skill_hub import _MAX_SKILL_FILE_PATH_CHARS
+
+        long_path = "d/" + "n" * _MAX_SKILL_FILE_PATH_CHARS + ".md"
+        with pytest.raises(HTTPException) as exc:
+            _normalize_skill_files({"SKILL.md": SKILL_MD, long_path: b"x"})
+        assert exc.value.status_code == 400
+        assert str(_MAX_SKILL_FILE_PATH_CHARS) in exc.value.detail
+
+    def test_path_at_the_cap_is_accepted(self):
+        from xagent.web.api.skill_hub import _MAX_SKILL_FILE_PATH_CHARS
+
+        path = "n" * (_MAX_SKILL_FILE_PATH_CHARS - 3) + ".md"
+        assert len(path) == _MAX_SKILL_FILE_PATH_CHARS
+        assert path in _normalize_skill_files({"SKILL.md": SKILL_MD, path: b"x"})
+
+
+class TestParseGateIsWired:
+    """The parser check must guard the shared write boundary, not just exist.
+
+    Asserted through ``_normalize_skill_files`` -- the function every write
+    path goes through -- rather than by calling the helper directly. A helper
+    that is defined, tested and never called is what the previous round
+    shipped: an unparsable bundle reached persistence and surfaced as a
+    post-write 500 with an orphaned row instead of a pre-write 400.
+    """
+
+    def test_unparsable_template_is_refused_by_the_normalizer(self):
+        with pytest.raises(HTTPException) as exc:
+            _normalize_skill_files(
+                {"SKILL.md": SKILL_MD, "template.md": b"\xff\xfe bad"}
+            )
+        assert exc.value.status_code == 400
+        assert "template.md" in exc.value.detail
+
+    def test_unparsable_bundle_is_refused_before_extraction_returns(self):
+        data = _make_zip({"SKILL.md": SKILL_MD, "template.md": b"\xff\xfe bad"})
+        with pytest.raises(HTTPException) as exc:
+            _safe_zip_extract(data, bad_zip_status=400)
+        assert exc.value.status_code == 400
+
+    def test_valid_bundle_still_passes_the_gate(self):
+        result = _normalize_skill_files(
+            {"SKILL.md": SKILL_MD, "assets/logo.png": bytes(range(200, 256))}
+        )
+        assert set(result) == {"SKILL.md", "assets/logo.png"}
+
+    def test_every_builtin_skill_still_normalizes(self):
+        """Calibration: the gate must not reject skills already shipping."""
+        import pathlib
+
+        roots = sorted(pathlib.Path("src/xagent/skills/builtin").glob("*/SKILL.md"))
+        assert roots, "no builtin skills found -- fixture path is wrong"
+        for skill_md in roots:
+            directory = skill_md.parent
+            files = {
+                str(item.relative_to(directory)): item.read_bytes()
+                for item in directory.rglob("*")
+                if item.is_file()
+            }
+            assert _normalize_skill_files(files)["SKILL.md"]
+
+
+class TestParseCulpritSelection:
+    """N8 — blame only the files the parser actually decodes."""
+
+    def test_invalid_template_is_named_not_a_valid_png(self):
+        from xagent.web.api.skill_hub import _assert_bundle_parses
+
+        png = b"\x89PNG\r\n\x1a\n" + bytes(range(200, 256))
+        # The fixture only tests anything if it really is non-UTF-8.
+        with pytest.raises(UnicodeDecodeError):
+            png.decode("utf-8")
+        with pytest.raises(HTTPException) as exc:
+            _assert_bundle_parses(
+                {
+                    "SKILL.md": SKILL_MD,
+                    "assets/logo.png": png,
+                    "template.md": b"\xff\xfe bad",
+                }
+            )
+        assert exc.value.status_code == 400
+        assert "template.md" in exc.value.detail
+        assert "logo.png" not in exc.value.detail
+
+    def test_invalid_skill_md_is_named(self):
+        from xagent.web.api.skill_hub import _assert_bundle_parses
+
+        with pytest.raises(HTTPException) as exc:
+            _assert_bundle_parses({"SKILL.md": b"\xff\xfe"})
+        assert exc.value.status_code == 400
+        assert "SKILL.md" in exc.value.detail
+
+    def test_binary_attachments_alone_do_not_fail_the_parse(self):
+        """A non-UTF-8 PNG is ordinary bundle content, not an error."""
+        from xagent.web.api.skill_hub import _assert_bundle_parses
+
+        _assert_bundle_parses(
+            {"SKILL.md": SKILL_MD, "assets/logo.png": bytes(range(200, 256))}
+        )
+
+
+class TestParserKeySynchronization:
+    """``_PARSER_DECODED_FILES`` must track what the parser actually reads.
+
+    The tuple drives both the pre-decode byte bound and the UTF-8 culprit
+    message, so a file the parser decodes without an entry here silently skips
+    the size guard and is mis-named in errors.
+
+    Asserted by *running* the parser against a recording mapping rather than
+    by reading its source. An AST scan only sees literal ``files["x"]`` /
+    ``files.get("x")`` shapes, so a refactor through a local variable, a
+    helper, or a mapping alias would leave it green while the invariant broke.
+    """
+
+    def test_tuple_matches_every_key_the_parser_reads(self):
+        from xagent.skills.parser import SkillParser
+        from xagent.web.api.skill_hub import _PARSER_DECODED_FILES
+
+        class _Recorder(dict):
+            """A bundle that remembers which keys were asked for."""
+
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.seen: list[str] = []
+
+            def __getitem__(self, key):
+                self.seen.append(key)
+                return super().__getitem__(key)
+
+            def __contains__(self, key):
+                self.seen.append(key)
+                return super().__contains__(key)
+
+            def get(self, key, default=None):
+                self.seen.append(key)
+                return super().get(key, default)
+
+        # Every declared file present, so the parser reaches all of them
+        # rather than short-circuiting on a missing one.
+        files = _Recorder({name: SKILL_MD for name in _PARSER_DECODED_FILES})
+        SkillParser.parse_bundle(name="probe", files=files)
+
+        # Only keys that name a bundle *file* matter; the parser may also look
+        # up unrelated things. Compare against what it asked for.
+        asked = [key for key in files.seen if isinstance(key, str)]
+        assert asked, "the recorder saw no key lookups -- the probe is broken"
+        assert set(asked) == set(_PARSER_DECODED_FILES), (
+            f"SkillParser.parse_bundle reads {sorted(set(asked))} but "
+            f"_PARSER_DECODED_FILES is {sorted(_PARSER_DECODED_FILES)}. A file "
+            "the parser reads without an entry here skips the pre-decode size "
+            "bound and is mis-named in UTF-8 errors."
+        )
+
+    def test_every_declared_file_is_actually_bounded(self):
+        """The consumer side: each declared file gets the byte bound.
+
+        Pairs with the invariant above -- that one keeps the tuple honest
+        about the parser, this one keeps the bound honest about the tuple.
+        """
+        from xagent.web.api.skill_hub import (
+            _MAX_SKILL_MD_CHARS,
+            _MAX_UTF8_BYTES_PER_CHAR,
+            _PARSER_DECODED_FILES,
+            _assert_bundle_parses,
+        )
+
+        oversized = b"x" * (_MAX_UTF8_BYTES_PER_CHAR * _MAX_SKILL_MD_CHARS + 1)
+        for name in _PARSER_DECODED_FILES:
+            files = {"SKILL.md": SKILL_MD, name: oversized}
+            with pytest.raises(HTTPException) as exc:
+                _assert_bundle_parses(files)
+            assert exc.value.status_code == 400
+            assert name in exc.value.detail

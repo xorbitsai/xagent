@@ -7,6 +7,8 @@ type TestWebSocketMessage = {
   type: string
   timestamp: string
   data?: unknown
+  error_code?: unknown
+  message?: string
   task_id?: number
   step_id?: string
   task?: Record<string, unknown>
@@ -29,6 +31,7 @@ const webSocketOptions = vi.hoisted(() => ({
       credentialOwner: { kind: "external" }
     } | null
     deliveryGeneration?: number
+    legacyErrorProse?: "trusted" | "untrusted"
     onConnectionClose?: (event: CloseEvent) => "handled" | "default"
     onConnectionFailure?: (failure: {
       recoverable: boolean
@@ -49,6 +52,7 @@ const webSocketOptions = vi.hoisted(() => ({
   },
   all: [] as Array<{
     onMessage?: (message: TestWebSocketMessage) => void
+    legacyErrorProse?: "trusted" | "untrusted"
     token?: string
   }>,
 }))
@@ -91,6 +95,7 @@ vi.mock("@/hooks/use-websocket", () => ({
       credentialOwner: { kind: "external" }
     } | null
     deliveryGeneration?: number
+    legacyErrorProse?: "trusted" | "untrusted"
     onConnectionClose?: (event: CloseEvent) => "handled" | "default"
     onConnectionFailure?: (failure: {
       recoverable: boolean
@@ -1131,6 +1136,81 @@ describe("AppProvider websocket message routing", () => {
         isOptimistic: true,
       }),
     ])
+  })
+
+  it("rejects an unsuccessful 2xx pre-task upload instead of dropping files", async () => {
+    apiRequestMock.mockResolvedValue(new Response(JSON.stringify({
+      success: false,
+      error_code: "upload_too_large",
+      detail: "private storage detail",
+    }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }))
+
+    let send: (() => Promise<void>) | undefined
+    function CreateTaskWithFileProbe() {
+      const { sendMessage } = useApp()
+      send = () => sendMessage(
+        "analyze attachment",
+        { clientMessageId: "turn-upload-failure" },
+        [new File(["data"], "data.txt")],
+      )
+      return null
+    }
+
+    render(
+      <AppProvider token="token">
+        <CreateTaskWithFileProbe />
+      </AppProvider>
+    )
+
+    await expect(send?.()).rejects.toThrow("clientErrors.uploadTooLarge")
+    expect(apiRequestMock).toHaveBeenCalledOnce()
+    expect(sendChatMessageMock).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    {
+      name: "blank",
+      files: [{ file_id: "   " }, { file_id: "file-2" }],
+    },
+    {
+      name: "duplicate",
+      files: [{ file_id: "file-1" }, { file_id: " file-1 " }],
+    },
+  ])("rejects $name pre-task upload identifiers before task creation", async ({ files }) => {
+    apiRequestMock.mockResolvedValue(new Response(JSON.stringify({
+      success: true,
+      files,
+    }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }))
+
+    let send: (() => Promise<void>) | undefined
+    function CreateTaskWithMalformedFilesProbe() {
+      const { sendMessage } = useApp()
+      send = () => sendMessage(
+        "analyze attachments",
+        { clientMessageId: "turn-malformed-upload" },
+        [
+          new File(["first"], "first.txt"),
+          new File(["second"], "second.txt"),
+        ],
+      )
+      return null
+    }
+
+    render(
+      <AppProvider token="token">
+        <CreateTaskWithMalformedFilesProbe />
+      </AppProvider>
+    )
+
+    await expect(send?.()).rejects.toThrow("clientErrors.uploadFailed")
+    expect(apiRequestMock).toHaveBeenCalledOnce()
+    expect(sendChatMessageMock).not.toHaveBeenCalled()
   })
 
   it("sends selected task runtime extensions in the create request", async () => {
@@ -3014,7 +3094,8 @@ describe("AppProvider websocket message routing", () => {
         timestamp: "2026-05-27T05:00:05Z",
         data: {
           type: "agent_error",
-          message: "Runtime error",
+          error_code: "task_execution_failed",
+          message: "provider token=secret",
           task: {
             id: 1,
             status: "failed",
@@ -3027,9 +3108,170 @@ describe("AppProvider websocket message routing", () => {
       expect(screen.getByTestId("task-status").textContent).toBe("failed")
       expect(screen.getByTestId("processing").textContent).toBe("false")
       expect(screen.getByTestId("messages").textContent).toContain(
-        "Runtime error"
+        "clientErrors.taskExecutionFailed"
+      )
+      expect(screen.getByTestId("messages").textContent).not.toContain("token=secret")
+    })
+  })
+
+  it.each(
+    [
+      { name: "object", value: { code: "task_execution_failed" } },
+      { name: "number", value: 42 },
+      { name: "array", value: ["task_execution_failed"] },
+      { name: "boolean", value: true },
+      { name: "null", value: null },
+    ].flatMap(({ name, value }) => [
+      { location: "nested", name, value },
+      { location: "root", name, value },
+    ]),
+  )("fails closed for a $location $name WebSocket error code", async ({ location, value }) => {
+    render(
+      <AppProvider token="token">
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.(location === "nested"
+        ? {
+            type: "agent_error",
+            timestamp: "2026-05-27T05:00:05Z",
+            data: {
+              type: "agent_error",
+              error_code: value,
+              message: "provider token=secret",
+            },
+          }
+        : {
+            type: "agent_error",
+            timestamp: "2026-05-27T05:00:05Z",
+            error_code: value,
+            message: "provider token=secret",
+          })
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain("Unknown error")
+    })
+    expect(screen.getByTestId("messages").textContent).not.toContain("token=secret")
+  })
+
+  it.each(
+    (["error", "agent_error", "task_error"] as const).flatMap((eventType) => [
+      { eventType, location: "nested" as const },
+      { eventType, location: "root" as const },
+    ]),
+  )("hides absent-code $eventType prose at the untrusted $location boundary", async ({ eventType, location }) => {
+    render(
+      <AppProvider
+        token="public-token"
+        transport={{ legacyErrorProse: "untrusted" }}
+      >
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+    expect(webSocketOptions.current?.legacyErrorProse).toBe("untrusted")
+    const secret = "provider=openai path=/srv/private token=secret"
+
+    act(() => {
+      onMessage?.(location === "nested"
+        ? {
+            type: eventType,
+            timestamp: "2026-05-27T05:00:05Z",
+            data: { type: eventType, message: secret },
+          }
+        : {
+            type: eventType,
+            timestamp: "2026-05-27T05:00:05Z",
+            message: secret,
+          } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain("Unknown error")
+    })
+    expect(screen.getByTestId("messages").textContent).not.toContain(secret)
+  })
+
+  it("preserves absent-code legacy prose for the authenticated default transport", async () => {
+    render(
+      <AppProvider token="authenticated-token">
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+    expect(webSocketOptions.current?.legacyErrorProse).toBe("trusted")
+
+    act(() => {
+      onMessage?.({
+        type: "agent_error",
+        timestamp: "2026-05-27T05:00:05Z",
+        data: {
+          type: "agent_error",
+          message: "Legacy actionable authenticated error",
+        },
+      })
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "Legacy actionable authenticated error",
       )
     })
+  })
+
+  it.each(
+    (["error", "agent_error", "task_error"] as const).flatMap((eventType) => [
+      { eventType, location: "nested" as const },
+      { eventType, location: "root" as const },
+    ]),
+  )("localizes recognized $location codes for untrusted $eventType events", async ({ eventType, location }) => {
+    render(
+      <AppProvider
+        token="public-token"
+        transport={{ legacyErrorProse: "untrusted" }}
+      >
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.(location === "nested"
+        ? {
+            type: eventType,
+            timestamp: "2026-05-27T05:00:05Z",
+            data: {
+              type: eventType,
+              error_code: "task_execution_failed",
+              message: "provider token=secret",
+            },
+          }
+        : {
+            type: eventType,
+            timestamp: "2026-05-27T05:00:05Z",
+            error_code: "task_execution_failed",
+            message: "provider token=secret",
+          } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "clientErrors.taskExecutionFailed",
+      )
+    })
+    expect(screen.getByTestId("messages").textContent).not.toContain("token=secret")
   })
 
   it("stops processing when a task waits for user input", async () => {

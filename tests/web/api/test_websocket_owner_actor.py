@@ -30,6 +30,7 @@ from xagent.core.agent.checkpoint import (
     CheckpointCorruptError,
     CheckpointUnavailableError,
 )
+from xagent.core.agent.runner import UserMessageInjectionOutcome
 from xagent.core.execution_scope import (
     ExecutionScope,
 )
@@ -52,13 +53,17 @@ from xagent.web.api.websocket import (
 )
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import Base, get_db, get_engine, init_db
-from xagent.web.models.task import Task, TaskStatus
-from xagent.web.models.task import TraceEvent as DatabaseTraceEvent
+from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.task_command import TaskExecutionCommand
+from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 from xagent.web.services import task_orchestrator
 from xagent.web.services.chat_history_service import DELIVERY_FAILED, DELIVERY_PENDING
+from xagent.web.services.managed_file_ref import (
+    DurableObjectIntegrityError,
+    DurableStorageOperationError,
+)
 from xagent.web.services.task_command_transport import (
     COMMAND_COMPLETED,
     ClaimedTaskCommand,
@@ -105,6 +110,45 @@ def _task(db, owner_id: int, status: TaskStatus = TaskStatus.RUNNING) -> Task:
     db.commit()
     db.refresh(t)
     return t
+
+
+def _seed_active_interaction_row(
+    db: Session, *, task_id: int, run_id: str, idempotency_key: str
+) -> int:
+    """One legal active TaskInteractionRequest row, for the replay-skips-
+    close tests below. Mirrors test_a2a_api.py's local, single-purpose row
+    builder of the same name rather than sharing it across test files."""
+    anchor = TraceEvent(
+        task_id=task_id,
+        event_id=f"anchor-{idempotency_key}",
+        event_type="agent_execution_checkpoint",
+        timestamp=datetime.now(timezone.utc),
+        data={},
+    )
+    db.add(anchor)
+    db.flush()
+    row = TaskInteractionRequest(
+        task_id=task_id,
+        run_id=run_id,
+        kind="clarification",
+        protocol_version=1,
+        status="active",
+        active_slot=1,
+        origin="sdk",
+        request_payload={"prompt": "example"},
+        request_idempotency_key=idempotency_key,
+        resume_trace_event_id=int(anchor.id),
+        resume_event_id="resume-event-1",
+        resume_execution_id="resume-execution-1",
+        resume_locator_format="trace_event_pk_v1",
+        resume_checkpoint_type="agent_execution_checkpoint",
+        resume_run_partition=run_id,
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=15),
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return int(row.id)
 
 
 # Anti-hang bounds, not latency assertions. Nothing here is measuring speed:
@@ -268,6 +312,123 @@ async def test_chat_admin_append_to_other_users_task_claims_as_owner(
     assert len(accepted) == 1
     assert accepted[0]["client_message_id"] == "client-turn-1"
     assert accepted[0]["turn_id"] == "client-turn-1"
+
+
+@pytest.mark.asyncio
+async def test_chat_without_an_actor_uses_the_authentication_contract() -> None:
+    ws_manager = MagicMock(send_personal_message=AsyncMock())
+
+    with patch("xagent.web.api.websocket.manager", ws_manager):
+        await handle_chat_message(
+            MagicMock(),
+            7,
+            {
+                "message": "do not echo this request",
+                "client_message_id": "unauthenticated-turn",
+                "files": [],
+            },
+        )
+
+    payloads = [
+        call.args[0] for call in ws_manager.send_personal_message.call_args_list
+    ]
+    assert payloads
+    assert all(
+        payload["error_code"] == "authentication_required" for payload in payloads
+    )
+    assert all(
+        payload["message"] == "Authentication is required to send this message."
+        for payload in payloads
+    )
+    assert "do not echo this request" not in repr(payloads)
+
+
+@pytest.mark.asyncio
+async def test_chat_non_owner_uses_the_neutral_unavailable_contract(db_session) -> None:
+    owner = _user(db_session, "chat-access-owner")
+    stranger = _user(db_session, "chat-access-stranger")
+    task = _task(db_session, owner.id, status=TaskStatus.COMPLETED)
+    ws_manager = MagicMock(send_personal_message=AsyncMock())
+
+    with patch("xagent.web.api.websocket.manager", ws_manager):
+        await handle_chat_message(
+            MagicMock(),
+            int(task.id),
+            {
+                "message": "try another owner's task",
+                "client_message_id": "access-denied-turn",
+                "user": stranger,
+                "files": [],
+            },
+        )
+
+    payloads = [
+        call.args[0] for call in ws_manager.send_personal_message.call_args_list
+    ]
+    assert payloads
+    assert all(payload["error_code"] == "task_unavailable" for payload in payloads)
+    assert all(
+        payload["message"] == "Task is no longer available." for payload in payloads
+    )
+    assert f"Task {task.id} does not belong to you" not in repr(payloads)
+
+
+@pytest.mark.asyncio
+async def test_unserialized_chat_non_owner_keeps_the_neutral_contract(
+    db_session,
+) -> None:
+    owner = _user(db_session, "direct-chat-access-owner")
+    stranger = _user(db_session, "direct-chat-access-stranger")
+    task = _task(db_session, owner.id, status=TaskStatus.COMPLETED)
+    ws_manager = MagicMock(send_personal_message=AsyncMock())
+
+    with patch("xagent.web.api.websocket.manager", ws_manager):
+        await _handle_chat_message_unserialized(
+            MagicMock(),
+            int(task.id),
+            {
+                "message": "try direct execution",
+                "client_message_id": "direct-access-denied-turn",
+                "user": stranger,
+                "files": [],
+            },
+        )
+
+    payloads = [
+        call.args[0] for call in ws_manager.send_personal_message.call_args_list
+    ]
+    assert payloads
+    assert all(payload["error_code"] == "task_unavailable" for payload in payloads)
+    assert all(
+        payload["message"] == "Task is no longer available." for payload in payloads
+    )
+
+
+@pytest.mark.asyncio
+async def test_chat_invalid_shape_uses_the_invalid_message_contract() -> None:
+    ws_manager = MagicMock(send_personal_message=AsyncMock())
+
+    with patch("xagent.web.api.websocket.manager", ws_manager):
+        await _handle_chat_message_unserialized(
+            MagicMock(),
+            7,
+            {
+                "message": {"operator_detail": "must not escape"},
+                "client_message_id": "invalid-message-turn",
+                "user": SimpleNamespace(id=1, is_admin=False),
+                "files": [],
+            },
+        )
+
+    payloads = [
+        call.args[0] for call in ws_manager.send_personal_message.call_args_list
+    ]
+    assert payloads
+    assert all(payload["error_code"] == "invalid_message" for payload in payloads)
+    assert all(
+        payload["message"] == "The message format is invalid." for payload in payloads
+    )
+    assert "operator_detail" not in repr(payloads)
 
 
 @pytest.mark.asyncio
@@ -953,7 +1114,46 @@ async def test_missing_task_cancel_after_atomic_create_never_leaves_pending(
 
 
 @pytest.mark.asyncio
-async def test_chat_busy_error_payload_is_loaded_off_loop(db_session) -> None:
+@pytest.mark.parametrize(
+    ("reason", "expected_code", "expected_message"),
+    [
+        (
+            "actor_task_reuse_unsupported",
+            "message_continuation_unsupported",
+            "Task does not support message continuation.",
+        ),
+        (
+            "workforce_archived",
+            "workforce_archived",
+            "This workforce has been archived. Unarchive and publish it before "
+            "starting a new conversation, or select an active workforce.",
+        ),
+        (
+            "workforce_config_changed",
+            "workforce_unavailable",
+            "This workforce conversation can no longer accept messages; "
+            "please start a new conversation.",
+        ),
+        (
+            "workforce_run_not_found",
+            "workforce_unavailable",
+            "This workforce conversation can no longer accept messages; "
+            "please start a new conversation.",
+        ),
+        (
+            "workforce_run_not_active",
+            "workforce_unavailable",
+            "This workforce conversation can no longer accept messages; "
+            "please start a new conversation.",
+        ),
+    ],
+)
+async def test_chat_turn_rejection_payload_is_loaded_off_loop(
+    db_session,
+    reason: str,
+    expected_code: str,
+    expected_message: str,
+) -> None:
     from xagent.web.services.task_orchestrator import TaskTurnError
 
     owner = _user(db_session, "busy-payload-owner")
@@ -961,11 +1161,17 @@ async def test_chat_busy_error_payload_is_loaded_off_loop(db_session) -> None:
     event_loop_thread = threading.get_ident()
     payload_threads: list[int] = []
     payload_messages: list[str] = []
+    payload_codes: list[str | None] = []
 
     def read_payload(_task_id, default_message, *_args, **_kwargs):
         payload_threads.append(threading.get_ident())
         payload_messages.append(default_message)
-        return {"type": "agent_error", "message": "busy"}
+        payload_codes.append(_kwargs.get("error_code"))
+        return {
+            "type": "agent_error",
+            "message": "busy",
+            "error_code": _kwargs.get("error_code"),
+        }
 
     ws_manager = MagicMock(
         broadcast_to_task=AsyncMock(),
@@ -975,7 +1181,7 @@ async def test_chat_busy_error_payload_is_loaded_off_loop(db_session) -> None:
         patch("xagent.web.api.websocket.manager", ws_manager),
         patch(
             "xagent.web.services.task_orchestrator.TaskTurnOrchestrator.begin_turn",
-            side_effect=TaskTurnError("workforce_archived"),
+            side_effect=TaskTurnError(reason),
         ),
         patch(
             "xagent.web.api.websocket._read_task_error_payload_isolated",
@@ -999,10 +1205,16 @@ async def test_chat_busy_error_payload_is_loaded_off_loop(db_session) -> None:
 
     assert len(payload_threads) == 1
     assert payload_threads[0] != event_loop_thread
-    assert payload_messages == [
-        "This workforce has been archived; the conversation can no longer "
-        "accept new messages."
+    assert payload_codes == [expected_code]
+    assert payload_messages == [expected_message]
+    broadcast = ws_manager.broadcast_to_task.await_args.args[0]
+    assert broadcast["error_code"] == expected_code
+    rejected = [
+        call.args[0]
+        for call in ws_manager.send_personal_message.call_args_list
+        if call.args[0].get("type") == "message_rejected"
     ]
+    assert rejected[0]["error_code"] == expected_code
 
 
 @pytest.mark.asyncio
@@ -1059,9 +1271,9 @@ async def test_running_chat_message_is_persisted_before_resume(db_session) -> No
     agent.get_dag_pattern.return_value = None
     observed_leases: list[TaskLease | None] = []
 
-    async def post_user_message(*_args, **_kwargs) -> bool:
+    async def post_user_message(*_args, **_kwargs) -> UserMessageInjectionOutcome:
         observed_leases.append(current_task_lease())
-        return True
+        return UserMessageInjectionOutcome.POSTED_FRESH
 
     agent.post_user_message = AsyncMock(side_effect=post_user_message)
     mgr = MagicMock(get_agent_for_task=AsyncMock(return_value=agent))
@@ -1071,7 +1283,7 @@ async def test_running_chat_message_is_persisted_before_resume(db_session) -> No
     )
     resume_bg = AsyncMock()
     bg_mgr = MagicMock()
-    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
     bg_mgr.running_tasks.get.return_value = None
 
     with (
@@ -1170,9 +1382,16 @@ async def test_legacy_continuation_runtime_fails_closed_without_side_effects(
         call.args[0] for call in ws_manager.send_personal_message.call_args_list
     ]
     assert any(
-        message.get("message") == "Task does not support message continuation"
+        message.get("message") == "Task does not support message continuation."
+        and message.get("error_code") == "message_continuation_unsupported"
         for message in sent_messages
     )
+    rejection = next(
+        message
+        for message in sent_messages
+        if message.get("type") == "message_rejected"
+    )
+    assert rejection["error_code"] == "message_continuation_unsupported"
 
 
 @pytest.mark.asyncio
@@ -1225,7 +1444,9 @@ async def test_running_chat_message_uses_one_offloop_scope_and_no_request_sessio
     agent = MagicMock()
     agent.supports_live_control.return_value = True
     agent.get_dag_pattern.return_value = None
-    agent.post_user_message = AsyncMock(return_value=True)
+    agent.post_user_message = AsyncMock(
+        return_value=UserMessageInjectionOutcome.POSTED_FRESH
+    )
     manager_calls: list[tuple[object, dict]] = []
     claim_threads: list[int] = []
 
@@ -1256,7 +1477,7 @@ async def test_running_chat_message_uses_one_offloop_scope_and_no_request_sessio
     )
     resume_bg = AsyncMock()
     bg_manager = MagicMock()
-    bg_manager.reserve_resume.return_value = True
+    bg_manager.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
     bg_manager.running_tasks.get.return_value = None
 
     try:
@@ -1323,7 +1544,7 @@ async def test_deferred_chat_message_is_acked_after_durable_command_commit(
     )
     resume_bg = AsyncMock()
     bg_mgr = MagicMock()
-    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
     bg_mgr.running_tasks.get.return_value = None
     websocket = MagicMock()
 
@@ -1403,7 +1624,7 @@ async def test_live_lease_injection_degrades_to_deferred_on_checkpoint_unavailab
     )
     resume_bg = AsyncMock()
     bg_mgr = MagicMock()
-    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
     bg_mgr.running_tasks.get.return_value = None
     websocket = MagicMock()
 
@@ -1466,10 +1687,10 @@ async def test_live_lease_injection_degrades_to_deferred_on_run_provenance_unava
     the same thing an unavailable read does here: inject_user_message found
     no live in-process context and had to cold-start one from a checkpoint
     read, and that read could not verify it. Nothing was ever live to
-    reject a message into, so this must fold into the same posted=False
+    reject a message into, so this must fold into the same not-posted
     deferred-delivery path as CheckpointUnavailableError -- not the
     corrupt/refused rejection the other refusal reasons get (see
-    test_live_lease_injection_rejects_delivery_on_corrupt_or_refused)."""
+    test_durable_failure_keeps_detail_sender_only)."""
     owner = _user(db_session, "owner")
     task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
     task.runner_id = "provenance-runner"
@@ -1491,7 +1712,7 @@ async def test_live_lease_injection_degrades_to_deferred_on_run_provenance_unava
     )
     resume_bg = AsyncMock()
     bg_mgr = MagicMock()
-    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
     bg_mgr.running_tasks.get.return_value = None
     websocket = MagicMock()
 
@@ -1560,22 +1781,64 @@ async def test_live_lease_injection_degrades_to_deferred_on_run_provenance_unava
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "error",
+    ("error", "sender_error_code", "sender_message"),
     [
-        CheckpointCorruptError("all matching rows undecodable"),
-        CheckpointAccessRefusedError("active lease is not bound to this reader"),
-        CheckpointAccessRefusedError(
-            "a tagged run has already superseded legacy checkpoints",
-            reason="superseded_legacy",
+        (
+            CheckpointCorruptError("all matching rows undecodable"),
+            "task_checkpoint_unreadable",
+            "The task's saved progress could not be read.",
+        ),
+        (
+            CheckpointAccessRefusedError("active lease is not bound to this reader"),
+            "task_checkpoint_unreadable",
+            "The task's saved progress could not be read.",
+        ),
+        (
+            CheckpointAccessRefusedError(
+                "a tagged run has already superseded legacy checkpoints",
+                reason="superseded_legacy",
+            ),
+            "task_checkpoint_unreadable",
+            "The task's saved progress could not be read.",
+        ),
+        (
+            DurableObjectIntegrityError(
+                "checksum mismatch",
+                storage_key="users/1/uploads/corrupt.txt",
+            ),
+            "message_attachment_corrupt",
+            "A stored file for this message failed its integrity check and must be re-uploaded.",
+        ),
+        (
+            DurableStorageOperationError(
+                "provider unavailable",
+                storage_key="users/1/uploads/unavailable.txt",
+            ),
+            "message_attachment_unavailable",
+            "A stored file for this message could not be read. Please try again.",
         ),
     ],
+    ids=[
+        "checkpoint-corrupt",
+        "checkpoint-access-refused",
+        "checkpoint-superseded-legacy",
+        "attachment-corrupt",
+        "attachment-unavailable",
+    ],
 )
-async def test_live_lease_injection_rejects_delivery_on_corrupt_or_refused(
+@pytest.mark.parametrize(
+    "durable_ack_sent",
+    [False, True],
+    ids=["live-ack", "suppressed-ack"],
+)
+async def test_durable_failure_keeps_detail_sender_only(
     db_session,
     error: Exception,
+    sender_error_code: str,
+    sender_message: str,
+    durable_ack_sent: bool,
 ) -> None:
-    """Corrupt/refused are not retryable by deferring -- reject the claimed
-    delivery outright instead of scheduling a resume attempt."""
+    """Answer a durable turn failure without disclosing it to subscribers."""
     owner = _user(db_session, "owner")
     task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
     task.runner_id = "rejected-runner"
@@ -1592,8 +1855,17 @@ async def test_live_lease_injection_rejects_delivery_on_corrupt_or_refused(
     )
     resume_bg = AsyncMock()
     bg_mgr = MagicMock()
-    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
     bg_mgr.running_tasks.get.return_value = None
+    origin_socket = MagicMock(name="origin-socket")
+    payload = {
+        "message": "Wait for the checkpoint",
+        "client_message_id": "rejected-turn-1",
+        "user": owner,
+        "files": [],
+    }
+    if durable_ack_sent:
+        payload["_durable_ack_sent"] = True
 
     with (
         patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
@@ -1602,14 +1874,9 @@ async def test_live_lease_injection_rejects_delivery_on_corrupt_or_refused(
         patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
     ):
         await _handle_chat_message_unserialized(
-            MagicMock(),
+            origin_socket,
             int(task.id),
-            {
-                "message": "Wait for the checkpoint",
-                "client_message_id": "rejected-turn-1",
-                "user": owner,
-                "files": [],
-            },
+            payload,
         )
 
     resume_bg.assert_not_awaited()
@@ -1619,9 +1886,34 @@ async def test_live_lease_injection_rejects_delivery_on_corrupt_or_refused(
         for call in ws_manager.send_personal_message.call_args_list
         if call.args[0].get("type") == "message_rejected"
     ]
-    assert len(rejected) == 1
-    assert rejected[0]["client_message_id"] == "rejected-turn-1"
-    assert rejected[0]["rejection_outcome"] == "not_accepted"
+    if durable_ack_sent:
+        assert not rejected
+        sender_errors = [
+            call
+            for call in ws_manager.send_personal_message.call_args_list
+            if call.args[0].get("type") == "error"
+        ]
+        assert len(sender_errors) == 1
+        assert sender_errors[0].args[0]["error_code"] == sender_error_code
+        assert sender_errors[0].args[0]["message"] == sender_message
+        assert sender_errors[0].args[1] is origin_socket
+    else:
+        assert len(rejected) == 1
+        assert rejected[0]["client_message_id"] == "rejected-turn-1"
+        assert rejected[0]["error_code"] == sender_error_code
+        assert rejected[0]["message"] == sender_message
+        assert rejected[0]["rejection_outcome"] == "not_accepted"
+    task_errors = [
+        call.args[0]
+        for call in ws_manager.broadcast_to_task.call_args_list
+        if call.args[0].get("type") in {"error", "agent_error", "task_error"}
+    ]
+    assert task_errors
+    assert all(
+        payload["error_code"] == "task_execution_failed"
+        and payload["message"] == websocket_api.CLIENT_SAFE_TASK_FAILURE
+        for payload in task_errors
+    )
     db_session.expire_all()
     stored = (
         db_session.query(TaskChatMessage)
@@ -1629,6 +1921,98 @@ async def test_live_lease_injection_rejects_delivery_on_corrupt_or_refused(
         .one()
     )
     assert stored.delivery_status == DELIVERY_FAILED
+
+
+@pytest.mark.asyncio
+async def test_attachment_bind_race_keeps_specific_failure_on_origin_lane(
+    db_session,
+    tmp_path,
+) -> None:
+    """A post-prepare bind loss must not disclose sender state to subscribers."""
+
+    owner = _user(db_session, "bind-race-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
+    task.runner_id = "bind-race-runner"
+    task.run_id = "bind-race-run"
+    file_path = tmp_path / "bind-race.txt"
+    file_path.write_text("raced attachment")
+    db_session.add(
+        UploadedFile(
+            file_id="bind-race-file",
+            user_id=int(owner.id),
+            task_id=int(task.id),
+            filename="bind-race.txt",
+            storage_path=str(file_path),
+            mime_type="text/plain",
+            file_size=file_path.stat().st_size,
+        )
+    )
+    db_session.commit()
+
+    class RecordingSocket:
+        def __init__(self) -> None:
+            self.messages: list[dict[str, Any]] = []
+
+        async def send_text(self, payload: str) -> None:
+            import json
+
+            self.messages.append(json.loads(payload))
+
+    origin = RecordingSocket()
+    subscriber = RecordingSocket()
+    connection_manager = websocket_api.ConnectionManager()
+    connection_manager.register_connection(origin, int(task.id))  # type: ignore[arg-type]
+    connection_manager.register_connection(subscriber, int(task.id))  # type: ignore[arg-type]
+
+    agent = MagicMock()
+    agent.supports_live_control.return_value = True
+    agent.get_dag_pattern.return_value = None
+    agent_manager = MagicMock(get_agent_for_task=AsyncMock(return_value=agent))
+    bg_manager = MagicMock()
+    bg_manager.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
+    bg_manager.running_tasks.get.return_value = None
+
+    with (
+        patch("xagent.web.api.chat.get_agent_manager", return_value=agent_manager),
+        patch("xagent.web.api.websocket.manager", connection_manager),
+        patch("xagent.web.api.websocket.background_task_manager", bg_manager),
+        patch(
+            "xagent.web.api.websocket.bind_turn_files_no_commit",
+            return_value=["bind-race-file"],
+        ),
+    ):
+        await _handle_chat_message_unserialized(
+            origin,  # type: ignore[arg-type]
+            int(task.id),
+            {
+                "message": "Use my attachment",
+                "client_message_id": "bind-race-turn",
+                "user": SimpleNamespace(id=int(owner.id), is_admin=False),
+                "files": [
+                    {
+                        "file_id": "bind-race-file",
+                        "name": "bind-race.txt",
+                    }
+                ],
+            },
+        )
+
+    assert any(
+        event.get("type") == "message_rejected"
+        and event.get("error_code") == "message_attachment_unavailable"
+        for event in origin.messages
+    )
+    subscriber_failures = [
+        event
+        for event in subscriber.messages
+        if event.get("type") in {"error", "agent_error", "task_error"}
+    ]
+    assert subscriber_failures
+    assert all(
+        event.get("error_code") == "task_execution_failed"
+        and event.get("message") == websocket_api.CLIENT_SAFE_TASK_FAILURE
+        for event in subscriber_failures
+    )
 
 
 @pytest.mark.asyncio
@@ -1643,14 +2027,16 @@ async def test_resume_registration_failure_keeps_injected_delivery_pending(
     agent = MagicMock()
     agent.supports_live_control.return_value = True
     agent.get_dag_pattern.return_value = None
-    agent.post_user_message = AsyncMock(return_value=True)
+    agent.post_user_message = AsyncMock(
+        return_value=UserMessageInjectionOutcome.POSTED_FRESH
+    )
     mgr = MagicMock(get_agent_for_task=AsyncMock(return_value=agent))
     ws_manager = MagicMock(
         broadcast_to_task=AsyncMock(),
         send_personal_message=AsyncMock(),
     )
     bg_mgr = MagicMock()
-    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
     bg_mgr.running_tasks.get.return_value = None
     bg_mgr.register_reserved_resume.side_effect = RuntimeError("reservation lost")
     bg_handle = MagicMock()
@@ -1710,13 +2096,15 @@ async def test_live_marker_failure_after_registered_handoff_is_still_accepted(
     agent = MagicMock()
     agent.supports_live_control.return_value = True
     agent.get_dag_pattern.return_value = None
-    agent.post_user_message = AsyncMock(return_value=True)
+    agent.post_user_message = AsyncMock(
+        return_value=UserMessageInjectionOutcome.POSTED_FRESH
+    )
     ws_manager = MagicMock(
         broadcast_to_task=AsyncMock(),
         send_personal_message=AsyncMock(),
     )
     bg_mgr = MagicMock()
-    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
     bg_mgr.running_tasks.get.return_value = None
 
     with (
@@ -1777,9 +2165,11 @@ async def test_live_resume_reads_the_interaction_row_before_injecting(
         order.append("read")
         return 4321
 
-    async def record_injection(*_args: object, **_kwargs: object) -> bool:
+    async def record_injection(
+        *_args: object, **_kwargs: object
+    ) -> UserMessageInjectionOutcome:
         order.append("inject")
-        return True
+        return UserMessageInjectionOutcome.POSTED_FRESH
 
     agent.post_user_message = AsyncMock(side_effect=record_injection)
     ws_manager = MagicMock(
@@ -1787,7 +2177,7 @@ async def test_live_resume_reads_the_interaction_row_before_injecting(
         send_personal_message=AsyncMock(),
     )
     bg_mgr = MagicMock()
-    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
     bg_mgr.running_tasks.get.return_value = None
 
     with (
@@ -1825,6 +2215,75 @@ async def test_live_resume_reads_the_interaction_row_before_injecting(
 
 
 @pytest.mark.asyncio
+async def test_live_injection_skips_the_close_on_a_replayed_turn_id(
+    db_session,
+) -> None:
+    """A replayed turn id short-circuits inside AgentRunner.inject_user_message
+    and is reported back as POSTED_REPLAY, not the same truthy value a
+    fresh write produces. The interaction row this test seeds is not the
+    question the replay answered, so the online injection site must leave
+    it untouched: still active, uncleared marker, and the close statement
+    must not run at all. That is asserted directly on the mock: replacing
+    the guard with `if True:` calls the close for real and turns
+    assert_not_called red. No DB-state assertion is made here -- with the
+    close function mocked out, nothing writes to the row or the marker, so
+    "still active" would hold no matter what the guard did."""
+    owner = _user(db_session, "close-replay-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
+    task.runner_id = "close-replay-runner"
+    task.run_id = "close-replay-run"
+    task.interaction_protocol_version = 1
+    db_session.commit()
+    task_id = int(task.id)
+    _seed_active_interaction_row(
+        db_session,
+        task_id=task_id,
+        run_id="close-replay-run",
+        idempotency_key="close-replay-q1",
+    )
+
+    agent = MagicMock()
+    agent.supports_live_control.return_value = True
+    agent.get_dag_pattern.return_value = None
+    agent.post_user_message = AsyncMock(
+        return_value=UserMessageInjectionOutcome.POSTED_REPLAY
+    )
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+    bg_mgr = MagicMock()
+    bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
+    bg_mgr.running_tasks.get.return_value = None
+
+    with (
+        patch(
+            "xagent.web.api.chat.get_agent_manager",
+            return_value=MagicMock(get_agent_for_task=AsyncMock(return_value=agent)),
+        ),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
+        patch("xagent.web.api.websocket.execute_resume_background", AsyncMock()),
+        patch(
+            "xagent.web.api.websocket.close_legacy_resume_interaction_sync",
+        ) as close_mock,
+    ):
+        await _handle_chat_message_unserialized(
+            MagicMock(),
+            task_id,
+            {
+                "message": "a retried delivery",
+                "client_message_id": "close-replay-turn",
+                "user": owner,
+                "files": [],
+            },
+        )
+
+    agent.post_user_message.assert_awaited_once()
+    close_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_live_close_failure_after_registered_handoff_is_still_accepted(
     db_session,
 ) -> None:
@@ -1838,13 +2297,15 @@ async def test_live_close_failure_after_registered_handoff_is_still_accepted(
     agent = MagicMock()
     agent.supports_live_control.return_value = True
     agent.get_dag_pattern.return_value = None
-    agent.post_user_message = AsyncMock(return_value=True)
+    agent.post_user_message = AsyncMock(
+        return_value=UserMessageInjectionOutcome.POSTED_FRESH
+    )
     ws_manager = MagicMock(
         broadcast_to_task=AsyncMock(),
         send_personal_message=AsyncMock(),
     )
     bg_mgr = MagicMock()
-    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
     bg_mgr.running_tasks.get.return_value = None
 
     with (
@@ -1897,13 +2358,15 @@ async def test_live_close_cancellation_does_not_abort_registered_handoff(
     agent = MagicMock()
     agent.supports_live_control.return_value = True
     agent.get_dag_pattern.return_value = None
-    agent.post_user_message = AsyncMock(return_value=True)
+    agent.post_user_message = AsyncMock(
+        return_value=UserMessageInjectionOutcome.POSTED_FRESH
+    )
     ws_manager = MagicMock(
         broadcast_to_task=AsyncMock(),
         send_personal_message=AsyncMock(),
     )
     bg_mgr = MagicMock()
-    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
     bg_mgr.running_tasks.get.return_value = None
 
     def raise_cancelled(*_args: object, **_kwargs: object) -> int:
@@ -2116,7 +2579,7 @@ async def test_message_handoff_registers_the_minted_run_not_the_stale_one(
         send_personal_message=AsyncMock(),
     )
     bg_mgr = MagicMock()
-    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
     bg_mgr.running_tasks.get.return_value = None
     registered_run_ids: list[str | None] = []
     registered_handles: list[asyncio.Task] = []
@@ -2190,13 +2653,15 @@ async def test_live_marker_cancellation_does_not_cancel_registered_handoff(
     agent = MagicMock()
     agent.supports_live_control.return_value = True
     agent.get_dag_pattern.return_value = None
-    agent.post_user_message = AsyncMock(return_value=True)
+    agent.post_user_message = AsyncMock(
+        return_value=UserMessageInjectionOutcome.POSTED_FRESH
+    )
     ws_manager = MagicMock(
         broadcast_to_task=AsyncMock(),
         send_personal_message=AsyncMock(),
     )
     bg_mgr = MagicMock()
-    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
     bg_mgr.running_tasks.get.return_value = None
     marker_started = threading.Event()
     marker_release = threading.Event()
@@ -2502,7 +2967,7 @@ async def test_live_control_delivery_failure_pool_timeout_is_not_retried(
         send_personal_message=AsyncMock(),
     )
     bg_mgr = MagicMock()
-    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
     mark_delivery = MagicMock(
         side_effect=SQLAlchemyTimeoutError("delivery pool exhausted")
     )
@@ -2543,7 +3008,9 @@ async def test_live_control_delivery_failure_pool_timeout_is_not_retried(
     ]
     assert len(rejected) == 1
     assert rejected[0]["client_message_id"] == "live-control-pool-timeout"
-    assert "inject failed" in rejected[0]["message"]
+    assert "inject failed" not in repr(rejected[0])
+    assert rejected[0]["message"] == websocket_api.CLIENT_SAFE_VALIDATION_ERROR
+    assert rejected[0]["error_code"] == "message_processing_failed"
     assert rejected[0]["rejection_outcome"] == "outcome_unknown"
 
 
@@ -2566,7 +3033,7 @@ async def test_delivery_failure_persistence_drains_before_cancellation(
         send_personal_message=AsyncMock(),
     )
     bg_manager = MagicMock()
-    bg_manager.reserve_resume.return_value = True
+    bg_manager.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
     persistence_started = threading.Event()
     allow_persistence = threading.Event()
     persistence_finished = threading.Event()
@@ -2717,6 +3184,7 @@ async def test_reusing_client_id_with_different_content_is_rejected(
         if call.args[0].get("type") == "message_rejected"
     ]
     assert len(rejected) == 1
+    assert rejected[0]["error_code"] == "message_id_conflict"
     assert rejected[0]["retry_with_new_id"] is True
     assert rejected[0]["rejection_outcome"] == "not_accepted"
 
@@ -2768,6 +3236,7 @@ async def test_failed_durable_delivery_is_not_silently_accepted(db_session) -> N
         if call.args[0].get("type") == "message_rejected"
     ]
     assert len(rejected) == 1
+    assert rejected[0]["error_code"] == "message_delivery_failed"
     assert rejected[0]["retry_with_new_id"] is True
     assert rejected[0]["rejection_outcome"] == "not_accepted"
 
@@ -2812,6 +3281,7 @@ async def test_pending_same_id_delivery_reports_unknown_outcome(db_session) -> N
     ]
     assert len(rejected) == 1
     assert rejected[0]["client_message_id"] == "pending-turn-1"
+    assert rejected[0]["error_code"] == "guidance_in_progress"
     assert rejected[0]["rejection_outcome"] == "outcome_unknown"
 
 
@@ -3587,7 +4057,7 @@ async def test_resume_background_restores_prior_status_on_run_provenance_unavail
     db_session.commit()
     # A real trace_events row -- the pointer column has an FK -- standing in
     # for the anchored checkpoint row this refusal is about.
-    pointer_row = DatabaseTraceEvent(
+    pointer_row = TraceEvent(
         task_id=int(task.id),
         build_id=None,
         event_id="provenance-restore-pointer",
@@ -3854,7 +4324,9 @@ async def test_deferred_injection_marker_failure_does_not_abort_resume(
         ]
     )
     agent = MagicMock(
-        post_user_message=AsyncMock(return_value=True),
+        post_user_message=AsyncMock(
+            return_value=UserMessageInjectionOutcome.POSTED_FRESH
+        ),
         resume_execution_by_id=AsyncMock(
             return_value={
                 "status": "completed",
@@ -3933,7 +4405,9 @@ async def test_deferred_injection_marker_cancellation_does_not_abort_resume(
         ]
     )
     agent = MagicMock(
-        post_user_message=AsyncMock(return_value=True),
+        post_user_message=AsyncMock(
+            return_value=UserMessageInjectionOutcome.POSTED_FRESH
+        ),
         resume_execution_by_id=AsyncMock(
             return_value={
                 "status": "completed",
@@ -4014,7 +4488,9 @@ async def test_deferred_injection_close_failure_does_not_abort_resume(
         ]
     )
     agent = MagicMock(
-        post_user_message=AsyncMock(return_value=True),
+        post_user_message=AsyncMock(
+            return_value=UserMessageInjectionOutcome.POSTED_FRESH
+        ),
         resume_execution_by_id=AsyncMock(
             return_value={
                 "status": "completed",
@@ -4117,7 +4593,9 @@ async def test_deferred_injection_closes_the_row_the_online_handler_observed(
         ]
     )
     agent = MagicMock(
-        post_user_message=AsyncMock(return_value=True),
+        post_user_message=AsyncMock(
+            return_value=UserMessageInjectionOutcome.POSTED_FRESH
+        ),
         resume_execution_by_id=AsyncMock(
             return_value={
                 "status": "completed",
@@ -4166,6 +4644,104 @@ async def test_deferred_injection_closes_the_row_the_online_handler_observed(
 
 
 @pytest.mark.asyncio
+async def test_deferred_injection_skips_the_close_on_a_replayed_turn_id(
+    db_session,
+) -> None:
+    """A cross-run retry of this background task re-enters with the same
+    pending_user_message. post_user_message short-circuits the repeated
+    turn id and reports POSTED_REPLAY, so the close must be skipped
+    entirely -- not just matched against the carried (stale) interaction
+    id, but never attempted. The row this test seeds is the question the
+    resumed agent has staged *since* the first attempt (a different id
+    from the one carried in pending_user_message), so a site that
+    re-derived its close key by reading the current active row instead of
+    using the carried one would retire this live question; asserting
+    active_interaction_id_sync is never called pins that the deferred path
+    still takes no read of its own, replay or not -- the same technique
+    the carried-vs-observed test above uses. close_legacy_resume_interaction_sync
+    is asserted uncalled directly: replacing the guard with `if True:`
+    calls it for real and turns this assertion red on its own."""
+    owner = _user(db_session, "deferred-replay-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.PAUSED)
+    task.interaction_protocol_version = 1
+    db_session.add(
+        TaskChatMessage(
+            task_id=int(task.id),
+            user_id=int(owner.id),
+            role="user",
+            content="Deferred guidance",
+            message_type="user_message",
+            turn_id="deferred-replay-turn",
+            delivery_status=DELIVERY_PENDING,
+        )
+    )
+    db_session.commit()
+    task_id = int(task.id)
+    # The question staged since the first attempt -- a different row from
+    # the one named in pending_user_message below.
+    _seed_active_interaction_row(
+        db_session,
+        task_id=task_id,
+        run_id="deferred-replay-run",
+        idempotency_key="deferred-replay-q1",
+    )
+    context = SimpleNamespace(
+        messages=[
+            SimpleNamespace(role="user", metadata={"turn_id": "deferred-replay-turn"})
+        ]
+    )
+    agent = MagicMock(
+        post_user_message=AsyncMock(
+            return_value=UserMessageInjectionOutcome.POSTED_REPLAY
+        ),
+        resume_execution_by_id=AsyncMock(
+            return_value={
+                "status": "completed",
+                "success": True,
+                "output": "Applied",
+                "agent_result": {"context": context},
+            }
+        ),
+    )
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+
+    with (
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.api.websocket.background_task_manager.promote_resume_task"),
+        patch(
+            "xagent.web.api.websocket.active_interaction_id_sync",
+            side_effect=AssertionError("the deferred path must not read its own"),
+        ),
+        patch(
+            "xagent.web.api.websocket.close_legacy_resume_interaction_sync",
+        ) as close_mock,
+    ):
+        await execute_resume_background(
+            task_id=task_id,
+            agent_service=agent,
+            task_owner_user_id=int(owner.id),
+            pending_user_message={
+                "execution_message": "Deferred guidance",
+                "display_message": "Deferred guidance",
+                "files": [],
+                "turn_id": "deferred-replay-turn",
+                # The stale id carried from the first attempt -- not the
+                # row seeded above, which is what a re-read would find.
+                "interaction_id": 424242,
+            },
+            delivery_turn_id="deferred-replay-turn",
+            delivery_websocket=MagicMock(),
+            delivery_client_message_id="deferred-replay-turn",
+        )
+
+    agent.post_user_message.assert_awaited_once()
+    close_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_deferred_injection_close_cancellation_does_not_abort_resume(
     db_session,
 ) -> None:
@@ -4193,7 +4769,9 @@ async def test_deferred_injection_close_cancellation_does_not_abort_resume(
         ]
     )
     agent = MagicMock(
-        post_user_message=AsyncMock(return_value=True),
+        post_user_message=AsyncMock(
+            return_value=UserMessageInjectionOutcome.POSTED_FRESH
+        ),
         resume_execution_by_id=AsyncMock(
             return_value={
                 "status": "completed",
@@ -4280,7 +4858,9 @@ async def test_deferred_injection_rejects_before_post_when_lease_is_denied(
     )
     db_session.commit()
     agent = MagicMock(
-        post_user_message=AsyncMock(return_value=True),
+        post_user_message=AsyncMock(
+            return_value=UserMessageInjectionOutcome.POSTED_FRESH
+        ),
         resume_execution_by_id=AsyncMock(),
     )
     ws_manager = MagicMock(
@@ -4425,7 +5005,6 @@ async def test_durable_attachment_failure_keeps_the_storage_key_off_the_socket(
     # answering the client with anything at all.
     frames = [str(call) for call in ws_manager.send_personal_message.await_args_list]
     assert any("message_rejected" in frame for frame in frames), frames
-
     # Every outbound egress: nothing may carry the key or the provider text.
     outbound = frames + [
         str(call) for call in ws_manager.broadcast_to_task.await_args_list
@@ -4488,11 +5067,12 @@ async def test_a_dispatch_fault_is_labelled_with_the_message_that_failed(
     db_session.close()
 
     websocket = MagicMock()
+    websocket.accept = AsyncMock()
     websocket.receive_text = AsyncMock(
         side_effect=[json.dumps({"type": "resume_task"}), WebSocketDisconnect()]
     )
     ws_manager = MagicMock(
-        connect=AsyncMock(),
+        register_connection=MagicMock(),
         disconnect=MagicMock(),
         send_personal_message=AsyncMock(),
         broadcast_to_task=AsyncMock(),

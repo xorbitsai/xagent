@@ -13,6 +13,7 @@ import pytest
 from xagent.core.agent import AgentExecutionAdapter, AgentExecutionConfig, ReActPattern
 from xagent.core.agent.execution_adapter import INTERRUPTED_USER_MESSAGE
 from xagent.core.agent.result import NO_OUTPUT_PLACEHOLDER
+from xagent.core.agent.runner import UserMessageInjectionOutcome
 from xagent.core.agent.service import AgentService
 from xagent.core.task_runtime import PREFERRED_INPUT_MODALITIES_METADATA_KEY
 
@@ -1239,6 +1240,73 @@ async def test_execution_adapter_exposes_pause_and_message_controls() -> None:
     assert final_status is not None
     assert final_status["status"] == "interrupted"
     assert final_status["is_resumable"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scenario", ["fresh", "replay", "conflicting_content"])
+async def test_execution_adapter_post_user_message_reports_fresh_vs_replay(
+    scenario: str,
+) -> None:
+    """This layer forwards the registry's report unmodified as a bare
+    UserMessageInjectionOutcome (dropping the raw context, which nothing
+    past this boundary reads): a first write is POSTED_FRESH, a repeat of
+    the same turn id with the same content short-circuits as
+    POSTED_REPLAY, and a repeat with different content still raises."""
+    llm = BlockingLLM(
+        {
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-noop",
+                    "name": "noop",
+                    "args": {},
+                }
+            ],
+        }
+    )
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="fresh-replay",
+            pattern="react",
+            llm=llm,
+            tools=[FakeTool()],
+            service_id="fresh-replay-service",
+            skill_manager=NoSkillManager(),
+        )
+    )
+    adapter.start(task="Wait", task_id="fresh-replay-exec")
+    handle = adapter.registry.get("fresh-replay-exec")
+    assert handle is not None
+    await llm.started.wait()
+    assert adapter.pause("fresh-replay-exec", reason="pause from test") is True
+
+    first = await adapter.post_user_message(
+        "fresh-replay-exec",
+        "Choose B",
+        turn_id="turn-adapter-fresh-replay",
+        request_interrupt=False,
+    )
+    assert first is UserMessageInjectionOutcome.POSTED_FRESH
+
+    if scenario == "replay":
+        second = await adapter.post_user_message(
+            "fresh-replay-exec",
+            "Choose B",
+            turn_id="turn-adapter-fresh-replay",
+            request_interrupt=False,
+        )
+        assert second is UserMessageInjectionOutcome.POSTED_REPLAY
+    elif scenario == "conflicting_content":
+        with pytest.raises(ValueError, match="different user message"):
+            await adapter.post_user_message(
+                "fresh-replay-exec",
+                "Choose C",
+                turn_id="turn-adapter-fresh-replay",
+                request_interrupt=False,
+            )
+
+    llm.release.set()
+    await handle.task
 
 
 @pytest.mark.asyncio

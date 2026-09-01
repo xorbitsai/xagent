@@ -6,6 +6,8 @@ with their own per-user env (their key). See PR #750 for the per-user env layer
 this builds on.
 """
 
+from typing import Any
+
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -560,6 +562,408 @@ def test_connect_rejects_user_owned_server_even_with_matching_config(test_db):
             db=test_db,
         )
     assert exc.value.status_code == 409
+
+
+def test_connect_heals_stale_args_on_matching_command(test_db):
+    """A pre-existing row with the right command/transport but args from
+    before a legitimate catalog update (a version bump, a new flag) must not
+    409 forever -- unlike a command mismatch (a real hijack), this is healed
+    in place so this and every future connect attempt succeeds with the
+    current official args, mirroring how _ensure_catalog_mcp_oauth_server
+    already syncs a drifted "auth" config instead of rejecting it."""
+    from xagent.web.api.mcp import MCPAppConnectRequest, connect_mcp_app
+
+    test_db.add(
+        MCPServer(
+            name="google-maps",
+            managed="external",
+            transport="stdio",
+            command="npx",
+            # Missing "--stdio": simulates a row created before that flag was
+            # added to the catalog's launch_config.
+            args=["-y", "@cablate/mcp-google-map"],
+        )
+    )
+    test_db.commit()
+
+    response = connect_mcp_app(
+        "google-maps",
+        MCPAppConnectRequest(env={"GOOGLE_MAPS_API_KEY": "my-key"}),
+        current_user=_user(test_db, 1),
+        db=test_db,
+    )
+    assert response is not None
+
+    healed = test_db.query(MCPServer).filter(MCPServer.name == "google-maps").first()
+    assert healed.args == ["-y", "@cablate/mcp-google-map", "--stdio"]
+
+
+def test_connect_heal_resets_orphan_rows_env_and_cwd(test_db):
+    """A row with today's command/transport but no *current* owner is not
+    safe to heal just because command/transport match: ownerless is also
+    the normal state of every legitimately catalog-connected row (connect
+    never marks an association is_owner=True), so it can't distinguish the
+    official row from a pre-catalog orphan (a user created a custom server
+    under this name before the catalog app existed, then was deleted --
+    deleting a user drops their UserMCPServer association, not the shared
+    MCPServer row) carrying its own env/cwd. Adopting it and blanking those
+    fields would be just as wrong as adopting it and keeping them: either
+    could destroy or leak real configuration
+    (MCPServer.to_connection_dict() applies a row's env to every user's
+    connection through it). Safe behavior is to leave a row with any
+    configured env/cwd/etc. untouched and 409, matching what it always got
+    before args-healing existed -- not adopt it, not silently wipe it."""
+    from fastapi import HTTPException
+
+    from xagent.web.api.mcp import MCPAppConnectRequest, connect_mcp_app
+
+    test_db.add(
+        MCPServer(
+            name="google-maps",
+            managed="external",
+            transport="stdio",
+            command="npx",
+            args=["-y", "@cablate/mcp-google-map"],  # stale, would trigger healing
+            env={"LEFTOVER_SECRET": "attacker-or-former-users-value"},
+            cwd="/some/orphaned/path",
+        )
+    )
+    test_db.commit()
+
+    with pytest.raises(HTTPException) as exc:
+        connect_mcp_app(
+            "google-maps",
+            MCPAppConnectRequest(env={"GOOGLE_MAPS_API_KEY": "my-key"}),
+            current_user=_user(test_db, 1),
+            db=test_db,
+        )
+    assert exc.value.status_code == 409
+
+    untouched = test_db.query(MCPServer).filter(MCPServer.name == "google-maps").first()
+    assert untouched.args == ["-y", "@cablate/mcp-google-map"]
+    assert untouched.env == {"LEFTOVER_SECRET": "attacker-or-former-users-value"}
+    assert untouched.cwd == "/some/orphaned/path"
+
+
+def test_connect_heal_refuses_row_with_platform_env_configured(test_db):
+    """The same refuse-to-heal gate must also protect a *legitimate*
+    admin-configured platform key on a real catalog row (not just an
+    orphan's leftover env) -- _app_platform_env_available reads
+    MCPServer.env directly as the platform-global fallback key, and
+    healing must never destroy it just because args also happened to drift.
+    A row with a platform key configured stays 409 (unhealed, untouched)
+    rather than silently losing that key."""
+    from fastapi import HTTPException
+
+    from xagent.web.api.mcp import MCPAppConnectRequest, connect_mcp_app
+
+    test_db.add(
+        MCPServer(
+            name="google-maps",
+            managed="external",
+            transport="stdio",
+            command="npx",
+            args=["-y", "@cablate/mcp-google-map"],  # stale, would trigger healing
+            env={"GOOGLE_MAPS_API_KEY": "encrypted-platform-key"},
+        )
+    )
+    test_db.commit()
+
+    with pytest.raises(HTTPException) as exc:
+        connect_mcp_app(
+            "google-maps",
+            MCPAppConnectRequest(),
+            current_user=_user(test_db, 1),
+            db=test_db,
+        )
+    assert exc.value.status_code == 409
+
+    untouched = test_db.query(MCPServer).filter(MCPServer.name == "google-maps").first()
+    assert untouched.env == {"GOOGLE_MAPS_API_KEY": "encrypted-platform-key"}
+
+
+def test_connect_succeeds_on_already_healthy_platform_row_with_matching_args(
+    test_db,
+):
+    """The refuse-to-heal gate must only fire when there's actually
+    something to heal -- a row whose args already match the catalog (no
+    drift at all) must connect successfully regardless of what else it
+    has configured, since nothing about it needs touching. This is the
+    normal, everyday case for any already-working platform-configured
+    catalog app and must never regress into a spurious 409."""
+    from xagent.web.api.mcp import MCPAppConnectRequest, connect_mcp_app
+
+    test_db.add(
+        MCPServer(
+            name="google-maps",
+            managed="external",
+            transport="stdio",
+            command="npx",
+            args=["-y", "@cablate/mcp-google-map", "--stdio"],  # already matches
+            env={"GOOGLE_MAPS_API_KEY": "encrypted-platform-key"},
+        )
+    )
+    test_db.commit()
+
+    connect_mcp_app(
+        "google-maps",
+        MCPAppConnectRequest(),
+        current_user=_user(test_db, 1),
+        db=test_db,
+    )
+
+    server = test_db.query(MCPServer).filter(MCPServer.name == "google-maps").first()
+    assert server.args == ["-y", "@cablate/mcp-google-map", "--stdio"]
+    assert server.env == {"GOOGLE_MAPS_API_KEY": "encrypted-platform-key"}
+
+
+def test_connect_heal_rejects_falsy_malformed_args_instead_of_wiping(test_db):
+    """launch_config.args of {}, 0, or False must not be laundered into a
+    validation-passing empty list by an `or []` fallback -- that would
+    silently wipe a row's real args on a successful connect. Only a
+    genuinely absent (None) args means "no args"; any other falsy-but-
+    wrong-type value must still fail shape validation."""
+    from fastapi import HTTPException
+
+    from xagent.web.api.mcp import MCPAppConnectRequest, connect_mcp_app
+
+    test_db.add(
+        PublicMCPApp(
+            app_id="totally-custom-app",
+            name="Totally Custom App",
+            description="A hand-created, non-builtin catalog app",
+            transport="stdio",
+            is_visible_in_connector=True,
+            launch_config={"command": "npx", "args": ["-y", "totally-custom-mcp"]},
+        )
+    )
+    test_db.add(
+        MCPServer(
+            name="totally-custom-app",
+            managed="external",
+            transport="stdio",
+            command="npx",
+            args=["-y", "totally-custom-mcp"],
+        )
+    )
+    test_db.commit()
+
+    falsy_malformed_args: Any
+    for falsy_malformed_args in ({}, 0, False):
+        app = (
+            test_db.query(PublicMCPApp)
+            .filter(PublicMCPApp.app_id == "totally-custom-app")
+            .first()
+        )
+        app.launch_config = {"command": "npx", "args": falsy_malformed_args}
+        test_db.commit()
+
+        with pytest.raises(HTTPException) as exc:
+            connect_mcp_app(
+                "totally-custom-app",
+                MCPAppConnectRequest(),
+                current_user=_user(test_db, 1),
+                db=test_db,
+            )
+        assert exc.value.status_code == 400
+
+        untouched = (
+            test_db.query(MCPServer)
+            .filter(MCPServer.name == "totally-custom-app")
+            .first()
+        )
+        assert untouched.args == ["-y", "totally-custom-mcp"]
+
+
+@pytest.mark.parametrize(
+    "field_name,field_value",
+    [
+        ("docker_url", "tcp://attacker-controlled-host:2375"),
+        ("docker_image", "attacker/evil-image:latest"),
+        ("docker_environment", {"LEFTOVER_SECRET": "attacker-or-former-users-value"}),
+        ("docker_working_dir", "/some/orphaned/path"),
+        ("volumes", ["/:/host-root"]),
+        ("bind_ports", {"8080": "8080"}),
+        ("auth", {"type": "bearer", "token": "leftover-or-attacker-token"}),
+        ("headers", {"X-Injected": "true"}),
+        ("timeout", 1),
+        ("concurrent_tools", ["some_tool"]),
+        ("runtime_input_schema", {"type": "object"}),
+        ("runtime_bindings", {"some_binding": "value"}),
+        ("concurrency_safe", True),
+    ],
+)
+def test_connect_heal_refuses_row_with_each_policy_field_independently(
+    test_db, field_name, field_value
+):
+    """Each configurable MCPServer field must independently gate healing on
+    its own, not only in combination with others -- a single bundled test
+    covering several fields at once (e.g. alongside a non-default
+    `managed`, which short-circuits the check first) can stay green even
+    if the check for one specific OTHER field is later dropped, since the
+    other fields in the bundle would still trip the gate. Isolating one
+    field per case means a regression in any single field's check fails
+    exactly the case that covers it. Otherwise-clean row (managed=
+    "external", the default every catalog-created row gets) with exactly
+    one policy field set -- see the sibling tests for managed/
+    restart_policy/env/cwd, which are significant enough to warrant their
+    own dedicated, non-parameterized cases instead of joining this list."""
+    from fastapi import HTTPException
+
+    from xagent.web.api.mcp import MCPAppConnectRequest, connect_mcp_app
+
+    test_db.add(
+        MCPServer(
+            name="google-maps",
+            managed="external",
+            transport="stdio",
+            command="npx",
+            args=["-y", "@cablate/mcp-google-map"],  # stale, would trigger healing
+            **{field_name: field_value},
+        )
+    )
+    test_db.commit()
+
+    with pytest.raises(HTTPException) as exc:
+        connect_mcp_app(
+            "google-maps",
+            MCPAppConnectRequest(env={"GOOGLE_MAPS_API_KEY": "my-key"}),
+            current_user=_user(test_db, 1),
+            db=test_db,
+        )
+    assert exc.value.status_code == 409
+
+    untouched = test_db.query(MCPServer).filter(MCPServer.name == "google-maps").first()
+    assert untouched.args == ["-y", "@cablate/mcp-google-map"]
+    assert getattr(untouched, field_name) == field_value
+
+
+def test_connect_heal_refuses_row_with_non_default_managed(test_db):
+    """managed is compared against its catalog-created default ("external")
+    directly, not via a plain truthiness check like most other gated
+    fields -- an internal (docker-lifecycle-managed) row is never what
+    this connect path creates, so a row that's internally managed alone,
+    with nothing else configured, must still refuse to heal."""
+    from fastapi import HTTPException
+
+    from xagent.web.api.mcp import MCPAppConnectRequest, connect_mcp_app
+
+    test_db.add(
+        MCPServer(
+            name="google-maps",
+            managed="internal",
+            transport="stdio",
+            command="npx",
+            args=["-y", "@cablate/mcp-google-map"],  # stale, would trigger healing
+        )
+    )
+    test_db.commit()
+
+    with pytest.raises(HTTPException) as exc:
+        connect_mcp_app(
+            "google-maps",
+            MCPAppConnectRequest(env={"GOOGLE_MAPS_API_KEY": "my-key"}),
+            current_user=_user(test_db, 1),
+            db=test_db,
+        )
+    assert exc.value.status_code == 409
+
+    untouched = test_db.query(MCPServer).filter(MCPServer.name == "google-maps").first()
+    assert untouched.args == ["-y", "@cablate/mcp-google-map"]
+    assert untouched.managed == "internal"
+
+
+def test_connect_heal_refuses_row_with_non_default_restart_policy(test_db):
+    """restart_policy is non-nullable with a "no" default, so it can't join
+    a plain truthiness check the way the other gated fields do -- it must
+    be compared against its actual default, not just checked for None."""
+    from fastapi import HTTPException
+
+    from xagent.web.api.mcp import MCPAppConnectRequest, connect_mcp_app
+
+    test_db.add(
+        MCPServer(
+            name="google-maps",
+            managed="external",
+            transport="stdio",
+            command="npx",
+            args=["-y", "@cablate/mcp-google-map"],  # stale, would trigger healing
+            restart_policy="always",
+        )
+    )
+    test_db.commit()
+
+    with pytest.raises(HTTPException) as exc:
+        connect_mcp_app(
+            "google-maps",
+            MCPAppConnectRequest(env={"GOOGLE_MAPS_API_KEY": "my-key"}),
+            current_user=_user(test_db, 1),
+            db=test_db,
+        )
+    assert exc.value.status_code == 409
+
+    untouched = test_db.query(MCPServer).filter(MCPServer.name == "google-maps").first()
+    assert untouched.args == ["-y", "@cablate/mcp-google-map"]
+    assert untouched.restart_policy == "always"
+
+
+def test_connect_rejects_malformed_catalog_args_instead_of_persisting(test_db):
+    """A custom (non-builtin) catalog app's launch_config is admin-editable
+    with no shape check on args (PublicMCPAppUpdate.launch_config is a plain
+    Dict[str, Any]) -- unlike a builtin app_id (e.g. "google-maps" is itself
+    a real registry entry, so a DB-row edit to it would just be overlaid
+    away by _app_to_dict and never reach this code path at all). Healing
+    must validate args the same way a fresh row would be, not raw-assign
+    whatever the catalog currently holds -- an admin PATCH that corrupts a
+    genuinely custom app's args into something other than list[str] must
+    surface as a 400 on the next connect, not get silently persisted onto
+    the shared row for the MCP SDK to reject later at session-init time."""
+    from fastapi import HTTPException
+
+    from xagent.web.api.mcp import MCPAppConnectRequest, connect_mcp_app
+
+    test_db.add(
+        PublicMCPApp(
+            app_id="totally-custom-app",
+            name="Totally Custom App",
+            description="A hand-created, non-builtin catalog app",
+            transport="stdio",
+            is_visible_in_connector=True,
+            launch_config={"command": "npx", "args": ["-y", "totally-custom-mcp"]},
+        )
+    )
+    test_db.add(
+        MCPServer(
+            name="totally-custom-app",
+            managed="external",
+            transport="stdio",
+            command="npx",
+            args=["-y", "totally-custom-mcp"],
+        )
+    )
+    test_db.commit()
+
+    app = (
+        test_db.query(PublicMCPApp)
+        .filter(PublicMCPApp.app_id == "totally-custom-app")
+        .first()
+    )
+    app.launch_config = {"command": "npx", "args": {"unexpected": "object"}}
+    test_db.commit()
+
+    with pytest.raises(HTTPException) as exc:
+        connect_mcp_app(
+            "totally-custom-app",
+            MCPAppConnectRequest(),
+            current_user=_user(test_db, 1),
+            db=test_db,
+        )
+    assert exc.value.status_code == 400
+
+    untouched = (
+        test_db.query(MCPServer).filter(MCPServer.name == "totally-custom-app").first()
+    )
+    assert untouched.args == ["-y", "totally-custom-mcp"]
 
 
 @pytest.mark.parametrize("name", ["google-maps", "Google-Maps", "google maps"])

@@ -393,6 +393,7 @@ async def test_successful_channel_turn_persists_user_before_exact_assistant_sett
             ),
             "message_type": expected_message_type,
             "error_message": expected_error,
+            "execution_result": execution_result,
         }
     ]
 

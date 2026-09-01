@@ -2,6 +2,11 @@
 
 import { getApiUrl } from "@/lib/utils"
 import {
+  clientErrorFallback,
+  readClientErrorCode,
+  type ClientErrorCode,
+} from "@/lib/client-errors"
+import {
   type AuthSessionSnapshot,
   type AuthMutationUnavailableReason,
   clearAuthSessionIfCurrent,
@@ -207,6 +212,23 @@ export function getUploadErrorMessage(response: Response, parsed: ParsedApiRespo
   if (response.status === 413) return messages.tooLarge
   if (parsed.isHtml) return messages.proxy
   return parsed.text?.trim() ? truncateUploadMessage(parsed.text) : messages.generic
+}
+export interface ClassifiedUploadError {
+  errorCode: ClientErrorCode
+  message: string
+}
+export function classifyUploadError(response: Response, parsed: ParsedApiResponse): ClassifiedUploadError {
+  const wireCode = isJsonRecord(parsed.data)
+    ? readClientErrorCode(parsed.data.error_code)
+    : null
+  const errorCode: ClientErrorCode = wireCode?.startsWith("upload_")
+    ? wireCode
+    : response.status === 413
+      ? "upload_too_large"
+      : parsed.isHtml
+        ? "upload_proxy_error"
+        : "upload_failed"
+  return { errorCode, message: clientErrorFallback(errorCode) }
 }
 export function getApiErrorMessage(response: Response, parsed: ParsedApiResponse, generic: string): string {
   if (isJsonRecord(parsed.data) && typeof parsed.data.detail === "string" && parsed.data.detail.trim()) return parsed.data.detail

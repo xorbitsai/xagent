@@ -22,19 +22,25 @@ describe("WidgetChromeControls", () => {
     vi.unstubAllGlobals()
   })
 
-  it("renders only the close button when there is no new-conversation action", () => {
+  it("renders the close button and a collapsed menu trigger even with no new-conversation action", () => {
+    // Expand/collapse is always offered regardless of newConversation, so
+    // the "..." trigger has something to open onto even without it.
     render(<WidgetChromeControls />)
 
     expect(screen.getByRole("button", { name: "widgetChat.close" })).toBeInTheDocument()
-    expect(screen.queryByRole("button", { name: "widgetChat.moreOptions" })).toBeNull()
-  })
-
-  it("renders a collapsed menu trigger when a new-conversation action is given", () => {
-    render(<WidgetChromeControls newConversation={{ label: "Start over", onClick: onNewConversation }} />)
-
     const menuTrigger = screen.getByRole("button", { name: "widgetChat.moreOptions" })
     expect(menuTrigger).toHaveAttribute("aria-expanded", "false")
     expect(screen.queryByRole("menu")).toBeNull()
+  })
+
+  it("omits the new-conversation menu item when no action is given, but still offers expand", () => {
+    render(<WidgetChromeControls />)
+
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+    const items = screen.getAllByRole("menuitem")
+
+    expect(items).toHaveLength(1)
+    expect(items[0]).toHaveTextContent("widgetChat.expandWindow")
   })
 
   it("posts widget_close to the parent window when the close button is clicked", () => {
@@ -44,6 +50,39 @@ describe("WidgetChromeControls", () => {
 
     expect(postMessageSpy).toHaveBeenCalledWith(
       { xagent: true, v: 1, type: "widget_close" },
+      "*",
+    )
+  })
+
+  it("announces chrome_ready exactly once on mount and chrome_not_ready exactly once on unmount", () => {
+    // widget.js's mobile FAB-hiding guard keys off exactly this pair: without
+    // a reliable not-ready signal when this component disappears (e.g. a
+    // Session degrading mid-conversation), the parent's only fallback close
+    // control would stay hidden with no way to bring it back. Exact counts,
+    // not just toHaveBeenCalledWith, so a dependency-array bug that re-runs
+    // this effect mid-life (flashing the fallback FAB during an otherwise
+    // uneventful re-render) would actually fail this test.
+    const { unmount, rerender } = render(<WidgetChromeControls />)
+
+    expect(postMessageSpy).toHaveBeenCalledTimes(1)
+    expect(postMessageSpy).toHaveBeenNthCalledWith(
+      1,
+      { xagent: true, v: 1, type: "widget_chrome_ready" },
+      "*",
+    )
+
+    // An unrelated prop change re-renders the component without unmounting
+    // it -- the effect's empty deps array must not treat this as a fresh
+    // mount.
+    rerender(<WidgetChromeControls newConversation={{ label: "Start over", onClick: onNewConversation }} />)
+    expect(postMessageSpy).toHaveBeenCalledTimes(1)
+
+    unmount()
+
+    expect(postMessageSpy).toHaveBeenCalledTimes(2)
+    expect(postMessageSpy).toHaveBeenNthCalledWith(
+      2,
+      { xagent: true, v: 1, type: "widget_chrome_not_ready" },
       "*",
     )
   })
@@ -114,11 +153,143 @@ describe("WidgetChromeControls", () => {
       />,
     )
 
-    expect(trigger).toBeDisabled()
     expect(screen.queryByRole("menu")).toBeNull()
-    // Not just "disabled" -- the whole point of this prop is a visible
-    // in-progress indicator on the trigger once the menu itself has closed.
+    // The spinner is status feedback, not a lockout -- sizing has no
+    // dependency on the conversation reset, so the trigger itself must stay
+    // reachable (the reset item's own `disabled` is what actually blocks
+    // re-triggering it while pending).
+    expect(trigger).not.toBeDisabled()
     expect(trigger.querySelector("svg.animate-spin")).not.toBeNull()
+  })
+
+  it("keeps expand/collapse reachable while a conversation reset is pending", () => {
+    render(
+      <WidgetChromeControls
+        newConversation={{
+          label: "Resetting...",
+          onClick: onNewConversation,
+          disabled: true,
+          pending: true,
+        }}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+    expect(screen.getByRole("menuitem", { name: "Resetting..." })).toBeDisabled()
+
+    fireEvent.click(screen.getByRole("menuitem", { name: "widgetChat.expandWindow" }))
+
+    expect(postMessageSpy).toHaveBeenCalledWith(
+      { xagent: true, v: 1, type: "widget_expand" },
+      "*",
+    )
+  })
+
+  it("toggles expand/collapse: posts the right message each way and flips the item's icon and label", () => {
+    render(<WidgetChromeControls />)
+
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+    const expandIcon = screen.getByRole("menuitem", { name: "widgetChat.expandWindow" })
+      .querySelector("svg[data-icon='expand']")
+    expect(expandIcon).not.toBeNull()
+    // data-icon is authored by this component's own branch, so it survives a
+    // source edit that swaps which Lucide icon actually renders there. The
+    // polyline's `points` geometry comes from lucide-react's own icon
+    // definition and differs per icon, so it can't drift out of sync the
+    // same way -- a real assertion of icon identity, not just the label.
+    expect(expandIcon?.querySelector("polyline[points='15 3 21 3 21 9']")).not.toBeNull()
+    fireEvent.click(screen.getByRole("menuitem", { name: "widgetChat.expandWindow" }))
+
+    expect(postMessageSpy).toHaveBeenCalledWith(
+      { xagent: true, v: 1, type: "widget_expand" },
+      "*",
+    )
+    // The menu closes on click, same as every other menu item.
+    expect(screen.queryByRole("menu")).toBeNull()
+
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+    const collapseIcon = screen.getByRole("menuitem", { name: "widgetChat.collapseWindow" })
+      .querySelector("svg[data-icon='collapse']")
+    expect(collapseIcon).not.toBeNull()
+    expect(collapseIcon?.querySelector("polyline[points='4 14 10 14 10 20']")).not.toBeNull()
+
+    fireEvent.click(screen.getByRole("menuitem", { name: "widgetChat.collapseWindow" }))
+
+    expect(postMessageSpy).toHaveBeenCalledWith(
+      { xagent: true, v: 1, type: "widget_collapse" },
+      "*",
+    )
+  })
+
+  it("corrects the optimistic expand guess when the host rejects it (its own mobile guard)", () => {
+    // widget.js's expandPanel() no-ops under the mobile breakpoint and
+    // replies with widget_expand_rejected instead -- without listening for
+    // that, this component's own optimistic setIsExpanded(true) is never
+    // corrected, and the menu keeps reading "Collapse window" with nothing
+    // actually expanded.
+    render(<WidgetChromeControls />)
+
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+    fireEvent.click(screen.getByRole("menuitem", { name: "widgetChat.expandWindow" }))
+
+    fireEvent(window, new MessageEvent("message", {
+      data: { xagent: true, v: 1, type: "widget_expand_rejected" },
+      source: window.parent as unknown as MessageEventSource,
+    }))
+
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+    expect(screen.getByRole("menuitem", { name: "widgetChat.expandWindow" })).toBeInTheDocument()
+  })
+
+  it("ignores a rejection message not sourced from window.parent", () => {
+    render(<WidgetChromeControls />)
+
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+    fireEvent.click(screen.getByRole("menuitem", { name: "widgetChat.expandWindow" }))
+
+    fireEvent(window, new MessageEvent("message", {
+      data: { xagent: true, v: 1, type: "widget_expand_rejected" },
+      source: window as unknown as MessageEventSource,
+    }))
+
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+    expect(screen.getByRole("menuitem", { name: "widgetChat.collapseWindow" })).toBeInTheDocument()
+  })
+
+  it("ignores a same-window rejection message on a direct (non-embedded) visit", () => {
+    // window.parent === window here, so event.source === window also equals
+    // window.parent -- the "not sourced from window.parent" check above
+    // alone would NOT catch this; only an explicit window.parent === window
+    // check does, mirroring postToParentWidget's own direct-visit guard.
+    vi.stubGlobal("parent", window)
+    render(<WidgetChromeControls />)
+
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+    fireEvent.click(screen.getByRole("menuitem", { name: "widgetChat.expandWindow" }))
+
+    fireEvent(window, new MessageEvent("message", {
+      data: { xagent: true, v: 1, type: "widget_expand_rejected" },
+      source: window as unknown as MessageEventSource,
+    }))
+
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+    expect(screen.getByRole("menuitem", { name: "widgetChat.collapseWindow" })).toBeInTheDocument()
+  })
+
+  it("keeps the new-conversation item and the expand toggle as two independent menu items", () => {
+    render(<WidgetChromeControls newConversation={{ label: "Start over", onClick: onNewConversation }} />)
+
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+    const items = screen.getAllByRole("menuitem")
+
+    expect(items).toHaveLength(2)
+    fireEvent.click(screen.getByRole("menuitem", { name: "widgetChat.expandWindow" }))
+
+    expect(onNewConversation).not.toHaveBeenCalled()
+    expect(postMessageSpy).toHaveBeenCalledWith(
+      { xagent: true, v: 1, type: "widget_expand" },
+      "*",
+    )
   })
 
   it("closes the menu on Escape", () => {

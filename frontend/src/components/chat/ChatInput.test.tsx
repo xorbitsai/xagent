@@ -463,6 +463,85 @@ describe("ChatInput", () => {
     )
   })
 
+  it("classifies a coded unsuccessful 2xx upload response", async () => {
+    apiRequestMock.mockImplementation((url: string) => Promise.resolve(
+      url === "http://upload.local/api/files/upload"
+        ? new Response(JSON.stringify({
+            success: false,
+            error_code: "upload_too_large",
+            detail: "private storage detail",
+          }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          })
+        : emptyJsonResponse(),
+    ))
+
+    function Harness() {
+      const [files, setFiles] = React.useState<File[]>([])
+      return (
+        <ChatInput
+          files={files}
+          hideConfig
+          inputValue=""
+          onFilesChange={setFiles}
+          onInputChange={vi.fn()}
+          onSend={vi.fn()}
+        />
+      )
+    }
+
+    const { container } = render(<Harness />)
+    fireEvent.change(container.querySelector('input[type="file"]') as HTMLInputElement, {
+      target: { files: [new File(["data"], "data.txt")] },
+    })
+
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalledWith(
+        "clientErrors.uploadTooLarge",
+        { duration: 8000 },
+      )
+    })
+    expect(screen.queryByText("data.txt")).not.toBeInTheDocument()
+  })
+
+  it("rejects duplicate custom upload identifiers before mutating files", async () => {
+    const uploadFile = vi.fn().mockResolvedValue({ file_id: "duplicate-id" })
+    const files = [
+      new File(["first"], "first.txt"),
+      new File(["second"], "second.txt"),
+    ]
+
+    function Harness() {
+      const [selectedFiles, setSelectedFiles] = React.useState<File[]>([])
+      return (
+        <ChatInput
+          files={selectedFiles}
+          hideConfig
+          inputValue=""
+          onFilesChange={setSelectedFiles}
+          onInputChange={vi.fn()}
+          onSend={vi.fn()}
+          uploadFile={uploadFile}
+        />
+      )
+    }
+
+    const { container } = render(<Harness />)
+    fireEvent.change(container.querySelector('input[type="file"]') as HTMLInputElement, {
+      target: { files },
+    })
+
+    await waitFor(() => expect(uploadFile).toHaveBeenCalledTimes(2))
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalledWith(
+        "clientErrors.uploadFailed",
+        { duration: 8000 },
+      )
+    })
+    expect(files.every(file => !("file_id" in file))).toBe(true)
+  })
+
   it("restores a draft file chip without displaying its canonical id and preserves that id on send", async () => {
     const onSend = vi.fn()
     const { container } = render(
@@ -1220,6 +1299,38 @@ describe("ChatInput", () => {
     })
     expect(onSend.mock.calls[0][1]).toEqual(
       expect.objectContaining({ clientMessageId: expect.any(String) })
+    )
+  })
+
+  it("localizes coded send failures without displaying their raw message", async () => {
+    const onSend = vi.fn().mockRejectedValue(Object.assign(
+      new Error("provider token=secret"),
+      {
+        errorCode: "task_checkpoint_unreadable",
+        userFacing: true,
+      },
+    ))
+    const { container } = render(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue="send safely"
+        onInputChange={vi.fn()}
+        onSend={onSend}
+        readOnlyConfig
+      />
+    )
+
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalledWith(
+        "clientErrors.taskCheckpointUnreadable",
+        { duration: 8000 },
+      )
+    })
+    expect(toastErrorMock).not.toHaveBeenCalledWith(
+      expect.stringContaining("token=secret"),
     )
   })
 

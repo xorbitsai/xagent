@@ -1858,6 +1858,25 @@ class WebToolConfig(BaseToolConfig):
         self._pending_runtime_policy = None
         return True
 
+    def invalidate_connector_runtime_cache(self) -> None:
+        """Force the next connector runtime/MCP config build to re-resolve
+        from current state (e.g. an app the user just connected), without
+        touching ``_connector_runtime_turn_id``.
+
+        Unlike ``set_connector_runtime_turn_id``, this never changes what
+        turn id ephemeral per-turn connector secrets are looked up under -
+        only a real turn id genuinely tied to the execution that stored
+        those secrets may do that (see the caller in ``websocket.py`` for
+        why: a websocket-only id, or a fabricated one, can only ever
+        collide with or miss a V1/SDK task's real ephemeral-secrets key,
+        never legitimately match it).
+        """
+
+        self._connector_runtime_view = None
+        self._cached_mcp_configs = None
+        self._factory_runtime_snapshot = None
+        self._pending_runtime_policy = None
+
     def set_execution_scope(self, scope: Optional[Any]) -> bool:
         """Switch the per-turn execution scope for a reused tool config.
 

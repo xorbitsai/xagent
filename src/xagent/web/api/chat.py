@@ -3104,6 +3104,35 @@ class AgentServiceManager:
                 connector_runtime_turn_id,
             )
 
+    def refresh_connector_runtime_tools(self, task_id: int) -> None:
+        """Force a cached agent's connector runtime/MCP config to
+        re-resolve on next use (e.g. after the user connects an app while
+        the task was paused), without touching ``_connector_runtime_turn_id``.
+
+        Unlike ``get_agent_for_task``'s ``connector_runtime_turn_id`` kwarg
+        (which both busts this cache AND rebinds the turn id ephemeral
+        per-turn connector secrets are looked up under), this only busts
+        the cache. Callers that just need "connector state may have
+        changed, please rebuild" - not "this specific new turn now owns
+        the connector runtime" - must use this instead: passing a turn id
+        that isn't genuinely the one the task's own ephemeral secrets (if
+        any) were stored under can only ever mismatch that lookup, never
+        legitimately satisfy it (see websocket.py's message-resume and
+        explicit-resume handlers, which used to fabricate one for exactly
+        this purpose).
+        """
+
+        agent = self._agents.get(task_id)
+        if agent is None:
+            return
+        tool_config = agent.tool_config
+        if tool_config is None or not hasattr(
+            tool_config, "invalidate_connector_runtime_cache"
+        ):
+            return
+        tool_config.invalidate_connector_runtime_cache()
+        agent.invalidate_tools()
+
     def _sync_execution_scope(
         self, task_id: int, scope: Optional[ExecutionScope]
     ) -> None:

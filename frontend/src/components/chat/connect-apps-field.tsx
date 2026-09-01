@@ -194,9 +194,15 @@ export function ConnectAppsField({
   /** Called once every requested app is connected, in place of onSkip -
    * distinct so the message it sends can say "connected" rather than
    * "I'll do this later" (see clarification-form.tsx's
-   * handleContinueConnectApps). Optional so an older/mixed-list caller
-   * that doesn't pass it just keeps the allConnectedNote-only footer this
-   * card had before, rather than crashing. */
+   * handleContinueConnectApps). Optional: an older/mixed-list caller that
+   * doesn't pass it at all just keeps the allConnectedNote-only footer this
+   * card had before, rather than crashing - but the caller this card
+   * actually has today (clarification-form.tsx's isConnectAppsOnly branch)
+   * DOES always pass this prop type, and instead passes `undefined` as the
+   * *value* while every requested app across the whole pause isn't
+   * connected yet (see allConnectAppsConnected there), or while this card
+   * isn't the live, active pause (see onSkip's own doc comment) - so a
+   * `false`-y value here just as often means "not yet," not "never will." */
   onContinue?: () => Promise<void> | void;
 }) {
   const { apps, refresh, isLoading, error } = useMcpApps();

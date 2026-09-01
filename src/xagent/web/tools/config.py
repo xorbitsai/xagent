@@ -608,21 +608,31 @@ def _oauth_launch_config_mapping(
     raise _OAuthLaunchConfigInvalid(field="type")
 
 
-# invalid_grant (RFC 6749), GitHub's non-standard equivalent
-# bad_refresh_token, and Slack's non-standard equivalent
-# invalid_refresh_token (Slack's Web API convention -- HTTP 200 with
-# {"ok": false, "error": ...} -- applies to its oauth.v2.access refresh
-# grant too, for workspaces with token rotation enabled) all describe THIS
-# account's refresh token specifically (revoked/expired/already used) --
+# invalid_grant (RFC 6749) describes THIS account's refresh token
+# specifically (revoked/expired/already used), regardless of provider --
 # RFC 6749's invalid_client and unauthorized_client instead describe the
 # OAuthProvider row's own client_id/client_secret or grant-type
 # authorization, the same class of admin-fixable, self-healing config
 # problem refresh_oauth_token_if_needed's own "missing CLIENT_ID or
 # SECRET" check already treats as transient. Bundling them in here would
 # mass-delete every user's connection to a provider over one admin typo.
-_OAUTH_PERMANENT_REFRESH_ERROR_CODES = frozenset(
-    {"invalid_grant", "bad_refresh_token", "invalid_refresh_token"}
-)
+_OAUTH_PERMANENT_REFRESH_ERROR_CODES = frozenset({"invalid_grant"})
+
+# Non-standard, per-provider equivalents of invalid_grant -- gated on
+# provider_name (like Meta's differently-shaped error object already is
+# in _oauth_refresh_error_code) so an unrelated provider -- including a
+# future one, or an admin-added custom OAuthProvider row with an arbitrary
+# token endpoint -- that coincidentally uses the same string for a
+# different, non-fatal reason can't be misread as a dead-token signal.
+_PROVIDER_DEAD_REFRESH_TOKEN_ERROR_CODES: dict[str, frozenset[str]] = {
+    # GitHub's classic OAuth Apps token endpoint reports a dead
+    # refresh_token via a 200 response with this code, not a 4xx.
+    "github": frozenset({"bad_refresh_token"}),
+    # Slack's Web API convention -- HTTP 200 with {"ok": false, "error":
+    # ...} -- applies to its oauth.v2.access refresh grant too, for
+    # workspaces with token rotation enabled.
+    "slack": frozenset({"invalid_refresh_token"}),
+}
 
 
 class _OAuthRefreshPermanentlyInvalid(Exception):
@@ -661,7 +671,9 @@ def _oauth_refresh_error_code(
     return None
 
 
-def _is_permanent_oauth_refresh_error(status_code: int, error_code: str | None) -> bool:
+def _is_permanent_oauth_refresh_error(
+    provider_name: str, status_code: int, error_code: str | None
+) -> bool:
     """Whether the provider's error body unambiguously says the refresh
     token itself is dead. Any other failure (an unrecognized error code, a
     malformed/absent body) is left to the caller as a transient failure --
@@ -680,7 +692,11 @@ def _is_permanent_oauth_refresh_error(status_code: int, error_code: str | None) 
     """
     if status_code >= 500:
         return False
-    return error_code in _OAUTH_PERMANENT_REFRESH_ERROR_CODES
+    if error_code in _OAUTH_PERMANENT_REFRESH_ERROR_CODES:
+        return True
+    return error_code in _PROVIDER_DEAD_REFRESH_TOKEN_ERROR_CODES.get(
+        provider_name.lower(), frozenset()
+    )
 
 
 def _log_and_classify_failed_refresh(
@@ -705,7 +721,9 @@ def _log_and_classify_failed_refresh(
         response.status_code,
         (error_code or "unknown")[:_OAUTH_ERROR_MESSAGE_LIMIT],
     )
-    if _is_permanent_oauth_refresh_error(response.status_code, error_code):
+    if _is_permanent_oauth_refresh_error(
+        provider_name, response.status_code, error_code
+    ):
         raise _OAuthRefreshPermanentlyInvalid()
 
 

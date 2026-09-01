@@ -1405,6 +1405,62 @@ async def test_refresh_slack_style_200_invalid_refresh_token_is_permanent(
 
 
 @pytest.mark.asyncio
+async def test_refresh_provider_specific_dead_token_codes_are_gated_by_provider(
+    db_session, monkeypatch
+):
+    """bad_refresh_token/invalid_refresh_token are GitHub's/Slack's own
+    non-standard vocabulary, not a generic OAuth2 code -- an unrelated
+    provider that happens to return one of these strings for a different,
+    non-fatal reason must not be misread as a dead-token signal, the same
+    way Meta's differently-shaped error object is gated on provider_name
+    rather than trusted for any provider."""
+    db, user = db_session
+    db.add(
+        OAuthProvider(
+            provider_name="google",
+            name="Google",
+            client_id=encrypt_value("client-id-secret"),
+            client_secret=encrypt_value("client-secret-value"),
+            auth_url="https://auth.example/authorize",
+            token_url="https://auth.example/token",
+        )
+    )
+    oauth_account = UserOAuth(
+        user_id=user.id,
+        provider="google",
+        access_token="old-token",
+        refresh_token="old-refresh",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        provider_user_id="42",
+    )
+    db.add(oauth_account)
+    db.commit()
+
+    class GoogleAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        async def post(self, *args, **kwargs):
+            return httpx.Response(400, json={"error": "bad_refresh_token"})
+
+    monkeypatch.setattr(
+        web_tools_config.httpx,
+        "AsyncClient",
+        GoogleAsyncClient,
+    )
+
+    assert (
+        await web_tools_config.refresh_oauth_token_if_needed(
+            db, oauth_account, "google"
+        )
+        is False
+    )
+
+
+@pytest.mark.asyncio
 async def test_remote_hook_without_app_info_can_claim_authorization(db_session):
     db, user = db_session
     server = _add_remote_server(db, user, name="Unregistered Remote")

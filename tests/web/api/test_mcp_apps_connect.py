@@ -775,18 +775,39 @@ def test_connect_heal_rejects_falsy_malformed_args_instead_of_wiping(test_db):
         assert untouched.args == ["-y", "totally-custom-mcp"]
 
 
-def test_connect_heal_refuses_row_with_policy_fields_the_gate_previously_missed(
-    test_db,
+@pytest.mark.parametrize(
+    "field_name,field_value",
+    [
+        ("docker_url", "tcp://attacker-controlled-host:2375"),
+        ("docker_image", "attacker/evil-image:latest"),
+        ("docker_environment", {"LEFTOVER_SECRET": "attacker-or-former-users-value"}),
+        ("docker_working_dir", "/some/orphaned/path"),
+        ("volumes", ["/:/host-root"]),
+        ("bind_ports", {"8080": "8080"}),
+        ("auth", {"type": "bearer", "token": "leftover-or-attacker-token"}),
+        ("headers", {"X-Injected": "true"}),
+        ("timeout", 1),
+        ("concurrent_tools", ["some_tool"]),
+        ("runtime_input_schema", {"type": "object"}),
+        ("runtime_bindings", {"some_binding": "value"}),
+        ("concurrency_safe", True),
+    ],
+)
+def test_connect_heal_refuses_row_with_each_policy_field_independently(
+    test_db, field_name, field_value
 ):
-    """The refuse-to-heal gate must cover every configurable MCPServer
-    field, not a hand-picked subset. An earlier version of this gate only
-    checked env/cwd/concurrent_tools/runtime_input_schema/
-    runtime_bindings/concurrency_safe -- a row carrying real policy in any
-    OTHER configurable field (docker_image, auth, headers, timeout,
-    volumes, bind_ports, a non-default managed/restart_policy, ...) would
-    have slipped past that gate and gotten silently healed/adopted, which
-    is worse than this PR's own baseline (pre-heal, any args mismatch
-    always 409'd regardless of what else was configured)."""
+    """Each configurable MCPServer field must independently gate healing on
+    its own, not only in combination with others -- a single bundled test
+    covering several fields at once (e.g. alongside a non-default
+    `managed`, which short-circuits the check first) can stay green even
+    if the check for one specific OTHER field is later dropped, since the
+    other fields in the bundle would still trip the gate. Isolating one
+    field per case means a regression in any single field's check fails
+    exactly the case that covers it. Otherwise-clean row (managed=
+    "external", the default every catalog-created row gets) with exactly
+    one policy field set -- see the sibling tests for managed/
+    restart_policy/env/cwd, which are significant enough to warrant their
+    own dedicated, non-parameterized cases instead of joining this list."""
     from fastapi import HTTPException
 
     from xagent.web.api.mcp import MCPAppConnectRequest, connect_mcp_app
@@ -794,17 +815,11 @@ def test_connect_heal_refuses_row_with_policy_fields_the_gate_previously_missed(
     test_db.add(
         MCPServer(
             name="google-maps",
-            managed="internal",  # non-default managed alone should refuse healing
+            managed="external",
             transport="stdio",
             command="npx",
             args=["-y", "@cablate/mcp-google-map"],  # stale, would trigger healing
-            docker_image="attacker/evil-image:latest",
-            docker_url="tcp://attacker-controlled-host:2375",
-            volumes=["/:/host-root"],
-            bind_ports={"8080": "8080"},
-            auth={"type": "bearer", "token": "leftover-or-attacker-token"},
-            headers={"X-Injected": "true"},
-            timeout=1,
+            **{field_name: field_value},
         )
     )
     test_db.commit()
@@ -820,13 +835,42 @@ def test_connect_heal_refuses_row_with_policy_fields_the_gate_previously_missed(
 
     untouched = test_db.query(MCPServer).filter(MCPServer.name == "google-maps").first()
     assert untouched.args == ["-y", "@cablate/mcp-google-map"]
-    assert untouched.docker_image == "attacker/evil-image:latest"
-    assert untouched.docker_url == "tcp://attacker-controlled-host:2375"
-    assert untouched.volumes == ["/:/host-root"]
-    assert untouched.bind_ports == {"8080": "8080"}
-    assert untouched.auth == {"type": "bearer", "token": "leftover-or-attacker-token"}
-    assert untouched.headers == {"X-Injected": "true"}
-    assert untouched.timeout == 1
+    assert getattr(untouched, field_name) == field_value
+
+
+def test_connect_heal_refuses_row_with_non_default_managed(test_db):
+    """managed is compared against its catalog-created default ("external")
+    directly, not via a plain truthiness check like most other gated
+    fields -- an internal (docker-lifecycle-managed) row is never what
+    this connect path creates, so a row that's internally managed alone,
+    with nothing else configured, must still refuse to heal."""
+    from fastapi import HTTPException
+
+    from xagent.web.api.mcp import MCPAppConnectRequest, connect_mcp_app
+
+    test_db.add(
+        MCPServer(
+            name="google-maps",
+            managed="internal",
+            transport="stdio",
+            command="npx",
+            args=["-y", "@cablate/mcp-google-map"],  # stale, would trigger healing
+        )
+    )
+    test_db.commit()
+
+    with pytest.raises(HTTPException) as exc:
+        connect_mcp_app(
+            "google-maps",
+            MCPAppConnectRequest(env={"GOOGLE_MAPS_API_KEY": "my-key"}),
+            current_user=_user(test_db, 1),
+            db=test_db,
+        )
+    assert exc.value.status_code == 409
+
+    untouched = test_db.query(MCPServer).filter(MCPServer.name == "google-maps").first()
+    assert untouched.args == ["-y", "@cablate/mcp-google-map"]
+    assert untouched.managed == "internal"
 
 
 def test_connect_heal_refuses_row_with_non_default_restart_policy(test_db):

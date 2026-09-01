@@ -170,6 +170,19 @@ def test_only_run_partition_absent_is_false_when_something_else_also_fails() -> 
     assert is_missing_run_partition_only(failed, data) is False
 
 
+def test_explicit_json_null_run_field_reads_as_absent() -> None:
+    """An explicitly stored JSON ``null`` is the same answer as a missing
+    key here, and the docstring says so. Pinned rather than left implicit:
+    a future tightening to ``not in row_data`` would move this row into the
+    corrupt branch, which is a decision to make deliberately, not by
+    accident."""
+
+    data = _data(**{TASK_RUN_ID_TRACE_FIELD: None})
+    failed = _failed(_row(), data)
+    assert failed == {CHECKPOINT_ROW_RUN_PARTITION}
+    assert is_missing_run_partition_only(failed, data) is True
+
+
 _SHARED_PREDICATE = "failed_checkpoint_row_conditions"
 _BY_PK_RESOLVER_MODULES = (
     "xagent/web/api/trace_handlers.py",

@@ -436,6 +436,39 @@ describe("ClarificationForm connect_apps interaction", () => {
     })
   })
 
+  it("sends a Continue message once every requested app is connected", async () => {
+    // The mirror image of the "binds a skip" test above: every existing
+    // connect_apps test in this file only asserts Continue is ABSENT in
+    // various not-yet-connected scenarios - none actually drives it through
+    // to a real allConnectAppsConnected=true render and confirms clicking it
+    // sends the expected message via handleContinueConnectApps.
+    mcpAppsMock.apps = [
+      {
+        id: "gmail",
+        name: "Gmail",
+        description: "",
+        icon: "",
+        users: "",
+        transport: "builtin",
+        provider: "google",
+        category: "Communication",
+        is_connected: true,
+      },
+    ]
+
+    render(<ClarificationForm interactions={[CONNECT_APPS_INTERACTION]} />)
+
+    fireEvent.click(screen.getByRole("button", { name: "chatPage.clarification.connectApps.continue" }))
+
+    await waitFor(() => {
+      expect(appContextMock.sendMessage).toHaveBeenCalledWith(
+        "chatPage.clarification.connectApps.continue",
+        { force: true },
+        [],
+      )
+    })
+  })
+
   it("renders the real connect_apps widget instead of an 'unsupported type' error when mixed into a list with another interaction type", () => {
     // Not producible by any seeder today (see LIVE_WIDGET_TYPES's comment in
     // clarification-form.tsx), but nothing rules it out - isConnectAppsOnly

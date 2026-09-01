@@ -372,6 +372,7 @@ const en = {
         subtitle: "Connect each app below — one sign-in still covers every app under the same provider.",
         loading: "Loading your apps…",
         retry: "Retry",
+        noneMatched: "The requested app isn't available in your connector list right now.",
         continueWith: "Continue with {provider}",
         connected: "Connected",
         connecting: "Connecting…",

@@ -185,7 +185,12 @@ export function ConnectAppsField({
   onContinue,
 }: {
   interaction: Interaction;
-  onSkip: () => Promise<void> | void;
+  /** Optional (and omitted) when this card isn't the live, active pause -
+   * see onContinue's own doc comment. Skip sends an ordinary chat message
+   * just like Continue does, with the exact same resume/interrupt side
+   * effects on whatever task state exists when it's received - so a stale
+   * historical card must not offer it either. */
+  onSkip?: () => Promise<void> | void;
   /** Called once every requested app is connected, in place of onSkip -
    * distinct so the message it sends can say "connected" rather than
    * "I'll do this later" (see clarification-form.tsx's
@@ -236,9 +241,7 @@ export function ConnectAppsField({
     // ClarificationForm's Collapsible card (title bar + chevron) is already
     // showing above this by the time useMcpApps() is still fetching or has
     // failed - returning null unconditionally here left it sitting over a
-    // blank void with nothing telling the user why. Once apps has loaded and
-    // still resolves to zero rows, null is correct again: there's genuinely
-    // nothing this card can show.
+    // blank void with nothing telling the user why.
     if (isLoading) {
       return (
         <p className="text-xs text-muted-foreground">
@@ -260,7 +263,52 @@ export function ConnectAppsField({
         </div>
       );
     }
-    return null;
+    // The catalog loaded fine, but none of the requested app names resolved
+    // against it - the backend names apps without filtering by
+    // is_visible_in_connector, while the frontend catalog fetch strong-hides
+    // any app with that flag off (e.g. a hidden-rollout gate), so a real
+    // pause can legitimately name an app this card can never render a row
+    // for. Retry (in case the catalog just hadn't loaded that app yet) plus
+    // Skip, matching the still-genuinely-paused task's own escape hatch -
+    // returning null here left a live pause with no visible action at all.
+    return (
+      <div className="flex items-center gap-3">
+        <p className="flex-1 text-xs text-muted-foreground">
+          {skipped
+            ? t("chatPage.clarification.connectApps.skippedNote")
+            : t("chatPage.clarification.connectApps.noneMatched")}
+        </p>
+        {!skipped && (
+          <>
+            <button
+              type="button"
+              className="flex-shrink-0 rounded-md border border-border px-2 py-1 text-xs font-medium text-foreground hover:bg-muted"
+              onClick={() => void refresh()}
+            >
+              {t("chatPage.clarification.connectApps.retry")}
+            </button>
+            {onSkip && (
+              <button
+                type="button"
+                className="flex-shrink-0 rounded-md px-2 py-1 text-xs font-medium text-muted-foreground hover:bg-muted hover:text-foreground"
+                onClick={async () => {
+                  setSkipped(true);
+                  try {
+                    await onSkip();
+                  } catch {
+                    if (isMountedRef.current) {
+                      setSkipped(false);
+                    }
+                  }
+                }}
+              >
+                {t("chatPage.clarification.connectApps.skip")}
+              </button>
+            )}
+          </>
+        )}
+      </div>
+    );
   }
 
   const withConnectingKey = async (key: string, run: () => Promise<void>) => {
@@ -548,7 +596,8 @@ export function ConnectAppsField({
               </button>
             )
           ) : (
-            !skipped && (
+            !skipped &&
+            onSkip && (
               <button
                 type="button"
                 className="flex-shrink-0 rounded-md px-2 py-1 text-xs font-medium text-muted-foreground hover:bg-muted hover:text-foreground"

@@ -174,17 +174,24 @@ describe("ConnectAppsField", () => {
     expect(screen.getByText("G")).toBeInTheDocument();
   });
 
-  it("renders nothing if none of the requested app names resolve to a catalog entry", () => {
+  it("shows a Retry/Skip fallback, not an empty card, if none of the requested app names resolve to a catalog entry", () => {
+    // A dead-end card (nothing rendered at all) would leave a genuinely
+    // live pause with no Skip/Continue/error affordance once every
+    // requested name fails to resolve - see the noneMatched fallback below.
     mcpAppsMock.apps = [];
 
-    const { container } = render(
+    render(
       <ConnectAppsField
         interaction={{ ...LEO_INTERACTION, apps: ["Some Unknown App"] }}
         onSkip={vi.fn()}
       />
     );
 
-    expect(container).toBeEmptyDOMElement();
+    expect(
+      screen.getByText("chatPage.clarification.connectApps.noneMatched")
+    ).toBeInTheDocument();
+    expect(screen.getByText("chatPage.clarification.connectApps.retry")).toBeInTheDocument();
+    expect(screen.getByText("chatPage.clarification.connectApps.skip")).toBeInTheDocument();
   });
 
   it("resolves a requested name against an app's id, not just its display name", () => {
@@ -777,6 +784,31 @@ describe("ConnectAppsField", () => {
     expect(
       screen.queryByRole("button", { name: "tools.mcp.dialog.connect" })
     ).not.toBeInTheDocument();
+  });
+
+  it("shows a Retry/Skip fallback, not a blank card, when the requested app is hidden from the connector catalog", () => {
+    // The backend can name an app the frontend catalog strong-hides (e.g. an
+    // is_visible_in_connector=False rollout gate on Intercom/Chrome) - the
+    // catalog fetch succeeds, but resolveRows can't match the requested name
+    // against it, so rows stays empty even though this is a genuinely live
+    // pause with nothing else to show.
+    mcpAppsMock.apps = [];
+    const onSkip = vi.fn();
+
+    render(
+      <ConnectAppsField
+        interaction={{ ...LEO_INTERACTION, apps: ["Intercom"] }}
+        onSkip={onSkip}
+      />
+    );
+
+    expect(
+      screen.getByText("chatPage.clarification.connectApps.noneMatched")
+    ).toBeInTheDocument();
+    expect(screen.getByText("chatPage.clarification.connectApps.retry")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByText("chatPage.clarification.connectApps.skip"));
+    expect(onSkip).toHaveBeenCalledTimes(1);
   });
 
   it("calls onSkip once when the skip link is clicked, hides the link, and swaps the footer note", () => {

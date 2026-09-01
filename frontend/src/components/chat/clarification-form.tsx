@@ -692,10 +692,18 @@ export function ClarificationForm({
       // real widget instead of falling to the "unsupported type" case below.
       case "connect_apps":
         return (
+          // Both Skip and Continue send an ordinary chat message with the
+          // same resume/interrupt side effects on whatever the underlying
+          // task's current state is - gated on active (not just
+          // isConnectAppsOnly) so a historical/already-resolved connect_apps
+          // message can't mutate a task it no longer represents the live
+          // pause for. Hire-seed cards (active=false from their very first
+          // render) lose these two buttons but keep every per-row Connect
+          // action, which has no such side effect.
           <ConnectAppsField
             interaction={interaction}
-            onSkip={handleSkipConnectApps}
-            onContinue={allConnectAppsConnected ? handleContinueConnectApps : undefined}
+            onSkip={active ? handleSkipConnectApps : undefined}
+            onContinue={allConnectAppsConnected && active ? handleContinueConnectApps : undefined}
           />
         )
 
@@ -743,11 +751,14 @@ export function ClarificationForm({
         {isConnectAppsOnly ? (
           <div className="space-y-4">
             {normalizedInteractions.map((interaction, index) => (
+              // See the mixed-list connect_apps case in renderField above
+              // for why both Skip and Continue are gated on active too, not
+              // just on isConnectAppsOnly/allConnectAppsConnected.
               <ConnectAppsField
                 key={`${interaction.field}-${index}`}
                 interaction={interaction}
-                onSkip={handleSkipConnectApps}
-                onContinue={allConnectAppsConnected ? handleContinueConnectApps : undefined}
+                onSkip={active ? handleSkipConnectApps : undefined}
+                onContinue={allConnectAppsConnected && active ? handleContinueConnectApps : undefined}
               />
             ))}
           </div>

@@ -315,6 +315,46 @@ describe("ClarificationForm connect_apps interaction", () => {
     ).toBeInTheDocument()
   })
 
+  it("does not offer Skip or Continue on an inactive (historical/already-resolved) connect_apps card, even once every app is connected", () => {
+    // Both Skip and Continue send an ordinary chat message with the same
+    // resume/interrupt side effects on whatever the underlying task's
+    // current state is - a card whose pause is no longer the live one
+    // (active=false, e.g. after a reload once the task has since resumed,
+    // completed, or is running something else) must not offer either, or
+    // clicking it can mutate an unrelated or already-finished task.
+    mcpAppsMock.apps = [
+      {
+        id: "gmail",
+        name: "Gmail",
+        description: "",
+        icon: "",
+        users: "",
+        transport: "builtin",
+        provider: "google",
+        category: "Communication",
+        is_connected: true,
+      },
+    ]
+
+    render(
+      <ClarificationForm
+        interactions={[CONNECT_APPS_INTERACTION]}
+        active={false}
+        onSend={vi.fn()}
+      />,
+    )
+
+    expect(
+      screen.queryByRole("button", { name: "chatPage.clarification.connectApps.continue" }),
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByText("chatPage.clarification.connectApps.skip"),
+    ).not.toBeInTheDocument()
+    // The per-row Connect action (no resume/interrupt side effect) stays
+    // available regardless - this is what keeps the Hire-seed flow working.
+    expect(screen.getByText("Gmail")).toBeInTheDocument()
+  })
+
   it("shows the live-translated connectApps title in the header instead of the generic 'Ask User' title, ignoring the persisted label", () => {
     // CONNECT_APPS_INTERACTION.label ("Connect your apps") stands in for the
     // DB-persisted, hire-time-translated string (see hire-agent.ts's

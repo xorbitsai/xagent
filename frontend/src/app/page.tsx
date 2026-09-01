@@ -428,11 +428,11 @@ export default function Home() {
 
           <div className="flex flex-wrap justify-center items-center gap-1.5 sm:gap-2 bg-[hsl(234_30%_25%/0.4)] rounded-full border border-[hsl(234_30%_35%)] p-1.5 mb-10 backdrop-blur-md">
             <Link href="/templates" className="flex items-center gap-2 px-4 py-2 rounded-full hover:bg-[hsl(234_30%_35%)] text-white transition-colors text-[14px] font-semibold">
-              <Layers className="w-4 h-4" /> <span className="hidden sm:inline">{t("nav.templates")}</span>
+              <Layers className="w-4 h-4" /> <span className="hidden sm:inline">{t("nav.addTeammates")}</span>
             </Link>
             <div className="w-px h-5 bg-[hsl(234_30%_40%)] mx-0.5 sm:mx-1 hidden sm:block" />
             <Link href="/build" className="flex items-center gap-2 px-4 py-2 rounded-full hover:bg-[hsl(234_30%_35%)] text-white transition-colors text-[14px] font-semibold">
-              <Bot className="w-4 h-4" /> <span className="hidden sm:inline">{t("nav.build")}</span>
+              <Bot className="w-4 h-4" /> <span className="hidden sm:inline">{t("nav.myTeam")}</span>
             </Link>
             <div className="w-px h-5 bg-[hsl(234_30%_40%)] mx-0.5 sm:mx-1 hidden sm:block" />
             <Link href="/task" className="flex items-center gap-2 px-4 py-2 rounded-full bg-[hsl(234_40%_40%)] hover:bg-[hsl(234_40%_45%)] text-white transition-colors text-[14px] font-semibold shadow-sm">

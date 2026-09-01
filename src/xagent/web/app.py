@@ -282,8 +282,7 @@ async def _run_trigger_dispatcher(
         # problem right after a container restart.
         delay = random.uniform(0, startup_jitter_seconds)
         logger.info(
-            "Trigger dispatcher delaying first tick by %.1fs to spread out "
-            "a restart-time burst",
+            "Trigger dispatcher delaying first tick by %.1fs past startup",
             delay,
         )
         await asyncio.sleep(delay)

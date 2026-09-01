@@ -1086,10 +1086,13 @@ def get_trigger_dispatcher_startup_jitter_seconds() -> int:
     A container restart brings every trigger that fell due while it was
     down (Gmail watch renewals, scheduled triggers) up for processing all
     at once, and the dispatcher's first tick runs immediately on startup --
-    before egress networking may be fully warmed up, and, on a
-    multi-replica rolling restart, at the same moment as every other
-    replica's first tick. Spreading that first tick across a random window
-    keeps the resulting burst smaller. 0 disables the delay.
+    before egress networking may be fully warmed up. This delay pushes that
+    first tick past the likely warm-up window; it does not shrink how much
+    that tick processes (still gated by the dispatcher's own batch-size and
+    scan-limit settings), only when it starts. On a multi-replica rolling
+    restart it also desyncs every replica's first tick from firing at the
+    same instant, spreading their combined load across the window instead
+    of concentrating it in a single moment. 0 disables the delay.
     """
     return _get_positive_int_env(
         TRIGGER_DISPATCHER_STARTUP_JITTER_SECONDS,

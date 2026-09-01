@@ -670,13 +670,6 @@ def _is_permanent_oauth_refresh_error(error_code: str | None) -> bool:
     return error_code in _OAUTH_PERMANENT_REFRESH_ERROR_CODES
 
 
-# Providers occasionally echo something far longer than a short error
-# code/slug into `error` -- capped to bound the resulting log line, same
-# precedent as api/auth.py's own OAUTH_ERROR_MESSAGE_LIMIT for
-# provider-controlled token-endpoint text.
-_OAUTH_REFRESH_ERROR_CODE_LOG_LIMIT = 500
-
-
 def _log_and_classify_failed_refresh(
     *, response: httpx.Response, provider_name: str
 ) -> None:
@@ -686,12 +679,18 @@ def _log_and_classify_failed_refresh(
     access_token" -- a non-200 status, and a 200 status whose body still
     lacks access_token (see _is_permanent_oauth_refresh_error).
     """
+    # Providers occasionally echo something far longer than a short error
+    # code/slug into `error` -- capped to bound the resulting log line,
+    # reusing api/auth.py's own limit for provider-controlled
+    # token-endpoint text rather than a second, independently-tunable copy.
+    from ..api.auth import _OAUTH_ERROR_MESSAGE_LIMIT
+
     error_code = _oauth_refresh_error_code(response, provider_name)
     logger.error(
         "Failed to refresh %s token (status %s, error=%s)",
         provider_name,
         response.status_code,
-        (error_code or "unknown")[:_OAUTH_REFRESH_ERROR_CODE_LOG_LIMIT],
+        (error_code or "unknown")[:_OAUTH_ERROR_MESSAGE_LIMIT],
     )
     if _is_permanent_oauth_refresh_error(error_code):
         raise _OAuthRefreshPermanentlyInvalid()
@@ -779,15 +778,12 @@ async def refresh_oauth_token_if_needed(
                         f"Successfully refreshed {provider_name} token for user {oauth_account.user_id}"
                     )
                     return True
-                # A 200 with no access_token still isn't a successful
-                # refresh -- see _log_and_classify_failed_refresh.
-                _log_and_classify_failed_refresh(
-                    response=response, provider_name=provider_name
-                )
-            else:
-                _log_and_classify_failed_refresh(
-                    response=response, provider_name=provider_name
-                )
+            # Not a successful refresh -- a non-200 status, or (e.g. GitHub's
+            # classic OAuth Apps token endpoint reporting a dead
+            # refresh_token) a 200 whose body still lacks access_token.
+            _log_and_classify_failed_refresh(
+                response=response, provider_name=provider_name
+            )
             return False
 
         if not oauth_account.refresh_token:
@@ -947,17 +943,10 @@ async def refresh_oauth_token_if_needed(
                     f"Successfully refreshed {provider_name} token for user {oauth_account.user_id}"
                 )
                 return True
-            # A 200 with no access_token still isn't a successful refresh --
-            # e.g. GitHub's classic OAuth Apps token endpoint reports a dead
-            # refresh_token this way instead of via a 4xx. See
-            # _log_and_classify_failed_refresh.
-            _log_and_classify_failed_refresh(
-                response=response, provider_name=provider_name
-            )
-        else:
-            _log_and_classify_failed_refresh(
-                response=response, provider_name=provider_name
-            )
+        # Not a successful refresh -- a non-200 status, or (e.g. GitHub's
+        # classic OAuth Apps token endpoint reporting a dead refresh_token)
+        # a 200 whose body still lacks access_token.
+        _log_and_classify_failed_refresh(response=response, provider_name=provider_name)
 
     except _OAuthRefreshPermanentlyInvalid:
         raise

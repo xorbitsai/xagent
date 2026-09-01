@@ -13,14 +13,18 @@ from typing import Mapping
 # instead of parsing a genuinely successful response.
 _PROVIDERS_REQUIRING_JSON_ACCEPT_HEADER = frozenset({"github"})
 
-# Meta's documented OAuthException codes for a dead access/session token
-# within its nested error shape (see meta_invalid_token_error_code):
-# 190 access token is invalid/expired, 102/463/467 the session was
-# invalidated (session key issue, password changed, user logged out).
+# Meta's two distinct top-level OAuthException codes for a dead
+# access/session token within its nested error shape (see
+# meta_invalid_token_error_code): 190 access token is invalid/expired, 102
+# session key invalid or no longer valid. Meta nests further detail for
+# code 190 (password changed, expired session, user logged out, ...) as a
+# separate `error_subcode` field rather than a different top-level `code`
+# -- checking `code == 190` alone already covers every one of those
+# subcodes without needing to enumerate them.
 # Not exhaustive -- Meta has other, rarer session-invalidation codes this
 # doesn't cover; those fail open (classified transient, retried) rather
 # than incorrectly deleting a connection that's still alive.
-_META_INVALID_TOKEN_ERROR_CODES = frozenset({190, 102, 463, 467})
+_META_INVALID_TOKEN_ERROR_CODES = frozenset({190, 102})
 
 
 def requires_json_accept_header(provider: str) -> bool:

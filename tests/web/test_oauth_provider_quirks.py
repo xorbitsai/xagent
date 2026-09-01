@@ -20,11 +20,11 @@ def test_requires_json_accept_header_false_for_other_providers():
         assert requires_json_accept_header(provider) is False
 
 
-@pytest.mark.parametrize("code", [190, 102, 463, 467])
+@pytest.mark.parametrize("code", [190, 102])
 def test_meta_invalid_token_error_code_normalizes_dead_session_codes(code):
-    """190 (invalid/expired access token), 102 (session key issue), 463
-    (password changed), and 467 (user logged out) are all Meta's documented
-    signals that the session is dead, not merely a transient blip."""
+    """190 (invalid/expired access token) and 102 (session key invalid or
+    no longer valid) are Meta's two distinct top-level OAuthException codes
+    for a dead session, not merely a transient blip."""
     error = {
         "message": "Error validating access token: Session has expired.",
         "type": "OAuthException",
@@ -33,9 +33,24 @@ def test_meta_invalid_token_error_code_normalizes_dead_session_codes(code):
     assert meta_invalid_token_error_code(error) == "invalid_grant"
 
 
+def test_meta_invalid_token_error_code_normalizes_code_190_regardless_of_subcode():
+    """Meta nests session-invalidation detail (password changed, expired,
+    logged out) as `error_subcode` under the top-level code 190 -- e.g.
+    {"code": 190, "error_subcode": 463} -- never as a bare top-level code
+    of 463/467 itself. code 190 alone must already cover every subcode
+    without needing to inspect error_subcode."""
+    error = {
+        "message": "Error validating access token: Session has expired.",
+        "type": "OAuthException",
+        "code": 190,
+        "error_subcode": 463,
+    }
+    assert meta_invalid_token_error_code(error) == "invalid_grant"
+
+
 def test_meta_invalid_token_error_code_ignores_other_oauth_exceptions():
-    """A different OAuthException code (e.g. a permission error) is not the
-    "token is dead" signal -- only code 190 is."""
+    """A different OAuthException code (e.g. a permission error) is not one
+    of the "session is dead" signals in _META_INVALID_TOKEN_ERROR_CODES."""
     error = {"message": "Missing permission", "type": "OAuthException", "code": 10}
     assert meta_invalid_token_error_code(error) is None
 

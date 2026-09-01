@@ -1,5 +1,7 @@
 """Shared, foreign-key-safe deletion of task-owned database rows."""
 
+from datetime import datetime, timezone
+
 from sqlalchemy.orm import Session
 
 from ..models.task import (
@@ -10,6 +12,8 @@ from ..models.task import (
     TraceMessageBlob,
 )
 from ..models.task_interaction import TaskInteractionRequest
+from ..models.uploaded_file import UploadedFile, uploaded_file_detach_values
+from .task_file_lifecycle import lock_task_no_commit
 from .task_interaction_schema import interaction_requests_table_exists
 
 
@@ -17,6 +21,7 @@ def purge_task_rows(
     db: Session,
     *,
     task_id: int,
+    detached_reason: str,
 ) -> bool:
     """Delete one task and its non-cascading rows in a caller-owned transaction.
 
@@ -31,9 +36,17 @@ def purge_task_rows(
     ordering comment at that call).
     """
 
-    task = db.query(Task).filter(Task.id == task_id).first()
+    task = lock_task_no_commit(db, task_id=task_id)
     if task is None:
         return False
+
+    db.query(UploadedFile).filter(UploadedFile.task_id == task_id).update(
+        uploaded_file_detach_values(
+            reason=detached_reason,
+            detached_at=datetime.now(timezone.utc),
+        ),
+        synchronize_session=False,
+    )
 
     # NULL the checkpoint pointer columns before the trace_events delete
     # below: last_checkpoint_trace_event_id FKs to trace_events.id, so a

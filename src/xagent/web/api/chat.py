@@ -66,6 +66,10 @@ from ..models.database import (
 )
 from ..models.model import Model as DBModel
 from ..models.task import AgentType, Task, TaskStatus, TraceEvent
+from ..models.uploaded_file import (
+    DETACHED_REASON_TASK_CREATE_FAILED,
+    DETACHED_REASON_TASK_DELETED,
+)
 from ..models.user import User
 from ..models.user_channel import UserChannel
 from ..sandbox_keys import (
@@ -96,6 +100,7 @@ from ..services.db_runtime import (
     is_database_pool_timeout,
     run_db_io_cancellation_safe,
 )
+from ..services.file_turn import bind_turn_files_no_commit
 from ..services.hot_path_cache import (
     cache_get,
     cache_set,
@@ -818,7 +823,11 @@ def _compensate_failed_task_extension_create(
     """Remove a just-created task after provider binding setup failed."""
 
     db.rollback()
-    deleted = purge_task_rows(db, task_id=task_id)
+    deleted = purge_task_rows(
+        db,
+        task_id=task_id,
+        detached_reason=DETACHED_REASON_TASK_CREATE_FAILED,
+    )
     db.commit()
     if deleted:
         invalidate_task_cache(task_id)
@@ -861,7 +870,11 @@ def _delete_task_sync(*, task_id: int) -> bool:
     session_factory = get_session_local()
     delete_db = session_factory()
     try:
-        deleted = purge_task_rows(delete_db, task_id=task_id)
+        deleted = purge_task_rows(
+            delete_db,
+            task_id=task_id,
+            detached_reason=DETACHED_REASON_TASK_DELETED,
+        )
         if not deleted:
             delete_db.rollback()
             return False
@@ -4445,21 +4458,20 @@ async def create_task(
         )
 
         if selected_file_ids:
-            from ..models.uploaded_file import UploadedFile
-
-            (
-                db.query(UploadedFile)
-                .filter(
-                    UploadedFile.file_id.in_(selected_file_ids),
-                    UploadedFile.user_id == int(user.id),
-                    UploadedFile.task_id.is_(None),
-                    UploadedFile.storage_status != "compensating",
-                )
-                .update(
-                    {UploadedFile.task_id: int(task.id)},
-                    synchronize_session=False,
-                )
+            missing_file_ids = bind_turn_files_no_commit(
+                file_ids=selected_file_ids,
+                task_id=int(task.id),
+                owner_user_id=int(user.id),
+                db=db,
             )
+            if missing_file_ids:
+                db.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Files are no longer bindable: " + ", ".join(missing_file_ids)
+                    ),
+                )
 
         if runtime_extension_requests:
             # Record which providers this task binds to *before* any hook runs,

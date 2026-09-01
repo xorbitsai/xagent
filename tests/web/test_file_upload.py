@@ -3,6 +3,7 @@
 import logging
 import os
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
@@ -2097,6 +2098,46 @@ class TestFileUploadSecurity:
         data = response.json()
         assert data["total_count"] == 1
         assert [item["filename"] for item in data["files"]] == ["agent-note.txt"]
+
+    def test_list_files_hides_detached_rows_from_existing_views(
+        self, client, test_db, auth_headers, tmp_path
+    ):
+        admin_user, test_app = test_db
+        detached_path = tmp_path / "detached.txt"
+        detached_path.write_text("detached", encoding="utf-8")
+        db = next(test_app.dependency_overrides[get_db]())
+        try:
+            db.add(
+                UploadedFile(
+                    file_id="detached-listing-file",
+                    user_id=int(admin_user.id),
+                    task_id=None,
+                    filename=detached_path.name,
+                    storage_path=str(detached_path),
+                    storage_status="available",
+                    detached_reason="task_deleted",
+                    detached_at=datetime.now(timezone.utc),
+                    file_size=detached_path.stat().st_size,
+                )
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        default = client.get("/api/files/list", headers=auth_headers)
+        uploads = client.get(
+            "/api/files/list?uploads_only=true",
+            headers=auth_headers,
+        )
+
+        assert default.status_code == 200
+        assert uploads.status_code == 200
+        assert "detached.txt" not in {
+            item["filename"] for item in default.json()["files"]
+        }
+        assert "detached.txt" not in {
+            item["filename"] for item in uploads.json()["files"]
+        }
 
     def test_list_file_tasks_returns_tasks_with_files(
         self, client, test_db, auth_headers

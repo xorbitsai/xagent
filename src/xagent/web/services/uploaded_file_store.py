@@ -13,7 +13,7 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
-from ...config import get_storage_root
+from ...config import get_storage_root, get_uploads_dir
 from ...core.execution_scope import (
     EXECUTION_SCOPE_NOT_PROVIDED,
     ExecutionScope,
@@ -24,9 +24,10 @@ from ...core.file_storage.keys import (
     build_upload_generation_storage_key,
     build_upload_storage_key,
 )
+from ...core.workspace import scoped_user_root
 from ..models.database import get_session_local, release_db_connection_if_clean
 from ..models.task import Task
-from ..models.uploaded_file import UploadedFile
+from ..models.uploaded_file import UploadedFile, uploaded_file_bind_values
 from .managed_file_ref import (
     DurableStorageOperationError,
     ManagedFileRef,
@@ -635,6 +636,7 @@ def settle_uploaded_file_compensation_no_commit(
     storage_key: str,
     expected_updated_at: datetime | None,
     presence: StoragePresence,
+    storage_path: str | None = None,
 ) -> UploadedFileCompensationSettlement | None:
     """CAS-settle a probed compensation claim without storage I/O."""
 
@@ -659,6 +661,8 @@ def settle_uploaded_file_compensation_no_commit(
         task_filter,
         updated_at_filter,
     )
+    if storage_path is not None:
+        query = query.filter(UploadedFile.storage_path == storage_path)
     changed = query.delete(synchronize_session=False)
     return "deleted" if changed == 1 else None
 
@@ -688,6 +692,7 @@ def take_over_uploaded_file_compensation_no_commit(
     task_id: int | None,
     storage_key: str,
     expected_updated_at: datetime | None,
+    storage_path: str | None = None,
 ) -> datetime | None:
     """CAS-take ownership of one stale compensation claim.
 
@@ -713,21 +718,20 @@ def take_over_uploaded_file_compensation_no_commit(
         datetime.now(timezone.utc),
         expected_utc + timedelta(seconds=1),
     )
-    changed = (
-        db.query(UploadedFile)
-        .filter(
-            UploadedFile.id == row_id,
-            UploadedFile.user_id == user_id,
-            UploadedFile.file_id == file_id,
-            UploadedFile.storage_key == storage_key,
-            UploadedFile.storage_status == "compensating",
-            task_filter,
-            UploadedFile.updated_at == expected_updated_at,
-        )
-        .update(
-            {UploadedFile.updated_at: takeover_at},
-            synchronize_session=False,
-        )
+    query = db.query(UploadedFile).filter(
+        UploadedFile.id == row_id,
+        UploadedFile.user_id == user_id,
+        UploadedFile.file_id == file_id,
+        UploadedFile.storage_key == storage_key,
+        UploadedFile.storage_status == "compensating",
+        task_filter,
+        UploadedFile.updated_at == expected_updated_at,
+    )
+    if storage_path is not None:
+        query = query.filter(UploadedFile.storage_path == storage_path)
+    changed = query.update(
+        {UploadedFile.updated_at: takeover_at},
+        synchronize_session=False,
     )
     if changed != 1:
         return None
@@ -735,6 +739,29 @@ def take_over_uploaded_file_compensation_no_commit(
         db,
         row_id=row_id,
     )
+
+
+def delete_uploaded_file_local_copy_if_owned(
+    *,
+    storage_path: str,
+    user_id: int,
+) -> bool:
+    """Delete a local copy only when it resolves under its user's upload root.
+
+    Returns ``False`` for external/shared paths, which are deliberately left
+    untouched. Files already absent count as successfully cleaned.
+    """
+
+    local_path = Path(storage_path)
+    try:
+        resolved_path = local_path.resolve()
+        user_root = scoped_user_root(get_uploads_dir(), user_id).resolve()
+        resolved_path.relative_to(user_root)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    if resolved_path.exists() and resolved_path.is_file():
+        resolved_path.unlink()
+    return True
 
 
 def _compensate_possible_immutable_staging_key(
@@ -1402,29 +1429,33 @@ class UploadedFileStore:
         if expected.task_id != staged.task_id and not allow_task_rebind:
             raise ValueError("Cannot replace an uploaded file bound to another task")
 
+        replacement_values: dict[Any, Any] = {
+            UploadedFile.file_id: staged.file_id,
+            UploadedFile.user_id: staged.user_id,
+            UploadedFile.task_id: staged.task_id,
+            UploadedFile.filename: staged.filename,
+            UploadedFile.storage_path: staged.storage_path,
+            UploadedFile.storage_backend: staged.storage_backend,
+            UploadedFile.storage_key: staged.storage_key,
+            UploadedFile.storage_uri: staged.storage_uri,
+            UploadedFile.checksum: staged.checksum,
+            UploadedFile.etag: staged.etag,
+            UploadedFile.workspace_relative_path: staged.workspace_relative_path,
+            UploadedFile.workspace_category: staged.workspace_category,
+            UploadedFile.storage_status: "available",
+            UploadedFile.mime_type: staged.mime_type,
+            UploadedFile.file_size: staged.file_size,
+        }
+        if staged.task_id is not None:
+            replacement_values.update(uploaded_file_bind_values(staged.task_id))
+
         statement = (
             update(UploadedFile)
             .where(
                 *_uploaded_file_version_match_predicates(expected),
                 UploadedFile.storage_status != "compensating",
             )
-            .values(
-                file_id=staged.file_id,
-                user_id=staged.user_id,
-                task_id=staged.task_id,
-                filename=staged.filename,
-                storage_path=staged.storage_path,
-                storage_backend=staged.storage_backend,
-                storage_key=staged.storage_key,
-                storage_uri=staged.storage_uri,
-                checksum=staged.checksum,
-                etag=staged.etag,
-                workspace_relative_path=staged.workspace_relative_path,
-                workspace_category=staged.workspace_category,
-                storage_status="available",
-                mime_type=staged.mime_type,
-                file_size=staged.file_size,
-            )
+            .values(replacement_values)
         )
         result = self.db.execute(statement.execution_options(synchronize_session=False))
         if int(getattr(result, "rowcount", 0) or 0) != 1:
@@ -1471,29 +1502,33 @@ class UploadedFileStore:
             raise ValueError("Metadata rollback must preserve uploaded-file identity")
         if replacement.storage_status not in {"available", "legacy"}:
             raise ValueError("Metadata rollback target must be a stable file state")
+        replacement_values: dict[Any, Any] = {
+            UploadedFile.file_id: replacement.file_id,
+            UploadedFile.user_id: replacement.user_id,
+            UploadedFile.task_id: replacement.task_id,
+            UploadedFile.filename: replacement.filename,
+            UploadedFile.storage_path: replacement.storage_path,
+            UploadedFile.storage_backend: replacement.storage_backend,
+            UploadedFile.storage_key: replacement.storage_key,
+            UploadedFile.storage_uri: replacement.storage_uri,
+            UploadedFile.checksum: replacement.checksum,
+            UploadedFile.etag: replacement.etag,
+            UploadedFile.workspace_relative_path: replacement.workspace_relative_path,
+            UploadedFile.workspace_category: replacement.workspace_category,
+            UploadedFile.storage_status: replacement.storage_status,
+            UploadedFile.mime_type: replacement.mime_type,
+            UploadedFile.file_size: replacement.file_size,
+        }
+        if replacement.task_id is not None:
+            replacement_values.update(uploaded_file_bind_values(replacement.task_id))
+
         statement = (
             update(UploadedFile)
             .where(
                 *_uploaded_file_version_match_predicates(expected),
                 UploadedFile.storage_status != "compensating",
             )
-            .values(
-                file_id=replacement.file_id,
-                user_id=replacement.user_id,
-                task_id=replacement.task_id,
-                filename=replacement.filename,
-                storage_path=replacement.storage_path,
-                storage_backend=replacement.storage_backend,
-                storage_key=replacement.storage_key,
-                storage_uri=replacement.storage_uri,
-                checksum=replacement.checksum,
-                etag=replacement.etag,
-                workspace_relative_path=replacement.workspace_relative_path,
-                workspace_category=replacement.workspace_category,
-                storage_status=replacement.storage_status,
-                mime_type=replacement.mime_type,
-                file_size=replacement.file_size,
-            )
+            .values(replacement_values)
         )
         result = self.db.execute(statement.execution_options(synchronize_session=False))
         if int(getattr(result, "rowcount", 0) or 0) != 1:

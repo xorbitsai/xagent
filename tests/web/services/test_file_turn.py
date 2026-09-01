@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -26,6 +27,7 @@ from xagent.web.services.execution_scope_snapshot import (
     load_task_execution_scope_snapshot,
 )
 from xagent.web.services.file_turn import (
+    bind_turn_files,
     bind_turn_files_no_commit,
     resolve_turn_file_infos,
 )
@@ -74,6 +76,8 @@ def _seed_binding_rows(SessionLocal) -> tuple[int, int, int]:
                     user_id=int(user.id),
                     filename="available.txt",
                     storage_path="/tmp/available.txt",
+                    detached_reason="task_deleted",
+                    detached_at=datetime(2026, 8, 1, tzinfo=timezone.utc),
                     file_size=1,
                 ),
                 UploadedFile(
@@ -109,9 +113,29 @@ def test_bind_turn_files_stages_without_committing(db_runtime) -> None:
         )
         assert missing == []
         assert _task_id_for_file(db, "available") == target_task_id
+        rebound = (
+            db.query(UploadedFile).filter(UploadedFile.file_id == "available").one()
+        )
+        assert rebound.detached_reason is None
+        assert rebound.detached_at is None
         db.rollback()
 
     with db_runtime() as db:
+        assert _task_id_for_file(db, "available") is None
+
+
+def test_bind_turn_files_rejects_a_missing_task(db_runtime) -> None:
+    user_id, _target_task_id, _competing_task_id = _seed_binding_rows(db_runtime)
+
+    with db_runtime() as db:
+        missing = bind_turn_files_no_commit(
+            file_ids=["available"],
+            task_id=987654321,
+            owner_user_id=user_id,
+            db=db,
+        )
+
+        assert missing == ["available"]
         assert _task_id_for_file(db, "available") is None
 
 
@@ -163,6 +187,23 @@ def test_caller_can_roll_back_partial_file_claim_as_one_domain_transaction(
     with db_runtime() as db:
         assert _task_id_for_file(db, "available") is None
         assert _task_id_for_file(db, "competing") == competing_task_id
+
+
+def test_committing_bind_wrapper_rolls_back_a_partial_claim(db_runtime) -> None:
+    user_id, target_task_id, _competing_task_id = _seed_binding_rows(db_runtime)
+
+    with db_runtime() as db:
+        with pytest.raises(ValueError, match="competing"):
+            bind_turn_files(
+                file_ids=["available", "competing"],
+                task_id=target_task_id,
+                owner_user_id=user_id,
+                db=db,
+            )
+        db.commit()
+
+    with db_runtime() as db:
+        assert _task_id_for_file(db, "available") is None
 
 
 def test_resolve_materializes_after_releasing_outer_pool_slot(

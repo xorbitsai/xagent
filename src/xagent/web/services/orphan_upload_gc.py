@@ -15,24 +15,22 @@ public-share path) scopes GC to exactly those uploads.
 Deletion rides the existing uploaded-file compensation protocol rather than
 a bespoke one, so every crash window is already owned by shipped machinery:
 
-1. **Local file first**, before any claim. At that point the row is still
-   ``available`` and durable-backed, so a consumer that wins the bind can
-   re-materialize the bytes from the durable object (``ensure_local``) — a
-   crash here leaves a fully consistent row that the next sweep retries.
-2. **Exact claim** — the same CAS as ``compensate_registered_uploads_sync``:
+1. **Exact claim** — the same CAS as ``compensate_registered_uploads_sync``:
    ``SET storage_status='compensating', updated_at=<token> WHERE id/user/
    file_id/storage_key match AND storage_status='available' AND task_id IS
    NULL``. Requiring the exact prior status makes overlapping sweeps
    mutually exclusive (the loser matches zero rows), and the ``task_id IS
    NULL`` predicate serializes against binders. The persisted ``updated_at``
    is the generation token fencing the later settlement.
+2. **Local cleanup after commit** — unlink only when the resolved path is
+   inside the configured per-user uploads root. External/shared paths are
+   left untouched.
 3. **Durable delete + settle** via the compensation helpers
    (:func:`delete_uploaded_file_compensation_object` /
    :func:`settle_uploaded_file_compensation_no_commit`). A crash or deferred
    presence after the claim leaves an aged ``compensating`` row that the
    stale-compensation recovery loop (``uploaded_file_recovery``) takes over
-   and finishes — the local file is already gone by step 1, so that generic
-   path (which knows no ``storage_path``) never leaks anything.
+   and finishes using the captured ``storage_path``.
 """
 
 from __future__ import annotations
@@ -41,18 +39,18 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Callable, cast
 
 from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
-from ..models.uploaded_file import UploadedFile
+from ..models.uploaded_file import DETACHED_REASONS, UploadedFile
 from .db_runtime import is_database_pool_timeout, run_db_io_cancellation_safe
 from .uploaded_file_store import (
     _load_uploaded_file_compensation_token_no_commit,
     delete_registered_preview_caches,
     delete_uploaded_file_compensation_object,
+    delete_uploaded_file_local_copy_if_owned,
     settle_uploaded_file_compensation_no_commit,
 )
 
@@ -96,6 +94,19 @@ class OrphanUploadSweepResult:
 
 
 @dataclass(frozen=True)
+class _SweepTickState:
+    cursor: OrphanUploadSweepCursor | None
+    backlog: bool
+    failed: bool = False
+
+
+@dataclass(frozen=True)
+class _CombinedGCTickResult:
+    taskless: _SweepTickState
+    detached: _SweepTickState
+
+
+@dataclass(frozen=True)
 class _OrphanUploadCandidate:
     """Detached exact identity of one reap-eligible row.
 
@@ -110,6 +121,8 @@ class _OrphanUploadCandidate:
     storage_key: str
     storage_path: str
     created_at: datetime
+    detached_reason: str | None = None
+    detached_at: datetime | None = None
 
     @property
     def cursor(self) -> OrphanUploadSweepCursor:
@@ -134,6 +147,8 @@ def _orphan_candidates(
     query = db.query(UploadedFile).filter(
         UploadedFile.upload_source == TASKLESS_SHARE_UPLOAD_SOURCE,
         UploadedFile.task_id.is_(None),
+        UploadedFile.detached_reason.is_(None),
+        UploadedFile.detached_at.is_(None),
         UploadedFile.created_at < cutoff,
         UploadedFile.storage_status == "available",
         UploadedFile.storage_key.isnot(None),
@@ -168,11 +183,53 @@ def _orphan_candidates(
     )
 
 
-def _delete_local_file(storage_path: str) -> None:
-    """Remove the staged local copy (mirrors ``UploadedFileStore._delete_local``)."""
-    local_path = Path(storage_path)
-    if local_path.exists() and local_path.is_file():
-        local_path.unlink()
+def _detached_candidates(
+    db: Session,
+    *,
+    cutoff: datetime,
+    limit: int,
+    after: OrphanUploadSweepCursor | None,
+) -> tuple[_OrphanUploadCandidate, ...]:
+    """Return one keyset page of attachments past their detach retention."""
+
+    query = db.query(UploadedFile).filter(
+        UploadedFile.detached_reason.in_(DETACHED_REASONS),
+        UploadedFile.detached_at.isnot(None),
+        UploadedFile.detached_at < cutoff,
+        UploadedFile.task_id.is_(None),
+        UploadedFile.storage_status == "available",
+        UploadedFile.storage_key.isnot(None),
+        UploadedFile.storage_key != "",
+    )
+    if after is not None:
+        after_detached_at, after_row_id = after
+        query = query.filter(
+            or_(
+                UploadedFile.detached_at > after_detached_at,
+                and_(
+                    UploadedFile.detached_at == after_detached_at,
+                    UploadedFile.id > after_row_id,
+                ),
+            )
+        )
+    records = (
+        query.order_by(UploadedFile.detached_at.asc(), UploadedFile.id.asc())
+        .limit(limit)
+        .all()
+    )
+    return tuple(
+        _OrphanUploadCandidate(
+            row_id=int(record.id),
+            user_id=int(record.user_id),
+            file_id=str(record.file_id),
+            storage_key=str(record.storage_key),
+            storage_path=str(record.storage_path),
+            created_at=cast(datetime, record.created_at),
+            detached_reason=str(record.detached_reason),
+            detached_at=cast(datetime, record.detached_at),
+        )
+        for record in records
+    )
 
 
 def _claim_orphan(db: Session, candidate: _OrphanUploadCandidate) -> datetime | None:
@@ -194,8 +251,19 @@ def _claim_orphan(db: Session, candidate: _OrphanUploadCandidate) -> datetime | 
             UploadedFile.user_id == candidate.user_id,
             UploadedFile.file_id == candidate.file_id,
             UploadedFile.storage_key == candidate.storage_key,
+            UploadedFile.storage_path == candidate.storage_path,
             UploadedFile.storage_status == "available",
             UploadedFile.task_id.is_(None),
+            (
+                UploadedFile.detached_reason.is_(None)
+                if candidate.detached_reason is None
+                else UploadedFile.detached_reason == candidate.detached_reason
+            ),
+            (
+                UploadedFile.detached_at.is_(None)
+                if candidate.detached_at is None
+                else UploadedFile.detached_at == candidate.detached_at
+            ),
         )
         .update(
             {
@@ -222,15 +290,14 @@ def _claim_orphan(db: Session, candidate: _OrphanUploadCandidate) -> datetime | 
 
 def _reap_orphan(db: Session, candidate: _OrphanUploadCandidate) -> bool:
     """Reap one candidate; True only when its metadata row was deleted."""
-    # Local bytes first, while the row is still available: a consumer that
-    # binds after this re-materializes from the durable object, and the
-    # generic stale-compensation recovery (which owns every post-claim crash
-    # window but knows no storage_path) then never has a local file to leak.
-    _delete_local_file(candidate.storage_path)
-
     token = _claim_orphan(db, candidate)
     if token is None:
         return False  # bound, or claimed by another owner — spared
+
+    delete_uploaded_file_local_copy_if_owned(
+        storage_path=candidate.storage_path,
+        user_id=candidate.user_id,
+    )
 
     presence = delete_uploaded_file_compensation_object(
         user_id=candidate.user_id,
@@ -256,6 +323,7 @@ def _reap_orphan(db: Session, candidate: _OrphanUploadCandidate) -> bool:
         storage_key=candidate.storage_key,
         expected_updated_at=token,
         presence=presence,
+        storage_path=candidate.storage_path,
     )
     if settlement is None:
         db.rollback()
@@ -304,6 +372,48 @@ def cleanup_orphaned_taskless_uploads(
     )
 
 
+def cleanup_detached_uploaded_files(
+    db: Session,
+    *,
+    older_than_seconds: int,
+    now: datetime | None = None,
+    batch_size: int = GC_BATCH_SIZE,
+    after: OrphanUploadSweepCursor | None = None,
+) -> OrphanUploadSweepResult:
+    """Reap one bounded page of attachments past their detach retention."""
+
+    reference = now or datetime.now(timezone.utc)
+    cutoff = reference - timedelta(seconds=older_than_seconds)
+    candidates = _detached_candidates(
+        db,
+        cutoff=cutoff,
+        limit=batch_size,
+        after=after,
+    )
+    deleted = 0
+    for candidate in candidates:
+        try:
+            if _reap_orphan(db, candidate):
+                deleted += 1
+        except Exception:
+            db.rollback()
+            logger.warning(
+                "Failed to GC detached upload id=%s",
+                candidate.row_id,
+                exc_info=True,
+            )
+    next_cursor = (
+        (cast(datetime, candidates[-1].detached_at), candidates[-1].row_id)
+        if candidates
+        else None
+    )
+    return OrphanUploadSweepResult(
+        scanned=len(candidates),
+        deleted=deleted,
+        next_cursor=next_cursor,
+    )
+
+
 def sweep_orphaned_taskless_uploads_isolated(
     *,
     older_than_seconds: int,
@@ -318,6 +428,28 @@ def sweep_orphaned_taskless_uploads_isolated(
         session_factory = get_session_local()
     with session_factory() as db:
         return cleanup_orphaned_taskless_uploads(
+            db,
+            older_than_seconds=older_than_seconds,
+            batch_size=batch_size,
+            after=after,
+        )
+
+
+def sweep_detached_uploaded_files_isolated(
+    *,
+    older_than_seconds: int,
+    batch_size: int = GC_BATCH_SIZE,
+    after: OrphanUploadSweepCursor | None = None,
+    session_factory: Callable[[], Session] | None = None,
+) -> OrphanUploadSweepResult:
+    """Run one detached-attachment GC page in its own short-lived Session."""
+
+    if session_factory is None:
+        from ..models.database import get_session_local
+
+        session_factory = get_session_local()
+    with session_factory() as db:
+        return cleanup_detached_uploaded_files(
             db,
             older_than_seconds=older_than_seconds,
             batch_size=batch_size,
@@ -364,10 +496,95 @@ async def _run_gc_tick(
     return cursor
 
 
+async def _run_combined_gc_tick(
+    *,
+    ttl_seconds: int,
+    detached_retention_seconds: int,
+    batch_size: int,
+    max_pages: int,
+    after: OrphanUploadSweepCursor | None,
+    detached_after: OrphanUploadSweepCursor | None,
+    session_factory: Callable[[], Session] | None = None,
+) -> _CombinedGCTickResult:
+    """Round-robin task-less and detached sweeps under one page budget."""
+
+    if max_pages < 1:
+        raise ValueError("max_pages must be positive")
+    cursors = [after, detached_after]
+    active = [True, True]
+    states = [
+        _SweepTickState(after, False),
+        _SweepTickState(detached_after, False),
+    ]
+    sweeps = (
+        (
+            sweep_orphaned_taskless_uploads_isolated,
+            "Orphan task-less upload",
+            ttl_seconds,
+        ),
+        (
+            sweep_detached_uploaded_files_isolated,
+            "Detached upload",
+            detached_retention_seconds,
+        ),
+    )
+    for page_index in range(max_pages):
+        sweep_index = page_index % 2
+        if not active[sweep_index]:
+            sweep_index = 1 - sweep_index
+        if not active[sweep_index]:
+            break
+        sweep, label, older_than_seconds = sweeps[sweep_index]
+        try:
+            result = await run_db_io_cancellation_safe(
+                lambda: sweep(
+                    older_than_seconds=older_than_seconds,
+                    batch_size=batch_size,
+                    after=cursors[sweep_index],
+                    session_factory=session_factory,
+                )
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            active[sweep_index] = False
+            states[sweep_index] = _SweepTickState(
+                cursors[sweep_index],
+                False,
+                True,
+            )
+            if is_database_pool_timeout(exc):
+                logger.warning("%s GC skipped after database pool timeout", label)
+            else:
+                logger.exception("%s GC sweep failed", label)
+            continue
+
+        if result.scanned:
+            logger.info(
+                "%s GC: scanned=%s deleted=%s",
+                label,
+                result.scanned,
+                result.deleted,
+            )
+        if result.scanned < batch_size:
+            cursors[sweep_index] = None
+            active[sweep_index] = False
+            states[sweep_index] = _SweepTickState(None, False)
+        else:
+            cursors[sweep_index] = result.next_cursor
+            states[sweep_index] = _SweepTickState(result.next_cursor, True)
+
+    return _CombinedGCTickResult(
+        taskless=states[0],
+        detached=states[1],
+    )
+
+
 async def run_orphan_upload_gc_loop(
     *,
     poll_interval_seconds: int,
     ttl_seconds: int,
+    detached_retention_seconds: int | None = None,
     batch_size: int = GC_BATCH_SIZE,
     max_pages_per_tick: int = GC_MAX_PAGES_PER_TICK,
     backlog_continue_delay_seconds: float = GC_BACKLOG_CONTINUE_DELAY_SECONDS,
@@ -387,16 +604,30 @@ async def run_orphan_upload_gc_loop(
     cannot starve newer orphans.
     """
     cursor: OrphanUploadSweepCursor | None = None
+    detached_cursor: OrphanUploadSweepCursor | None = None
     while True:
         backlog_remaining = False
         try:
-            cursor = await _run_gc_tick(
-                ttl_seconds=ttl_seconds,
-                batch_size=batch_size,
-                max_pages=max_pages_per_tick,
-                after=cursor,
-            )
-            backlog_remaining = cursor is not None
+            if detached_retention_seconds is None:
+                cursor = await _run_gc_tick(
+                    ttl_seconds=ttl_seconds,
+                    batch_size=batch_size,
+                    max_pages=max_pages_per_tick,
+                    after=cursor,
+                )
+                backlog_remaining = cursor is not None
+            else:
+                result = await _run_combined_gc_tick(
+                    ttl_seconds=ttl_seconds,
+                    detached_retention_seconds=detached_retention_seconds,
+                    batch_size=batch_size,
+                    max_pages=max_pages_per_tick,
+                    after=cursor,
+                    detached_after=detached_cursor,
+                )
+                cursor = result.taskless.cursor
+                detached_cursor = result.detached.cursor
+                backlog_remaining = result.taskless.backlog or result.detached.backlog
         except asyncio.CancelledError:
             raise
         except Exception as exc:

@@ -332,6 +332,13 @@ jobs:
       # added to this list -- the fast job deselects the marker and
       # provisions no database, so an unlisted file's postgres tests run
       # nowhere.
+      - name: Test uploaded-file detach migration (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/alembic/test_20260830_add_uploaded_file_detach_provenance.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
       - name: Test owner-aware OAuth migrations (Postgres-only)
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |

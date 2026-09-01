@@ -1799,6 +1799,60 @@ def test_create_task_records_runtime_extension_bindings_for_deletion(
         unregister_task_extension("test_runtime")
 
 
+def test_create_task_rolls_back_when_a_selected_file_loses_the_bind_race(
+    test_db,
+    user1_headers,
+    tmp_path,
+    monkeypatch,
+):
+    import xagent.web.api.chat as chat_module
+    from xagent.web.models.database import get_db
+    from xagent.web.models.task import Task
+    from xagent.web.models.uploaded_file import UploadedFile
+    from xagent.web.models.user import User
+
+    source = tmp_path / "bind-race.txt"
+    source.write_text("payload", encoding="utf-8")
+    db = next(get_db())
+    try:
+        user = db.query(User).filter(User.username == "user1").one()
+        db.add(
+            UploadedFile(
+                file_id="bind-race-file",
+                user_id=int(user.id),
+                filename=source.name,
+                storage_path=str(source),
+                storage_status="legacy",
+                file_size=source.stat().st_size,
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    monkeypatch.setattr(
+        chat_module,
+        "bind_turn_files_no_commit",
+        lambda **_kwargs: ["bind-race-file"],
+        raising=False,
+    )
+
+    response = client.post(
+        "/api/chat/task/create",
+        json={"title": "lost bind race", "files": ["bind-race-file"]},
+        headers=user1_headers,
+    )
+
+    assert response.status_code == 409
+    db = next(get_db())
+    try:
+        assert db.query(Task).filter(Task.title == "lost bind race").count() == 0
+        file_record = db.query(UploadedFile).filter_by(file_id="bind-race-file").one()
+        assert file_record.task_id is None
+    finally:
+        db.close()
+
+
 def test_delete_task_reports_concurrent_disappearance(
     test_db,
     user1_headers,

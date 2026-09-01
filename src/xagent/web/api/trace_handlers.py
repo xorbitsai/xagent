@@ -498,8 +498,16 @@ class DatabaseTraceHandler(BaseTraceHandler):
 
         Once a target row is found, its *identity* is authoritative: a
         validation mismatch raises rather than falling back to search other
-        rows. Its *payload* is not. A row that is correctly identified but
-        whose payload cannot be read defers to the scan as well, so the
+        rows. One shape is carved out of that rule rather than being an
+        exception to it: a row whose only failed condition is the run
+        partition, and only because the field is absent entirely, is not a
+        mismatch at all -- it is a row written before that field existed,
+        which the legacy scan below would itself have excluded, so this
+        defers to that scan instead of raising (see the branch at the
+        judgment below, and ``is_missing_run_partition_only``). Its
+        *payload* is not authoritative either. A row that is correctly
+        identified but whose payload cannot be read defers to the scan as
+        well, so the
         older rows history pruning deliberately retains can still answer
         the read (see _prune_checkpoint_history). That fallback carries the
         row's own verdict flag on the returned ``_AnchorFallback``, because

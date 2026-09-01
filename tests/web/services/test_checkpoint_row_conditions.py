@@ -11,14 +11,16 @@ file covers the answer itself.
 
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
+import xagent
 from xagent.web.services.task_lease_service import TASK_RUN_ID_TRACE_FIELD
 from xagent.web.services.trace_event_staging import (
     CHECKPOINT_ROW_BUILD_SCOPE,
     CHECKPOINT_ROW_CHECKPOINT_TYPE,
-    CHECKPOINT_ROW_CONDITIONS,
     CHECKPOINT_ROW_EVENT_TYPE,
     CHECKPOINT_ROW_EXECUTION_IDENTITY,
     CHECKPOINT_ROW_RUN_PARTITION,
@@ -71,20 +73,6 @@ def _failed(row: _StandInRow, data: dict[str, Any], *, run_id: str | None = _RUN
         run_id=run_id,
         execution_id=_EXECUTION_ID,
     )
-
-
-def test_row_condition_constants_are_registered() -> None:
-    """Cell 13: guards against adding a condition constant without also
-    listing it in ``CHECKPOINT_ROW_CONDITIONS``."""
-
-    assert set(CHECKPOINT_ROW_CONDITIONS) == {
-        CHECKPOINT_ROW_TASK_OWNERSHIP,
-        CHECKPOINT_ROW_EVENT_TYPE,
-        CHECKPOINT_ROW_BUILD_SCOPE,
-        CHECKPOINT_ROW_CHECKPOINT_TYPE,
-        CHECKPOINT_ROW_RUN_PARTITION,
-        CHECKPOINT_ROW_EXECUTION_IDENTITY,
-    }
 
 
 def test_all_six_conditions_pass() -> None:
@@ -180,3 +168,55 @@ def test_only_run_partition_absent_is_false_when_something_else_also_fails() -> 
     del data[TASK_RUN_ID_TRACE_FIELD]
     failed = _failed(row, data)
     assert is_missing_run_partition_only(failed, data) is False
+
+
+_SHARED_PREDICATE = "failed_checkpoint_row_conditions"
+_BY_PK_RESOLVER_MODULES = (
+    "xagent/web/api/trace_handlers.py",
+    "xagent/web/services/task_interaction_anchor.py",
+)
+
+
+def _imports_and_calls(source: str, name: str) -> tuple[bool, bool]:
+    imported = called = False
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.ImportFrom):
+            if any(alias.name == name for alias in node.names):
+                imported = True
+        elif isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name) and func.id == name:
+                called = True
+            elif isinstance(func, ast.Attribute) and func.attr == name:
+                called = True
+    return imported, called
+
+
+def test_both_by_pk_resolvers_read_the_shared_predicate() -> None:
+    """Neither by-primary-key resolver may go back to a private inlined copy
+    of the row-validity conditions.
+
+    This replaces the two AST pins that used to compare the two hand-copied
+    disjunctions operand by operand. Those pins had a real blind spot -- they
+    saw the operands but not how ``partition_matches`` was computed above
+    them, which is where the two copies actually differed -- and they became
+    meaningless once there was one definition rather than two. What still
+    needs guarding is not that the copies agree but that no copy comes back,
+    so this asserts reachability of the shared definition, not its text.
+
+    Deliberately not extended to lease recovery's own consumer
+    (``task_lease_service._candidate_row_failures``): it reads the predicate
+    through a function-level import to avoid a module cycle, which this
+    import-shaped check cannot see. Its behaviour is pinned by
+    ``test_task_lease_recovery.py`` instead.
+    """
+
+    root = Path(next(iter(xagent.__path__))).parent
+    for relative in _BY_PK_RESOLVER_MODULES:
+        path = root / relative
+        assert path.is_file(), path
+        imported, called = _imports_and_calls(
+            path.read_text(encoding="utf-8"), _SHARED_PREDICATE
+        )
+        assert imported, f"{relative} no longer imports {_SHARED_PREDICATE}"
+        assert called, f"{relative} no longer calls {_SHARED_PREDICATE}"

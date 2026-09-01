@@ -16,9 +16,11 @@ not an implementation detail (see the corrupt-before-legacy note below):
 4. the row exists but fails any of six self-consistency conditions ->
    corrupt, unless the only condition it fails is the run-partition match
    and its run field is absent entirely rather than merely mismatched --
-   that shape reclassifies as absence, not corrupt (see
-   ``resolve_interaction_anchor``'s own docstring for the reclassification
-   check, a five-condition mirror of this table's six).
+   that shape reclassifies as absence, not corrupt. That check is not a
+   second copy of the conditions: it reads the set of failed condition
+   names this table's own predicate returns, and asks whether that set is
+   exactly {run partition} and the field is absent
+   (``is_missing_run_partition_only``, ``trace_event_staging.py``).
 5. the row passes all six conditions but its ``checkpoint_type`` is a
    legacy type -> absence, not corrupt.
 6. the row passes all six conditions and its ``checkpoint_type`` is the

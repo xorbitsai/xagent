@@ -656,19 +656,25 @@ def _oauth_refresh_error_code(
     return None
 
 
-def _raise_if_permanent_oauth_refresh_error(*, error_code: str | None) -> None:
-    """Raise only when the provider's error body unambiguously says the
-    refresh token itself is dead. Any other failure (an unrecognized error
-    code, a malformed/absent body) is left to the caller as a transient
-    failure -- see _OAuthRefreshPermanentlyInvalid.
+def _is_permanent_oauth_refresh_error(error_code: str | None) -> bool:
+    """Whether the provider's error body unambiguously says the refresh
+    token itself is dead. Any other failure (an unrecognized error code, a
+    malformed/absent body) is left to the caller as a transient failure --
+    see _OAuthRefreshPermanentlyInvalid.
 
     Not gated on HTTP status: GitHub's classic OAuth Apps token endpoint
     reports a dead refresh token (``{"error": "bad_refresh_token"}``) via a
     200 response rather than a 4xx, so requiring 400/401 here would make
     that case unclassifiable no matter what the caller checks.
     """
-    if error_code in _OAUTH_PERMANENT_REFRESH_ERROR_CODES:
-        raise _OAuthRefreshPermanentlyInvalid()
+    return error_code in _OAUTH_PERMANENT_REFRESH_ERROR_CODES
+
+
+# Providers occasionally echo something far longer than a short error
+# code/slug into `error` -- capped to bound the resulting log line, same
+# precedent as api/auth.py's own OAUTH_ERROR_MESSAGE_LIMIT for
+# provider-controlled token-endpoint text.
+_OAUTH_REFRESH_ERROR_CODE_LOG_LIMIT = 500
 
 
 def _log_and_classify_failed_refresh(
@@ -678,16 +684,17 @@ def _log_and_classify_failed_refresh(
     when its body confirms the refresh token itself is dead. Shared by
     every response shape that means "this refresh did not produce a usable
     access_token" -- a non-200 status, and a 200 status whose body still
-    lacks access_token (see _raise_if_permanent_oauth_refresh_error).
+    lacks access_token (see _is_permanent_oauth_refresh_error).
     """
     error_code = _oauth_refresh_error_code(response, provider_name)
     logger.error(
         "Failed to refresh %s token (status %s, error=%s)",
         provider_name,
         response.status_code,
-        error_code or "unknown",
+        (error_code or "unknown")[:_OAUTH_REFRESH_ERROR_CODE_LOG_LIMIT],
     )
-    _raise_if_permanent_oauth_refresh_error(error_code=error_code)
+    if _is_permanent_oauth_refresh_error(error_code):
+        raise _OAuthRefreshPermanentlyInvalid()
 
 
 async def refresh_oauth_token_if_needed(

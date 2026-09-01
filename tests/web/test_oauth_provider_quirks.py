@@ -1,3 +1,5 @@
+import pytest
+
 from xagent.web.oauth_provider_quirks import (
     meta_invalid_token_error_code,
     requires_json_accept_header,
@@ -18,11 +20,15 @@ def test_requires_json_accept_header_false_for_other_providers():
         assert requires_json_accept_header(provider) is False
 
 
-def test_meta_invalid_token_error_code_normalizes_code_190():
+@pytest.mark.parametrize("code", [190, 102, 463, 467])
+def test_meta_invalid_token_error_code_normalizes_dead_session_codes(code):
+    """190 (invalid/expired access token), 102 (session key issue), 463
+    (password changed), and 467 (user logged out) are all Meta's documented
+    signals that the session is dead, not merely a transient blip."""
     error = {
         "message": "Error validating access token: Session has expired.",
         "type": "OAuthException",
-        "code": 190,
+        "code": code,
     }
     assert meta_invalid_token_error_code(error) == "invalid_grant"
 

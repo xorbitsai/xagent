@@ -13,9 +13,14 @@ from typing import Mapping
 # instead of parsing a genuinely successful response.
 _PROVIDERS_REQUIRING_JSON_ACCEPT_HEADER = frozenset({"github"})
 
-# Meta's documented code for "access token is invalid/expired" within its
-# nested OAuthException error shape (see meta_invalid_token_error_code).
-_META_INVALID_TOKEN_ERROR_CODE = 190
+# Meta's documented OAuthException codes for a dead access/session token
+# within its nested error shape (see meta_invalid_token_error_code):
+# 190 access token is invalid/expired, 102/463/467 the session was
+# invalidated (session key issue, password changed, user logged out).
+# Not exhaustive -- Meta has other, rarer session-invalidation codes this
+# doesn't cover; those fail open (classified transient, retried) rather
+# than incorrectly deleting a connection that's still alive.
+_META_INVALID_TOKEN_ERROR_CODES = frozenset({190, 102, 463, 467})
 
 
 def requires_json_accept_header(provider: str) -> bool:
@@ -28,14 +33,15 @@ def meta_invalid_token_error_code(error: object) -> str | None:
 
     Meta nests its error as an object instead of the standard top-level
     string `error` field other providers use (``{"error": {"type":
-    "OAuthException", "code": 190, ...}}``); code 190 is Meta's documented
-    "access token is invalid/expired" signal, normalized here to the
-    standard `invalid_grant` code callers already recognize.
+    "OAuthException", "code": 190, ...}}``); see
+    _META_INVALID_TOKEN_ERROR_CODES for which codes mean the token/session
+    is dead, normalized here to the standard `invalid_grant` code callers
+    already recognize.
     """
     if (
         isinstance(error, Mapping)
         and error.get("type") == "OAuthException"
-        and error.get("code") == _META_INVALID_TOKEN_ERROR_CODE
+        and error.get("code") in _META_INVALID_TOKEN_ERROR_CODES
     ):
         return "invalid_grant"
     return None

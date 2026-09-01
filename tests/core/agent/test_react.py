@@ -23,11 +23,13 @@ from xagent.core.agent import (
     ToolCallRecord,
 )
 from xagent.core.agent.context.execution import CLOCK_TIMEZONE_METADATA_KEY
+from xagent.core.agent.pattern.final_answer_stream import ReActFinalAnswerStreamer
 from xagent.core.agent.pattern.react.react import (
     _INTERACTION_TRIM_CHARS,
     _normalize_ask_user_interactions,
 )
 from xagent.core.agent.result import tool_result_succeeded
+from xagent.core.agent.runtime import NO_DELIVERABLE_FINAL_ANSWER_REASON
 from xagent.core.file_ref import WORKSPACE_OUTPUT_FILES_TOOL_NAME
 from xagent.core.model.chat.basic.router import RouterLLM
 from xagent.core.model.chat.exceptions import LLMToolProtocolError
@@ -891,6 +893,44 @@ class StreamingRepeatedGuardFinalAnswerLLM:
                     }
                 ],
             )
+        yield StreamChunk(type=ChunkType.END)
+
+
+class ScriptedStreamLLM:
+    """Streams one scripted tool-call batch per ``stream_chat`` call.
+
+    Each batch is a list of ``(tool_name, args_dict)`` pairs. Every call's
+    arguments are streamed in two fragments (a truncated prefix, then the
+    full JSON) so the answer streamer sees a partial candidate before the
+    complete one, matching the production streaming shape. This is the one
+    general-purpose fake model for the #486 batch-shape matrix - covering a
+    new shape means adding a batch here, not a new fake model class.
+    """
+
+    def __init__(self, batches: list[list[tuple[str, dict[str, Any]]]]) -> None:
+        self.batches = batches
+        self.stream_calls: list[dict[str, Any]] = []
+
+    async def chat(self, **kwargs: Any) -> Any:
+        raise AssertionError("ScriptedStreamLLM should not fall back to chat()")
+
+    async def stream_chat(self, **kwargs: Any) -> Any:
+        self.stream_calls.append(kwargs)
+        index = min(len(self.stream_calls) - 1, len(self.batches) - 1)
+        for position, (name, args) in enumerate(self.batches[index]):
+            serialized = json.dumps(args)
+            cut = max(1, len(serialized) // 2)
+            for fragment in (serialized[:cut], serialized):
+                yield StreamChunk(
+                    type=ChunkType.TOOL_CALL,
+                    tool_calls=[
+                        {
+                            "index": position,
+                            "id": f"call_{position}",
+                            "function": {"name": name, "arguments": fragment},
+                        }
+                    ],
+                )
         yield StreamChunk(type=ChunkType.END)
 
 
@@ -7712,3 +7752,724 @@ def test_tool_call_date_line_uses_the_caller_timezone() -> None:
 
 def test_tool_call_date_line_degrades_to_utc_for_an_unusable_timezone() -> None:
     assert _date_instruction(_react_clock_prompt("Not/AZone")) == UTC_DATE_INSTRUCTION
+
+
+# ---------------------------------------------------------------------------
+# xagent#486: every final_answer stream that gets opened must be closed with
+# exactly one terminal event, regardless of how the batch that opened it
+# resolves. See _close_streamed_answer's docstring in react.py for the R0-R3
+# contract these tests pin down.
+# ---------------------------------------------------------------------------
+
+
+def _fa(answer: str) -> tuple[str, dict[str, Any]]:
+    return ("final_answer", {"answer": answer})
+
+
+def _send_message_call(*, expect_response: bool) -> tuple[str, dict[str, Any]]:
+    return (
+        "send_message",
+        {
+            "message": "Side note",
+            "message_type": "question" if expect_response else "progress",
+            "expect_response": expect_response,
+        },
+    )
+
+
+def _ask_user_question_call() -> tuple[str, dict[str, Any]]:
+    return (
+        "ask_user_question",
+        {
+            "message": "Which one?",
+            "interactions": [
+                {"type": "select_one", "field": "choice", "label": "Choice"}
+            ],
+        },
+    )
+
+
+def _work_tool_call() -> tuple[str, dict[str, Any]]:
+    return ("calculator", {"expression": "2+2"})
+
+
+_FALLBACK_ANSWER = "Fallback answer."
+_FALLBACK_BATCH: list[tuple[str, dict[str, Any]]] = [_fa(_FALLBACK_ANSWER)]
+
+
+def _terminal_events_by_message_id(
+    events: list[dict[str, Any]],
+) -> dict[str, list[str]]:
+    """Group final_answer_start/end/error events by message_id.
+
+    Used to check that every started message_id gets exactly one terminal
+    event (end or error), never zero and never two.
+    """
+
+    by_id: dict[str, list[str]] = {}
+    for event in events:
+        event_type = event.get("type")
+        if event_type not in (
+            "final_answer_start",
+            "final_answer_end",
+            "final_answer_error",
+        ):
+            continue
+        by_id.setdefault(event["message_id"], []).append(event_type)
+    return by_id
+
+
+_I1_RUN_CASES: list[dict[str, Any]] = [
+    {
+        "label": "C1_single_final_answer",
+        "batches": [[_fa("Answer one.")]],
+        "needs_tool": False,
+        "user_interaction_enabled": True,
+        "max_iterations": 1,
+        "expected_sequences": [["final_answer_start", "final_answer_end"]],
+    },
+    {
+        "label": "C2_identical_final_answers",
+        "batches": [[_fa("Same answer."), _fa("Same answer.")]],
+        "needs_tool": False,
+        "user_interaction_enabled": True,
+        "max_iterations": 1,
+        "expected_sequences": [["final_answer_start", "final_answer_end"]],
+    },
+    {
+        "label": "C3_distinct_final_answers",
+        "batches": [[_fa("First."), _fa("Second."), _fa("Third.")]],
+        "needs_tool": False,
+        "user_interaction_enabled": True,
+        "max_iterations": 1,
+        "expected_sequences": [["final_answer_start", "final_answer_end"]],
+    },
+    {
+        "label": "C4_final_answer_before_send_message",
+        "batches": [[_fa("Answer one."), _send_message_call(expect_response=False)]],
+        "needs_tool": False,
+        "user_interaction_enabled": True,
+        "max_iterations": 1,
+        "expected_sequences": [["final_answer_start", "final_answer_end"]],
+    },
+    {
+        "label": "C5_final_answer_before_ask_user_question",
+        "batches": [[_fa("Answer one."), _ask_user_question_call()]],
+        "needs_tool": False,
+        "user_interaction_enabled": True,
+        "max_iterations": 1,
+        "expected_sequences": [["final_answer_start", "final_answer_end"]],
+    },
+    {
+        "label": "C6_send_message_before_final_answer",
+        "batches": [[_send_message_call(expect_response=False), _fa("Answer one.")]],
+        "needs_tool": False,
+        "user_interaction_enabled": True,
+        "max_iterations": 1,
+        "expected_sequences": [],
+    },
+    {
+        "label": "C7_send_message_expect_response_before_final_answer",
+        "batches": [[_send_message_call(expect_response=True), _fa("Answer one.")]],
+        "needs_tool": False,
+        "user_interaction_enabled": True,
+        "max_iterations": 1,
+        "expected_sequences": [],
+    },
+    {
+        "label": "C8_ask_user_question_before_final_answer",
+        "batches": [[_ask_user_question_call(), _fa("Answer one.")]],
+        "needs_tool": False,
+        "user_interaction_enabled": True,
+        "max_iterations": 1,
+        "expected_sequences": [],
+    },
+    {
+        "label": "C9a_final_answer_before_work_tool",
+        "batches": [[_fa("Candidate."), _work_tool_call()], _FALLBACK_BATCH],
+        "needs_tool": True,
+        "user_interaction_enabled": True,
+        "max_iterations": 3,
+        "expected_sequences": [
+            ["final_answer_start", "final_answer_error"],
+            ["final_answer_start", "final_answer_end"],
+        ],
+    },
+    {
+        "label": "C9b_work_tool_before_final_answer",
+        "batches": [[_work_tool_call(), _fa("Candidate.")], _FALLBACK_BATCH],
+        "needs_tool": True,
+        "user_interaction_enabled": True,
+        "max_iterations": 3,
+        # The work tool's name arrives before any final_answer bytes, so the
+        # streamer disables itself immediately - only the fallback batch's
+        # stream ever opens.
+        "expected_sequences": [["final_answer_start", "final_answer_end"]],
+    },
+    {
+        "label": "C10_empty_final_answer_in_control_only_batch",
+        "batches": [[_fa("Valid answer."), _fa("")], _FALLBACK_BATCH],
+        "needs_tool": False,
+        "user_interaction_enabled": True,
+        "max_iterations": 3,
+        "expected_sequences": [
+            ["final_answer_start", "final_answer_error"],
+            ["final_answer_start", "final_answer_end"],
+        ],
+    },
+    {
+        "label": "C14_disabled_control_tool_cancels_first_final_answer",
+        "batches": [
+            [_fa("Answer one."), _send_message_call(expect_response=False)],
+            _FALLBACK_BATCH,
+        ],
+        "needs_tool": False,
+        "user_interaction_enabled": False,
+        "max_iterations": 3,
+        "expected_sequences": [
+            ["final_answer_start", "final_answer_error"],
+            ["final_answer_start", "final_answer_end"],
+        ],
+    },
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case", _I1_RUN_CASES, ids=[case["label"] for case in _I1_RUN_CASES]
+)
+async def test_react_every_started_answer_stream_gets_exactly_one_terminal_event(
+    case: dict[str, Any],
+) -> None:
+    """I-1: for every batch shape that can occur through a real ReAct run,
+    each final_answer_start's message_id gets exactly one terminal event
+    (final_answer_end or final_answer_error) - never zero, never two. A
+    shape whose stream never opens (R0) produces no started ids at all."""
+
+    llm = ScriptedStreamLLM(case["batches"])
+    pattern = ReActPattern(
+        max_iterations=case["max_iterations"],
+        user_interaction_enabled=case["user_interaction_enabled"],
+    )
+    tools = [FakeTool()] if case["needs_tool"] else []
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Question")
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+
+    await pattern.run(context=context, tools=tools, llm=llm, runtime=runtime)
+
+    by_id = _terminal_events_by_message_id(outbound.events)
+    actual_sequences = list(by_id.values())
+    assert actual_sequences == case["expected_sequences"]
+    for sequence in actual_sequences:
+        assert sequence[0] == "final_answer_start"
+        assert len(sequence) == 2
+        assert sequence[1] in ("final_answer_end", "final_answer_error")
+
+
+@pytest.mark.asyncio
+async def test_react_every_started_answer_stream_gets_exactly_one_terminal_event_without_outbound_handler() -> (
+    None
+):
+    """I-1, front condition (no outbound handler): start_final_answer_stream
+    returns None with no handler to send to, so the answer streamer never
+    accumulates content and never starts - the run still delivers the
+    correct answer through the non-streaming path, and there is nothing to
+    close."""
+
+    llm = ScriptedStreamLLM([[_fa("Answer one.")]])
+    pattern = ReActPattern(max_iterations=1)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Question")
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=None)
+
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    assert result["success"] is True
+    assert result["response"] == "Answer one."
+    assert runtime.last_final_answer_stream_message_id is None
+
+
+@pytest.mark.asyncio
+async def test_react_every_started_answer_stream_gets_exactly_one_terminal_event_without_native_streaming() -> (
+    None
+):
+    """I-1, front condition (no native streaming): a model without
+    stream_chat falls back to the non-streaming call path, so on_chunk is
+    never invoked and the answer streamer never starts - zero final_answer_*
+    events, even though tool_schemas were offered and a final_answer call
+    was made."""
+
+    llm = FakeLLM(
+        responses=[
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"Answer one."}',
+                        },
+                    }
+                ]
+            }
+        ]
+    )
+    pattern = ReActPattern(max_iterations=1)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Question")
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    assert result["success"] is True
+    assert result["response"] == "Answer one."
+    assert outbound.events == []
+
+
+@pytest.mark.asyncio
+async def test_react_every_started_answer_stream_gets_exactly_one_terminal_event_c12_manual() -> (
+    None
+):
+    """I-1, C12 (no tool_calls, plain assistant content, stream already
+    open): there is no known way for a real model response to leave the
+    stream open while producing zero tool_calls - reaching R1 or R3 both
+    require at least one tool call, and the only way tool_calls empties out
+    after the stream opens (the bundled-final_answer strip) always keeps a
+    work-tool entry behind. This case drives the stream open through the
+    real streaming primitive directly, then calls the close function with a
+    tool_calls=[] batch, so the R2 branch is exercised the same way I-11
+    exercises R3's otherwise-untriggerable shapes."""
+
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+    streamer = ReActFinalAnswerStreamer(runtime)
+    await streamer.handle_chunk(
+        StreamChunk(
+            type=ChunkType.TOOL_CALL,
+            tool_calls=[
+                {
+                    "id": "call_final",
+                    "function": {
+                        "name": "final_answer",
+                        "arguments": '{"answer":"Partial"}',
+                    },
+                }
+            ],
+        )
+    )
+    assert streamer.started
+    pattern = ReActPattern(max_iterations=1)
+
+    await pattern._close_streamed_answer(
+        answer_streamer=streamer,
+        assistant_content="Some plain content.",
+        tool_calls=[],
+    )
+
+    by_id = _terminal_events_by_message_id(outbound.events)
+    assert len(by_id) == 1
+    (sequence,) = by_id.values()
+    assert sequence == ["final_answer_start", "final_answer_end"]
+    end_event = next(e for e in outbound.events if e["type"] == "final_answer_end")
+    assert end_event["content"] == "Some plain content."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "label,batch,force_final_answer",
+    [
+        ("identical", [_fa("  Same answer.\n"), _fa("  Same answer.\n")], False),
+        (
+            "distinct_increasing",
+            [_fa("  First.\n"), _fa("  Second, longer.\n"), _fa("  Third, longest.\n")],
+            False,
+        ),
+        (
+            "distinct_decreasing",
+            [_fa("  First, longest.\n"), _fa("  Second.\n"), _fa("  Third.\n")],
+            False,
+        ),
+        (
+            "two_distinct_forced",
+            [_fa("  First.\n"), _fa("  Second, different.\n")],
+            True,
+        ),
+    ],
+)
+async def test_react_multi_final_answer_closes_stream_with_first_payload(
+    label: str,
+    batch: list[tuple[str, dict[str, Any]]],
+    force_final_answer: bool,
+) -> None:
+    """I-2: a batch with more than one final_answer call closes the stream on
+    the batch's first payload, verbatim (no stripping) - matching the text
+    _handle_control_tool actually delivers, whatever the later payloads say.
+
+    Every payload carries leading/trailing whitespace so this is only green
+    if the close path uses the raw text and never adds a ``.strip()``.
+    ``two_distinct_forced`` runs with ``force_final_answer_next`` set: when
+    the model is forced to answer through a single-tool ``final_answer``
+    schema, more than one call in the same batch is the shape that actually
+    reaches production, not an edge case.
+    """
+
+    llm = ScriptedStreamLLM([batch])
+    pattern = ReActPattern(max_iterations=1)
+    if force_final_answer:
+        pattern.force_final_answer_next = True
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Question")
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    first_payload = batch[0][1]["answer"]
+    assert result["success"] is True
+    assert result["response"] == first_payload
+    end_events = [e for e in outbound.events if e["type"] == "final_answer_end"]
+    assert len(end_events) == 1
+    assert end_events[0]["content"] == first_payload
+    assert not any(e["type"] == "final_answer_error" for e in outbound.events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "control_call",
+    [
+        _send_message_call(expect_response=False),
+        _ask_user_question_call(),
+    ],
+    ids=["send_message", "ask_user_question"],
+)
+async def test_react_final_answer_before_control_tool_ends_stream(
+    control_call: tuple[str, dict[str, Any]],
+) -> None:
+    """I-3: final_answer first in the batch always ends the stream with its
+    own answer, even when a control tool follows it in the same batch - that
+    trailing call never actually runs (_handle_control_tool's final_answer
+    branch finalizes the run before it is reached)."""
+
+    llm = ScriptedStreamLLM([[_fa("Answer one."), control_call]])
+    pattern = ReActPattern(max_iterations=1)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Question")
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    assert result["success"] is True
+    assert result["response"] == "Answer one."
+    assert [e["type"] for e in outbound.events] == [
+        "final_answer_start",
+        "final_answer_delta",
+        "final_answer_end",
+    ]
+    assert outbound.events[-1]["content"] == "Answer one."
+    # The trailing control tool never ran: it would have produced an
+    # agent_message event (send_message) or paused the run.
+    assert not any(e["type"] == "agent_message" for e in outbound.events)
+    assert result.get("status") != "waiting_for_user"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "control_call",
+    [
+        _send_message_call(expect_response=False),
+        _send_message_call(expect_response=True),
+        _ask_user_question_call(),
+    ],
+    ids=["send_message", "send_message_expect_response", "ask_user_question"],
+)
+async def test_react_control_tool_before_final_answer_opens_no_answer_stream(
+    control_call: tuple[str, dict[str, Any]],
+) -> None:
+    """I-4: a control tool ahead of final_answer in the same batch disables
+    the answer streamer before any answer bytes are emitted (the streamer
+    self-disables on the first non-final_answer tool name it sees), so no
+    final_answer_* event of any kind is ever produced for that response.
+    The run's delivered outcome is pinned too: the later final_answer is
+    still executed and delivered unless a response-expecting control tool
+    pauses the run before reaching it."""
+
+    llm = ScriptedStreamLLM([[control_call, _fa("Answer one.")], _FALLBACK_BATCH])
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Question")
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    assert not any(e["type"].startswith("final_answer_") for e in outbound.events)
+    control_name, control_args = control_call
+    if control_name == "ask_user_question" or control_args.get("expect_response"):
+        assert result["status"] == "waiting_for_user"
+    else:
+        assert result["success"] is True
+        assert result["response"] == "Answer one."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ordering", ["final_answer_first", "work_tool_first"])
+async def test_react_work_tool_batch_still_fails_stream_before_close(
+    ordering: str,
+) -> None:
+    """I-5: a final_answer bundled with a work tool keeps going through the
+    existing strip-and-fail path (the batch is stripped of its final_answer
+    call and the open stream is failed there), not through the close
+    function's own R3 fallback, and the stream this closes never ends as
+    though the stripped text were the delivered answer.
+
+    Streaming a work-tool name before any final_answer bytes disables the
+    answer streamer immediately (final_answer_stream.py's guard checks tool
+    names as soon as they appear, before reading any field), so
+    ``work_tool_first`` never opens a stream at all; ``final_answer_first``
+    is the only ordering that can leave a stream open for the strip point to
+    close.
+    """
+
+    if ordering == "final_answer_first":
+        batch = [_fa("Candidate."), _work_tool_call()]
+    else:
+        batch = [_work_tool_call(), _fa("Candidate.")]
+    llm = ScriptedStreamLLM([batch, _FALLBACK_BATCH])
+    pattern = ReActPattern(max_iterations=3)
+    tool = FakeTool()
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Question")
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+
+    result = await pattern.run(context=context, tools=[tool], llm=llm, runtime=runtime)
+
+    assert result["success"] is True
+    assert result["response"] == _FALLBACK_ANSWER
+    # Deltas may echo the discarded candidate while the model is still
+    # streaming - that is pre-existing emit_prefix behavior, unrelated to
+    # this invariant. What must never happen is the discarded text being
+    # delivered as a completed answer.
+    assert not any(
+        e["type"] == "final_answer_end" and e.get("content") == "Candidate."
+        for e in outbound.events
+    )
+
+    if ordering == "work_tool_first":
+        # The work tool's name arrives before any final_answer bytes, so the
+        # streamer disables itself immediately: no stream is ever opened for
+        # this batch, and only the fallback batch's stream produces events.
+        by_id = _terminal_events_by_message_id(outbound.events)
+        assert len(by_id) == 1
+        (only_sequence,) = by_id.values()
+        assert only_sequence == ["final_answer_start", "final_answer_end"]
+        return
+
+    by_id = _terminal_events_by_message_id(outbound.events)
+    assert len(by_id) == 2
+    first_id, second_id = by_id.keys()
+    assert by_id[first_id] == ["final_answer_start", "final_answer_error"]
+    assert by_id[second_id] == ["final_answer_start", "final_answer_end"]
+    first_stream_error = next(
+        e for e in outbound.events if e["type"] == "final_answer_error"
+    )
+    assert first_stream_error["error"] == (
+        "discarded an answer that arrived together with tool "
+        "calls; answering again once the tools have run"
+    )
+    second_stream_end = next(
+        e
+        for e in outbound.events
+        if e["type"] == "final_answer_end" and e["message_id"] == second_id
+    )
+    assert second_stream_end["content"] == _FALLBACK_ANSWER
+    assert runtime.last_final_answer_stream_message_id == second_id
+
+
+@pytest.mark.asyncio
+async def test_react_disabled_control_tool_fails_cancelled_answer_stream() -> None:
+    """I-6: when a disabled user-interaction control tool shares the batch
+    with the first final_answer, _disabled_control_tool_index means R1 does
+    not fire - the stream is failed, not ended, and the run recovers on the
+    next forced turn. The failed stream's id is never mistaken for the
+    delivered one."""
+
+    llm = ScriptedStreamLLM(
+        [
+            [_fa("Answer one."), _send_message_call(expect_response=False)],
+            _FALLBACK_BATCH,
+        ]
+    )
+    pattern = ReActPattern(max_iterations=3, user_interaction_enabled=False)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Question")
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    assert result["success"] is True
+    assert result["response"] == _FALLBACK_ANSWER
+    by_id = _terminal_events_by_message_id(outbound.events)
+    assert len(by_id) == 2
+    first_id, second_id = by_id.keys()
+    assert by_id[first_id] == ["final_answer_start", "final_answer_error"]
+    assert by_id[second_id] == ["final_answer_start", "final_answer_end"]
+    assert runtime.last_final_answer_stream_message_id == second_id
+    assert runtime.last_final_answer_stream_message_id != first_id
+
+
+@pytest.mark.asyncio
+async def test_react_close_streamed_answer_zero_side_effect_when_discarded_stream_is_last() -> (
+    None
+):
+    """A discarded stream's id must never leave itself behind in
+    runtime.last_final_answer_stream_message_id. max_iterations=1 forces the
+    discarded stream to be the run's only stream, which is the only
+    construction where this assertion has any discriminating power - with a
+    later round, start_final_answer_stream unconditionally clears the field
+    before a new id could be confused with the old one, so the assertion
+    would pass even if the close function wrongly called finish() instead of
+    fail() here."""
+
+    llm = ScriptedStreamLLM(
+        [[_fa("Answer one."), _send_message_call(expect_response=False)]]
+    )
+    pattern = ReActPattern(max_iterations=1, user_interaction_enabled=False)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Question")
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+
+    await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    assert runtime.last_final_answer_stream_message_id is None
+
+
+@pytest.mark.asyncio
+async def test_react_disabled_control_tool_index_is_the_single_predicate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """I-7: _close_streamed_answer and _execute_pending_tool_calls must share
+    one _disabled_control_tool_index implementation. Patching it to always
+    return None flips both call sites' observable behavior together: the
+    execution side stops canceling the first final_answer, and the streaming
+    side switches from failing to ending that same stream. A collusion where
+    the close function reimplemented the check inline would not move under
+    this patch."""
+
+    def make_pattern() -> tuple[
+        ReActPattern,
+        ScriptedStreamLLM,
+        OutboundCollector,
+        PatternRuntime,
+        ExecutionContext,
+    ]:
+        llm = ScriptedStreamLLM(
+            [
+                [_fa("Answer one."), _send_message_call(expect_response=False)],
+                _FALLBACK_BATCH,
+            ]
+        )
+        pattern = ReActPattern(max_iterations=3, user_interaction_enabled=False)
+        context = ExecutionContext(
+            system_prompt="You are helpful.", execution_id="task-1"
+        )
+        context.add_user_message("Question")
+        outbound = OutboundCollector()
+        runtime = PatternRuntime(
+            execution_id="task-1", outbound_message_handler=outbound
+        )
+        return pattern, llm, outbound, runtime, context
+
+    real_pattern, real_llm, real_outbound, real_runtime, real_context = make_pattern()
+    real_result = await real_pattern.run(
+        context=real_context, tools=[], llm=real_llm, runtime=real_runtime
+    )
+
+    assert real_result["response"] == _FALLBACK_ANSWER
+    assert any(e["type"] == "final_answer_error" for e in real_outbound.events)
+
+    (
+        mutant_pattern,
+        mutant_llm,
+        mutant_outbound,
+        mutant_runtime,
+        mutant_context,
+    ) = make_pattern()
+    monkeypatch.setattr(
+        mutant_pattern,
+        "_disabled_control_tool_index",
+        lambda tool_calls, *, user_interaction_enabled: None,
+    )
+    mutant_result = await mutant_pattern.run(
+        context=mutant_context, tools=[], llm=mutant_llm, runtime=mutant_runtime
+    )
+
+    assert mutant_result["response"] == "Answer one."
+    assert not any(e["type"] == "final_answer_error" for e in mutant_outbound.events)
+    assert any(
+        e["type"] == "final_answer_end" and e["content"] == "Answer one."
+        for e in mutant_outbound.events
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "label,tool_calls,assistant_content",
+    [
+        (
+            "C11_work_tool_only",
+            [{"name": "calculator", "args": {"expression": "2+2"}}],
+            None,
+        ),
+        ("C13_no_calls_no_content", [], None),
+        (
+            "C15_final_answer_not_first",
+            [
+                {"name": "send_message", "args": {"message": "hi"}},
+                {"name": "final_answer", "args": {"answer": "x"}},
+            ],
+            None,
+        ),
+    ],
+)
+async def test_react_close_streamed_answer_fails_open_stream_without_deliverable_final_answer(
+    label: str,
+    tool_calls: list[dict[str, Any]],
+    assistant_content: Any,
+) -> None:
+    """I-11: these three tool_calls shapes have no known way to occur through
+    a real model response, so they are pinned at the function level instead
+    of being forced into an end-to-end fake-model shape that would not occur
+    in production. Whenever the stream is open and neither R1 nor R2 applies,
+    _close_streamed_answer
+    must fail it exactly once and must never call finish."""
+
+    class RecordingStreamer:
+        def __init__(self) -> None:
+            self.started = True
+            self.finish_calls: list[str] = []
+            self.fail_calls: list[str] = []
+
+        async def finish(self, content: str) -> None:
+            self.finish_calls.append(content)
+
+        async def fail(self, error: str) -> None:
+            self.fail_calls.append(error)
+
+    pattern = ReActPattern(max_iterations=1)
+    streamer = RecordingStreamer()
+
+    await pattern._close_streamed_answer(
+        answer_streamer=streamer,
+        assistant_content=assistant_content,
+        tool_calls=tool_calls,
+    )
+
+    assert streamer.finish_calls == []
+    assert streamer.fail_calls == [NO_DELIVERABLE_FINAL_ANSWER_REASON]

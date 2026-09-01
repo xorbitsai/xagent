@@ -477,6 +477,10 @@ async def test_ws_turn_rate_limited_rejects_without_dispatch(
     assert kwargs["accepted"] is False
     assert kwargs["client_message_id"] == "m2"
     assert kwargs["rejection_outcome"] == "not_accepted"
+    assert kwargs["error_code"] == "message_rate_limited"
+    assert kwargs["message"] == (
+        "You're sending messages too quickly. Please wait a moment and try again."
+    )
 
 
 @pytest.mark.asyncio
@@ -530,7 +534,13 @@ async def test_ws_turn_rate_limited_without_client_id_sends_error(
         if call.args and call.args[0].get("type") == "error"
     ]
     assert len(error_frames) == 1
-    assert "too quickly" in error_frames[0]["message"]
+    assert error_frames[0] == {
+        "type": "error",
+        "error_code": "message_rate_limited",
+        "message": (
+            "You're sending messages too quickly. Please wait a moment and try again."
+        ),
+    }
     assert websocket.closed is False  # throttled turn must not close the socket
 
 
@@ -620,6 +630,10 @@ async def test_widget_ws_turn_rate_limited_rejects_without_dispatch(
     assert kwargs["accepted"] is False
     assert kwargs["client_message_id"] == "m2"
     assert kwargs["rejection_outcome"] == "not_accepted"
+    assert kwargs["error_code"] == "message_rate_limited"
+    assert kwargs["message"] == (
+        "You're sending messages too quickly. Please wait a moment and try again."
+    )
 
 
 @pytest.mark.asyncio

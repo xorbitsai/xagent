@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable, cast
+from typing import TYPE_CHECKING, Any, Callable, cast
 
 from ...config import get_uploads_dir
 from ..memory import MemoryStore
@@ -28,6 +28,9 @@ from ..tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
 from ..workspace import TaskWorkspace, create_workspace
 from .trace import Tracer
 from .transcript import normalize_transcript_messages
+
+if TYPE_CHECKING:
+    from .runner import UserMessageInjectionOutcome
 
 logger = logging.getLogger(__name__)
 
@@ -349,10 +352,11 @@ class AgentService:
         turn_id: str | None = None,
         request_interrupt: bool = True,
         reason: str | None = None,
-    ) -> bool:
+    ) -> "UserMessageInjectionOutcome":
         if self._execution_adapter is None:
             self._execution_adapter = self._build_execution_adapter()
-        return bool(
+        return cast(
+            "UserMessageInjectionOutcome",
             await self._execution_adapter.post_user_message(
                 execution_id,
                 message,
@@ -362,7 +366,7 @@ class AgentService:
                 turn_id=turn_id,
                 request_interrupt=request_interrupt,
                 reason=reason,
-            )
+            ),
         )
 
     async def resume_execution_by_id(

@@ -12,11 +12,12 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Any, Callable, Coroutine, Iterator, TypeVar, cast
+from typing import Any, Callable, Coroutine, Iterator, Sequence, TypeVar, cast
 
 from sqlalchemy import and_, case, func, or_, update
 from sqlalchemy.exc import MultipleResultsFound
 from sqlalchemy.orm import Query, Session
+from sqlalchemy.sql.elements import ColumnElement
 
 from ...config import (
     get_task_lease_heartbeat_seconds,
@@ -747,7 +748,9 @@ def acquire_task_lease_no_commit(
     *,
     runner_id: str | None = None,
     expected_run_id: str | None = None,
+    expected_status: TaskStatus | None = None,
     new_run: bool = False,
+    claim_predicates: Sequence[ColumnElement[bool]] = (),
 ) -> TaskLease | None:
     """Stage one atomic lease claim; the caller owns commit/rollback."""
     runner = runner_id or get_runner_id()
@@ -807,6 +810,10 @@ def acquire_task_lease_no_commit(
         stmt = stmt.where(task_status_predicate.ne(TaskStatus.RUNNING))
     if expected_run_id is not None:
         stmt = stmt.where(Task.run_id == expected_run_id)
+    if expected_status is not None:
+        stmt = stmt.where(task_status_predicate.eq(expected_status))
+    if claim_predicates:
+        stmt = stmt.where(*claim_predicates)
     result = db.execute(
         stmt.returning(Task.run_id).execution_options(synchronize_session=False)
     )

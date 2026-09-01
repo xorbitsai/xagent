@@ -898,23 +898,39 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             # --headless/--isolated keep server deployments displayless and give
             # each session a throwaway profile instead of a shared one.
             # Version-pinned: npx resolves this on every launch, so an
-            # unpinned tag would silently pick up new upstream releases; the
-            # backend image (Dockerfile.backend) pre-installs this exact
-            # version globally so npx resolves it locally instead of hitting
-            # the npm registry on every server launch.
+            # unpinned tag would silently pick up new upstream releases;
+            # both Dockerfile.backend (non-sandboxed launches) and
+            # Dockerfile.sandbox (should_sandbox_mcp_connection() routes
+            # every npx/uvx MCP connector into the sandbox image whenever
+            # one is configured) independently pre-install this exact
+            # version and warm an npx cache for it. That warm-up is
+            # intended to make npx resolve locally instead of hitting the
+            # npm registry on every launch, but currently does not: the
+            # MCP stdio launcher this connector's process goes through
+            # only forwards a fixed env allowlist to the spawned npx
+            # child (no NPM_CONFIG_CACHE), so every launch still needs
+            # npm-registry access regardless of the warm-up -- tracked in
+            # xorbitsai/xagent#1869, not yet fixed here.
             # No --executablePath/--channel: the default "stable" channel
             # resolution finds Chrome per-platform (/Applications/... on
-            # macOS dev hosts, /opt/google/chrome/chrome in the backend
-            # image, which Dockerfile.backend guarantees exists) — a
-            # hardcoded path here would break every other platform.
-            # --chrome-arg='--no-sandbox'/'--disable-setuid-sandbox': the
-            # backend container runs Chrome as root, needing the same root/
-            # no-sandbox exposure the existing browser_use tool
-            # (core/tools/core/browser_use.py) already carries in this image
-            # -- not identical flags (browser_use passes only --no-sandbox,
-            # plus --disable-web-security and file-access flags this
-            # connector does not set), just a comparable, already-accepted
+            # macOS dev hosts, /opt/google/chrome/chrome in both the
+            # backend and sandbox images, which each guarantee that path
+            # exists) — a hardcoded path here would break every other
+            # platform.
+            # --chrome-arg='--no-sandbox'/'--disable-setuid-sandbox': both
+            # the backend and sandbox containers run Chrome as root,
+            # needing the same root/no-sandbox exposure the existing
+            # browser_use tool (core/tools/core/browser_use.py) already
+            # carries in the backend image -- not identical flags
+            # (browser_use passes only --no-sandbox, plus
+            # --disable-web-security and file-access flags this connector
+            # does not set), just a comparable, already-accepted
             # trade-off, not a new class of risk.
+            # --chrome-arg='--disable-dev-shm-usage': Docker's default
+            # /dev/shm size (64MB) is a well-documented Chrome-in-container
+            # crash mode: --no-sandbox is set above regardless, so this
+            # costs nothing and heads off a real failure mode once this
+            # connector is enabled, rather than waiting to hit it live.
             # --no-usage-statistics/--no-performance-crux: chrome-devtools-mcp
             # sends usage telemetry to Google and POSTs page URLs to the CrUX
             # API by default; opt out until this connector's data flow is
@@ -923,17 +939,21 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                 "command": "npx",
                 "args": [
                     "-y",
-                    # npm-exec flag, must precede the package spec: with the
-                    # exact-version cache warmed at image build time
-                    # (Dockerfile.backend), resolution never hits the npm
-                    # registry at launch; on a cache miss (e.g. first run on
-                    # a dev machine) it still fetches normally.
+                    # npm-exec flag, must precede the package spec: intended
+                    # to let the exact-version cache warmed at image build
+                    # time (both Dockerfile.backend and Dockerfile.sandbox)
+                    # skip the npm registry at launch, though that warm-up
+                    # currently doesn't reach this connector's actual npx
+                    # process (xorbitsai/xagent#1869) -- harmless either
+                    # way, since --prefer-offline still falls back to a
+                    # normal fetch on any cache miss.
                     "--prefer-offline",
                     "chrome-devtools-mcp@1.6.0",
                     "--headless",
                     "--isolated",
                     "--chrome-arg=--no-sandbox",
                     "--chrome-arg=--disable-setuid-sandbox",
+                    "--chrome-arg=--disable-dev-shm-usage",
                     "--no-usage-statistics",
                     "--no-performance-crux",
                 ],

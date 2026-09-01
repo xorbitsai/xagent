@@ -49,6 +49,7 @@ on:
       - 'src/xagent/web/models/user.py'
       - 'src/xagent/web/models/user_oauth.py'
       - 'tests/web/test_user_oauth_actor_ownership.py'
+      - 'tests/web/test_trusted_actor_oauth_postgresql.py'
       - 'tests/shared/postgres_disposable.py'
       - 'tests/web/services/checkpoint_anchor_shared.py'
   pull_request:
@@ -72,7 +73,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -136,6 +137,7 @@ jobs:
             src/xagent/web/models/user.py
             src/xagent/web/models/user_oauth.py
             tests/web/test_user_oauth_actor_ownership.py
+            tests/web/test_trusted_actor_oauth_postgresql.py
             tests/shared/postgres_disposable.py
             tests/web/services/checkpoint_anchor_shared.py
           )
@@ -175,11 +177,11 @@ jobs:
 
       - name: Checkout code
         if: needs.detect-migration-changes.outputs.should-test == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
         if: needs.detect-migration-changes.outputs.should-test == 'true'
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -260,11 +262,11 @@ jobs:
 
       - name: Checkout code
         if: needs.detect-migration-changes.outputs.should-test == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
         if: needs.detect-migration-changes.outputs.should-test == 'true'
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -336,6 +338,13 @@ jobs:
           pytest tests/migrations/test_migration_integration.py -m postgresql -q
         env:
           DATABASE_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test trusted actor OAuth concurrency (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/web/test_trusted_actor_oauth_postgresql.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 
       - name: Test Gmail provisioning Postgres-only behavior
         if: needs.detect-migration-changes.outputs.should-test == 'true'

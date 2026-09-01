@@ -89,6 +89,13 @@ from ...result import (
     unwrap_final_answer_content,
 )
 from ...runtime import (
+    DISCARDED_BUNDLED_FINAL_ANSWER_REASON,
+    INTERRUPTED_DURING_LLM_STREAM_REASON,
+    INVALID_TOOL_PROTOCOL_AFTER_RECOVERY_REASON,
+    INVALID_TOOL_PROTOCOL_AFTER_RETRY_REASON,
+    INVALID_TOOL_PROTOCOL_RETRYING_REASON,
+    NO_DELIVERABLE_FINAL_ANSWER_REASON,
+    UNAVAILABLE_TOOL_CALL_RESTORING_TOOLS_REASON,
     ExecutionInterrupted,
     LLMCallInterrupted,
     PatternRuntime,
@@ -709,7 +716,7 @@ class ReActPattern(AgentPattern):
                     response = await runtime.stream_final_answer(call_llm, **llm_kwargs)
             except LLMCallInterrupted:
                 if answer_streamer is not None:
-                    await answer_streamer.fail("interrupted during LLM stream")
+                    await answer_streamer.fail(INTERRUPTED_DURING_LLM_STREAM_REASON)
                 interrupted = await self._interrupt_if_requested(
                     runtime=runtime,
                     context=context,
@@ -722,7 +729,7 @@ class ReActPattern(AgentPattern):
                 unavailable_tool_call = exc.code == "unavailable_tool_call"
                 if answer_streamer is not None:
                     await answer_streamer.fail(
-                        "unavailable tool call, restoring available tools"
+                        UNAVAILABLE_TOOL_CALL_RESTORING_TOOLS_REASON
                         if unavailable_tool_call
                         else f"invalid {exc.code} tool protocol, retrying"
                     )
@@ -795,13 +802,13 @@ class ReActPattern(AgentPattern):
                         context=context,
                         iteration=iteration,
                         answer_streamer=answer_streamer,
-                        stream_failure_message=("invalid tool protocol after recovery"),
+                        stream_failure_message=INVALID_TOOL_PROTOCOL_AFTER_RECOVERY_REASON,
                         empty_final_answer=(
                             self._empty_final_answer_call(normalized) is not None
                         ),
                     )
                 if answer_streamer is not None:
-                    await answer_streamer.fail("invalid tool protocol, retrying")
+                    await answer_streamer.fail(INVALID_TOOL_PROTOCOL_RETRYING_REASON)
                 # Rejecting the whole response drops any assistant preamble it
                 # carried: the response is discarded before ``add_assistant_message``,
                 # so the retry rebuilds from context without it. Deliberate - the
@@ -868,7 +875,7 @@ class ReActPattern(AgentPattern):
                         context=context,
                         iteration=iteration,
                         answer_streamer=answer_streamer,
-                        stream_failure_message="invalid tool protocol after retry",
+                        stream_failure_message=INVALID_TOOL_PROTOCOL_AFTER_RETRY_REASON,
                         empty_final_answer=(
                             self._empty_final_answer_call(normalized) is not None
                         ),
@@ -893,10 +900,7 @@ class ReActPattern(AgentPattern):
                     # The discarded text may already be streaming to the UI.
                     # Nothing downstream closes that stream once the batch no
                     # longer carries a final_answer, so close it here.
-                    await answer_streamer.fail(
-                        "discarded an answer that arrived together with tool "
-                        "calls; answering again once the tools have run"
-                    )
+                    await answer_streamer.fail(DISCARDED_BUNDLED_FINAL_ANSWER_REASON)
             if force_final_answer_now and not normalized.get("tool_calls"):
                 normalized["done"] = True
 
@@ -920,7 +924,7 @@ class ReActPattern(AgentPattern):
                 )
 
             if answer_streamer is not None:
-                await self._finish_streamed_answer_if_final(
+                await self._close_streamed_answer(
                     answer_streamer=answer_streamer,
                     assistant_content=assistant_content,
                     tool_calls=tool_calls,
@@ -1010,33 +1014,56 @@ class ReActPattern(AgentPattern):
             },
         ).to_dict()
 
-    async def _finish_streamed_answer_if_final(
+    async def _close_streamed_answer(
         self,
         *,
         answer_streamer: ReActFinalAnswerStreamer,
         assistant_content: Any,
         tool_calls: list[dict[str, Any]],
     ) -> None:
+        """Ensure a started answer stream reaches exactly one terminal event.
+
+        The branches below are R0 (nothing streamed - no-op), R1
+        (``tool_calls[0]`` is a ``final_answer`` with a non-blank answer and
+        no disabled user-interaction control tool in the batch, per
+        ``_disabled_control_tool_index`` - ``finish`` with that answer's
+        exact, unstripped text, the same text ``_handle_control_tool``
+        delivers), R2 (no tool calls, plain assistant text - ``finish`` with
+        that text) and R3 (anything else - ``fail`` with a fixed reason;
+        ``fail`` is a no-op for a stream already closed earlier in this
+        response).
+
+        Do not relax R1's first-position condition. A later ``final_answer``
+        in a mixed batch can still be delivered
+        (``_execute_pending_tool_calls`` keeps walking past e.g. a
+        ``send_message`` that expects no response), but such a batch never
+        leaves an open stream to close: ``ReActFinalAnswerStreamer``
+        permanently disables itself as soon as a non-``final_answer`` tool
+        name appears in the response, before any answer content for a
+        non-first ``final_answer`` has accumulated, so R0 applies. Relaxing
+        the condition would finish streams with candidates whose delivery
+        this method has not checked. Do not turn R3 into a ``finish`` to
+        avoid the error event it produces - that would report an undelivered
+        candidate as the completed answer.
+        """
+
         if not answer_streamer.started:
             return
-        final_answer = self._final_answer_tool_content(tool_calls)
-        if final_answer is not None and len(tool_calls) == 1:
-            await answer_streamer.finish(final_answer)
-            return
+        if tool_calls and tool_calls[0].get("name") == "final_answer":
+            answer = self._final_answer_text(tool_calls[0].get("args"))
+            if answer.strip() and (
+                self._disabled_control_tool_index(
+                    tool_calls,
+                    user_interaction_enabled=self.user_interaction_enabled,
+                )
+                is None
+            ):
+                await answer_streamer.finish(answer)
+                return
         if not tool_calls and assistant_content is not None:
             await answer_streamer.finish(str(assistant_content))
-
-    def _final_answer_tool_content(
-        self,
-        tool_calls: list[dict[str, Any]],
-    ) -> str | None:
-        for tool_call in tool_calls:
-            if tool_call.get("name") != "final_answer":
-                continue
-            args = tool_call.get("args")
-            if isinstance(args, dict):
-                return self._final_answer_text(args)
-        return None
+            return
+        await answer_streamer.fail(NO_DELIVERABLE_FINAL_ANSWER_REASON)
 
     def _messages_for_llm(
         self,
@@ -1254,7 +1281,7 @@ class ReActPattern(AgentPattern):
                 on_chunk=answer_streamer.handle_chunk,
             )
         except LLMCallInterrupted:
-            await answer_streamer.fail("interrupted during LLM stream")
+            await answer_streamer.fail(INTERRUPTED_DURING_LLM_STREAM_REASON)
             raise
         except Exception as exc:
             await answer_streamer.fail(str(exc))
@@ -2814,6 +2841,33 @@ class ReActPattern(AgentPattern):
             if record is not None:
                 self.tool_ledger[tool_id] = record
 
+    def _disabled_control_tool_index(
+        self,
+        tool_calls: list[dict[str, Any]],
+        *,
+        user_interaction_enabled: bool,
+    ) -> int | None:
+        """Index of the first disabled user-interaction control tool, if any.
+
+        Shared by ``_execute_pending_tool_calls`` (which cancels every call
+        ahead of that index) and ``_close_streamed_answer`` (which must treat
+        a batch the same way whether or not its first call has already run).
+        Both callers pass their own ``user_interaction_enabled`` state rather
+        than this reading ``self`` directly, so the two call sites cannot
+        silently drift onto different predicates.
+        """
+
+        if user_interaction_enabled:
+            return None
+        return next(
+            (
+                index
+                for index, pending in enumerate(tool_calls)
+                if pending.get("name") in USER_INTERACTION_CONTROL_TOOL_NAMES
+            ),
+            None,
+        )
+
     async def _execute_pending_tool_calls(
         self,
         *,
@@ -2823,13 +2877,9 @@ class ReActPattern(AgentPattern):
         runtime: PatternRuntime,
     ) -> dict[str, Any] | None:
         if not self.user_interaction_enabled:
-            disabled_index = next(
-                (
-                    index
-                    for index, pending in enumerate(self.pending_tool_calls)
-                    if pending.get("name") in USER_INTERACTION_CONTROL_TOOL_NAMES
-                ),
-                None,
+            disabled_index = self._disabled_control_tool_index(
+                self.pending_tool_calls,
+                user_interaction_enabled=self.user_interaction_enabled,
             )
             if disabled_index is not None:
                 preceding = self.pending_tool_calls[:disabled_index]

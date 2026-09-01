@@ -9,14 +9,15 @@ from typing import Any, Callable
 
 from ...context.enrichment import latest_user_text
 from ...language import (
-    OUTPUT_LANGUAGE_METADATA_KEY,
     OUTPUT_LANGUAGE_SOURCE_METADATA_KEY,
     OUTPUT_LANGUAGE_SOURCE_PLAN,
     detect_prose_script_mismatch,
     detect_response_language_script_mismatch,
+    effective_output_language,
     normalize_response_language_label,
-    output_language_policy,
+    output_language_directives,
     plan_language_rules,
+    request_context_output_language,
 )
 from ..base import (
     RequiredToolCallError,
@@ -28,8 +29,6 @@ from ..base import (
 logger = logging.getLogger(__name__)
 
 MAX_PLAN_TOOL_CALL_ATTEMPTS = 2
-LATEST_USER_REQUEST_PREVIEW_LIMIT = 1200
-_MIDDLE_TRUNCATION_MARKER = "\n... [middle truncated] ...\n"
 PLAN_GENERATION_REQUIRED_TOOL_MESSAGE = (
     "Plan generation failed because the model did not return the required "
     "planning tool call. Please retry."
@@ -339,7 +338,17 @@ class LLMPlanGenerator(PlanGenerator):
             },
             {"role": "user", "content": self._build_prompt(request)},
         ]
+
+        def finalize(plan: ExecutionPlan) -> ExecutionPlan:
+            return self._filter_suggested_tools(
+                plan=plan,
+                available_tool_names=request.available_tool_names,
+            )
+
         retry_feedback: str | None = None
+        # A plan that only triggered the soft language nudge stays usable, so a
+        # worse second attempt must not turn a working plan into a hard failure.
+        nudged_plan: ExecutionPlan | None = None
         for attempt in range(MAX_PLAN_TOOL_CALL_ATTEMPTS):
             attempt_messages = list(messages)
             if retry_feedback:
@@ -362,6 +371,8 @@ class LLMPlanGenerator(PlanGenerator):
                 )
             except RequiredToolCallError:
                 if attempt + 1 >= MAX_PLAN_TOOL_CALL_ATTEMPTS:
+                    if nudged_plan is not None:
+                        return finalize(nudged_plan)
                     raise
                 retry_feedback = self._required_tool_call_retry_feedback(
                     self.PLAN_TOOL_NAME
@@ -376,6 +387,8 @@ class LLMPlanGenerator(PlanGenerator):
                 continue
             except PlanToolArgumentsError as exc:
                 if attempt + 1 >= MAX_PLAN_TOOL_CALL_ATTEMPTS:
+                    if nudged_plan is not None:
+                        return finalize(nudged_plan)
                     raise
                 retry_feedback = self._invalid_tool_arguments_retry_feedback(exc)
                 logger.warning(
@@ -395,6 +408,8 @@ class LLMPlanGenerator(PlanGenerator):
                 )
             except PlanValidationError as exc:
                 if attempt + 1 >= MAX_PLAN_TOOL_CALL_ATTEMPTS:
+                    if nudged_plan is not None:
+                        return finalize(nudged_plan)
                     raise
                 retry_feedback = self._invalid_plan_retry_feedback(exc)
                 logger.warning(
@@ -404,11 +419,20 @@ class LLMPlanGenerator(PlanGenerator):
                     exc,
                 )
                 continue
-            self._apply_response_language(request.context, plan_arguments)
-            return self._filter_suggested_tools(
-                plan=plan,
-                available_tool_names=request.available_tool_names,
-            )
+            if attempt + 1 < MAX_PLAN_TOOL_CALL_ATTEMPTS and not (
+                self._has_external_language_authority(request.context)
+            ):
+                reminder = self._request_language_reminder(request.context, plan)
+                if reminder is not None:
+                    retry_feedback = reminder
+                    nudged_plan = plan
+                    logger.info(
+                        "LLMPlanGenerator plan language may not match the request; "
+                        "asking the planner to re-check once. execution_id=%s",
+                        request.execution_id,
+                    )
+                    continue
+            return finalize(plan)
         raise RuntimeError("LLMPlanGenerator retry loop exited unexpectedly.")
 
     def _filter_suggested_tools(
@@ -537,7 +561,7 @@ class LLMPlanGenerator(PlanGenerator):
         }
 
     def _build_prompt(self, request: PlanGenerationRequest) -> str:
-        latest_request = latest_user_text(request.context) or ""
+        latest_request = latest_user_text(request.context, prefer_display=True) or ""
         expected_language, language_source = self._language_authority(request.context)
         latest_messages = [
             {"role": message.role, "content": message.content}
@@ -547,11 +571,14 @@ class LLMPlanGenerator(PlanGenerator):
         payload = {
             "execution_id": request.execution_id,
             "replan": request.replan,
-            "latest_user_request": self._latest_user_request_preview(latest_request),
-            "output_language_policy": output_language_policy(
+            # Quoted whole: the planner picks response_language from this field,
+            # and "messages" below already carries the full text anyway.
+            "latest_user_request": latest_request.strip(),
+            "output_language_policy": output_language_directives(
                 None
                 if language_source == OUTPUT_LANGUAGE_SOURCE_PLAN
-                else expected_language
+                else expected_language,
+                section="plan_payload",
             ),
             "messages": latest_messages,
             "retrieved_memory_context": request.context.metadata.get(
@@ -573,32 +600,42 @@ class LLMPlanGenerator(PlanGenerator):
         return json.dumps(payload, ensure_ascii=False)
 
     @staticmethod
-    def _latest_user_request_preview(request_text: str) -> str:
-        """Keep both ends of a bounded request so trailing directives survive."""
-        stripped = request_text.strip()
-        if len(stripped) <= LATEST_USER_REQUEST_PREVIEW_LIMIT:
-            return stripped
-        available = LATEST_USER_REQUEST_PREVIEW_LIMIT - len(_MIDDLE_TRUNCATION_MARKER)
-        head_length = available // 2
-        tail_length = available - head_length
-        return (
-            stripped[:head_length] + _MIDDLE_TRUNCATION_MARKER + stripped[-tail_length:]
-        )
-
-    @staticmethod
     def _language_authority(context: Any) -> tuple[str, str]:
         """Return language value/source and migrate legacy direct-DAG metadata."""
         metadata = getattr(context, "metadata", None)
         if not isinstance(metadata, dict):
             return "", ""
-        language = normalize_response_language_label(
-            str(metadata.get(OUTPUT_LANGUAGE_METADATA_KEY) or "")
-        )
+        language = effective_output_language(context)
         source = str(metadata.get(OUTPUT_LANGUAGE_SOURCE_METADATA_KEY) or "")
-        if language and not source and metadata.get("pattern") == "dag_plan_execute":
+        if (
+            language
+            and not source
+            and metadata.get("pattern") == "dag_plan_execute"
+            and language != request_context_output_language(metadata)
+        ):
             source = OUTPUT_LANGUAGE_SOURCE_PLAN
             metadata[OUTPUT_LANGUAGE_SOURCE_METADATA_KEY] = source
         return language, source
+
+    @staticmethod
+    def _has_external_language_authority(context: Any) -> bool:
+        """Whether an API caller pinned the output language via request_context."""
+        language, _ = LLMPlanGenerator._language_authority(context)
+        metadata = getattr(context, "metadata", None)
+        return bool(language) and language == request_context_output_language(metadata)
+
+    @staticmethod
+    def _step_prose(step: PlanStep) -> str:
+        return "\n".join(
+            value
+            for value in (
+                step.task,
+                step.description or "",
+                step.termination_condition or "",
+                step.completion_evidence or "",
+            )
+            if value
+        )
 
     @staticmethod
     def _validate_plan_language(
@@ -631,18 +668,8 @@ class LLMPlanGenerator(PlanGenerator):
             )
 
         for step in plan.steps:
-            prose = "\n".join(
-                value
-                for value in (
-                    step.task,
-                    step.description or "",
-                    step.termination_condition or "",
-                    step.completion_evidence or "",
-                )
-                if value
-            )
             mismatch = detect_response_language_script_mismatch(
-                response_language, prose
+                response_language, LLMPlanGenerator._step_prose(step)
             )
             if mismatch is not None:
                 raise PlanLanguageMismatchError(
@@ -653,37 +680,31 @@ class LLMPlanGenerator(PlanGenerator):
                     response_language=response_language,
                 )
 
-            if expected_language and language_source != OUTPUT_LANGUAGE_SOURCE_PLAN:
-                continue
-            request_mismatch = detect_prose_script_mismatch(
-                latest_user_text(context) or "",
-                prose,
-            )
-            if request_mismatch is not None:
-                raise PlanLanguageMismatchError(
-                    f"plan step {step.id!r} has predominantly "
-                    f"{request_mismatch.observed_script}-script user-facing text, "
-                    "which does not match the latest user request.",
-                    response_language="",
-                )
-
     @staticmethod
-    def _apply_response_language(context: Any, plan_arguments: dict[str, Any]) -> None:
-        response_language = normalize_response_language_label(
-            str(plan_arguments.get("response_language") or "")
-        )
-        if not response_language:
-            return
-        metadata = getattr(context, "metadata", None)
-        if not isinstance(metadata, dict):
-            return
-        _, language_source = LLMPlanGenerator._language_authority(context)
-        if (
-            not metadata.get(OUTPUT_LANGUAGE_METADATA_KEY)
-            or language_source == OUTPUT_LANGUAGE_SOURCE_PLAN
-        ):
-            metadata[OUTPUT_LANGUAGE_METADATA_KEY] = response_language
-            metadata[OUTPUT_LANGUAGE_SOURCE_METADATA_KEY] = OUTPUT_LANGUAGE_SOURCE_PLAN
+    def _request_language_reminder(context: Any, plan: ExecutionPlan) -> str | None:
+        """Return one retry nudge when plan prose looks off-script for the request.
+
+        Script comparison cannot tell a biased plan from a request that legitimately
+        asks for another language, so it may only nudge once, never reject a plan.
+        """
+        request = latest_user_text(context, prefer_display=True) or ""
+        for step in plan.steps:
+            mismatch = detect_prose_script_mismatch(
+                request, LLMPlanGenerator._step_prose(step)
+            )
+            if mismatch is None:
+                continue
+            return (
+                f"Plan step {step.id!r} is written in predominantly "
+                f"{mismatch.observed_script} script, which does not match the "
+                "script of the latest user request. Re-read latest_user_request "
+                "above and decide the output language from that request alone, "
+                "including any language change it asks for explicitly or "
+                f"implicitly. Call {LLMPlanGenerator.PLAN_TOOL_NAME} again exactly "
+                "once. If that language is still correct for this request, keep it "
+                "and return the same plan language."
+            )
+        return None
 
     def _required_tool_call_retry_feedback(self, tool_name: str) -> str:
         return (

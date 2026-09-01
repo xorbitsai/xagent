@@ -25,6 +25,95 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Which halves of the tree this change touches. Consumed by the jobs below as
+  # *step*-level guards, never as a job-level `if:` -- see the comment on
+  # ci-summary and docs/branch-protection.md "Gate at the step, not at the job".
+  changes:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    # The merge queue allows 60 minutes for a check to respond. A hung API call
+    # must not eat that budget.
+    timeout-minutes: 5
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    permissions:
+      contents: read
+      # paths-filter defaults its `token` input to github.token, and any
+      # non-empty token sends it down the pulls.listFiles API path rather than
+      # git diff. Without this scope that call is a 403, the step throws, and
+      # every pull request fails here. Fail-closed, but total -- do not drop it.
+      pull-requests: read
+    outputs:
+      # Non-pull_request events (merge_group, push to main, workflow_dispatch)
+      # never filter. The merge queue is the last gate before main and has to
+      # behave exactly as it did before this job existed, which also makes it
+      # the safety net for anything the pull-request filters get wrong.
+      #
+      # `!= 'false'` rather than `== 'true'` so that a missing or empty filter
+      # output lands on "run everything" instead of silently skipping. The
+      # literal-value assertion in ci-summary is the other half of that guard.
+      #
+      # The changed_files clauses are the third: pulls.listFiles caps at 3000
+      # files and paths-filter never checks the rows it got against that count.
+      # `== null` is not redundant -- an absent count compares as 0.
+      code: >-
+        ${{ github.event_name != 'pull_request'
+        || github.event.pull_request.changed_files == null
+        || github.event.pull_request.changed_files > 3000
+        || steps.filter.outputs.code != 'false' }}
+      frontend: >-
+        ${{ github.event_name != 'pull_request'
+        || github.event.pull_request.changed_files == null
+        || github.event.pull_request.changed_files > 3000
+        || steps.filter.outputs.frontend != 'false' }}
+
+    steps:
+      # No checkout: on pull_request the action reads the changed file list from
+      # the API, so this job never materialises the branch's code.
+      - name: Filter changed paths
+        id: filter
+        if: github.event_name == 'pull_request'
+        # Pinned by commit rather than by tag. This action decides whether the
+        # test suite runs at all, so a hijacked tag here would silently disable
+        # the only required check on the repository.
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        with:
+          # `code` expresses "not a docs-only change" through negation, which
+          # needs "matches at least one include and no exclude". The default
+          # `some` quantifier does not mean that.
+          predicate-quantifier: 'some-with-excludes'
+          filters: |
+            code:
+              - '**'
+              - '!docs/**'
+              - '!assets/**'
+              # Root-level markdown only. src/xagent/skills/**/SKILL.md is input
+              # to tests/skills and to the read_skill_doc tool, so it is code.
+              - '!*.md'
+              # Only the source tree, not all of `frontend/`: two Python tests
+              # read frontend/package.json and frontend/public, and paths-filter
+              # cannot re-include a file a pattern has already excluded.
+              - '!frontend/src/**'
+            frontend:
+              - 'frontend/**'
+              # The last step of frontend-build builds a wheel from the hatch
+              # `packages`/`artifacts` config and asserts both the bundled
+              # frontend and the Python package are inside it.
+              - 'pyproject.toml'
+              # Hatchling honours .gitignore when it selects files -- the
+              # frontend_dist `artifacts` override exists because of it -- so an
+              # edit here can drop a tracked file from the wheel.
+              - '.gitignore'
+              # pyproject's `readme` target, and root markdown is excluded from
+              # `code` -- without this rule, renaming it skips the only job that
+              # builds a wheel.
+              - 'README.md'
+              # The whole package tree, not just the entrypoint: hatchling
+              # packages all of src/xagent and drops any file .gitignore
+              # matches, so a backend-only change can break the wheel while
+              # never touching a rule above (PR #1848 review).
+              - 'src/xagent/**'
+              - '.github/workflows/ci.yml'
+
   prepare-deepdoc-cache:
     name: Prepare Deepdoc Cache
     runs-on: ubuntu-latest
@@ -34,7 +123,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Check Deepdoc cache
         id: deepdoc-cache
@@ -161,7 +250,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -209,7 +298,7 @@ jobs:
           python3 -m uv sync --group dev
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: '20'
           cache: 'npm'
@@ -228,11 +317,18 @@ jobs:
         env:
           PRE_COMMIT_USE_SYSTEM: true
 
+      # Not only in the pytest-fast-deepdoc `core` leg: this is the one job
+      # CI Summary gathers that no `changes` output can gate, and a suite
+      # validating those outputs must not be skippable by them.
+      - name: Run CI contract tests
+        shell: bash
+        run: python3 -m uv run python -m pytest tests/test_ci_summary_contract.py -q
+
   pytest-fast:
     name: Pytest Fast (${{ matrix.name }})
     runs-on: ubuntu-latest
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
-    needs: pre-commit
+    needs: [changes, pre-commit]
     strategy:
       fail-fast: false
       matrix:
@@ -243,10 +339,16 @@ jobs:
             paths: tests/integration
 
     steps:
+      - name: Skip tests
+        if: needs.changes.outputs.code != 'true'
+        run: echo "Docs-only change; no code paths touched."
+
       - name: Checkout code
-        uses: actions/checkout@v4
+        if: needs.changes.outputs.code == 'true'
+        uses: actions/checkout@v7
 
       - name: Ensure uv is available
+        if: needs.changes.outputs.code == 'true'
         shell: bash
         run: |
           set -e
@@ -259,6 +361,7 @@ jobs:
           python3 -m uv --version || uv --version
 
       - name: Create virtual environment (if not exists)
+        if: needs.changes.outputs.code == 'true'
         shell: bash
         run: |
           set -e
@@ -269,17 +372,20 @@ jobs:
           $_UV venv --python 3.12
 
       - name: Install dependencies
+        if: needs.changes.outputs.code == 'true'
         shell: bash
         run: |
           set -e
           python3 -m uv sync --all-extras
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        if: needs.changes.outputs.code == 'true'
+        uses: actions/setup-node@v7
         with:
           node-version: '20'
 
       - name: Install pptxgenjs globally
+        if: needs.changes.outputs.code == 'true'
         run: |
           set -e
           npm install -g pptxgenjs@4.0.1
@@ -288,7 +394,7 @@ jobs:
         # tests/web/test_sandbox_reconcile_e2e.py drives a real Docker daemon.
         # Pull with retries here so registry flakes fail in this step instead of
         # as APIErrors inside the tests (#1099).
-        if: matrix.name == 'web'
+        if: needs.changes.outputs.code == 'true' && (matrix.name == 'web')
         shell: bash
         run: |
           set -e
@@ -296,6 +402,7 @@ jobs:
           .github/scripts/docker-pull-retry.sh "$image"
 
       - name: Run tests
+        if: needs.changes.outputs.code == 'true'
         shell: bash
         run: |
           set -e
@@ -305,13 +412,14 @@ jobs:
     name: Pytest Fast Deepdoc (${{ matrix.name }})
     runs-on: ubuntu-latest
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
-    needs: [prepare-deepdoc-cache, pre-commit]
+    needs: [changes, prepare-deepdoc-cache, pre-commit]
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: core
             paths: >-
+              tests/test_ci_summary_contract.py
               tests/test_docker_workflow_versions.py
               tests/agent
               tests/alembic
@@ -327,10 +435,16 @@ jobs:
             paths: tests/web_integration
 
     steps:
+      - name: Skip tests
+        if: needs.changes.outputs.code != 'true'
+        run: echo "Docs-only change; no code paths touched."
+
       - name: Checkout code
-        uses: actions/checkout@v4
+        if: needs.changes.outputs.code == 'true'
+        uses: actions/checkout@v7
 
       - name: Ensure uv is available
+        if: needs.changes.outputs.code == 'true'
         shell: bash
         run: |
           set -e
@@ -343,6 +457,7 @@ jobs:
           python3 -m uv --version || uv --version
 
       - name: Create virtual environment (if not exists)
+        if: needs.changes.outputs.code == 'true'
         shell: bash
         run: |
           set -e
@@ -353,26 +468,28 @@ jobs:
           $_UV venv --python 3.12
 
       - name: Install dependencies
+        if: needs.changes.outputs.code == 'true'
         shell: bash
         run: |
           set -e
           python3 -m uv sync --all-extras
 
       - name: Restore Deepdoc cache
-        if: needs.prepare-deepdoc-cache.outputs.cache-hit == 'true'
+        if: needs.changes.outputs.code == 'true' && (needs.prepare-deepdoc-cache.outputs.cache-hit == 'true')
         uses: actions/cache/restore@v4
         with:
           path: ${{ env.DEEPDOC_CACHE_PATH }}
           key: deepdoc-${{ runner.os }}-py312-modelscope-deepdoc-lib-0.2.2-v1
 
       - name: Download Deepdoc cache artifact
-        if: needs.prepare-deepdoc-cache.outputs.cache-hit != 'true'
+        if: needs.changes.outputs.code == 'true' && (needs.prepare-deepdoc-cache.outputs.cache-hit != 'true')
         uses: actions/download-artifact@v4
         with:
           name: deepdoc-cache
           path: ${{ env.DEEPDOC_CACHE_PATH }}
 
       - name: Verify Deepdoc cache
+        if: needs.changes.outputs.code == 'true'
         shell: bash
         run: |
           set -e
@@ -432,11 +549,13 @@ jobs:
           PY
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        if: needs.changes.outputs.code == 'true'
+        uses: actions/setup-node@v7
         with:
           node-version: '20'
 
       - name: Install pptxgenjs globally
+        if: needs.changes.outputs.code == 'true'
         run: |
           set -e
           npm install -g pptxgenjs@4.0.1
@@ -444,7 +563,7 @@ jobs:
       - name: Pre-pull the sandbox image
         # tests/sandbox drives a real Docker daemon (test_docker_lifecycle_api.py
         # and friends). Same reasoning as the pytest-fast web leg (#1099).
-        if: matrix.name == 'core'
+        if: needs.changes.outputs.code == 'true' && (matrix.name == 'core')
         shell: bash
         run: |
           set -e
@@ -452,6 +571,7 @@ jobs:
           .github/scripts/docker-pull-retry.sh "$image"
 
       - name: Run tests
+        if: needs.changes.outputs.code == 'true'
         shell: bash
         run: |
           set -e
@@ -460,13 +580,19 @@ jobs:
   pytest-slow:
     runs-on: ubuntu-latest
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
-    needs: [prepare-deepdoc-cache, pre-commit]
+    needs: [changes, prepare-deepdoc-cache, pre-commit]
 
     steps:
+      - name: Skip tests
+        if: needs.changes.outputs.code != 'true'
+        run: echo "Docs-only change; no code paths touched."
+
       - name: Checkout code
-        uses: actions/checkout@v4
+        if: needs.changes.outputs.code == 'true'
+        uses: actions/checkout@v7
 
       - name: Ensure uv is available
+        if: needs.changes.outputs.code == 'true'
         shell: bash
         run: |
           set -e
@@ -479,6 +605,7 @@ jobs:
           python3 -m uv --version || uv --version
 
       - name: Create virtual environment (if not exists)
+        if: needs.changes.outputs.code == 'true'
         shell: bash
         run: |
           set -e
@@ -489,26 +616,28 @@ jobs:
           $_UV venv --python 3.12
 
       - name: Install dependencies
+        if: needs.changes.outputs.code == 'true'
         shell: bash
         run: |
           set -e
           python3 -m uv sync --all-extras
 
       - name: Restore Deepdoc cache
-        if: needs.prepare-deepdoc-cache.outputs.cache-hit == 'true'
+        if: needs.changes.outputs.code == 'true' && (needs.prepare-deepdoc-cache.outputs.cache-hit == 'true')
         uses: actions/cache/restore@v4
         with:
           path: ${{ env.DEEPDOC_CACHE_PATH }}
           key: deepdoc-${{ runner.os }}-py312-modelscope-deepdoc-lib-0.2.2-v1
 
       - name: Download Deepdoc cache artifact
-        if: needs.prepare-deepdoc-cache.outputs.cache-hit != 'true'
+        if: needs.changes.outputs.code == 'true' && (needs.prepare-deepdoc-cache.outputs.cache-hit != 'true')
         uses: actions/download-artifact@v4
         with:
           name: deepdoc-cache
           path: ${{ env.DEEPDOC_CACHE_PATH }}
 
       - name: Verify Deepdoc cache
+        if: needs.changes.outputs.code == 'true'
         shell: bash
         run: |
           set -e
@@ -568,16 +697,19 @@ jobs:
           PY
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        if: needs.changes.outputs.code == 'true'
+        uses: actions/setup-node@v7
         with:
           node-version: '20'
 
       - name: Install pptxgenjs globally
+        if: needs.changes.outputs.code == 'true'
         run: |
           set -e
           npm install -g pptxgenjs@4.0.1
 
       - name: Run slow tests
+        if: needs.changes.outputs.code == 'true'
         shell: bash
         run: |
           set -e
@@ -586,14 +718,20 @@ jobs:
   e2e:
     runs-on: ubuntu-latest
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
-    needs: pre-commit
+    needs: [changes, pre-commit]
     timeout-minutes: 30
 
     steps:
+      - name: Skip tests
+        if: needs.changes.outputs.code != 'true'
+        run: echo "Docs-only change; no code paths touched."
+
       - name: Checkout code
-        uses: actions/checkout@v4
+        if: needs.changes.outputs.code == 'true'
+        uses: actions/checkout@v7
 
       - name: Ensure uv is available
+        if: needs.changes.outputs.code == 'true'
         shell: bash
         run: |
           set -e
@@ -605,6 +743,7 @@ jobs:
           python3 -m uv --version || uv --version
 
       - name: Create virtual environment
+        if: needs.changes.outputs.code == 'true'
         shell: bash
         run: |
           set -e
@@ -613,23 +752,27 @@ jobs:
           $_UV venv --python 3.12
 
       - name: Install dependencies
+        if: needs.changes.outputs.code == 'true'
         shell: bash
         run: |
           set -e
           python3 -m uv sync --group test
 
       - name: Verify Docker
+        if: needs.changes.outputs.code == 'true'
         run: docker version
 
       - name: Pull e2e service images
         # Retry service images before pytest so registry failures surface here
         # instead of as confusing Docker daemon errors inside e2e fixtures.
+        if: needs.changes.outputs.code == 'true'
         shell: bash
         run: |
           set -e
           .github/scripts/docker-pull-retry.sh minio/minio postgres:17-bookworm
 
       - name: Run e2e tests
+        if: needs.changes.outputs.code == 'true'
         shell: bash
         run: |
           set -e
@@ -638,30 +781,40 @@ jobs:
   frontend-build:
     runs-on: ubuntu-latest
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    needs: changes
 
     steps:
+      - name: Skip frontend build
+        if: needs.changes.outputs.frontend != 'true'
+        run: echo "No frontend or packaging change; nothing to build."
+
       - name: Checkout code
-        uses: actions/checkout@v4
+        if: needs.changes.outputs.frontend == 'true'
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0  # full history + tags so hatch-vcs can derive the version
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        if: needs.changes.outputs.frontend == 'true'
+        uses: actions/setup-node@v7
         with:
           node-version: '22'
           cache: 'npm'
           cache-dependency-path: frontend/package-lock.json
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        if: needs.changes.outputs.frontend == 'true'
+        uses: actions/setup-python@v7
         with:
           python-version: '3.11'
 
       - name: Install dependencies
+        if: needs.changes.outputs.frontend == 'true'
         working-directory: ./frontend
         run: npm ci
 
       - name: Run widget regression tests with coverage
+        if: needs.changes.outputs.frontend == 'true'
         working-directory: ./frontend
         run: npm run test:widget:coverage
 
@@ -670,24 +823,29 @@ jobs:
       # KB component, and App Router suites so newly added tests are discovered
       # automatically.
       - name: Run frontend test manifest contract
+        if: needs.changes.outputs.frontend == 'true'
         working-directory: ./frontend
         shell: bash
         run: npm run test:ci-manifest
 
       - name: Run page component tests
+        if: needs.changes.outputs.frontend == 'true'
         working-directory: ./frontend
         shell: bash
         run: npm run test:pages
 
       - name: Run knowledge base component tests
+        if: needs.changes.outputs.frontend == 'true'
         working-directory: ./frontend
         run: npm run test:kb-components
 
       - name: Run App Router tests
+        if: needs.changes.outputs.frontend == 'true'
         working-directory: ./frontend
         run: npm run test:app-pages
 
       - name: Run Home and Build supporting contract tests
+        if: needs.changes.outputs.frontend == 'true'
         working-directory: ./frontend
         run: npm run test:home-build-contracts
 
@@ -695,11 +853,13 @@ jobs:
       # deployment). Verify it produces a servable bundle: index shell plus the
       # dynamic-route __shell__ pages the SPA fallback depends on.
       - name: Build frontend (static export)
+        if: needs.changes.outputs.frontend == 'true'
         working-directory: ./frontend
         env:
           NEXT_TELEMETRY_DISABLED: '1'
         run: npm run build
       - name: Verify static export output
+        if: needs.changes.outputs.frontend == 'true'
         working-directory: ./frontend
         run: |
           set -e
@@ -711,6 +871,7 @@ jobs:
       # The multi-container Docker image serves the frontend via a Node server,
       # so the standalone build must keep working too.
       - name: Build frontend (standalone / Docker)
+        if: needs.changes.outputs.frontend == 'true'
         working-directory: ./frontend
         env:
           NEXT_TELEMETRY_DISABLED: '1'
@@ -724,6 +885,7 @@ jobs:
       # Guard the export -> wheel packaging path (runs only at release otherwise),
       # so a broken bundling glob or a dropped Python package is caught on the PR.
       - name: Verify package bundles the frontend
+        if: needs.changes.outputs.frontend == 'true'
         run: |
           set -e
           rm -rf frontend/.next frontend/out src/xagent/web/frontend_dist
@@ -742,6 +904,7 @@ jobs:
     runs-on: ubuntu-latest
     if: always() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
     needs:
+      - changes
       - prepare-deepdoc-cache
       - pre-commit
       - pytest-fast
@@ -766,6 +929,7 @@ jobs:
             fi
           }
 
+          check_job "changes" "${{ needs.changes.result }}"
           check_job "prepare-deepdoc-cache" "${{ needs['prepare-deepdoc-cache'].result }}"
           check_job "pre-commit" "${{ needs['pre-commit'].result }}"
           check_job "pytest-fast" "${{ needs['pytest-fast'].result }}"
@@ -773,5 +937,23 @@ jobs:
           check_job "pytest-slow" "${{ needs['pytest-slow'].result }}"
           check_job "e2e" "${{ needs.e2e.result }}"
           check_job "frontend-build" "${{ needs['frontend-build'].result }}"
+
+          # On an empty outputs value every guarded work step skips, only
+          # the Skip sentinel runs, and the job reports success -- so the
+          # results above cannot tell that nothing ran. This is what fails.
+          check_flag() {
+            local name="$1"
+            local value="$2"
+            case "$value" in
+              true|false) ;;
+              *)
+                echo "::error::changes.outputs.$name is '$value', expected true or false"
+                failed=1
+                ;;
+            esac
+          }
+
+          check_flag "code" "${{ needs.changes.outputs.code }}"
+          check_flag "frontend" "${{ needs.changes.outputs.frontend }}"
 
           exit "$failed"

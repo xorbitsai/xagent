@@ -23,7 +23,10 @@ describe("uploadPublicChatFile", () => {
       taskType: "task",
       taskId: 42,
       fallbackError: "Upload failed",
-    })).rejects.toThrow("File is too large")
+    })).rejects.toMatchObject({
+      errorCode: "upload_too_large",
+      message: "File is too large. Please reduce the upload size and try again.",
+    })
 
     const [, request] = fetchMock.mock.calls[0]
     expect(new Headers(request?.headers).get("Authorization")).toBe(
@@ -55,6 +58,26 @@ describe("uploadPublicChatFile", () => {
       name: "trip.txt",
       size: 4,
       type: "text/plain",
+    })
+  })
+
+  it("rejects a successful response with a whitespace-only file identifier", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ success: true, file_id: "   " }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    )
+
+    await expect(uploadPublicChatFile({
+      url: "http://api.local/api/share/files/upload",
+      accessToken: "guest-token",
+      file: new File(["trip"], "trip.txt", { type: "text/plain" }),
+      taskType: "task",
+      fallbackError: "Upload failed",
+    })).rejects.toMatchObject({
+      errorCode: "upload_failed",
+      message: "Upload failed",
     })
   })
 })

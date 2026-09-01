@@ -17,6 +17,7 @@ from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import QueuePool
 
+from xagent.core.agent.runner import UserMessageInjectionOutcome
 from xagent.db.sqlite import apply_sqlite_concurrency_pragmas
 from xagent.web.api import websocket as websocket_api
 from xagent.web.api.websocket import (
@@ -34,6 +35,7 @@ from xagent.web.models.database import (
 )
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_command import TaskExecutionCommand
+from xagent.web.models.task_command_terminal_event import TaskCommandTerminalEvent
 from xagent.web.models.user import User
 from xagent.web.services import task_command_transport as task_command_transport_module
 from xagent.web.services.task_command_transport import (
@@ -225,6 +227,46 @@ def test_enqueue_is_committed_and_idempotent(db_session) -> None:
     assert db_session.query(TaskExecutionCommand).count() == 1
 
 
+def test_reused_actor_id_does_not_match_a_legacy_command(db_session) -> None:
+    user, task = _create_running_task(db_session)
+    actor_id = int(user.id)
+    task_id = int(task.id)
+    legacy = TaskExecutionCommand(
+        task_id=task_id,
+        actor_user_id=actor_id,
+        actor_subject=f"legacy-user-id:{actor_id}",
+        command_id="legacy-actor-idempotency",
+        kind=TaskCommandKind.PAUSE.value,
+        payload={"type": "pause_task"},
+    )
+    db_session.add(legacy)
+    db_session.commit()
+    assert user.actor_subject != legacy.actor_subject
+
+    duplicate = stage_task_command(
+        db_session,
+        task_id=task_id,
+        actor_user_id=actor_id,
+        command_id=legacy.command_id,
+        kind=TaskCommandKind.PAUSE,
+        payload={"type": "pause_task"},
+    )
+    classification = classify_task_command_conflict(
+        db_session,
+        task_id=task_id,
+        command_id=legacy.command_id,
+        actor_user_id=actor_id,
+        kind=TaskCommandKind.PAUSE,
+        payload={"type": "pause_task"},
+    )
+
+    assert duplicate.created is False
+    assert duplicate.payload_matches is False
+    assert classification.kind is TaskCommandConflictKind.RACED_DUPLICATE
+    assert classification.raced is not None
+    assert classification.raced.payload_matches is False
+
+
 def test_live_run_command_stays_with_owner_until_task_lease_expires(
     db_session,
 ) -> None:
@@ -372,6 +414,12 @@ def test_stale_attempt_cannot_mutate_reclaimed_command(db_session) -> None:
     assert row.status == "processing"
     assert row.claimed_by == "runner-a"
     assert row.attempt_count == second.attempt_count
+    assert (
+        db_session.query(TaskCommandTerminalEvent)
+        .filter(TaskCommandTerminalEvent.task_command_id == enqueued.command_id)
+        .count()
+        == 0
+    )
 
 
 def test_live_foreign_runner_is_rechecked_before_cancel(db_session) -> None:
@@ -876,6 +924,13 @@ async def test_deferred_message_eventually_fails_and_unblocks_cancel(
     assert row.status == COMMAND_FAILED
     assert row.failure_count == 0
     assert row.defer_count == MAX_COMMAND_DEFERS
+    event = (
+        db_session.query(TaskCommandTerminalEvent)
+        .filter(TaskCommandTerminalEvent.task_command_id == message.command_id)
+        .one()
+    )
+    assert event.outcome == COMMAND_FAILED
+    assert event.outcome_version == row.attempt_count
 
     cancel_claim = claim_task_command(db_session)
     assert cancel_claim is not None
@@ -988,7 +1043,9 @@ async def test_recovery_dispatches_committed_message_across_run_rotation(
 
     runtime_agent = MagicMock()
     runtime_agent.supports_live_control.return_value = True
-    runtime_agent.post_user_message = AsyncMock(return_value=True)
+    runtime_agent.post_user_message = AsyncMock(
+        return_value=UserMessageInjectionOutcome.POSTED_FRESH
+    )
     runtime_manager = MagicMock(
         get_agent_for_task=AsyncMock(return_value=runtime_agent)
     )

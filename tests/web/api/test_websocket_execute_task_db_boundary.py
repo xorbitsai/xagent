@@ -180,6 +180,7 @@ def test_websocket_task_info_exposes_persisted_runtime_extension_bindings(
 
 @pytest.mark.asyncio
 async def test_existing_task_scheduler_reuses_shared_runtime_without_turn_claim(
+    _test_db: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The compatibility entry schedules runtime work without a new message."""

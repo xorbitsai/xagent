@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Mapping
 
 from sqlalchemy.orm import Session
 
@@ -40,9 +40,20 @@ def finalize_managed_task_lease_result(
     *,
     status: TaskStatus,
     assistant_content: str | None = None,
+    turn_id: str | None = None,
     interactions: list[dict[str, Any]] | None = None,
     message_type: str = ASSISTANT_RESPONSE_MESSAGE_TYPE,
     error_message: str | None = None,
+    # Reserved for a future reader and unconsumed today: this function
+    # never reads it, and resolve_publishable_clarification -- the reader
+    # it is reserved for -- has no production caller anywhere yet. The
+    # change that wires that resolver is what will read it. Never pass
+    # this to a logger or an exception.
+    # finalize_managed_task_lease_result_isolated
+    # hands its call off to a worker thread, so this mapping is held by a
+    # closure across that thread boundary for a while, and it can carry
+    # large structures such as file_outputs with no truncation applied.
+    execution_result: Mapping[str, Any] | None = None,
 ) -> bool:
     """Atomically persist one inline transport result under its exact lease."""
 
@@ -86,6 +97,7 @@ def finalize_managed_task_lease_result(
                 content=history_content,
                 interactions=(interactions if status != TaskStatus.FAILED else None),
                 message_type=history_message_type,
+                turn_id=turn_id,
             )
         db.commit()
     except Exception:
@@ -101,9 +113,11 @@ def _finalize_managed_task_lease_result_sync(
     *,
     status: TaskStatus,
     assistant_content: str | None = None,
+    turn_id: str | None = None,
     interactions: list[dict[str, Any]] | None = None,
     message_type: str = ASSISTANT_RESPONSE_MESSAGE_TYPE,
     error_message: str | None = None,
+    execution_result: Mapping[str, Any] | None = None,
 ) -> bool:
     from ..models.database import get_session_local
 
@@ -114,9 +128,11 @@ def _finalize_managed_task_lease_result_sync(
             lease,
             status=status,
             assistant_content=assistant_content,
+            turn_id=turn_id,
             interactions=interactions,
             message_type=message_type,
             error_message=error_message,
+            execution_result=execution_result,
         )
 
 
@@ -125,9 +141,11 @@ async def finalize_managed_task_lease_result_isolated(
     *,
     status: TaskStatus,
     assistant_content: str | None = None,
+    turn_id: str | None = None,
     interactions: list[dict[str, Any]] | None = None,
     message_type: str = ASSISTANT_RESPONSE_MESSAGE_TYPE,
     error_message: str | None = None,
+    execution_result: Mapping[str, Any] | None = None,
 ) -> bool:
     """Settle one exact managed lease using a worker-owned short Session."""
 
@@ -136,9 +154,11 @@ async def finalize_managed_task_lease_result_isolated(
             lease,
             status=status,
             assistant_content=assistant_content,
+            turn_id=turn_id,
             interactions=interactions,
             message_type=message_type,
             error_message=error_message,
+            execution_result=execution_result,
         )
     )
 
@@ -182,9 +202,11 @@ class ManagedTaskLease:
         *,
         status: TaskStatus,
         assistant_content: str | None = None,
+        turn_id: str | None = None,
         interactions: list[dict[str, Any]] | None = None,
         message_type: str = ASSISTANT_RESPONSE_MESSAGE_TYPE,
         error_message: str | None = None,
+        execution_result: Mapping[str, Any] | None = None,
     ) -> bool:
         """Stop heartbeating, then atomically persist this owner's result."""
 
@@ -195,9 +217,11 @@ class ManagedTaskLease:
             self._finalize_resources(
                 status=status,
                 assistant_content=assistant_content,
+                turn_id=turn_id,
                 interactions=interactions,
                 message_type=message_type,
                 error_message=error_message,
+                execution_result=execution_result,
             )
         )
         return await drain_async_task_cancellation_safe(cleanup_task)
@@ -223,9 +247,11 @@ class ManagedTaskLease:
         *,
         status: TaskStatus,
         assistant_content: str | None,
+        turn_id: str | None,
         interactions: list[dict[str, Any]] | None,
         message_type: str,
         error_message: str | None,
+        execution_result: Mapping[str, Any] | None = None,
     ) -> bool:
         if not await self._stop_heartbeat_for_settlement():
             return False
@@ -233,9 +259,11 @@ class ManagedTaskLease:
             self.lease,
             status=status,
             assistant_content=assistant_content,
+            turn_id=turn_id,
             interactions=interactions,
             message_type=message_type,
             error_message=error_message,
+            execution_result=execution_result,
         )
 
     async def _close_resources(self) -> bool:

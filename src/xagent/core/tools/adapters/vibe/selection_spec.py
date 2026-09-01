@@ -53,7 +53,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, List, Optional, Set
 
 from .base import (
@@ -63,6 +63,47 @@ from .base import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def with_mcp_tools(spec: "ToolSelectionSpec") -> "ToolSelectionSpec":
+    """Return the same selection with MCP tools enabled.
+
+    Actor-marked tasks must load their owner-scoped builtin tools even when a
+    long-lived agent was created before it had an ordinary ``mcp`` category.
+    The caller still supplies the actor policy that authorizes each server.
+    """
+    if isinstance(spec, _SpecAll):
+        return spec
+    if isinstance(spec, _SpecNone):
+        return _SpecByCategories(categories=frozenset({"mcp"}))
+    assert isinstance(spec, _SpecByCategories)
+    return replace(spec, categories=spec.categories | frozenset({"mcp"}))
+
+
+def without_published_agent_tools(spec: "ToolSelectionSpec") -> "ToolSelectionSpec":
+    """Return the same selection with published-agent delegation disabled.
+
+    Actor-marked direct tasks call this before tool construction, so the
+    published-agent creator is skipped by the registry rather than invoked and
+    asked to return an empty list.
+    """
+
+    if isinstance(spec, _SpecNone):
+        return spec
+    if isinstance(spec, _SpecAll):
+        return replace(spec, published_agent_ids=frozenset())
+    assert isinstance(spec, _SpecByCategories)
+
+    categories = frozenset(
+        category for category in spec.categories if category != "agent"
+    )
+    if not categories and not spec.mcp_servers:
+        return _SpecNone()
+    return replace(
+        spec,
+        categories=categories,
+        published_agent_ids=frozenset(),
+    )
 
 
 def normalize_mcp_server_name(name: str) -> str:

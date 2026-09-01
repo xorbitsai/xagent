@@ -462,6 +462,66 @@ describe("widget bootstrap", () => {
       expect(panel().style.width).toBe("")
     })
 
+    it("ignores a drag start while expanded", () => {
+      // The expanded rule's own width would otherwise get fought over an
+      // inline width from a drag that isn't blocked here.
+      runWidget({ "data-widget-key": "widget-secret" })
+      openPanel()
+      window.dispatchEvent(new MessageEvent("message", {
+        data: { xagent: true, v: 1, type: "widget_expand" },
+        origin: "https://chat.example",
+        source: widgetIframe().contentWindow as Window,
+      }))
+      expect(panel()).toHaveClass("expanded")
+
+      firePointerEvent(handle(), "pointerdown", { pointerId: 1, clientX: 100 })
+
+      expect(document.body.style.userSelect).toBe("")
+      // Proves dragState was never created, not just that userSelect happens
+      // to be unset: a real drag would set an inline width here, clobbering
+      // the .expanded rule's own width.
+      firePointerEvent(handle(), "pointermove", { pointerId: 1, clientX: 250 })
+      expect(panel().style.width).toBe("")
+    })
+
+    it("cancels an already-active drag when expand arrives mid-drag", () => {
+      // isMobileViewport()/isExpanded in the pointerdown guard only block a
+      // *new* drag from starting once expanded -- they don't touch a drag
+      // already under way. That's reachable in practice: this drag's
+      // pointerId is independent of whatever pointer taps "Expand window"
+      // inside the iframe (e.g. a second finger, on a touch-capable
+      // desktop-width device, while the first still holds the handle down).
+      // Without expandPanel() cancelling it, this pointerId's next
+      // pointermove would go on setting an inline width, desyncing the
+      // panel's rendered width from the .expanded class it now also carries.
+      runWidget({ "data-widget-key": "widget-secret" })
+      openPanel()
+
+      firePointerEvent(handle(), "pointerdown", { pointerId: 30, clientX: 300 })
+      firePointerEvent(handle(), "pointermove", { pointerId: 30, clientX: 200 })
+      expect(panel().style.width).toBe("480px")
+      expect(document.body.style.userSelect).toBe("none")
+
+      window.dispatchEvent(new MessageEvent("message", {
+        data: { xagent: true, v: 1, type: "widget_expand" },
+        origin: "https://chat.example",
+        source: widgetIframe().contentWindow as Window,
+      }))
+
+      expect(panel()).toHaveClass("expanded")
+      expect(panel().style.width).toBe("")
+      expect(document.body.style.userSelect).toBe("")
+      // The abandoned in-progress width (480) must not have been committed
+      // as the user's stored preference -- cancelDrag(), not endDrag().
+      expect(localStorage.getItem("xagent_widget_width")).toBeNull()
+
+      // The drag is over: this pointerId's continuation is a no-op, not a
+      // desync between an inline width and the .expanded class.
+      firePointerEvent(handle(), "pointermove", { pointerId: 30, clientX: 50 })
+      expect(panel().style.width).toBe("")
+      expect(panel()).toHaveClass("expanded")
+    })
+
     it("boundary: applies the mobile CSS at exactly the breakpoint width, not just below it", () => {
       // isMobileViewport() uses <=, matching the CSS media query's own
       // max-width: 480px (also <= in CSS terms) -- off by one here would

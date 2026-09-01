@@ -292,6 +292,7 @@ describe("useWebSocket message delivery", () => {
     const { result } = renderHook(() => useWebSocket({
       url: "ws://localhost",
       taskId: 1,
+      legacyErrorProse: "trusted",
     }))
 
     await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
@@ -337,7 +338,7 @@ describe("useWebSocket message delivery", () => {
     })
   })
 
-  it("marks a rejection that carries the backend's reason as user facing", async () => {
+  it("marks a coded backend rejection as localizable and user facing", async () => {
     // The clarification form only shows a rejection reason that is marked
     // user facing; if this flag regresses, the visitor drops back to the
     // generic "Failed to send response" toast.
@@ -360,6 +361,7 @@ describe("useWebSocket message delivery", () => {
       socket.receive({
         type: "message_rejected",
         client_message_id: "rejected-with-reason",
+        error_code: "guidance_in_progress",
         message: "A previous guidance message is still being applied. Please wait for it to finish.",
         rejection_outcome: "not_accepted",
       })
@@ -369,6 +371,75 @@ describe("useWebSocket message delivery", () => {
       message: "A previous guidance message is still being applied. Please wait for it to finish.",
       disposition: "rejected",
       userFacing: true,
+      errorCode: "guidance_in_progress",
+    })
+  })
+
+  it("preserves absent-code rejection prose for a trusted legacy transport", async () => {
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 1,
+      legacyErrorProse: "trusted",
+    }))
+
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open())
+
+    const delivery = result.current.sendChatMessage(
+      "answer",
+      undefined,
+      false,
+      "trusted-legacy-rejection",
+    )
+    act(() => {
+      socket.receive({
+        type: "message_rejected",
+        client_message_id: "trusted-legacy-rejection",
+        message: "Legacy actionable authenticated rejection",
+        rejection_outcome: "not_accepted",
+      })
+    })
+
+    await expect(delivery).rejects.toMatchObject({
+      message: "Legacy actionable authenticated rejection",
+      disposition: "rejected",
+      userFacing: true,
+      errorCode: null,
+    })
+  })
+
+  it("hides absent-code rejection prose for an untrusted legacy transport", async () => {
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 1,
+      legacyErrorProse: "untrusted",
+    }))
+
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open())
+
+    const delivery = result.current.sendChatMessage(
+      "answer",
+      undefined,
+      false,
+      "untrusted-legacy-rejection",
+    )
+    act(() => {
+      socket.receive({
+        type: "message_rejected",
+        client_message_id: "untrusted-legacy-rejection",
+        message: "provider token=secret",
+        rejection_outcome: "not_accepted",
+      })
+    })
+
+    await expect(delivery).rejects.toMatchObject({
+      message: "Message was rejected.",
+      disposition: "rejected",
+      userFacing: false,
+      errorCode: null,
     })
   })
 
@@ -400,6 +471,83 @@ describe("useWebSocket message delivery", () => {
       message: "Message was rejected.",
       disposition: "rejected",
       userFacing: false,
+      errorCode: null,
+    })
+  })
+
+  it("does not trust a rejection carrying an unknown error code", async () => {
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 1,
+      legacyErrorProse: "trusted",
+    }))
+
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open())
+
+    const delivery = result.current.sendChatMessage(
+      "answer",
+      undefined,
+      false,
+      "rejected-unknown-code",
+    )
+    act(() => {
+      socket.receive({
+        type: "message_rejected",
+        client_message_id: "rejected-unknown-code",
+        error_code: "provider_secret",
+        message: "token=secret",
+        rejection_outcome: "not_accepted",
+      })
+    })
+
+    await expect(delivery).rejects.toMatchObject({
+      message: "Message was rejected.",
+      disposition: "rejected",
+      userFacing: false,
+      errorCode: null,
+    })
+  })
+
+  it.each([
+    ["object", {}],
+    ["number", 7],
+    ["array", ["provider_secret"]],
+    ["boolean", false],
+    ["null", null],
+  ])("does not trust a rejection carrying a malformed %s error code", async (_label, malformedCode) => {
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 1,
+      legacyErrorProse: "trusted",
+    }))
+
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open())
+
+    const delivery = result.current.sendChatMessage(
+      "answer",
+      undefined,
+      false,
+      "rejected-malformed-code",
+    )
+    act(() => {
+      socket.receive({
+        type: "message_rejected",
+        client_message_id: "rejected-malformed-code",
+        error_code: malformedCode,
+        message: "provider token=secret",
+        rejection_outcome: "not_accepted",
+      })
+    })
+
+    await expect(delivery).rejects.toMatchObject({
+      message: "Message was rejected.",
+      disposition: "rejected",
+      userFacing: false,
+      errorCode: null,
     })
   })
 
@@ -442,6 +590,7 @@ describe("useWebSocket message delivery", () => {
     const { result } = renderHook(() => useWebSocket({
       url: "ws://localhost",
       taskId: 1,
+      legacyErrorProse: "trusted",
     }))
 
     await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
@@ -557,6 +706,7 @@ describe("useWebSocket message delivery", () => {
     const { result } = renderHook(() => useWebSocket({
       url: "ws://localhost",
       taskId: 1,
+      legacyErrorProse: "trusted",
     }))
     await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
     const socket = MockWebSocket.instances[0]
@@ -1228,6 +1378,52 @@ describe("useWebSocket normalized connections", () => {
       client_message_id: "session-turn-1",
       turn_id: "server-turn-1",
     })
+  })
+
+  it("offers an explicit unbound Session binding on the initial physical connection", async () => {
+    renderHook(() => useWebSocket({
+      connection: sessionConnection({
+        taskBindingMode: "session-subprotocol",
+      }),
+    }))
+
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    expect(MockWebSocket.instances[0].protocols).toEqual([
+      "xagent-session-v1",
+      "xagent-session-token.st_secret",
+      "xagent-session-binding-v1",
+      "xagent-session-task.unbound",
+    ])
+  })
+
+  it("offers the current bound task when establishing a replacement physical connection", async () => {
+    const connection = sessionConnection({
+      taskBindingMode: "session-subprotocol",
+    })
+    const hook = renderHook(
+      ({ taskId }: { taskId: number | undefined }) => useWebSocket({
+        connection,
+        taskId,
+      }),
+      { initialProps: { taskId: undefined as number | undefined } },
+    )
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    expect(MockWebSocket.instances[0].protocols).toContain(
+      "xagent-session-task.unbound",
+    )
+
+    hook.rerender({ taskId: 42 })
+    expect(MockWebSocket.instances).toHaveLength(1)
+    act(() => hook.result.current.disconnect())
+    act(() => hook.result.current.connect())
+
+    expect(MockWebSocket.instances).toHaveLength(2)
+    expect(MockWebSocket.instances[1].protocols).toEqual([
+      "xagent-session-v1",
+      "xagent-session-token.st_secret",
+      "xagent-session-binding-v1",
+      "xagent-session-task.42",
+    ])
   })
 
   it.each([4001, 4003, 1011])(
@@ -2876,6 +3072,131 @@ describe("useWebSocket normalized connections", () => {
       disposition: "not_sent",
     })
     expect(uploadFiles).not.toHaveBeenCalled()
+    expect(socket.send).not.toHaveBeenCalled()
+  })
+
+  it("rejects a coded unsuccessful 2xx batch upload before sending chat", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({
+        success: false,
+        error_code: "upload_too_large",
+        detail: "private proxy detail",
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    )
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 1,
+    }))
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open())
+
+    await expect(result.current.sendChatMessage(
+      "with file",
+      [new File(["data"], "data.txt")],
+    )).rejects.toMatchObject({
+      errorCode: "upload_too_large",
+      message: "File is too large. Please reduce the upload size and try again.",
+      userFacing: true,
+    })
+    expect(socket.send).not.toHaveBeenCalled()
+    fetchMock.mockRestore()
+  })
+
+  it("rejects a malformed oversized upload result before sending chat", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({
+        success: true,
+        files: [
+          { file_id: 123, filename: "bad.txt" },
+          { file_id: "file-2", filename: "second.txt" },
+          { file_id: "file-3", filename: "extra.txt" },
+        ],
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    )
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 1,
+    }))
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open())
+
+    const outcome = result.current.sendChatMessage(
+      "with files",
+      [
+        new File(["one"], "first.txt"),
+        new File(["two"], "second.txt"),
+      ],
+    ).then(
+      () => null,
+      error => error,
+    )
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce())
+    await expect(outcome).resolves.toMatchObject({
+      errorCode: "upload_failed",
+      userFacing: true,
+    })
+    expect(socket.send).not.toHaveBeenCalled()
+    fetchMock.mockRestore()
+  })
+
+  it("rejects an incomplete custom upload result before sending chat", async () => {
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 1,
+      uploadFiles: vi.fn().mockResolvedValue([]),
+    }))
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open())
+
+    await expect(result.current.sendChatMessage(
+      "with file",
+      [new File(["data"], "data.txt")],
+    )).rejects.toMatchObject({
+      errorCode: "upload_failed",
+      userFacing: true,
+    })
+    expect(socket.send).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    {
+      name: "blank",
+      uploadResult: [{ file_id: "   " }, { file_id: "file-2" }],
+    },
+    {
+      name: "duplicate",
+      uploadResult: [{ file_id: "file-1" }, { file_id: " file-1 " }],
+    },
+  ])("rejects $name custom upload identifiers before sending chat", async ({ uploadResult }) => {
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 1,
+      uploadFiles: vi.fn().mockResolvedValue(uploadResult),
+    }))
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open())
+
+    await expect(result.current.sendChatMessage(
+      "with files",
+      [
+        new File(["first"], "first.txt"),
+        new File(["second"], "second.txt"),
+      ],
+    )).rejects.toMatchObject({
+      errorCode: "upload_failed",
+      userFacing: true,
+    })
     expect(socket.send).not.toHaveBeenCalled()
   })
 

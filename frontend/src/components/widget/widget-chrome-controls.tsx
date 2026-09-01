@@ -1,9 +1,9 @@
 "use client"
 
-import React, { useEffect, useRef, useState } from "react"
-import { Loader2, MessageSquarePlus, MoreHorizontal, X } from "lucide-react"
+import React, { useCallback, useEffect, useRef, useState } from "react"
+import { Loader2, Maximize2, MessageSquarePlus, Minimize2, MoreHorizontal, X } from "lucide-react"
 import { useI18n } from "@/contexts/i18n-context"
-import { postToParentWidget } from "@/lib/widget-parent-message"
+import { listenForWidgetHostMessage, postToParentWidget } from "@/lib/widget-parent-message"
 
 // Exported so the standalone share-mode reset button (public-agent-chat-page.tsx)
 // can match this styling instead of drifting with its own duplicate string.
@@ -13,10 +13,11 @@ export const iconButtonClassName =
   + "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
 
 interface WidgetChromeControlsProps {
-  // Undefined hides the "..." menu entirely -- it would otherwise open onto
-  // nothing. Each host page supplies its own already-resolved label/handler
-  // since "new conversation" means something different (and is disabled/
-  // pending differently) in guest vs. Session mode.
+  // Undefined omits the new-conversation menu item -- expand/collapse is
+  // always offered regardless, so the "..." trigger itself always renders.
+  // Each host page supplies its own already-resolved label/handler since
+  // "new conversation" means something different (and is disabled/pending
+  // differently) in guest vs. Session mode.
   newConversation?: {
     label: string
     onClick: () => void
@@ -28,11 +29,33 @@ interface WidgetChromeControlsProps {
     // visible with the menu closed.
     pending?: boolean
   }
+  // Expand/collapse state is owned here (uncontrolled) by default, which is
+  // fine as long as this component's own mount lifetime matches the panel's.
+  // Session mode's header can remount independently of the panel (its
+  // conversation content swaps to an error subtree on reconnect), which would
+  // silently reset this back to false under the panel's back; passing both
+  // props lets that caller lift the state to somewhere that doesn't unmount.
+  expanded?: boolean
+  onExpandedChange?: (expanded: boolean) => void
 }
 
-export function WidgetChromeControls({ newConversation }: WidgetChromeControlsProps) {
+export function WidgetChromeControls({
+  newConversation,
+  expanded: controlledExpanded,
+  onExpandedChange,
+}: WidgetChromeControlsProps) {
   const { t } = useI18n()
   const [isMenuOpen, setIsMenuOpen] = useState(false)
+  const [internalExpanded, setInternalExpanded] = useState(false)
+  const isControlled = controlledExpanded !== undefined
+  const isExpanded = isControlled ? controlledExpanded : internalExpanded
+  const setIsExpanded = useCallback((next: boolean) => {
+    if (isControlled) {
+      onExpandedChange?.(next)
+    } else {
+      setInternalExpanded(next)
+    }
+  }, [isControlled, onExpandedChange])
   const menuRef = useRef<HTMLDivElement>(null)
 
   // This component rendering at all *is* "the iframe has a close control" --
@@ -83,9 +106,31 @@ export function WidgetChromeControls({ newConversation }: WidgetChromeControlsPr
     }
   }, [isMenuOpen])
 
+  useEffect(() => (
+    // Correct the optimistic setIsExpanded(true) below when widget.js's own
+    // mobile guard rejects the widget_expand that caused it -- otherwise the
+    // menu keeps reading "Collapse window" with nothing actually expanded,
+    // and the next click (a no-op collapse from here) needs a second click
+    // after an eventual desktop-width resize to actually expand.
+    listenForWidgetHostMessage("widget_expand_rejected", () => setIsExpanded(false))
+  ), [setIsExpanded])
+
   const handleNewConversation = () => {
     setIsMenuOpen(false)
     newConversation?.onClick()
+  }
+
+  const handleToggleExpand = () => {
+    setIsMenuOpen(false)
+    // Optimistic: widget.js owns the actual panel size and can't confirm
+    // back, but this is the same origin/deployment on both sides of the
+    // postMessage, not an untrusted round-trip -- nothing else can disagree
+    // with this state. The postMessage call is a side effect, so it belongs
+    // here in the click handler, not inside setIsExpanded's updater (React
+    // may invoke that updater more than once, e.g. under StrictMode).
+    const next = !isExpanded
+    setIsExpanded(next)
+    postToParentWidget(next ? "widget_expand" : "widget_collapse")
   }
 
   const handleClose = () => {
@@ -95,29 +140,33 @@ export function WidgetChromeControls({ newConversation }: WidgetChromeControlsPr
 
   return (
     <div className="ml-auto flex items-center gap-1">
-      {newConversation ? (
-        <div ref={menuRef} className="relative">
-          <button
-            type="button"
-            onClick={() => setIsMenuOpen((open) => !open)}
-            disabled={newConversation.pending}
-            title={t("widgetChat.moreOptions")}
-            aria-label={t("widgetChat.moreOptions")}
-            aria-haspopup="menu"
-            aria-expanded={isMenuOpen}
-            className={iconButtonClassName}
+      <div ref={menuRef} className="relative">
+        <button
+          type="button"
+          onClick={() => setIsMenuOpen((open) => !open)}
+          // Sizing (expand/collapse) has no dependency on the conversation
+          // reset, so a pending reset must not block reaching it -- the
+          // reset item already carries its own `disabled` for that action
+          // specifically. The spinner below still surfaces reset-in-flight
+          // status on the trigger itself.
+          title={t("widgetChat.moreOptions")}
+          aria-label={t("widgetChat.moreOptions")}
+          aria-haspopup="menu"
+          aria-expanded={isMenuOpen}
+          className={iconButtonClassName}
+        >
+          {newConversation?.pending ? (
+            <Loader2 className="w-4 h-4 animate-spin" />
+          ) : (
+            <MoreHorizontal className="w-4 h-4" />
+          )}
+        </button>
+        {isMenuOpen ? (
+          <div
+            role="menu"
+            className="absolute right-0 top-full z-20 mt-1 w-max max-w-xs rounded-md border bg-popover py-1 text-popover-foreground shadow-md"
           >
-            {newConversation.pending ? (
-              <Loader2 className="w-4 h-4 animate-spin" />
-            ) : (
-              <MoreHorizontal className="w-4 h-4" />
-            )}
-          </button>
-          {isMenuOpen ? (
-            <div
-              role="menu"
-              className="absolute right-0 top-full z-20 mt-1 w-max max-w-xs rounded-md border bg-popover py-1 text-popover-foreground shadow-md"
-            >
+            {newConversation ? (
               <button
                 type="button"
                 role="menuitem"
@@ -128,10 +177,23 @@ export function WidgetChromeControls({ newConversation }: WidgetChromeControlsPr
                 <MessageSquarePlus className="w-4 h-4 shrink-0" />
                 {newConversation.label}
               </button>
-            </div>
-          ) : null}
-        </div>
-      ) : null}
+            ) : null}
+            <button
+              type="button"
+              role="menuitem"
+              onClick={handleToggleExpand}
+              className="flex w-full items-center gap-2 whitespace-nowrap px-3 py-2 text-left text-sm hover:bg-muted/50 transition-colors focus-visible:bg-muted/50 focus-visible:outline-none"
+            >
+              {isExpanded ? (
+                <Minimize2 className="w-4 h-4 shrink-0" data-icon="collapse" />
+              ) : (
+                <Maximize2 className="w-4 h-4 shrink-0" data-icon="expand" />
+              )}
+              {isExpanded ? t("widgetChat.collapseWindow") : t("widgetChat.expandWindow")}
+            </button>
+          </div>
+        ) : null}
+      </div>
       <button
         type="button"
         onClick={handleClose}

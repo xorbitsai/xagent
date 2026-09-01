@@ -86,6 +86,10 @@ from .external_task_cancel import (
 )
 from .file_turn import bind_turn_files_no_commit
 from .hot_path_cache import invalidate_task_cache
+from .mcp_runtime import (
+    MCPBuiltinOAuthActorPolicy,
+    MCPBuiltinOAuthActorPolicyRequiredError,
+)
 from .task_execution_controller import (
     TaskControlState,
     apply_task_control_transition,
@@ -107,6 +111,7 @@ from .task_lease_service import (
     stop_task_lease_heartbeat,
     validate_preacquired_task_lease_isolated,
 )
+from .task_runtime import mcp_runtime_authorization_policy_required
 from .task_setup_snapshot import load_task_setup_snapshot_sync
 
 logger = logging.getLogger(__name__)
@@ -310,6 +315,16 @@ class TaskTurnOrchestrator:
         settlement.  Cross-worker duplicates are rejected by lease acquisition.
         """
         async with task_execution_controller.command(task_id):
+            actor_marked = await run_db_io_cancellation_safe(
+                lambda: _task_requires_actor_policy_sync(
+                    task_id,
+                    task_owner_user_id,
+                )
+            )
+            if actor_marked:
+                raise MCPBuiltinOAuthActorPolicyRequiredError(
+                    f"Task {task_id} is actor-marked; legacy execution is unsupported"
+                )
             _refuse_if_bg_inflight(task_id)
             background_task = _schedule_bg(
                 task_id=task_id,
@@ -508,6 +523,7 @@ class TaskTurnOrchestrator:
                 task_owner_user_id=task_owner_user_id,
                 payload=payload,
                 claimed=claimed,
+                kind=kind,
                 force_fresh=force_fresh,
                 context=context,
             )
@@ -583,7 +599,33 @@ class TaskTurnOrchestrator:
         force_fresh: bool = False,
         context: Optional[Dict[str, Any]] = None,
     ) -> TurnStarted:
-        """Schedule a turn already committed by its transaction owner."""
+        """Schedule an ordinary turn already committed by its domain owner."""
+
+        return await TaskTurnOrchestrator._schedule_claimed_turn(
+            task_id=task_id,
+            task_owner_user_id=task_owner_user_id,
+            actor_user_id=actor_user_id,
+            payload=payload,
+            claimed=claimed,
+            kind=kind,
+            force_fresh=force_fresh,
+            context=context,
+        )
+
+    @staticmethod
+    async def _schedule_claimed_turn(
+        *,
+        task_id: int,
+        task_owner_user_id: int,
+        actor_user_id: int | None,
+        payload: TaskTurnPayload,
+        claimed: "_ClaimedTurn",
+        kind: TurnKind,
+        force_fresh: bool = False,
+        context: Optional[Dict[str, Any]] = None,
+        mcp_runtime_authorization_policy: MCPBuiltinOAuthActorPolicy | None = None,
+    ) -> TurnStarted:
+        """Shared scheduler with actor context reserved for trusted CREATE."""
 
         async def _schedule() -> TurnStarted:
             # The no-commit claim delegates commit to its domain owner, so
@@ -598,8 +640,10 @@ class TaskTurnOrchestrator:
                     task_owner_user_id=task_owner_user_id,
                     payload=payload,
                     claimed=claimed,
+                    kind=kind,
                     force_fresh=force_fresh,
                     context=context,
+                    mcp_runtime_authorization_policy=(mcp_runtime_authorization_policy),
                 )
                 return _turn_started_snapshot(
                     task_id=task_id,
@@ -625,10 +669,11 @@ class TaskTurnOrchestrator:
         payload: TaskTurnPayload,
         claimed: "_ClaimedTurn",
         context: Optional[Dict[str, Any]] = None,
+        mcp_runtime_authorization_policy: MCPBuiltinOAuthActorPolicy | None = None,
     ) -> TurnStarted:
         """Compatibility wrapper for an already committed CREATE claim."""
 
-        return await TaskTurnOrchestrator.schedule_claimed_turn(
+        return await TaskTurnOrchestrator._schedule_claimed_turn(
             task_id=task_id,
             task_owner_user_id=task_owner_user_id,
             actor_user_id=actor_user_id,
@@ -636,6 +681,7 @@ class TaskTurnOrchestrator:
             claimed=claimed,
             kind=TurnKind.CREATE,
             context=context,
+            mcp_runtime_authorization_policy=mcp_runtime_authorization_policy,
         )
 
 
@@ -665,12 +711,26 @@ async def _schedule_committed_turn(
     task_owner_user_id: int,
     payload: TaskTurnPayload,
     claimed: _ClaimedTurn,
+    kind: TurnKind,
     force_fresh: bool,
     context: Optional[Dict[str, Any]],
+    mcp_runtime_authorization_policy: MCPBuiltinOAuthActorPolicy | None = None,
 ) -> "asyncio.Task[None]":
     """Own scheduling and compensation after a turn claim has committed."""
 
     try:
+        actor_marked = mcp_runtime_authorization_policy_required(claimed.agent_config)
+        if actor_marked and (
+            kind is not TurnKind.CREATE or mcp_runtime_authorization_policy is None
+        ):
+            raise MCPBuiltinOAuthActorPolicyRequiredError(
+                f"Task {task_id} is actor-marked; only trusted fresh direct "
+                "execution is supported"
+            )
+        if mcp_runtime_authorization_policy is not None and not actor_marked:
+            raise MCPBuiltinOAuthActorPolicyRequiredError(
+                f"Task {task_id} was not persisted as actor-marked"
+            )
         _refuse_if_bg_inflight(task_id)
         handle = _schedule_bg(
             task_id=task_id,
@@ -682,6 +742,7 @@ async def _schedule_committed_turn(
             force_fresh=force_fresh,
             context=context,
             before_message_id=claimed.before_message_id,
+            mcp_runtime_authorization_policy=mcp_runtime_authorization_policy,
         )
     except BaseException as schedule_error:
         # Schedule failed after the claim committed -> force FAILED so the row
@@ -971,6 +1032,30 @@ def invalidate_task_cache_best_effort(task_id: int) -> None:
         )
 
 
+def _task_requires_actor_policy(
+    db: Session,
+    task_id: int,
+    task_owner_user_id: int,
+) -> bool:
+    row = (
+        db.query(Task.agent_config)
+        .filter(Task.id == task_id, Task.user_id == task_owner_user_id)
+        .first()
+    )
+    return bool(row is not None and mcp_runtime_authorization_policy_required(row[0]))
+
+
+def _task_requires_actor_policy_sync(
+    task_id: int,
+    task_owner_user_id: int,
+) -> bool:
+    from ..models.database import get_session_local
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        return _task_requires_actor_policy(db, task_id, task_owner_user_id)
+
+
 def _claim_turn_no_commit(
     db: Session,
     task_id: int,
@@ -980,6 +1065,13 @@ def _claim_turn_no_commit(
     kind: TurnKind,
 ) -> _ClaimedTurn:
     """Stage one atomic turn claim; the caller owns commit and rollback."""
+
+    if kind == TurnKind.APPEND and _task_requires_actor_policy(
+        db,
+        task_id,
+        task_owner_user_id,
+    ):
+        raise TaskTurnError("actor_task_reuse_unsupported")
 
     if kind == TurnKind.CREATE:
         status_filter = Task.status == TaskStatus.PENDING
@@ -1654,6 +1746,7 @@ def _schedule_bg(
     force_fresh: bool,
     context: Optional[Dict[str, Any]],
     before_message_id: Optional[int] = None,
+    mcp_runtime_authorization_policy: MCPBuiltinOAuthActorPolicy | None = None,
 ) -> "asyncio.Task[None]":
     """Lease-aware bg scheduler.
 
@@ -1804,6 +1897,9 @@ def _schedule_bg(
                         expected_run_id=lease.run_id,
                         task_lease=lease,
                         resolved_execution_scope=scope,
+                        mcp_runtime_authorization_policy=(
+                            mcp_runtime_authorization_policy
+                        ),
                     )
 
                 await run_while_task_lease_owned(
@@ -2010,6 +2106,25 @@ def _schedule_bg(
                     turn_id,
                     exc_info=True,
                 )
+            if mcp_runtime_authorization_policy is not None:
+                try:
+                    await run_db_io_cancellation_safe(
+                        lambda: _get_agent_manager().remove_agent(
+                            task_id,
+                            task_owner_user_id,
+                            expected_run_id=(
+                                task_lease.run_id if task_lease is not None else run_id
+                            ),
+                        )
+                    )
+                except asyncio.CancelledError as exc:
+                    cleanup_cancellation = cleanup_cancellation or exc
+                except Exception:
+                    logger.warning(
+                        "actor runtime cleanup failed for task %s",
+                        task_id,
+                        exc_info=True,
+                    )
             if cleanup_cancellation is not None:
                 raise cleanup_cancellation
 

@@ -36,7 +36,7 @@ from ...core.utils.encryption import decrypt_value, encrypt_value
 from ..auth_dependencies import get_current_user, is_admin_user
 from ..mcp_apps import (
     get_all_mcp_apps,
-    get_app_by_name,
+    get_app_for_mcp_server,
     restrict_to_app_scoped_oauth_grant,
 )
 from ..models.custom_api import CustomApi, UserCustomApi
@@ -1553,7 +1553,10 @@ def _enrich_oauth_server_info(
     if server.transport != "oauth":
         return None, None, None
 
-    app_info = get_app_by_name(db, str(server.name))
+    # Stable identity, not the mutable display name: an id-named row (the
+    # catalog-connect convention) resolved to nothing here, so its app_id,
+    # provider and connected account were all reported as absent.
+    app_info = get_app_for_mcp_server(db, server)
     if not app_info:
         return None, None, None
 
@@ -3471,10 +3474,20 @@ async def delete_mcp_server(
 
         # If it's an OAuth server, also delete the corresponding OAuth tokens
         if server.transport == "oauth":
-            from ..mcp_apps import get_app_by_name
-
-            # Find the corresponding app_id and provider
-            app_info = get_app_by_name(db, str(server.name))
+            # Resolve by stable identity rather than by ``server.name``.
+            # ``PublicMCPApp.name`` is mutable and carries no uniqueness
+            # constraint, so a name lookup here decided whose credentials to
+            # delete using a value an admin rename can change out from under an
+            # in-flight disconnect -- and it resolved nothing at all for rows
+            # named after the app id, silently skipping the cleanup below and
+            # leaving usable tokens behind after a successful teardown.
+            # ``get_app_for_mcp_server`` prefers the row's own ``auth.app_id``
+            # stamp; an unstamped row resolves only when the id and display
+            # name namespaces agree on one owner, and answers ``None`` when
+            # they do not -- which lands on the ``if app_info:`` guard below
+            # and leaves the credentials in place rather than deleting some
+            # other app's.
+            app_info = get_app_for_mcp_server(db, server)
             if app_info:
                 provider = app_info.get("provider")
                 app_id = app_info.get("id")
@@ -3503,8 +3516,6 @@ async def delete_mcp_server(
                 # that row anymore — delete it too rather than leaving an
                 # inert orphan token behind.
                 if provider and provider not in providers_to_delete:
-                    from ..mcp_apps import get_app_for_mcp_server
-
                     other_servers = (
                         db.query(MCPServer)
                         .join(

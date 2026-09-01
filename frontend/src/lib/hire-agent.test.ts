@@ -239,4 +239,63 @@ describe("hireAgentFromTemplate", () => {
       })
     ).rejects.toThrow("Malformed task create response");
   });
+
+  // Pins a PR review finding: resolve and task/create are 2 independent
+  // network calls, each authenticated with whatever session apiRequest
+  // finds live when IT fires - not one identity pinned at the start of
+  // this function. A caller whose own identity-swap guard only checks
+  // before invoking this function can't otherwise stop task/create running
+  // under a DIFFERENT identity than the one that just resolved the agent,
+  // if a swap lands in the gap between the two calls.
+  it("aborts before task/create when abortIfIdentityChanged returns true after resolve", async () => {
+    resolveAgentForTemplateMock.mockResolvedValueOnce({
+      agent: { id: 42, name: "Leo" },
+      created: true,
+    });
+
+    await expect(
+      hireAgentFromTemplate({
+        templateId: "sales-email-lead-response-agent",
+        persona: LEO_PERSONA,
+        strings: STRINGS,
+        abortIfIdentityChanged: () => true,
+      })
+    ).rejects.toThrow("Aborted: authenticated identity changed mid-hire");
+
+    expect(apiRequestMock).not.toHaveBeenCalled();
+  });
+
+  it("still creates the task when abortIfIdentityChanged returns false (identity unchanged)", async () => {
+    resolveAgentForTemplateMock.mockResolvedValueOnce({
+      agent: { id: 42, name: "Leo" },
+      created: true,
+    });
+    apiRequestMock.mockResolvedValueOnce(jsonResponse({ task_id: 7 }));
+
+    const result = await hireAgentFromTemplate({
+      templateId: "sales-email-lead-response-agent",
+      persona: LEO_PERSONA,
+      strings: STRINGS,
+      abortIfIdentityChanged: () => false,
+    });
+
+    expect(result).toEqual({ taskId: 7, agentId: 42, created: true });
+    expect(apiRequestMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not require abortIfIdentityChanged at all (other callers, e.g. the templates marketplace, don't pass it)", async () => {
+    resolveAgentForTemplateMock.mockResolvedValueOnce({
+      agent: { id: 42, name: "Leo" },
+      created: true,
+    });
+    apiRequestMock.mockResolvedValueOnce(jsonResponse({ task_id: 7 }));
+
+    await expect(
+      hireAgentFromTemplate({
+        templateId: "sales-email-lead-response-agent",
+        persona: LEO_PERSONA,
+        strings: STRINGS,
+      })
+    ).resolves.toEqual({ taskId: 7, agentId: 42, created: true });
+  });
 });

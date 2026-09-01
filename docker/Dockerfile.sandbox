@@ -29,6 +29,13 @@ LABEL description="Full sandbox image with all tools"
 
 COPY --from=uv /uv /uvx /usr/local/bin/
 
+# Fixed npm/npx cache location, set before anything in this stage might
+# invoke npx -- npm's default path is keyed to $HOME, which varies by
+# exec user. Doesn't by itself guarantee the warmed cache gets used;
+# see the npx warm-up comment below (xorbitsai/xagent#1869).
+ENV NPM_CONFIG_CACHE=/opt/npm-cache
+RUN mkdir -p "$NPM_CONFIG_CACHE" && chmod 1777 "$NPM_CONFIG_CACHE"
+
 ######################## python 3.11 install (apt)
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -44,6 +51,84 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && ln -sf /usr/bin/pip3 /usr/local/bin/pip \
     && rm -rf /var/lib/apt/lists/* \
     && python --version && pip --version
+
+######################## browser install (apt): Chrome on amd64, Chromium on arm64
+#
+# Browser for the built-in "chrome" MCP connector (chrome-devtools-mcp).
+# Dockerfile.backend's own INSTALL_CHROME block only covers the non-
+# sandboxed path; should_sandbox_mcp_connection() routes every npx/uvx
+# connector into *this* image once a sandbox is configured, so it needs
+# the same browser or the connector fails with "Could not find Google
+# Chrome executable". --build-arg INSTALL_CHROME=false skips it (and the
+# npx cache below) for deployments that never enable the connector.
+#
+# Security posture matches Dockerfile.backend's, not a new risk: this
+# container always execs as root (docker_sandbox.py) and the connector's
+# launch_config passes --no-sandbox/--disable-setuid-sandbox, so Chrome
+# runs as UID 0 with its own sandbox disabled. Accepted only because the
+# connector stays is_visible_in_connector: false pending the same
+# security review Dockerfile.backend's comment tracks.
+ARG INSTALL_CHROME=true
+# Resolves "stable" to exactly /opt/google/chrome/chrome on Linux -- see
+# Dockerfile.backend's block for the per-architecture rationale (no
+# arm64 Chrome from Google; Chromium is CDP-compatible and gets
+# symlinked to the same path so both images share one resolver path).
+#
+# fonts-liberation + fonts-noto-cjk: neither Debian's chromium package
+# (fonts-liberation is only a Recommends, skipped by
+# --no-install-recommends) nor node:22-slim ships any font, and headless
+# Chrome/Chromium with none installed silently renders blank/tofu text
+# instead of failing the build. fonts-noto-cjk matches what
+# Dockerfile.backend's base stage already installs for this connector.
+RUN if [ "$INSTALL_CHROME" != "true" ]; then \
+        echo "INSTALL_CHROME=$INSTALL_CHROME -- skipping Chrome/Chromium install"; \
+    else \
+        if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
+            apt-get update \
+            && apt-get install -y --no-install-recommends -o Acquire::Retries=5 curl gnupg \
+            && curl -fsSL https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg \
+            && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] https://dl.google.com/linux/chrome/deb/ stable main" \
+                > /etc/apt/sources.list.d/google-chrome.list \
+            && apt-get update \
+            && apt-get install -y --no-install-recommends -o Acquire::Retries=5 \
+                google-chrome-stable fonts-liberation fonts-noto-cjk \
+            && apt-get purge -y --auto-remove -o APT::AutoRemove::RecommendsImportant=false curl gnupg \
+            && rm -rf /var/lib/apt/lists/* /etc/apt/sources.list.d/google-chrome.list /usr/share/keyrings/google-chrome.gpg; \
+        elif [ "$(dpkg --print-architecture)" = "arm64" ]; then \
+            apt-get update \
+            && apt-get install -y --no-install-recommends -o Acquire::Retries=5 \
+                chromium fonts-liberation fonts-noto-cjk \
+            && rm -rf /var/lib/apt/lists/* \
+            && mkdir -p /opt/google/chrome \
+            && ln -s /usr/bin/chromium /opt/google/chrome/chrome; \
+        else \
+            echo "ERROR: unsupported architecture $(dpkg --print-architecture) for the chrome connector -- add an install branch, or build with --build-arg INSTALL_CHROME=false" >&2; \
+            exit 1; \
+        fi; \
+        [ -e /opt/google/chrome/chrome ] || { echo "ERROR: the Chrome/Chromium install did not produce /opt/google/chrome/chrome -- update the chrome-devtools-mcp resolver path handling" >&2; exit 1; }; \
+    fi
+
+# Warm the npx cache for the version pinned in builtin_mcp_registry.py's
+# launch_config, mirroring Dockerfile.backend's identical step, to skip
+# the npm registry on launch -- when the cache actually gets consulted,
+# which today it doesn't (xorbitsai/xagent#1869: the MCP stdio launcher
+# every connector goes through only forwards a fixed env allowlist to
+# the spawned process, stripping NPM_CONFIG_CACHE; also affects
+# Dockerfile.backend's identical warm-up). Harmless either way -- npx
+# still falls back to a normal fetch on a cache miss. #1869 also covers
+# Boxlite (this image's other sandbox backend) execing as the non-root
+# `sandbox` user by default, relevant once the env gap above is closed:
+# it could read an already-warmed cache but not write a new entry into
+# one root-owned and world-*readable*-only (see umask below).
+#
+# `--help` exercises resolution without starting Chrome, so this needs
+# no display/GPU setup at build time. umask 0022, not 0000: only
+# cross-user *read* access is needed, so a laxer mask would needlessly
+# leave the cache tree writable by any future lower-privileged process
+# in the container.
+RUN if [ "$INSTALL_CHROME" = "true" ]; then \
+        umask 0022 && npx -y --prefer-offline chrome-devtools-mcp@1.6.0 --help > /dev/null; \
+    fi
 
 ######################## tools dependencies
 

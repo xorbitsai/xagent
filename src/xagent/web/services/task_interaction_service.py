@@ -127,6 +127,7 @@ from .task_command_transport import (
     _canonical_payload,
     _matches_existing,
     _normalize_command_id,
+    _resolve_actor_subject,
     classify_task_command_conflict,
     notify_task_command_dispatcher,
     stage_task_command,
@@ -2394,6 +2395,7 @@ def _verify_respond_durable_graph(
     command_kind: TaskCommandKind,
     command_payload: dict[str, Any],
     actor_user_id: int | None,
+    actor_subject: str | None,
 ) -> InteractionResponseReceipt | None:
     """Check the complete accepted answer graph in a fresh, owned Session,
     up to three times with a short sleep between attempts. Same retry shape
@@ -2467,6 +2469,7 @@ def _verify_respond_durable_graph(
                     if len(commands) == 1 and _matches_existing(
                         commands[0],
                         actor_user_id=actor_user_id,
+                        actor_subject=actor_subject,
                         kind=command_kind,
                         payload=command_payload,
                     ):
@@ -2728,8 +2731,8 @@ def respond(
        transaction -- see ``classify_task_command_conflict``'s own
        docstring for why a savepoint rollback satisfies the
        post-rollback-state precondition it documents) and asks one
-       question about the row that won: does it carry this call's own
-       ``actor_user_id``, kind and canonical payload? The
+       question about the row that won: does it carry this call's stable
+       actor subject, kind and canonical payload? The
        ``IntegrityError`` door answers it through
        ``classify_task_command_conflict``, the ``created=False`` door
        through the ``payload_matches`` ``stage_task_command`` already
@@ -2891,6 +2894,7 @@ def respond(
         )
         canonical_submitted_values = _canonical_payload(envelope.values)
         actor_user_id = principal.user_id
+        actor_subject = _resolve_actor_subject(db, actor_user_id)
 
         # Runs before anchor resolution below, not after it. Answering
         # clears ``active_slot``, and the checkpoint retention pruner only
@@ -2918,6 +2922,7 @@ def respond(
             if _matches_existing(
                 existing_command,
                 actor_user_id=actor_user_id,
+                actor_subject=actor_subject,
                 kind=TaskCommandKind.RESUME,
                 payload=command_payload,
             ):
@@ -3041,6 +3046,7 @@ def respond(
                     if _matches_existing(
                         fresh_command,
                         actor_user_id=actor_user_id,
+                        actor_subject=actor_subject,
                         kind=TaskCommandKind.RESUME,
                         payload=command_payload,
                     ):
@@ -3282,6 +3288,7 @@ def respond(
                     command_kind=TaskCommandKind.RESUME,
                     command_payload=command_payload,
                     actor_user_id=actor_user_id,
+                    actor_subject=actor_subject,
                 )
                 if receipt is not None:
                     return RespondReplayed(receipt=receipt)
@@ -3335,6 +3342,7 @@ def respond(
                 command_kind=TaskCommandKind.RESUME,
                 command_payload=command_payload,
                 actor_user_id=actor_user_id,
+                actor_subject=actor_subject,
             )
             if receipt is not None:
                 _notify_dispatcher_best_effort(

@@ -193,6 +193,7 @@ describe("SessionAgentChatPage", () => {
     // without this.
     expect(screen.queryByRole("button", { name: "widgetChat.close" })).not.toBeInTheDocument()
     expect(app.provider?.token).toBeUndefined()
+    expect(app.provider?.transport?.legacyErrorProse).toBe("untrusted")
     expect(app.provider?.transport?.session).toEqual({
       connection: null,
       onConnectionClose: bridge.value.handleConnectionClose,
@@ -236,6 +237,7 @@ describe("SessionAgentChatPage", () => {
       ],
       expectedProtocol: "xagent-session-v1",
       chatTaskIdMode: "omit",
+      taskBindingMode: "session-subprotocol",
       credentialOwner: { kind: "external" },
     })
     expect(app.provider?.transport?.session?.onConnectionFailure).toBe(
@@ -316,12 +318,9 @@ describe("SessionAgentChatPage", () => {
       { mode: "balanced" },
       [],
     )
-    // No conversation yet — nothing to reset, so the "..." menu (which would
-    // only ever hold the new-conversation action) doesn't render either. (Not
-    // asserting the menuitem itself is absent here: the menu was never
-    // opened, so that check can't fail regardless of whether this logic
-    // works — the trigger's own absence, below, is what actually proves it.)
-    expect(screen.queryByRole("button", { name: "widgetChat.moreOptions" })).toBeNull()
+    // No conversation yet — nothing to reset, but the "..." trigger still
+    // renders since expand/collapse is always offered regardless.
+    expect(screen.getByRole("button", { name: "widgetChat.moreOptions" })).toBeInTheDocument()
     expect(screen.getByRole("button", { name: "widgetChat.close" })).toBeInTheDocument()
   })
 
@@ -373,10 +372,11 @@ describe("SessionAgentChatPage", () => {
     app.isConversationResetPending = true
     rerender(<SessionAgentChatPage />)
 
-    expect(trigger).toBeDisabled()
     expect(screen.queryByRole("menu")).toBeNull()
-    // Not just "disabled" -- the whole point of this prop is a visible
-    // in-progress indicator on the trigger once the menu itself has closed.
+    // The spinner is status feedback, not a lockout -- sizing has no
+    // dependency on the conversation reset, so the trigger itself must stay
+    // reachable even while pending.
+    expect(trigger).not.toBeDisabled()
     expect(trigger.querySelector("svg.animate-spin")).not.toBeNull()
   })
 
@@ -459,6 +459,45 @@ describe("SessionAgentChatPage", () => {
     expect(screen.queryByRole("button", { name: "widgetChat.close" })).not.toBeInTheDocument()
     expect(screen.queryByTestId("session-conversation-panel")).not.toBeInTheDocument()
     expect(app.provider?.transport?.session?.connection).toBeNull()
+  })
+
+  it("keeps an accepted expansion across a degraded/active remount instead of resetting to Expand", () => {
+    // WidgetChromeControls is torn down and rebuilt across this transition
+    // (the degraded branch renders a completely different subtree with no
+    // header at all), so its own isExpanded state can't survive it -- this
+    // is why SessionAgentChatPage lifts and passes it down as a controlled
+    // prop instead of leaving it as the component's internal useState.
+    const postMessageSpy = vi.fn()
+    vi.stubGlobal("parent", { postMessage: postMessageSpy })
+    setBridge("active", activeSession())
+    app.state.taskId = 71
+    app.isConnected = true
+
+    const { rerender } = render(<SessionAgentChatPage />)
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+    fireEvent.click(screen.getByRole("menuitem", { name: "widgetChat.expandWindow" }))
+    expect(postMessageSpy).toHaveBeenCalledWith(
+      { xagent: true, v: 1, type: "widget_expand" },
+      "*",
+    )
+
+    setBridge("degraded", null)
+    rerender(<SessionAgentChatPage />)
+    expect(screen.getByRole("heading", {
+      name: "widgetSession.unavailable.title",
+    })).toBeInTheDocument()
+
+    setBridge("active", activeSession())
+    app.state.taskId = 71
+    rerender(<SessionAgentChatPage />)
+
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+    expect(screen.getByRole("menuitem", { name: "widgetChat.collapseWindow" })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("menuitem", { name: "widgetChat.collapseWindow" }))
+    expect(postMessageSpy).toHaveBeenCalledWith(
+      { xagent: true, v: 1, type: "widget_collapse" },
+      "*",
+    )
   })
 
   it.each([

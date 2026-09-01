@@ -23,22 +23,9 @@ PRODUCERS: dict[str, int | None] = {
     "send_message_delivery": None,  # keyword-only
 }
 
-# The one deliberate exception: agent RuntimeError text is passed through to
-# the INITIATING SENDER - the rejection ack and the personal error bubble.
-# Narrowing that wording is the product decision tracked in #1479.
-#
-# The broadcast half of the passthrough is closed (maintainer scope ruling on
-# #1514): the task-wide broadcast reaches every connection under the task_id,
-# anonymous widget and share visitors included, and DurableStorageOperation-
-# Error subclasses RuntimeError with tenant-scope text in its message, so
-# broadcasts carry CLIENT_SAFE_TASK_FAILURE instead - pinned by the two
-# audience-boundary tests at the end of this file. Still #1479: whether the
-# sender copy should also be narrowed when the initiator is an anonymous
-# public connection.
-#
-# Anchored to the function and the exception handler that owns the expression.
-# The raw wording is the deliberate #1479 RuntimeError contract; the same text
-# in a validation or generic-exception branch is not curated and must fail.
+# Issue #1479 removes the last deliberate RuntimeError passthroughs. Keep the
+# typed set in the guard so a reintroduced exception interpolation cannot earn
+# an allowance accidentally.
 
 
 class _RawMessageAllowance(NamedTuple):
@@ -47,29 +34,7 @@ class _RawMessageAllowance(NamedTuple):
     expression: str
 
 
-ALLOWED_RAW_MESSAGES = {
-    _RawMessageAllowance(
-        "_handle_chat_message_unserialized",
-        "RuntimeError",
-        "f'Runtime error: {str(e)}'",
-    ),
-    _RawMessageAllowance(
-        "handle_execute_task", "RuntimeError", "f'Runtime error: {str(e)}'"
-    ),
-    _RawMessageAllowance(
-        "handle_intervention", "RuntimeError", "f'Runtime error: {str(e)}'"
-    ),
-    _RawMessageAllowance(
-        "_handle_pause_task_unserialized",
-        "RuntimeError",
-        "f'Runtime error: {str(e)}'",
-    ),
-    _RawMessageAllowance(
-        "_handle_resume_task_unserialized",
-        "RuntimeError",
-        "f'Runtime error: {str(e)}'",
-    ),
-}
+ALLOWED_RAW_MESSAGES: set[_RawMessageAllowance] = set()
 
 
 def _parents(tree: ast.Module) -> dict[ast.AST, ast.AST]:
@@ -122,13 +87,17 @@ DICT_ERROR_PAYLOAD_BUILDERS = {
 
 # The only functions allowed to mint client-visible text from an exception.
 SAFE_MESSAGE_BUILDERS = {
+    "client_error_message",
     "client_safe_error_message",
     "client_safe_task_command_failure",
 }
 SAFE_MESSAGE_CONSTANTS = {
+    "CLIENT_SAFE_GUIDANCE_IN_PROGRESS",
     "CLIENT_SAFE_TASK_FAILURE",
     "CLIENT_SAFE_VALIDATION_ERROR",
 }
+
+_CLIENT_ERROR_MESSAGE_IMPORT = (2, "services.client_error_messages")
 
 
 def _unwrap_serializer(expr: ast.expr, parents: dict[ast.AST, ast.AST]) -> ast.expr:
@@ -1030,6 +999,40 @@ def _is_unshadowed_module_name(
     return True
 
 
+def _is_client_error_contract_import(
+    node: ast.Name,
+    parents: dict[ast.AST, ast.AST],
+) -> bool:
+    """Trust only the exact client-error contract import used by WebSocket."""
+
+    scopes = _enclosing_functions(node, parents)
+    if (
+        _is_comprehension_binding(node, node.id, parents)
+        or _is_parameter(scopes, node.id)
+        or any(_local_assignments([scope], node.id) for scope in scopes)
+    ):
+        return False
+    module: ast.AST = node
+    while module in parents:
+        module = parents[module]
+    bindings = (
+        _module_bindings(module, node.id) if isinstance(module, ast.Module) else []
+    )
+    if len(bindings) != 1 or not isinstance(bindings[0], ast.ImportFrom):
+        return False
+    binding = bindings[0]
+    expected_level, expected_module = _CLIENT_ERROR_MESSAGE_IMPORT
+    imported_names = [
+        alias.name for alias in binding.names if (alias.asname or alias.name) == node.id
+    ]
+    return (
+        parents.get(binding) is module
+        and binding.level == expected_level
+        and binding.module == expected_module
+        and imported_names == [node.id]
+    )
+
+
 def _is_direct_module_binding(
     binding: ast.AST,
     module: ast.Module,
@@ -1161,6 +1164,10 @@ def _is_client_safe(
     ):
         return True
     if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Name):
+        if expr.func.id == "client_error_message" and _is_client_error_contract_import(
+            expr.func, parents
+        ):
+            return True
         if expr.func.id == "client_safe_error_message" and _is_unshadowed_module_name(
             expr.func, parents, ast.FunctionDef
         ):

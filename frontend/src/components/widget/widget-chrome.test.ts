@@ -41,12 +41,36 @@ function fromIframe(type: string) {
   }))
 }
 
-describe("widget close chrome", () => {
+function styleText() {
+  return document.head.querySelector("style")!.innerHTML
+}
+
+// Slices from the desktop-scoped @media marker up to the next @media marker
+// (the mobile block that follows it) -- narrow enough that a rule can't leak
+// in from a later, unrelated block the way slicing to end-of-string would.
+function expandedBlock() {
+  const text = styleText()
+  const start = text.indexOf("@media not all and (max-width: 480px)")
+  if (start === -1) throw new Error("expanded media query block not found in generated <style>")
+  const end = text.indexOf("@media", start + 1)
+  return end === -1 ? text.slice(start) : text.slice(start, end)
+}
+
+function mobileBlock() {
+  const text = styleText()
+  const start = text.indexOf("@media (max-width: 480px)")
+  if (start === -1) throw new Error("mobile media query block not found in generated <style>")
+  return text.slice(start)
+}
+
+describe("widget chrome", () => {
   let currentScriptDescriptor: PropertyDescriptor | undefined
+  let originalInnerWidth: number
   const fetchMock = vi.fn()
 
   beforeEach(() => {
     currentScriptDescriptor = Object.getOwnPropertyDescriptor(document, "currentScript")
+    originalInnerWidth = window.innerWidth
     document.head.innerHTML = ""
     document.body.innerHTML = ""
     localStorage.clear()
@@ -60,6 +84,7 @@ describe("widget close chrome", () => {
   })
 
   afterEach(async () => {
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: originalInnerWidth })
     for (const container of document.querySelectorAll(".xagent-widget-container")) {
       container.remove()
     }
@@ -79,14 +104,17 @@ describe("widget close chrome", () => {
     vi.restoreAllMocks()
   })
 
-  it("keeps the widget_close message type literal in sync with the host script", () => {
+  it("keeps every WidgetParentMessageType literal in sync with the host script", () => {
     // widget.js is a hand-authored static asset with no build-time import
     // from TS source, so nothing else ties these two literals together --
-    // a rename on one side without the other would silently break the close
-    // button (a same-origin, same-source, correctly-enveloped message the
-    // host would now just ignore) with no compiler error to catch it.
-    const messageType: WidgetParentMessageType = "widget_close"
-    expect(widgetScript).toContain(`data.type === '${messageType}'`)
+    // a rename on one side without the other would silently break the
+    // corresponding control (a same-origin, same-source, correctly-enveloped
+    // message the host would now just ignore) with no compiler error to
+    // catch it.
+    const messageTypes: WidgetParentMessageType[] = ["widget_close", "widget_expand", "widget_collapse"]
+    for (const messageType of messageTypes) {
+      expect(widgetScript).toContain(`data.type === '${messageType}'`)
+    }
   })
 
   it("keeps the chrome-readiness message type literals in sync with the host script", () => {
@@ -236,6 +264,153 @@ describe("widget close chrome", () => {
     fromIframe("widget_minimize")
 
     expect(panelEl()).toHaveClass("open")
+  })
+
+  it("expands the panel when the iframe posts widget_expand", () => {
+    runWidget()
+    fabEl()?.click()
+
+    fromIframe("widget_expand")
+
+    expect(panelEl()).toHaveClass("expanded")
+  })
+
+  it("tells the iframe to correct itself when the mobile guard rejects widget_expand", () => {
+    // Without this, the iframe's own optimistic setIsExpanded(true) is never
+    // corrected: the menu keeps reading "Collapse window" with nothing
+    // actually expanded, and the visitor's next click (a no-op collapse from
+    // the iframe's perspective) needs a second click after an eventual
+    // desktop-width resize to actually expand.
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 400 })
+    runWidget()
+    fabEl()?.click()
+    const postToIframe = vi.spyOn(iframeEl()!.contentWindow!, "postMessage")
+
+    fromIframe("widget_expand")
+
+    expect(panelEl()).not.toHaveClass("expanded")
+    expect(postToIframe).toHaveBeenCalledWith(
+      { xagent: true, v: 1, type: "widget_expand_rejected" },
+      HOST,
+    )
+  })
+
+  it("does not tell the iframe to correct itself when widget_expand actually succeeds", () => {
+    runWidget()
+    fabEl()?.click()
+    const postToIframe = vi.spyOn(iframeEl()!.contentWindow!, "postMessage")
+
+    fromIframe("widget_expand")
+
+    expect(panelEl()).toHaveClass("expanded")
+    expect(postToIframe).not.toHaveBeenCalled()
+  })
+
+  it("keeps the .expanded rule (and its resize-handle override) scoped above the mobile breakpoint", () => {
+    // jsdom never evaluates @media against getComputedStyle (confirmed
+    // empirically), so this asserts against the generated CSS text instead --
+    // the same pattern the sibling widget-bootstrap.test.ts file already uses
+    // for the mobile block. Without this, a future edit that moves .expanded
+    // into the mobile block, or duplicates it there, would pass every other
+    // test here while silently breaking "can't expand on mobile."
+    //
+    // A non-default data-button-size is used deliberately: both the base
+    // max-height and the expanded height are button-size-derived, and the
+    // default 60px happens to make the old hardcoded "100px" offset produce
+    // the same result (60px + 40px = 100px) -- so only a distinguishing size
+    // can catch a regression back to that hardcode.
+    runWidget({ "data-widget-key": "widget-secret", "data-button-size": "100px" })
+
+    const block = expandedBlock()
+    expect(block).toMatch(/\.xagent-widget-panel\.expanded\s*\{[^}]*width:\s*min\(720px, 100vw - 40px\);/)
+    expect(block).toMatch(
+      /\.xagent-widget-panel\.expanded\s*\{[^}]*height:\s*calc\(100vh - 100px - 40px\);/,
+    )
+    expect(block).toMatch(/\.xagent-widget-panel\.expanded\s+\.xagent-widget-resize-handle\s*\{[^}]*display:\s*none;/)
+    expect(mobileBlock()).not.toMatch(/\.xagent-widget-panel\.expanded/)
+    expect(styleText()).toMatch(/max-height:\s*calc\(100vh - 100px - 40px\);/)
+  })
+
+  it("collapses the panel, restoring its normal width, when the iframe posts widget_collapse", () => {
+    localStorage.setItem("xagent_widget_width", "500")
+    runWidget()
+    fabEl()?.click()
+    fromIframe("widget_expand")
+    // The .expanded rule's own width would otherwise lose to a lingering
+    // inline one -- expanding must clear whatever the resize handle left.
+    // toHaveStyle checks computed style, which jsdom never resolves for
+    // anything behind a media query (confirmed empirically), so this reads
+    // the raw inline style directly like the resize-handle tests already do.
+    expect((panelEl() as HTMLElement).style.width).toBe("")
+
+    fromIframe("widget_collapse")
+
+    expect(panelEl()).not.toHaveClass("expanded")
+    expect((panelEl() as HTMLElement).style.width).toBe("500px")
+  })
+
+  it("does not let a same-side window resize clobber the expanded width", () => {
+    // applyPanelWidth() (called from onWindowResize on every horizontal
+    // resize) used to unconditionally set an inline width, which outranks
+    // the .expanded CSS rule's own width by specificity regardless of
+    // viewport -- desyncing the panel's width from its still-expanded
+    // height on any resize that stays well above the mobile breakpoint.
+    runWidget()
+    fabEl()?.click()
+    fromIframe("widget_expand")
+    expect((panelEl() as HTMLElement).style.width).toBe("")
+    const postToIframe = vi.spyOn(iframeEl()!.contentWindow!, "postMessage")
+
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: window.innerWidth - 50 })
+    window.dispatchEvent(new Event("resize"))
+
+    expect(panelEl()).toHaveClass("expanded")
+    expect((panelEl() as HTMLElement).style.width).toBe("")
+    // Still on the desktop side of the breakpoint -- nothing to correct.
+    expect(postToIframe).not.toHaveBeenCalled()
+  })
+
+  it("force-collapses an already-expanded panel when a resize carries it across the mobile breakpoint", () => {
+    // The .expanded CSS rule is scoped above the mobile breakpoint, so
+    // nothing previously re-validated isExpanded against a resize the way
+    // expandPanel() already does for a fresh click -- the panel would
+    // render mobile-sized while isExpanded stayed true on both sides, then
+    // silently snap back to full size if the window later widened past the
+    // breakpoint again with no further click from the visitor.
+    runWidget()
+    fabEl()?.click()
+    fromIframe("widget_expand")
+    expect(panelEl()).toHaveClass("expanded")
+    const postToIframe = vi.spyOn(iframeEl()!.contentWindow!, "postMessage")
+
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 400 })
+    window.dispatchEvent(new Event("resize"))
+
+    expect(panelEl()).not.toHaveClass("expanded")
+    expect(postToIframe).toHaveBeenCalledWith(
+      { xagent: true, v: 1, type: "widget_expand_rejected" },
+      HOST,
+    )
+
+    // Widening back past the breakpoint afterward must not silently
+    // re-expand the panel with no further click.
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 1024 })
+    window.dispatchEvent(new Event("resize"))
+
+    expect(panelEl()).not.toHaveClass("expanded")
+  })
+
+  it("stays expanded across a close/reopen within the same page view", () => {
+    // No persistence for this (unlike width): a JS variable that's simply
+    // never reset by closePanel(), so it only resets on an actual reload.
+    runWidget()
+    fabEl()?.click()
+    fromIframe("widget_expand")
+
+    fabEl()?.click()
+    fabEl()?.click()
+
+    expect(panelEl()).toHaveClass("expanded")
   })
 
   it("ignores a chrome message from a different origin", () => {

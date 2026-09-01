@@ -141,6 +141,7 @@ from xagent.db.sqlite import apply_sqlite_concurrency_pragmas
 from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.task_interaction import TaskInteractionRequest
+from xagent.web.models.user import User
 from xagent.web.services import task_interaction_service as svc
 from xagent.web.services.ops_signals import (
     CHECKPOINT_LOAD_UNAVAILABLE,
@@ -2760,6 +2761,7 @@ def _stage_matching_command(
         command = TaskExecutionCommand(
             task_id=task_id,
             actor_user_id=actor_user_id,
+            actor_subject=_actor_subject(db, actor_user_id),
             command_id=command_id,
             kind=svc.TaskCommandKind.RESUME.value,
             payload=payload,
@@ -2771,6 +2773,14 @@ def _stage_matching_command(
         return int(command.id)
     finally:
         db.close()
+
+
+def _actor_subject(db: Session, actor_user_id: int | None) -> str | None:
+    if actor_user_id is None:
+        return None
+    subject = db.query(User.actor_subject).filter(User.id == actor_user_id).scalar()
+    assert subject is not None
+    return str(subject)
 
 
 def _respond_envelope(**overrides: Any) -> svc.RespondEnvelope:
@@ -3472,6 +3482,50 @@ def test_respond_returns_the_original_receipt_for_a_matching_replay(
         assert outcome.receipt.idempotency_key == command_id
 
 
+def test_respond_rejects_a_legacy_command_from_a_reused_numeric_actor_id(
+    _respond_db,
+) -> None:
+    user_id, task_id = _waiting_task(_respond_db)
+    principal = _owning_principal(user_id)
+    values = {"env": "prod"}
+    command_id = "legacy-actor-replay-key"
+    interaction_id = _answered_row_with_valid_anchor(
+        _respond_db,
+        task_id=task_id,
+        run_id="run-a",
+        responder_identity=principal.identity_string(),
+        response_payload=values,
+    )
+    payload = svc._respond_command_payload(
+        interaction_id=interaction_id, principal=principal, values=values
+    )
+    command_db_id = _stage_matching_command(
+        _respond_db,
+        task_id=task_id,
+        actor_user_id=principal.user_id,
+        command_id=command_id,
+        payload=payload,
+    )
+    db = _respond_db()
+    try:
+        command = db.get(TaskExecutionCommand, command_db_id)
+        assert command is not None
+        command.actor_subject = f"legacy-user-id:{user_id}"
+        assert _actor_subject(db, user_id) != command.actor_subject
+        db.commit()
+    finally:
+        db.close()
+
+    outcome = svc.respond(
+        interaction_id=interaction_id,
+        task_id=task_id,
+        principal=principal,
+        envelope=_respond_envelope(idempotency_key=command_id, values=values),
+    )
+
+    assert outcome == svc.RespondConflict(reason="idempotency_key_reused")
+
+
 def test_respond_replays_an_answered_row_whose_anchor_was_pruned(
     _respond_db,
 ) -> None:
@@ -3675,6 +3729,7 @@ def _racing_fence_stmt_that_answers_with_command(
             command = TaskExecutionCommand(
                 task_id=task_id,
                 actor_user_id=actor_user_id,
+                actor_subject=_actor_subject(race_db, actor_user_id),
                 command_id=command_id,
                 kind=svc.TaskCommandKind.RESUME.value,
                 payload=command_payload,
@@ -4766,6 +4821,7 @@ def test_respond_reports_replayed_when_the_replay_branch_commit_ack_is_lost_but_
             command = TaskExecutionCommand(
                 task_id=task_id,
                 actor_user_id=principal.user_id,
+                actor_subject=_actor_subject(self, principal.user_id),
                 command_id=idempotency_key,
                 kind=svc.TaskCommandKind.RESUME.value,
                 payload=command_payload,

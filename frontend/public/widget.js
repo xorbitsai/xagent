@@ -289,6 +289,12 @@
   // so a viewport narrower than the stored preference at load never
   // overwrites it (e.g. via a later, otherwise-unmoved drag release).
   var panelWidth = readStoredWidth();
+  // Declared here, next to the other panel-sizing state, even though it's
+  // first read (via var hoisting) much later in applyPanelWidth() below --
+  // that read only works today because the value is `undefined` (falsy)
+  // until this line runs; keep it here so a future var -> let/const
+  // conversion can't turn it into a load-time ReferenceError.
+  var isExpanded = false;
 
   // Styles
   var style = document.createElement('style');
@@ -339,7 +345,11 @@
       right: 0;
       width: ${DEFAULT_PANEL_WIDTH}px;
       height: 600px;
-      max-height: calc(100vh - 100px);
+      /* The panel's bottom edge sits buttonSize + 40px above the viewport
+         bottom (container's own 20px, plus the panel's own bottom offset
+         above -- both referenced from the rule right above), so that's the
+         most height can grow to before the top edge goes off-screen. */
+      max-height: calc(100vh - ${buttonSize} - 40px);
       background: ${panelBgColor};
       border-radius: 12px;
       box-shadow: 0 8px 24px rgba(0, 0, 0, 0.16);
@@ -407,6 +417,30 @@
        mechanism. */
     .xagent-widget-scroll-locked {
       overflow: hidden !important;
+    }
+
+    /* Expand mode jumps straight to the same max width the drag-resize
+       handle already clamps to, rather than a separate arbitrary size. The
+       exact logical complement of the max-width block below (not a
+       min-width one pixel above it, which would leave a sub-pixel gap
+       neither query matches), so its two-class selector can never outrank
+       the mobile layout by specificity alone -- structurally impossible to
+       apply under the mobile breakpoint at all. */
+    @media not all and (max-width: ${MOBILE_BREAKPOINT}px) {
+      .xagent-widget-panel.expanded {
+        /* Same viewport clamp the drag-resize handle already enforces via
+           clampPanelWidth() -- a flat 720px would push the right-anchored
+           panel (and its left-edge resize handle) off the left of the
+           screen on any supported desktop width narrower than 760px. */
+        width: min(${MAX_PANEL_WIDTH}px, 100vw - ${HORIZONTAL_VIEWPORT_MARGIN}px);
+        height: calc(100vh - ${buttonSize} - 40px);
+      }
+
+      /* Dragging the handle sets an inline width that would win over (and
+         desync from) the expanded class's own width by specificity. */
+      .xagent-widget-panel.expanded .xagent-widget-resize-handle {
+        display: none;
+      }
     }
 
     @media (max-width: ${MOBILE_BREAKPOINT}px) {
@@ -504,6 +538,14 @@
   // viewport (a shrunk window, a rotated device) must not permanently shrink
   // the user's stored preference once the viewport widens again.
   function applyPanelWidth() {
+    // Expand mode's own CSS rule owns width while active; setting an inline
+    // width here would outrank it by specificity regardless of viewport,
+    // desyncing the panel's width from its still-expanded height -- a plain
+    // window resize that stays well above the mobile breakpoint still calls
+    // this via onWindowResize below. collapsePanel() calls this itself,
+    // after already flipping isExpanded false, specifically to restore the
+    // width this skips while expanded.
+    if (isExpanded) return;
     panel.style.width = isMobileViewport() ? '' : clampPanelWidth(panelWidth) + 'px';
   }
   applyPanelWidth();
@@ -529,7 +571,7 @@
     // whose CSP blocks that inline <style> would leave it visually
     // draggable with no CSS backing it up -- check the open class directly
     // too, as defense in depth that doesn't depend on the stylesheet loading.
-    if (torndown || isMobileViewport() || dragState || (event.button || 0) !== 0 || !panel.classList.contains('open')) return;
+    if (torndown || isMobileViewport() || isExpanded || dragState || (event.button || 0) !== 0 || !panel.classList.contains('open')) return;
     dragState = {
       pointerId: event.pointerId,
       startX: event.clientX,
@@ -687,6 +729,21 @@
     // that on release), end the drag cleanly here. The user can just grab
     // the handle again if they still want to resize.
     cancelDrag();
+    // A resize can carry an already-expanded panel across the mobile
+    // breakpoint just as easily as a click can arrive there in the first
+    // place. The .expanded CSS rule stops applying (it's scoped above the
+    // breakpoint), so the panel would render as a plain mobile-sized panel
+    // while isExpanded stays true on both sides -- then widening back past
+    // the breakpoint with no further click reactivates the CSS rule and
+    // silently snaps the panel back to full size, the exact thing
+    // expandPanel()'s own mobile guard exists to prevent for a fresh
+    // request. Force the same correction path a click-time rejection uses.
+    if (isExpanded && isMobileViewport()) {
+      collapsePanel();
+      if (iframe.contentWindow) {
+        iframe.contentWindow.postMessage({ xagent: true, v: 1, type: 'widget_expand_rejected' }, host);
+      }
+    }
   }
   window.addEventListener('resize', onWindowResize);
 
@@ -837,6 +894,39 @@
     applyScrollLock();
   }
 
+  // Returns whether it actually expanded -- onChromeMessage uses this to
+  // tell the iframe when its optimistic isExpanded guess needs correcting.
+  function expandPanel() {
+    // The .expanded CSS rule is itself scoped above the mobile breakpoint,
+    // so this would already be a visual no-op there -- but isExpanded would
+    // still latch true, and nothing rechecks it on a later resize/rotation
+    // (see onWindowResize below), so growing past the breakpoint afterward
+    // would silently expand the panel with no further click from the user.
+    if (isMobileViewport()) return false;
+    // Expanding invalidates a drag's frozen startX/startWidth anchors the
+    // same way a viewport-width change does (see onWindowResize's own
+    // cancelDrag() call) -- a drag can only still be active here via a
+    // second, independent pointer (e.g. one finger holding the handle while
+    // another taps this menu item on a touch-capable desktop-width device),
+    // since isMobileViewport()/isExpanded already block a *new* drag from
+    // starting once expanded. Without this, that drag's very next
+    // pointermove would go on setting an inline width, desyncing the
+    // panel's rendered width from the .expanded class it now also carries.
+    cancelDrag();
+    isExpanded = true;
+    panel.classList.add('expanded');
+    // Let the .expanded rule's own width win -- an inline width from a
+    // prior drag would otherwise outrank it by specificity regardless.
+    panel.style.width = '';
+    return true;
+  }
+
+  function collapsePanel() {
+    isExpanded = false;
+    panel.classList.remove('expanded');
+    applyPanelWidth();
+  }
+
   fab.onclick = function () {
     // A host SPA can remove just the panel (leaving container/FAB in place;
     // panelRemovalObserver already covers that -- see its own comment
@@ -888,6 +978,17 @@
       panel.classList.add('xagent-widget-chrome-ready');
     } else if (data.type === 'widget_chrome_not_ready') {
       panel.classList.remove('xagent-widget-chrome-ready');
+    } else if (data.type === 'widget_expand') {
+      // Correct the iframe's optimistic isExpanded guess when the mobile
+      // guard above rejects it -- otherwise the menu keeps reading "Collapse
+      // window" with nothing actually expanded, and the visitor's next click
+      // (a no-op collapse from the iframe's perspective) needs a second
+      // click on an eventual desktop-width resize to actually expand.
+      if (!expandPanel()) {
+        iframe.contentWindow.postMessage({ xagent: true, v: 1, type: 'widget_expand_rejected' }, host);
+      }
+    } else if (data.type === 'widget_collapse') {
+      collapsePanel();
     }
   }
   window.addEventListener('message', onChromeMessage);

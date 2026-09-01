@@ -38,6 +38,86 @@ from .streaming import merge_streamed_tool_call_arguments
 
 logger = logging.getLogger(__name__)
 
+# Fixed final_answer stream close reasons. ReAct's fail() call sites import
+# these names directly (react.py already imports this module at module
+# scope, so that adds no new dependency edge) instead of writing their own
+# copies of the literal text, so there is exactly one place that spells each
+# reason and exactly one place that recognizes it for logging.
+INTERRUPTED_DURING_LLM_STREAM_REASON = "interrupted during LLM stream"
+UNAVAILABLE_TOOL_CALL_RESTORING_TOOLS_REASON = (
+    "unavailable tool call, restoring available tools"
+)
+INVALID_TOOL_PROTOCOL_RETRYING_REASON = "invalid tool protocol, retrying"
+DISCARDED_BUNDLED_FINAL_ANSWER_REASON = (
+    "discarded an answer that arrived together with tool "
+    "calls; answering again once the tools have run"
+)
+INVALID_TOOL_PROTOCOL_AFTER_RECOVERY_REASON = "invalid tool protocol after recovery"
+INVALID_TOOL_PROTOCOL_AFTER_RETRY_REASON = "invalid tool protocol after retry"
+NO_DELIVERABLE_FINAL_ANSWER_REASON = "no deliverable final_answer in this batch"
+
+_KNOWN_STREAM_CLOSE_REASONS = frozenset(
+    {
+        INTERRUPTED_DURING_LLM_STREAM_REASON,
+        UNAVAILABLE_TOOL_CALL_RESTORING_TOOLS_REASON,
+        INVALID_TOOL_PROTOCOL_RETRYING_REASON,
+        DISCARDED_BUNDLED_FINAL_ANSWER_REASON,
+        INVALID_TOOL_PROTOCOL_AFTER_RECOVERY_REASON,
+        INVALID_TOOL_PROTOCOL_AFTER_RETRY_REASON,
+        NO_DELIVERABLE_FINAL_ANSWER_REASON,
+    }
+)
+
+# react.py's LLMToolProtocolError handler builds this reason as
+# f"invalid {exc.code} tool protocol, retrying", where exc.code comes
+# straight from the provider's error payload. _normalize_stream_close_reason
+# folds it to a fixed shape that keeps exc.code's length, never its text.
+_TOOL_PROTOCOL_RETRY_PREFIX = "invalid "
+_TOOL_PROTOCOL_RETRY_SUFFIX = " tool protocol, retrying"
+_TOOL_PROTOCOL_RETRY_TEMPLATE_MIN_LENGTH = len(_TOOL_PROTOCOL_RETRY_PREFIX) + len(
+    _TOOL_PROTOCOL_RETRY_SUFFIX
+)
+
+
+def _normalize_stream_close_reason(reason: str) -> str:
+    """Classify a final_answer stream close reason for logging.
+
+    ``reason`` is whatever ``FinalAnswerStreamSession.fail`` was called with:
+    a fixed string this codebase wrote, a provider-error-code-derived
+    template, or an arbitrary provider exception's ``str(exc)``. It still
+    reaches the frontend unchanged either way - this function only decides
+    what gets logged - and the classification works from the string's
+    content alone; there is no side channel telling it where a reason came
+    from.
+
+    - An exact match against a known fixed string is logged verbatim.
+    - A match against the "invalid <code> tool protocol, retrying" template
+      is folded to a fixed shape that keeps the length of the
+      provider-controlled ``code`` value but not its text. The exact-match
+      check above runs first, so the one known literal that could otherwise
+      overlap this template ("invalid tool protocol, retrying", with a
+      single space doing double duty as both the prefix's and the suffix's
+      space) is already resolved by the time this check runs; the length
+      guard here is a second, independent reason it cannot match anyway,
+      since a real templated reason is always longer.
+    - Anything else - including a raw provider exception message - is
+      reduced to its length. Never guess a class name or any other
+      structure out of unrecognized text: that would smuggle part of it
+      into the logs, which is the one thing this function exists to
+      prevent.
+    """
+
+    if reason in _KNOWN_STREAM_CLOSE_REASONS:
+        return reason
+    if (
+        len(reason) > _TOOL_PROTOCOL_RETRY_TEMPLATE_MIN_LENGTH
+        and reason.startswith(_TOOL_PROTOCOL_RETRY_PREFIX)
+        and reason.endswith(_TOOL_PROTOCOL_RETRY_SUFFIX)
+    ):
+        code_chars = len(reason) - _TOOL_PROTOCOL_RETRY_TEMPLATE_MIN_LENGTH
+        return f"invalid tool protocol (code:{code_chars} chars), retrying"
+    return f"<unparsed>:{len(reason)}"
+
 
 class ExecutionInterrupted(Exception):
     """Base signal for an execution interrupted at an active I/O boundary."""
@@ -569,6 +649,13 @@ class PatternRuntime:
                 "task_id": self.execution_id,
             }
         )
+        logger.info(
+            "final_answer stream opened. task_id=%s step=%s turn=%s message_id=%s",
+            self.execution_id,
+            self.active_react_step_id,
+            self.active_turn_id,
+            message_id,
+        )
         return message_id
 
     async def emit_final_answer_delta(self, message_id: str, delta: str) -> None:
@@ -593,6 +680,15 @@ class PatternRuntime:
                 "content": content,
             }
         )
+        logger.info(
+            "final_answer stream closed. task_id=%s step=%s turn=%s "
+            "message_id=%s content_chars=%d",
+            self.execution_id,
+            self.active_react_step_id,
+            self.active_turn_id,
+            message_id,
+            len(content),
+        )
 
     async def fail_final_answer_stream(self, message_id: str, error: str) -> None:
         if self.last_final_answer_stream_message_id == message_id:
@@ -604,6 +700,15 @@ class PatternRuntime:
                 "task_id": self.execution_id,
                 "error": error,
             }
+        )
+        logger.warning(
+            "final_answer stream failed. task_id=%s step=%s turn=%s "
+            "message_id=%s reason=%s",
+            self.execution_id,
+            self.active_react_step_id,
+            self.active_turn_id,
+            message_id,
+            _normalize_stream_close_reason(error),
         )
 
     def _has_native_stream_chat(self, llm: Any) -> bool:

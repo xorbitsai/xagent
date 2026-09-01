@@ -5,6 +5,7 @@ Provides web-specific configuration classes that load from database
 and other web-specific sources.
 """
 
+import asyncio
 import copy
 import inspect
 import logging
@@ -28,8 +29,10 @@ from typing import (
     TypeVar,
     cast,
 )
+from weakref import WeakValueDictionary
 
 import httpx
+from sqlalchemy import text
 
 from ...config import get_uploads_dir
 from ...core.agent.result import (
@@ -57,6 +60,7 @@ from ...core.tools.adapters.vibe.connector_runtime import (
     runtime_bindings_from_config,
 )
 from ...core.tools.adapters.vibe.db_session import tool_session_scope
+from ..services.mcp_runtime import MCPBuiltinOAuthActorPolicy
 from ..services.tool_credentials import (
     TOOL_CREDENTIAL_SPECS,
     get_sql_connection_map,
@@ -81,6 +85,9 @@ OAUTH_TOKEN_RESOLVER_FAILURE_CODE = "oauth_token_resolver_failed"
 OAUTH_TOKEN_RESOLVER_FAILURE_MESSAGE = "OAuth token resolver failed"
 UNAVAILABLE_MCP_MESSAGE = "MCP server is unavailable."
 UNAVAILABLE_MCP_CREDENTIAL_MESSAGE = "MCP server credentials are unavailable."
+_ACTOR_OAUTH_REFRESH_LOCKS: WeakValueDictionary[
+    tuple[int, int, str, str], asyncio.Lock
+] = WeakValueDictionary()
 # This web-runtime allowlist is intentionally narrower than the adapter-layer
 # public summary allowlist. It accepts only credential/config resolution reasons
 # produced at this boundary; adapter/list-tools phases are sanitized separately
@@ -571,6 +578,24 @@ def _oauth_launch_config_env_mapping(
         "Ignoring OAuth MCP launch config env_mapping because env_mapping must be a mapping"
     )
     return {}
+
+
+def _actor_oauth_refresh_lock(
+    user_id: int,
+    resource_owner_key: str,
+    app_id: str,
+) -> asyncio.Lock:
+    key = (
+        id(asyncio.get_running_loop()),
+        user_id,
+        resource_owner_key,
+        app_id,
+    )
+    lock = _ACTOR_OAUTH_REFRESH_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _ACTOR_OAUTH_REFRESH_LOCKS[key] = lock
+    return lock
 
 
 def _oauth_launch_config_mapping(
@@ -1371,6 +1396,7 @@ class WebToolConfig(BaseToolConfig):
         sandbox: Optional[Any] = None,
         tool_selection_spec: Optional[Any] = None,
         mcp_auth_context: Optional[Dict[str, Any]] = None,
+        mcp_runtime_authorization_policy: MCPBuiltinOAuthActorPolicy | None = None,
         execution_scope: Optional[Any] = None,
         connector_runtime_turn_id: Optional[str] = None,
         mcp_failure_policy: MCPFailurePolicy = MCPFailurePolicy.BEST_EFFORT,
@@ -1454,6 +1480,7 @@ class WebToolConfig(BaseToolConfig):
         self._mcp_auth_context = (
             mcp_auth_context if isinstance(mcp_auth_context, dict) else {}
         )
+        self._mcp_runtime_authorization_policy = mcp_runtime_authorization_policy
         if connector_runtime_turn_id is None:
             raw_turn_id = workspace_config.get("turn_id")
             connector_runtime_turn_id = (
@@ -3387,29 +3414,196 @@ class WebToolConfig(BaseToolConfig):
             },
         }
 
+    def _legacy_oauth_session_factory(self) -> Callable[[], Any]:
+        """Capture a factory before OAuth maintenance moves to a worker thread."""
+        if self._db_factory is not None:
+            return cast(Callable[[], Any], self._db_factory)
+        if self._live_db is not None:
+            from sqlalchemy.orm import sessionmaker
+
+            return sessionmaker(
+                bind=self._live_db.get_bind().engine,
+                autoflush=False,
+            )
+        return cast(Callable[[], Any], self.get_session_factory())
+
     def _new_legacy_oauth_session(self) -> Any:
         """Open the transaction owner for legacy OAuth token maintenance."""
-        if self._db_factory is not None:
-            return self._db_factory()
-        if self._live_db is not None:
-            from sqlalchemy.orm import Session
+        return self._legacy_oauth_session_factory()()
 
-            return Session(bind=self._live_db.get_bind().engine, autoflush=False)
-        return self.get_session_factory()()
+    async def _finish_legacy_oauth_access_token_resolution(
+        self,
+        *,
+        oauth_db: Any,
+        oauth_account: Any,
+        provider_name: object,
+        user_id: int,
+        resource_owner_key: str | None,
+    ) -> _LegacyOAuthTokenResolution:
+        if not oauth_account or not oauth_account.access_token:
+            return _LegacyOAuthTokenResolution(access_token=None)
+
+        logger.info(
+            "OAUTH CONFIG: Token found for '%s'. Refresh token present: %s, Expires: %s",
+            provider_name,
+            oauth_account.refresh_token is not None,
+            oauth_account.expires_at,
+        )
+        account_id = int(oauth_account.id)
+        is_valid = await refresh_oauth_token_if_needed(
+            oauth_db,
+            oauth_account,
+            str(provider_name) if provider_name else "",
+        )
+        if not is_valid:
+            logger.warning(
+                "OAUTH CONFIG: Token for '%s' is invalid and could not be refreshed. "
+                "Deleting OAuth record to prompt user for reconnection.",
+                provider_name,
+            )
+            if resource_owner_key is None:
+                # Ordinary flows preserve the existing recovery path for a
+                # failed flush. Actor flows retain their credential lock so a
+                # concurrent winner cannot be deleted after refresh.
+                oauth_db.rollback()
+                oauth_account = get_scoped_user_oauth_account(
+                    oauth_db,
+                    user_id=user_id,
+                    account_id=account_id,
+                    resource_owner_key=None,
+                )
+            if oauth_account is not None:
+                oauth_db.delete(oauth_account)
+                oauth_db.commit()
+            return _LegacyOAuthTokenResolution(
+                access_token=None,
+                refresh_failed=True,
+            )
+
+        access_token = str(oauth_account.access_token)
+        instance_url = getattr(oauth_account, "instance_url", None)
+        oauth_db.commit()
+        return _LegacyOAuthTokenResolution(
+            access_token=access_token,
+            instance_url=instance_url,
+        )
+
+    async def _resolve_actor_oauth_access_token_in_worker(
+        self,
+        *,
+        session_factory: Callable[[], Any],
+        provider_name: object,
+        app_id: str,
+        resource_owner_key: str,
+        user_id: int,
+    ) -> _LegacyOAuthTokenResolution:
+        """Resolve one actor namespace on a worker-thread event loop."""
+        from ...web.models.user_oauth import UserOAuth
+
+        oauth_db = session_factory()
+        try:
+            # Lock the current namespace, not a stale row id. Actor callbacks
+            # replace credentials with delete-and-insert, so the primary key
+            # can change while this resolver waits.
+            actor_query = scoped_user_oauth_query(
+                oauth_db,
+                user_id=user_id,
+                resource_owner_key=resource_owner_key,
+            ).filter(UserOAuth.provider == app_id)
+            if oauth_db.get_bind().dialect.name == "sqlite":
+                oauth_db.execute(
+                    text(
+                        "UPDATE user_oauth SET id = id "
+                        "WHERE user_id = :user_id "
+                        "AND resource_owner_key = :resource_owner_key "
+                        "AND provider = :provider"
+                    ),
+                    {
+                        "user_id": user_id,
+                        "resource_owner_key": resource_owner_key,
+                        "provider": app_id,
+                    },
+                )
+            else:
+                actor_query = actor_query.with_for_update()
+            oauth_account = actor_query.first()
+            logger.info(
+                "OAUTH CONFIG: Checked actor app credential for user %s. Found: %s",
+                user_id,
+                oauth_account is not None,
+            )
+            return await self._finish_legacy_oauth_access_token_resolution(
+                oauth_db=oauth_db,
+                oauth_account=oauth_account,
+                provider_name=provider_name,
+                user_id=user_id,
+                resource_owner_key=resource_owner_key,
+            )
+        except Exception:
+            oauth_db.rollback()
+            raise
+        finally:
+            oauth_db.close()
+
+    async def _resolve_actor_oauth_access_token(
+        self,
+        *,
+        provider_name: object,
+        app_id: str,
+        resource_owner_key: str,
+        user_id: int,
+    ) -> _LegacyOAuthTokenResolution:
+        from ..services.db_runtime import run_db_io_cancellation_safe
+
+        # Same-process waiters must not open a Session or reserve a pooled
+        # connection. The stable namespace also survives callback replacement
+        # of the credential row.
+        actor_refresh_lock = _actor_oauth_refresh_lock(
+            user_id,
+            resource_owner_key,
+            app_id,
+        )
+        await actor_refresh_lock.acquire()
+        try:
+            session_factory = self._legacy_oauth_session_factory()
+            return await run_db_io_cancellation_safe(
+                lambda: asyncio.run(
+                    self._resolve_actor_oauth_access_token_in_worker(
+                        session_factory=session_factory,
+                        provider_name=provider_name,
+                        app_id=app_id,
+                        resource_owner_key=resource_owner_key,
+                        user_id=user_id,
+                    )
+                )
+            )
+        finally:
+            actor_refresh_lock.release()
 
     async def _resolve_legacy_oauth_access_token(
         self,
         *,
         provider_name: object,
         app_id: object,
+        resource_owner_key: str | None = None,
     ) -> _LegacyOAuthTokenResolution:
-        """Resolve and persist one legacy OAuth account in an isolated transaction."""
+        """Resolve and persist one exact OAuth owner in an isolated transaction."""
         from ...web.mcp_apps import restrict_to_app_scoped_oauth_grant
         from ...web.models.user_oauth import UserOAuth
 
         if self._user_id is None:
             return _LegacyOAuthTokenResolution(access_token=None)
         user_id = int(self._user_id)
+        if resource_owner_key is not None:
+            if not isinstance(app_id, str):
+                return _LegacyOAuthTokenResolution(access_token=None)
+            return await self._resolve_actor_oauth_access_token(
+                provider_name=provider_name,
+                app_id=app_id,
+                resource_owner_key=resource_owner_key,
+                user_id=user_id,
+            )
+
         oauth_db = self._new_legacy_oauth_session()
         try:
             if app_id:
@@ -3452,55 +3646,12 @@ class WebToolConfig(BaseToolConfig):
                     oauth_account is not None,
                 )
 
-            if not oauth_account or not oauth_account.access_token:
-                return _LegacyOAuthTokenResolution(access_token=None)
-
-            logger.info(
-                "OAUTH CONFIG: Token found for '%s'. Refresh token present: %s, Expires: %s",
-                provider_name,
-                oauth_account.refresh_token is not None,
-                oauth_account.expires_at,
-            )
-            account_id = int(oauth_account.id)
-            is_valid = await refresh_oauth_token_if_needed(
-                oauth_db,
-                oauth_account,
-                str(provider_name) if provider_name else "",
-            )
-            if not is_valid:
-                logger.warning(
-                    "OAUTH CONFIG: Token for '%s' is invalid and could not be refreshed. "
-                    "Deleting OAuth record to prompt user for reconnection.",
-                    provider_name,
-                )
-                # A failed flush leaves the transaction unusable. Roll it back,
-                # reload the account, then persist the disconnection atomically.
-                oauth_db.rollback()
-                oauth_account = get_scoped_user_oauth_account(
-                    oauth_db,
-                    user_id=user_id,
-                    account_id=account_id,
-                    resource_owner_key=None,
-                )
-                if oauth_account is not None:
-                    oauth_db.delete(oauth_account)
-                    oauth_db.commit()
-                return _LegacyOAuthTokenResolution(
-                    access_token=None,
-                    refresh_failed=True,
-                )
-
-            access_token = str(oauth_account.access_token)
-            # Not direct attribute access: mypy infers oauth_account's
-            # instance_url as Column[str] here (get_scoped_user_oauth_account
-            # returns a type the SQLAlchemy plugin doesn't narrow the same
-            # way as a plain query result), so getattr's own 3-arg overload
-            # is what actually produces the correct `str | None` this
-            # function's return type declares.
-            instance_url = getattr(oauth_account, "instance_url", None)
-            oauth_db.commit()
-            return _LegacyOAuthTokenResolution(
-                access_token=access_token, instance_url=instance_url
+            return await self._finish_legacy_oauth_access_token_resolution(
+                oauth_db=oauth_db,
+                oauth_account=oauth_account,
+                provider_name=provider_name,
+                user_id=user_id,
+                resource_owner_key=None,
             )
         except Exception:
             oauth_db.rollback()
@@ -3515,23 +3666,71 @@ class WebToolConfig(BaseToolConfig):
         user_env_by_id: Mapping[int, Any],
         shared_env_by_id: Mapping[int, Any],
         env_source_by_id: Mapping[int, Any],
+        actor_builtin_app_info: Mapping[str, Any] | None = None,
+        actor_builtin_invalid: bool = False,
     ) -> Dict[str, Any]:
         """Build one MCP server config, preserving explicit unavailable outcomes."""
-        # Build config dict from server model
-        runtime_bindings = getattr(server, "runtime_bindings", None)
-        allow_delegated_authorization = bool(
-            getattr(server, "allow_delegated_authorization", False)
+        actor_builtin = actor_builtin_app_info is not None
+        if actor_builtin_invalid:
+            policy_diagnostic = {
+                "code": "config_load_failed",
+                "message": "MCP server configuration is unavailable",
+                "server_id": int(server.id),
+                "server_name": server.name,
+            }
+            self._mcp_oauth_diagnostics.append(policy_diagnostic)
+            return self._build_unavailable_mcp_config(
+                server=server,
+                reason="config_load_failed",
+                diagnostic=policy_diagnostic,
+            )
+
+        if actor_builtin and (self._mcp_auth_context or {}).get(str(server.id)):
+            policy_diagnostic = {
+                "code": "config_load_failed",
+                "message": "Task-supplied MCP authorization is not accepted",
+                "server_id": int(server.id),
+                "server_name": server.name,
+            }
+            self._mcp_oauth_diagnostics.append(policy_diagnostic)
+            return self._build_unavailable_mcp_config(
+                server=server,
+                reason="config_load_failed",
+                diagnostic=policy_diagnostic,
+            )
+
+        # Actor builtins are constructed only from canonical catalog metadata
+        # and the exact actor credential. Task connector runtime values are not
+        # loaded, retained, or exposed in the serialized config.
+        runtime_bindings = (
+            None if actor_builtin else getattr(server, "runtime_bindings", None)
         )
-        runtime_values = self._get_connector_runtime_for("mcp", int(server.id))
+        allow_delegated_authorization = (
+            False
+            if actor_builtin
+            else bool(getattr(server, "allow_delegated_authorization", False))
+        )
+        runtime_values = (
+            None
+            if actor_builtin
+            else self._get_connector_runtime_for("mcp", int(server.id))
+        )
         config: Dict[str, Any] = {
             "id": int(server.id),
             "name": server.name,
             "transport": server.transport,
-            "description": server.description,
-            "runtime_input_schema": getattr(server, "runtime_input_schema", None),
-            "runtime_bindings": runtime_bindings,
-            "allow_delegated_authorization": allow_delegated_authorization,
+            "description": (
+                actor_builtin_app_info.get("description")
+                if actor_builtin_app_info is not None
+                else server.description
+            ),
         }
+        if not actor_builtin:
+            config.update(
+                runtime_input_schema=getattr(server, "runtime_input_schema", None),
+                runtime_bindings=runtime_bindings,
+                allow_delegated_authorization=allow_delegated_authorization,
+            )
         if runtime_values:
             context_values = runtime_values.get("context")
             config["connector_runtime"] = {
@@ -3549,7 +3748,11 @@ class WebToolConfig(BaseToolConfig):
             # The provider might be linkedin, google, etc. based on the app config
             from ...web.mcp_apps import get_app_for_mcp_server
 
-            app_info = get_app_for_mcp_server(self.db, server)
+            app_info = (
+                dict(actor_builtin_app_info)
+                if actor_builtin_app_info is not None
+                else get_app_for_mcp_server(self.db, server)
+            )
             if app_info is None:
                 logger.warning(
                     "OAuth MCP server '%s' has no matching catalog app",
@@ -3568,7 +3771,7 @@ class WebToolConfig(BaseToolConfig):
             app_id = app_info.get("id") if app_info else None
 
             hook_token: _ResolvedHookToken | None = None
-            if app_info:
+            if app_info and not actor_builtin:
                 configured_resource = _oauth_token_configured_resource(app_info)
                 providers_to_resolve = _oauth_token_provider_candidates(app_info)
                 try:
@@ -3623,6 +3826,12 @@ class WebToolConfig(BaseToolConfig):
                 legacy_token = await self._resolve_legacy_oauth_access_token(
                     provider_name=provider_name,
                     app_id=app_id,
+                    resource_owner_key=(
+                        self._mcp_runtime_authorization_policy.resource_owner_key
+                        if actor_builtin
+                        and self._mcp_runtime_authorization_policy is not None
+                        else None
+                    ),
                 )
                 if legacy_token.refresh_failed:
                     return self._build_unavailable_mcp_config(
@@ -3859,6 +4068,8 @@ class WebToolConfig(BaseToolConfig):
         user_env_by_id: Mapping[int, Any],
         shared_env_by_id: Mapping[int, Any],
         env_source_by_id: Mapping[int, Any],
+        actor_builtin_app_info: Mapping[str, Any] | None = None,
+        actor_builtin_invalid: bool = False,
     ) -> Dict[str, Any]:
         """Isolate unexpected failures while loading one MCP server config."""
         try:
@@ -3867,6 +4078,8 @@ class WebToolConfig(BaseToolConfig):
                 user_env_by_id=user_env_by_id,
                 shared_env_by_id=shared_env_by_id,
                 env_source_by_id=env_source_by_id,
+                actor_builtin_app_info=actor_builtin_app_info,
+                actor_builtin_invalid=actor_builtin_invalid,
             )
         except ConnectorRuntimeError:
             raise
@@ -3940,6 +4153,29 @@ class WebToolConfig(BaseToolConfig):
                 self._user_id,
                 self._connector_team_id,
             )
+
+            # Classify the complete personal ∪ governing-team visible set
+            # before constructing any runtime config. Canonical builtins use
+            # actor OAuth; native rows preserve their existing transport path;
+            # reserved/catalog drift is retained as a per-row unavailable
+            # result and can never dispatch through that native path.
+            actor_classifications: dict[int, tuple[Mapping[str, Any] | None, bool]] = {}
+            if self._mcp_runtime_authorization_policy is not None:
+                from ...web.mcp_apps import (
+                    BuiltinOAuthServerDefinitionError,
+                    classify_actor_builtin_oauth_server,
+                )
+
+                for visible_server in servers:
+                    try:
+                        actor_classifications[int(visible_server.id)] = (
+                            classify_actor_builtin_oauth_server(
+                                self.db, visible_server
+                            ),
+                            False,
+                        )
+                    except BuiltinOAuthServerDefinitionError:
+                        actor_classifications[int(visible_server.id)] = (None, True)
 
             # Prefetch shared runtime state once before entering the isolated
             # per-server formatter.
@@ -4015,6 +4251,12 @@ class WebToolConfig(BaseToolConfig):
                 user_env_by_id=user_env_by_id,
                 shared_env_by_id=shared_env_by_id,
                 env_source_by_id=env_source_by_id,
+                actor_builtin_app_info=actor_classifications.get(
+                    int(server.id), (None, False)
+                )[0],
+                actor_builtin_invalid=actor_classifications.get(
+                    int(server.id), (None, False)
+                )[1],
             )
             for server in servers
         ]

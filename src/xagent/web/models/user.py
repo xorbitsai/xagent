@@ -1,3 +1,5 @@
+import uuid
+
 from sqlalchemy import (
     JSON,
     Boolean,
@@ -20,6 +22,15 @@ class User(Base):  # type: ignore
     __tablename__ = "users"
 
     id = Column(Integer, primary_key=True, index=True)
+    # Stable internal pseudonym for durable actor correlation. Unlike ``id``,
+    # it is never reused after account deletion and is not exposed to clients.
+    actor_subject = Column(
+        String(64),
+        unique=True,
+        index=True,
+        nullable=True,
+        default=lambda: str(uuid.uuid4()),
+    )
     username = Column(String(50), unique=True, index=True, nullable=False)
     email = Column(String(255), unique=True, index=True, nullable=True)
     password_hash = Column(String(255), nullable=False)

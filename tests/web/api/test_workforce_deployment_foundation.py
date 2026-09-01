@@ -877,10 +877,11 @@ def test_deployment_model_defaults_and_owner_uniqueness() -> None:
         db.close()
 
 
-async def test_ws_append_rejection_surfaces_workforce_reason() -> None:
-    """Transport-boundary pin: the websocket path must surface the specific
-    workforce rejection instead of the generic (and misleading) "task busy"
-    message — an archived workforce can never be retried into success."""
+async def test_ws_append_rejection_surfaces_workforce_code() -> None:
+    """Transport-boundary pin: the websocket path must surface stable
+    non-retryable workforce guidance instead of the generic (and misleading)
+    "task busy" message — an archived workforce can never be retried into
+    success."""
     import asyncio
     from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -922,7 +923,11 @@ async def test_ws_append_rejection_surfaces_workforce_reason() -> None:
             else:
                 raise AssertionError("agent_error broadcast did not arrive in time")
 
-        assert "archived" in errors[0]["message"]
+        assert errors[0]["message"] == (
+            "This workforce has been archived. Unarchive and publish it before "
+            "starting a new conversation, or select an active workforce."
+        )
+        assert errors[0]["error_code"] == "workforce_archived"
         assert "busy" not in errors[0]["message"]
     finally:
         db.close()

@@ -73,6 +73,21 @@ vi.mock("@/components/chat/ChatInput", () => ({
       >
         attach-preuploaded-chat-input-file
       </button>
+      <button
+        type="button"
+        onClick={() => {
+          const preUploaded = new File(["existing"], "existing.txt", {
+            type: "text/plain",
+          }) as File & { file_id?: string }
+          preUploaded.file_id = "duplicate-file-id"
+          onFilesChange?.([
+            preUploaded,
+            new File(["new"], "new.txt", { type: "text/plain" }),
+          ])
+        }}
+      >
+        attach-mixed-chat-input-files
+      </button>
       <button type="button" onClick={() => onSend?.("chat input message")}>
         send-chat-input
       </button>
@@ -201,6 +216,31 @@ const agentConfig: AgentConfig = {
   },
 }
 
+const successfulUploadResponse = (files: unknown[]) =>
+  new Response(JSON.stringify({ success: true, files }), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  })
+
+const renderBuilderChat = () =>
+  render(
+    <AgentBuilderChat
+      agentConfig={agentConfig}
+      onUpdateConfig={vi.fn()}
+    />
+  )
+
+const expectUploadRejectedWithoutSend = async () => {
+  await waitFor(() => {
+    expect(apiRequestMock).toHaveBeenCalledTimes(1)
+  })
+  MockWebSocket.instances.forEach((ws) => ws.open())
+  await waitFor(() => {
+    expect(toastErrorMock.mock.calls[0]?.[0]).toBe("Failed to upload files")
+  })
+  expect(MockWebSocket.instances.flatMap((ws) => ws.sentMessages)).toEqual([])
+}
+
 describe("AgentBuilderChat", () => {
   beforeEach(() => {
     apiRequestMock.mockReset()
@@ -241,6 +281,35 @@ describe("AgentBuilderChat", () => {
     await waitFor(() => {
       expect(screen.getByText("rejected")).toBeInTheDocument()
     })
+  })
+
+  it.each([
+    {
+      caseName: "contains a blank file id",
+      files: [{ file_id: "   ", filename: "data.txt" }],
+    },
+    { caseName: "has the wrong result count", files: [] },
+  ])("does not send when an upload response $caseName", async ({ files }) => {
+    apiRequestMock.mockResolvedValueOnce(successfulUploadResponse(files))
+    renderBuilderChat()
+
+    fireEvent.click(await screen.findByText("send-file-interaction"))
+
+    await expectUploadRejectedWithoutSend()
+  })
+
+  it("does not send when a new upload duplicates a pre-uploaded file id", async () => {
+    apiRequestMock.mockResolvedValueOnce(
+      successfulUploadResponse([
+        { file_id: "duplicate-file-id", filename: "new.txt" },
+      ])
+    )
+    renderBuilderChat()
+
+    fireEvent.click(screen.getByText("attach-mixed-chat-input-files"))
+    fireEvent.click(screen.getByText("send-chat-input"))
+
+    await expectUploadRejectedWithoutSend()
   })
 
   it("reuses pre-uploaded file ids from compact chat input instead of uploading again", async () => {

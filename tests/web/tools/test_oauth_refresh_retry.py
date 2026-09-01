@@ -78,6 +78,17 @@ def _github_oauth_account(user) -> UserOAuth:
     )
 
 
+def _meta_oauth_account(user) -> UserOAuth:
+    return UserOAuth(
+        user_id=user.id,
+        provider="facebook",
+        access_token="old-long-token",
+        refresh_token=None,
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        provider_user_id="meta-user-1",
+    )
+
+
 @pytest.fixture(autouse=True)
 def _no_real_sleep(monkeypatch):
     """The retry backoff would otherwise add real wall-clock delay to
@@ -91,10 +102,12 @@ def _no_real_sleep(monkeypatch):
 
 class _FakeAsyncClient:
     """Minimal async-context-manager stand-in for httpx.AsyncClient whose
-    `post` is supplied by the test."""
+    `post` and/or `get` are supplied by the test. Meta's refresh path uses
+    `get` (fb_exchange_token); every other provider uses `post`."""
 
-    def __init__(self, post):
+    def __init__(self, post=None, get=None):
         self._post = post
+        self._get = get
 
     async def __aenter__(self):
         return self
@@ -103,7 +116,14 @@ class _FakeAsyncClient:
         return None
 
     async def post(self, *args, **kwargs):
+        if self._post is None:
+            raise NotImplementedError("post not mocked for this test")
         return await self._post(*args, **kwargs)
+
+    async def get(self, *args, **kwargs):
+        if self._get is None:
+            raise NotImplementedError("get not mocked for this test")
+        return await self._get(*args, **kwargs)
 
 
 @pytest.mark.asyncio
@@ -242,3 +262,50 @@ async def test_refresh_does_not_retry_on_ambiguous_read_timeout(
         is False
     )
     assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_refresh_retries_transient_network_error_for_meta_get_path(
+    db_session, monkeypatch
+):
+    """Meta's refresh path uses client.get (fb_exchange_token), not POST
+    like every other provider -- make sure the retry wrapper covers it too,
+    not just the POST path the other tests in this file exercise."""
+    db, user = db_session
+    db.add(
+        OAuthProvider(
+            provider_name="meta",
+            name="Meta",
+            client_id=encrypt_value("meta-client-id"),
+            client_secret=encrypt_value("meta-client-secret"),
+            auth_url="https://www.facebook.com/v25.0/dialog/oauth",
+            token_url="https://graph.facebook.com/v25.0/oauth/access_token",
+            redirect_uri="https://app.example.com/api/auth/meta/callback",
+            userinfo_url="https://graph.facebook.com/v25.0/me?fields=id,email",
+            user_id_path="id",
+            email_path="email",
+            default_scopes=["public_profile"],
+        )
+    )
+    oauth_account = _meta_oauth_account(user)
+    db.add(oauth_account)
+    db.commit()
+
+    calls: list[int] = []
+
+    async def get(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise httpx.ConnectTimeout("connection timed out")
+        return MockResponse({"access_token": "new-long-token", "expires_in": 5184000})
+
+    monkeypatch.setattr(
+        tool_config.httpx, "AsyncClient", lambda: _FakeAsyncClient(get=get)
+    )
+
+    assert (
+        await tool_config.refresh_oauth_token_if_needed(db, oauth_account, "meta")
+        is True
+    )
+    assert len(calls) == 2
+    assert oauth_account.access_token == "new-long-token"

@@ -859,6 +859,42 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             },
         },
         {
+            "app_id": "mixpanel",
+            "name": "Mixpanel",
+            "description": "Connect to Mixpanel with a Service Account to query events, segmentation, retention, funnels, and user profiles, and export raw event data. Supports US, EU, and India data residency.",
+            "icon": "https://www.google.com/s2/favicons?domain=mixpanel.com&sz=128",
+            "transport": "stdio",
+            "provider_name": None,
+            "category": "Analytics",
+            "oauth_scopes": None,
+            "is_visible_in_connector": True,
+            # Key-based (non-oauth), like posthog/stripe: Mixpanel's Query/
+            # Export API authenticates with a Service Account's username +
+            # secret over HTTP Basic, generated self-serve by the project
+            # owner (no partner application or review). MIXPANEL_PROJECT_ID
+            # is required because the Query API is project-scoped, not
+            # account-scoped -- every call needs it regardless of endpoint.
+            # MIXPANEL_REGION is in required_env (there is no optional_env
+            # concept anywhere in the connect flow, per api/mcp.py) even
+            # though mixpanel.py itself treats a missing/empty value as
+            # "us" -- omitting it here would leave EU/India users with no
+            # way to select their region through the connect UI at all.
+            # Unlike POSTHOG_HOST, this only ever selects one of Mixpanel's
+            # three fixed data-residency host pairs (us/eu/in, see
+            # mixpanel.py's _REGION_HOSTS), not an arbitrary host, so there
+            # is no user-supplied-URL SSRF surface to validate here.
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.mixpanel"],
+                "required_env": [
+                    "MIXPANEL_SERVICE_ACCOUNT_USERNAME",
+                    "MIXPANEL_SERVICE_ACCOUNT_SECRET",
+                    "MIXPANEL_PROJECT_ID",
+                    "MIXPANEL_REGION",
+                ],
+            },
+        },
+        {
             # "chrome-devtools", not the generic "chrome", matching the
             # upstream package name and the vendor-scoped ids every other
             # seeded app uses. Known, accepted caveat: api/mcp.py couples

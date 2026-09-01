@@ -642,12 +642,11 @@ async def _request_oauth_refresh_with_retries(
         is_last_attempt = attempt == OAUTH_REFRESH_MAX_ATTEMPTS - 1
         try:
             response = await request()
+            if response.status_code < 500 or is_last_attempt:
+                return response
         except _OAUTH_REFRESH_RETRYABLE_EXCEPTIONS:
             if is_last_attempt:
                 raise
-        else:
-            if response.status_code < 500 or is_last_attempt:
-                return response
 
         # Jittered so a burst of concurrent refreshes (the exact scenario
         # above) doesn't retry in lockstep and reproduce the same

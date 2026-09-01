@@ -10,6 +10,7 @@ import copy
 import inspect
 import logging
 import os
+import random
 import re
 import shlex
 from dataclasses import dataclass, field
@@ -608,6 +609,62 @@ def _oauth_launch_config_mapping(
     raise _OAuthLaunchConfigInvalid(field="type")
 
 
+OAUTH_REFRESH_MAX_ATTEMPTS = 2
+OAUTH_REFRESH_RETRY_BASE_DELAY_SECONDS = 0.5
+# Only failures that guarantee the request body was never transmitted are
+# safe to retry blindly. A grant_type=refresh_token POST is not idempotent
+# on providers that rotate refresh tokens: if the server processed the
+# grant and issued a new refresh_token but the response was lost to a
+# ReadTimeout/WriteTimeout (request already sent, outcome unknown), a
+# retry would resend the now-stale refresh_token and get back a genuine
+# invalid_grant -- which _raise_if_permanent_oauth_refresh_error correctly
+# treats as confirmed-dead and deletes the connection, silently
+# reproducing the exact bug this refresh path was fixed to avoid. A
+# connect-phase failure never got that far, and a 5xx is the provider's
+# own signal that it didn't process the request, so both are safe.
+_OAUTH_REFRESH_RETRYABLE_EXCEPTIONS = (httpx.ConnectError, httpx.ConnectTimeout)
+
+
+async def _request_oauth_refresh_with_retries(
+    request: Callable[[], Awaitable[httpx.Response]],
+    *,
+    provider_name: str,
+) -> httpx.Response:
+    """Retry a token-endpoint request across transient failures that are
+    safe to resend -- see _OAUTH_REFRESH_RETRYABLE_EXCEPTIONS. Useful for
+    the cold-start network blip right after a container restart, when a
+    backlog of triggers firing at once produces a burst of concurrent
+    refreshes just as egress is still warming up. A 4xx is the provider's
+    definitive answer about this specific token; retrying cannot change
+    it, so it's returned immediately without spending a retry on it.
+    """
+    for attempt in range(OAUTH_REFRESH_MAX_ATTEMPTS):
+        is_last_attempt = attempt == OAUTH_REFRESH_MAX_ATTEMPTS - 1
+        try:
+            response = await request()
+        except _OAUTH_REFRESH_RETRYABLE_EXCEPTIONS:
+            if is_last_attempt:
+                raise
+        else:
+            if response.status_code < 500 or is_last_attempt:
+                return response
+
+        # Jittered so a burst of concurrent refreshes (the exact scenario
+        # above) doesn't retry in lockstep and reproduce the same
+        # contention on the next attempt.
+        delay = OAUTH_REFRESH_RETRY_BASE_DELAY_SECONDS * (2**attempt)
+        delay += random.uniform(0, OAUTH_REFRESH_RETRY_BASE_DELAY_SECONDS)
+        logger.info(
+            "Retrying %s token refresh after a transient failure (attempt %s/%s)",
+            provider_name,
+            attempt + 2,
+            OAUTH_REFRESH_MAX_ATTEMPTS,
+        )
+        await asyncio.sleep(delay)
+
+    raise AssertionError("unreachable: the last attempt always returns or raises")
+
+
 async def refresh_oauth_token_if_needed(
     db: Any, oauth_account: Any, provider_name: str
 ) -> bool:
@@ -666,15 +723,18 @@ async def refresh_oauth_token_if_needed(
 
         if normalized_provider == "meta":
             async with httpx.AsyncClient() as client:
-                response = await client.get(
-                    provider_config.token_url,
-                    params={
-                        "grant_type": "fb_exchange_token",
-                        "client_id": client_id,
-                        "client_secret": client_secret,
-                        "fb_exchange_token": oauth_account.access_token,
-                    },
-                    timeout=10.0,
+                response = await _request_oauth_refresh_with_retries(
+                    lambda: client.get(
+                        provider_config.token_url,
+                        params={
+                            "grant_type": "fb_exchange_token",
+                            "client_id": client_id,
+                            "client_secret": client_secret,
+                            "fb_exchange_token": oauth_account.access_token,
+                        },
+                        timeout=10.0,
+                    ),
+                    provider_name=provider_name,
                 )
 
             if response.status_code == 200:
@@ -784,12 +844,15 @@ async def refresh_oauth_token_if_needed(
             body_kwarg = {"json": data}
 
         async with httpx.AsyncClient() as client:
-            response = await client.post(
-                refresh_token_url,
-                headers=headers,
-                timeout=10.0,
-                **body_kwarg,
-                **post_kwargs,
+            response = await _request_oauth_refresh_with_retries(
+                lambda: client.post(
+                    refresh_token_url,
+                    headers=headers,
+                    timeout=10.0,
+                    **body_kwarg,
+                    **post_kwargs,
+                ),
+                provider_name=provider_name,
             )
 
         if response.status_code == 200:

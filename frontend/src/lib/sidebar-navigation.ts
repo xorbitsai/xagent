@@ -124,14 +124,14 @@ export const getNavigationGroupsForUser = (user?: SidebarUser | null): Navigatio
                 color: "text-blue-500"
             },
             {
-                name: "Agents",
+                name: "My Team",
                 nameKey: "nav.build",
                 href: "/build",
                 icon: Bot,
                 color: "text-yellow-400"
             },
             {
-                name: "Templates",
+                name: "Add teammates",
                 nameKey: "nav.templates",
                 href: "/templates",
                 icon: LayoutTemplate,

@@ -22,6 +22,7 @@ const toastErrorMock = vi.hoisted(() => vi.fn())
 const mcpAppsMock = vi.hoisted(() => ({
   apps: [] as McpApp[],
   refresh: vi.fn(),
+  providerAvailable: true,
 }))
 
 vi.mock("@/contexts/app-context-chat", () => ({
@@ -59,7 +60,12 @@ vi.mock("@/components/ui/sonner", () => ({
 // Only exercised by connect_apps interactions (below); every other test in
 // this file never mounts ConnectAppsField, so these mocks are inert for them.
 vi.mock("@/contexts/mcp-apps-context", () => ({
-  useMcpApps: () => mcpAppsMock,
+  useMcpApps: () => {
+    if (!mcpAppsMock.providerAvailable) {
+      throw new Error("useMcpApps must be used within a McpAppsProvider")
+    }
+    return mcpAppsMock
+  },
 }))
 vi.mock("@/contexts/auth-context", () => ({
   useAuth: () => ({ token: "test-token" }),
@@ -71,6 +77,7 @@ import { ClarificationForm } from "./clarification-form"
 // swapped by one test cannot leak into a suite added below it.
 beforeEach(() => {
   i18nMock.translate = i18nMock.identity
+  mcpAppsMock.providerAvailable = true
 })
 
 describe("ClarificationForm Session file capability", () => {
@@ -257,6 +264,27 @@ describe("ClarificationForm Session file capability", () => {
     )
 
     expect(container.querySelector('input[type="file"]')).not.toBeNull()
+  })
+})
+
+describe("ClarificationForm without a McpAppsProvider", () => {
+  it("renders an ordinary (non-connect_apps) interaction without crashing on a public widget/share page", () => {
+    // allConnectAppsConnected's useMcpApps() call is unconditional (React
+    // hooks can't be gated on interaction type), but McpAppsProvider isn't
+    // mounted on public widget/share pages (application-shell.tsx's
+    // isExternalRoutePath branch only wraps them in AnonymousAuthProvider) -
+    // useMcpApps() throwing there would crash ANY interaction rendered on
+    // those pages, not just connect_apps ones.
+    mcpAppsMock.providerAvailable = false
+
+    render(
+      <ClarificationForm
+        interactions={[{ type: "text_input", field: "note", label: "Note" }]}
+        onSend={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByText("Note:")).toBeInTheDocument()
   })
 })
 

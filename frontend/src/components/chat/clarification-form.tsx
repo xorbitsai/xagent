@@ -14,7 +14,7 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 import { ChevronDown, ChevronRight, MessageSquare, Upload, File as FileIcon, X, Globe } from "lucide-react"
 import { ConnectAppsField, resolveRows } from "./connect-apps-field"
 import { findMatchingMcpApp } from "@/lib/mcp-lookup"
-import { useMcpApps } from "@/contexts/mcp-apps-context"
+import { useMcpApps, type McpApp } from "@/contexts/mcp-apps-context"
 import type { MessageDeliveryDisposition } from "@/hooks/use-websocket"
 import type { TranslationKey } from "@/i18n/translations"
 import {
@@ -257,7 +257,23 @@ export function ClarificationForm({
   // finish first. Without this global check, connecting the first card's
   // app alone would let that card fire Continue while a sibling card's app
   // is still unconnected, sending a premature/contradictory message.
-  const { apps: mcpApps } = useMcpApps()
+  // Called unconditionally on every render (React hooks can't be called only
+  // for connect_apps interactions), but McpAppsProvider isn't mounted on
+  // every surface this form renders on - public widget/share pages (see
+  // application-shell.tsx's isExternalRoutePath branch) only get
+  // AnonymousAuthProvider, so useMcpApps() would throw there for ANY
+  // interaction type, not just connect_apps. Same try/catch shape as
+  // useApp() above, for the same reason.
+  let mcpApps: McpApp[] = []
+  try {
+    mcpApps = useMcpApps().apps
+  } catch {
+    // Not inside a McpAppsProvider (e.g. a public widget/share page) -
+    // allConnectAppsConnected below naturally stays false with an empty
+    // list, which is correct: connect_apps cards aren't rendered on these
+    // provider-less surfaces anyway, since ConnectAppsField itself would
+    // throw the same way if it ever mounted there.
+  }
   const allConnectAppsConnected = useMemo(() => {
     if (!isConnectAppsOnly) return false
     const allAppNames = normalizedInteractions.flatMap((interaction) => interaction.apps ?? [])

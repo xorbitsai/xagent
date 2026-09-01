@@ -158,9 +158,11 @@ async def test_refresh_retries_transient_network_error_then_succeeds(
     assert oauth_account.access_token == "new-token"
     # base delay (0.5s) plus up to a full base delay of jitter -- see
     # OAUTH_REFRESH_RETRY_BASE_DELAY_SECONDS and the backoff formula in
-    # _request_oauth_refresh_with_retries.
+    # _request_oauth_refresh_with_retries. Upper bound has a tiny epsilon:
+    # random.uniform(0, 0.5) can round to exactly 0.5 in rare floating-point
+    # cases, and a strict "< 1.0" would flake on that.
     assert len(sleep_delays) == 1
-    assert 0.5 <= sleep_delays[0] < 1.0
+    assert 0.5 <= sleep_delays[0] <= 1.0 + 1e-9
 
 
 @pytest.mark.asyncio
@@ -180,6 +182,36 @@ async def test_refresh_retries_connect_error_then_succeeds(db_session, monkeypat
         calls.append(1)
         if len(calls) == 1:
             raise httpx.ConnectError("connection refused")
+        return MockResponse({"access_token": "new-token", "expires_in": 3600})
+
+    monkeypatch.setattr(
+        tool_config.httpx, "AsyncClient", lambda: _FakeAsyncClient(post)
+    )
+
+    assert (
+        await tool_config.refresh_oauth_token_if_needed(db, oauth_account, "github")
+        is True
+    )
+    assert len(calls) == 2
+    assert oauth_account.access_token == "new-token"
+
+
+@pytest.mark.asyncio
+async def test_refresh_retries_proxy_error_then_succeeds(db_session, monkeypatch):
+    """ProxyError (a failed CONNECT/SOCKS handshake) also guarantees the
+    request never reached the token endpoint -- must be retried like
+    ConnectError/ConnectTimeout, not silently dropped from the tuple."""
+    db, user = db_session
+    oauth_account = _github_oauth_account(user)
+    db.add(oauth_account)
+    db.commit()
+
+    calls: list[int] = []
+
+    async def post(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise httpx.ProxyError("proxy CONNECT failed")
         return MockResponse({"access_token": "new-token", "expires_in": 3600})
 
     monkeypatch.setattr(

@@ -953,10 +953,15 @@ async def test_unexpected_server_config_failure_retains_failure_and_later_server
 
 
 @pytest.mark.asyncio
-async def test_user_oauth_refresh_failure_retains_unavailable_and_deletes_invalid_record(
+async def test_user_oauth_refresh_transient_failure_retains_unavailable_without_deleting_record(
     db_session,
     monkeypatch,
 ):
+    """A refresh failure that doesn't confirm the refresh token is dead --
+    e.g. a network error, timeout, or provider outage -- must not delete the
+    connection: it may well succeed the next time it's used. See
+    _OAuthRefreshPermanentlyInvalid.
+    """
     db, user = db_session
     oauth_server = _add_oauth_server(db, user, launch_config=_launch_config())
     oauth_account = _add_user_oauth(
@@ -993,13 +998,51 @@ async def test_user_oauth_refresh_failure_retains_unavailable_and_deletes_invali
     assert "expired-secret-token" not in repr(configs[0])
     assert pending_app in db.new
     with isolated_session_factory() as verification_db:
-        assert verification_db.get(UserOAuth, account_id) is None
+        assert verification_db.get(UserOAuth, account_id) is not None
         assert (
             verification_db.query(PublicMCPApp)
             .filter(PublicMCPApp.app_id == pending_app.app_id)
             .first()
             is None
         )
+
+
+@pytest.mark.asyncio
+async def test_user_oauth_refresh_permanently_invalid_deletes_record(
+    db_session,
+    monkeypatch,
+):
+    """Only a confirmed-dead refresh token (_OAuthRefreshPermanentlyInvalid)
+    should cost the user their stored connection.
+    """
+    db, user = db_session
+    oauth_server = _add_oauth_server(db, user, launch_config=_launch_config())
+    oauth_account = _add_user_oauth(
+        db, user, provider="google", access_token="expired-secret-token"
+    )
+    account_id = oauth_account.id
+    isolated_session_factory = sessionmaker(
+        bind=db.get_bind(), autoflush=False, autocommit=False
+    )
+
+    async def fail_refresh(*args, **kwargs):
+        raise web_tools_config._OAuthRefreshPermanentlyInvalid()
+
+    monkeypatch.setattr(web_tools_config, "refresh_oauth_token_if_needed", fail_refresh)
+
+    configs = await _tool_config(
+        db, user, db_factory=isolated_session_factory
+    ).get_mcp_server_configs()
+
+    assert [config["name"] for config in configs] == ["Google Drive"]
+    _assert_unavailable_mcp_config(
+        configs[0],
+        oauth_server,
+        reason="oauth_token_refresh_failed",
+        oauth_token_required=True,
+    )
+    with isolated_session_factory() as verification_db:
+        assert verification_db.get(UserOAuth, account_id) is None
 
 
 @pytest.mark.asyncio
@@ -1132,11 +1175,21 @@ async def test_user_oauth_refresh_failure_logs_only_safe_metadata(
     )
 
     with caplog.at_level(logging.ERROR):
-        is_valid = await web_tools_config.refresh_oauth_token_if_needed(
-            db, oauth_account, "google"
-        )
+        if failure_kind == "response":
+            # A provider-confirmed invalid_grant is a permanent failure (see
+            # _OAuthRefreshPermanentlyInvalid) and is signalled by raising,
+            # not by returning False, so the caller knows to drop the
+            # connection instead of retrying it later.
+            with pytest.raises(web_tools_config._OAuthRefreshPermanentlyInvalid):
+                await web_tools_config.refresh_oauth_token_if_needed(
+                    db, oauth_account, "google"
+                )
+        else:
+            is_valid = await web_tools_config.refresh_oauth_token_if_needed(
+                db, oauth_account, "google"
+            )
+            assert is_valid is False
 
-    assert is_valid is False
     assert response_secret not in caplog.text
     assert exception_secret not in caplog.text
     assert "leaked-response-access-token" not in caplog.text

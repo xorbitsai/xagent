@@ -608,6 +608,61 @@ def _oauth_launch_config_mapping(
     raise _OAuthLaunchConfigInvalid(field="type")
 
 
+_OAUTH_PERMANENT_REFRESH_ERROR_CODES = frozenset(
+    {"invalid_grant", "invalid_client", "unauthorized_client"}
+)
+
+
+class _OAuthRefreshPermanentlyInvalid(Exception):
+    """The provider (or our own stored config) confirms this connection's
+    refresh token is dead -- revoked, expired, or the token/config it needs
+    to refresh is simply missing -- as opposed to a transient failure
+    (timeout, network error, provider 5xx) that may well succeed on a later
+    retry. Only this case should cost the user their stored connection.
+    """
+
+
+def _oauth_refresh_error_code(response: httpx.Response) -> str | None:
+    """Best-effort OAuth ``error`` code from a failed refresh response body.
+
+    Most providers use the standard top-level string ``error`` field. Meta
+    nests its error as an object instead (``{"error": {"type":
+    "OAuthException", "code": 190, ...}}``); code 190 is Meta's documented
+    "access token is invalid/expired" signal, so it's normalized to the
+    standard ``invalid_grant`` code the caller already recognizes.
+    """
+    try:
+        data = response.json()
+    except ValueError:
+        return None
+    if not isinstance(data, Mapping):
+        return None
+    error = data.get("error")
+    if isinstance(error, str):
+        return error
+    if (
+        isinstance(error, Mapping)
+        and error.get("type") == "OAuthException"
+        and error.get("code") == 190
+    ):
+        return "invalid_grant"
+    return None
+
+
+def _raise_if_permanent_oauth_refresh_error(
+    *, status_code: int, error_code: str | None
+) -> None:
+    """Raise only when the provider's error body unambiguously says the
+    refresh token itself is dead. Any other 4xx/5xx (rate limiting, a
+    momentary outage, a malformed body) is left to the caller as a
+    transient failure -- see _OAuthRefreshPermanentlyInvalid.
+    """
+    if status_code not in (400, 401):
+        return
+    if error_code in _OAUTH_PERMANENT_REFRESH_ERROR_CODES:
+        raise _OAuthRefreshPermanentlyInvalid()
+
+
 async def refresh_oauth_token_if_needed(
     db: Any, oauth_account: Any, provider_name: str
 ) -> bool:
@@ -691,18 +746,28 @@ async def refresh_oauth_token_if_needed(
                     )
                     return True
             else:
+                error_code = _oauth_refresh_error_code(response)
                 logger.error(
-                    "Failed to refresh %s token (status %s)",
+                    "Failed to refresh %s token (status %s, error=%s)",
                     provider_name,
                     response.status_code,
+                    error_code or "unknown",
+                )
+                _raise_if_permanent_oauth_refresh_error(
+                    status_code=response.status_code, error_code=error_code
                 )
             return False
 
         if not oauth_account.refresh_token:
+            # Unlike the provider-config checks above (which can self-heal
+            # once an admin fixes the OAuthProvider row, so are left as a
+            # transient False), a missing refresh_token is a property of
+            # this specific account row -- no retry will ever produce one,
+            # so this is permanent.
             logger.warning(
                 f"Token expired for {provider_name} but no refresh_token available."
             )
-            return False
+            raise _OAuthRefreshPermanentlyInvalid()
 
         data = {
             "grant_type": "refresh_token",
@@ -762,12 +827,15 @@ async def refresh_oauth_token_if_needed(
             # use-time validation of that same stored value.
             stored_instance_url = getattr(oauth_account, "instance_url", None)
             if not stored_instance_url:
+                # A per-account data problem (like the missing refresh_token
+                # check above), not a provider-config one -- retrying will
+                # never produce an instance_url, so this is permanent.
                 logger.warning(
                     f"Cannot refresh Deputy token for user "
                     f"{oauth_account.user_id}: no instance_url stored on "
                     "this connection."
                 )
-                return False
+                raise _OAuthRefreshPermanentlyInvalid()
             refresh_token_url = f"{stored_instance_url}/oauth/access_token"
 
         headers = {}
@@ -848,12 +916,19 @@ async def refresh_oauth_token_if_needed(
                 )
                 return True
         else:
+            error_code = _oauth_refresh_error_code(response)
             logger.error(
-                "Failed to refresh %s token (status %s)",
+                "Failed to refresh %s token (status %s, error=%s)",
                 provider_name,
                 response.status_code,
+                error_code or "unknown",
+            )
+            _raise_if_permanent_oauth_refresh_error(
+                status_code=response.status_code, error_code=error_code
             )
 
+    except _OAuthRefreshPermanentlyInvalid:
+        raise
     except Exception as e:
         logger.error(
             "Exception refreshing token for %s with %s",
@@ -3450,11 +3525,33 @@ class WebToolConfig(BaseToolConfig):
             oauth_account.expires_at,
         )
         account_id = int(oauth_account.id)
-        is_valid = await refresh_oauth_token_if_needed(
-            oauth_db,
-            oauth_account,
-            str(provider_name) if provider_name else "",
-        )
+        permanently_invalid = False
+        try:
+            is_valid = await refresh_oauth_token_if_needed(
+                oauth_db,
+                oauth_account,
+                str(provider_name) if provider_name else "",
+            )
+        except _OAuthRefreshPermanentlyInvalid:
+            is_valid = False
+            permanently_invalid = True
+
+        if not is_valid and not permanently_invalid:
+            # A transient failure (network error, timeout, provider outage)
+            # during refresh -- unlike a confirmed dead refresh token, this
+            # may well succeed the next time the connector is used, so the
+            # connection is kept rather than forcing the user to reconnect.
+            logger.warning(
+                "OAUTH CONFIG: Token for '%s' could not be refreshed due to "
+                "a transient error; keeping the connection for a later retry.",
+                provider_name,
+            )
+            oauth_db.rollback()
+            return _LegacyOAuthTokenResolution(
+                access_token=None,
+                refresh_failed=True,
+            )
+
         if not is_valid:
             logger.warning(
                 "OAUTH CONFIG: Token for '%s' is invalid and could not be refreshed. "

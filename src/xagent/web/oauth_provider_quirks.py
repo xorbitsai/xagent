@@ -1,8 +1,11 @@
 """Per-provider quirks in how OAuth token endpoints respond to a token
-request, shared between the initial code exchange (api/auth.py) and token
-refresh (tools/config.py) so a quirk fixed in one lifecycle path can't
-silently regress in the other -- see the two call sites' own comments for
-the underlying provider behavior each policy works around.
+request. Some of these are shared between the initial code exchange
+(api/auth.py) and token refresh (tools/config.py) so a quirk fixed in one
+lifecycle path can't silently regress in the other (requires_json_accept_
+header is); others (meta_invalid_token_error_code) are refresh-specific --
+see each function's own docstring, and the call sites' own comments, for
+which lifecycle path(s) it applies to and the underlying provider behavior
+it works around.
 """
 
 from typing import Mapping

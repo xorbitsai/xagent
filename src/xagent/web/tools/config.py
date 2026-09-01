@@ -3573,7 +3573,7 @@ class WebToolConfig(BaseToolConfig):
                 refresh_failed=True,
             )
 
-        if not is_valid:
+        if permanently_invalid:
             logger.warning(
                 "OAUTH CONFIG: Token for '%s' is invalid and could not be refreshed. "
                 "Deleting OAuth record to prompt user for reconnection.",

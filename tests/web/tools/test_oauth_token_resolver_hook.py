@@ -1232,6 +1232,76 @@ def test_oauth_refresh_error_code_gates_meta_shape_on_provider():
 
 
 @pytest.mark.asyncio
+async def test_refresh_unknown_provider_is_transient(db_session):
+    """No OAuthProvider row for this provider name is an admin-fixable
+    config problem (the row was never created, or was deleted), not
+    evidence this account's refresh token is dead -- must not raise
+    _OAuthRefreshPermanentlyInvalid, unlike a confirmed-dead token."""
+    db, user = db_session
+    oauth_account = UserOAuth(
+        user_id=user.id,
+        provider="not-a-configured-provider",
+        access_token="old-token",
+        refresh_token="old-refresh",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        provider_user_id="42",
+    )
+    db.add(oauth_account)
+    db.commit()
+
+    assert (
+        await web_tools_config.refresh_oauth_token_if_needed(
+            db, oauth_account, "not-a-configured-provider"
+        )
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_refresh_missing_provider_credentials_is_transient(
+    db_session, monkeypatch
+):
+    """A provider row with no client_id/client_secret (and no env-var
+    fallback) is the same admin-fixable config problem as an unknown
+    provider -- must not raise _OAuthRefreshPermanentlyInvalid."""
+    db, user = db_session
+    monkeypatch.delenv("XAGENT_GOOGLE_CLIENT_ID", raising=False)
+    monkeypatch.delenv("XAGENT_GOOGLE_CLIENT_SECRET", raising=False)
+    db.add(
+        OAuthProvider(
+            provider_name="google",
+            name="Google",
+            client_id="",
+            client_secret="",
+            auth_url="https://accounts.google.com/o/oauth2/v2/auth",
+            token_url="https://oauth2.googleapis.com/token",
+            redirect_uri="https://app.example.com/api/auth/google/callback",
+            userinfo_url="https://openidconnect.googleapis.com/v1/userinfo",
+            user_id_path="sub",
+            email_path="email",
+            default_scopes=["email"],
+        )
+    )
+    oauth_account = UserOAuth(
+        user_id=user.id,
+        provider="google",
+        access_token="old-token",
+        refresh_token="old-refresh",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        provider_user_id="42",
+    )
+    db.add(oauth_account)
+    db.commit()
+
+    assert (
+        await web_tools_config.refresh_oauth_token_if_needed(
+            db, oauth_account, "google"
+        )
+        is False
+    )
+
+
+@pytest.mark.asyncio
 async def test_remote_hook_without_app_info_can_claim_authorization(db_session):
     db, user = db_session
     server = _add_remote_server(db, user, name="Unregistered Remote")

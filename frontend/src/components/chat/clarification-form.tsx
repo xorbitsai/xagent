@@ -13,6 +13,7 @@ import { toast } from "@/components/ui/sonner"
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible"
 import { ChevronDown, ChevronRight, MessageSquare, Upload, File as FileIcon, X, Globe } from "lucide-react"
 import { ConnectAppsField, resolveRows } from "./connect-apps-field"
+import { findMatchingMcpApp } from "@/lib/mcp-lookup"
 import { useMcpApps } from "@/contexts/mcp-apps-context"
 import type { MessageDeliveryDisposition } from "@/hooks/use-websocket"
 import type { TranslationKey } from "@/i18n/translations"
@@ -260,6 +261,15 @@ export function ClarificationForm({
   const allConnectAppsConnected = useMemo(() => {
     if (!isConnectAppsOnly) return false
     const allAppNames = normalizedInteractions.flatMap((interaction) => interaction.apps ?? [])
+    if (allAppNames.length === 0) return false
+    // resolveRows silently drops any requested name that doesn't resolve
+    // against the catalog at all (e.g. one hidden via
+    // is_visible_in_connector=false, which is exactly what a card's own
+    // noneMatched fallback surfaces) - checking only the rows it DID
+    // resolve would let this go true while that app can never actually be
+    // connected from here, firing Continue prematurely.
+    const anyUnresolved = allAppNames.some((name) => !findMatchingMcpApp(mcpApps, name))
+    if (anyUnresolved) return false
     const rows = resolveRows(allAppNames, mcpApps)
     return rows.length > 0 && rows.every((row) => row.app.is_connected)
   }, [isConnectAppsOnly, normalizedInteractions, mcpApps])

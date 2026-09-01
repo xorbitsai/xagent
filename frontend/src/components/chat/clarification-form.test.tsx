@@ -565,6 +565,41 @@ describe("ClarificationForm connect_apps interaction", () => {
       screen.queryByRole("button", { name: "chatPage.clarification.connectApps.continue" }),
     ).not.toBeInTheDocument()
   })
+
+  it("does not offer Continue when a simultaneously-paused app is hidden from the connector catalog entirely", () => {
+    // resolveRows silently drops a requested app name that doesn't resolve
+    // to any catalog entry at all (e.g. one hidden via
+    // is_visible_in_connector=false) - that card is stuck on its own
+    // noneMatched fallback with no way to connect it, but Gmail's card must
+    // not treat "every app resolveRows kept" as "every app requested."
+    mcpAppsMock.apps = [
+      {
+        id: "gmail",
+        name: "Gmail",
+        description: "",
+        icon: "",
+        users: "",
+        transport: "builtin",
+        provider: "google",
+        category: "Communication",
+        is_connected: true,
+      },
+    ]
+
+    render(
+      <ClarificationForm
+        interactions={[
+          CONNECT_APPS_INTERACTION,
+          { type: "connect_apps", field: "connect_apps", label: "Connect your apps", apps: ["Hidden App"] },
+        ]}
+        onSend={vi.fn()}
+      />,
+    )
+
+    expect(
+      screen.queryByRole("button", { name: "chatPage.clarification.connectApps.continue" }),
+    ).not.toBeInTheDocument()
+  })
 })
 
 describe("ClarificationForm delivery failures", () => {

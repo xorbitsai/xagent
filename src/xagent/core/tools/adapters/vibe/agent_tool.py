@@ -1670,13 +1670,15 @@ def _classify_delegated_child_failure(
 
     if tool_result_waits_for_user(result):
         child_message = result.get("message")
-        # Capped the same as output/error below - a plain string, but an
-        # unbounded one from a misbehaving or malicious nested tool would
-        # otherwise flow uncapped into this failure's error/output/response
-        # text. Without relaying it at all, the parent (and the user) would
-        # see only this generic sentence with no indication of which app
-        # needs reconnecting - the only actionable part of the child's own
-        # diagnostic (e.g. UnavailableMCPTool naming the specific app).
+        # child_message itself is capped to _DELEGATION_TRACE_TEXT_LIMIT (the
+        # same bound output/error get below), not the combined relay text -
+        # a plain string, but an unbounded one from a misbehaving or
+        # malicious nested tool would otherwise flow uncapped into this
+        # failure's error/output/response text. Without relaying it at all,
+        # the parent (and the user) would see only this generic sentence
+        # with no indication of which app needs reconnecting - the only
+        # actionable part of the child's own diagnostic (e.g.
+        # UnavailableMCPTool naming the specific app).
         detail = (
             f" {child_message.strip()[:_DELEGATION_TRACE_TEXT_LIMIT]}"
             if isinstance(child_message, str) and child_message.strip()

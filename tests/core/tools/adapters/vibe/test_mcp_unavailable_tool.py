@@ -179,6 +179,39 @@ async def test_unavailable_tool_oauth_required_with_app_name_pauses_for_connect_
 
 
 @pytest.mark.asyncio
+async def test_unavailable_tool_return_schema_round_trips_the_waiting_for_user_pause(
+    monkeypatch,
+):
+    """return_type() is the tool's advertised public contract - a consumer
+    that validates through it (unlike the first-party ReAct path, which
+    consumes the raw dict) must still get the pause's message and
+    connect_apps interaction, not have them silently dropped."""
+    monkeypatch.setenv("XAGENT_USER_ID", "7")
+    tool = _unavailable_tool(
+        allow_users=["7"],
+        failure_code="oauth_token_required",
+        app_name="Gmail",
+    )
+
+    result = await tool.run_json_async({})
+    parsed = tool.return_type().model_validate(result)
+
+    assert parsed.status == "waiting_for_user"
+    assert parsed.message == (
+        "I need access to Gmail to continue. "
+        "Please connect it below, then let me know once you have."
+    )
+    assert parsed.interactions == [
+        {
+            "type": "connect_apps",
+            "field": "connect_apps",
+            "label": "Connect your apps",
+            "apps": ["Gmail"],
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_unavailable_tool_oauth_required_without_app_name_keeps_error(
     monkeypatch,
 ):

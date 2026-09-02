@@ -1064,6 +1064,18 @@ class _UnavailableMCPToolResult(BaseModel):
         default=True,
         description="Whether the tool execution resulted in an error",
     )
+    message: str | None = Field(
+        default=None,
+        description="User-facing prompt for a waiting_for_user pause",
+    )
+    interactions: List[Dict[str, Any]] | None = Field(
+        default=None,
+        description=(
+            "Interactions to render for a waiting_for_user pause (e.g. a "
+            "connect_apps card) - untyped like every other interaction dict "
+            "in this codebase, not just this tool's own connect_apps shape"
+        ),
+    )
 
 
 class UnavailableMCPTool(AbstractBaseTool):

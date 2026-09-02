@@ -143,6 +143,8 @@ BACKGROUND_JOB_VISIBILITY_TIMEOUT_SECONDS = (
 BACKGROUND_JOB_MAX_RETRIES = "XAGENT_BACKGROUND_JOB_MAX_RETRIES"
 BACKGROUND_JOB_STALE_SECONDS = "XAGENT_BACKGROUND_JOB_STALE_SECONDS"
 BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS = "XAGENT_BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS"
+KB_INDEX_MAINTENANCE_INTERVAL_SECONDS = "XAGENT_KB_INDEX_MAINTENANCE_INTERVAL_SECONDS"
+KB_VECTOR_RETRAIN_INTERVAL_SECONDS = "XAGENT_KB_VECTOR_RETRAIN_INTERVAL_SECONDS"
 TASKLESS_UPLOAD_TTL_SECONDS = "XAGENT_TASKLESS_UPLOAD_TTL_SECONDS"
 ORPHAN_UPLOAD_SWEEP_INTERVAL_SECONDS = "XAGENT_ORPHAN_UPLOAD_SWEEP_INTERVAL_SECONDS"
 WORKFORCE_PREVIEW_RUN_STALE_SECONDS = "XAGENT_WORKFORCE_PREVIEW_RUN_STALE_SECONDS"
@@ -992,6 +994,37 @@ def get_background_job_sweep_interval_seconds() -> int:
         BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS,
         300,
         minimum=30,
+    )
+
+
+def get_kb_index_maintenance_interval_seconds() -> int:
+    """How often the KB storage compaction sweep runs (#1557).
+
+    Priority:
+        1. XAGENT_KB_INDEX_MAINTENANCE_INTERVAL_SECONDS environment variable
+        2. Default 3600 (hourly)
+    """
+    return _get_positive_int_env(
+        KB_INDEX_MAINTENANCE_INTERVAL_SECONDS,
+        60 * 60,
+        minimum=60,
+    )
+
+
+def get_kb_vector_retrain_interval_seconds() -> int:
+    """How often KB vector indices are retrained from scratch (#1557).
+
+    Deliberately far coarser than the compaction sweep: ``optimize()`` keeps
+    new rows searchable, a retrain only recovers recall drift.
+
+    Priority:
+        1. XAGENT_KB_VECTOR_RETRAIN_INTERVAL_SECONDS environment variable
+        2. Default 604800 (weekly)
+    """
+    return _get_positive_int_env(
+        KB_VECTOR_RETRAIN_INTERVAL_SECONDS,
+        7 * 24 * 60 * 60,
+        minimum=60 * 60,
     )
 
 

@@ -10,6 +10,8 @@ from ...config import (
     get_background_job_visibility_timeout_seconds,
     get_celery_broker_url,
     get_celery_result_backend,
+    get_kb_index_maintenance_interval_seconds,
+    get_kb_vector_retrain_interval_seconds,
 )
 
 
@@ -23,6 +25,8 @@ def create_celery_app() -> Any:
     result_backend = get_celery_result_backend()
     visibility_timeout = get_background_job_visibility_timeout_seconds()
     sweep_interval = get_background_job_sweep_interval_seconds()
+    kb_maintenance_interval = get_kb_index_maintenance_interval_seconds()
+    kb_retrain_interval = get_kb_vector_retrain_interval_seconds()
     app = Celery("xagent", broker=broker_url, backend=result_backend)
     app.conf.update(
         broker_connection_retry_on_startup=True,
@@ -38,11 +42,27 @@ def create_celery_app() -> Any:
             "xagent.web.jobs.trigger_tasks.scan_due_triggers": {
                 "queue": "triggers",
             },
+            "xagent.web.jobs.kb_maintenance_tasks.compact_kb_storage": {
+                "queue": "default",
+            },
+            "xagent.web.jobs.kb_maintenance_tasks.retrain_kb_vector_indexes": {
+                "queue": "default",
+            },
         },
         beat_schedule={
             "scan-due-triggers-and-stale-jobs": {
                 "task": "xagent.web.jobs.trigger_tasks.scan_due_triggers",
                 "schedule": float(sweep_interval),
+            },
+            "compact-kb-storage": {
+                "task": "xagent.web.jobs.kb_maintenance_tasks.compact_kb_storage",
+                "schedule": float(kb_maintenance_interval),
+            },
+            "retrain-kb-vector-indexes": {
+                "task": (
+                    "xagent.web.jobs.kb_maintenance_tasks.retrain_kb_vector_indexes"
+                ),
+                "schedule": float(kb_retrain_interval),
             },
         },
         task_serializer="json",
@@ -62,6 +82,7 @@ def register_celery_tasks() -> None:
     for module_name in (
         "xagent.web.jobs.tasks",
         "xagent.web.jobs.trigger_tasks",
+        "xagent.web.jobs.kb_maintenance_tasks",
     ):
         import_module(module_name)
 

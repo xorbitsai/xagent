@@ -7,6 +7,7 @@ backend-specific database semantics.
 from __future__ import annotations
 
 import logging
+import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import timedelta
@@ -675,6 +676,16 @@ class VectorIndexStore(ABC):
     @abstractmethod
     def list_table_names(self) -> Sequence[str]:
         """List backend table names."""
+
+    def list_table_names_strict(self) -> Sequence[str]:
+        """List backend table names for callers that must see a listing failure.
+
+        ``list_table_names`` swallows the error and returns ``[]``, which a
+        maintenance sweep cannot tell apart from an empty database. This
+        default delegates to it and so inherits that blind spot; a backend that
+        can tell the two apart overrides this and lets the error out.
+        """
+        return self.list_table_names()
 
     @abstractmethod
     def get_vector_dimension(self, table_name: str) -> Optional[int]:
@@ -1366,13 +1377,27 @@ class VectorIndexStore(ABC):
         return False
 
     def compact_tables(
-        self, table_names: Sequence[str], policy: Optional[IndexPolicy] = None
+        self,
+        table_names: Sequence[str],
+        policy: Optional[IndexPolicy] = None,
+        stop_event: Optional[threading.Event] = None,
     ) -> List[str]:
         """Compact the fragmented tables among ``table_names``; returns those done.
 
+        ``stop_event``, when set, stops the sweep at the next table boundary.
         Best-effort maintenance; backends without compaction return an empty list.
         """
         return []
+
+    def retrain_vector_index(self, table_name: str) -> str:
+        """Rebuild a table's vector index from scratch.
+
+        Distinct from :meth:`trigger_reindex`, which only merges new rows into
+        the partitions the index already has. Returns ``retrained``,
+        ``no_index``, ``contended`` or ``failed``; backends without a
+        retrainable index return ``no_index``.
+        """
+        return "no_index"
 
     # --- Async index management variants ---
 

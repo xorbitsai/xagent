@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import threading
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -72,14 +73,101 @@ def _fragment_count(table: Any) -> int:
         return 0
 
 
+#: Consecutive incomplete maintenance passes before the failure is escalated.
+MAINTENANCE_FAILURE_ALERT_THRESHOLD = 3
+
+#: How long a retrain waits for a compaction already in flight on its table.
+#: Comfortably above a measured optimize+FTS pass (~15s at 77k rows) and well
+#: under the weekly gap it would otherwise forfeit.
+RETRAIN_LOCK_WAIT_SECONDS = 300
+
+#: Per-process, best-effort: this state lives in one interpreter and is lost on
+#: restart, so under a prefork pool a streak split across children may not
+#: escalate. Every individual failure still logs a WARNING.
+_maintenance_failures: Dict[str, int] = {}
+_maintenance_failures_lock = threading.Lock()
+
+
+def _record_maintenance_outcome(key: str, ok: bool) -> None:
+    """Count consecutive incomplete maintenance passes for one key.
+
+    A single warning per failure is why fourteen consecutive failures looked
+    identical to never having run (#1557).
+    """
+    with _maintenance_failures_lock:
+        if ok:
+            _maintenance_failures.pop(key, None)
+            return
+        count = _maintenance_failures.get(key, 0) + 1
+        _maintenance_failures[key] = count
+    # Only on the crossing: one incident is one page, and every failure before
+    # and after it already logs its own WARNING.
+    if count == MAINTENANCE_FAILURE_ALERT_THRESHOLD:
+        logger.error(
+            "KB index maintenance has now failed %s consecutive times for %s",
+            count,
+            key,
+        )
+
+
+def failing_maintenance_keys() -> Dict[str, int]:
+    """Keys whose maintenance has failed often enough in a row to alert on.
+
+    Per-process (see ``_maintenance_failures``).
+    """
+    with _maintenance_failures_lock:
+        return {
+            key: count
+            for key, count in _maintenance_failures.items()
+            if count >= MAINTENANCE_FAILURE_ALERT_THRESHOLD
+        }
+
+
+def has_pending_maintenance_retry(key: str) -> bool:
+    """Whether the last maintenance pass for ``key`` left work unfinished.
+
+    Physical compaction success clears the fragment and version thresholds, so
+    without this a failed FTS rebuild would never be retried. Per-process, so a
+    restart drops the marker and the table waits for the next threshold hit.
+    """
+    with _maintenance_failures_lock:
+        return key in _maintenance_failures
+
+
+def _vector_index_params(policy: Any, row_count: int) -> Tuple[Any, Dict[str, Any]]:
+    """Pick the index type for a table of this size and its create_index kwargs."""
+    try:
+        from lancedb.index import IVF_HNSW_SQ, IVF_PQ  # type: ignore
+    except ImportError:
+        IVF_HNSW_SQ = "IVF_HNSW_SQ"
+        IVF_PQ = "IVF_PQ"
+
+    from ..core.schemas import IndexType
+
+    if row_count >= policy.ivfpq_threshold_rows:
+        recommended, index_type = IndexType.IVFPQ, IVF_PQ
+        create_params = policy.ivfpq_params or {}
+    else:
+        recommended, index_type = IndexType.HNSW, IVF_HNSW_SQ
+        create_params = policy.hnsw_params or {}
+
+    return recommended, {
+        "metric": policy.metric.value,
+        "index_type": index_type,
+        **create_params,
+    }
+
+
 @contextmanager
-def _compaction_lock(conn: Any, table_name: str) -> Iterator[bool]:
+def _compaction_lock(conn: Any, table_name: str, timeout: float = 0) -> Iterator[bool]:
     """Yield whether this process took the compaction lock for one table.
 
     Concurrent ``optimize()`` calls each rewrite the table in full and then all
     but one lose the commit, so the losers waste a complete rewrite. A
-    non-blocking lock keeps one worker doing the work; the rest skip, which
-    costs nothing because the next ingestion compacts instead.
+    non-blocking lock keeps one worker doing the work; the rest skip and wait
+    for the next scheduled sweep, up to one maintenance interval later. Pass a
+    ``timeout`` to wait instead of skipping -- the weekly retrain has no cheap
+    next attempt to fall back on.
 
     Per table, not per database: the work is per table, so a database-wide lock
     would let one worker's collection starve another's embeddings table.
@@ -93,7 +181,9 @@ def _compaction_lock(conn: Any, table_name: str) -> Iterator[bool]:
         return
 
     try:
-        lock = FileLock(os.path.join(uri, f".{table_name}.compaction.lock"), timeout=0)
+        lock = FileLock(
+            os.path.join(uri, f".{table_name}.compaction.lock"), timeout=timeout
+        )
         lock.acquire()
     except Timeout:
         yield False
@@ -878,6 +968,9 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             logger.warning("Failed to list LanceDB tables: %s", exc)
             return []
 
+    def list_table_names_strict(self) -> Sequence[str]:
+        return list_table_names(self._get_connection())
+
     def get_vector_dimension(self, table_name: str) -> Optional[int]:
         """Get the vector dimension from a table's schema."""
         from ..LanceDB.schema_manager import _safe_close_table
@@ -1376,14 +1469,6 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         from ..core.config import IndexPolicy
         from ..core.schemas import IndexResult
         from ..LanceDB.model_tag_utils import to_model_tag
-
-        # Import LanceDB index types
-        try:
-            from lancedb.index import IVF_HNSW_SQ, IVF_PQ  # type: ignore
-        except ImportError:
-            IVF_HNSW_SQ = "IVF_HNSW_SQ"
-            IVF_PQ = "IVF_PQ"
-
         from ..LanceDB.schema_manager import _safe_close_table
 
         conn = self._get_connection()
@@ -1432,13 +1517,9 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                     f"({policy.enable_threshold_rows}) for index creation"
                 )
             else:
-                # Auto-select index type based on scale
                 from ..core.schemas import IndexType
 
-                if row_count >= policy.ivfpq_threshold_rows:
-                    recommended_type = IndexType.IVFPQ
-                else:
-                    recommended_type = IndexType.HNSW
+                recommended_type, all_params = _vector_index_params(policy, row_count)
 
                 # Check existing indexes
                 indexes = table.list_indices()
@@ -1448,27 +1529,12 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                 has_vector_index = any("vector" in idx.columns for idx in indexes)
 
                 if not has_vector_index:
-                    # Create index with recommended type
-                    if recommended_type == IndexType.IVFPQ:
-                        index_type = IVF_PQ
-                        create_params = policy.ivfpq_params or {}
-                    else:  # HNSW
-                        index_type = IVF_HNSW_SQ
-                        create_params = policy.hnsw_params or {}
-
-                    # Merge metric with create_params
-                    all_params = {
-                        "metric": policy.metric.value,
-                        "index_type": index_type,
-                        **create_params,
-                    }
-
                     table.create_index(**all_params)
                     vector_index_status = "index_building"
                     logger.info(
                         "Successfully created vector index for %s (type=%s, metric=%s)",
                         table_name,
-                        index_type,
+                        all_params["index_type"],
                         policy.metric.value,
                     )
                     if recommended_type == IndexType.IVFPQ:
@@ -1600,6 +1666,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                 )
             # Must precede optimize: its incremental FTS merge is reported to
             # panic on older-writer indices, taking the index step down (lance#8310).
+            fts_ok = True
             try:
                 self._rebuild_fts_index(table, table_name)
             except (KeyboardInterrupt, SystemExit):
@@ -1607,15 +1674,20 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             except BaseException as exc:  # noqa: BLE001
                 # BaseException because pyo3 raises a Rust panic as
                 # PanicException; losing compaction costs more than stale FTS.
+                fts_ok = False
                 logger.warning("FTS rebuild failed for %s: %s", table_name, exc)
             table.optimize(cleanup_older_than=cleanup_older_than)
             # Pruning drops the versions cached handles point at, same reason
             # the delete paths invalidate after mutating a table.
             self.invalidate_table_cache(table_name)
             logger.info("Optimized %s", table_name)
+            # A swallowed FTS rebuild failure still leaves the index stale, so
+            # it counts as an incomplete pass even though compaction succeeded.
+            _record_maintenance_outcome(table_name, fts_ok)
             return True
         except Exception as e:  # noqa: BLE001
             logger.warning("Optimize failed for %s: %s", table_name, e)
+            _record_maintenance_outcome(table_name, False)
             return False
         finally:
             _safe_close_table(table)
@@ -1636,6 +1708,56 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         fts_params = {"with_position": True, **(DEFAULT_INDEX_POLICY.fts_params or {})}
         table.create_fts_index("text", replace=True, **fts_params)
         logger.info("Rebuilt FTS index for %s before optimize", table_name)
+
+    def retrain_vector_index(self, table_name: str) -> str:
+        """Rebuild an existing vector index from scratch.
+
+        ``optimize()``'s index step only assigns new rows to the partitions the
+        index already has, so recall drifts as the corpus grows. Far more
+        expensive than a compaction pass, hence its own coarse schedule.
+
+        Returns one of ``retrained``, ``no_index``, ``contended`` or ``failed``:
+        the weekly cadence runs 168 times less often than compaction, so losing
+        one attempt to a lock it shared with an hourly sweep costs a whole week
+        and must not read as "nothing to do".
+        """
+        from ..core.config import IndexPolicy
+        from ..LanceDB.schema_manager import _safe_close_table
+
+        table = None
+        try:
+            conn = self._get_connection()
+            with _compaction_lock(
+                conn, table_name, timeout=RETRAIN_LOCK_WAIT_SECONDS
+            ) as acquired:
+                if not acquired:
+                    logger.warning(
+                        "Gave up waiting %ss for the %s maintenance lock; "
+                        "vector index not retrained",
+                        RETRAIN_LOCK_WAIT_SECONDS,
+                        table_name,
+                    )
+                    _record_maintenance_outcome(f"{table_name}:retrain", False)
+                    return "contended"
+                table = conn.open_table(table_name)
+                if not any("vector" in idx.columns for idx in table.list_indices()):
+                    return "no_index"
+                policy = IndexPolicy()
+                row_count = table.count_rows()
+                _, params = _vector_index_params(policy, row_count)
+                table.create_index(**params)
+                self.invalidate_table_cache(table_name)
+                logger.info(
+                    "Retrained vector index for %s (%s rows)", table_name, row_count
+                )
+                _record_maintenance_outcome(f"{table_name}:retrain", True)
+                return "retrained"
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Vector index retrain failed for %s: %s", table_name, e)
+            _record_maintenance_outcome(f"{table_name}:retrain", False)
+            return "failed"
+        finally:
+            _safe_close_table(table)
 
     def should_compact(
         self, table_name: str, policy: Optional[IndexPolicy] = None
@@ -1658,7 +1780,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         Deliberately independent of :meth:`should_reindex`: index staleness is a
         third, unrelated problem, and ``optimize()`` bundles compaction with
         index rebuilds, so reusing that predicate would rebuild large unrelated
-        indices on every ingest.
+        indices on every maintenance pass.
         """
         from ..LanceDB.schema_manager import _safe_close_table
 
@@ -1685,22 +1807,30 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             _safe_close_table(table)
 
     def compact_tables(
-        self, table_names: Sequence[str], policy: Optional[IndexPolicy] = None
+        self,
+        table_names: Sequence[str],
+        policy: Optional[IndexPolicy] = None,
+        stop_event: Optional[threading.Event] = None,
     ) -> List[str]:
         """Compact the degraded tables among ``table_names``; returns those done.
 
-        Callers pass the tables they just wrote; sweeping the whole database on
-        every ingest costs more than it saves. Names that do not exist are
-        skipped without opening anything -- callers probe more than one spelling
-        of the embeddings table, so a miss is routine, not exceptional.
+        The scheduled sweep passes the whole table listing; the per-table
+        gating below is what keeps that affordable. Names that do not exist are
+        skipped without opening anything.
 
         Takes a per-table advisory lock: concurrent ``optimize()`` calls all
         rewrite the table and then all but one lose the commit, so the losers
         burn a full rewrite for nothing. Whoever cannot take a table's lock
-        skips that table -- free, the next ingestion compacts instead -- and
-        moves on to the rest, so one busy table cannot starve the others.
+        skips that table -- the next sweep picks it up, up to one maintenance
+        interval later -- and moves on, so one busy table cannot starve the rest.
+
+        A table whose last pass left work unfinished stays eligible even once
+        the physical thresholds are clear: a successful ``optimize()`` resets
+        them while a failed FTS rebuild leaves the index stale.
 
         Best-effort maintenance: individual failures are logged, never raised.
+        ``stop_event`` is checked between tables so a shutdown does not have to
+        wait out the whole listing.
         """
         if not table_names:
             return []
@@ -1716,9 +1846,9 @@ class LanceDBVectorIndexStore(VectorIndexStore):
 
         candidates = [name for name in table_names if name in existing]
         if not candidates:
-            # list_table_names() returns [] rather than raising when it cannot
-            # read the listing, so without this compaction would switch itself
-            # off permanently and silently.
+            # Only reachable when the listing itself is unreadable, since the
+            # sweep's names come from it -- and list_table_names() returns []
+            # rather than raising, so this is the one signal that it did.
             logger.warning(
                 "None of the tables to compact were found in the database "
                 "listing (asked for %s); skipping compaction",
@@ -1728,11 +1858,19 @@ class LanceDBVectorIndexStore(VectorIndexStore):
 
         compacted: List[str] = []
         for name in candidates:
+            # Per table, not finer: one table's optimize is a single native
+            # call this cannot interrupt.
+            if stop_event is not None and stop_event.is_set():
+                logger.info("Compaction stopped after %s table(s)", len(compacted))
+                break
             with _compaction_lock(conn, name) as acquired:
                 if not acquired:
                     logger.debug("%s is being compacted elsewhere; skipping", name)
                     continue
-                if self.should_compact(name, policy) and self.trigger_reindex(
+                eligible = self.should_compact(
+                    name, policy
+                ) or has_pending_maintenance_retry(name)
+                if eligible and self.trigger_reindex(
                     name, cleanup_older_than=cleanup_older_than
                 ):
                     compacted.append(name)

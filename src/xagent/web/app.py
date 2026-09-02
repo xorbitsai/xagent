@@ -23,6 +23,7 @@ from ..config import (
     get_file_storage_startup_sync_enabled,
     get_gmail_watch_enabled,
     get_gmail_watch_renewal_interval_seconds,
+    get_kb_index_maintenance_interval_seconds,
     get_orphan_upload_sweep_interval_seconds,
     get_session_secret,
     get_task_lease_recovery_batch_size,
@@ -89,6 +90,7 @@ from .services.interaction_rollout import (
     mark_native_schema_ready,
     validate_interaction_rollout_at_startup,
 )
+from .services.kb_maintenance import run_kb_maintenance_loop
 from .services.local_browser_runtime import (
     register_local_browser_runtime,
     unregister_local_browser_runtime,
@@ -638,6 +640,81 @@ async def stop_orphan_upload_gc_task(app_instance: FastAPI) -> None:
                 "Orphan upload GC loop stopped after failure",
                 exc_info=exc,
             )
+
+
+def start_kb_maintenance_task(
+    app_instance: FastAPI,
+) -> asyncio.Task[Any] | None:
+    """Start the in-process KB index maintenance loop (#1557).
+
+    Runs in every supported deployment, like ``start_orphan_upload_gc_task``:
+    XAGENT_CELERY_ENABLED says durable jobs go to a worker, not that Beat is
+    running (``scripts/dev_background_jobs.py --no-beat`` sets one without the
+    other), so gating on it would leave that deployment with no maintenance at
+    all. Overlapping with Beat is safe -- the per-table compaction lock is a
+    FileLock on the shared LanceDB volume and the loser skips that table.
+    """
+
+    existing_task = cast(
+        asyncio.Task[Any] | None,
+        getattr(app_instance.state, "kb_maintenance_task", None),
+    )
+    if existing_task is not None and not existing_task.done():
+        return existing_task
+    app_instance.state.kb_maintenance_task = None
+
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        logger.info("Skipping in-process KB index maintenance (test environment)")
+        return None
+
+    poll_interval_seconds = get_kb_index_maintenance_interval_seconds()
+    stop_event = threading.Event()
+    app_instance.state.kb_maintenance_stop = stop_event
+    task = asyncio.create_task(
+        run_kb_maintenance_loop(
+            poll_interval_seconds=poll_interval_seconds,
+            stop_event=stop_event,
+        )
+    )
+    app_instance.state.kb_maintenance_task = task
+    logger.info(
+        "Started in-process KB index maintenance loop (interval=%ss)",
+        poll_interval_seconds,
+    )
+    return task
+
+
+async def stop_kb_maintenance_task(app_instance: FastAPI) -> None:
+    """Flag the sweep, then collect the coroutine.
+
+    Cancelling an ``asyncio.to_thread`` await settles the task at once and
+    leaves the thread running, so the flag -- not the cancel -- is what ends a
+    sweep in flight, at its next table boundary. Awaiting here therefore costs
+    nothing and bounds nothing; the unbounded join is
+    ``loop.shutdown_default_executor()`` further down the asyncio teardown.
+    """
+
+    stop_event = getattr(app_instance.state, "kb_maintenance_stop", None)
+    if stop_event is not None:
+        stop_event.set()
+    app_instance.state.kb_maintenance_stop = None
+
+    task = getattr(app_instance.state, "kb_maintenance_task", None)
+    app_instance.state.kb_maintenance_task = None
+    if task is None:
+        return
+    if not task.done():
+        logger.info("Cancelling KB index maintenance loop...")
+        task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:
+        logger.error(
+            "KB index maintenance loop stopped after failure",
+            exc_info=exc,
+        )
 
 
 def start_temp_file_cleanup_task(
@@ -1237,6 +1314,7 @@ async def startup_event() -> None:
     start_task_lease_recovery_task(app)
     start_uploaded_file_recovery_task(app)
     start_orphan_upload_gc_task(app)
+    start_kb_maintenance_task(app)
 
     # Persisted ExecutionScope snapshots (workforce sub-tasks) keep a
     # sub-task scoped across process restarts. With no resolver registered
@@ -1765,6 +1843,7 @@ async def shutdown_event() -> None:
         await stop_task_command_dispatcher()
     _task_command_dispatcher_task = None
 
+    await stop_kb_maintenance_task(app)
     await stop_orphan_upload_gc_task(app)
     await stop_uploaded_file_recovery_task(app)
     await stop_task_lease_recovery_task(app)

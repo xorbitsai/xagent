@@ -9,7 +9,6 @@ import pytest
 
 from xagent.core.tools.core.RAG_tools.core.config import DEFAULT_INDEX_POLICY
 from xagent.core.tools.core.RAG_tools.core.exceptions import DatabaseOperationError
-from xagent.core.tools.core.RAG_tools.storage.factory import StorageFactory
 from xagent.core.tools.core.RAG_tools.storage.lancedb_stores import (
     LanceDBIngestionStatusStore,
     LanceDBMainPointerStore,
@@ -3273,78 +3272,6 @@ def test_compact_tables_swallows_optimize_failure(mock_get_connection: Mock) -> 
     broken.optimize.assert_called_once()
 
 
-def test_ingestion_compaction_hook_never_raises() -> None:
-    """Compaction failure must not break a successful ingestion."""
-    from xagent.core.tools.core.RAG_tools.pipelines.document_ingestion import (
-        _compact_storage_if_needed,
-    )
-
-    with patch.object(
-        StorageFactory,
-        "get_vector_index_store",
-        side_effect=RuntimeError("store unavailable"),
-    ):
-        _compact_storage_if_needed("embedding-default")
-
-
-def test_ingestion_compaction_hook_scopes_to_written_tables() -> None:
-    """The hook compacts exactly the tables an ingestion writes, nothing else."""
-    from xagent.core.tools.core.RAG_tools.pipelines.document_ingestion import (
-        _compact_storage_if_needed,
-    )
-
-    store = Mock()
-    store.compact_tables.return_value = []
-    with patch.object(StorageFactory, "get_vector_index_store", return_value=store):
-        _compact_storage_if_needed("text-embedding-v4")
-
-    names = store.compact_tables.call_args.args[0]
-    assert set(names) == {
-        "documents",
-        "parses",
-        "chunks",
-        "collection_config",
-        "collection_metadata",
-        "ingestion_runs",
-        "embeddings_text_embedding_v4",
-    }
-    assert len(names) == len(set(names))  # idempotent tag: no duplicate probe
-
-
-def test_ingestion_compaction_hook_covers_vendor_prefixed_model_ids() -> None:
-    """A vendor-prefixed id must reach the table the write path really creates.
-
-    ``to_model_tag`` is not idempotent for ids containing a slash, and the write
-    path applies it twice (CollectionHandle then upsert_embeddings), so probing
-    only the single-applied spelling silently misses the embeddings table.
-    """
-    from xagent.core.tools.core.RAG_tools.LanceDB.model_tag_utils import to_model_tag
-    from xagent.core.tools.core.RAG_tools.pipelines.document_ingestion import (
-        _compact_storage_if_needed,
-    )
-
-    model_id = "BAAI/bge-large-zh-v1.5"
-    # Guard the premise: if to_model_tag ever becomes idempotent this test is moot.
-    assert to_model_tag(model_id) != to_model_tag(to_model_tag(model_id))
-
-    store = Mock()
-    store.compact_tables.return_value = []
-    with patch.object(StorageFactory, "get_vector_index_store", return_value=store):
-        _compact_storage_if_needed(model_id)
-
-    names = store.compact_tables.call_args.args[0]
-    assert set(names) == {
-        "documents",
-        "parses",
-        "chunks",
-        "collection_config",
-        "collection_metadata",
-        "ingestion_runs",
-        "embeddings_BAAI_bge_large_zh_v1_5",  # single-applied (legacy spelling)
-        "embeddings_baai_bge_large_zh_v1_5",  # double-applied (what writes create)
-    }
-
-
 def test_compaction_collapses_fragments_and_retains_recent_versions(
     tmp_path: Any,
 ) -> None:
@@ -3461,82 +3388,6 @@ def test_trigger_reindex_drops_the_cached_handle(mock_get_connection: Mock) -> N
 
     assert store.trigger_reindex("documents") is True
     assert "documents" not in store._table_cache
-
-
-def test_compaction_finds_the_embeddings_table_the_write_path_creates(
-    tmp_path: Any,
-) -> None:
-    """End-to-end: the real write path's table name is one the hook actually probes.
-
-    Exercises the genuine double application of ``to_model_tag`` -- the caller
-    (CollectionHandle) tags the model id, then ``upsert_embeddings`` tags it
-    again -- and asserts the ingest hook asks for that name letter for letter.
-
-    The comparison is on the probed strings, not on whether ``open_table``
-    happens to succeed: a case-insensitive filesystem (macOS) resolves the
-    wrongly-cased name to the same directory, so an open-based assertion would
-    pass locally and still miss the table on a case-sensitive production box.
-    """
-    import lancedb
-
-    from xagent.core.tools.core.RAG_tools.LanceDB.model_tag_utils import to_model_tag
-    from xagent.core.tools.core.RAG_tools.pipelines.document_ingestion import (
-        _compact_storage_if_needed,
-    )
-
-    model_id = "BAAI/bge-large-zh-v1.5"
-    db = lancedb.connect(str(tmp_path))
-    store = LanceDBVectorIndexStore()
-    probed: List[str] = []
-
-    with patch.object(store, "_get_connection", return_value=db):
-        # CollectionHandle._upsert_model_embeddings tags once, then passes on.
-        model_tag = to_model_tag(model_id)
-        for i in range(12):
-            store.upsert_embeddings(
-                model_tag,
-                [
-                    {
-                        "collection": "demo",
-                        "doc_id": "doc-1",
-                        "chunk_id": f"chunk-{i}",
-                        "parse_hash": "hash-1",
-                        "model": model_id,
-                        "vector": [0.1, 0.2],
-                        "text": f"text-{i}",
-                        "chunk_hash": f"chunk-hash-{i}",
-                        "metadata": "{}",
-                    }
-                ],
-            )
-
-        created = [n for n in db.table_names() if n.startswith("embeddings_")]
-        assert created == ["embeddings_baai_bge_large_zh_v1_5"]
-
-        from xagent.core.tools.core.RAG_tools.core.config import IndexPolicy
-
-        real_compact_tables = store.compact_tables
-
-        def _record(names: Any, policy: Any = None) -> List[str]:
-            probed.extend(names)
-            return real_compact_tables(names, policy)
-
-        with patch.object(store, "compact_tables", _record):
-            with patch.object(
-                StorageFactory, "get_vector_index_store", return_value=store
-            ):
-                with patch(
-                    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores."
-                    "DEFAULT_INDEX_POLICY",
-                    IndexPolicy(compact_fragment_threshold=10),
-                ):
-                    _compact_storage_if_needed(model_id)
-
-        stats = db.open_table(created[0]).stats()
-
-    # The name the write path really created must be asked for verbatim.
-    assert created[0] in probed
-    assert stats["fragment_stats"]["num_fragments"] == 1  # and really got compacted
 
 
 @patch(

@@ -2289,6 +2289,47 @@ class TestOrphanUploadGcConfig:
         assert get_orphan_upload_sweep_interval_seconds() == 900
 
 
+class TestKBIndexMaintenanceConfig:
+    """Scheduled KB index maintenance intervals (#1557)."""
+
+    def test_maintenance_interval_default(self, monkeypatch):
+        from xagent.config import get_kb_index_maintenance_interval_seconds
+
+        monkeypatch.delenv(
+            "XAGENT_KB_INDEX_MAINTENANCE_INTERVAL_SECONDS", raising=False
+        )
+        assert get_kb_index_maintenance_interval_seconds() == 3600
+
+    def test_maintenance_interval_env_override(self, monkeypatch):
+        from xagent.config import get_kb_index_maintenance_interval_seconds
+
+        monkeypatch.setenv("XAGENT_KB_INDEX_MAINTENANCE_INTERVAL_SECONDS", "900")
+        assert get_kb_index_maintenance_interval_seconds() == 900
+
+    def test_retrain_interval_defaults_far_coarser_than_maintenance(self, monkeypatch):
+        """The retrain must not default onto the compaction cadence."""
+        from xagent.config import (
+            get_kb_index_maintenance_interval_seconds,
+            get_kb_vector_retrain_interval_seconds,
+        )
+
+        monkeypatch.delenv("XAGENT_KB_VECTOR_RETRAIN_INTERVAL_SECONDS", raising=False)
+        monkeypatch.delenv(
+            "XAGENT_KB_INDEX_MAINTENANCE_INTERVAL_SECONDS", raising=False
+        )
+        assert get_kb_vector_retrain_interval_seconds() == 7 * 24 * 3600
+        assert (
+            get_kb_vector_retrain_interval_seconds()
+            > get_kb_index_maintenance_interval_seconds()
+        )
+
+    def test_retrain_interval_below_minimum_falls_back_to_default(self, monkeypatch):
+        from xagent.config import get_kb_vector_retrain_interval_seconds
+
+        monkeypatch.setenv("XAGENT_KB_VECTOR_RETRAIN_INTERVAL_SECONDS", "60")
+        assert get_kb_vector_retrain_interval_seconds() == 7 * 24 * 3600
+
+
 class TestWorkforcePreviewRunReapConfig:
     """PR #1060 review: get_workforce_preview_run_stale_seconds() had no
     test, unlike its sibling TTL config functions above."""

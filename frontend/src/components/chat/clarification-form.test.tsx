@@ -491,7 +491,45 @@ describe("ClarificationForm connect_apps interaction", () => {
     await waitFor(() => {
       expect(appContextMock.sendMessage).toHaveBeenCalledWith(
         "chatPage.clarification.connectApps.continue",
-        { force: true },
+        { force: true, metadata: {} },
+        [],
+      )
+    })
+  })
+
+  it("includes request_id in the Continue metadata, matching Skip", async () => {
+    // handleContinueConnectApps must carry the same request_id metadata
+    // handleSkipConnectApps already does - the two are otherwise the same
+    // "acknowledgement becomes a chat message" mechanism, and silently
+    // diverging here would be a trap for whichever gets read first by a
+    // future backend consumer.
+    mcpAppsMock.apps = [
+      {
+        id: "gmail",
+        name: "Gmail",
+        description: "",
+        icon: "",
+        users: "",
+        transport: "builtin",
+        provider: "google",
+        category: "Communication",
+        is_connected: true,
+      },
+    ]
+
+    render(
+      <ClarificationForm
+        interactions={[CONNECT_APPS_INTERACTION]}
+        requestId="inputreq_continue_metadata"
+      />,
+    )
+
+    fireEvent.click(screen.getByRole("button", { name: "chatPage.clarification.connectApps.continue" }))
+
+    await waitFor(() => {
+      expect(appContextMock.sendMessage).toHaveBeenCalledWith(
+        "chatPage.clarification.connectApps.continue",
+        { force: true, metadata: { request_id: "inputreq_continue_metadata" } },
         [],
       )
     })
@@ -625,6 +663,58 @@ describe("ClarificationForm connect_apps interaction", () => {
     expect(
       screen.queryByRole("button", { name: "chatPage.clarification.connectApps.continue" }),
     ).not.toBeInTheDocument()
+  })
+
+  it("gives simultaneously-paused cards distinct React keys even when they share a requestId", () => {
+    // connectAppsCardKey must not collapse to the bare requestId when one is
+    // present - with two cards from the same live pause round (same
+    // requestId), that would give every sibling card in this map the exact
+    // same React key, which React would warn about and could misattribute
+    // one card's DOM node/local state to another on re-render.
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
+    mcpAppsMock.apps = [
+      {
+        id: "gmail",
+        name: "Gmail",
+        description: "",
+        icon: "",
+        users: "",
+        transport: "builtin",
+        provider: "google",
+        category: "Communication",
+        is_connected: true,
+      },
+      {
+        id: "salesforce",
+        name: "Salesforce",
+        description: "",
+        icon: "",
+        users: "",
+        transport: "builtin",
+        provider: "salesforce",
+        category: "Sales",
+        is_connected: false,
+      },
+    ]
+
+    render(
+      <ClarificationForm
+        interactions={[
+          CONNECT_APPS_INTERACTION,
+          { type: "connect_apps", field: "connect_apps", label: "Connect your apps", apps: ["Salesforce"] },
+        ]}
+        requestId="shared-round-1"
+        onSend={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByText("Gmail")).toBeInTheDocument()
+    expect(screen.getByText("Salesforce")).toBeInTheDocument()
+    const duplicateKeyWarning = consoleErrorSpy.mock.calls.some((call) =>
+      typeof call[0] === "string" && call[0].includes("same key"),
+    )
+    expect(duplicateKeyWarning).toBe(false)
+    consoleErrorSpy.mockRestore()
   })
 
   it("hides every sibling card's Continue once one card's Continue is clicked", async () => {

@@ -129,18 +129,28 @@ const LIVE_WIDGET_TYPES = new Set(["connect_apps"])
 // the task_waiting_for_user path (resume-restore reassertion, historical
 // replay) rather than the live agent_message pause broadcast - reachable
 // not just on page load but on a live WebSocket reconnect mid-session too.
-// Falling back to the requested apps keeps the key stable across re-renders
-// of the SAME occurrence (so an already-answered card doesn't spuriously
-// reset) while still changing key - forcing the real remount the requestId
-// key exists for - whenever a genuinely different set of apps is asked for.
-// It cannot distinguish two rounds asking for the exact same app twice in a
-// row, which is the one case only a real per-round id can cover.
+// Falling back to the requested apps keeps the round-identity part of the
+// key stable across re-renders of the SAME occurrence (so an already-
+// answered card doesn't spuriously reset) while still changing - forcing
+// the real remount the requestId key exists for - whenever a genuinely
+// different set of apps is asked for. It cannot distinguish two rounds
+// asking for the exact same app twice in a row, which is the one case only
+// a real per-round id can cover.
+//
+// field/index are always appended, not just folded into the fallback: with
+// several simultaneously-paused connect_apps cards sharing the same live
+// requestId, returning requestId alone here would give every sibling card
+// in the isConnectAppsOnly map the SAME React key - React would warn and
+// could reuse/misattribute a DOM node and its local continued/skipped state
+// between two unrelated cards on re-render.
 const connectAppsCardKey = (
   requestId: string | undefined,
   interaction: Interaction,
   index: number,
-): string =>
-  requestId ?? `apps:${(interaction.apps ?? []).join(",")}-${interaction.field}-${index}`
+): string => {
+  const roundIdentity = requestId ?? `apps:${(interaction.apps ?? []).join(",")}`
+  return `${roundIdentity}-${interaction.field}-${index}`
+}
 
 export function ClarificationForm({
   interactions,
@@ -206,7 +216,7 @@ export function ClarificationForm({
 
   const [formState, setFormState] = useState<Record<string, any>>({})
   const previousRequestIdRef = useRef(connectAppsRoundSignal)
-  const latestRequestIdRef = useRef(requestId)
+  const latestRequestIdRef = useRef(connectAppsRoundSignal)
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [isSubmitted, setIsSubmitted] = useState(!active && !isConnectAppsOnly)
   const [isOpen, setIsOpen] = useState(active || isConnectAppsOnly)
@@ -239,7 +249,11 @@ export function ClarificationForm({
   const [connectAppsAnswered, setConnectAppsAnswered] = useState(false)
 
   useLayoutEffect(() => {
-    latestRequestIdRef.current = requestId
+    // connectAppsRoundSignal (not raw requestId) - see handleSubmit's
+    // matching comment on submittedRequestId for why: the two agree
+    // whenever requestId is present, and only diverge on the requestId-less
+    // path this ref exists to stay correct on too.
+    latestRequestIdRef.current = connectAppsRoundSignal
     if (previousRequestIdRef.current === connectAppsRoundSignal) return
     previousRequestIdRef.current = connectAppsRoundSignal
     setFormState({})
@@ -384,7 +398,14 @@ export function ClarificationForm({
   }
 
   const handleSubmit = async () => {
-    const submittedRequestId = requestId
+    // connectAppsRoundSignal, not raw requestId: when requestId is present
+    // the two are identical, but on the requestId-less task_waiting_for_user
+    // path this is what actually distinguishes "the round this submit
+    // belongs to" from a later one that arrives before this submit's promise
+    // settles - matching what the round-reset effect below compares against
+    // (previousRequestIdRef), so a late-resolving submit from a stale round
+    // can't collapse/mark-answered a newer round it raced.
+    const submittedRequestId = connectAppsRoundSignal
     // Construct the message
     const metadata: any = requestId ? { request_id: requestId } : {}
     const lines = normalizedInteractions.flatMap(interaction => {
@@ -558,11 +579,17 @@ export function ClarificationForm({
   // once every app the agent actually asked for is already connected.
   const handleContinueConnectApps = async () => {
     const message = t("chatPage.clarification.connectApps.continue")
+    // Matches handleSkipConnectApps's metadata exactly - no backend consumer
+    // reads request_id from this payload today, but nothing about a Continue
+    // click makes that correlation less relevant than a Skip's, and the two
+    // silently diverging here would be a trap for whichever one a future
+    // backend consumer gets wired up against first.
+    const metadata = requestId ? { request_id: requestId } : {}
     try {
       if (onSend) {
-        await onSend(message, [], {})
+        await onSend(message, [], metadata)
       } else if (sendMessage) {
-        await sendMessage(message, { force: true }, [])
+        await sendMessage(message, { force: true, metadata }, [])
       }
     } catch (error) {
       console.error("Failed to send connect-apps continue response", error)

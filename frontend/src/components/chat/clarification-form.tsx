@@ -125,6 +125,23 @@ const sendHintKey = (
 // switch below instead of falling through to its "unsupported type" case.
 const LIVE_WIDGET_TYPES = new Set(["connect_apps"])
 
+// requestId is undefined/"undefined" for a connect_apps card rendered from
+// the task_waiting_for_user path (resume-restore reassertion, historical
+// replay) rather than the live agent_message pause broadcast - reachable
+// not just on page load but on a live WebSocket reconnect mid-session too.
+// Falling back to the requested apps keeps the key stable across re-renders
+// of the SAME occurrence (so an already-answered card doesn't spuriously
+// reset) while still changing key - forcing the real remount the requestId
+// key exists for - whenever a genuinely different set of apps is asked for.
+// It cannot distinguish two rounds asking for the exact same app twice in a
+// row, which is the one case only a real per-round id can cover.
+const connectAppsCardKey = (
+  requestId: string | undefined,
+  interaction: Interaction,
+  index: number,
+): string =>
+  requestId ?? `apps:${(interaction.apps ?? []).join(",")}-${interaction.field}-${index}`
+
 export function ClarificationForm({
   interactions,
   messageId,
@@ -156,6 +173,22 @@ export function ClarificationForm({
   const isConnectAppsOnly =
     interactions.length > 0 && interactions.every((interaction) => LIVE_WIDGET_TYPES.has(interaction.type))
 
+  // requestId is undefined for the task_waiting_for_user broadcast path
+  // (resume-restore reassertion, historical replay) - unlike a live
+  // agent_message pause, it never carries one at all. Without a fallback,
+  // the requestId-keyed reset effect right below (which clears
+  // connectAppsAnswered for a new round - see that flag's own comment)
+  // would see "undefined === undefined" forever and never fire again after
+  // the first requestId-less round, permanently disabling every later one.
+  // Mirrors connectAppsCardKey's own fallback for the same reason, but
+  // covers the whole pause's requested apps, not one card's.
+  const connectAppsRoundSignal =
+    requestId ??
+    interactions
+      .filter((interaction) => interaction.type === "connect_apps")
+      .flatMap((interaction) => interaction.apps ?? [])
+      .join(",")
+
   const { t } = useI18n()
 
   // Ignore the persisted interaction.label for a live-widget type (it's only
@@ -172,7 +205,7 @@ export function ClarificationForm({
       : interaction.label || interaction.field
 
   const [formState, setFormState] = useState<Record<string, any>>({})
-  const previousRequestIdRef = useRef(requestId)
+  const previousRequestIdRef = useRef(connectAppsRoundSignal)
   const latestRequestIdRef = useRef(requestId)
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [isSubmitted, setIsSubmitted] = useState(!active && !isConnectAppsOnly)
@@ -207,15 +240,15 @@ export function ClarificationForm({
 
   useLayoutEffect(() => {
     latestRequestIdRef.current = requestId
-    if (previousRequestIdRef.current === requestId) return
-    previousRequestIdRef.current = requestId
+    if (previousRequestIdRef.current === connectAppsRoundSignal) return
+    previousRequestIdRef.current = connectAppsRoundSignal
     setFormState({})
     setIsSubmitting(false)
     setIsSubmitted(!active && !isConnectAppsOnly)
     setIsOpen(active || isConnectAppsOnly)
     setSendFailure(null)
     setConnectAppsAnswered(false)
-  }, [active, isConnectAppsOnly, requestId])
+  }, [active, isConnectAppsOnly, requestId, connectAppsRoundSignal])
 
   useEffect(() => {
     if (active) {
@@ -776,9 +809,11 @@ export function ClarificationForm({
           // inside ConnectAppsField itself) would otherwise survive the
           // reused live-turn instance exactly like connectAppsAnswered
           // almost did, permanently disabling this button for every
-          // subsequent round.
+          // subsequent round. connectAppsCardKey's own comment covers the
+          // requestId-less fallback this needs for the task_waiting_for_user
+          // broadcast path, which never carries one.
           <ConnectAppsField
-            key={requestId}
+            key={connectAppsCardKey(requestId, interaction, 0)}
             interaction={interaction}
             onSkip={active && !connectAppsAnswered ? handleSkipConnectAppsOnce : undefined}
             onContinue={
@@ -842,9 +877,10 @@ export function ClarificationForm({
               // independent local continued/skipped state, so answering one
               // must hide every sibling's button too, not just its own.
               // Also keyed on requestId - see the mixed-list case's own
-              // comment on why a new pause round must force a real remount.
+              // comment on why a new pause round must force a real remount,
+              // and connectAppsCardKey's for the requestId-less fallback.
               <ConnectAppsField
-                key={`${requestId}-${interaction.field}-${index}`}
+                key={connectAppsCardKey(requestId, interaction, index)}
                 interaction={interaction}
                 onSkip={active && !connectAppsAnswered ? handleSkipConnectAppsOnce : undefined}
                 onContinue={

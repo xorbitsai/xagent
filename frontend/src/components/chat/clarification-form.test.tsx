@@ -795,6 +795,69 @@ describe("ClarificationForm connect_apps interaction", () => {
     ).toBeInTheDocument()
   })
 
+  it("offers Continue again for a new pause with no requestId, when the requested apps differ", async () => {
+    // Models the task_waiting_for_user broadcast path (resume-restore
+    // reassertion, historical replay), which never carries a request_id at
+    // all - unlike the live agent_message path the test above covers. The
+    // requestId-less fallback key must still change for a genuinely new
+    // round so this reused instance's local answered state doesn't survive
+    // it, exactly as with a real requestId.
+    mcpAppsMock.apps = [
+      {
+        id: "gmail",
+        name: "Gmail",
+        description: "",
+        icon: "",
+        users: "",
+        transport: "builtin",
+        provider: "google",
+        category: "Communication",
+        is_connected: true,
+      },
+      {
+        id: "slack",
+        name: "Slack",
+        description: "",
+        icon: "",
+        users: "",
+        transport: "builtin",
+        provider: "slack",
+        category: "Communication",
+        is_connected: true,
+      },
+    ]
+    const onSend = vi.fn().mockResolvedValue(undefined)
+    const { rerender } = render(
+      <ClarificationForm
+        interactions={[{ ...CONNECT_APPS_INTERACTION, apps: ["Gmail"] }]}
+        requestId={undefined}
+        onSend={onSend}
+      />,
+    )
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "chatPage.clarification.connectApps.continue" }),
+    )
+    await waitFor(() => {
+      expect(onSend).toHaveBeenCalledTimes(1)
+    })
+    expect(
+      screen.queryByRole("button", { name: "chatPage.clarification.connectApps.continue" }),
+    ).not.toBeInTheDocument()
+
+    rerender(
+      <ClarificationForm
+        interactions={[{ ...CONNECT_APPS_INTERACTION, apps: ["Slack"] }]}
+        requestId={undefined}
+        onSend={onSend}
+      />,
+    )
+
+    expect(
+      screen.getByRole("button", { name: "chatPage.clarification.connectApps.continue" }),
+    ).toBeInTheDocument()
+  })
+
   it("does not offer Continue when a simultaneously-paused app is hidden from the connector catalog entirely", () => {
     // resolveRows silently drops a requested app name that doesn't resolve
     // to any catalog entry at all (e.g. one hidden via

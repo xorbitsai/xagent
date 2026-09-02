@@ -24,12 +24,14 @@ import pytest
 import sqlalchemy as sa
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
+from alembic.script import ScriptDirectory
 from sqlalchemy import text
 
 from tests.shared.postgres_disposable import (
     disposable_database_factory,
     load_migration_module,
 )
+from xagent.db.config import create_alembic_config
 from xagent.web.models.database import Base, _initialize_database_schema
 from xagent.web.models.task import (
     TASKSTATUS_ENUM_REPAIR_REVISION,
@@ -189,7 +191,17 @@ def test_a_pre_waiting_for_user_database_starts_after_upgrading_to_head(
             ),
             {"user_id": user_id, "label": LABEL},
         )
-    assert version == migration.revision
+    # `version` is whatever revision is actually current after upgrading to
+    # "head" -- which legitimately moves past this migration once a later
+    # revision chains on top of it, so this only needs to confirm the
+    # enum-repair migration was applied somewhere along the way, not that
+    # it's still the tip.
+    alembic_cfg = create_alembic_config(engine)
+    script = ScriptDirectory.from_config(alembic_cfg)
+    applied_revisions = {
+        rev.revision for rev in script.walk_revisions(base="base", head=version)
+    }
+    assert migration.revision in applied_revisions
 
 
 # ---- the revision's own branches ----

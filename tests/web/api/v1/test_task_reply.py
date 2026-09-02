@@ -862,17 +862,17 @@ def test_reply_checkpoint_read_error_maps_to_distinct_code(
         db.close()
 
 
-def test_reply_run_provenance_unavailable_overrides_the_start_a_new_task_message(
+def test_reply_run_provenance_unavailable_keeps_the_start_a_new_task_guidance(
     mock_start_task,
 ):
     """run_provenance_unavailable shares interaction_not_resumable's code
-    and status with superseded_legacy, but not its default message: unlike
-    a superseded legacy partition, this is not a permanent property of the
-    task -- the same task can become resumable again without starting a new
-    one. The default INTERACTION_NOT_RESUMABLE text ("Start a new task
-    instead of retrying") would tell the caller to give up on a task that
-    may recover on its own, so this reason must carry an overridden message
-    instead."""
+    and status with superseded_legacy, and shares its "start a new task"
+    guidance too: nothing on this side of v1 can repair or relax the
+    missing provenance, so a reply retry against the same task is a
+    deterministic re-refusal, exactly like a superseded legacy partition.
+    The override exists only to name the actual reason instead of the
+    default message's generic "a different run is active" -- not to tell
+    the caller the response is anything other than terminal."""
     agent_id, full_key = _create_agent_with_key()
     task_id = _create_waiting_task(full_key, agent_id, run_id="run-provenance-message")
     _insert_question_message(task_id)
@@ -895,9 +895,10 @@ def test_reply_run_provenance_unavailable_overrides_the_start_a_new_task_message
     body = resp.json()
     assert body["error"]["code"] == "interaction_not_resumable"
     message = body["error"]["message"]
-    assert "start a new task" not in message.lower()
+    assert "start a new task" in message.lower()
     assert "currently running" not in message.lower()
     assert "waiting_for_user" in message
+    assert "belonging to the current run" in message
 
 
 def test_reply_unknown_checkpoint_read_error_subclass_is_treated_as_retryable(

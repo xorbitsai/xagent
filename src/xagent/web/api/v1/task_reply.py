@@ -593,21 +593,23 @@ async def reply_to_task(
             if exc.reason == "run_provenance_unavailable":
                 # Not retryable by waiting -- the TASK_BUSY default below is
                 # for reasons where a different execution is genuinely live
-                # right now, which is not this -- but also not the
-                # permanent property of the task that INTERACTION_NOT_
-                # RESUMABLE's default message assumes: the anchored row may
-                # still be there, this reader just cannot verify it right
-                # now, and the same task can become resumable again without
-                # starting a new one. Override the default "start a new
-                # task" text accordingly; wording mirrors the a2a mapping
-                # for the same reason (a2a.py's message:send dict).
+                # right now, which is not this. Same error code and status
+                # as superseded_legacy below, and the same "start a new
+                # task" guidance: nothing on this side of v1 can repair or
+                # relax the missing provenance, so a reply retry against the
+                # same task is a deterministic re-refusal. Override only the
+                # default message's stated reason, to name the actual one
+                # instead of the generic "a different run is active"; wording
+                # mirrors the a2a mapping for the same reason (a2a.py's
+                # message:send dict).
                 raise V1ApiError(
                     V1ErrorCode.INTERACTION_NOT_RESUMABLE,
                     409,
                     message=(
-                        "This task's saved progress cannot currently be "
-                        "verified as belonging to the current run. The "
-                        "task remains in waiting_for_user."
+                        "This task's saved progress cannot be verified as "
+                        "belonging to the current run; it remains in "
+                        "waiting_for_user. Start a new task instead of "
+                        "retrying."
                     ),
                 ) from exc
             if exc.reason == "superseded_legacy":

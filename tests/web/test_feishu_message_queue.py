@@ -67,6 +67,7 @@ async def test_error_after_prepare_settles_preclaimed_task_instead_of_orphaning_
             task_id=45,
             is_new_task=True,
             managed_lease=managed,
+            prior_status=TaskStatus.PENDING,
         )
 
     sent_messages: list[str] = []
@@ -174,6 +175,7 @@ async def test_channel_failure_suppresses_stale_error_after_exact_settlement_rej
             task_id=45,
             is_new_task=True,
             managed_lease=managed,
+            prior_status=TaskStatus.PENDING,
         )
 
     monkeypatch.setattr(
@@ -340,6 +342,10 @@ async def test_successful_channel_turn_persists_user_before_exact_assistant_sett
             task_id=45,
             is_new_task=False,
             managed_lease=managed,
+            # This turn is resuming a prior connect_apps-style pause - the
+            # only scenario refresh_connector_runtime_tools should fire for
+            # (see the assertion on refresh_calls below).
+            prior_status=TaskStatus.WAITING_FOR_USER,
         )
 
     async def persist_message(**kwargs) -> None:  # type: ignore[no-untyped-def]

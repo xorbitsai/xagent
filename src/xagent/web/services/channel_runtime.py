@@ -102,6 +102,12 @@ class ClaimedChannelTask:
     is_new_task: bool
     managed_lease: ManagedTaskLease
     requested_agent_missing: bool = False
+    # The task's status as claimed - PENDING for a brand-new task, otherwise
+    # whatever it was before this claim transitioned it to RUNNING. Callers
+    # use this to tell a genuine resume-from-pause apart from an ordinary
+    # continuing message, e.g. to decide whether a cached agent's connector
+    # runtime tools actually need refreshing.
+    prior_status: TaskStatus = TaskStatus.PENDING
 
 
 @dataclass(frozen=True)
@@ -113,6 +119,7 @@ class _ChannelTaskClaimSnapshot:
     is_new_task: bool
     lease: TaskLease
     requested_agent_missing: bool = False
+    prior_status: TaskStatus = TaskStatus.PENDING
 
 
 @dataclass(frozen=True)
@@ -902,6 +909,10 @@ def _prepare_channel_task_sync(
                 db.flush()
 
             task_id = int(task.id)
+            # Captured before acquire_task_lease_no_commit below transitions
+            # this row to RUNNING - the value, not the ORM attribute, since
+            # the same in-session Task object gets mutated in place.
+            prior_status = TaskStatus(task.status)
             claim_predicates = ()
             if task_mode is ChannelTaskMode.ACTOR_INTERACTION:
                 assert agent_id is not None
@@ -955,6 +966,7 @@ def _prepare_channel_task_sync(
                 is_new_task=is_new_task,
                 lease=lease,
                 requested_agent_missing=requested_agent_missing,
+                prior_status=prior_status,
             )
         except Exception:
             db.rollback()
@@ -1049,6 +1061,7 @@ async def prepare_channel_task(
         is_new_task=snapshot.is_new_task,
         managed_lease=managed_lease,
         requested_agent_missing=snapshot.requested_agent_missing,
+        prior_status=snapshot.prior_status,
     )
 
 

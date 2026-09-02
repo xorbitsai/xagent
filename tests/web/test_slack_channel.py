@@ -1210,6 +1210,11 @@ async def test_successful_slack_turn_reuses_channel_runtime(
 ) -> None:
     bot = make_bot()
     bot._save_active_tasks = lambda: None  # type: ignore[method-assign]
+    # A continuing conversation, not a brand-new task: refresh_calls below
+    # only fires for a turn resuming a prior connect_apps-style pause, which
+    # requires an existing task (is_new_task=False) whose prior_status was
+    # actually WAITING_FOR_USER - a fresh task has no such pause to resume.
+    bot.active_tasks["T1:D1:U1:direct"] = 45
     lease = TaskLease(task_id=45, runner_id="runner-a", run_id="run-a")
     finalized: list[tuple[TaskStatus, str]] = []
     finalized_execution_results: list[Any] = []
@@ -1243,8 +1248,9 @@ async def test_successful_slack_turn_reuses_channel_runtime(
         return SimpleNamespace(
             user_id=5,
             task_id=45,
-            is_new_task=True,
+            is_new_task=False,
             managed_lease=managed,
+            prior_status=TaskStatus.WAITING_FOR_USER,
         )
 
     class FakeTracer:

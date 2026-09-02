@@ -1374,6 +1374,61 @@ async def test_prepare_channel_task_continues_task_when_selection_still_valid(
 
 
 @pytest.mark.asyncio
+async def test_prepare_channel_task_reports_prior_status_for_new_and_resumed_tasks(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mock_workspace_db,
+) -> None:
+    """Callers (each bot channel) use prior_status - the task's status just
+    before THIS claim, not its now-RUNNING status - to tell a genuine resume
+    from a connect_apps-style pause apart from an ordinary continuing
+    message, so they only refresh a cached agent's connector runtime tools
+    when actually resuming a pause."""
+    del mock_workspace_db
+    engine, SessionLocal, user_id, channel_id = _create_channel_session_local(tmp_path)
+    agent_id = _add_agent(SessionLocal, user_id=user_id, name="Prior Status Agent")
+    monkeypatch.setattr(
+        "xagent.web.services.channel_runtime.get_session_local",
+        lambda: SessionLocal,
+    )
+    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+
+    first = await prepare_channel_task(
+        channel_id=channel_id,
+        external_user_id="telegram-user",
+        active_task_id=None,
+        text="hello",
+        channel_name="Telegram",
+        agent_id=agent_id,
+    )
+    assert first is not None
+    # A brand-new task was never paused before this claim.
+    assert first.prior_status == TaskStatus.PENDING
+    assert await first.managed_lease.finalize_result(status=TaskStatus.WAITING_FOR_USER)
+    await first.managed_lease.close()
+
+    second = await prepare_channel_task(
+        channel_id=channel_id,
+        external_user_id="telegram-user",
+        active_task_id=first.task_id,
+        text="I connected the app",
+        channel_name="Telegram",
+        agent_id=agent_id,
+    )
+    assert second is not None
+    assert second.task_id == first.task_id
+    # Resuming the same task: prior_status reflects what it was (paused)
+    # right before this claim transitioned it to RUNNING.
+    assert second.prior_status == TaskStatus.WAITING_FOR_USER
+    with SessionLocal() as db:
+        task = db.query(Task).filter(Task.id == second.task_id).one()
+        assert task.status == TaskStatus.RUNNING
+
+    assert await second.managed_lease.finalize_result(status=TaskStatus.COMPLETED)
+    engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_numeric_allowed_users_authorizes_the_matching_sender(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

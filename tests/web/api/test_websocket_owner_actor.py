@@ -2533,6 +2533,131 @@ async def test_message_handoff_registers_the_minted_run_not_the_stale_one(
 
 
 @pytest.mark.asyncio
+async def test_resuming_a_waiting_for_user_task_refreshes_connector_runtime_tools(
+    db_session,
+) -> None:
+    """A message that resumes a task genuinely paused on waiting_for_user
+    (e.g. answering a connect_apps card) must still bust the cached agent's
+    connector-runtime tools, unlike an ordinary continuing message - see the
+    RUNNING counterpart test below."""
+
+    owner = _user(db_session, "connector-refresh-waiting-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.WAITING_FOR_USER)
+    task.control_state = "waiting_for_user"
+    db_session.commit()
+
+    agent = MagicMock()
+    agent.supports_live_control.return_value = True
+    agent.get_dag_pattern.return_value = None
+    # Deferred (not injected) so this exercises the same handoff-to-resume
+    # path as test_message_handoff_registers_the_minted_run_not_the_stale_one
+    # above, without depending on that test's own run-id specifics.
+    agent.post_user_message = AsyncMock(return_value=False)
+    agent_manager = MagicMock(get_agent_for_task=AsyncMock(return_value=agent))
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+    bg_mgr = MagicMock()
+    bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
+    bg_mgr.running_tasks.get.return_value = None
+    registered_handles: list[asyncio.Task] = []
+
+    def register_resume(
+        _task_id: int,
+        task_handle: asyncio.Task,
+        *,
+        run_id: str | None = None,
+    ) -> None:
+        registered_handles.append(task_handle)
+
+    async def resume_forever(*_args, **_kwargs) -> None:
+        await asyncio.Event().wait()
+
+    bg_mgr.register_reserved_resume.side_effect = register_resume
+    with (
+        patch(
+            "xagent.web.api.chat.get_agent_manager",
+            return_value=agent_manager,
+        ),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
+        patch(
+            "xagent.web.api.websocket.execute_resume_background",
+            side_effect=resume_forever,
+        ),
+    ):
+        await _handle_chat_message_unserialized(
+            MagicMock(),
+            int(task.id),
+            {
+                "message": "I connected the app",
+                "client_message_id": "connector-refresh-waiting-turn",
+                "user": owner,
+                "files": [],
+            },
+        )
+        for handle in registered_handles:
+            handle.cancel()
+        await asyncio.gather(*registered_handles, return_exceptions=True)
+
+    agent_manager.refresh_connector_runtime_tools.assert_called_once_with(int(task.id))
+
+
+@pytest.mark.asyncio
+async def test_ordinary_running_message_does_not_refresh_connector_runtime_tools(
+    db_session,
+) -> None:
+    """An ordinary continuing message to an already-RUNNING task has no
+    reason to believe connector state changed - forcing a full MCP/OAuth
+    tool rebuild on every single message, not just a genuine connect_apps
+    resume, was a real latency/capacity regression (see the WAITING_FOR_USER
+    counterpart test above)."""
+
+    owner = _user(db_session, "connector-refresh-running-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
+    task.runner_id = "connector-refresh-running-runner"
+    task.run_id = "connector-refresh-running-run"
+    db_session.commit()
+
+    agent = MagicMock()
+    agent.supports_live_control.return_value = True
+    agent.get_dag_pattern.return_value = None
+    agent.post_user_message = AsyncMock(
+        return_value=UserMessageInjectionOutcome.POSTED_FRESH
+    )
+    agent_manager = MagicMock(get_agent_for_task=AsyncMock(return_value=agent))
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+    bg_mgr = MagicMock()
+    bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
+    bg_mgr.running_tasks.get.return_value = None
+
+    with (
+        patch(
+            "xagent.web.api.chat.get_agent_manager",
+            return_value=agent_manager,
+        ),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
+    ):
+        await _handle_chat_message_unserialized(
+            MagicMock(),
+            int(task.id),
+            {
+                "message": "just an ordinary follow-up",
+                "client_message_id": "connector-refresh-running-turn",
+                "user": owner,
+                "files": [],
+            },
+        )
+
+    agent_manager.refresh_connector_runtime_tools.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_live_marker_cancellation_does_not_cancel_registered_handoff(
     db_session,
 ) -> None:

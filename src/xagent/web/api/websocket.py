@@ -6574,7 +6574,17 @@ async def _handle_chat_message_unserialized(
                 # lookup key and break it for any task using ephemeral
                 # secrets - refresh_connector_runtime_tools only busts the
                 # cache, leaving the real turn id (if any) untouched.
-                get_agent_manager().refresh_connector_runtime_tools(task_id)
+                #
+                # Gated on task_status (this message's PRIOR status, read
+                # before this handler touched anything): an ordinary message
+                # to an already-RUNNING task has no reason to believe
+                # connector state changed, and a cached agent's tools are
+                # already warm - invalidating them here unconditionally
+                # forced a full MCP/OAuth rebuild (DB scans, per-server
+                # network handshakes) on every single message, not just a
+                # genuine resume from a connect_apps pause.
+                if task_status in {TaskStatus.PAUSED, TaskStatus.WAITING_FOR_USER}:
+                    get_agent_manager().refresh_connector_runtime_tools(task_id)
                 if hasattr(agent_service, "set_outbound_message_handler"):
                     agent_service.set_outbound_message_handler(
                         make_agent_outbound_handler(task_id)
@@ -9190,16 +9200,6 @@ async def _handle_resume_task_unserialized(
             task_owner_user_id=task_owner_user_id,
             resolved_execution_scope=resolved_execution_scope,
         )
-        # No per-message turn id exists on this explicit-command resume path
-        # (unlike the new-user-message resume above), but a cached
-        # AgentService's tools still need the same nudge to rebuild against
-        # connector state that may have changed (e.g. the user connecting an
-        # app) since it paused. A fabricated uuid4 here would only ever
-        # mismatch whatever real turn id a task's own ephemeral connector
-        # secrets (if any) were stored under - see the sibling call's
-        # comment - so use refresh_connector_runtime_tools instead, which
-        # busts the cache without touching connector_runtime_turn_id.
-        get_agent_manager().refresh_connector_runtime_tools(task_id)
         if getattr(agent_service, "supports_live_control", lambda: False)():
             if task_status not in {TaskStatus.PAUSED, TaskStatus.WAITING_FOR_USER}:
                 reason = "Task is not paused and cannot be resumed."
@@ -9216,6 +9216,21 @@ async def _handle_resume_task_unserialized(
                     reason,
                     reason_code="not_resumable",
                 )
+            # No per-message turn id exists on this explicit-command resume
+            # path (unlike the new-user-message resume above), but a cached
+            # AgentService's tools still need the same nudge to rebuild
+            # against connector state that may have changed (e.g. the user
+            # connecting an app) since it paused. A fabricated uuid4 here
+            # would only ever mismatch whatever real turn id a task's own
+            # ephemeral connector secrets (if any) were stored under - see
+            # the sibling call's comment - so use
+            # refresh_connector_runtime_tools instead, which busts the
+            # cache without touching connector_runtime_turn_id. Placed
+            # after the resumability check above (not before) so a
+            # rejected resume request - task_status already confirmed
+            # PAUSED/WAITING_FOR_USER here - never pays for a wasted
+            # rebuild.
+            get_agent_manager().refresh_connector_runtime_tools(task_id)
             reservation = background_task_manager.try_reserve_resume(
                 task_id,
                 expected_run_id=task_fields.run_id,

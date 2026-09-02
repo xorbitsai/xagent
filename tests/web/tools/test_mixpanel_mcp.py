@@ -627,6 +627,33 @@ def test_query_retention_defaults_and_optional_params(monkeypatch):
     assert "event" not in params
 
 
+def test_query_retention_requires_born_event_for_birth_type(monkeypatch):
+    # Mixpanel has no "any event" fallback for retention_type="birth"
+    # (unlike "compounded") -- born_event is required in that case.
+    mock_request = Mock()
+    monkeypatch.setattr(mixpanel.requests, "request", mock_request)
+
+    result = json.loads(mixpanel.mixpanel_query_retention("2026-01-01", "2026-01-31"))
+
+    assert result["status"] == "error"
+    assert "born_event" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_query_retention_allows_missing_born_event_for_compounded_type(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"data": {}}))
+    monkeypatch.setattr(mixpanel.requests, "request", mock_request)
+
+    result = json.loads(
+        mixpanel.mixpanel_query_retention(
+            "2026-01-01", "2026-01-31", retention_type="compounded"
+        )
+    )
+
+    assert result["status"] == "success"
+    assert "born_event" not in mock_request.call_args.kwargs["params"]
+
+
 def test_list_funnels_returns_list(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(json_data=[{"funnel_id": 1, "name": "Onboarding"}])

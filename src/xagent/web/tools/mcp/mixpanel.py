@@ -410,8 +410,9 @@ def mixpanel_query_retention(
     from_date, to_date: inclusive YYYY-MM-DD dates for the born-event window.
     retention_type: "birth" (first time someone does born_event) or
     "compounded" (any time someone does born_event).
-    born_event: the event that starts a user's retention cohort; defaults
-    to "any event" if omitted.
+    born_event: the event that starts a user's retention cohort --
+    required when retention_type is "birth" (Mixpanel has no "any event"
+    fallback for that case, unlike "compounded"); optional otherwise.
     event: the event that counts as a user "returning"; defaults to
     born_event if omitted (classic retention).
     born_where, where: optional Mixpanel expressions filtering the born and
@@ -421,6 +422,8 @@ def mixpanel_query_retention(
     try:
         _validate_date(from_date, "from_date")
         _validate_date(to_date, "to_date")
+        if retention_type == "birth" and not born_event:
+            raise ValueError('born_event is required when retention_type is "birth"')
         params: dict[str, Any] = {
             "from_date": from_date,
             "to_date": to_date,

@@ -2,6 +2,7 @@ import json
 import logging
 import re
 import time
+from datetime import date
 from os import environ
 from typing import Any
 
@@ -104,12 +105,18 @@ def _validate_date(value: str, field_name: str) -> str:
     instead of a confusing "no data" response. Anchored with \\Z rather
     than $ -- $ matches immediately before a trailing newline as well as at
     the true end of the string, which would let e.g. "2026-01-15\\n" slip
-    through as "valid".
+    through as "valid". The regex alone accepts a shape-correct but
+    calendar-invalid date like "2026-02-30"; date.fromisoformat() rejects
+    that, matching google_search_console.py's identical validator.
     """
     if not isinstance(value, str) or not _DATE_PATTERN.match(value):
         raise ValueError(
             f"{field_name} must be a YYYY-MM-DD date string, got {value!r}"
         )
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        raise ValueError(f"{field_name} must be a valid calendar date") from None
     return value
 
 
@@ -156,9 +163,13 @@ def _request(
     instead of buffering it into `.text`/`.json()` here -- used only by
     mixpanel_export_events, whose NDJSON body has no server-side row cap of
     its own and can be arbitrarily large; the caller is responsible for
-    iterating and closing it (a `with` block). An error response (>=400) is
-    still read and closed here regardless of `stream`, since error bodies
-    are small and the caller never sees the response object in that case.
+    iterating and closing it (a `with` block). Every other outcome closes
+    the response here regardless of `stream` before returning/raising --
+    a redirect or a discarded 429 retry response never reaches the caller,
+    and an error (>=400) response is read (error bodies are small) via
+    `_extract_error_detail`/`.text`, which drains and effectively closes it
+    -- so `stream=True` only ever hands back a connection the caller must
+    manage on the single success path.
     """
     url = f"https://{host}{path}"
     request_params = dict(params or {})
@@ -188,6 +199,13 @@ def _request(
                 except ValueError:
                     retry_after = 0
                 if 0 < retry_after <= MAX_RETRY_AFTER_SECONDS:
+                    # With stream=True this response's connection was never
+                    # read (a non-streamed 429 body is tiny and already
+                    # drained by `requests` itself, so this is a no-op
+                    # there) -- close it explicitly before discarding the
+                    # reference, or the socket for this attempt is held
+                    # open, unreleased, for the entire sleep below.
+                    response.close()
                     time.sleep(retry_after)
                     continue
             break
@@ -199,6 +217,10 @@ def _request(
         raise RuntimeError(redact_sensitive_text(str(exc))) from exc
 
     if 300 <= response.status_code < 400:
+        # Same as the 429-retry path above: closes a still-open stream=True
+        # connection before this response is discarded (a no-op for the
+        # non-streamed case, where the body is already drained).
+        response.close()
         raise RuntimeError(
             f"Mixpanel returned an unexpected redirect (HTTP {response.status_code}); "
             "refusing to follow it with credentials attached"

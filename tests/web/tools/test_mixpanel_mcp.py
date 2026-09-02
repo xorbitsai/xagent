@@ -25,6 +25,7 @@ class MockResponse:
         self.content = content if content is not None else self.text.encode()
         self.url = url
         self.headers = headers or {}
+        self.closed = False
 
     def json(self):
         if self._json_raises:
@@ -37,10 +38,14 @@ class MockResponse:
                 f"{self.status_code} Client Error for url: {self.url}", response=self
             )
 
+    def close(self):
+        self.closed = True
+
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
         return False
 
     def iter_lines(self):
@@ -153,6 +158,14 @@ def test_validate_date_rejects_malformed_value(value):
         mixpanel._validate_date(value, "from_date")
 
 
+@pytest.mark.parametrize("value", ["2026-02-30", "2026-13-01", "2026-00-10"])
+def test_validate_date_rejects_calendar_invalid_date(value):
+    # Shape-correct (matches the regex) but not a real calendar date --
+    # date.fromisoformat() is what actually catches this.
+    with pytest.raises(ValueError, match="valid calendar date"):
+        mixpanel._validate_date(value, "from_date")
+
+
 def test_extract_error_detail_returns_error_string():
     response = MockResponse(json_data={"error": "invalid credentials"})
 
@@ -238,6 +251,18 @@ def test_request_rejects_redirect_response(monkeypatch, status_code):
         mixpanel._request("GET", "mixpanel.com", "/api/query/events/names")
 
 
+def test_request_closes_streamed_response_on_redirect(monkeypatch):
+    # A stream=True response left open on this path would leak its
+    # connection, since it's discarded here instead of ever being iterated.
+    response = MockResponse(status_code=302, url="https://data.mixpanel.com/x")
+    monkeypatch.setattr(mixpanel.requests, "request", Mock(return_value=response))
+
+    with pytest.raises(RuntimeError, match="redirect"):
+        mixpanel._request("GET", "data.mixpanel.com", "/api/2.0/export", stream=True)
+
+    assert response.closed is True
+
+
 def test_request_passes_configured_timeout(monkeypatch):
     mock_request = Mock(return_value=MockResponse(json_data={"ok": True}))
     monkeypatch.setattr(mixpanel.requests, "request", mock_request)
@@ -261,6 +286,25 @@ def test_request_retries_once_on_429_with_retry_after(monkeypatch):
     assert result == {"ok": True}
     assert mock_request.call_count == 2
     mixpanel.time.sleep.assert_called_once_with(1)
+
+
+def test_request_closes_discarded_streamed_response_before_429_retry(monkeypatch):
+    # The first attempt's connection is never read when stream=True -- it
+    # must be closed explicitly before being discarded for the retry, or
+    # it leaks for the duration of the sleep.
+    first = MockResponse(status_code=429, url="x", headers={"Retry-After": "1"})
+    second = MockResponse(status_code=200, text="")
+    mock_request = Mock(side_effect=[first, second])
+    monkeypatch.setattr(mixpanel.requests, "request", mock_request)
+    monkeypatch.setattr(mixpanel.time, "sleep", Mock())
+
+    result = mixpanel._request(
+        "GET", "data.mixpanel.com", "/api/2.0/export", stream=True
+    )
+
+    assert result is second
+    assert first.closed is True
+    assert second.closed is False
 
 
 def test_request_does_not_retry_a_second_429(monkeypatch):

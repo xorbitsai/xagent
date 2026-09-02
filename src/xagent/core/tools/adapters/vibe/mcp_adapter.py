@@ -1165,7 +1165,7 @@ class UnavailableMCPTool(AbstractBaseTool):
                 "status": "waiting_for_user",
                 "message": (
                     f"I need access to {self._app_name} to continue. "
-                    "Please connect it below, then let me know once you have."
+                    "Please connect it, then let me know once you have."
                 ),
                 "interactions": [
                     {

@@ -110,7 +110,9 @@ def _extract_error_detail(response: requests.Response) -> str | None:
         detail = payload.get(key)
         if isinstance(detail, str) and detail:
             return detail
-        if isinstance(detail, dict) and detail:
+        # "errors" in particular can be a list of per-field messages (e.g.
+        # {"errors": ["external_id can't be blank"]}), not just a dict.
+        if isinstance(detail, (dict, list)) and detail:
             return json.dumps(detail, ensure_ascii=False)
     return None
 

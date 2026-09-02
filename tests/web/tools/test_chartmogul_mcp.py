@@ -72,6 +72,15 @@ def test_extract_error_detail_prefers_message_key():
     assert chartmogul._extract_error_detail(response) == "Invalid API key"
 
 
+def test_extract_error_detail_handles_a_list_of_field_errors():
+    response = MockResponse(json_data={"errors": ["external_id can't be blank"]})
+
+    detail = chartmogul._extract_error_detail(response)
+
+    assert detail is not None
+    assert "external_id can't be blank" in detail
+
+
 def test_extract_error_detail_returns_none_for_non_json():
     response = MockResponse(text="<html>gateway error</html>")
 

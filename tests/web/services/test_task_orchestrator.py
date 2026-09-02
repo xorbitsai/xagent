@@ -1943,8 +1943,14 @@ async def test_schedule_bg_skips_finish_turn_when_lease_acquire_fails(
 
     mock_exec.assert_not_awaited()
     mock_finish.assert_not_called()
-    assert get_ephemeral_runtime_values(payload.turn_id) is None
-    assert pop_ephemeral_runtime_values(payload.turn_id) is None
+    # This coroutine never acquired the lease, so it is a bystander that
+    # never becomes authoritative for the turn - the other worker holding
+    # the lease owns this turn_id's eventual settlement (and pop) too. A
+    # bystander popping here would be the exact bug this whole mechanism
+    # exists to avoid: it could evict values a turn still actively running
+    # elsewhere depends on.
+    assert get_ephemeral_runtime_values(payload.turn_id) is not None
+    assert pop_ephemeral_runtime_values(payload.turn_id) is not None
 
 
 @pytest.mark.asyncio
@@ -2513,7 +2519,12 @@ async def test_schedule_bg_releases_lease_on_execute_task_background_exception(
 
     user = _create_user(db_session)
     task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
-    fake_lease = TaskLease(task_id=int(task.id), runner_id="test-runner")
+    task.runner_id = "test-runner"
+    task.run_id = "run-a"
+    db_session.commit()
+    fake_lease = TaskLease(
+        task_id=int(task.id), runner_id="test-runner", run_id="run-a"
+    )
     payload = TaskTurnPayload("x")
     _store_runtime_secret_for_turn(payload.turn_id)
     assert get_ephemeral_runtime_values(payload.turn_id) is not None
@@ -2533,6 +2544,10 @@ async def test_schedule_bg_releases_lease_on_execute_task_background_exception(
         ),
         patch(
             "xagent.web.services.task_orchestrator.settle_task_lease_isolated",
+            # wraps, not a bare Mock: the ephemeral-values assertion below
+            # needs the real settlement (and finish_turn's turn_id pop
+            # inside it) to actually run, not just be recorded as called.
+            wraps=settle_task_lease_isolated,
         ) as mock_settle,
         patch.object(background_task_manager, "register_task"),
         patch(
@@ -2757,7 +2772,12 @@ async def test_schedule_bg_forwards_execution_message_to_execute_task_background
 
     user = _create_user(db_session)
     task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
-    fake_lease = TaskLease(task_id=int(task.id), runner_id="test-runner")
+    task.runner_id = "test-runner"
+    task.run_id = "run-a"
+    db_session.commit()
+    fake_lease = TaskLease(
+        task_id=int(task.id), runner_id="test-runner", run_id="run-a"
+    )
     payload = TaskTurnPayload(
         transcript_message="summarize this",
         execution_message="summarize this\n\n[uploaded file: secret.txt]",
@@ -2782,6 +2802,10 @@ async def test_schedule_bg_forwards_execution_message_to_execute_task_background
         ) as mock_exec,
         patch(
             "xagent.web.services.task_orchestrator.settle_task_lease_isolated",
+            # wraps, not a bare Mock: the ephemeral-values assertion below
+            # needs the real settlement (and finish_turn's turn_id pop
+            # inside it) to actually run, not just be recorded as called.
+            wraps=settle_task_lease_isolated,
         ),
         patch.object(background_task_manager, "register_task"),
         patch(
@@ -2793,6 +2817,7 @@ async def test_schedule_bg_forwards_execution_message_to_execute_task_background
             task_id=int(task.id),
             task_owner_user_id=int(user.id),
             task_source=task.source,
+            run_id="run-a",
             payload=payload,
             force_fresh=False,
             context={"turn_id": "caller-turn", "existing": "value"},

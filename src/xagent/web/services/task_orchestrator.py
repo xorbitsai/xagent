@@ -752,6 +752,7 @@ async def _schedule_committed_turn(
                 lambda: settle_task_lease_isolated(
                     claimed.task_lease,
                     error_message="turn scheduling failed after claim commit",
+                    turn_id=payload.turn_id,
                 )
             )
         except Exception as terminal_error:
@@ -1054,15 +1055,6 @@ def _task_requires_actor_policy_sync(
     SessionLocal = get_session_local()
     with SessionLocal() as db:
         return _task_requires_actor_policy(db, task_id, task_owner_user_id)
-
-
-def _task_status_sync(task_id: int) -> TaskStatus | None:
-    from ..models.database import get_session_local
-
-    SessionLocal = get_session_local()
-    with SessionLocal() as db:
-        row = db.query(Task.status).filter(Task.id == task_id).first()
-        return row[0] if row is not None else None
 
 
 def _claim_turn_no_commit(
@@ -1435,12 +1427,31 @@ def _get_agent_manager() -> Any:
     return get_agent_manager()
 
 
+def _pop_ephemeral_runtime_values_best_effort(turn_id: str) -> None:
+    """Pop one turn's ephemeral connector secrets; never raise into a settler.
+
+    Called only from a branch that has just committed (or reconciled) a
+    genuinely terminal outcome for this exact turn_id - see the callers in
+    ``finish_turn`` and ``settle_task_lease_isolated`` for why each call site
+    is safe to pop from.
+    """
+    from .connector_runtime import pop_ephemeral_runtime_values
+
+    try:
+        pop_ephemeral_runtime_values(turn_id)
+    except Exception:
+        logger.warning(
+            "connector runtime cleanup failed for turn %s", turn_id, exc_info=True
+        )
+
+
 def settle_task_lease_isolated(
     lease: TaskLease,
     *,
     error_message: str | None = None,
     client_error_message: str = CLIENT_SAFE_TASK_FAILURE,
     client_message_type: str = TASK_FAILURE_MESSAGE_TYPE,
+    turn_id: str | None = None,
 ) -> bool:
     """Settle exactly one run/runner lease in one worker-owned Session.
 
@@ -1459,6 +1470,13 @@ def settle_task_lease_isolated(
     On checkout or commit failure the transaction is rolled back and the lease
     is intentionally retained for TTL recovery; this function never creates an
     ownerless RUNNING task.
+
+    ``turn_id``, when given, pops that turn's ephemeral connector secrets the
+    moment this call itself commits a genuine FAILED transition - using the
+    same row this decision is made from, not a separate later read (see
+    ``finish_turn``'s matching ``turn_id`` handling for the reconciliation
+    path, which is where every other outcome, including this one when
+    ``error_message`` is ``None``, gets the same treatment).
     """
     from ..models.database import get_session_local
     from .chat_history_service import persist_assistant_message_no_commit
@@ -1487,6 +1505,8 @@ def settle_task_lease_isolated(
                         )
                     settle_db.commit()
                     invalidate_task_cache_best_effort(lease.task_id)
+                    if turn_id is not None:
+                        _pop_ephemeral_runtime_values_best_effort(turn_id)
                     return True
 
                 # The task may already have committed a terminal/control state.
@@ -1498,6 +1518,7 @@ def settle_task_lease_isolated(
                 settle_db,
                 lease.task_id,
                 task_lease=lease,
+                turn_id=turn_id,
             )
             if error_message is not None:
                 return False
@@ -1515,6 +1536,7 @@ def finish_turn(
     task_id: int,
     *,
     task_lease: TaskLease | None = None,
+    turn_id: str | None = None,
 ) -> bool:
     """Reconcile terminal fields and, when supplied, release one exact lease.
 
@@ -1547,6 +1569,16 @@ def finish_turn(
       - other statuses (PAUSED / WAITING_FOR_USER): control status and
         ``output`` are preserved; the lease release clears any stale
         ``error_message`` left by an earlier failed attempt
+
+    ``turn_id``, when given, pops that turn's ephemeral connector secrets
+    (see ``connector_runtime.store_ephemeral_runtime_values``) from exactly
+    the COMPLETED, FAILED, and RUNNING-fallback branches above - the ones
+    that read this same already-fenced ``fresh.status`` as genuinely
+    terminal. This is the sole place that decides both things, so there is
+    no separate later read of the row to race against a fast concurrent
+    resume: the PAUSED / WAITING_FOR_USER branch (the same turn resuming
+    later under this same turn_id) and the live-other-owner skip (this
+    coroutine is not the one settling the turn) never pop.
     """
     from ..models.chat_message import TaskChatMessage
     from .workforce_runtime import sync_workforce_run_status
@@ -1615,6 +1647,8 @@ def finish_turn(
                 task_id,
                 len(latest_assistant.content),
             )
+            if turn_id is not None:
+                _pop_ephemeral_runtime_values_best_effort(turn_id)
             return committed
         else:
             logger.warning(
@@ -1625,10 +1659,13 @@ def finish_turn(
             trigger_run_changed = sync_trigger_run_status(
                 bg_db, fresh, TaskStatus.COMPLETED
             )
-            return commit_terminal(
+            committed = commit_terminal(
                 TaskStatus.COMPLETED,
                 changed=run_changed or trigger_run_changed,
             )
+            if turn_id is not None:
+                _pop_ephemeral_runtime_values_best_effort(turn_id)
+            return committed
 
     if status == TaskStatus.FAILED:
         changed = False
@@ -1650,8 +1687,13 @@ def finish_turn(
                 "finish_turn: task %s marked failed (cleared stale output)",
                 task_id,
             )
+            if turn_id is not None:
+                _pop_ephemeral_runtime_values_best_effort(turn_id)
             return committed
-        return commit_terminal(TaskStatus.FAILED, changed=False)
+        committed = commit_terminal(TaskStatus.FAILED, changed=False)
+        if turn_id is not None:
+            _pop_ephemeral_runtime_values_best_effort(turn_id)
+        return committed
 
     if status == TaskStatus.RUNNING:
         # Lease ownership guard: a live lease held by another worker
@@ -1695,6 +1737,8 @@ def finish_turn(
             "flipping to FAILED",
             task_id,
         )
+        if turn_id is not None:
+            _pop_ephemeral_runtime_values_best_effort(turn_id)
         return committed
 
     # PAUSED / WAITING_FOR_USER / other: preserve the control status while
@@ -1827,6 +1871,7 @@ def _schedule_bg(
                         error_message=(
                             "task execution cancelled during lease acquisition"
                         ),
+                        turn_id=payload.turn_id,
                     ),
                 )
                 if lease is None:
@@ -2025,6 +2070,7 @@ def _schedule_bg(
                                     or CLIENT_SAFE_TASK_FAILURE
                                 ),
                                 client_message_type=client_history_message_type,
+                                turn_id=turn_id,
                             )
                         )
                         # Gate on the returned value, not on "didn't raise":
@@ -2103,34 +2149,17 @@ def _schedule_bg(
                                 task_id,
                                 exc_info=True,
                             )
-            try:
-                from .connector_runtime import pop_ephemeral_runtime_values
-
-                if turn_id is not None:
-                    # Ephemeral per-turn values are single-use, but "used" means
-                    # this turn reached a terminal outcome - a turn that instead
-                    # paused on waiting_for_user (e.g. this same PR's
-                    # connect_apps interaction) is the SAME turn resuming later
-                    # under this SAME turn_id, still mid-flight, not a finished
-                    # one. Popping unconditionally here left every such resume
-                    # with nothing to look up under its own, correct turn_id -
-                    # the connector-runtime cache refresh added for that resume
-                    # deliberately never rebinds the turn_id (see
-                    # WebToolConfig.invalidate_connector_runtime_cache's
-                    # docstring), which only helps if this turn's own values
-                    # are still there to find.
-                    settled_status = await run_db_io_cancellation_safe(
-                        lambda: _task_status_sync(task_id)
-                    )
-                    if settled_status != TaskStatus.WAITING_FOR_USER:
-                        pop_ephemeral_runtime_values(turn_id)
-            except Exception:
-                logger.warning(
-                    "connector runtime cleanup failed for task %s turn %s",
-                    task_id,
-                    turn_id,
-                    exc_info=True,
-                )
+            # Ephemeral per-turn connector secrets are popped from inside
+            # settle_task_lease_isolated/finish_turn above (via the turn_id
+            # passed into each settle call), the moment - and using the same
+            # already-fenced row read - that one of them decides this turn
+            # reached a genuinely terminal outcome. That keeps a paused turn
+            # resuming under this same turn_id (WAITING_FOR_USER / PAUSED)
+            # from losing values it still needs, without a second, separate
+            # status read here racing a fast concurrent resume. A bystander
+            # coroutine that never held ``lease`` (skipped the block above
+            # entirely) correctly never pops either: it was never
+            # authoritative for this turn's outcome.
             if mcp_runtime_authorization_policy is not None:
                 try:
                     await run_db_io_cancellation_safe(

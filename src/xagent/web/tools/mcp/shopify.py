@@ -153,7 +153,11 @@ def _user_errors_message(user_errors: list[dict[str, Any]]) -> str:
     parts = []
     for err in user_errors:
         field = err.get("field")
-        field_path = ".".join(field) if isinstance(field, list) else field
+        # field is a path array (e.g. ["variants", 0, "price"]) that can mix
+        # strings with integer array indices -- ".".join() requires every
+        # element to already be a str, so an index entry raises TypeError
+        # without the str() conversion.
+        field_path = ".".join(map(str, field)) if isinstance(field, list) else field
         message = err.get("message") or "unknown error"
         parts.append(f"{field_path}: {message}" if field_path else message)
     return "; ".join(parts) if parts else "Shopify reported a validation error"
@@ -333,7 +337,15 @@ def _extract_connection(
     page_info = connection.get("pageInfo") or {}
     has_more = bool(page_info.get("hasNextPage"))
     after_cursor = page_info.get("endCursor") if has_more else None
-    return [summary_fn(node) for node in nodes], has_more, after_cursor
+    # A connection's individual nodes can be null (e.g. a node that failed
+    # to resolve due to permissions or a backend error) even when the list
+    # itself is present -- summary_fn assumes a dict, so skip null entries
+    # rather than letting one bad node crash the whole page.
+    return (
+        [summary_fn(node) for node in nodes if node is not None],
+        has_more,
+        after_cursor,
+    )
 
 
 def _list_connection(

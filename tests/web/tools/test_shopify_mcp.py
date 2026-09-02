@@ -186,6 +186,16 @@ def test_user_errors_message_joins_field_path_and_message():
     assert message == "product.title: can't be blank"
 
 
+def test_user_errors_message_handles_integer_array_index_in_field_path():
+    # Shopify's field path can mix strings with integer array indices for a
+    # list-input error (e.g. a variant's price).
+    message = shopify._user_errors_message(
+        [{"field": ["variants", 0, "price"], "message": "must be positive"}]
+    )
+
+    assert message == "variants.0.price: must be positive"
+
+
 def test_user_errors_message_handles_missing_field():
     message = shopify._user_errors_message([{"field": None, "message": "failed"}])
 
@@ -441,6 +451,18 @@ def test_extract_connection_returns_end_cursor_when_has_more():
     assert items == [{"id": "1"}]
     assert has_more is True
     assert after_cursor == "cur1"
+
+
+def test_extract_connection_skips_null_nodes():
+    # A connection's individual nodes can be null (e.g. failed to resolve
+    # due to permissions) even when the list itself is present.
+    items, _has_more, _after_cursor = shopify._extract_connection(
+        {"products": {"nodes": [{"id": "1"}, None, {"id": "2"}], "pageInfo": {}}},
+        "products",
+        lambda n: n,
+    )
+
+    assert items == [{"id": "1"}, {"id": "2"}]
 
 
 def test_extract_connection_no_cursor_when_not_truncated():

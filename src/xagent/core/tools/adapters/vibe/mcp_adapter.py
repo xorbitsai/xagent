@@ -21,6 +21,7 @@ from typing import (
     Dict,
     List,
     Mapping,
+    NamedTuple,
     Optional,
     Type,
     TypeVar,
@@ -125,11 +126,16 @@ _HTTP_401_TEXT_RE = re.compile(
 # `pattern` share this number, so lowering it also drops mid-length patterns
 # entirely: a pattern is emitted whole or not at all and is never truncated.
 _FIELD_TEXT_MAX_CHARS = 200
-# `format` values the JSON Schema vocabulary defines. MCP servers are untrusted
-# input, and `format` is emitted verbatim, so only known tokens pass; anything
-# else is dropped rather than forwarded to the model as authoritative text.
-# This set is also what bounds the length of an accepted `format`, so the key
-# carries no length cap of its own.
+# The `format` tokens carried through: the JSON Schema Draft 2020-12 format
+# vocabulary, plus the OpenAPI 3.0 hints (`byte`, `binary`, `password`,
+# `int32`, `int64`, `float`, `double`) connector authors write in practice.
+# `description` and `pattern` are free text no allowlist could enumerate, but
+# `format` is a closed set of defined tokens, so a token outside it names no
+# rule to pass on and is dropped rather than forwarded to the model as
+# authoritative text. The match is exact, and every defined token is
+# lower-case, so `Date-Time` is not one of them. This set is also what bounds
+# the length of an accepted `format`, so the key carries no length cap of its
+# own.
 _KNOWN_FIELD_FORMATS = frozenset(
     {
         "date-time",
@@ -319,13 +325,11 @@ def _field_metadata_candidates(
         # optional field with no default. Membership is tested member by member
         # because enum members may be objects, which no hash-based container
         # would accept.
-        # The tradeoff this makes is worth stating plainly: an optional field
-        # whose author wrote an enum and no default emits both that enum and
-        # `default: null`, and read as pure JSON Schema those two contradict
-        # each other, because `null` is not one of the listed values. The null
-        # is this adapter's placeholder for "the author declared nothing", not
-        # a value the author asserted, so the author's enum is the half that
-        # is kept.
+        # Only an authored default is capable of the contradiction. An
+        # optional field whose author wrote an enum and no default emits that
+        # enum inside the non-null branch of its `anyOf` and `default: null`
+        # beside the wrapper, and the null validates against the null branch,
+        # so those two say nothing conflicting about each other.
         if (
             isinstance(raw_enum, list)
             and raw_enum
@@ -360,9 +364,9 @@ def _field_metadata_candidates(
 
     if "format" in field_schema:
         raw_format = field_schema["format"]
-        # The vocabulary is the whole gate: `format` is emitted verbatim, so
-        # only tokens JSON Schema defines pass, and that set also bounds how
-        # long an accepted token can be.
+        # The allowlist is the whole gate: `format` is emitted verbatim, so
+        # only a defined token passes, and that set also bounds how long an
+        # accepted token can be.
         if isinstance(raw_format, str) and raw_format in _KNOWN_FIELD_FORMATS:
             candidates.append(("format", raw_format))
         else:
@@ -380,11 +384,24 @@ def _field_metadata_candidates(
     return candidates, rejected
 
 
+class _FieldMetadata(NamedTuple):
+    """What one field of one tool emits, named so the read site cannot slip.
+
+    The three parts travel together from the one place that decides them to
+    the one place that builds the field, and a caller that mixed two of them
+    up would put a description where a default belongs.
+    """
+
+    emitted_default: Any
+    description: Optional[str]
+    extra: dict[str, Any]
+
+
 def _tool_field_metadata(
     properties: Mapping[str, Any],
     required: Any,
     excluded_names: set[str],
-) -> tuple[dict[str, tuple[Any, Optional[str], dict[str, Any]]], int]:
+) -> tuple[dict[str, _FieldMetadata], int]:
     """Decide what every field of one tool emits.
 
     Fields are independent: each key is judged on its own, so nothing one
@@ -396,11 +413,20 @@ def _tool_field_metadata(
     here rather than by the caller so that it is derived exactly once per
     field: the enum rules already need to know it.
     """
-    metadata: dict[str, tuple[Any, Optional[str], dict[str, Any]]] = {}
+    metadata: dict[str, _FieldMetadata] = {}
     rejected_keys = 0
 
     for field_name, field_schema in properties.items():
         if field_name in excluded_names:
+            continue
+
+        if not isinstance(field_schema, Mapping):
+            # A field schema that is not a mapping declares nothing readable,
+            # a default included, so it is recorded empty and left to the
+            # type conversion the caller runs. Reading a default off it first
+            # would raise past the caller instead and cost the tool every one
+            # of its arguments over one malformed field.
+            metadata[field_name] = _FieldMetadata(None, None, {})
             continue
 
         if field_name in required:
@@ -410,10 +436,6 @@ def _tool_field_metadata(
             default_is_authored = False
         else:
             emitted_default, default_is_authored = _emitted_default(field_schema)
-
-        if not isinstance(field_schema, Mapping):
-            metadata[field_name] = (emitted_default, None, {})
-            continue
 
         candidates, rejected = _field_metadata_candidates(
             field_schema,
@@ -430,7 +452,7 @@ def _tool_field_metadata(
             else:
                 extra[key] = value
 
-        metadata[field_name] = (emitted_default, description, extra)
+        metadata[field_name] = _FieldMetadata(emitted_default, description, extra)
 
     return metadata, rejected_keys
 
@@ -892,10 +914,10 @@ class MCPToolAdapter(AbstractBaseTool):
                     continue
                 # Both loops walk `properties` skipping the same names, so
                 # every field reaching here has a record.
-                emitted_default, description, extra = metadata[field_name]
+                field_metadata = metadata[field_name]
                 annotation: Any = self._json_schema_to_python_type(field_schema)
 
-                if description is not None or extra:
+                if field_metadata.description is not None or field_metadata.extra:
                     # Carried on the annotation so it lands inside the
                     # non-null branch of the `anyOf` an optional field gets.
                     # A field with nothing to say is left alone, so its
@@ -903,8 +925,8 @@ class MCPToolAdapter(AbstractBaseTool):
                     annotation = Annotated[
                         annotation,
                         Field(
-                            description=description,
-                            json_schema_extra=extra or None,
+                            description=field_metadata.description,
+                            json_schema_extra=field_metadata.extra or None,
                         ),
                     ]
 
@@ -913,7 +935,10 @@ class MCPToolAdapter(AbstractBaseTool):
                     fields[field_name] = (annotation, ...)
                 else:
                     # Optional field with default
-                    fields[field_name] = (Optional[annotation], emitted_default)
+                    fields[field_name] = (
+                        Optional[annotation],
+                        field_metadata.emitted_default,
+                    )
 
             if rejected_keys:
                 logger.debug(

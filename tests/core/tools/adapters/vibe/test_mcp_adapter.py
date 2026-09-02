@@ -24,6 +24,7 @@ from xagent.core.tools.adapters.vibe.mcp_adapter import (
     MCPServerLoadFailure,
     MCPToolAdapter,
     _build_mcp_tool_adapter,
+    _compact_json,
     _exception_indicates_http_401,
     _mcp_return_value_as_string,
     load_mcp_tools_as_agent_tools,
@@ -2175,10 +2176,6 @@ def _emitted_metadata(properties, required=None, *, field="f"):
     return _metadata_carrier(_emitted_field(properties, required, field=field))
 
 
-def _compact_json(value):
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-
-
 @pytest.mark.parametrize("is_required", [True, False])
 def test_field_description_reaches_emitted_schema(is_required):
     properties = {"f": {"type": "string", "description": "The city to look up."}}
@@ -2214,8 +2211,10 @@ def test_field_constraint_keys_reach_emitted_schema(field_schema, key, expected)
     [
         ({"type": "string", "pattern": "^[a-z]+$"}, "123-NOT-MATCHING"),
         ({"type": "string", "maxLength": 2}, "far beyond the stated maximum length"),
+        ({"type": "string", "minLength": 20}, "short"),
         ({"type": "integer", "minimum": 10}, 1),
         ({"type": "string", "enum": ["metric", "imperial"]}, "furlongs"),
+        ({"type": "string", "format": "email"}, "not-an-email-address"),
     ],
 )
 def test_preserved_constraints_do_not_enforce_validation(field_schema, violating_value):
@@ -2329,6 +2328,52 @@ def test_malformed_field_schema_values_are_not_emitted(field_schema, key):
 
 
 @pytest.mark.parametrize("is_required", [True, False])
+def test_a_field_schema_that_is_not_a_mapping_costs_only_itself(is_required):
+    """One unreadable field schema does not cost the tool its other arguments.
+
+    A property whose schema is not a mapping declares nothing this adapter can
+    read, a default included. It still becomes a field, and the field beside
+    it keeps the metadata its own schema declared.
+    """
+    schema = _emitted_schema(
+        {"broken": 5, "kept": {"type": "string", "description": "Kept."}},
+        ["broken", "kept"] if is_required else [],
+    )
+
+    assert set(schema["properties"]) == {"broken", "kept"}
+    assert _metadata_carrier(schema["properties"]["kept"])["description"] == "Kept."
+
+
+@pytest.mark.parametrize("is_required", [True, False])
+def test_non_ascii_metadata_reaches_the_emitted_schema(is_required):
+    """Metadata is carried as text, and the cap counts characters, not bytes.
+
+    The emitted schema is serialized with ``ensure_ascii=False``, so text
+    outside ASCII reaches the model as itself. A capped description of CJK
+    characters is three times the cap in UTF-8 bytes, which is the point:
+    the cap counts what the author wrote, not how it encodes.
+    """
+    long_description = "西" * (_FIELD_TEXT_MAX_CHARS + 50)
+    carrier = _emitted_metadata(
+        {
+            "f": {
+                "type": "string",
+                "description": long_description,
+                "enum": ["公制", "英制"],
+                "pattern": "^[一-鿿]+$",
+            }
+        },
+        ["f"] if is_required else [],
+    )
+
+    assert len(carrier["description"]) == _FIELD_TEXT_MAX_CHARS
+    assert carrier["description"] == "西" * (_FIELD_TEXT_MAX_CHARS - 1) + "…"
+    assert len(carrier["description"].encode("utf-8")) > _FIELD_TEXT_MAX_CHARS
+    assert carrier["enum"] == ["公制", "英制"]
+    assert carrier["pattern"] == "^[一-鿿]+$"
+
+
+@pytest.mark.parametrize("is_required", [True, False])
 def test_field_without_metadata_matches_baseline_shape(is_required):
     emitted = _emitted_schema({"f": {"type": "string"}}, ["f"] if is_required else [])
     if is_required:
@@ -2371,6 +2416,14 @@ def test_non_finite_default_is_not_emitted(non_finite):
 
     assert schema["properties"]["f"]["default"] is None
     _compact_json(schema)
+
+
+@pytest.mark.parametrize("declared", ["metric", 7, False, ["a"], {"k": 1}])
+def test_an_authored_default_is_emitted_as_written(declared):
+    """A usable default the author wrote reaches the schema unchanged."""
+    schema = _emitted_schema({"f": {"type": "string", "default": declared}})
+
+    assert schema["properties"]["f"]["default"] == declared
 
 
 def test_enum_containing_non_finite_number_is_not_emitted():
@@ -2613,6 +2666,10 @@ def test_field_metadata_survives_the_claude_schema_pass(is_required):
     optional field to its non-null branch, keeping only what that branch
     holds. The one documented loss is numeric bounds, which that same pass
     strips from every number and integer schema regardless of this adapter.
+
+    This is the only provider pass there is to test: ``claude.py`` holds the
+    repo's sole rewrite of an emitted tool schema, so every other provider is
+    sent the schema this adapter emits, ``anyOf`` and nested metadata intact.
     """
     emitted = _emitted_schema(
         {

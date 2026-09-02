@@ -1839,6 +1839,18 @@ class WebToolConfig(BaseToolConfig):
             ) from exc
         return self._connector_runtime_view
 
+    def get_connector_runtime_turn_id(self) -> Optional[str]:
+        """The turn id this config's connector runtime/secrets are bound to.
+
+        A resume must look up ephemeral per-turn connector secrets under the
+        SAME turn id the original pausing turn stored them under - which is
+        exactly ``_connector_runtime_turn_id`` here, precisely because a
+        resume deliberately never rebinds it (see
+        ``invalidate_connector_runtime_cache``'s docstring below).
+        """
+
+        return self._connector_runtime_turn_id
+
     def set_connector_runtime_turn_id(self, turn_id: Optional[str]) -> bool:
         """Switch the per-turn connector runtime source for reused agents.
 

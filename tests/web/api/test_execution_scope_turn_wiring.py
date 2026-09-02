@@ -871,7 +871,10 @@ async def test_resume_db_lifecycle_runs_in_short_session_workers() -> None:
         }
 
     def release_resume_lease(
-        acquired_lease: object, *, error_message: str | None
+        acquired_lease: object,
+        *,
+        error_message: str | None,
+        turn_id: str | None = None,
     ) -> None:
         assert acquired_lease is lease
         assert error_message is None

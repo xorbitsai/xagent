@@ -81,8 +81,37 @@ def test_auth_returns_username_secret_tuple():
     assert mixpanel._auth() == ("svc-account.mp-service-account", "test-secret")
 
 
+def test_auth_strips_whitespace(monkeypatch):
+    monkeypatch.setenv(
+        "MIXPANEL_SERVICE_ACCOUNT_USERNAME", "  svc-account.mp-service-account\n"
+    )
+    monkeypatch.setenv("MIXPANEL_SERVICE_ACCOUNT_SECRET", " test-secret ")
+
+    assert mixpanel._auth() == ("svc-account.mp-service-account", "test-secret")
+
+
+def test_auth_treats_whitespace_only_values_as_missing(monkeypatch):
+    monkeypatch.setenv("MIXPANEL_SERVICE_ACCOUNT_USERNAME", "   ")
+
+    with pytest.raises(ValueError, match="MIXPANEL_SERVICE_ACCOUNT_USERNAME"):
+        mixpanel._auth()
+
+
 def test_project_id_requires_env(monkeypatch):
     monkeypatch.delenv("MIXPANEL_PROJECT_ID")
+
+    with pytest.raises(ValueError, match="MIXPANEL_PROJECT_ID"):
+        mixpanel._project_id()
+
+
+def test_project_id_strips_whitespace(monkeypatch):
+    monkeypatch.setenv("MIXPANEL_PROJECT_ID", " 12345\n")
+
+    assert mixpanel._project_id() == "12345"
+
+
+def test_project_id_treats_whitespace_only_value_as_missing(monkeypatch):
+    monkeypatch.setenv("MIXPANEL_PROJECT_ID", "   ")
 
     with pytest.raises(ValueError, match="MIXPANEL_PROJECT_ID"):
         mixpanel._project_id()
@@ -640,6 +669,27 @@ def test_create_annotation_sends_json_body_to_app_api(monkeypatch):
         "/api/app/projects/12345/annotations"
     )
     assert "project_id" not in mock_request.call_args.kwargs["params"]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "2026-01-15",
+        "2026-01-15T00:00:00",
+        "01-15-2026 00:00:00",
+        "2026-02-30 00:00:00",
+        "not-a-datetime",
+        "",
+    ],
+)
+def test_create_annotation_rejects_malformed_date(value, monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(mixpanel.requests, "request", mock_request)
+
+    result = json.loads(mixpanel.mixpanel_create_annotation(value, "Deployed v2"))
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
 
 
 def test_export_events_parses_ndjson_and_caps_result(monkeypatch):

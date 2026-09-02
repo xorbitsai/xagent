@@ -2,7 +2,7 @@ import json
 import logging
 import re
 import time
-from datetime import date
+from datetime import date, datetime
 from os import environ
 from typing import Any
 
@@ -62,8 +62,13 @@ def _error(message: str) -> str:
 
 
 def _auth() -> tuple[str, str]:
-    username = environ.get("MIXPANEL_SERVICE_ACCOUNT_USERNAME")
-    secret = environ.get("MIXPANEL_SERVICE_ACCOUNT_SECRET")
+    # Stripped like MIXPANEL_REGION below: a value that's only whitespace
+    # (e.g. a trailing newline from copy-pasting the credential into a
+    # connect-flow form) is not a usable credential and should be treated
+    # as missing here rather than sent to Mixpanel as a malformed Basic
+    # Auth username/password.
+    username = environ.get("MIXPANEL_SERVICE_ACCOUNT_USERNAME", "").strip()
+    secret = environ.get("MIXPANEL_SERVICE_ACCOUNT_SECRET", "").strip()
     if not username:
         raise ValueError(
             "MIXPANEL_SERVICE_ACCOUNT_USERNAME environment variable is missing"
@@ -76,7 +81,7 @@ def _auth() -> tuple[str, str]:
 
 
 def _project_id() -> str:
-    project_id = environ.get("MIXPANEL_PROJECT_ID")
+    project_id = environ.get("MIXPANEL_PROJECT_ID", "").strip()
     if not project_id:
         raise ValueError("MIXPANEL_PROJECT_ID environment variable is missing")
     return project_id
@@ -117,6 +122,26 @@ def _validate_date(value: str, field_name: str) -> str:
         date.fromisoformat(value)
     except ValueError:
         raise ValueError(f"{field_name} must be a valid calendar date") from None
+    return value
+
+
+def _validate_annotation_datetime(value: str, field_name: str) -> str:
+    """Validate mixpanel_create_annotation's `date` param (YYYY-MM-DD
+    HH:MM:SS) -- distinct from _validate_date above, since an annotation is
+    anchored to a specific time, not just a day. Unvalidated, a malformed
+    value here would reach Mixpanel's API as-is and likely produce a
+    confusing error rather than a clear local one.
+    """
+    if not isinstance(value, str):
+        raise ValueError(
+            f"{field_name} must be a YYYY-MM-DD HH:MM:SS string, got {value!r}"
+        )
+    try:
+        datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        raise ValueError(
+            f"{field_name} must be a YYYY-MM-DD HH:MM:SS string, got {value!r}"
+        ) from None
     return value
 
 
@@ -524,6 +549,7 @@ def mixpanel_create_annotation(date: str, description: str) -> str:
     description: the annotation's text.
     """
     try:
+        _validate_annotation_datetime(date, "date")
         result = _request(
             "POST",
             _region_hosts()["query"],

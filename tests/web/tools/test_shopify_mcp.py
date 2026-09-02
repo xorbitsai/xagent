@@ -353,6 +353,32 @@ def test_graphql_raises_with_structured_error_body_on_http_error(monkeypatch):
         shopify._graphql("query { shop { id } }")
 
 
+def test_graphql_raises_with_plain_string_error_body_on_http_error(monkeypatch):
+    # Shopify's own auth-failure responses (e.g. an invalid access token)
+    # put a plain string in "errors", not the GraphQL {"errors": [{...}]}
+    # shape -- this must not be iterated character-by-character.
+    monkeypatch.setattr(
+        shopify.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                status_code=401,
+                json_data={
+                    "errors": "[API] Invalid API key or access token "
+                    "(unrecognized login or wrong password)"
+                },
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        shopify._graphql("query { shop { id } }")
+
+    message = str(excinfo.value)
+    assert "Invalid API key or access token" in message
+    assert "A; P; I" not in message
+
+
 def test_graphql_truncates_unstructured_error_body(monkeypatch):
     long_body = "x" * 5000
     monkeypatch.setattr(

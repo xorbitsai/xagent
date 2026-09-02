@@ -285,7 +285,19 @@ def _graphql(
         try:
             payload = response.json()
             if isinstance(payload, dict) and payload.get("errors"):
-                detail = graphql_errors_message(payload["errors"])
+                errors_field = payload["errors"]
+                # Shopify's own auth-failure responses (e.g. a 401 for an
+                # invalid access token) put a plain string here -- "[API]
+                # Invalid API key or access token (...)" -- not the GraphQL
+                # {"errors": [{"message": ...}]} shape graphql_errors_message
+                # expects. Iterating a str with that helper walks it one
+                # character at a time instead of raising, producing a
+                # mangled "a; p; i" message instead of a clear error.
+                detail = (
+                    errors_field
+                    if isinstance(errors_field, str)
+                    else graphql_errors_message(errors_field)
+                )
         except ValueError:
             pass
         if detail is None:

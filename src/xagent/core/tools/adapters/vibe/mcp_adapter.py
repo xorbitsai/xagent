@@ -1163,6 +1163,10 @@ class UnavailableMCPTool(AbstractBaseTool):
             return {
                 "success": False,
                 "status": "waiting_for_user",
+                # Not an error - _UnavailableMCPToolResult.is_error defaults
+                # to True, which would otherwise mislabel this pause for any
+                # consumer that keys off is_error rather than status.
+                "is_error": False,
                 "message": (
                     f"I need access to {self._app_name} to continue. "
                     "Please connect it, then let me know once you have."

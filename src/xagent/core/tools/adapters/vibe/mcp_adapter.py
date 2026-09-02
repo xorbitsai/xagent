@@ -15,7 +15,18 @@ import weakref
 from collections.abc import Coroutine, Iterator
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Mapping, Optional, Type, TypeVar, Union, cast
+from typing import (
+    Annotated,
+    Any,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Type,
+    TypeVar,
+    Union,
+    cast,
+)
 
 import httpx
 from mcp.types import Tool as MCPTool
@@ -114,14 +125,11 @@ _HTTP_401_TEXT_RE = re.compile(
 # `pattern` share this number, so lowering it also drops mid-length patterns
 # entirely: a pattern is emitted whole or not at all and is never truncated.
 _FIELD_TEXT_MAX_CHARS = 200
-# Caps one field's `format`, a short identifier token such as `date-time` or
-# `uri`. 64 mirrors the repo's short-identifier cap (`MAX_AGENT_TOOL_NAME_
-# LENGTH`, `STRIP_LOG_MAX_TOOL_NAME_CHARS`, `COMPACT_DROPPED_TOOL_NAME_MAX_
-# CHARS`). `format` is emitted whole or not at all and is never truncated.
-_FIELD_TOKEN_MAX_CHARS = 64
 # `format` values the JSON Schema vocabulary defines. MCP servers are untrusted
 # input, and `format` is emitted verbatim, so only known tokens pass; anything
 # else is dropped rather than forwarded to the model as authoritative text.
+# This set is also what bounds the length of an accepted `format`, so the key
+# carries no length cap of its own.
 _KNOWN_FIELD_FORMATS = frozenset(
     {
         "date-time",
@@ -153,18 +161,29 @@ _KNOWN_FIELD_FORMATS = frozenset(
     }
 )
 
-# Numeric field-schema keys carried through, in the order they are emitted.
-# Each is accepted or dropped on its own value; one key never affects another.
-_FIELD_NUMERIC_METADATA_KEYS = ("minLength", "maxLength", "minimum", "maximum")
-
 
 def _json_equal(a: Any, b: Any) -> bool:
     """Compare two JSON values using JSON's own type distinctions.
 
     JSON Schema treats booleans and numbers as different types, while Python
-    holds ``True == 1``. Enum membership follows JSON, not Python.
+    holds ``True == 1``. Enum membership follows JSON, not Python, and the
+    distinction has to hold at every level: the JSON arrays ``[true]`` and
+    ``[1]`` are not the same array, so the comparison recurses instead of
+    handing nested values back to Python's ``==``.
+
+    Recursion is bounded by the shallower of the two values, and an enum only
+    reaches here after ``_is_json_serializable`` has already serialized it,
+    so its nesting is within the interpreter's recursion limit.
     """
     if isinstance(a, bool) != isinstance(b, bool):
+        return False
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(
+            _json_equal(item_a, item_b) for item_a, item_b in zip(a, b)
+        )
+    if isinstance(a, dict) and isinstance(b, dict):
+        return a.keys() == b.keys() and all(_json_equal(a[key], b[key]) for key in a)
+    if isinstance(a, (list, dict)) or isinstance(b, (list, dict)):
         return False
     return bool(a == b)
 
@@ -179,20 +198,56 @@ def _compact_json(value: Any) -> str:
 
 
 def _is_json_serializable(value: Any) -> bool:
+    """Whether a value survives the serialization the emitted schema applies.
+
+    ``RecursionError`` is refused alongside the type and value errors, because
+    a value nested deeper than the interpreter's recursion limit cannot be
+    emitted either: ``json.dumps`` gives up at roughly 1200 levels. Refusing
+    it here drops the one key it arrived on, whereas letting it escape would
+    reach the caller's fallback and cost the whole tool its arguments.
+    """
     try:
         _compact_json(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, RecursionError):
         return False
     return True
 
 
 def _is_finite_number(value: Any) -> bool:
-    """Whether a value is a JSON number, excluding booleans and non-finite floats."""
-    return (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and math.isfinite(value)
-    )
+    """Whether a value is a JSON number, excluding booleans and non-finite floats.
+
+    Python integers are unbounded, so for an integer too large to convert to a
+    float ``math.isfinite`` raises ``OverflowError`` rather than answering.
+    Such a number is no more emittable than an infinity, so it is refused the
+    same way: the key it arrived on is dropped and nothing else is affected.
+    """
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
+def _is_non_negative_integer(value: Any) -> bool:
+    """Whether a value is a JSON integer of zero or more.
+
+    ``minLength`` and ``maxLength`` count characters, so JSON Schema defines
+    them as non-negative integers. A negative or fractional bound is not a
+    stricter rule the model should honour, it is a malformed one.
+    """
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+# Numeric field-schema keys carried through, in the order they are emitted,
+# each with the check its own JSON Schema definition calls for. Every key is
+# accepted or dropped on its own value; one key never affects another.
+_FIELD_NUMERIC_METADATA_KEYS = (
+    ("minLength", _is_non_negative_integer),
+    ("maxLength", _is_non_negative_integer),
+    ("minimum", _is_finite_number),
+    ("maximum", _is_finite_number),
+)
 
 
 def _bounded_field_text(value: str) -> str:
@@ -264,6 +319,13 @@ def _field_metadata_candidates(
         # optional field with no default. Membership is tested member by member
         # because enum members may be objects, which no hash-based container
         # would accept.
+        # The tradeoff this makes is worth stating plainly: an optional field
+        # whose author wrote an enum and no default emits both that enum and
+        # `default: null`, and read as pure JSON Schema those two contradict
+        # each other, because `null` is not one of the listed values. The null
+        # is this adapter's placeholder for "the author declared nothing", not
+        # a value the author asserted, so the author's enum is the half that
+        # is kept.
         if (
             isinstance(raw_enum, list)
             and raw_enum
@@ -280,33 +342,37 @@ def _field_metadata_candidates(
 
     if "pattern" in field_schema:
         raw_pattern = field_schema["pattern"]
-        pattern = " ".join(raw_pattern.split()) if isinstance(raw_pattern, str) else ""
-        # A truncated regex is syntactically invalid yet still reads to the
-        # model as an authoritative rule, so an over-long pattern is dropped.
-        if pattern and len(pattern) <= _FIELD_TEXT_MAX_CHARS:
-            candidates.append(("pattern", pattern))
+        # A pattern is passed through character for character. The whitespace
+        # collapsing `description` gets would change which strings the regex
+        # matches -- `^a  b$` and `^a b$` accept disjoint sets -- and a regex
+        # is read by a matcher, not by a reader. A truncated regex is
+        # syntactically invalid yet still reads to the model as an
+        # authoritative rule, so an over-long pattern is dropped whole. A
+        # blank pattern states nothing and is dropped as malformed.
+        if (
+            isinstance(raw_pattern, str)
+            and raw_pattern.strip()
+            and len(raw_pattern) <= _FIELD_TEXT_MAX_CHARS
+        ):
+            candidates.append(("pattern", raw_pattern))
         else:
             rejected += 1
 
     if "format" in field_schema:
         raw_format = field_schema["format"]
-        # The whitelist already bounds the length -- its longest member is well
-        # under the cap -- so the cap is a stated ceiling on this key rather
-        # than a test that decides any real input.
-        if (
-            isinstance(raw_format, str)
-            and len(raw_format) <= _FIELD_TOKEN_MAX_CHARS
-            and raw_format in _KNOWN_FIELD_FORMATS
-        ):
+        # The vocabulary is the whole gate: `format` is emitted verbatim, so
+        # only tokens JSON Schema defines pass, and that set also bounds how
+        # long an accepted token can be.
+        if isinstance(raw_format, str) and raw_format in _KNOWN_FIELD_FORMATS:
             candidates.append(("format", raw_format))
         else:
             rejected += 1
 
-    for key in _FIELD_NUMERIC_METADATA_KEYS:
+    for key, is_acceptable in _FIELD_NUMERIC_METADATA_KEYS:
         if key not in field_schema:
             continue
         value = field_schema[key]
-        if _is_finite_number(value):
+        if is_acceptable(value):
             candidates.append((key, value))
         else:
             rejected += 1
@@ -318,29 +384,36 @@ def _tool_field_metadata(
     properties: Mapping[str, Any],
     required: Any,
     excluded_names: set[str],
-) -> tuple[dict[str, tuple[Optional[str], dict[str, Any]]], int]:
-    """Decide the metadata every field of one tool emits.
+) -> tuple[dict[str, tuple[Any, Optional[str], dict[str, Any]]], int]:
+    """Decide what every field of one tool emits.
 
-    Fields are independent: each key is capped on its own, so nothing one field
-    declares can change what another field emits.
+    Fields are independent: each key is judged on its own, so nothing one
+    field declares can change what another field emits.
 
-    Returns the per-field description and schema extras, and how many present
-    keys were rejected on their own contents.
+    Returns one record per field the args model will carry -- the default it
+    emits, its description, and its other schema keys -- plus how many present
+    metadata keys were rejected on their own contents. The default is decided
+    here rather than by the caller so that it is derived exactly once per
+    field: the enum rules already need to know it.
     """
-    metadata: dict[str, tuple[Optional[str], dict[str, Any]]] = {}
+    metadata: dict[str, tuple[Any, Optional[str], dict[str, Any]]] = {}
     rejected_keys = 0
 
     for field_name, field_schema in properties.items():
         if field_name in excluded_names:
             continue
-        if not isinstance(field_schema, Mapping):
-            continue
 
         if field_name in required:
+            # A required field has no default to emit, and the enum rules that
+            # consult one do not apply to it.
             emitted_default: Any = None
             default_is_authored = False
         else:
             emitted_default, default_is_authored = _emitted_default(field_schema)
+
+        if not isinstance(field_schema, Mapping):
+            metadata[field_name] = (emitted_default, None, {})
+            continue
 
         candidates, rejected = _field_metadata_candidates(
             field_schema,
@@ -357,8 +430,7 @@ def _tool_field_metadata(
             else:
                 extra[key] = value
 
-        if description is not None or extra:
-            metadata[field_name] = (description, extra)
+        metadata[field_name] = (emitted_default, description, extra)
 
     return metadata, rejected_keys
 
@@ -769,6 +841,18 @@ class MCPToolAdapter(AbstractBaseTool):
         ``json_schema_extra``, which never becomes a Pydantic validator, so
         argument validation behaves exactly as it would without it.
 
+        Only the tool's own top-level fields are read. A nested ``object`` or
+        an ``array`` item schema is already flattened to a bare Python type
+        here, so metadata a connector wrote on a nested sub-field or on an
+        array's items is not extracted and does not reach the model.
+
+        The metadata is attached to the field's annotation rather than placed
+        beside the field. For an optional field Pydantic emits an ``anyOf``
+        wrapper, and a consumer that resolves that wrapper down to its
+        non-null branch keeps only what that branch holds; metadata placed
+        beside the wrapper would be dropped there, which is exactly the shape
+        the fix is for.
+
         A field's default is the one exception, and it is not presentation: a
         non-finite default is replaced by ``None``, so such a field is omitted
         from the arguments sent to the server instead of carrying a value no
@@ -806,31 +890,30 @@ class MCPToolAdapter(AbstractBaseTool):
             for field_name, field_schema in properties.items():
                 if field_name in runtime_bound_args:
                     continue
-                field_type = self._json_schema_to_python_type(field_schema)
-                description, extra = metadata.get(field_name, (None, {}))
+                # Both loops walk `properties` skipping the same names, so
+                # every field reaching here has a record.
+                emitted_default, description, extra = metadata[field_name]
+                annotation: Any = self._json_schema_to_python_type(field_schema)
 
-                # Check if field is required
-                if field_name in required:
-                    default_value: Any = ...
-                    annotation: Any = field_type
-                else:
-                    # Optional field with default
-                    default_value, _ = _emitted_default(field_schema)
-                    annotation = Optional[field_type]
-
-                if description is None and not extra:
-                    # A field with nothing to say keeps the plain tuple form,
-                    # so its emitted schema is unchanged.
-                    fields[field_name] = (annotation, default_value)
-                else:
-                    fields[field_name] = (
+                if description is not None or extra:
+                    # Carried on the annotation so it lands inside the
+                    # non-null branch of the `anyOf` an optional field gets.
+                    # A field with nothing to say is left alone, so its
+                    # emitted schema is unchanged.
+                    annotation = Annotated[
                         annotation,
                         Field(
-                            default=default_value,
                             description=description,
                             json_schema_extra=extra or None,
                         ),
-                    )
+                    ]
+
+                # Check if field is required
+                if field_name in required:
+                    fields[field_name] = (annotation, ...)
+                else:
+                    # Optional field with default
+                    fields[field_name] = (Optional[annotation], emitted_default)
 
             if rejected_keys:
                 logger.debug(

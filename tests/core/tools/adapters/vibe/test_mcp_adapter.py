@@ -15,10 +15,10 @@ from mcp.types import CallToolResult, TextContent
 from pydantic import BaseModel, ConfigDict, create_model
 from pydantic.alias_generators import to_camel
 
+from xagent.core.model.chat.basic.claude import _fix_pydantic_schema_for_claude
 from xagent.core.tools.adapters.vibe import mcp_adapter as mcp_adapter_module
 from xagent.core.tools.adapters.vibe.mcp_adapter import (
     _FIELD_TEXT_MAX_CHARS,
-    _FIELD_TOKEN_MAX_CHARS,
     EmptyArgsModel,
     MCPFailurePhase,
     MCPServerLoadFailure,
@@ -2129,18 +2129,6 @@ async def test_delegated_authorization_retry_failure_does_not_leak_token(
     assert "expired-token" not in public_output
 
 
-_METADATA_KEYS = (
-    "description",
-    "enum",
-    "pattern",
-    "format",
-    "minLength",
-    "maxLength",
-    "minimum",
-    "maximum",
-)
-
-
 def _schema_adapter(properties, required=None, *, tool_name="probe_tool"):
     """Build an adapter over a hand-written MCP input schema."""
     mcp_tool = SimpleNamespace(
@@ -2167,16 +2155,24 @@ def _emitted_field(properties, required=None, *, field="f"):
     return _emitted_schema(properties, required)["properties"][field]
 
 
-def _without_metadata(properties):
-    """Same properties with every preserved metadata key removed."""
-    stripped = {}
-    for name, field_schema in properties.items():
-        stripped[name] = {
-            key: value
-            for key, value in field_schema.items()
-            if key not in _METADATA_KEYS
-        }
-    return stripped
+def _metadata_carrier(field):
+    """The subschema of one emitted field that carries its metadata.
+
+    An optional field is emitted as an ``anyOf`` of its declared type and
+    ``null``, and its metadata sits on the declared-type branch so that a
+    consumer resolving the wrapper down to that branch keeps it. A required
+    field has no wrapper and carries its metadata directly.
+    """
+    options = field.get("anyOf")
+    if options is None:
+        return field
+    non_null = [option for option in options if option.get("type") != "null"]
+    assert len(non_null) == 1, options
+    return non_null[0]
+
+
+def _emitted_metadata(properties, required=None, *, field="f"):
+    return _metadata_carrier(_emitted_field(properties, required, field=field))
 
 
 def _compact_json(value):
@@ -2186,9 +2182,9 @@ def _compact_json(value):
 @pytest.mark.parametrize("is_required", [True, False])
 def test_field_description_reaches_emitted_schema(is_required):
     properties = {"f": {"type": "string", "description": "The city to look up."}}
-    field = _emitted_field(properties, ["f"] if is_required else [])
+    carrier = _emitted_metadata(properties, ["f"] if is_required else [])
 
-    assert field["description"] == "The city to look up."
+    assert carrier["description"] == "The city to look up."
 
 
 @pytest.mark.parametrize(
@@ -2404,9 +2400,9 @@ def test_enum_containing_non_finite_number_is_not_emitted():
 def test_enum_dropped_when_authored_default_is_not_a_member(
     field_schema, enum_expected
 ):
-    field = _emitted_field({"f": field_schema})
+    carrier = _emitted_metadata({"f": field_schema})
 
-    assert ("enum" in field) is enum_expected
+    assert ("enum" in carrier) is enum_expected
 
 
 @pytest.mark.parametrize(
@@ -2415,7 +2411,6 @@ def test_enum_dropped_when_authored_default_is_not_a_member(
         ("pattern", "^[a-z]{2,10}$", True),
         ("pattern", "^(?:" + "a" * (_FIELD_TEXT_MAX_CHARS + 20) + ")$", False),
         ("format", "date-time", True),
-        ("format", "x" * (_FIELD_TOKEN_MAX_CHARS + 1), False),
     ],
 )
 def test_pattern_and_format_are_all_or_nothing(key, value, emitted):
@@ -2538,12 +2533,12 @@ def test_enum_survives_when_the_server_declared_no_default(is_required):
     field the connector documented with a closed value set.
     """
     members = ["metric", "imperial"]
-    field = _emitted_field(
+    carrier = _emitted_metadata(
         {"f": {"type": "string", "enum": members}},
         ["f"] if is_required else [],
     )
 
-    assert field["enum"] == members
+    assert carrier["enum"] == members
 
 
 def test_enum_survives_when_a_non_finite_default_was_replaced():
@@ -2552,7 +2547,7 @@ def test_enum_survives_when_a_non_finite_default_was_replaced():
         {"f": {"type": "number", "enum": [1, 2], "default": float("inf")}}, []
     )
 
-    assert field["enum"] == [1, 2]
+    assert _metadata_carrier(field)["enum"] == [1, 2]
     assert field["default"] is None
 
 
@@ -2567,10 +2562,255 @@ def test_enum_survives_when_a_non_finite_default_was_replaced():
 def test_authored_default_still_governs_the_enum(declared_default, enum_expected):
     """A default the author wrote must sit inside the enum they wrote."""
     members = ["metric", "imperial"]
-    field = _emitted_field(
+    carrier = _emitted_metadata(
         {"f": {"type": "string", "enum": members, "default": declared_default}}, []
     )
 
-    assert ("enum" in field) is enum_expected
+    assert ("enum" in carrier) is enum_expected
     if enum_expected:
-        assert field["enum"] == members
+        assert carrier["enum"] == members
+
+
+def test_optional_field_metadata_is_nested_in_the_non_null_branch():
+    """An optional field carries its metadata inside its declared-type branch.
+
+    Beside the ``anyOf`` wrapper the metadata would be lost to any consumer
+    that resolves the wrapper down to the non-null branch. The default stays
+    a sibling of the wrapper, because it belongs to the field, not to one
+    branch of it.
+    """
+    field = _emitted_field(
+        {
+            "f": {
+                "type": "string",
+                "description": "Guidance.",
+                "enum": ["a", "b"],
+                "pattern": "^[ab]$",
+            }
+        },
+        [],
+    )
+
+    assert field["anyOf"] == [
+        {
+            "description": "Guidance.",
+            "enum": ["a", "b"],
+            "pattern": "^[ab]$",
+            "type": "string",
+        },
+        {"type": "null"},
+    ]
+    assert field["default"] is None
+    assert "description" not in field
+    assert "enum" not in field
+
+
+@pytest.mark.parametrize("is_required", [True, False])
+def test_field_metadata_survives_the_claude_schema_pass(is_required):
+    """Metadata reaches Anthropic providers, whether or not the field is optional.
+
+    Claude does not accept ``anyOf``, and the provider client resolves an
+    optional field to its non-null branch, keeping only what that branch
+    holds. The one documented loss is numeric bounds, which that same pass
+    strips from every number and integer schema regardless of this adapter.
+    """
+    emitted = _emitted_schema(
+        {
+            "tax_reference_number": {
+                "type": "string",
+                "description": "Tax file number, 9 digits.",
+                "enum": ["TFN", "ABN"],
+                "pattern": "^[0-9]{9}$",
+                "format": "regex",
+                "minLength": 9,
+            },
+            "attempts": {"type": "integer", "minimum": 1, "maximum": 9},
+        },
+        ["tax_reference_number", "attempts"] if is_required else [],
+    )
+    fixed = _fix_pydantic_schema_for_claude(emitted)["properties"]
+
+    assert fixed["tax_reference_number"]["description"] == "Tax file number, 9 digits."
+    assert fixed["tax_reference_number"]["enum"] == ["TFN", "ABN"]
+    assert fixed["tax_reference_number"]["pattern"] == "^[0-9]{9}$"
+    assert fixed["tax_reference_number"]["format"] == "regex"
+    assert fixed["tax_reference_number"]["minLength"] == 9
+    assert "minimum" not in fixed["attempts"]
+    assert "maximum" not in fixed["attempts"]
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        "^a  b$",
+        "^a\tb$",
+        " ^abc$ ",
+        "^[ ]{3}x$",
+    ],
+)
+def test_pattern_is_emitted_character_for_character(pattern):
+    """A regex is machine-read, so no whitespace normalization touches it.
+
+    ``^a  b$`` and ``^a b$`` accept disjoint sets of strings, so collapsing
+    the run would hand the model a rule the connector author never wrote.
+    """
+    carrier = _emitted_metadata({"f": {"type": "string", "pattern": pattern}}, ["f"])
+
+    assert carrier["pattern"] == pattern
+
+
+@pytest.mark.parametrize("pattern", ["", "   ", "\t\n"])
+def test_blank_pattern_is_not_emitted(pattern):
+    """A pattern with nothing but whitespace states nothing and is dropped."""
+    carrier = _emitted_metadata({"f": {"type": "string", "pattern": pattern}}, ["f"])
+
+    assert "pattern" not in carrier
+
+
+@pytest.mark.parametrize("key", ["minLength", "maxLength"])
+@pytest.mark.parametrize("value", [-5, 2.7, -0.5, True])
+def test_length_bounds_must_be_non_negative_integers(key, value):
+    """JSON Schema defines the length bounds as non-negative integers.
+
+    A negative or fractional character count is a malformed rule, not a
+    stricter one, so it is dropped instead of being handed to the model.
+    """
+    carrier = _emitted_metadata({"f": {"type": "string", key: value}}, ["f"])
+
+    assert key not in carrier
+
+
+@pytest.mark.parametrize("value", [0, 9])
+def test_length_bounds_accept_zero_and_above(value):
+    carrier = _emitted_metadata({"f": {"type": "string", "minLength": value}}, ["f"])
+
+    assert carrier["minLength"] == value
+
+
+@pytest.mark.parametrize(
+    "enum_members,declared_default,enum_expected",
+    [
+        # JSON keeps `true` and `1` apart at every level, so a default of
+        # `[1]` is not the listed member `[true]` and the two contradict.
+        ([[True]], [1], False),
+        ([{"k": True}], [{"k": 1}], False),
+        ([[True]], [True], True),
+        ([{"k": True}], {"k": True}, True),
+    ],
+)
+def test_nested_bool_and_number_enum_members_stay_apart(
+    enum_members, declared_default, enum_expected
+):
+    carrier = _emitted_metadata(
+        {"f": {"enum": enum_members, "default": declared_default}}, []
+    )
+
+    assert ("enum" in carrier) is enum_expected
+
+
+def test_nested_field_metadata_is_not_extracted():
+    """Only the tool's own top-level fields are read.
+
+    A nested object or an array item schema is flattened to a bare Python
+    type here, so metadata written inside one does not reach the model. This
+    pins the documented boundary rather than asserting it is desirable.
+    """
+    emitted = _emitted_schema(
+        {
+            "address": {
+                "type": "object",
+                "description": "Postal address.",
+                "properties": {
+                    "street": {"type": "string", "description": "STREET_DESC"}
+                },
+            },
+            "tags": {
+                "type": "array",
+                "description": "Labels.",
+                "items": {"type": "string", "description": "ITEM_DESC"},
+            },
+        },
+        ["address", "tags"],
+    )
+    serialized = _compact_json(emitted)
+
+    assert emitted["properties"]["address"]["description"] == "Postal address."
+    assert emitted["properties"]["tags"]["description"] == "Labels."
+    assert "STREET_DESC" not in serialized
+    assert "ITEM_DESC" not in serialized
+
+
+def test_an_unusable_numeric_bound_costs_only_its_own_key():
+    """A value no provider can carry drops that key and nothing else.
+
+    Python integers are unbounded, so an integer past the float range makes
+    ``math.isfinite`` raise rather than answer. Left uncaught that reaches
+    the args-model fallback and the whole tool loses its arguments, so the
+    check has to refuse the value instead.
+    """
+    too_large = int("9" * 401)
+    schema = _emitted_schema(
+        {
+            "n": {"type": "integer", "minimum": too_large, "description": "Count."},
+            "other": {"type": "string", "description": "Untouched."},
+        },
+        ["n", "other"],
+    )
+    args_model = _schema_adapter(
+        {
+            "n": {"type": "integer", "minimum": too_large, "description": "Count."},
+            "other": {"type": "string", "description": "Untouched."},
+        },
+        ["n", "other"],
+    ).args_type()
+
+    assert set(args_model.model_fields) == {"n", "other"}
+    assert "minimum" not in schema["properties"]["n"]
+    assert schema["properties"]["n"]["description"] == "Count."
+    assert schema["properties"]["other"]["description"] == "Untouched."
+
+
+def test_an_unserializable_deep_enum_costs_only_its_own_key():
+    """A value nested past the recursion limit drops its key, not the tool.
+
+    ``json.dumps`` gives up at roughly 1200 levels with a ``RecursionError``,
+    which is refused where the value is judged.
+    """
+    deep: list = []
+    cursor = deep
+    for _ in range(1500):
+        nested: list = []
+        cursor.append(nested)
+        cursor = nested
+    properties = {
+        "f": {"type": "string", "enum": [deep], "description": "Count."},
+        "other": {"type": "string", "description": "Untouched."},
+    }
+    schema = _emitted_schema(properties, ["f", "other"])
+    args_model = _schema_adapter(properties, ["f", "other"]).args_type()
+
+    assert set(args_model.model_fields) == {"f", "other"}
+    assert "enum" not in schema["properties"]["f"]
+    assert schema["properties"]["f"]["description"] == "Count."
+    assert schema["properties"]["other"]["description"] == "Untouched."
+
+
+@pytest.mark.parametrize(
+    "length,truncated",
+    [
+        (_FIELD_TEXT_MAX_CHARS - 1, False),
+        (_FIELD_TEXT_MAX_CHARS, False),
+        (_FIELD_TEXT_MAX_CHARS + 1, True),
+    ],
+)
+def test_description_length_boundary(length, truncated):
+    """The cap is inclusive: exactly the cap is kept, one over is shortened."""
+    raw = "a" * length
+    carrier = _emitted_metadata({"f": {"type": "string", "description": raw}}, ["f"])
+    description = carrier["description"]
+
+    assert len(description) <= _FIELD_TEXT_MAX_CHARS
+    if truncated:
+        assert description == "a" * (_FIELD_TEXT_MAX_CHARS - 1) + "…"
+    else:
+        assert description == raw

@@ -287,6 +287,9 @@ def test_redact_sensitive_text_masks_basic_auth_credential() -> None:
     redacted = redact_sensitive_text(text)
 
     assert "dXNlcjpzdXBlci1zZWNyZXQtdG9rZW4=" not in redacted
+    # Not just "the secret is gone" -- confirm it was actually masked in
+    # place rather than the whole header being silently dropped.
+    assert "Authorization: Basic ***" in redacted
 
 
 def test_redact_sensitive_text_masks_assignment_style_secrets() -> None:

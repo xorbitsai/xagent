@@ -308,13 +308,17 @@ def test_create_contact_sends_post(monkeypatch):
     monkeypatch.setattr(chartmogul.requests, "request", mock_request)
 
     chartmogul.chartmogul_create_contact(
-        {"customer_uuid": "cus_1", "email": "a@example.com"}
+        "cus_1", {"data_source_uuid": "ds_1", "email": "a@example.com"}
     )
 
     assert mock_request.call_args.kwargs["method"] == "POST"
     assert mock_request.call_args.kwargs["url"] == (
-        "https://api.chartmogul.com/v1/contacts"
+        "https://api.chartmogul.com/v1/customers/cus_1/contacts"
     )
+    assert mock_request.call_args.kwargs["json"] == {
+        "data_source_uuid": "ds_1",
+        "email": "a@example.com",
+    }
 
 
 def test_get_contact_returns_record(monkeypatch):
@@ -564,3 +568,30 @@ def test_success_with_capped_list_drops_message_as_last_resort(monkeypatch):
     assert result["entries"] == []
     assert result["truncated"] is True
     assert "message" not in result
+
+
+async def test_mcp_registers_all_fifteen_tools():
+    """Direct-call unit tests above exercise each tool's Python body, but
+    none of them go through FastMCP's own registration/schema layer -- a
+    tool whose @mcp.tool() decorator was dropped, or whose name was
+    typo'd, would still pass every test above while being unreachable to
+    an agent."""
+    tools = await chartmogul.mcp.list_tools()
+
+    assert {tool.name for tool in tools} == {
+        "chartmogul_list_customers",
+        "chartmogul_create_customer",
+        "chartmogul_get_customer",
+        "chartmogul_update_customer",
+        "chartmogul_delete_customer",
+        "chartmogul_list_contacts",
+        "chartmogul_create_contact",
+        "chartmogul_get_contact",
+        "chartmogul_update_contact",
+        "chartmogul_delete_contact",
+        "chartmogul_list_opportunities",
+        "chartmogul_create_opportunity",
+        "chartmogul_get_opportunity",
+        "chartmogul_update_opportunity",
+        "chartmogul_delete_opportunity",
+    }

@@ -171,38 +171,48 @@ def _request(
         )
     if response.status_code == 204 or not response.content:
         return {}
-    return response.json()
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise RuntimeError(
+            f"ChartMogul returned a 2xx response with a non-JSON body: {exc}"
+        ) from exc
 
 
 def _clamp_per_page(per_page: int) -> int:
     return clamp_limit(per_page, max_limit=MAX_PER_PAGE)
 
 
-def _validated_dict(result: Any, endpoint: str) -> dict[str, Any] | str:
-    """Return ``result`` if it's a dict, else an ``_error()`` JSON string."""
+def _validated_dict(result: Any, endpoint: str) -> dict[str, Any]:
+    """Return ``result`` if it's a dict, else raise.
+
+    Every caller is inside a ``try/except Exception -> _error(str(e))``
+    block, so raising here (rather than returning a ``dict | str`` union
+    every call site would have to narrow) reaches the caller's own error
+    envelope unchanged.
+    """
     if not isinstance(result, dict):
-        return _error(f"ChartMogul returned an unexpected response for {endpoint}")
+        raise RuntimeError(f"ChartMogul returned an unexpected response for {endpoint}")
     return result
 
 
-def _validated_list_result(result: Any, endpoint: str) -> dict[str, Any] | str:
-    """Return ``result`` with ``entries`` normalized to a list, else an
-    ``_error()`` JSON string.
+def _validated_list_result(result: Any, endpoint: str) -> dict[str, Any]:
+    """Return ``result`` with ``entries`` normalized to a list, else raise.
 
     A present-but-``null`` ``entries`` field is treated the same as an
-    empty list rather than a connector-level error, in case ChartMogul
-    ever returns ``null`` instead of ``[]`` for a zero-result page. A
-    *missing* ``entries`` key is still rejected as an unexpected shape --
-    unlike an explicit ``null``, its absence isn't evidence of "empty",
-    just of a response that isn't a page of this resource at all.
+    empty list rather than an error, in case ChartMogul ever returns
+    ``null`` instead of ``[]`` for a zero-result page. A *missing*
+    ``entries`` key is still rejected as an unexpected shape -- unlike an
+    explicit ``null``, its absence isn't evidence of "empty", just of a
+    response that isn't a page of this resource at all.
     """
     if not isinstance(result, dict) or "entries" not in result:
-        return _error(f"ChartMogul returned an unexpected response for {endpoint}")
+        raise RuntimeError(f"ChartMogul returned an unexpected response for {endpoint}")
     entries = result["entries"]
     if entries is None:
         entries = []
     elif not isinstance(entries, list):
-        return _error(f"ChartMogul returned an unexpected response for {endpoint}")
+        raise RuntimeError(f"ChartMogul returned an unexpected response for {endpoint}")
     return {**result, "entries": entries}
 
 
@@ -253,8 +263,6 @@ def chartmogul_list_customers(
             },
         )
         result = _validated_list_result(result, "/customers")
-        if isinstance(result, str):
-            return result
         return _success_with_capped_list("entries", result)
     except Exception as e:
         logger.error(f"Error listing ChartMogul customers: {e}", exc_info=True)
@@ -273,8 +281,6 @@ def chartmogul_create_customer(data: dict[str, Any]) -> str:
     try:
         result = _request("POST", "/customers", json_data=data)
         result = _validated_dict(result, "/customers")
-        if isinstance(result, str):
-            return result
         return success_with_capped_dict("customer", result)
     except Exception as e:
         logger.error(f"Error creating ChartMogul customer: {e}", exc_info=True)
@@ -292,8 +298,6 @@ def chartmogul_get_customer(uuid: str) -> str:
         safe_uuid = url_path_id(uuid, "uuid")
         result = _request("GET", f"/customers/{safe_uuid}")
         result = _validated_dict(result, "/customers")
-        if isinstance(result, str):
-            return result
         return success_with_capped_dict("customer", result)
     except Exception as e:
         logger.error(f"Error fetching ChartMogul customer {uuid}: {e}", exc_info=True)
@@ -312,8 +316,6 @@ def chartmogul_update_customer(uuid: str, data: dict[str, Any]) -> str:
         safe_uuid = url_path_id(uuid, "uuid")
         result = _request("PATCH", f"/customers/{safe_uuid}", json_data=data)
         result = _validated_dict(result, "/customers")
-        if isinstance(result, str):
-            return result
         return success_with_capped_dict("customer", result)
     except Exception as e:
         logger.error(f"Error updating ChartMogul customer {uuid}: {e}", exc_info=True)
@@ -380,8 +382,6 @@ def chartmogul_list_contacts(
             },
         )
         result = _validated_list_result(result, "/contacts")
-        if isinstance(result, str):
-            return result
         return _success_with_capped_list("entries", result)
     except Exception as e:
         logger.error(f"Error listing ChartMogul contacts: {e}", exc_info=True)
@@ -389,20 +389,28 @@ def chartmogul_list_contacts(
 
 
 @mcp.tool()
-def chartmogul_create_contact(data: dict[str, Any]) -> str:
+def chartmogul_create_contact(customer_uuid: str, data: dict[str, Any]) -> str:
     """
-    Create a contact (POST /contacts).
+    Create a contact under a customer (POST /customers/{customer_uuid}/contacts).
 
-    data: a ChartMogul contact object. Should include "customer_uuid" (or
-    "customer_external_id" together with "data_source_uuid") to associate
-    it with a customer; commonly also "first_name", "last_name", "email",
-    "title", "phone".
+    Unlike customers and opportunities, contact creation is nested under its
+    customer -- confirmed against ChartMogul's official docs
+    (dev.chartmogul.com/reference/customers/add-contact): "customer_uuid" is
+    a path parameter, not a body field.
+
+    customer_uuid: the ChartMogul customer this contact belongs to.
+    data: a ChartMogul contact object. Must include "data_source_uuid" (the
+    customer's data source; an error is returned if the customer isn't
+    associated with it); optionally "first_name", "last_name", "email",
+    "title", "phone", "position", "external_id", "linked_in", "twitter",
+    "notes", "custom".
     """
     try:
-        result = _request("POST", "/contacts", json_data=data)
+        safe_customer_uuid = url_path_id(customer_uuid, "customer_uuid")
+        result = _request(
+            "POST", f"/customers/{safe_customer_uuid}/contacts", json_data=data
+        )
         result = _validated_dict(result, "/contacts")
-        if isinstance(result, str):
-            return result
         return success_with_capped_dict("contact", result)
     except Exception as e:
         logger.error(f"Error creating ChartMogul contact: {e}", exc_info=True)
@@ -420,8 +428,6 @@ def chartmogul_get_contact(uuid: str) -> str:
         safe_uuid = url_path_id(uuid, "uuid")
         result = _request("GET", f"/contacts/{safe_uuid}")
         result = _validated_dict(result, "/contacts")
-        if isinstance(result, str):
-            return result
         return success_with_capped_dict("contact", result)
     except Exception as e:
         logger.error(f"Error fetching ChartMogul contact {uuid}: {e}", exc_info=True)
@@ -440,8 +446,6 @@ def chartmogul_update_contact(uuid: str, data: dict[str, Any]) -> str:
         safe_uuid = url_path_id(uuid, "uuid")
         result = _request("PATCH", f"/contacts/{safe_uuid}", json_data=data)
         result = _validated_dict(result, "/contacts")
-        if isinstance(result, str):
-            return result
         return success_with_capped_dict("contact", result)
     except Exception as e:
         logger.error(f"Error updating ChartMogul contact {uuid}: {e}", exc_info=True)
@@ -514,8 +518,6 @@ def chartmogul_list_opportunities(
             },
         )
         result = _validated_list_result(result, "/opportunities")
-        if isinstance(result, str):
-            return result
         return _success_with_capped_list("entries", result)
     except Exception as e:
         logger.error(f"Error listing ChartMogul opportunities: {e}", exc_info=True)
@@ -535,8 +537,6 @@ def chartmogul_create_opportunity(data: dict[str, Any]) -> str:
     try:
         result = _request("POST", "/opportunities", json_data=data)
         result = _validated_dict(result, "/opportunities")
-        if isinstance(result, str):
-            return result
         return success_with_capped_dict("opportunity", result)
     except Exception as e:
         logger.error(f"Error creating ChartMogul opportunity: {e}", exc_info=True)
@@ -554,8 +554,6 @@ def chartmogul_get_opportunity(uuid: str) -> str:
         safe_uuid = url_path_id(uuid, "uuid")
         result = _request("GET", f"/opportunities/{safe_uuid}")
         result = _validated_dict(result, "/opportunities")
-        if isinstance(result, str):
-            return result
         return success_with_capped_dict("opportunity", result)
     except Exception as e:
         logger.error(
@@ -576,8 +574,6 @@ def chartmogul_update_opportunity(uuid: str, data: dict[str, Any]) -> str:
         safe_uuid = url_path_id(uuid, "uuid")
         result = _request("PATCH", f"/opportunities/{safe_uuid}", json_data=data)
         result = _validated_dict(result, "/opportunities")
-        if isinstance(result, str):
-            return result
         return success_with_capped_dict("opportunity", result)
     except Exception as e:
         logger.error(

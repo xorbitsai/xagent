@@ -4820,10 +4820,11 @@ def test_normalize_keeps_colliding_fields_at_single_tool_callsite(
 ) -> None:
     """Within one ask_user_question call, a BOM-wrapped field name and
     its plain counterpart now normalize to the same field. This function
-    does not deduplicate -- both interactions are kept unchanged, and the
-    single-tool call site sends the result on as-is (the multi-tool call
-    site has its own dedup, covered separately below). One warning is
-    logged, with an integer-only extra/message-args payload."""
+    does not deduplicate -- both interactions are kept unchanged. Both
+    call sites deduplicate afterward: the multi-tool one is covered
+    below in this file, the single-tool one in
+    test_react_ask_user_question_dedup.py. One warning is logged, with
+    an integer-only extra/message-args payload."""
     with caplog.at_level(
         logging.WARNING, logger="xagent.core.agent.pattern.react.react"
     ):
@@ -5577,7 +5578,10 @@ async def test_react_pattern_traces_context_compaction() -> None:
     result = await ReActPattern(max_iterations=1).run(
         context=context,
         tools=[],
-        llm=FakeLLM([{"content": "done"}]),
+        # Two responses: compaction now summarizes with the main model when no
+        # compact model is configured, so it consumes one before the turn's
+        # own call.
+        llm=FakeLLM([{"content": "summary"}, {"content": "done"}]),
         runtime=runtime,
     )
 
@@ -8473,3 +8477,101 @@ async def test_react_close_streamed_answer_fails_open_stream_without_deliverable
 
     assert streamer.finish_calls == []
     assert streamer.fail_calls == [NO_DELIVERABLE_FINAL_ANSWER_REASON]
+
+
+class RoutedDownstreamLLM:
+    """Downstream selection behind a router.
+
+    It needs both entry points: compaction goes through ``run_llm_call`` ->
+    ``chat``, while the turn's own call streams (``_ResolvedRouterLLM``
+    defines ``stream_chat``, so the runtime takes the native streaming path).
+    Both record into one list so call ordering is assertable.
+    """
+
+    def __init__(self, chat_responses: list[Any], final_text: str) -> None:
+        self.chat_responses = chat_responses
+        self.final_text = final_text
+        self.calls: list[dict[str, Any]] = []
+
+    async def chat(self, messages: Any = None, **kwargs: Any) -> Any:
+        self.calls.append({"messages": messages, **kwargs})
+        return self.chat_responses.pop(0)
+
+    async def stream_chat(self, messages: Any = None, **kwargs: Any) -> Any:
+        self.calls.append({"messages": messages, **kwargs})
+        yield StreamChunk(type=ChunkType.TOKEN, delta=self.final_text)
+        yield StreamChunk(type=ChunkType.END)
+
+
+def _routing_router(
+    downstream: Any, route_prompts: list[str], *, context_window: int = 4
+) -> RouterLLM:
+    """A real ``RouterLLM`` whose selection is stubbed to record its prompt.
+
+    ``context_window`` is deliberately set, matching production: ``adapter.py``
+    always stamps it from the model row, and ``prepare_llm_for_context``
+    recomputes the compaction threshold from it. Leaving it unset would put the
+    fixture in a state a real router never reaches. A window of 4 yields a
+    threshold of 3, small enough that any context compacts.
+    """
+    router = RouterLLM(downstream_resolver=lambda _model_id: downstream)
+    router.context_window = context_window
+
+    async def select_model(prompt: str) -> str:
+        route_prompts.append(prompt)
+        return "test/model"
+
+    router._select_model = select_model  # type: ignore[assignment]
+    return router
+
+
+def _react_context_with_tool_history(execution_id: str) -> ExecutionContext:
+    context = ExecutionContext(execution_id=execution_id)
+    context.add_user_message("current request")
+    context.add_assistant_message(
+        "",
+        tool_calls=[
+            {"id": "call-1", "type": "function", "function": {"name": "read_file"}},
+        ],
+    )
+    context.add_tool_result("read_file", {"output": "x" * 200}, tool_call_id="call-1")
+    return context
+
+
+@pytest.mark.asyncio
+async def test_react_summarizes_with_the_main_model_when_no_compact_model() -> None:
+    """An unset compact slot must not silently disable summary compaction.
+
+    ``PatternRuntime.compact_context_if_needed`` skips summarization entirely
+    without a compact LLM and drops all but the last few messages instead.
+    Agent preview and delegated sub-agents resolve that slot themselves and
+    validate only the default model, so an empty slot is ordinary -- and made
+    the same agent behave differently depending on how it was launched.
+    """
+    downstream = RoutedDownstreamLLM(
+        [{"content": "summarized tool result"}], final_text="done"
+    )
+    route_prompts: list[str] = []
+    router = _routing_router(downstream, route_prompts)
+    context = _react_context_with_tool_history("compact-inherits-main")
+
+    result = await ReActPattern(max_iterations=1).run(
+        context=context,
+        tools=[],
+        llm=router,
+        compact_llm=None,
+        runtime=PatternRuntime(tracer=TraceEventRecorder()),
+    )
+
+    assert result["success"] is True
+    # Two downstream calls: the summary, then the turn's own call -- and the
+    # summary reached that call, which is what proves compaction summarized
+    # rather than truncated.
+    assert len(downstream.calls) == 2
+    assert any(
+        "summarized tool result" in message.get("content", "")
+        for message in downstream.calls[1]["messages"]
+    )
+    # One routing decision for the whole turn, taken on the conversation.
+    assert len(route_prompts) == 1
+    assert "Conversation history to compact" not in route_prompts[0]

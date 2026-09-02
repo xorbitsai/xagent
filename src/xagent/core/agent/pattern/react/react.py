@@ -261,10 +261,14 @@ def _normalize_ask_user_interactions(interactions: Any) -> list[dict[str, Any]]:
     or renaming one. Each one still goes through every other step above --
     its field is trimmed, its options are filtered, ``actions`` is stripped
     -- only the name collision itself is left as-is, and a warning is
-    logged. The single-tool call site (``ask_user_question`` in
-    ``_handle_control_tool``) sends the result on as-is. The multi-tool call
-    site (``_pause_for_tool_results``) runs its own deduplication across all
-    tools' interactions after calling this function once per tool.
+    logged. Both call sites deduplicate afterward, in the same shape
+    (append ``_2``, ``_3`` to a repeated base) but at different scope: the
+    single-tool call site (``ask_user_question`` in ``_handle_control_tool``)
+    deduplicates within that one call's own interactions only. The
+    multi-tool call site (``_pause_for_tool_results``) runs its own
+    deduplication across all tools' interactions after calling this
+    function once per tool, so a base already used by an earlier tool in
+    the same batch is not reused by a later one either.
 
     The output never carries an ``actions`` key: ``actions`` is a model
     alias for ``options`` (consumed above whenever ``options`` itself is
@@ -672,7 +676,21 @@ class ReActPattern(AgentPattern):
             }
             await runtime.compact_context_if_needed(
                 context=context,
-                llm=compact_llm,
+                # Fall back to the main model when no compact model is
+                # configured. PatternRuntime skips summarization entirely
+                # without one and drops all but the last few messages
+                # instead, losing what the agent actually did; agent preview
+                # and delegated sub-agents resolve the compact slot on their
+                # own and validate only the default model, so an empty slot
+                # is ordinary rather than exceptional.
+                #
+                # Substituting here, rather than defaulting the field further
+                # up, keeps "unset" distinguishable from "explicitly set to
+                # the main model" -- and hands compaction the *resolved*
+                # per-call model, so a virtual model reuses this turn's
+                # routing decision instead of routing again on the compaction
+                # prompt, whose only user message is the whole transcript.
+                llm=compact_llm if compact_llm is not None else call_llm,
                 metadata={"iteration": iteration},
             )
 
@@ -2379,6 +2397,26 @@ class ReActPattern(AgentPattern):
             interactions = _normalize_ask_user_interactions(
                 args.get("interactions", [])
             )
+            # Same dedup shape _pause_for_tool_results runs on the multi-tool
+            # path (append _2, _3 to a repeated base, first occupant keeps
+            # its own name), the only legitimate difference being scope:
+            # used_fields here spans only this one call's own interactions,
+            # never a sibling tool's, because this branch has no sibling
+            # tool to collide with.
+            used_fields: set[str] = set()
+            deduplicated_interactions: list[dict[str, Any]] = []
+            for interaction in interactions:
+                item = dict(interaction)
+                base_field = str(item.get("field") or "response")
+                field = base_field
+                suffix = 2
+                while field in used_fields:
+                    field = f"{base_field}_{suffix}"
+                    suffix += 1
+                item["field"] = field
+                used_fields.add(field)
+                deduplicated_interactions.append(item)
+            interactions = deduplicated_interactions
             outbound_message = await runtime.send_message(
                 message=message,
                 message_type="question",

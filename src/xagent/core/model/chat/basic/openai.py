@@ -11,7 +11,13 @@ from ....utils.security import redact_sensitive_text
 from ..exceptions import LLMEmptyContentError, LLMRetryableError, LLMTimeoutError
 from ..timeout_config import TimeoutConfig
 from ..token_context import add_token_usage, extract_cached_input_tokens
-from ..types import PROVIDER_STATE_METADATA_KEY, ChunkType, StreamChunk
+from ..types import (
+    CONTENT_SOURCE_KEY,
+    CONTENT_SOURCE_REASONING_FALLBACK,
+    PROVIDER_STATE_METADATA_KEY,
+    ChunkType,
+    StreamChunk,
+)
 from .base import BaseLLM
 
 logger = logging.getLogger(__name__)
@@ -45,28 +51,142 @@ def _openai_error_body(error: BaseException) -> Any:
         return None
 
 
+def _openai_error_payload(error: BaseException) -> dict[str, Any] | None:
+    """The error object itself, whichever shape it arrives in.
+
+    The wire format wraps it (``{"error": {...}}``), but the SDK unwraps that
+    in ``_make_status_error``, so ``BadRequestError.body`` is the inner object
+    already. Code that only looked for the wrapper therefore found nothing on
+    any error the SDK actually produced -- and passed its tests, because the
+    fixtures hand-built the wire shape. Normalize here so both work.
+    """
+    body = _openai_error_body(error)
+    if not isinstance(body, dict):
+        return None
+    inner = body.get("error")
+    return inner if isinstance(inner, dict) else body
+
+
+def _openai_error_code(error: BaseException) -> str | None:
+    """The machine-readable code for a 400, when the endpoint sends one.
+
+    The SDK lifts it onto the exception; the payload is the fallback for
+    anything that did not come through the SDK.
+    """
+    code = getattr(error, "code", None)
+    if isinstance(code, str) and code:
+        return code
+    error_payload = _openai_error_payload(error)
+    if error_payload is None:
+        return None
+    payload_code = error_payload.get("code")
+    return payload_code if isinstance(payload_code, str) and payload_code else None
+
+
+def _openai_rejected_param(error: BaseException) -> str | None:
+    """The parameter the endpoint said was at fault, when it says so.
+
+    OpenAI-shaped error bodies name the offending parameter in
+    ``error.param``. That is worth reaching for because the human-readable
+    message is not a reliable substitute: ``_format_openai_error`` appends
+    ``provider_raw`` and ``previous_errors`` blobs, so for a gateway that
+    tried several upstreams the text is several providers' complaints
+    concatenated, and a keyword found there may belong to an attempt that has
+    nothing to do with this failure. ``param`` describes only this one.
+    """
+    param = getattr(error, "param", None)
+    if not isinstance(param, str) or not param:
+        error_payload = _openai_error_payload(error)
+        param = error_payload.get("param") if error_payload is not None else None
+    if not isinstance(param, str) or not param:
+        return None
+    # Structured-output rejections name a path ("response_format.json_schema
+    # .schema"); the parameter is its first segment. Returning the full path
+    # would satisfy "an explicit param exists" while matching nothing, which
+    # would skip the text fallback and lose a recovery that works today.
+    return param.split(".", 1)[0]
+
+
 def _openai_error_details(error: BaseException) -> list[str]:
     details: list[str] = []
-    body = _openai_error_body(error)
-    if isinstance(body, dict):
-        error_payload = body.get("error")
-        if isinstance(error_payload, dict):
-            metadata = error_payload.get("metadata")
-            if isinstance(metadata, dict):
-                provider_name = metadata.get("provider_name")
-                if provider_name:
-                    details.append(f"provider_name={provider_name}")
-                raw = metadata.get("raw")
-                if raw:
-                    details.append("provider_raw=" + _truncate_error_detail(raw))
-                previous_errors = metadata.get("previous_errors")
-                if previous_errors:
-                    details.append(
-                        "previous_errors=" + _truncate_error_detail(previous_errors)
-                    )
-            elif metadata is not None:
-                details.append("metadata=" + _truncate_error_detail(metadata))
+    error_payload = _openai_error_payload(error)
+    if error_payload is not None:
+        metadata = error_payload.get("metadata")
+        if isinstance(metadata, dict):
+            provider_name = metadata.get("provider_name")
+            if provider_name:
+                details.append(f"provider_name={provider_name}")
+            raw = metadata.get("raw")
+            if raw:
+                details.append("provider_raw=" + _truncate_error_detail(raw))
+            previous_errors = metadata.get("previous_errors")
+            if previous_errors:
+                details.append(
+                    "previous_errors=" + _truncate_error_detail(previous_errors)
+                )
+        elif metadata is not None:
+            details.append("metadata=" + _truncate_error_detail(metadata))
     return details
+
+
+def _degrade_rejected_params(
+    completion_params: dict[str, Any],
+    error_msg: str,
+    rejected_param: str | None = None,
+    error_code: str | None = None,
+) -> list[str]:
+    """Drop or rename request parameters a compatible endpoint rejected.
+
+    Returns the names degraded, empty when the 400 was about something else
+    and the caller should re-raise. Each parameter is judged independently:
+    one 400 can name both, and treating them as alternatives would silently
+    skip a degrade that was also needed.
+
+    ``rejected_param`` is the endpoint's own answer (see
+    ``_openai_rejected_param``) and settles it outright when present. Only
+    without one does this fall back to reading ``error_msg``, which is a
+    weaker signal: it carries ``provider_raw`` and ``previous_errors`` blobs,
+    so a keyword in it may come from a different upstream attempt in a
+    gateway's fallback chain rather than from this failure. The fallback
+    therefore requires the parameter name and the complaint to appear
+    together, not merely both somewhere in the text.
+
+    ``max_tokens`` is renamed rather than dropped -- reasoning models spell
+    the same budget ``max_completion_tokens``, and for context compaction that
+    budget is what keeps a summary small enough not to re-trigger the next
+    compaction.
+    """
+    lowered = error_msg.lower()
+    degraded: list[str] = []
+
+    # ``param`` says *which* parameter, never that renaming it would help:
+    # a plain out-of-range value ("max_tokens is too large") reports the same
+    # param, and renaming that one wastes the retry that could have recovered
+    # some other way. So an unsupported-parameter signal is required either
+    # way; ``param`` only narrows which parameter it applies to.
+    names_replacement = (
+        error_code == "unsupported_parameter" or "max_completion_tokens" in lowered
+    )
+    if (
+        "max_tokens" in completion_params
+        and names_replacement
+        and (rejected_param is None or rejected_param == "max_tokens")
+    ):
+        completion_params["max_completion_tokens"] = completion_params.pop("max_tokens")
+        degraded.append("max_tokens")
+
+    if "response_format" in completion_params and (
+        rejected_param == "response_format"
+        if rejected_param is not None
+        # Unchanged from before this degrade path existed: presence of the
+        # name anywhere in the text. Tightening it here would narrow a
+        # recovery that has been working, which is not this change's business.
+        else "response_format" in lowered
+    ):
+        completion_params.pop("response_format")
+        degraded.append("response_format")
+
+    return degraded
 
 
 def _format_openai_error(prefix: str, error: BaseException) -> str:
@@ -565,6 +685,7 @@ class OpenAICompatibleLLM(BaseLLM):
                     return {
                         "type": "text",
                         "content": reasoning_content,
+                        CONTENT_SOURCE_KEY: CONTENT_SOURCE_REASONING_FALLBACK,
                         "reasoning_content": reasoning_content,
                         "reasoning": reasoning_content,
                         "raw": resp.model_dump(),
@@ -586,33 +707,35 @@ class OpenAICompatibleLLM(BaseLLM):
 
         try:
             # Make the API call
-            try:
-                response = await _make_api_call()
-            except openai.BadRequestError as e:
-                # Check if error is related to response_format
-                error_msg = _format_openai_error("OpenAI bad request", e)
-                if (
-                    "response_format" in error_msg.lower()
-                    and "response_format" in completion_params
-                ):
-                    # Remove response_format and retry
-                    logger.warning(
-                        f"API doesn't support response_format, retrying without it. Error: {error_msg}"
-                    )
-                    completion_params.pop("response_format")
-                    response_format = None
-
-                    # Retry without response_format and fall through to the
-                    # main flow (the structured-output degrade check below is
-                    # gated on response_format, now None). A BadRequestError
-                    # raised here is not caught by this clause -- it
-                    # propagates to the outer ``except openai.BadRequestError``
-                    # below, which wraps it into RuntimeError like every other
-                    # failure path.
+            while True:
+                try:
                     response = await _make_api_call()
-
-                else:
-                    raise
+                    break
+                except openai.BadRequestError as e:
+                    error_msg = _format_openai_error("OpenAI bad request", e)
+                    degraded = _degrade_rejected_params(
+                        completion_params,
+                        error_msg,
+                        _openai_rejected_param(e),
+                        _openai_error_code(e),
+                    )
+                    if not degraded:
+                        raise
+                    logger.warning(
+                        "API rejected %s, retrying without it. Error: %s",
+                        " and ".join(degraded),
+                        error_msg,
+                    )
+                    if "response_format" in degraded:
+                        # The structured-output degrade check below is gated
+                        # on response_format, so clear it here too.
+                        response_format = None
+                    # Bounded by construction: every degrade removes or
+                    # renames a parameter, and each is triggered only while
+                    # that parameter is still in the request, so at most one
+                    # round per supported degrade. Endpoints commonly report
+                    # one invalid parameter per response, so a single round
+                    # is not always enough.
 
             result = _process_response(response, request_thinking=thinking)
 
@@ -667,7 +790,7 @@ class OpenAICompatibleLLM(BaseLLM):
 
         except openai.BadRequestError as e:
             # Handle bad request errors, including a response_format resend
-            # that failed again (see the nested try/except above).
+            # that failed again (see the degrade loop above).
             raise RuntimeError(_format_openai_error("OpenAI bad request", e)) from e
 
         except openai.APITimeoutError as e:
@@ -811,28 +934,29 @@ class OpenAICompatibleLLM(BaseLLM):
 
         try:
             # Make the API call with extra_body if needed
-            try:
-                response = await _make_api_call()
-            except openai.BadRequestError as e:
-                # Check if error is related to response_format
-                error_msg = _format_openai_error("OpenAI bad request", e)
-                if (
-                    "response_format" in error_msg.lower()
-                    and "response_format" in completion_params
-                ):
-                    # Remove response_format and retry
-                    logger.warning(
-                        f"API doesn't support response_format, retrying without it. Error: {error_msg}"
-                    )
-                    completion_params.pop("response_format")
-
-                    # Retry without response_format. A BadRequestError raised
-                    # here is not caught by this clause -- it propagates to
-                    # the outer ``except openai.BadRequestError`` below, which
-                    # wraps it into RuntimeError like every other failure path.
+            while True:
+                try:
                     response = await _make_api_call()
-                else:
-                    raise
+                    break
+                except openai.BadRequestError as e:
+                    error_msg = _format_openai_error("OpenAI bad request", e)
+                    degraded = _degrade_rejected_params(
+                        completion_params,
+                        error_msg,
+                        _openai_rejected_param(e),
+                        _openai_error_code(e),
+                    )
+                    if not degraded:
+                        raise
+                    logger.warning(
+                        "API rejected %s, retrying without it. Error: %s",
+                        " and ".join(degraded),
+                        error_msg,
+                    )
+                    # Loop because endpoints commonly report one invalid
+                    # parameter per response. Bounded by construction: each
+                    # degrade removes or renames a parameter and fires only
+                    # while it is still in the request.
 
             # Validate response
             if not hasattr(response, "choices") or not response.choices:
@@ -923,6 +1047,7 @@ class OpenAICompatibleLLM(BaseLLM):
                     return {
                         "type": "text",
                         "content": reasoning_content,
+                        CONTENT_SOURCE_KEY: CONTENT_SOURCE_REASONING_FALLBACK,
                         "reasoning_content": reasoning_content,
                         "reasoning": reasoning_content,
                         "raw": response.model_dump(),
@@ -959,7 +1084,7 @@ class OpenAICompatibleLLM(BaseLLM):
 
         except openai.BadRequestError as e:
             # Handle bad request errors, including a response_format resend
-            # that failed again (see the nested try/except above).
+            # that failed again (see the degrade loop above).
             raise RuntimeError(_format_openai_error("OpenAI bad request", e)) from e
 
         except openai.APIError as e:
@@ -1051,38 +1176,39 @@ class OpenAICompatibleLLM(BaseLLM):
 
         try:
             # Create streaming response
-            try:
+            client = self._client
+            assert client is not None
+
+            async def _create_stream() -> Any:
                 if extra_body:
-                    stream = await self._client.chat.completions.create(
+                    return await client.chat.completions.create(
                         extra_body=extra_body, **completion_params
                     )
-                else:
-                    stream = await self._client.chat.completions.create(
-                        **completion_params
-                    )
-            except openai.BadRequestError as e:
-                # Check if error is related to response_format
-                error_msg = _format_openai_error("OpenAI bad request", e)
-                if (
-                    "response_format" in error_msg.lower()
-                    and "response_format" in completion_params
-                ):
-                    # Remove response_format and retry
-                    logger.warning(
-                        f"API doesn't support response_format, retrying without it. Error: {error_msg}"
-                    )
-                    completion_params.pop("response_format")
+                return await client.chat.completions.create(**completion_params)
 
-                    if extra_body:
-                        stream = await self._client.chat.completions.create(
-                            extra_body=extra_body, **completion_params
-                        )
-                    else:
-                        stream = await self._client.chat.completions.create(
-                            **completion_params
-                        )
-                else:
-                    raise
+            while True:
+                try:
+                    stream = await _create_stream()
+                    break
+                except openai.BadRequestError as e:
+                    error_msg = _format_openai_error("OpenAI bad request", e)
+                    degraded = _degrade_rejected_params(
+                        completion_params,
+                        error_msg,
+                        _openai_rejected_param(e),
+                        _openai_error_code(e),
+                    )
+                    if not degraded:
+                        raise
+                    logger.warning(
+                        "API rejected %s, retrying without it. Error: %s",
+                        " and ".join(degraded),
+                        error_msg,
+                    )
+                    # Loop because endpoints commonly report one invalid
+                    # parameter per response. Bounded by construction: each
+                    # degrade removes or renames a parameter and fires only
+                    # while it is still in the request.
 
             # Timeout control
             first_token = True

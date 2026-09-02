@@ -54,7 +54,37 @@ COMMAND_TERMINAL = (COMMAND_COMPLETED, COMMAND_FAILED)
 
 COMMAND_ID_PATTERN = re.compile(r"[A-Za-z0-9._:-]{1,64}")
 MAX_COMMAND_FAILURES = 5
+# Since the budget was coupled to the lease TTL, this constant is the FLOOR
+# of the effective defer budget, not the budget itself — compare against
+# max_command_defers(), never against this constant directly.
 MAX_COMMAND_DEFERS = 60
+
+
+def max_command_defers() -> int:
+    """The defer budget, a TTL-coupled heuristic rather than a guarantee.
+
+    A deferral's shortest canonical wait is a task lease another holder has
+    not released yet: on a non-RUNNING row the lease cannot be refreshed, so
+    it clears within one TTL. The budget (spent roughly once per second —
+    ``defer_task_command`` re-arms the claim one second out) must outlast
+    that with real margin: a fixed 60 was silently smaller than any raised
+    ``XAGENT_TASK_LEASE_TTL_SECONDS``, turning every long park into a
+    terminal failure for an already-accepted command
+    (xorbitsai/xagent-saas#952 B3). Twice the TTL keeps 100% headroom at
+    every setting; the historical constant stays as the floor so short-TTL
+    deployments keep their existing patience. Read per call, not cached:
+    the TTL is env-driven and tests vary it.
+
+    This mitigates rather than closes the exhaustion: a RUNNING row's lease
+    is heartbeat-refreshed for the whole turn, so a command deferring behind
+    a turn longer than the budget still fails terminally. The structural
+    fix — patience as a wall-clock deadline against the command's
+    ``created_at`` instead of a defer count — is #1995.
+    """
+
+    return max(MAX_COMMAND_DEFERS, get_task_lease_ttl_seconds() * 2)
+
+
 DISPATCHER_IDLE_SECONDS = 0.5
 DISPATCHER_CONCURRENCY = 4
 
@@ -963,7 +993,7 @@ def defer_task_command(
         observed_defer_count = int(snapshot.defer_count or 0)
         observed_attempt_count = int(snapshot.attempt_count or 0)
         defer_count = observed_defer_count + 1
-        terminal = defer_count >= MAX_COMMAND_DEFERS
+        terminal = defer_count >= max_command_defers()
         updated = (
             db.query(TaskExecutionCommand)
             .filter(
@@ -1205,6 +1235,16 @@ async def dispatch_one_task_command(
             {"rejection_reason": exc.reason} if exc.reason is not None else None
         )
 
+        # An executor that bound its own presentation draft wins; the neutral
+        # literal is only the fallback. The other two dispositions already
+        # read the bound draft — hardcoding here silently discarded the
+        # external input executor's identity-withholding draft
+        # (xorbitsai/xagent-saas#952 M3).
+        rejection_event = terminal_event_draft_for_error(exc) or TerminalTaskEventDraft(
+            message_code=None,
+            resend_safe=False,
+        )
+
         def persist_rejection() -> bool:
             return fail_task_command(
                 command.id,
@@ -1213,10 +1253,7 @@ async def dispatch_one_task_command(
                 force_terminal=True,
                 expected_attempt_count=command.attempt_count,
                 result=rejection_result,
-                terminal_event=TerminalTaskEventDraft(
-                    message_code=None,
-                    resend_safe=False,
-                ),
+                terminal_event=rejection_event,
             )
 
         disposition_name = "fail_task_command"

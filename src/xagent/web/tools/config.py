@@ -668,7 +668,14 @@ def _oauth_refresh_error_code(
 
     try:
         data = response.json()
-    except ValueError:
+    except Exception:
+        # response.json() isn't guaranteed to raise only ValueError/
+        # JSONDecodeError -- a sufficiently pathological body (e.g. deeply
+        # nested enough to blow the parser's recursion limit) can raise
+        # something else entirely. This is a best-effort extraction either
+        # way, so any failure to parse means "no code", not a reason to
+        # let an exotic exception escape uncaught to the caller's generic
+        # handler and lose the status-code-bearing log line above it.
         return None
     if not data or not isinstance(data, Mapping):
         return None

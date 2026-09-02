@@ -1281,6 +1281,24 @@ def test_oauth_refresh_error_code_rejects_malformed_bodies(response):
     assert web_tools_config._oauth_refresh_error_code(response, "google") is None
 
 
+def test_oauth_refresh_error_code_swallows_non_value_error_parse_failures():
+    """response.json() isn't guaranteed to raise only ValueError -- a
+    pathological body (e.g. deeply nested enough to hit the parser's
+    recursion limit) can raise something else entirely. Catching only
+    ValueError would let that escape uncaught to the caller's generic
+    exception handler, losing the status-code-bearing log line this
+    function's caller emits."""
+
+    class ExplodingJsonResponse:
+        def json(self):
+            raise RecursionError("maximum recursion depth exceeded")
+
+    assert (
+        web_tools_config._oauth_refresh_error_code(ExplodingJsonResponse(), "google")
+        is None
+    )
+
+
 def test_oauth_refresh_error_code_gates_meta_shape_on_provider():
     """Meta's nested-error-object normalization must only apply when the
     caller is actually refreshing a Meta connection -- an unrelated

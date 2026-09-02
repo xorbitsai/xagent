@@ -46,6 +46,7 @@ from ..models.agent import Agent
 from ..models.custom_api import CustomApi, UserCustomApi
 from ..models.mcp import MCPServer, UserMCPServer
 from ..models.task import Task, TaskConnectorRuntimeContext
+from .task_interaction_service import _MAX_INTERACTION_TTL_SECONDS
 
 logger = logging.getLogger(__name__)
 
@@ -117,10 +118,10 @@ _EPHEMERAL_RUNTIME_STORED_AT: dict[str, float] = {}
 _EPHEMERAL_RUNTIME_VALUES_LOCK = RLock()
 _RUNTIME_RESOLVER_REGISTRATION: _ConnectorRuntimeResolverRegistration | None = None
 
-# Not a real interaction deadline - production already allows a native
-# waiting-for-user interaction to stay open for up to
-# task_interaction_service.py's _MAX_INTERACTION_TTL_SECONDS (7 days), so
-# this has to be at least that generous to never clip a legitimate pause.
+# Not a real interaction deadline - matches task_interaction_service.py's
+# _MAX_INTERACTION_TTL_SECONDS by reference (not by copying the value) so
+# this can never silently drift shorter than the longest pause production
+# already allows a native waiting-for-user interaction to stay open for.
 # Its only job is to turn what would otherwise be a permanent leak into a
 # bounded one: task_orchestrator.py's and websocket.py's deferred-to-TTL-
 # recovery branches (lease lost, DB pool exhaustion, unhealthy heartbeat at
@@ -129,7 +130,7 @@ _RUNTIME_RESOLVER_REGISTRATION: _ConnectorRuntimeResolverRegistration | None = N
 # on a terminal status or resume again under the same turn_id - and
 # task_lease_recovery.py's batch sweep, which does later decide that,
 # has no way to look up which turn_id belongs to which recovered task_id.
-_EPHEMERAL_RUNTIME_TTL_SECONDS = 7 * 24 * 3600
+_EPHEMERAL_RUNTIME_TTL_SECONDS = _MAX_INTERACTION_TTL_SECONDS
 
 
 def _prune_expired_ephemeral_runtime_values_locked() -> None:

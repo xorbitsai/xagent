@@ -608,22 +608,28 @@ def _oauth_launch_config_mapping(
     raise _OAuthLaunchConfigInvalid(field="type")
 
 
-# invalid_grant (RFC 6749) describes THIS account's refresh token
-# specifically (revoked/expired/already used), regardless of provider --
-# RFC 6749's invalid_client and unauthorized_client instead describe the
-# OAuthProvider row's own client_id/client_secret or grant-type
-# authorization, the same class of admin-fixable, self-healing config
-# problem refresh_oauth_token_if_needed's own "missing CLIENT_ID or
-# SECRET" check already treats as transient. Bundling them in here would
-# mass-delete every user's connection to a provider over one admin typo.
-_OAUTH_PERMANENT_REFRESH_ERROR_CODES = frozenset({"invalid_grant"})
-
-# Non-standard, per-provider equivalents of invalid_grant -- gated on
-# provider_name (like Meta's differently-shaped error object already is
-# in _oauth_refresh_error_code) so an unrelated provider -- including a
-# future one, or an admin-added custom OAuthProvider row with an arbitrary
-# token endpoint -- that coincidentally uses the same string for a
-# different, non-fatal reason can't be misread as a dead-token signal.
+# No error code is trusted globally across every provider -- not even RFC
+# 6749's invalid_grant. Per RFC 6749 section 5.2, invalid_grant also
+# covers a refresh token "issued to another client": a client-binding
+# mismatch that a shared OAuthProvider row's credential rotation can
+# trigger for every existing UserOAuth account at once (the new
+# client_id/secret get sent alongside a refresh_token issued under the
+# old ones), without any of those grants actually being dead -- the same
+# class of "one admin credential change mass-deletes every user's
+# connection" bug already fixed below for invalid_client/
+# unauthorized_client, just reachable through invalid_grant's more
+# overloaded RFC meaning instead of a missing-credential check.
+#
+# Only a provider's own unambiguous, non-standard dead-token vocabulary
+# is trusted, gated on provider_name (an unrelated provider -- including
+# a future one, or an admin-added custom OAuthProvider row with an
+# arbitrary token endpoint -- that coincidentally uses the same string
+# for a different, non-fatal reason can't be misread as a dead-token
+# signal). Meta's own OAuthException codes (190/102, normalized to the
+# string "invalid_grant" by oauth_provider_quirks.
+# meta_invalid_token_error_code) are Meta-specific and unambiguous, unlike
+# RFC 6749's own invalid_grant string, so they're listed here too rather
+# than trusted for every provider.
 _PROVIDER_DEAD_REFRESH_TOKEN_ERROR_CODES: dict[str, frozenset[str]] = {
     # GitHub's classic OAuth Apps token endpoint reports a dead
     # refresh_token via a 200 response with this code, not a 4xx.
@@ -632,6 +638,9 @@ _PROVIDER_DEAD_REFRESH_TOKEN_ERROR_CODES: dict[str, frozenset[str]] = {
     # ...} -- applies to its oauth.v2.access refresh grant too, for
     # workspaces with token rotation enabled.
     "slack": frozenset({"invalid_refresh_token"}),
+    # See meta_invalid_token_error_code -- normalizes Meta's own
+    # OAuthException codes to this string.
+    "meta": frozenset({"invalid_grant"}),
 }
 
 
@@ -689,11 +698,13 @@ def _is_permanent_oauth_refresh_error(
     "bad_refresh_token"}``) via a 200 response rather than a 4xx, so
     requiring 400/401 here would make that case unclassifiable no matter
     what the caller checks.
+
+    See _PROVIDER_DEAD_REFRESH_TOKEN_ERROR_CODES for why no code
+    (including RFC 6749's own invalid_grant) is trusted for every
+    provider.
     """
     if status_code >= 500:
         return False
-    if error_code in _OAUTH_PERMANENT_REFRESH_ERROR_CODES:
-        return True
     return error_code in _PROVIDER_DEAD_REFRESH_TOKEN_ERROR_CODES.get(
         provider_name.lower(), frozenset()
     )

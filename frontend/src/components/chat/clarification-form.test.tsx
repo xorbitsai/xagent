@@ -685,6 +685,116 @@ describe("ClarificationForm connect_apps interaction", () => {
     ).not.toBeInTheDocument()
   })
 
+  it("hides every sibling card's Skip once one card's Skip is clicked", async () => {
+    // Mirror of the Continue test above, for the Skip path: with neither
+    // app connected yet (Skip visible on both cards, Continue on neither),
+    // clicking one card's Skip used to leave the other card's identical
+    // Skip link still live - a second click there would send a second,
+    // redundant skip acknowledgement for the same pause. connectAppsAnswered
+    // is a pause-level latch shared by every card precisely to prevent that.
+    mcpAppsMock.apps = [
+      {
+        id: "gmail",
+        name: "Gmail",
+        description: "",
+        icon: "",
+        users: "",
+        transport: "builtin",
+        provider: "google",
+        category: "Communication",
+        is_connected: false,
+      },
+      {
+        id: "salesforce",
+        name: "Salesforce",
+        description: "",
+        icon: "",
+        users: "",
+        transport: "builtin",
+        provider: "salesforce",
+        category: "Sales",
+        is_connected: false,
+      },
+    ]
+    const onSend = vi.fn().mockResolvedValue(undefined)
+
+    render(
+      <ClarificationForm
+        interactions={[
+          CONNECT_APPS_INTERACTION,
+          { type: "connect_apps", field: "connect_apps", label: "Connect your apps", apps: ["Salesforce"] },
+        ]}
+        onSend={onSend}
+      />,
+    )
+
+    const skipLinks = screen.getAllByText("chatPage.clarification.connectApps.skip")
+    expect(skipLinks).toHaveLength(2)
+
+    fireEvent.click(skipLinks[0])
+
+    await waitFor(() => {
+      expect(onSend).toHaveBeenCalledTimes(1)
+    })
+    expect(
+      screen.queryByText("chatPage.clarification.connectApps.skip"),
+    ).not.toBeInTheDocument()
+  })
+
+  it("offers Continue again for a new connect_apps pause after a prior round's Continue was answered", async () => {
+    // The live-turn render path reuses this same component instance across
+    // rounds (see the requestId-keyed reset effect's own comment) - without
+    // resetting connectAppsAnswered there too, answering round 1's pause
+    // would permanently disable Skip/Continue for every subsequent
+    // connect_apps pause on this same message, not just the one just
+    // answered.
+    mcpAppsMock.apps = [
+      {
+        id: "gmail",
+        name: "Gmail",
+        description: "",
+        icon: "",
+        users: "",
+        transport: "builtin",
+        provider: "google",
+        category: "Communication",
+        is_connected: true,
+      },
+    ]
+    const onSend = vi.fn().mockResolvedValue(undefined)
+    const { rerender } = render(
+      <ClarificationForm
+        interactions={[CONNECT_APPS_INTERACTION]}
+        requestId="round-1"
+        onSend={onSend}
+      />,
+    )
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "chatPage.clarification.connectApps.continue" }),
+    )
+    await waitFor(() => {
+      expect(onSend).toHaveBeenCalledTimes(1)
+    })
+    expect(
+      screen.queryByRole("button", { name: "chatPage.clarification.connectApps.continue" }),
+    ).not.toBeInTheDocument()
+
+    // A second, later connect_apps pause on the same reused instance - a
+    // new requestId is this component's own signal that the round changed.
+    rerender(
+      <ClarificationForm
+        interactions={[CONNECT_APPS_INTERACTION]}
+        requestId="round-2"
+        onSend={onSend}
+      />,
+    )
+
+    expect(
+      screen.getByRole("button", { name: "chatPage.clarification.connectApps.continue" }),
+    ).toBeInTheDocument()
+  })
+
   it("does not offer Continue when a simultaneously-paused app is hidden from the connector catalog entirely", () => {
     // resolveRows silently drops a requested app name that doesn't resolve
     // to any catalog entry at all (e.g. one hidden via

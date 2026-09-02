@@ -186,6 +186,24 @@ export function ClarificationForm({
       errorCode: ClientErrorCode | null
     } | null
   >(null)
+  // Continue/Skip answer the WHOLE pause, but each ConnectAppsField card
+  // manages its own local `continued`/`skipped` state independently - with
+  // multiple simultaneously-paused cards (concurrent tool calls each naming
+  // a different unavailable app), clicking one card's button only hides
+  // that card's own button, leaving every sibling card's button still live.
+  // A second click on a sibling would fire a second answer for the same
+  // pause. This flag is a pause-level latch shared across every card: once
+  // any card's click succeeds, every card's onSkip/onContinue prop becomes
+  // undefined (see both render sites below), hiding every remaining button
+  // at once - rolled back on a failed send exactly like each card's own
+  // local optimistic state already rolls back, so a network failure doesn't
+  // strand the pause with no visible action anywhere. Declared here (not
+  // nearer its own handlers below) so the requestId-keyed reset effect right
+  // after can clear it for a genuinely new pause - the live-turn render path
+  // reuses this same component instance across rounds (see that effect's
+  // own comment), so without this a round-2 connect_apps pause would
+  // inherit round 1's answered state and never offer Skip/Continue at all.
+  const [connectAppsAnswered, setConnectAppsAnswered] = useState(false)
 
   useLayoutEffect(() => {
     latestRequestIdRef.current = requestId
@@ -196,6 +214,7 @@ export function ClarificationForm({
     setIsSubmitted(!active && !isConnectAppsOnly)
     setIsOpen(active || isConnectAppsOnly)
     setSendFailure(null)
+    setConnectAppsAnswered(false)
   }, [active, isConnectAppsOnly, requestId])
 
   useEffect(() => {
@@ -520,20 +539,8 @@ export function ClarificationForm({
     }
   }
 
-  // Continue/Skip answer the WHOLE pause, but each ConnectAppsField card
-  // manages its own local `continued`/`skipped` state independently - with
-  // multiple simultaneously-paused cards (concurrent tool calls each naming
-  // a different unavailable app), clicking one card's button only hides
-  // that card's own button, leaving every sibling card's button still live.
-  // A second click on a sibling would fire a second answer for the same
-  // pause. This flag is a pause-level latch shared across every card: once
-  // any card's click succeeds, every card's onSkip/onContinue prop becomes
-  // undefined (see both render sites below), hiding every remaining button
-  // at once - rolled back on a failed send exactly like each card's own
-  // local optimistic state already rolls back, so a network failure doesn't
-  // strand the pause with no visible action anywhere.
-  const [connectAppsAnswered, setConnectAppsAnswered] = useState(false)
-
+  // connectAppsAnswered itself is declared earlier, alongside the other
+  // requestId-keyed state it's reset with - see its own doc comment there.
   const handleSkipConnectAppsOnce = async () => {
     setConnectAppsAnswered(true)
     try {
@@ -763,7 +770,15 @@ export function ClarificationForm({
           // !connectAppsAnswered - see that flag's own doc comment for why
           // (this branch is single-card today, but shares the same latch for
           // consistency should a future change combine several here too).
+          // Keyed on requestId (not just interaction.field, which stays
+          // "connect_apps" across rounds) so a new pause round forces a real
+          // remount - the card's OWN local continued/skipped state (declared
+          // inside ConnectAppsField itself) would otherwise survive the
+          // reused live-turn instance exactly like connectAppsAnswered
+          // almost did, permanently disabling this button for every
+          // subsequent round.
           <ConnectAppsField
+            key={requestId}
             interaction={interaction}
             onSkip={active && !connectAppsAnswered ? handleSkipConnectAppsOnce : undefined}
             onContinue={
@@ -826,8 +841,10 @@ export function ClarificationForm({
               // land several cards in this exact map, each with its own
               // independent local continued/skipped state, so answering one
               // must hide every sibling's button too, not just its own.
+              // Also keyed on requestId - see the mixed-list case's own
+              // comment on why a new pause round must force a real remount.
               <ConnectAppsField
-                key={`${interaction.field}-${index}`}
+                key={`${requestId}-${interaction.field}-${index}`}
                 interaction={interaction}
                 onSkip={active && !connectAppsAnswered ? handleSkipConnectAppsOnce : undefined}
                 onContinue={

@@ -3065,9 +3065,21 @@ export function AppProvider({
               return
             }
             const interactions = normalizeInteractions(eventData.metadata?.interactions)
+            // request_id is never actually populated by the backend for this
+            // event type - make_agent_outbound_handler (websocket.py) only
+            // ever sets event_id, a fresh uuid4 minted once per
+            // _pause_for_tool_results call (react.py), which is exactly the
+            // same per-pause-round identity this component needs. Preferring
+            // request_id first costs nothing if some future caller does send
+            // it, but falling back to event_id is what makes this field
+            // non-empty at all for a connect_apps (or any tool-originated)
+            // pause today - without it, every requestId-keyed reset/remount
+            // downstream (ClarificationForm) silently never fires.
             const interactionRequestId = typeof eventData.request_id === "string"
               ? eventData.request_id
-              : undefined
+              : typeof eventData.event_id === "string"
+                ? eventData.event_id
+                : undefined
             const isAgentMessage = eventType === "agent_message"
             const isAiMessage = eventType === "ai_message"
             const expectsUserResponse =

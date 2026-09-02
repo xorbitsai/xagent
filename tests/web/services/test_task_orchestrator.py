@@ -2824,6 +2824,70 @@ async def test_schedule_bg_forwards_execution_message_to_execute_task_background
 
 
 @pytest.mark.asyncio
+async def test_schedule_bg_keeps_ephemeral_values_when_turn_pauses_waiting_for_user(
+    db_session,
+) -> None:
+    """A turn that pauses on waiting_for_user (e.g. this same PR's
+    connect_apps interaction) is the SAME turn resuming later under its
+    SAME turn_id, not a finished one - popping its ephemeral values here
+    would leave that resume with nothing to look up under the one turn_id
+    the connector-runtime cache refresh deliberately never rebinds."""
+    from xagent.web.api.websocket import background_task_manager
+    from xagent.web.services.task_lease_service import TaskLease
+
+    user = _create_user(db_session)
+    task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
+    task_id = int(task.id)
+    fake_lease = TaskLease(task_id=task_id, runner_id="test-runner")
+    payload = TaskTurnPayload("x")
+    _store_runtime_secret_for_turn(payload.turn_id)
+    assert get_ephemeral_runtime_values(payload.turn_id) is not None
+
+    async def pause_execution(**_kwargs) -> None:
+        def commit_waiting_status() -> None:
+            SessionLocal = database_module.get_session_local()
+            with SessionLocal() as waiting_db:
+                waiting_task = waiting_db.query(Task).filter(Task.id == task_id).one()
+                waiting_task.status = TaskStatus.WAITING_FOR_USER
+                waiting_task.control_state = "waiting_for_user"
+                waiting_db.commit()
+
+        await asyncio.to_thread(commit_waiting_status)
+
+    with (
+        patch(
+            "xagent.web.services.task_orchestrator.acquire_task_lease_isolated",
+            return_value=fake_lease,
+        ),
+        patch(
+            "xagent.web.services.task_orchestrator.run_task_lease_heartbeat",
+            new=AsyncMock(),
+        ),
+        patch(
+            "xagent.web.api.websocket.execute_task_background",
+            new=AsyncMock(side_effect=pause_execution),
+        ),
+        patch(
+            "xagent.web.services.task_orchestrator.settle_task_lease_isolated",
+        ),
+        patch.object(background_task_manager, "register_task"),
+    ):
+        bg_task = _schedule_bg(
+            task_id=task_id,
+            task_owner_user_id=int(user.id),
+            task_source=task.source,
+            payload=payload,
+            force_fresh=False,
+            context=None,
+        )
+        await bg_task
+
+    assert get_ephemeral_runtime_values(payload.turn_id) is not None
+    # Cleanup: don't leak this test's entry into module-global state.
+    assert pop_ephemeral_runtime_values(payload.turn_id) is not None
+
+
+@pytest.mark.asyncio
 async def test_schedule_bg_acquires_expired_lease_on_first_try(db_session) -> None:
     """Expired lease columns are granted by acquire_task_lease's atomic WHERE."""
     from xagent.web.api.websocket import background_task_manager

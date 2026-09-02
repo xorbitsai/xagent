@@ -1056,6 +1056,15 @@ def _task_requires_actor_policy_sync(
         return _task_requires_actor_policy(db, task_id, task_owner_user_id)
 
 
+def _task_status_sync(task_id: int) -> TaskStatus | None:
+    from ..models.database import get_session_local
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        row = db.query(Task.status).filter(Task.id == task_id).first()
+        return row[0] if row is not None else None
+
+
 def _claim_turn_no_commit(
     db: Session,
     task_id: int,
@@ -2098,7 +2107,23 @@ def _schedule_bg(
                 from .connector_runtime import pop_ephemeral_runtime_values
 
                 if turn_id is not None:
-                    pop_ephemeral_runtime_values(turn_id)
+                    # Ephemeral per-turn values are single-use, but "used" means
+                    # this turn reached a terminal outcome - a turn that instead
+                    # paused on waiting_for_user (e.g. this same PR's
+                    # connect_apps interaction) is the SAME turn resuming later
+                    # under this SAME turn_id, still mid-flight, not a finished
+                    # one. Popping unconditionally here left every such resume
+                    # with nothing to look up under its own, correct turn_id -
+                    # the connector-runtime cache refresh added for that resume
+                    # deliberately never rebinds the turn_id (see
+                    # WebToolConfig.invalidate_connector_runtime_cache's
+                    # docstring), which only helps if this turn's own values
+                    # are still there to find.
+                    settled_status = await run_db_io_cancellation_safe(
+                        lambda: _task_status_sync(task_id)
+                    )
+                    if settled_status != TaskStatus.WAITING_FOR_USER:
+                        pop_ephemeral_runtime_values(turn_id)
             except Exception:
                 logger.warning(
                     "connector runtime cleanup failed for task %s turn %s",

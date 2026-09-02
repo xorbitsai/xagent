@@ -80,6 +80,29 @@ def test_grounding_rule_exempts_values_the_model_must_compose() -> None:
         "document text you were asked to produce",
     ):
         assert example in rule
+    # A page size the model picks is not a claim about the world, so pausing
+    # for it would be the over-asking failure the exemption exists to prevent.
+    assert (
+        "does not reach a default or inferred parameter value such as a page "
+        "size or result limit" in rule
+    )
+
+
+def test_grounding_rule_keeps_literal_facts_inside_composed_text_sourced() -> None:
+    """The compose exemption is per value, not per argument.
+
+    ``python_executor`` takes one free-form ``code`` argument and
+    ``write_file`` one ``content`` argument. Read at whole-argument
+    granularity, the exemption would clear an invented identifier for
+    delivery into an external system as long as it rode inside composed code
+    or document text -- the same outcome the rule exists to prevent.
+    """
+    rule = grounding_rule()
+
+    assert (
+        "A fact value written literally inside such composed code or text is "
+        "still subject to the sourcing rule above." in rule
+    )
 
 
 def test_grounding_rule_without_tools_omits_tool_argument_clause() -> None:
@@ -89,6 +112,8 @@ def test_grounding_rule_without_tools_omits_tool_argument_clause() -> None:
     assert "tool-call arguments that assert facts" not in rule
     assert "never guess one" not in rule
     assert "compose yourself" not in rule
+    assert "still subject to the sourcing rule above" not in rule
+    assert "a default or inferred parameter value" not in rule
 
 
 def test_grounding_rule_requires_labeling_regardless_of_request() -> None:

@@ -40,7 +40,9 @@ def grounding_rule(*, can_call_tools: bool = True) -> str:
         quantitative data, and requiring up-front disclosure of any
         illustrative figures. When ``can_call_tools`` is true it also forbids
         supplying a fact-carrying tool-call argument that no source provides,
-        while leaving arguments the model is expected to compose untouched.
+        while leaving arguments the model is expected to compose untouched --
+        except for a fact value written literally inside composed code or
+        document text, which the sourcing requirement still covers.
     """
     insufficient_context_rule = (
         "If available context is insufficient, say so or use an appropriate "
@@ -62,7 +64,11 @@ def grounding_rule(*, can_call_tools: bool = True) -> str:
         "never carry one over from a different record. This does not restrict "
         "values you are expected to compose yourself, such as a search query, "
         "code or a command you write to do the work, a message or answer you "
-        "write to the user, or document text you were asked to produce. Treat "
+        "write to the user, or document text you were asked to produce. A fact "
+        "value written literally inside such composed code or text is still "
+        "subject to the sourcing rule above. The rule also does not reach a "
+        "default or inferred parameter value such as a page size or result "
+        "limit, which you are expected to decide yourself. Treat "
         "a fact-carrying value you cannot source as "
         "missing information rather than inventing it, and omit it when the "
         "tool allows it to be omitted."

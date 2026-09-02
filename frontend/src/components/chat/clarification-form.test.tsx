@@ -627,6 +627,64 @@ describe("ClarificationForm connect_apps interaction", () => {
     ).not.toBeInTheDocument()
   })
 
+  it("hides every sibling card's Continue once one card's Continue is clicked", async () => {
+    // Each ConnectAppsField card owns its own local continued/skipped state,
+    // so with both apps connected (Continue visible on both cards),
+    // clicking one card's button used to leave the other card's identical
+    // button still live - a second click there would send a second,
+    // redundant answer for the same pause. connectAppsAnswered is a
+    // pause-level latch shared by every card precisely to prevent that.
+    mcpAppsMock.apps = [
+      {
+        id: "gmail",
+        name: "Gmail",
+        description: "",
+        icon: "",
+        users: "",
+        transport: "builtin",
+        provider: "google",
+        category: "Communication",
+        is_connected: true,
+      },
+      {
+        id: "salesforce",
+        name: "Salesforce",
+        description: "",
+        icon: "",
+        users: "",
+        transport: "builtin",
+        provider: "salesforce",
+        category: "Sales",
+        is_connected: true,
+      },
+    ]
+    const onSend = vi.fn().mockResolvedValue(undefined)
+
+    render(
+      <ClarificationForm
+        interactions={[
+          CONNECT_APPS_INTERACTION,
+          { type: "connect_apps", field: "connect_apps", label: "Connect your apps", apps: ["Salesforce"] },
+        ]}
+        onSend={onSend}
+      />,
+    )
+
+    const continueButtons = screen.getAllByRole("button", {
+      name: "chatPage.clarification.connectApps.continue",
+    })
+    expect(continueButtons).toHaveLength(2)
+
+    fireEvent.click(continueButtons[0])
+
+    await waitFor(() => {
+      expect(onSend).toHaveBeenCalledTimes(1)
+    })
+    expect(
+      screen.queryByRole("button", { name: "chatPage.clarification.connectApps.continue" }),
+    ).not.toBeInTheDocument()
+  })
+
   it("does not offer Continue when a simultaneously-paused app is hidden from the connector catalog entirely", () => {
     // resolveRows silently drops a requested app name that doesn't resolve
     // to any catalog entry at all (e.g. one hidden via

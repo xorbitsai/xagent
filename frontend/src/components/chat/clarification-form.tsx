@@ -520,6 +520,40 @@ export function ClarificationForm({
     }
   }
 
+  // Continue/Skip answer the WHOLE pause, but each ConnectAppsField card
+  // manages its own local `continued`/`skipped` state independently - with
+  // multiple simultaneously-paused cards (concurrent tool calls each naming
+  // a different unavailable app), clicking one card's button only hides
+  // that card's own button, leaving every sibling card's button still live.
+  // A second click on a sibling would fire a second answer for the same
+  // pause. This flag is a pause-level latch shared across every card: once
+  // any card's click succeeds, every card's onSkip/onContinue prop becomes
+  // undefined (see both render sites below), hiding every remaining button
+  // at once - rolled back on a failed send exactly like each card's own
+  // local optimistic state already rolls back, so a network failure doesn't
+  // strand the pause with no visible action anywhere.
+  const [connectAppsAnswered, setConnectAppsAnswered] = useState(false)
+
+  const handleSkipConnectAppsOnce = async () => {
+    setConnectAppsAnswered(true)
+    try {
+      await handleSkipConnectApps()
+    } catch (error) {
+      setConnectAppsAnswered(false)
+      throw error
+    }
+  }
+
+  const handleContinueConnectAppsOnce = async () => {
+    setConnectAppsAnswered(true)
+    try {
+      await handleContinueConnectApps()
+    } catch (error) {
+      setConnectAppsAnswered(false)
+      throw error
+    }
+  }
+
   const renderField = (interaction: Interaction) => {
     const value = formState[interaction.field]
 
@@ -725,11 +759,18 @@ export function ClarificationForm({
           // message can't mutate a task it no longer represents the live
           // pause for. Hire-seed cards (active=false from their very first
           // render) lose these two buttons but keep every per-row Connect
-          // action, which has no such side effect.
+          // action, which has no such side effect. Also gated on
+          // !connectAppsAnswered - see that flag's own doc comment for why
+          // (this branch is single-card today, but shares the same latch for
+          // consistency should a future change combine several here too).
           <ConnectAppsField
             interaction={interaction}
-            onSkip={active ? handleSkipConnectApps : undefined}
-            onContinue={allConnectAppsConnected && active ? handleContinueConnectApps : undefined}
+            onSkip={active && !connectAppsAnswered ? handleSkipConnectAppsOnce : undefined}
+            onContinue={
+              allConnectAppsConnected && active && !connectAppsAnswered
+                ? handleContinueConnectAppsOnce
+                : undefined
+            }
           />
         )
 
@@ -779,12 +820,21 @@ export function ClarificationForm({
             {normalizedInteractions.map((interaction, index) => (
               // See the mixed-list connect_apps case in renderField above
               // for why both Skip and Continue are gated on active too, not
-              // just on isConnectAppsOnly/allConnectAppsConnected.
+              // just on isConnectAppsOnly/allConnectAppsConnected - and
+              // connectAppsAnswered's own doc comment for why every card here
+              // shares one latch: multiple concurrent tool-call pauses can
+              // land several cards in this exact map, each with its own
+              // independent local continued/skipped state, so answering one
+              // must hide every sibling's button too, not just its own.
               <ConnectAppsField
                 key={`${interaction.field}-${index}`}
                 interaction={interaction}
-                onSkip={active ? handleSkipConnectApps : undefined}
-                onContinue={allConnectAppsConnected && active ? handleContinueConnectApps : undefined}
+                onSkip={active && !connectAppsAnswered ? handleSkipConnectAppsOnce : undefined}
+                onContinue={
+                  allConnectAppsConnected && active && !connectAppsAnswered
+                    ? handleContinueConnectAppsOnce
+                    : undefined
+                }
               />
             ))}
           </div>

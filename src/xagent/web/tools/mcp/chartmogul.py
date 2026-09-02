@@ -410,10 +410,13 @@ def chartmogul_create_contact(customer_uuid: str, data: dict[str, Any]) -> str:
         result = _request(
             "POST", f"/customers/{safe_customer_uuid}/contacts", json_data=data
         )
-        result = _validated_dict(result, "/contacts")
+        result = _validated_dict(result, f"/customers/{safe_customer_uuid}/contacts")
         return success_with_capped_dict("contact", result)
     except Exception as e:
-        logger.error(f"Error creating ChartMogul contact: {e}", exc_info=True)
+        logger.error(
+            f"Error creating ChartMogul contact for customer {customer_uuid}: {e}",
+            exc_info=True,
+        )
         return _error(str(e))
 
 

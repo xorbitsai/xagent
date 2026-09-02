@@ -106,6 +106,7 @@ from xagent.config import (
     TRIGGER_DISPATCHER_BATCH_SIZE,
     TRIGGER_DISPATCHER_ENABLED,
     TRIGGER_DISPATCHER_INTERVAL_SECONDS,
+    TRIGGER_DISPATCHER_STARTUP_JITTER_SECONDS,
     TRUSTED_EGRESS_PROXY,
     UPLOADED_FILE_RECOVERY_BATCH_SIZE,
     UPLOADED_FILE_RECOVERY_INTERVAL_SECONDS,
@@ -212,6 +213,7 @@ from xagent.config import (
     get_trigger_dispatcher_batch_size,
     get_trigger_dispatcher_enabled,
     get_trigger_dispatcher_interval_seconds,
+    get_trigger_dispatcher_startup_jitter_seconds,
     get_trusted_egress_proxy_enabled,
     get_uploaded_file_recovery_batch_size,
     get_uploaded_file_recovery_interval_seconds,
@@ -694,16 +696,20 @@ class TestCeleryBackgroundJobConfig:
         monkeypatch.delenv(TRIGGER_DISPATCHER_ENABLED, raising=False)
         monkeypatch.delenv(TRIGGER_DISPATCHER_INTERVAL_SECONDS, raising=False)
         monkeypatch.delenv(TRIGGER_DISPATCHER_BATCH_SIZE, raising=False)
+        monkeypatch.delenv(TRIGGER_DISPATCHER_STARTUP_JITTER_SECONDS, raising=False)
         assert get_trigger_dispatcher_enabled() is True
         assert get_trigger_dispatcher_interval_seconds() == 5
         assert get_trigger_dispatcher_batch_size() == 20
+        assert get_trigger_dispatcher_startup_jitter_seconds() == 30
 
         monkeypatch.setenv(TRIGGER_DISPATCHER_ENABLED, "false")
         monkeypatch.setenv(TRIGGER_DISPATCHER_INTERVAL_SECONDS, "9")
         monkeypatch.setenv(TRIGGER_DISPATCHER_BATCH_SIZE, "3")
+        monkeypatch.setenv(TRIGGER_DISPATCHER_STARTUP_JITTER_SECONDS, "0")
         assert get_trigger_dispatcher_enabled() is False
         assert get_trigger_dispatcher_interval_seconds() == 9
         assert get_trigger_dispatcher_batch_size() == 3
+        assert get_trigger_dispatcher_startup_jitter_seconds() == 0
 
     def test_task_lease_recovery_tuning(self, monkeypatch):
         monkeypatch.setenv(TASK_LEASE_TTL_SECONDS, "60")

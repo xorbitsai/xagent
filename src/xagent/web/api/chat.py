@@ -112,6 +112,10 @@ from ..services.mcp_runtime import (
     MCPBuiltinOAuthActorPolicyMismatchError,
     MCPBuiltinOAuthActorPolicyRequiredError,
 )
+from ..services.memory_policy import (
+    MemoryPolicyRequest,
+    resolve_trusted_memory_policy,
+)
 from ..services.model_service import _get_visible_user_ids
 from ..services.task_deletion import purge_task_rows
 from ..services.task_execution_context_service import (
@@ -312,6 +316,13 @@ def _get_task_activity_ids(db: Session, task_id: int) -> tuple[int, int]:
 class AgentServiceMemoryPolicy:
     memory: MemoryStore
     memory_enabled: bool
+    memory_available: bool = True
+    memory_availability_reason: str | None = None
+
+
+def _optional_task_int(task: Any, field: str) -> int | None:
+    value = getattr(task, field, None)
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 def resolve_agent_service_memory_policy(
@@ -325,13 +336,31 @@ def resolve_agent_service_memory_policy(
         task_config = getattr(task, "agent_config", None)
         config = task_config if isinstance(task_config, Mapping) else {}
 
-    if config.get("is_preview") is True:
-        return AgentServiceMemoryPolicy(InMemoryMemoryStore(), False)
-
-    if task is not None and task.agent_id:
-        return AgentServiceMemoryPolicy(get_memory_store(), False)
-
-    return AgentServiceMemoryPolicy(get_memory_store(), True)
+    is_preview = config.get("is_preview") is True
+    default_enabled = not is_preview and not (
+        task is not None and getattr(task, "agent_id", None)
+    )
+    source = getattr(task, "source", None)
+    override = resolve_trusted_memory_policy(
+        MemoryPolicyRequest(
+            task_id=_optional_task_int(task, "id"),
+            user_id=_optional_task_int(task, "user_id"),
+            agent_id=_optional_task_int(task, "agent_id"),
+            source=source if isinstance(source, str) else None,
+            is_preview=is_preview,
+        )
+    )
+    enabled = default_enabled if override is None else override.enabled
+    use_in_memory = (is_preview and not enabled) or (
+        override is not None and not override.available
+    )
+    memory = InMemoryMemoryStore() if use_in_memory else get_memory_store()
+    return AgentServiceMemoryPolicy(
+        memory=memory,
+        memory_enabled=enabled,
+        memory_available=True if override is None else override.available,
+        memory_availability_reason=None if override is None else override.reason,
+    )
 
 
 async def resolve_agent_service_memory_policy_async(

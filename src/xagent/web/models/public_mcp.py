@@ -1,28 +1,48 @@
 from datetime import datetime
 from typing import Any
+from uuid import UUID, uuid4
 
 from sqlalchemy import (
     JSON,
     Boolean,
+    CheckConstraint,
     DateTime,
     ForeignKey,
     Integer,
     String,
     Text,
+    UniqueConstraint,
+    Uuid,
+    event,
+    inspect,
     true,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
 
 from .database import Base
+from .generation import RandomUUID
 
 
 class PublicMCPApp(Base):  # type: ignore[no-any-unimported]
     """Registry of official MCP apps available for users to connect to."""
 
     __tablename__ = "public_mcp_apps"
+    __table_args__ = (
+        UniqueConstraint("generation", name="uq_public_mcp_apps_generation"),
+        CheckConstraint(
+            "CAST(generation AS VARCHAR) <> ''",
+            name="ck_public_mcp_apps_generation_nonempty",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    generation: Mapped[UUID] = mapped_column(
+        Uuid,
+        default=uuid4,
+        server_default=RandomUUID(),
+        nullable=False,
+    )
     app_id: Mapped[str] = mapped_column(
         String(100), unique=True, nullable=False, index=True
     )
@@ -40,6 +60,15 @@ class PublicMCPApp(Base):  # type: ignore[no-any-unimported]
         Boolean, default=True, server_default=true(), nullable=False
     )
     launch_config: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+
+
+@event.listens_for(PublicMCPApp, "before_update")
+def _prevent_public_mcp_app_generation_update(
+    _mapper: Any, _connection: Any, target: PublicMCPApp
+) -> None:
+    """Keep a catalog generation tied to exactly one row lifecycle."""
+    if inspect(target).attrs.generation.history.has_changes():
+        raise ValueError("PublicMCPApp.generation is immutable")
 
 
 class PublicMCPAppAudit(Base):  # type: ignore[no-any-unimported]

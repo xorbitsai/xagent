@@ -637,7 +637,7 @@ async def test_deputy_refresh_scope_filters_empty_entries_in_default_scopes(
 
 
 @pytest.mark.asyncio
-async def test_deputy_refresh_without_instance_url_returns_false_and_skips_network(
+async def test_deputy_refresh_without_instance_url_raises_permanent_and_skips_network(
     db_session, monkeypatch
 ):
     db, user = db_session
@@ -677,10 +677,11 @@ async def test_deputy_refresh_without_instance_url_returns_false_and_skips_netwo
 
     monkeypatch.setattr(tool_config.httpx, "AsyncClient", ExplodingAsyncClient())
 
-    assert (
+    # No instance_url on this account is a per-account data problem that no
+    # retry can fix, so it's signalled as permanent (see
+    # _OAuthRefreshPermanentlyInvalid), not returned as a plain False.
+    with pytest.raises(tool_config._OAuthRefreshPermanentlyInvalid):
         await tool_config.refresh_oauth_token_if_needed(db, oauth_account, "deputy")
-        is False
-    )
     assert oauth_account.access_token == "old-token"
 
 

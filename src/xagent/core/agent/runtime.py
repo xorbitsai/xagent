@@ -1340,6 +1340,17 @@ class PatternRuntime:
         # is indistinguishable in the trace from compaction that never tried
         # to summarize at all.
         unusable_summary_metadata: dict[str, Any] | None = None
+        # Cleared as soon as a usable summary path exists -- a model with a
+        # ``chat`` method plus a context that implements the compact protocol.
+        # It is deliberately NOT tied to a summary actually being attempted: a
+        # context that declines to build a request (nothing visible to
+        # summarize) had a summarizer available and must not be reported as
+        # lacking one. Reaching the fallback with this still set means no
+        # summarizer was reachable at all, which the trace previously could
+        # not distinguish from a summary that was attempted and failed.
+        summary_unavailable_metadata: dict[str, Any] | None = {
+            "llm_summary_unavailable": True,
+        }
         # Written by ``_run_compact_llm_call`` when it had to lower the
         # budget, so the compact trace event can say so alongside the other
         # degrade markers.
@@ -1350,6 +1361,7 @@ class PatternRuntime:
             and callable(llm_compact_request_if_needed)
             and callable(compact_with_llm_response)
         ):
+            summary_unavailable_metadata = None
             request = llm_compact_request_if_needed()
             if request is not None:
                 request_metadata = request.get("metadata") or {}
@@ -1405,14 +1417,35 @@ class PatternRuntime:
                     result.metadata["fallback_strategy"] = result.strategy
                     result.metadata.update(request_metadata)
 
+        # Backstop. ``compact_if_needed`` drops the oldest messages outright,
+        # so it runs only after summarization was skipped, errored, or came
+        # back unusable -- never as an alternative worth choosing.
         if result is None or not getattr(result, "compacted", False):
             if not callable(compact_if_needed):
                 return result
-            result = compact_if_needed(llm)
+            result = compact_if_needed()
             if inspect.isawaitable(result):
                 result = await result
-            if result is not None and unusable_summary_metadata is not None:
-                result.metadata.update(unusable_summary_metadata)
+            # ``compacted`` is True even when the tail window already held
+            # every message and nothing was removed, so it cannot stand in for
+            # "messages were dropped" -- claiming a drop that did not happen
+            # would be the same kind of lie this marker exists to prevent.
+            removed_count = (getattr(result, "metadata", None) or {}).get(
+                "removed_count", 0
+            )
+            fallback_metadata = unusable_summary_metadata
+            if fallback_metadata is None and removed_count > 0:
+                fallback_metadata = summary_unavailable_metadata
+                if fallback_metadata is not None:
+                    logger.warning(
+                        "Context compaction found no reachable summary path "
+                        "(no compact model, or a context that cannot build a "
+                        "compact request); dropping messages instead. "
+                        "execution_id=%s",
+                        getattr(context, "execution_id", None),
+                    )
+            if result is not None and fallback_metadata is not None:
+                result.metadata.update(fallback_metadata)
                 result.metadata["fallback_strategy"] = result.strategy
 
         if result is None:

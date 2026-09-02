@@ -62,6 +62,7 @@ from xagent.web.services.task_command_transport import (
     fail_task_command,
     finish_task_command,
     load_task_command,
+    max_command_defers,
     notify_task_command_dispatcher,
     renew_task_command_claim,
     retry_failed_task_command,
@@ -706,7 +707,7 @@ async def test_final_command_deferral_is_broadcast(db_session) -> None:
         payload={"agent_id": 1},
         target_run_id=None,
         attempt_count=1,
-        defer_count=MAX_COMMAND_DEFERS - 1,
+        defer_count=max_command_defers() - 1,
     )
 
     with patch.object(
@@ -911,7 +912,7 @@ async def test_deferred_message_eventually_fails_and_unblocks_cancel(
     )
     row = db_session.get(TaskExecutionCommand, message.command_id)
     assert row is not None
-    row.defer_count = MAX_COMMAND_DEFERS - 1
+    row.defer_count = max_command_defers() - 1
     db_session.commit()
 
     async def defer(_command):
@@ -923,7 +924,7 @@ async def test_deferred_message_eventually_fails_and_unblocks_cancel(
     assert row is not None
     assert row.status == COMMAND_FAILED
     assert row.failure_count == 0
-    assert row.defer_count == MAX_COMMAND_DEFERS
+    assert row.defer_count == max_command_defers()
     event = (
         db_session.query(TaskCommandTerminalEvent)
         .filter(TaskCommandTerminalEvent.task_command_id == message.command_id)
@@ -980,7 +981,7 @@ def test_failed_command_retry_preserves_immutable_target(db_session) -> None:
     assert row is not None
     row.status = COMMAND_FAILED
     row.failure_count = MAX_COMMAND_FAILURES
-    row.defer_count = MAX_COMMAND_DEFERS
+    row.defer_count = max_command_defers()
     row.error = "temporary cancellation failure"
     row.completed_at = datetime.utcnow()
     db_session.commit()
@@ -2901,3 +2902,30 @@ def test_enqueue_notifies_only_after_commit(db_session, monkeypatch) -> None:
     )
 
     assert order == ["commit", "notify"]
+
+
+def test_defer_budget_is_coupled_to_the_lease_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The defer budget must outlast the configured lease TTL with margin.
+
+    A deferral's canonical wait is an unreleased task lease, which clears
+    within one TTL; a fixed budget silently smaller than a raised
+    ``XAGENT_TASK_LEASE_TTL_SECONDS`` turned every long park into a terminal
+    failure for an already-accepted command (xorbitsai/xagent-saas#952 B3).
+    """
+
+    monkeypatch.setenv("XAGENT_TASK_LEASE_TTL_SECONDS", "300")
+    assert max_command_defers() == 600
+
+    # The historical constant stays as the floor for short TTLs.
+    monkeypatch.setenv("XAGENT_TASK_LEASE_TTL_SECONDS", "10")
+    assert max_command_defers() == MAX_COMMAND_DEFERS
+
+    # The default (no env var) doubles the historical constant.
+    monkeypatch.delenv("XAGENT_TASK_LEASE_TTL_SECONDS", raising=False)
+    assert max_command_defers() == 120
+
+    # An invalid value falls back to the default TTL, not the floor.
+    monkeypatch.setenv("XAGENT_TASK_LEASE_TTL_SECONDS", "not-a-number")
+    assert max_command_defers() == 120

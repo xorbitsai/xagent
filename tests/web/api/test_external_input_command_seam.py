@@ -22,6 +22,8 @@ from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.task_command_terminal_event import TaskCommandTerminalEvent
 from xagent.web.services.external_task_input import (
+    EXTERNAL_INPUT_NOT_APPLIED_MESSAGE,
+    EXTERNAL_INPUT_UNCONFIRMED_MESSAGE,
     execute_external_task_input_command,
     register_external_task_input_executor,
     registered_external_task_input_executor,
@@ -32,12 +34,14 @@ from xagent.web.services.task_command_transport import (
     COMMAND_FAILED,
     COMMAND_PENDING,
     MAX_COMMAND_DEFERS,
+    MAX_COMMAND_FAILURES,
     ClaimedTaskCommand,
     TaskCommandDeferred,
     TaskCommandKind,
     TaskCommandRejected,
     dispatch_one_task_command,
     enqueue_task_command,
+    max_command_defers,
 )
 from xagent.web.services.task_execution_controller import TaskControlState
 
@@ -449,7 +453,9 @@ async def test_deferred_external_input_spends_the_defer_budget_not_failures() ->
 
 
 @pytest.mark.asyncio
-async def test_exhausted_external_deferral_withholds_command_identity() -> None:
+async def test_exhausted_external_deferral_withholds_command_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """An external audience never sees durable command identity.
 
     The terminal rebind in ``execute_durable_task_command`` runs *after* the
@@ -457,8 +463,13 @@ async def test_exhausted_external_deferral_withholds_command_identity() -> None:
     ``_terminal_command_event_draft`` itself: an exhausted external-scope
     deferral must persist ``include_command_identity=False`` (same policy as
     the external cancel) while still carrying the exception's own
-    ``resend_safe`` evidence.
+    ``resend_safe`` evidence. The live ``agent_error`` frame follows the
+    same rule: identity withheld and a purpose-built terminal sentence,
+    pinned here because the exhausted-deferral path broadcasts through the
+    same chokepoint.
     """
+
+    from unittest.mock import AsyncMock, MagicMock
 
     agent_id, owner_user_id = _create_agent()
     task_id = _create_waiting_task(agent_id=agent_id, owner_user_id=owner_user_id)
@@ -470,6 +481,10 @@ async def test_exhausted_external_deferral_withholds_command_identity() -> None:
         )
 
     register_external_task_input_executor(executor)
+
+    broadcast_manager = MagicMock()
+    broadcast_manager.broadcast_to_task = AsyncMock()
+    monkeypatch.setattr(websocket_api, "manager", broadcast_manager)
 
     db = _direct_db_session()
     try:
@@ -483,12 +498,12 @@ async def test_exhausted_external_deferral_withholds_command_identity() -> None:
         )
         assert enqueued.created
         # Spend all but the last unit of the defer budget so the next
-        # deferral is the terminal one -- MAX_COMMAND_DEFERS real round
+        # deferral is the terminal one -- max_command_defers() real round
         # trips would prove nothing more about the disposition under test.
         db.query(TaskExecutionCommand).filter(
             TaskExecutionCommand.command_id == "ext-input-exhausted"
         ).update(
-            {TaskExecutionCommand.defer_count: MAX_COMMAND_DEFERS - 1},
+            {TaskExecutionCommand.defer_count: max_command_defers() - 1},
             synchronize_session=False,
         )
         db.commit()
@@ -499,6 +514,15 @@ async def test_exhausted_external_deferral_withholds_command_identity() -> None:
         websocket_api.execute_durable_task_command
     )
     assert processed is True
+
+    payloads = [
+        call.args[0] for call in broadcast_manager.broadcast_to_task.await_args_list
+    ]
+    assert [payload["type"] for payload in payloads] == ["agent_error"]
+    (exhausted_payload,) = payloads
+    assert exhausted_payload["message"] == EXTERNAL_INPUT_NOT_APPLIED_MESSAGE
+    assert "command_id" not in exhausted_payload
+    assert "command_kind" not in exhausted_payload
 
     db = _direct_db_session()
     try:
@@ -516,6 +540,480 @@ async def test_exhausted_external_deferral_withholds_command_identity() -> None:
         assert event.outcome == "failed"
         assert event.message_code == "task_command_deferred"
         assert event.resend_safe is True
+        assert event.include_command_identity is False
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_defer_exhaustion_boundary_uses_the_effective_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both budget consumers must use the effective budget, not the constant.
+
+    With a raised TTL the budget is 2*TTL, so the historical constant's
+    boundary (defer count 60) must stay non-terminal: the wrapper must not
+    broadcast and the transport must keep the row PENDING. At the effective
+    boundary the command terminalizes -- and because an exhausted
+    ``resend_safe=False`` deferral proves nothing about the downstream
+    handoff, the broadcast must assert only uncertainty, never
+    non-application.
+    """
+
+    from unittest.mock import AsyncMock, MagicMock
+
+    monkeypatch.setenv("XAGENT_TASK_LEASE_TTL_SECONDS", "300")
+    budget = max_command_defers()
+    assert budget == 600
+
+    agent_id, owner_user_id = _create_agent()
+    task_id = _create_waiting_task(agent_id=agent_id, owner_user_id=owner_user_id)
+
+    async def executor(_command: ClaimedTaskCommand) -> dict[str, Any]:
+        raise TaskCommandDeferred("the delivery handoff is still pending")
+
+    register_external_task_input_executor(executor)
+
+    broadcast_manager = MagicMock()
+    broadcast_manager.broadcast_to_task = AsyncMock()
+    monkeypatch.setattr(websocket_api, "manager", broadcast_manager)
+
+    def seed_defer_count(count: int) -> None:
+        # The command's own claim_expires_at, not a next-attempt column --
+        # this transport has none -- gates whether a PENDING row is
+        # claimable (``_claim_availability_predicate``). The first seed
+        # relies on the fresh row's NULL default; the second clears the
+        # one-second backoff the prior deferral armed so the row is
+        # claimable again without sleeping through real time.
+        db = _direct_db_session()
+        try:
+            db.query(TaskExecutionCommand).filter(
+                TaskExecutionCommand.command_id == "ext-input-boundary"
+            ).update(
+                {
+                    TaskExecutionCommand.defer_count: count,
+                    TaskExecutionCommand.claim_expires_at: None,
+                },
+                synchronize_session=False,
+            )
+            db.commit()
+        finally:
+            db.close()
+
+    db = _direct_db_session()
+    try:
+        enqueued = enqueue_task_command(
+            db,
+            task_id=task_id,
+            actor_user_id=owner_user_id,
+            command_id="ext-input-boundary",
+            kind=TaskCommandKind.MESSAGE,
+            payload={"scope": "external", "message": "the answer"},
+        )
+        assert enqueued.created
+    finally:
+        db.close()
+
+    # The historical constant's boundary: one deferral past count 59 must
+    # spend budget, not terminalize.
+    seed_defer_count(MAX_COMMAND_DEFERS - 1)
+    processed = await dispatch_one_task_command(
+        websocket_api.execute_durable_task_command
+    )
+    assert processed is True
+    broadcast_manager.broadcast_to_task.assert_not_awaited()
+
+    db = _direct_db_session()
+    try:
+        row = (
+            db.query(TaskExecutionCommand)
+            .filter(TaskExecutionCommand.command_id == "ext-input-boundary")
+            .one()
+        )
+        assert row.status == COMMAND_PENDING
+        assert int(row.defer_count or 0) == MAX_COMMAND_DEFERS
+        assert (
+            db.query(TaskCommandTerminalEvent)
+            .filter(TaskCommandTerminalEvent.task_command_id == int(row.id))
+            .count()
+            == 0
+        )
+    finally:
+        db.close()
+
+    # The effective boundary: the six-hundredth deferral is terminal, and
+    # its broadcast asserts only uncertainty.
+    seed_defer_count(budget - 1)
+    processed = await dispatch_one_task_command(
+        websocket_api.execute_durable_task_command
+    )
+    assert processed is True
+
+    payloads = [
+        call.args[0] for call in broadcast_manager.broadcast_to_task.await_args_list
+    ]
+    assert [payload["type"] for payload in payloads] == ["agent_error"]
+    (exhausted_payload,) = payloads
+    assert exhausted_payload["message"] == EXTERNAL_INPUT_UNCONFIRMED_MESSAGE
+    assert "command_id" not in exhausted_payload
+    assert "command_kind" not in exhausted_payload
+
+    db = _direct_db_session()
+    try:
+        row = (
+            db.query(TaskExecutionCommand)
+            .filter(TaskExecutionCommand.command_id == "ext-input-boundary")
+            .one()
+        )
+        assert row.status == COMMAND_FAILED
+        event = (
+            db.query(TaskCommandTerminalEvent)
+            .filter(TaskCommandTerminalEvent.task_command_id == int(row.id))
+            .one()
+        )
+        assert event.outcome == "failed"
+        assert event.resend_safe is False
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_exhausted_generic_failure_reports_an_unconfirmed_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A generic failure proves nothing about the downstream handoff.
+
+    The failure-budget exhaustion arm broadcasts through the same external
+    branch; a worker may have injected the answer before the exception, so
+    the audience must get the uncertainty sentence, never categorical
+    non-application.
+    """
+
+    from unittest.mock import AsyncMock, MagicMock
+
+    agent_id, owner_user_id = _create_agent()
+    task_id = _create_waiting_task(agent_id=agent_id, owner_user_id=owner_user_id)
+
+    async def executor(_command: ClaimedTaskCommand) -> dict[str, Any]:
+        raise RuntimeError("the runtime broke mid-delivery")
+
+    register_external_task_input_executor(executor)
+
+    broadcast_manager = MagicMock()
+    broadcast_manager.broadcast_to_task = AsyncMock()
+    monkeypatch.setattr(websocket_api, "manager", broadcast_manager)
+
+    db = _direct_db_session()
+    try:
+        enqueued = enqueue_task_command(
+            db,
+            task_id=task_id,
+            actor_user_id=owner_user_id,
+            command_id="ext-input-generic-failure",
+            kind=TaskCommandKind.MESSAGE,
+            payload={"scope": "external", "message": "the answer"},
+        )
+        assert enqueued.created
+        db.query(TaskExecutionCommand).filter(
+            TaskExecutionCommand.command_id == "ext-input-generic-failure"
+        ).update(
+            {TaskExecutionCommand.failure_count: MAX_COMMAND_FAILURES - 1},
+            synchronize_session=False,
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    processed = await dispatch_one_task_command(
+        websocket_api.execute_durable_task_command
+    )
+    assert processed is True
+
+    payloads = [
+        call.args[0] for call in broadcast_manager.broadcast_to_task.await_args_list
+    ]
+    assert [payload["type"] for payload in payloads] == ["agent_error"]
+    (failure_payload,) = payloads
+    assert failure_payload["message"] == EXTERNAL_INPUT_UNCONFIRMED_MESSAGE
+    assert "command_id" not in failure_payload
+    assert "command_kind" not in failure_payload
+
+    db = _direct_db_session()
+    try:
+        row = (
+            db.query(TaskExecutionCommand)
+            .filter(TaskExecutionCommand.command_id == "ext-input-generic-failure")
+            .one()
+        )
+        assert row.status == COMMAND_FAILED
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_rejected_external_input_broadcasts_and_keeps_the_bound_draft(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A terminal rejection must surface, and the executor's draft must win.
+
+    The seam executor is the one MESSAGE handler with no notification
+    channel of its own: without the broadcast, a deferred answer that is
+    later terminally rejected vanishes silently while the task stays parked
+    (xorbitsai/xagent-saas#952 B2). And the rejection disposition must
+    persist the draft the executor bound -- hardcoding a neutral one
+    silently discarded its identity-withholding (#952 M3) -- proven here
+    through the real dispatch path, not by reading back the attribute.
+
+    The bound draft uses ``message_code=None`` rather than the more obvious
+    ``TASK_COMMAND_FAILED``: the fallback ``_terminal_command_event_draft``
+    derives exactly ``task_command_failed``/``resend_safe=False``/identity
+    withheld for this exact command (a rejection on an external-scope
+    MESSAGE), so a fallback-equivalent bound value would pass even if
+    precedence were broken and the fallback ran instead. ``None`` is a value
+    ``TerminalTaskEventDraft`` accepts but the fallback never produces, so
+    only the bound draft winning can explain the assertion below.
+    """
+
+    from unittest.mock import AsyncMock, MagicMock
+
+    from xagent.web.services.task_command_terminal_events import (
+        TerminalTaskEventDraft,
+        bind_terminal_event_draft,
+    )
+
+    agent_id, owner_user_id = _create_agent()
+    task_id = _create_waiting_task(agent_id=agent_id, owner_user_id=owner_user_id)
+
+    async def executor(_command: ClaimedTaskCommand) -> dict[str, Any]:
+        rejection = TaskCommandRejected(
+            "the continuation was refused", reason="continuation_refused"
+        )
+        bind_terminal_event_draft(
+            rejection,
+            TerminalTaskEventDraft(
+                message_code=None,
+                resend_safe=False,
+                include_command_identity=False,
+            ),
+        )
+        raise rejection
+
+    register_external_task_input_executor(executor)
+
+    broadcast_manager = MagicMock()
+    broadcast_manager.broadcast_to_task = AsyncMock()
+    monkeypatch.setattr(websocket_api, "manager", broadcast_manager)
+
+    db = _direct_db_session()
+    try:
+        enqueued = enqueue_task_command(
+            db,
+            task_id=task_id,
+            actor_user_id=owner_user_id,
+            command_id="ext-input-rejected",
+            kind=TaskCommandKind.MESSAGE,
+            payload={"scope": "external", "message": "the answer"},
+        )
+        assert enqueued.created
+    finally:
+        db.close()
+
+    processed = await dispatch_one_task_command(
+        websocket_api.execute_durable_task_command
+    )
+    assert processed is True
+
+    payloads = [
+        call.args[0] for call in broadcast_manager.broadcast_to_task.await_args_list
+    ]
+    assert [payload["type"] for payload in payloads] == ["agent_error"]
+
+    (rejection_payload,) = payloads
+    # The live frame mirrors the persisted-event disclosure rule: the
+    # external audience never sees durable command identity, and the generic
+    # fallback's "Please try again." would be false for the non-retryable
+    # rejections this broadcast exists to surface.
+    assert rejection_payload["message"] == EXTERNAL_INPUT_NOT_APPLIED_MESSAGE
+    assert "command_id" not in rejection_payload
+    assert "command_kind" not in rejection_payload
+
+    db = _direct_db_session()
+    try:
+        row = (
+            db.query(TaskExecutionCommand)
+            .filter(TaskExecutionCommand.command_id == "ext-input-rejected")
+            .one()
+        )
+        assert row.status == COMMAND_FAILED
+        event = (
+            db.query(TaskCommandTerminalEvent)
+            .filter(TaskCommandTerminalEvent.task_command_id == int(row.id))
+            .one()
+        )
+        assert event.outcome == "failed"
+        assert event.message_code is None
+        assert event.include_command_identity is False
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_rejected_external_input_without_a_bound_draft_gets_the_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An executor that binds nothing still gets a classified terminal event.
+
+    The rejection arm derives the standard draft only when the executor
+    bound none, so the fallback must classify the outcome
+    (``task_command_failed``) and withhold identity for the external scope
+    -- the other half of the precedence contract pinned above.
+    """
+
+    from unittest.mock import AsyncMock, MagicMock
+
+    agent_id, owner_user_id = _create_agent()
+    task_id = _create_waiting_task(agent_id=agent_id, owner_user_id=owner_user_id)
+
+    async def executor(_command: ClaimedTaskCommand) -> dict[str, Any]:
+        raise TaskCommandRejected(
+            "the continuation was refused", reason="continuation_refused"
+        )
+
+    register_external_task_input_executor(executor)
+
+    broadcast_manager = MagicMock()
+    broadcast_manager.broadcast_to_task = AsyncMock()
+    monkeypatch.setattr(websocket_api, "manager", broadcast_manager)
+
+    db = _direct_db_session()
+    try:
+        enqueued = enqueue_task_command(
+            db,
+            task_id=task_id,
+            actor_user_id=owner_user_id,
+            command_id="ext-input-rejected-unbound",
+            kind=TaskCommandKind.MESSAGE,
+            payload={"scope": "external", "message": "the answer"},
+        )
+        assert enqueued.created
+    finally:
+        db.close()
+
+    processed = await dispatch_one_task_command(
+        websocket_api.execute_durable_task_command
+    )
+    assert processed is True
+
+    payloads = [
+        call.args[0] for call in broadcast_manager.broadcast_to_task.await_args_list
+    ]
+    assert [payload["type"] for payload in payloads] == ["agent_error"]
+    (rejection_payload,) = payloads
+    assert rejection_payload["message"] == EXTERNAL_INPUT_NOT_APPLIED_MESSAGE
+
+    db = _direct_db_session()
+    try:
+        row = (
+            db.query(TaskExecutionCommand)
+            .filter(TaskExecutionCommand.command_id == "ext-input-rejected-unbound")
+            .one()
+        )
+        assert row.status == COMMAND_FAILED
+        event = (
+            db.query(TaskCommandTerminalEvent)
+            .filter(TaskCommandTerminalEvent.task_command_id == int(row.id))
+            .one()
+        )
+        assert event.outcome == "failed"
+        assert event.message_code == "task_command_failed"
+        assert event.include_command_identity is False
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_rejection_broadcast_failure_does_not_supersede_the_disposition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed broadcast must not turn a terminal rejection into a retry.
+
+    ``broadcast_to_task`` re-raises non-connection errors (its control-state
+    snapshot read can fail), and an exception escaping the rejection arm
+    would supersede ``TaskCommandRejected``: the dispatcher's generic
+    disposition would then spend the failure budget on a command whose
+    outcome is already durably decided, and the executor-bound draft would
+    be lost with it. The broadcast is fire-and-forget for the disposition:
+    one dispatch must leave the command terminally failed with the bound
+    draft persisted.
+    """
+
+    from unittest.mock import AsyncMock, MagicMock
+
+    from xagent.web.services.task_command_terminal_events import (
+        TerminalTaskEventDraft,
+        bind_terminal_event_draft,
+    )
+
+    agent_id, owner_user_id = _create_agent()
+    task_id = _create_waiting_task(agent_id=agent_id, owner_user_id=owner_user_id)
+
+    async def executor(_command: ClaimedTaskCommand) -> dict[str, Any]:
+        rejection = TaskCommandRejected(
+            "the continuation was refused", reason="continuation_refused"
+        )
+        bind_terminal_event_draft(
+            rejection,
+            TerminalTaskEventDraft(
+                message_code=None,
+                resend_safe=False,
+                include_command_identity=False,
+            ),
+        )
+        raise rejection
+
+    register_external_task_input_executor(executor)
+
+    broadcast_manager = MagicMock()
+    broadcast_manager.broadcast_to_task = AsyncMock(
+        side_effect=Exception("the control-state snapshot read failed")
+    )
+    monkeypatch.setattr(websocket_api, "manager", broadcast_manager)
+
+    db = _direct_db_session()
+    try:
+        enqueued = enqueue_task_command(
+            db,
+            task_id=task_id,
+            actor_user_id=owner_user_id,
+            command_id="ext-input-broadcast-broke",
+            kind=TaskCommandKind.MESSAGE,
+            payload={"scope": "external", "message": "the answer"},
+        )
+        assert enqueued.created
+    finally:
+        db.close()
+
+    processed = await dispatch_one_task_command(
+        websocket_api.execute_durable_task_command
+    )
+    assert processed is True
+    broadcast_manager.broadcast_to_task.assert_awaited()
+
+    db = _direct_db_session()
+    try:
+        row = (
+            db.query(TaskExecutionCommand)
+            .filter(TaskExecutionCommand.command_id == "ext-input-broadcast-broke")
+            .one()
+        )
+        assert row.status == COMMAND_FAILED
+        event = (
+            db.query(TaskCommandTerminalEvent)
+            .filter(TaskCommandTerminalEvent.task_command_id == int(row.id))
+            .one()
+        )
+        assert event.outcome == "failed"
+        assert event.message_code is None
         assert event.include_command_identity is False
     finally:
         db.close()

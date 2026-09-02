@@ -27,13 +27,13 @@ from xagent.web.services.task_command_transport import (
     COMMAND_FAILED,
     COMMAND_PENDING,
     COMMAND_PROCESSING,
-    MAX_COMMAND_DEFERS,
     ClaimedTaskCommand,
     TaskCommandDeferred,
     TaskCommandKind,
     dispatch_one_task_command,
     enqueue_task_command,
     get_runner_id,
+    max_command_defers,
 )
 
 
@@ -343,11 +343,11 @@ async def test_exhausted_contention_persists_evidence_based_resend_safety(
     )
     stored = db_session.get(TaskExecutionCommand, enqueued.command_id)
     assert stored is not None
-    stored.defer_count = MAX_COMMAND_DEFERS - 1
+    stored.defer_count = max_command_defers() - 1
     # Each prior clean contention both claimed and deferred once. A stale
     # worker adds one unmatched claim that the reclaiming worker must treat as
     # possible in-flight injection evidence even when no delivery row exists.
-    stored.attempt_count = MAX_COMMAND_DEFERS - 1
+    stored.attempt_count = max_command_defers() - 1
     if unsettled_prior_claim:
         stored.status = COMMAND_PROCESSING
         stored.claimed_by = "stale-worker"
@@ -380,7 +380,7 @@ async def test_exhausted_contention_persists_evidence_based_resend_safety(
     assert stored is not None
     assert stored.status == COMMAND_FAILED
     assert stored.failure_count == 0
-    assert stored.defer_count == MAX_COMMAND_DEFERS
+    assert stored.defer_count == max_command_defers()
     event = (
         db_session.query(TaskCommandTerminalEvent)
         .filter(TaskCommandTerminalEvent.task_command_id == enqueued.command_id)

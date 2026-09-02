@@ -1964,3 +1964,32 @@ def test_compact_rejects_content_the_client_marked_as_a_reasoning_fallback() -> 
     assert not result.compacted
     assert result.strategy == "none"
     assert ctx.messages == original
+
+
+def test_compact_config_round_trip_drops_the_retired_strategy_key() -> None:
+    """Pins the rolling-deploy contract for the removed ``strategy`` knob.
+
+    ``to_dict`` must stop emitting the key, and a legacy payload that still
+    carries it -- every row persisted before the removal, reloaded by every
+    resumed execution -- must restore the surrounding fields unchanged. The
+    ``from_dict`` half cannot break as long as the reader uses per-key
+    ``get``; it is pinned because switching to ``CompactConfig(**compact)``
+    would turn those live rows into a crash. The ``hasattr`` check guards the
+    other direction: re-adding the field with a default would silently revive
+    the dispatch this change removed.
+    """
+    context = ExecutionContext()
+    context.compact_config.enabled = False
+    context.compact_config.threshold = 1234
+    context.compact_config.max_messages = 7
+
+    payload = context.to_dict()
+    assert "strategy" not in payload["compact_config"]
+    payload["compact_config"]["strategy"] = "truncate"
+
+    restored = ExecutionContext.from_dict(payload)
+
+    assert restored.compact_config.enabled is False
+    assert restored.compact_config.threshold == 1234
+    assert restored.compact_config.max_messages == 7
+    assert not hasattr(restored.compact_config, "strategy")

@@ -1612,3 +1612,98 @@ async def test_compaction_stops_descending_once_a_budget_is_accepted() -> None:
     assert llm.budgets == [8000]
     assert result.strategy == "truncate"
     assert result.metadata["llm_summary_unusable"] is True
+
+
+@pytest.mark.asyncio
+async def test_compaction_marks_messages_dropped_for_want_of_a_summary_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dropping messages because no summary model was reachable used to look
+    exactly like dropping them after a summary failed -- both produced a bare
+    ``truncate`` result, and only the failure path left a marker behind. That
+    made "nothing could summarize" invisible in the trace.
+    """
+    recording_logger = RecordingLogger()
+    monkeypatch.setattr(runtime_module, "logger", recording_logger)
+    context = ExecutionContext(execution_id="no-compact-model")
+    context.compact_config.threshold = 1
+    context.compact_config.max_messages = 2
+    for index in range(6):
+        context.add_user_message(f"m{index}")
+
+    result = await PatternRuntime().compact_context_if_needed(
+        context=context, llm=None, metadata={"phase": "test"}
+    )
+
+    assert result.compacted is True
+    assert result.strategy == "truncate"
+    # Without this the test cannot tell a real drop from the no-op window that
+    # keeps every message, which is exactly what the marker must not claim.
+    assert result.metadata["removed_count"] == 4
+    assert result.metadata["llm_summary_unavailable"] is True
+    assert result.metadata["fallback_strategy"] == "truncate"
+    assert len(recording_logger.warning_calls) == 1
+    msg, args = recording_logger.warning_calls[0]
+    assert "no reachable summary path" in msg % args
+
+
+@pytest.mark.asyncio
+async def test_compaction_does_not_claim_a_drop_when_the_window_kept_everything(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A context can be over budget while holding fewer messages than the tail
+    window keeps -- one huge tool result does it. ``_drop_oldest_messages``
+    still reports ``compacted=True`` there, so keying the marker off that flag
+    announced a drop that never happened, once per turn, forever.
+    """
+    recording_logger = RecordingLogger()
+    monkeypatch.setattr(runtime_module, "logger", recording_logger)
+    context = ExecutionContext(execution_id="nothing-to-drop")
+    context.compact_config.threshold = 1
+    context.compact_config.max_messages = 20
+    context.add_user_message("only message")
+
+    result = await PatternRuntime().compact_context_if_needed(
+        context=context, llm=None, metadata={"phase": "test"}
+    )
+
+    assert result.metadata["removed_count"] == 0
+    assert "llm_summary_unavailable" not in result.metadata
+    assert recording_logger.warning_calls == []
+
+
+@pytest.mark.asyncio
+async def test_compaction_does_not_blame_the_model_when_nothing_is_summarizable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A usable summary model plus a context that declines to build a request
+    (over budget, but every message hidden) is not the same failure as having
+    no summarizer at all, and must not be reported as one.
+
+    This is the only test that reaches the line clearing
+    ``summary_unavailable_metadata``: delete that line and the marker below
+    reappears.
+    """
+    recording_logger = RecordingLogger()
+    monkeypatch.setattr(runtime_module, "logger", recording_logger)
+
+    class UnusedCompactLLM:
+        model_name = "compact-test"
+
+        async def chat(self, **_: Any) -> Any:  # pragma: no cover - never called
+            raise AssertionError("no request should have been built")
+
+    context = ExecutionContext(execution_id="nothing-summarizable")
+    context.compact_config.threshold = 1
+    context.compact_config.max_messages = 2
+    for index in range(6):
+        context.add_user_message(f"m{index}", hidden=True)
+
+    result = await PatternRuntime().compact_context_if_needed(
+        context=context, llm=UnusedCompactLLM(), metadata={"phase": "test"}
+    )
+
+    assert result.compacted is True
+    assert result.metadata["removed_count"] == 4
+    assert "llm_summary_unavailable" not in result.metadata
+    assert recording_logger.warning_calls == []

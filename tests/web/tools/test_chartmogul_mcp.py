@@ -113,6 +113,15 @@ def test_request_drops_none_valued_params(monkeypatch):
     assert mock_request.call_args.kwargs["params"] == {"cursor": "abc"}
 
 
+def test_request_drops_empty_string_valued_params(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"ok": True}))
+    monkeypatch.setattr(chartmogul.requests, "request", mock_request)
+
+    chartmogul._request("GET", "/customers", params={"email": "", "cursor": "abc"})
+
+    assert mock_request.call_args.kwargs["params"] == {"cursor": "abc"}
+
+
 def test_request_raises_with_error_detail_on_failure(monkeypatch):
     monkeypatch.setattr(
         chartmogul.requests,
@@ -176,6 +185,23 @@ def test_list_customers_rejects_unexpected_shape(monkeypatch):
     result = json.loads(chartmogul.chartmogul_list_customers())
 
     assert result["status"] == "error"
+
+
+def test_list_customers_treats_null_entries_as_empty_page(monkeypatch):
+    monkeypatch.setattr(
+        chartmogul.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={"entries": None, "has_more": False, "cursor": None}
+            )
+        ),
+    )
+
+    result = json.loads(chartmogul.chartmogul_list_customers())
+
+    assert result["status"] == "success"
+    assert result["entries"] == []
 
 
 def test_list_customers_clamps_per_page(monkeypatch):
@@ -516,3 +542,25 @@ def test_success_with_capped_list_message_warns_data_is_not_recoverable(monkeypa
     # cursor/has_more still describe the original fetched page, unchanged
     assert result["cursor"] == "abc"
     assert result["has_more"] is True
+
+
+def test_success_with_capped_list_drops_message_as_last_resort(monkeypatch):
+    # Small enough that even an empty item list plus the added "message"
+    # text doesn't fit -- forces the post-loop fallback that drops the
+    # message itself rather than returning an over-limit response.
+    monkeypatch.setattr(chartmogul, "get_tool_max_output_length", lambda: 40)
+
+    result = json.loads(
+        chartmogul._success_with_capped_list(
+            "entries",
+            {
+                "entries": [{"uuid": "cus_1"}, {"uuid": "cus_2"}],
+                "has_more": True,
+                "cursor": "abc",
+            },
+        )
+    )
+
+    assert result["entries"] == []
+    assert result["truncated"] is True
+    assert "message" not in result

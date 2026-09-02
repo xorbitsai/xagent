@@ -9,7 +9,7 @@ from mcp.server.fastmcp import FastMCP
 from ....config import get_tool_max_output_length
 from ....core.utils.security import redact_sensitive_text
 from ...utils.graphql_errors import truncate_error_text
-from .utils import setup_proxy_env, success_with_capped_dict, url_path_id
+from .utils import clamp_limit, setup_proxy_env, success_with_capped_dict, url_path_id
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("chartmogul-mcp")
@@ -79,6 +79,12 @@ def _success_with_capped_list(list_field: str, payload: dict[str, Any]) -> str:
         items = items[: len(items) // 2]
         halved = True
         response = _build(items, True, halved)
+    if halved and len(response) > max_output_length:
+        # Even an empty item list didn't buy back enough room (an unusually
+        # large cursor/other payload field, or a very small configured
+        # limit) -- drop the added "message" text itself as a last resort,
+        # matching deputy.py's identical fallback.
+        response = _build(items, True, False)
     return response
 
 
@@ -129,7 +135,13 @@ def _request(
             method=method,
             url=f"{API_BASE_URL}{path}",
             auth=(_api_key(), ""),
-            params={k: v for k, v in (params or {}).items() if v is not None},
+            # Drop "" as well as None: every list filter below is optional,
+            # and an LLM tool-call passing e.g. email="" to mean "no filter"
+            # would otherwise become a real `?email=` query param instead of
+            # being omitted.
+            params={
+                k: v for k, v in (params or {}).items() if v is not None and v != ""
+            },
             json=json_data,
             timeout=DEFAULT_TIMEOUT_SECONDS,
         )
@@ -163,7 +175,35 @@ def _request(
 
 
 def _clamp_per_page(per_page: int) -> int:
-    return max(1, min(int(per_page), MAX_PER_PAGE))
+    return clamp_limit(per_page, max_limit=MAX_PER_PAGE)
+
+
+def _validated_dict(result: Any, endpoint: str) -> dict[str, Any] | str:
+    """Return ``result`` if it's a dict, else an ``_error()`` JSON string."""
+    if not isinstance(result, dict):
+        return _error(f"ChartMogul returned an unexpected response for {endpoint}")
+    return result
+
+
+def _validated_list_result(result: Any, endpoint: str) -> dict[str, Any] | str:
+    """Return ``result`` with ``entries`` normalized to a list, else an
+    ``_error()`` JSON string.
+
+    A present-but-``null`` ``entries`` field is treated the same as an
+    empty list rather than a connector-level error, in case ChartMogul
+    ever returns ``null`` instead of ``[]`` for a zero-result page. A
+    *missing* ``entries`` key is still rejected as an unexpected shape --
+    unlike an explicit ``null``, its absence isn't evidence of "empty",
+    just of a response that isn't a page of this resource at all.
+    """
+    if not isinstance(result, dict) or "entries" not in result:
+        return _error(f"ChartMogul returned an unexpected response for {endpoint}")
+    entries = result["entries"]
+    if entries is None:
+        entries = []
+    elif not isinstance(entries, list):
+        return _error(f"ChartMogul returned an unexpected response for {endpoint}")
+    return {**result, "entries": entries}
 
 
 # ---------------------------------------------------------------------------
@@ -212,8 +252,9 @@ def chartmogul_list_customers(
                 "per_page": _clamp_per_page(per_page),
             },
         )
-        if not isinstance(result, dict) or not isinstance(result.get("entries"), list):
-            return _error("ChartMogul returned an unexpected response for /customers")
+        result = _validated_list_result(result, "/customers")
+        if isinstance(result, str):
+            return result
         return _success_with_capped_list("entries", result)
     except Exception as e:
         logger.error(f"Error listing ChartMogul customers: {e}", exc_info=True)
@@ -231,8 +272,9 @@ def chartmogul_create_customer(data: dict[str, Any]) -> str:
     """
     try:
         result = _request("POST", "/customers", json_data=data)
-        if not isinstance(result, dict):
-            return _error("ChartMogul returned an unexpected response for /customers")
+        result = _validated_dict(result, "/customers")
+        if isinstance(result, str):
+            return result
         return success_with_capped_dict("customer", result)
     except Exception as e:
         logger.error(f"Error creating ChartMogul customer: {e}", exc_info=True)
@@ -249,8 +291,9 @@ def chartmogul_get_customer(uuid: str) -> str:
     try:
         safe_uuid = url_path_id(uuid, "uuid")
         result = _request("GET", f"/customers/{safe_uuid}")
-        if not isinstance(result, dict):
-            return _error("ChartMogul returned an unexpected response for /customers")
+        result = _validated_dict(result, "/customers")
+        if isinstance(result, str):
+            return result
         return success_with_capped_dict("customer", result)
     except Exception as e:
         logger.error(f"Error fetching ChartMogul customer {uuid}: {e}", exc_info=True)
@@ -268,8 +311,9 @@ def chartmogul_update_customer(uuid: str, data: dict[str, Any]) -> str:
     try:
         safe_uuid = url_path_id(uuid, "uuid")
         result = _request("PATCH", f"/customers/{safe_uuid}", json_data=data)
-        if not isinstance(result, dict):
-            return _error("ChartMogul returned an unexpected response for /customers")
+        result = _validated_dict(result, "/customers")
+        if isinstance(result, str):
+            return result
         return success_with_capped_dict("customer", result)
     except Exception as e:
         logger.error(f"Error updating ChartMogul customer {uuid}: {e}", exc_info=True)
@@ -335,8 +379,9 @@ def chartmogul_list_contacts(
                 "per_page": _clamp_per_page(per_page),
             },
         )
-        if not isinstance(result, dict) or not isinstance(result.get("entries"), list):
-            return _error("ChartMogul returned an unexpected response for /contacts")
+        result = _validated_list_result(result, "/contacts")
+        if isinstance(result, str):
+            return result
         return _success_with_capped_list("entries", result)
     except Exception as e:
         logger.error(f"Error listing ChartMogul contacts: {e}", exc_info=True)
@@ -355,8 +400,9 @@ def chartmogul_create_contact(data: dict[str, Any]) -> str:
     """
     try:
         result = _request("POST", "/contacts", json_data=data)
-        if not isinstance(result, dict):
-            return _error("ChartMogul returned an unexpected response for /contacts")
+        result = _validated_dict(result, "/contacts")
+        if isinstance(result, str):
+            return result
         return success_with_capped_dict("contact", result)
     except Exception as e:
         logger.error(f"Error creating ChartMogul contact: {e}", exc_info=True)
@@ -373,8 +419,9 @@ def chartmogul_get_contact(uuid: str) -> str:
     try:
         safe_uuid = url_path_id(uuid, "uuid")
         result = _request("GET", f"/contacts/{safe_uuid}")
-        if not isinstance(result, dict):
-            return _error("ChartMogul returned an unexpected response for /contacts")
+        result = _validated_dict(result, "/contacts")
+        if isinstance(result, str):
+            return result
         return success_with_capped_dict("contact", result)
     except Exception as e:
         logger.error(f"Error fetching ChartMogul contact {uuid}: {e}", exc_info=True)
@@ -392,8 +439,9 @@ def chartmogul_update_contact(uuid: str, data: dict[str, Any]) -> str:
     try:
         safe_uuid = url_path_id(uuid, "uuid")
         result = _request("PATCH", f"/contacts/{safe_uuid}", json_data=data)
-        if not isinstance(result, dict):
-            return _error("ChartMogul returned an unexpected response for /contacts")
+        result = _validated_dict(result, "/contacts")
+        if isinstance(result, str):
+            return result
         return success_with_capped_dict("contact", result)
     except Exception as e:
         logger.error(f"Error updating ChartMogul contact {uuid}: {e}", exc_info=True)
@@ -465,10 +513,9 @@ def chartmogul_list_opportunities(
                 "per_page": _clamp_per_page(per_page),
             },
         )
-        if not isinstance(result, dict) or not isinstance(result.get("entries"), list):
-            return _error(
-                "ChartMogul returned an unexpected response for /opportunities"
-            )
+        result = _validated_list_result(result, "/opportunities")
+        if isinstance(result, str):
+            return result
         return _success_with_capped_list("entries", result)
     except Exception as e:
         logger.error(f"Error listing ChartMogul opportunities: {e}", exc_info=True)
@@ -487,10 +534,9 @@ def chartmogul_create_opportunity(data: dict[str, Any]) -> str:
     """
     try:
         result = _request("POST", "/opportunities", json_data=data)
-        if not isinstance(result, dict):
-            return _error(
-                "ChartMogul returned an unexpected response for /opportunities"
-            )
+        result = _validated_dict(result, "/opportunities")
+        if isinstance(result, str):
+            return result
         return success_with_capped_dict("opportunity", result)
     except Exception as e:
         logger.error(f"Error creating ChartMogul opportunity: {e}", exc_info=True)
@@ -507,10 +553,9 @@ def chartmogul_get_opportunity(uuid: str) -> str:
     try:
         safe_uuid = url_path_id(uuid, "uuid")
         result = _request("GET", f"/opportunities/{safe_uuid}")
-        if not isinstance(result, dict):
-            return _error(
-                "ChartMogul returned an unexpected response for /opportunities"
-            )
+        result = _validated_dict(result, "/opportunities")
+        if isinstance(result, str):
+            return result
         return success_with_capped_dict("opportunity", result)
     except Exception as e:
         logger.error(
@@ -530,10 +575,9 @@ def chartmogul_update_opportunity(uuid: str, data: dict[str, Any]) -> str:
     try:
         safe_uuid = url_path_id(uuid, "uuid")
         result = _request("PATCH", f"/opportunities/{safe_uuid}", json_data=data)
-        if not isinstance(result, dict):
-            return _error(
-                "ChartMogul returned an unexpected response for /opportunities"
-            )
+        result = _validated_dict(result, "/opportunities")
+        if isinstance(result, str):
+            return result
         return success_with_capped_dict("opportunity", result)
     except Exception as e:
         logger.error(

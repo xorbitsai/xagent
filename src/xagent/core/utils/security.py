@@ -32,6 +32,7 @@ ASSIGNMENT_SECRET_PATTERN = re.compile(
     r"(?i)\b(api[_-]?key|access[_-]?token|token|password|secret|key)=([^&\s]+)"
 )
 BEARER_PATTERN = re.compile(r"(?i)(authorization\s*[:=]\s*bearer\s+)([^\s,;]+)")
+BASIC_AUTH_PATTERN = re.compile(r"(?i)(authorization\s*[:=]\s*basic\s+)([^\s,;]+)")
 HEADER_KEY_PATTERNS = [
     re.compile(r"(?i)(x-goog-api-key\s*[:=]\s*)([^\s,;]+)"),
     re.compile(r"(?i)(x-api-key\s*[:=]\s*)([^\s,;]+)"),
@@ -318,6 +319,10 @@ def redact_sensitive_text(text: str) -> str:
         redacted,
     )
     redacted = BEARER_PATTERN.sub(
+        lambda match: f"{match.group(1)}{_mask_secret(match.group(2))}",
+        redacted,
+    )
+    redacted = BASIC_AUTH_PATTERN.sub(
         lambda match: f"{match.group(1)}{_mask_secret(match.group(2))}",
         redacted,
     )

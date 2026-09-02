@@ -6711,22 +6711,16 @@ async def _handle_chat_message_unserialized(
                                 # read when no in-process context exists,
                                 # and the merge-baseline read taken when a
                                 # context is already live but has no cached
-                                # runtime checkpoint. Only the cold-start one
-                                # can still surface here as a refusal -- the
-                                # merge-baseline read already downgrades this
-                                # exact reason to a None baseline inside
-                                # inject_user_message itself, since a live
-                                # context does not depend on that read
-                                # succeeding (see the try/except around
-                                # ``checkpoint_baseline`` there). For the
-                                # cold-start case, a run_provenance_unavailable
-                                # refusal means the same thing a None read
-                                # used to mean before that refusal existed:
-                                # nothing here was ever live to reject a
-                                # message into, so fold it into the same
-                                # not-posted deferral as the unavailable
-                                # case above rather than rejecting delivery
-                                # outright.
+                                # runtime checkpoint. Both can surface here
+                                # as a run_provenance_unavailable refusal,
+                                # and the right reaction is the same for
+                                # either: nothing durable has been written
+                                # yet (the merge-baseline read runs before
+                                # any context mutation, and the cold-start
+                                # read never got a context live at all), so
+                                # fold it into the same not-posted deferral
+                                # as the unavailable case above rather than
+                                # rejecting delivery outright.
                                 if (
                                     isinstance(exc, CheckpointAccessRefusedError)
                                     and exc.reason == "run_provenance_unavailable"

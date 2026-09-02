@@ -19,7 +19,6 @@ from ..task_runtime import (
 from ..workspace import WorkspaceManager
 from .attachments import build_image_context_references
 from .checkpoint import (
-    CheckpointAccessRefusedError,
     CheckpointCorruptError,
     read_latest_checkpoint_payload,
 )
@@ -552,13 +551,14 @@ class AgentRunner:
                 )
 
         # Resolve the checkpoint-merge baseline before any context mutation
-        # below (add_user_message, pending marker) so a failed read leaves
-        # zero residue instead of an in-memory message that was never
-        # durably confirmed -- a retry after the failure must actually
-        # persist, not find a ghost confirmation from the rejected attempt.
-        # A live runtime's cached checkpoint wins over a fresh read; the
-        # cold-start read above (if this call triggered one) is reused
-        # instead of reading the same window twice.
+        # below (add_user_message, pending marker) so a failed read -- a
+        # refusal propagated below included -- leaves zero residue instead
+        # of an in-memory message that was never durably confirmed -- a
+        # retry after the failure must actually persist, not find a ghost
+        # confirmation from the rejected attempt. A live runtime's cached
+        # checkpoint wins over a fresh read; the cold-start read above (if
+        # this call triggered one) is reused instead of reading the same
+        # window twice.
         control = self._active_controls.get(execution_id)
         checkpoint_baseline: dict[str, Any] | None
         if control is not None and control.runtime.last_checkpoint is not None:
@@ -566,25 +566,17 @@ class AgentRunner:
         elif cold_start_checkpoint is not None:
             checkpoint_baseline = cold_start_checkpoint
         else:
-            try:
-                checkpoint_baseline = await self._load_latest_checkpoint(execution_id)
-            except CheckpointAccessRefusedError as exc:
-                if exc.reason != "run_provenance_unavailable":
-                    raise
-                # This read only resolves a merge baseline for the durable
-                # persist below, not whether a checkpoint exists to inject
-                # into -- the context is already live (the branch above
-                # already established it, whether from an existing runtime
-                # or the cold-start read), so injection itself does not
-                # depend on this read succeeding. Before this refusal
-                # existed, the equivalent condition made this read return
-                # None, which this branch already treated as "no baseline
-                # to merge onto" -- not an injection failure. Preserve that:
-                # a refusal that only means "this reader cannot verify the
-                # anchored row" must not turn an otherwise-successful
-                # injection into a rejected one over a baseline read that
-                # was never load-bearing for the injection succeeding.
-                checkpoint_baseline = None
+            # A refusal here is a read that could not be completed, and the
+            # persist below merges onto whatever this returns: with no
+            # baseline it writes a payload carrying only type/label/
+            # execution_id/context, dropping pattern_state, and
+            # load_pattern_checkpoint restores pattern state only from a
+            # dict pattern_state -- so the next worker to pick this task up
+            # would resume with default pattern state and nothing would say
+            # so. Let it propagate; this read runs before any context
+            # mutation, so a rejected injection leaves no residue, and every
+            # caller already classifies the refusal itself.
+            checkpoint_baseline = await self._load_latest_checkpoint(execution_id)
 
         # Attach files + display text to the new Message so they survive
         # checkpoint round-trips: Message.metadata is serialized by

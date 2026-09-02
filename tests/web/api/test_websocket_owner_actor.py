@@ -1684,12 +1684,14 @@ async def test_live_lease_injection_degrades_to_deferred_on_run_provenance_unava
     db_session,
 ) -> None:
     """A ``run_provenance_unavailable`` refusal during live injection means
-    the same thing an unavailable read does here: inject_user_message found
-    no live in-process context and had to cold-start one from a checkpoint
-    read, and that read could not verify it. Nothing was ever live to
-    reject a message into, so this must fold into the same not-posted
-    deferred-delivery path as CheckpointUnavailableError -- not the
-    corrupt/refused rejection the other refusal reasons get (see
+    the same thing an unavailable read does here: whichever of
+    inject_user_message's two checkpoint reads raised it -- the cold-start
+    read when no in-process context exists, or the merge-baseline read
+    taken once a context is already live -- nothing durable was ever
+    written, because both reads run before any context mutation. This must
+    fold into the same not-posted deferred-delivery path as
+    CheckpointUnavailableError -- not the corrupt/refused rejection the
+    other refusal reasons get (see
     test_durable_failure_keeps_detail_sender_only)."""
     owner = _user(db_session, "owner")
     task = _task(db_session, owner.id, status=TaskStatus.RUNNING)

@@ -424,15 +424,22 @@ async def test_inject_user_message_propagates_unavailable() -> None:
 
 
 class RunProvenanceUnavailableCheckpointStore:
-    """Every read refuses with ``run_provenance_unavailable``.
+    """Refuses every read with ``run_provenance_unavailable`` and records
+    every write.
 
-    Models the merge-baseline read inside ``inject_user_message`` hitting a
-    checkpoint pointer row this reader cannot verify. Unlike
-    ``UnavailableCheckpointStore``, this refusal is downgraded to a ``None``
-    baseline at that one call site instead of propagating: the context is
-    already live by the time this read runs, so injection does not depend
-    on it succeeding.
+    Carries the production writer's shape -- ``checkpoint(**payload)``, the
+    first name ``_persist_injected_context`` probes and the one
+    ``TraceCheckpointStore`` defines -- so a write this call was not
+    supposed to make is observable. A store implementing only
+    ``load_latest_checkpoint`` makes that helper return without writing
+    anything, which would pass no matter what the runner did.
     """
+
+    def __init__(self) -> None:
+        self.by_execution_id: dict[str, dict[str, Any]] = {}
+
+    async def checkpoint(self, **payload: Any) -> None:
+        self.by_execution_id[str(payload["execution_id"])] = dict(payload)
 
     async def load_latest_checkpoint(self, execution_id: str) -> dict[str, Any]:
         del execution_id
@@ -443,31 +450,95 @@ class RunProvenanceUnavailableCheckpointStore:
 
 
 @pytest.mark.asyncio
-async def test_inject_user_message_baseline_refusal_still_injects() -> None:
+async def test_inject_user_message_propagates_baseline_refusal() -> None:
     """A live context with no cached runtime checkpoint (the common
     already-paused, process-still-warm case) takes the merge-baseline read
-    at the bottom of ``inject_user_message``, not the cold-start read at the
-    top. A ``run_provenance_unavailable`` refusal there must not turn an
-    otherwise-successful injection into a rejected one -- only the
-    cold-start read (see test_inject_user_message_propagates_unavailable)
-    is allowed to fail the whole call."""
+    at the bottom of ``inject_user_message``. A refusal there is a read
+    that could not be completed, so the injection is rejected rather than
+    persisted onto an empty baseline: persisting would write a checkpoint
+    carrying only ``context`` -- no ``pattern_state`` -- over the very row
+    the refusal was about, and ``load_pattern_checkpoint`` restores pattern
+    state only from a dict ``pattern_state``, so the next worker would
+    resume with default pattern state and nothing would report it.
+
+    The read runs before any context mutation, so the rejected call leaves
+    no in-memory message and no write behind. Both are asserted: a store
+    that cannot record a write cannot fail this test.
+    """
+    store = RunProvenanceUnavailableCheckpointStore()
     runner = AgentRunner(
         agent=Agent(name="checkpoint-reader", patterns=[], llm=None),
-        tracer=RunProvenanceUnavailableCheckpointStore(),
+        tracer=store,
     )
     context = ExecutionContext(execution_id="exec-live-baseline-refused")
     runner.context_manager.set_context(context)
 
+    with pytest.raises(CheckpointAccessRefusedError) as excinfo:
+        await runner.inject_user_message(
+            "exec-live-baseline-refused",
+            "Continue",
+            request_interrupt=False,
+        )
+
+    assert excinfo.value.reason == "run_provenance_unavailable"
+    assert context.messages == []
+    assert store.by_execution_id == {}
+
+
+class SingleReadCheckpointStore:
+    """Returns one fixed baseline checkpoint on every read and records
+    every write.
+
+    Used to show the property the removed downgrade-to-``None`` branch was
+    discarding for a ``run_provenance_unavailable`` refusal: a
+    merge-baseline read that succeeds and carries ``pattern_state`` must
+    have that ``pattern_state`` survive into the persisted payload.
+    """
+
+    def __init__(self, baseline: dict[str, Any]) -> None:
+        self._baseline = baseline
+        self.by_execution_id: dict[str, dict[str, Any]] = {}
+
+    async def checkpoint(self, **payload: Any) -> None:
+        self.by_execution_id[str(payload["execution_id"])] = dict(payload)
+
+    async def load_latest_checkpoint(self, execution_id: str) -> dict[str, Any]:
+        del execution_id
+        return dict(self._baseline)
+
+
+@pytest.mark.asyncio
+async def test_inject_user_message_persists_baseline_pattern_state() -> None:
+    """The positive counterpart to
+    test_inject_user_message_propagates_baseline_refusal: when the
+    merge-baseline read succeeds and its payload carries ``pattern_state``,
+    that ``pattern_state`` must survive into what gets persisted -- proving
+    that dropping the baseline (as the removed downgrade did on a refusal)
+    is what actually loses it, not something already lost by the time the
+    read returns."""
+    baseline = {
+        "type": "checkpoint",
+        "pattern": "writer",
+        "pattern_state": {"step": 3},
+        "context": {"messages": []},
+    }
+    store = SingleReadCheckpointStore(baseline)
+    runner = AgentRunner(
+        agent=Agent(name="checkpoint-reader", patterns=[], llm=None),
+        tracer=store,
+    )
+    context = ExecutionContext(execution_id="exec-live-baseline-pattern-state")
+    runner.context_manager.set_context(context)
+
     result = await runner.inject_user_message(
-        "exec-live-baseline-refused",
+        "exec-live-baseline-pattern-state",
         "Continue",
         request_interrupt=False,
     )
 
-    assert result.context is context
     assert result.outcome is UserMessageInjectionOutcome.POSTED_FRESH
-    assert len(context.messages) == 1
-    assert context.messages[0].content == "Continue"
+    persisted = store.by_execution_id["exec-live-baseline-pattern-state"]
+    assert persisted["pattern_state"] == {"step": 3}
 
 
 @pytest.mark.asyncio

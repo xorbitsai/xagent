@@ -141,7 +141,7 @@ def _request(
     form_data: dict[str, Any] | None = None,
     json_data: dict[str, Any] | None = None,
     include_project_id: bool = True,
-    parse_json: bool = True,
+    stream: bool = False,
 ) -> Any:
     """Call a Mixpanel API host and return the parsed response.
 
@@ -151,6 +151,14 @@ def _request(
     API endpoint, which are project-scoped via that param, but false for
     the App API's annotations endpoints, which instead take the project id
     as a URL path segment (the caller builds that into `path` itself).
+
+    stream=True returns the raw (still-open) response for a 2xx result
+    instead of buffering it into `.text`/`.json()` here -- used only by
+    mixpanel_export_events, whose NDJSON body has no server-side row cap of
+    its own and can be arbitrarily large; the caller is responsible for
+    iterating and closing it (a `with` block). An error response (>=400) is
+    still read and closed here regardless of `stream`, since error bodies
+    are small and the caller never sees the response object in that case.
     """
     url = f"https://{host}{path}"
     request_params = dict(params or {})
@@ -172,6 +180,7 @@ def _request(
                 # misconfiguration or a host trying to relay the
                 # credentials elsewhere.
                 allow_redirects=False,
+                stream=stream,
             )
             if response.status_code == 429 and attempt == 0:
                 try:
@@ -209,8 +218,8 @@ def _request(
             message = f"{message} - {redact_sensitive_text(detail)}"
         raise RuntimeError(message) from exc
 
-    if not parse_json:
-        return response.text
+    if stream:
+        return response
     if not response.content:
         return {}
     try:
@@ -535,23 +544,30 @@ def mixpanel_export_events(
             params["event"] = json.dumps([event])
         if where:
             params["where"] = where
-        raw = _request(
+        response = _request(
             "GET",
             _region_hosts()["export"],
             "/api/2.0/export",
             params=params,
-            parse_json=False,
+            stream=True,
         )
         events: list[Any] = []
         row_limit_reached = False
-        for line in raw.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            if len(events) >= MAX_EXPORT_EVENTS:
-                row_limit_reached = True
-                break
-            events.append(json.loads(line))
+        # Streamed rather than buffered whole: the `limit` param above asks
+        # Mixpanel to cap the export server-side, but this is the actual
+        # enforcement -- iterating line-by-line and stopping (closing the
+        # connection via the `with` block) at MAX_EXPORT_EVENTS means a
+        # wide date range can never pull more than that many events'
+        # worth of data over the wire, regardless of whether Mixpanel
+        # honors `limit` on every account/plan.
+        with response:
+            for line in response.iter_lines():
+                if not line:
+                    continue
+                if len(events) >= MAX_EXPORT_EVENTS:
+                    row_limit_reached = True
+                    break
+                events.append(json.loads(line))
         return success_with_capped_dict(
             "events",
             {

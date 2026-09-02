@@ -37,6 +37,16 @@ class MockResponse:
                 f"{self.status_code} Client Error for url: {self.url}", response=self
             )
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return False
+
+    def iter_lines(self):
+        for line in self.text.splitlines():
+            yield line.encode("utf-8")
+
 
 @pytest.fixture(autouse=True)
 def _credentials(monkeypatch):
@@ -325,18 +335,33 @@ def test_request_truncates_unstructured_error_body(monkeypatch):
     assert len(str(excinfo.value)) < len(long_body)
 
 
-def test_request_with_parse_json_false_returns_raw_text(monkeypatch):
-    monkeypatch.setattr(
-        mixpanel.requests,
-        "request",
-        Mock(return_value=MockResponse(status_code=200, text='{"a": 1}\n{"b": 2}\n')),
-    )
+def test_request_with_stream_true_returns_raw_response(monkeypatch):
+    mock_response = MockResponse(status_code=200, text='{"a": 1}\n{"b": 2}\n')
+    monkeypatch.setattr(mixpanel.requests, "request", Mock(return_value=mock_response))
 
     result = mixpanel._request(
-        "GET", "data.mixpanel.com", "/api/2.0/export", parse_json=False
+        "GET", "data.mixpanel.com", "/api/2.0/export", stream=True
     )
 
-    assert result == '{"a": 1}\n{"b": 2}\n'
+    assert result is mock_response
+
+
+def test_request_passes_stream_flag_to_requests_request(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"ok": True}))
+    monkeypatch.setattr(mixpanel.requests, "request", mock_request)
+
+    mixpanel._request("GET", "mixpanel.com", "/api/query/events/names", stream=True)
+
+    assert mock_request.call_args.kwargs["stream"] is True
+
+
+def test_request_defaults_stream_to_false(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"ok": True}))
+    monkeypatch.setattr(mixpanel.requests, "request", mock_request)
+
+    mixpanel._request("GET", "mixpanel.com", "/api/query/events/names")
+
+    assert mock_request.call_args.kwargs["stream"] is False
 
 
 def test_list_event_names_returns_names(monkeypatch):
@@ -575,11 +600,8 @@ def test_create_annotation_sends_json_body_to_app_api(monkeypatch):
 
 def test_export_events_parses_ndjson_and_caps_result(monkeypatch):
     lines = "\n".join(json.dumps({"event": "Signup", "n": i}) for i in range(3))
-    monkeypatch.setattr(
-        mixpanel.requests,
-        "request",
-        Mock(return_value=MockResponse(status_code=200, text=lines)),
-    )
+    mock_request = Mock(return_value=MockResponse(status_code=200, text=lines))
+    monkeypatch.setattr(mixpanel.requests, "request", mock_request)
 
     result = json.loads(mixpanel.mixpanel_export_events("2026-01-01", "2026-01-31"))
 
@@ -587,6 +609,9 @@ def test_export_events_parses_ndjson_and_caps_result(monkeypatch):
     assert result["events"]["count"] == 3
     assert result["events"]["row_limit_reached"] is False
     assert result["events"]["events"][0] == {"event": "Signup", "n": 0}
+    # Streamed, not buffered whole -- a wide date range must not pull the
+    # entire NDJSON body into memory before the row cap applies.
+    assert mock_request.call_args.kwargs["stream"] is True
 
 
 def test_export_events_truncates_at_max_events(monkeypatch):

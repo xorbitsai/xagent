@@ -504,7 +504,7 @@ def shopify_get_shop() -> str:
         )
         return _success(shop=data.get("shop") or {}, _errors=errors)
     except Exception as e:
-        logger.error(f"Error fetching Shopify shop info: {e}")
+        logger.error(f"Error fetching Shopify shop info: {e}", exc_info=True)
         return _error(str(e))
 
 
@@ -523,7 +523,7 @@ def shopify_list_products(query: str = "", limit: int = 25, after: str = "") -> 
             "products", _PRODUCT_FIELDS, limit, query, after, _product_summary
         )
     except Exception as e:
-        logger.error(f"Error listing Shopify products: {e}")
+        logger.error(f"Error listing Shopify products: {e}", exc_info=True)
         return _error(str(e))
 
 
@@ -542,7 +542,7 @@ def shopify_get_product(product_id: str) -> str:
             return _error(f"Product '{product_id}' not found")
         return _success(product=_product_summary(product), _errors=errors)
     except Exception as e:
-        logger.error(f"Error fetching Shopify product {product_id}: {e}")
+        logger.error(f"Error fetching Shopify product {product_id}: {e}", exc_info=True)
         return _error(str(e))
 
 
@@ -590,7 +590,7 @@ def shopify_create_product(
             _product_summary,
         )
     except Exception as e:
-        logger.error(f"Error creating Shopify product: {e}")
+        logger.error(f"Error creating Shopify product: {e}", exc_info=True)
         return _error(str(e))
 
 
@@ -641,7 +641,7 @@ def shopify_update_product(
             _product_summary,
         )
     except Exception as e:
-        logger.error(f"Error updating Shopify product {product_id}: {e}")
+        logger.error(f"Error updating Shopify product {product_id}: {e}", exc_info=True)
         return _error(str(e))
 
 
@@ -662,7 +662,7 @@ def shopify_list_orders(query: str = "", limit: int = 25, after: str = "") -> st
             "orders", _ORDER_FIELDS, limit, query, after, _order_summary
         )
     except Exception as e:
-        logger.error(f"Error listing Shopify orders: {e}")
+        logger.error(f"Error listing Shopify orders: {e}", exc_info=True)
         return _error(str(e))
 
 
@@ -681,7 +681,7 @@ def shopify_get_order(order_id: str) -> str:
             return _error(f"Order '{order_id}' not found")
         return _success(order=_order_summary(order), _errors=errors)
     except Exception as e:
-        logger.error(f"Error fetching Shopify order {order_id}: {e}")
+        logger.error(f"Error fetching Shopify order {order_id}: {e}", exc_info=True)
         return _error(str(e))
 
 
@@ -715,7 +715,7 @@ def shopify_update_order(
             _order_summary,
         )
     except Exception as e:
-        logger.error(f"Error updating Shopify order {order_id}: {e}")
+        logger.error(f"Error updating Shopify order {order_id}: {e}", exc_info=True)
         return _error(str(e))
 
 
@@ -734,7 +734,7 @@ def shopify_list_customers(query: str = "", limit: int = 25, after: str = "") ->
             "customers", _CUSTOMER_FIELDS, limit, query, after, _customer_summary
         )
     except Exception as e:
-        logger.error(f"Error listing Shopify customers: {e}")
+        logger.error(f"Error listing Shopify customers: {e}", exc_info=True)
         return _error(str(e))
 
 
@@ -753,7 +753,9 @@ def shopify_get_customer(customer_id: str) -> str:
             return _error(f"Customer '{customer_id}' not found")
         return _success(customer=_customer_summary(customer), _errors=errors)
     except Exception as e:
-        logger.error(f"Error fetching Shopify customer {customer_id}: {e}")
+        logger.error(
+            f"Error fetching Shopify customer {customer_id}: {e}", exc_info=True
+        )
         return _error(str(e))
 
 
@@ -771,7 +773,7 @@ def shopify_list_collections(limit: int = 25, after: str = "") -> str:
             "collections", _COLLECTION_FIELDS, limit, "", after, _collection_summary
         )
     except Exception as e:
-        logger.error(f"Error listing Shopify collections: {e}")
+        logger.error(f"Error listing Shopify collections: {e}", exc_info=True)
         return _error(str(e))
 
 

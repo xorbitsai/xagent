@@ -55,10 +55,10 @@ jobs:
           rmz_version: "3.1.1"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: Log in to Docker Hub
         if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.push_to_dockerhub == 'true' }}
@@ -77,7 +77,7 @@ jobs:
 
       - name: Extract metadata for backend
         id: meta-backend
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.BACKEND_IMAGE }}
           tags: |
@@ -86,7 +86,7 @@ jobs:
 
       - name: Extract metadata for frontend
         id: meta-frontend
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.FRONTEND_IMAGE }}
           tags: |
@@ -111,7 +111,7 @@ jobs:
           echo "build_time=$BUILD_TIME" >> "$GITHUB_OUTPUT"
 
       - name: Build and push backend image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/Dockerfile.backend
@@ -128,7 +128,7 @@ jobs:
           cache-to: ${{ (github.event_name != 'workflow_dispatch' || github.event.inputs.push_to_dockerhub == 'true') && format('type=registry,ref={0}:buildcache,mode=max', env.BACKEND_IMAGE) || '' }}
 
       - name: Build and push frontend image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: ./frontend
           file: docker/Dockerfile.frontend
@@ -142,7 +142,7 @@ jobs:
       - name: Extract metadata for backend GHCR
         id: meta-backend-ghcr
         if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.push_to_ghcr == 'true' }}
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ghcr.io/${{ github.repository_owner }}/xagent-backend
           tags: |
@@ -152,7 +152,7 @@ jobs:
       - name: Extract metadata for frontend GHCR
         id: meta-frontend-ghcr
         if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.push_to_ghcr == 'true' }}
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ghcr.io/${{ github.repository_owner }}/xagent-frontend
           tags: |
@@ -161,7 +161,7 @@ jobs:
 
       - name: Build and push backend image to GHCR
         if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.push_to_ghcr == 'true' }}
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/Dockerfile.backend
@@ -177,7 +177,7 @@ jobs:
 
       - name: Build and push frontend image to GHCR
         if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.push_to_ghcr == 'true' }}
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: ./frontend
           file: docker/Dockerfile.frontend

@@ -127,7 +127,7 @@ jobs:
 
       - name: Check Deepdoc cache
         id: deepdoc-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: ${{ env.DEEPDOC_CACHE_PATH }}
           key: deepdoc-${{ runner.os }}-py312-modelscope-deepdoc-lib-0.2.2-v1
@@ -228,14 +228,14 @@ jobs:
 
       - name: Save Deepdoc cache
         if: steps.deepdoc-cache.outputs.cache-hit != 'true' && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: ${{ env.DEEPDOC_CACHE_PATH }}
           key: deepdoc-${{ runner.os }}-py312-modelscope-deepdoc-lib-0.2.2-v1
 
       - name: Upload Deepdoc cache artifact
         if: steps.deepdoc-cache.outputs.cache-hit != 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: deepdoc-cache
           path: ${{ env.DEEPDOC_CACHE_PATH }}
@@ -298,7 +298,7 @@ jobs:
           python3 -m uv sync --group dev
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: '20'
           cache: 'npm'
@@ -380,7 +380,7 @@ jobs:
 
       - name: Setup Node.js
         if: needs.changes.outputs.code == 'true'
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: '20'
 
@@ -476,14 +476,14 @@ jobs:
 
       - name: Restore Deepdoc cache
         if: needs.changes.outputs.code == 'true' && (needs.prepare-deepdoc-cache.outputs.cache-hit == 'true')
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: ${{ env.DEEPDOC_CACHE_PATH }}
           key: deepdoc-${{ runner.os }}-py312-modelscope-deepdoc-lib-0.2.2-v1
 
       - name: Download Deepdoc cache artifact
         if: needs.changes.outputs.code == 'true' && (needs.prepare-deepdoc-cache.outputs.cache-hit != 'true')
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: deepdoc-cache
           path: ${{ env.DEEPDOC_CACHE_PATH }}
@@ -550,7 +550,7 @@ jobs:
 
       - name: Setup Node.js
         if: needs.changes.outputs.code == 'true'
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: '20'
 
@@ -624,14 +624,14 @@ jobs:
 
       - name: Restore Deepdoc cache
         if: needs.changes.outputs.code == 'true' && (needs.prepare-deepdoc-cache.outputs.cache-hit == 'true')
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: ${{ env.DEEPDOC_CACHE_PATH }}
           key: deepdoc-${{ runner.os }}-py312-modelscope-deepdoc-lib-0.2.2-v1
 
       - name: Download Deepdoc cache artifact
         if: needs.changes.outputs.code == 'true' && (needs.prepare-deepdoc-cache.outputs.cache-hit != 'true')
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: deepdoc-cache
           path: ${{ env.DEEPDOC_CACHE_PATH }}
@@ -698,7 +698,7 @@ jobs:
 
       - name: Setup Node.js
         if: needs.changes.outputs.code == 'true'
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: '20'
 
@@ -796,7 +796,7 @@ jobs:
 
       - name: Setup Node.js
         if: needs.changes.outputs.frontend == 'true'
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: '22'
           cache: 'npm'
@@ -804,7 +804,7 @@ jobs:
 
       - name: Setup Python
         if: needs.changes.outputs.frontend == 'true'
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.11'
 

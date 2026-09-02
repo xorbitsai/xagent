@@ -446,12 +446,6 @@ def test_identity_string_for_user_principal() -> None:
             ),
             id="guest_with_an_empty_guest_id",
         ),
-        pytest.param(
-            InteractionPrincipal(
-                kind="robot", user_id=7, is_admin=False, auth_mode=None
-            ),
-            id="unrecognized_kind",
-        ),
     ],
 )
 def test_identity_string_refuses_a_principal_it_cannot_name(
@@ -459,6 +453,11 @@ def test_identity_string_refuses_a_principal_it_cannot_name(
 ) -> None:
     with pytest.raises(ValueError):
         principal.identity_string()
+
+
+def test_unrecognized_kind_cannot_be_constructed() -> None:
+    with pytest.raises(ValueError, match="robot"):
+        InteractionPrincipal(kind="robot", user_id=7, is_admin=False, auth_mode=None)
 
 
 # ---------------------------------------------------------------------------

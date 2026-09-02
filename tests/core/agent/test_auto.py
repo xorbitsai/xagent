@@ -28,6 +28,7 @@ from xagent.core.agent.language import (
     response_language_rules,
 )
 from xagent.core.agent.pattern.auto.auto import DECISION_TOOL_NAME, _AutoChildRuntime
+from xagent.core.model.chat.basic.router import RouterLLM
 from xagent.core.model.chat.exceptions import LLMToolProtocolError
 from xagent.core.model.chat.tool_protocol import (
     ToolProtocolViolation,
@@ -1292,10 +1293,24 @@ async def test_auto_pattern_react_decision_delegates_to_react() -> None:
 
 
 @pytest.mark.asyncio
-async def test_auto_pattern_does_not_use_main_llm_for_compaction() -> None:
+async def test_auto_pattern_falls_back_to_the_main_llm_for_compaction() -> None:
+    """Deliberate reversal of a previous policy.
+
+    This test used to assert the opposite -- that an unconfigured compact slot
+    left the main model untouched, so compaction cost nothing. What it cost
+    instead was the summary: ``PatternRuntime.compact_context_if_needed``
+    skips summarization without a compact LLM and drops all but the last few
+    messages, so the resumed conversation loses the tool observations that
+    explain what the agent already did. Spending main-model tokens is the
+    lesser price, and an empty slot is ordinary rather than exceptional --
+    agent preview and delegated sub-agents resolve it themselves and validate
+    only the default model.
+    """
     llm = FakeLLM(
         [
+            {"content": "summary for the routing decision"},
             decision_tool_response("react", "Ordinary response."),
+            {"content": "summary for the child pattern"},
             "react done",
         ]
     )
@@ -1309,8 +1324,18 @@ async def test_auto_pattern_does_not_use_main_llm_for_compaction() -> None:
 
     assert result["success"] is True
     assert result["output"] == "react done"
-    assert len(llm.calls) == 2
-    assert has_tool(llm.calls[0], DECISION_TOOL_NAME)
+    # Four calls: Auto compacts before routing, routes, then the child ReAct
+    # pattern compacts again (this fixture's threshold of 1 keeps every
+    # context over budget) before its own call.
+    assert len(llm.calls) == 4
+    compaction_calls = [
+        call
+        for call in llm.calls
+        if "Compress agent conversation history"
+        in call["messages"][0].get("content", "")
+    ]
+    assert len(compaction_calls) == 2
+    assert has_tool(llm.calls[1], DECISION_TOOL_NAME)
 
 
 @pytest.mark.asyncio
@@ -2306,3 +2331,85 @@ async def test_direct_final_answer_allows_an_explicit_target_language() -> None:
     system_content = context.get_messages_for_llm()[0]["content"]
     assert request in system_content
     assert target_rule in system_content
+
+
+class RoutedDecisionLLM:
+    """Downstream selection behind a router, for the Auto decision path.
+
+    Both entry points are needed: compaction goes through ``run_llm_call`` ->
+    ``chat``, while the routing decision streams (``_ResolvedRouterLLM``
+    defines ``stream_chat``, so the runtime takes the native streaming path).
+    """
+
+    def __init__(self, chat_responses: list[Any], decision: dict[str, Any]) -> None:
+        self.chat_responses = chat_responses
+        self.decision = decision
+        self.calls: list[dict[str, Any]] = []
+
+    async def chat(self, messages: Any = None, **kwargs: Any) -> Any:
+        self.calls.append({"messages": messages, **kwargs})
+        return self.chat_responses.pop(0)
+
+    async def stream_chat(self, messages: Any = None, **kwargs: Any) -> Any:
+        self.calls.append({"messages": messages, **kwargs})
+        yield StreamChunk(
+            type=ChunkType.TOOL_CALL,
+            tool_calls=self.decision["tool_calls"],
+        )
+
+
+def _auto_routing_router(downstream: Any, route_prompts: list[str]) -> RouterLLM:
+    """A real ``RouterLLM`` with its selection stubbed to record the prompt.
+
+    ``context_window`` is set, as production always does via ``adapter.py``;
+    4 gives a compaction threshold of 3, so any context compacts.
+    """
+    router = RouterLLM(downstream_resolver=lambda _model_id: downstream)
+    router.context_window = 4
+
+    async def select_model(prompt: str) -> str:
+        route_prompts.append(prompt)
+        return "test/model"
+
+    router._select_model = select_model  # type: ignore[assignment]
+    return router
+
+
+@pytest.mark.asyncio
+async def test_auto_summarizes_with_the_main_model_when_no_compact_model() -> None:
+    """Same substitution as ReAct, and the resolve-before-compact order.
+
+    Auto compacted before resolving the virtual model, the reverse of what
+    ``prepare_llm_for_context`` documents: the resolver recomputes the
+    compaction threshold from the selected model's window, which is useless
+    once compaction has run, and compaction would otherwise route a second
+    time on the compaction prompt -- whose only user message is the whole
+    transcript.
+    """
+    downstream = RoutedDecisionLLM(
+        [{"content": "summary of prior work"}],
+        decision=decision_tool_response("final_answer", "Greeting only.", answer="hi"),
+    )
+    route_prompts: list[str] = []
+    router = _auto_routing_router(downstream, route_prompts)
+    context = ExecutionContext()
+    context.add_user_message("hi")
+    context.add_tool_result("read_file", {"output": "x" * 200}, tool_call_id="call-1")
+
+    result = await AutoPattern().run(
+        context=context,
+        tools=[],
+        llm=router,
+        compact_llm=None,
+        runtime=PatternRuntime(),
+    )
+
+    assert result["success"] is True
+    # The summary call happened, and it went to the main model.
+    assert len(downstream.calls) == 2
+    # Exactly two routing decisions -- the one hoisted above compaction and
+    # the per-attempt one in the decision loop. Never on the transcript.
+    assert len(route_prompts) == 2
+    assert not any(
+        "Conversation history to compact" in prompt for prompt in route_prompts
+    )

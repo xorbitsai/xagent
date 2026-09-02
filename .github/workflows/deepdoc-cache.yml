@@ -25,7 +25,7 @@ jobs:
 
       - name: Restore Deepdoc cache
         id: deepdoc-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: ${{ env.DEEPDOC_CACHE_PATH }}
           key: deepdoc-${{ runner.os }}-py312-modelscope-deepdoc-lib-0.2.2-v1
@@ -128,7 +128,7 @@ jobs:
 
       - name: Save Deepdoc cache
         if: steps.deepdoc-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: ${{ env.DEEPDOC_CACHE_PATH }}
           key: deepdoc-${{ runner.os }}-py312-modelscope-deepdoc-lib-0.2.2-v1

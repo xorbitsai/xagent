@@ -12,6 +12,19 @@ from typing import Any, Dict, List
 # transport implementation module.
 PROVIDER_STATE_METADATA_KEY = "_xagent_provider_state"
 
+# Response-dict key marking that ``content`` was not produced as content.
+# A reasoning model whose output budget runs out while it is still thinking
+# returns an empty ``content`` alongside a ``reasoning_content`` trace; the
+# OpenAI-compatible client surfaces that trace as ``content`` so a caller
+# does not read a truncated-but-healthy response as an empty one. That is a
+# reasonable default for, say, a connection test, and wrong for any caller
+# that treats content as an answer -- so the substitution is declared rather
+# than left to be inferred from the response's shape. Lives here, next to
+# PROVIDER_STATE_METADATA_KEY and for the same reason: consumers can honour
+# it without importing a transport module.
+CONTENT_SOURCE_KEY = "content_source"
+CONTENT_SOURCE_REASONING_FALLBACK = "reasoning_fallback"
+
 
 class ChunkType(Enum):
     """Streaming response chunk types"""

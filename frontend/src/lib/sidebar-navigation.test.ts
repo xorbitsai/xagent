@@ -36,6 +36,18 @@ describe("sidebar navigation", () => {
     expect(resources?.defaultCollapsed).toBe(true)
   })
 
+  it("renames the build/templates nav entries to My Team/Add teammates", () => {
+    const groups = getNavigationGroupsForUser({ is_admin: false })
+    const agentDevelopment = groups.find((group) => group.titleKey === "nav.sections.agentDevelopment")
+
+    expect(agentDevelopment?.items.find((item) => item.href === "/build")).toEqual(
+      expect.objectContaining({ name: "My Team", nameKey: "nav.myTeam" })
+    )
+    expect(agentDevelopment?.items.find((item) => item.href === "/templates")).toEqual(
+      expect.objectContaining({ name: "Add teammates", nameKey: "nav.addTeammates" })
+    )
+  })
+
   it("keeps the admin-only routes free of trailing slashes so active-route matching works", () => {
     const groups = getNavigationGroupsForUser({ is_admin: true })
     const resources = groups.find((group) => group.titleKey === "nav.sections.resources")

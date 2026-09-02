@@ -39,11 +39,11 @@ from xagent.web.services.a2a_protocol import (
 )
 from xagent.web.services.task_command_transport import (
     COMMAND_FAILED,
-    MAX_COMMAND_DEFERS,
     MAX_COMMAND_FAILURES,
     ClaimedTaskCommand,
     TaskCommandKind,
     TaskCommandRejected,
+    max_command_defers,
 )
 from xagent.web.services.task_execution_controller import TaskControlState
 from xagent.web.services.task_lease_service import TaskLease, current_task_lease
@@ -2533,7 +2533,7 @@ def test_cancel_retries_a_pre_upgrade_terminal_transport_failure() -> None:
                 status=COMMAND_FAILED,
                 attempt_count=1,
                 failure_count=MAX_COMMAND_FAILURES,
-                defer_count=MAX_COMMAND_DEFERS,
+                defer_count=max_command_defers(),
                 error="temporary transport failure",
                 completed_at=datetime.now(UTC),
             )

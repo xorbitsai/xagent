@@ -10,6 +10,7 @@ import copy
 import inspect
 import logging
 import os
+import random
 import re
 import shlex
 from dataclasses import dataclass, field
@@ -608,6 +609,80 @@ def _oauth_launch_config_mapping(
     raise _OAuthLaunchConfigInvalid(field="type")
 
 
+OAUTH_REFRESH_MAX_ATTEMPTS = 2
+OAUTH_REFRESH_RETRY_BASE_DELAY_SECONDS = 0.5
+# Only failures that guarantee the request body was never transmitted are
+# safe to retry blindly. A grant_type=refresh_token POST is not idempotent
+# on providers that rotate refresh tokens: if the server processed the
+# grant and issued a new refresh_token but the response was lost to a
+# ReadTimeout/WriteTimeout (request already sent, outcome unknown), a
+# retry would resend the now-stale refresh_token and get back a genuine
+# invalid_grant for a token that, moments ago, was perfectly valid --
+# indistinguishable from an actually-dead token and forcing an
+# unnecessary reconnect. A connect-phase failure never got that far, so
+# it's unconditionally safe to retry. A 5xx is conventionally treated the
+# same way (the provider's own signal that it didn't process the
+# request) -- not an absolute guarantee, but the standard assumption
+# behind retrying 5xx across virtually every HTTP client's default retry
+# policy, and a much narrower risk window than a timeout that could land
+# on either side of the provider actually persisting the grant.
+_OAUTH_REFRESH_RETRYABLE_EXCEPTIONS = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    # A proxy-handshake failure (e.g. an env-configured egress proxy,
+    # trust_env=True is httpx's default) means the request never reached
+    # the actual token endpoint either -- same "never transmitted"
+    # guarantee as ConnectError, just one hop earlier.
+    httpx.ProxyError,
+    # Timing out waiting for a free connection from the client's own pool
+    # happens before a single byte is written to the wire -- same
+    # guarantee again, and the likeliest of the four to actually fire in
+    # this function's own motivating scenario: a burst of concurrent
+    # refreshes contending for a still-small connection pool right after
+    # a cold start.
+    httpx.PoolTimeout,
+)
+
+
+async def _request_oauth_refresh_with_retries(
+    request: Callable[[], Awaitable[httpx.Response]],
+    *,
+    provider_name: str,
+) -> httpx.Response:
+    """Retry a token-endpoint request across transient failures that are
+    safe to resend -- see _OAUTH_REFRESH_RETRYABLE_EXCEPTIONS. Useful for
+    the cold-start network blip right after a container restart, when a
+    backlog of triggers firing at once produces a burst of concurrent
+    refreshes just as egress is still warming up. A 4xx is the provider's
+    definitive answer about this specific token; retrying cannot change
+    it, so it's returned immediately without spending a retry on it.
+    """
+    for attempt in range(OAUTH_REFRESH_MAX_ATTEMPTS):
+        is_last_attempt = attempt == OAUTH_REFRESH_MAX_ATTEMPTS - 1
+        try:
+            response = await request()
+            if response.status_code < 500 or is_last_attempt:
+                return response
+        except _OAUTH_REFRESH_RETRYABLE_EXCEPTIONS:
+            if is_last_attempt:
+                raise
+
+        # Jittered so a burst of concurrent refreshes (the exact scenario
+        # above) doesn't retry in lockstep and reproduce the same
+        # contention on the next attempt.
+        delay = OAUTH_REFRESH_RETRY_BASE_DELAY_SECONDS * (2**attempt)
+        delay += random.uniform(0, OAUTH_REFRESH_RETRY_BASE_DELAY_SECONDS)
+        logger.info(
+            "Retrying %s token refresh after a transient failure (attempt %s/%s)",
+            provider_name,
+            attempt + 2,
+            OAUTH_REFRESH_MAX_ATTEMPTS,
+        )
+        await asyncio.sleep(delay)
+
+    raise AssertionError("unreachable: the last attempt always returns or raises")
+
+
 # No error code is trusted globally across every provider -- not even RFC
 # 6749's invalid_grant. Per RFC 6749 section 5.2, invalid_grant also
 # covers a refresh token "issued to another client": a client-binding
@@ -803,15 +878,18 @@ async def refresh_oauth_token_if_needed(
 
         if normalized_provider == "meta":
             async with httpx.AsyncClient() as client:
-                response = await client.get(
-                    provider_config.token_url,
-                    params={
-                        "grant_type": "fb_exchange_token",
-                        "client_id": client_id,
-                        "client_secret": client_secret,
-                        "fb_exchange_token": oauth_account.access_token,
-                    },
-                    timeout=10.0,
+                response = await _request_oauth_refresh_with_retries(
+                    lambda: client.get(
+                        provider_config.token_url,
+                        params={
+                            "grant_type": "fb_exchange_token",
+                            "client_id": client_id,
+                            "client_secret": client_secret,
+                            "fb_exchange_token": oauth_account.access_token,
+                        },
+                        timeout=10.0,
+                    ),
+                    provider_name=provider_name,
                 )
 
             if response.status_code == 200:
@@ -929,12 +1007,15 @@ async def refresh_oauth_token_if_needed(
             body_kwarg = {"json": data}
 
         async with httpx.AsyncClient() as client:
-            response = await client.post(
-                refresh_token_url,
-                headers=headers,
-                timeout=10.0,
-                **body_kwarg,
-                **post_kwargs,
+            response = await _request_oauth_refresh_with_retries(
+                lambda: client.post(
+                    refresh_token_url,
+                    headers=headers,
+                    timeout=10.0,
+                    **body_kwarg,
+                    **post_kwargs,
+                ),
+                provider_name=provider_name,
             )
 
         if response.status_code == 200:

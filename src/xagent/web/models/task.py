@@ -16,7 +16,12 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
+from sqlalchemy import inspect as sa_inspect
+from sqlalchemy import (
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.engine import Connection
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
@@ -44,6 +49,147 @@ class TaskStatus(enum.Enum):
     WAITING_FOR_USER = "waiting_for_user"
     COMPLETED = "completed"
     FAILED = "failed"
+
+
+class TaskStatusEnumDriftError(RuntimeError):
+    """The live database's ``taskstatus`` enum does not carry the same labels
+    as ``TaskStatus``. Raised during database startup, before the process
+    begins serving, because a mismatch here has no runtime remedy: writing a
+    label the database does not have fails at the write, in request context,
+    after the caller already believes the transition happened.
+    """
+
+
+#: The Alembic revision that adds ``WAITING_FOR_USER`` to a native
+#: ``taskstatus`` enum created before that member existed. Named in the
+#: remediation text below so an operator reading a startup failure has an
+#: exact revision rather than a description; pinned against the revision file
+#: itself by
+#: tests/migrations/test_20260901_add_task_status_waiting_for_user_enum_label.py.
+#: This revision only backfills the ``WAITING_FOR_USER`` label. Each future
+#: ``TaskStatus`` member needs its own ``ALTER TYPE ... ADD VALUE``
+#: migration, and this constant needs updating to name it, or the
+#: remediation text above keeps pointing an operator at a revision that
+#: does not add the label they are missing.
+TASKSTATUS_ENUM_REPAIR_REVISION = "20260901_taskstatus_waiting_for_user"
+
+_MISSING_LABEL_REMEDY = (
+    "Upgrade this database to the Alembic head: revision "
+    f"{TASKSTATUS_ENUM_REPAIR_REVISION} adds WAITING_FOR_USER to the type "
+    "backing tasks.status. A label no revision adds needs one written; to "
+    "repair a database by hand instead, run ALTER TYPE <the type tasks.status "
+    "is declared with> ADD VALUE IF NOT EXISTS '<label>' for each missing "
+    "label, then restart this process."
+)
+
+
+def check_task_status_enum_drift(bind: Connection) -> None:
+    """Refuse to serve when the live ``taskstatus`` enum's labels disagree
+    with the labels ``Task.status`` is declared with.
+
+    A no-op on every backend other than PostgreSQL: ``pg_enum`` is a
+    PostgreSQL system catalog, and the other backends this repo supports
+    store the ``Enum`` column as a plain string, checked at the ORM layer
+    instead.
+
+    Takes the caller's connection rather than opening its own, and runs from
+    ``_initialize_database_schema`` (``models/database.py``) after
+    ``try_upgrade_db`` and inside ``database_startup_lock``. Three properties
+    follow from that placement and are the reason for it. A migration that
+    adds a ``TaskStatus`` label via ``ALTER TYPE ... ADD VALUE`` has already
+    run by the time this check reads the catalog, so shipping one cannot
+    trip this check into a crash loop -- revision
+    ``20260901_taskstatus_waiting_for_user`` is that migration for
+    ``WAITING_FOR_USER``. The connection is the startup lock's
+    own, so this check adds no failure mode of its own beyond the ones
+    schema initialization already has. And no second backend worker can
+    observe a half-initialized database while it runs.
+
+    Unlike ``validate_builtin_public_mcp_apps`` (``builtin_mcp_registry.py``),
+    which runs from the same place and only reports drift, this one raises.
+    Catalog drift there is configuration that an operator can reconcile while
+    the process serves; a missing enum label is a write that will fail after
+    a caller already believes a status transition succeeded, so the process
+    must not begin serving at all.
+
+    Keyed on the ``tasks`` table's existence rather than on an empty live
+    label set, because two different situations produce that same empty
+    set and only one of them is drift. "Nothing has been created yet" is
+    not; "``tasks`` is present and its ``status`` column yields no enum
+    labels" is, and it stays caught: the column is gone (``DROP TYPE ...
+    CASCADE`` takes the column with the type), or ``status`` is not an
+    enum column at all. Both of those report every ``TaskStatus`` member
+    as missing and refuse to serve, which is the direction to fail in.
+    Callers that run schema creation first (the startup path does) always
+    find ``tasks`` present; the guard covers a caller that passes a bind
+    whose schema has not been created.
+
+    Reads the labels off ``tasks.status``'s own type rather than off
+    whichever type happens to be named ``taskstatus``. ``to_regclass``
+    resolves the unqualified ``tasks`` exactly as the ``has_table("tasks")``
+    guard above does, ``pg_attribute`` names the column, and ``atttypid``
+    is the type that column is declared with -- one resolution, not two
+    that can disagree. Matching on the type name would be the second,
+    independent one: PostgreSQL resolves relation names and type names
+    against ``search_path`` separately, so with ``search_path = shadow,
+    public``, a ``shadow.taskstatus`` and a ``public.tasks`` whose column
+    uses ``public.taskstatus`` send the two lookups to different schemas.
+    A complete copy in ``shadow`` would then hide a label genuinely missing
+    from the type the column uses, and an extra label on that copy would
+    reject a correct deployment.
+
+    Expected labels come from ``Task.__table__.c.status.type.enums`` --
+    the ``Enum`` column's own declared labels -- rather than from
+    ``{member.name for member in TaskStatus}``. Today the two sets are
+    equal, because the column has no ``values_callable`` and SQLAlchemy's
+    default is to persist member names. If the column is ever given a
+    ``values_callable`` that persists something else (member values, for
+    instance), the column's declared labels stop matching the member-name
+    set, and only the column is still the live database's contract.
+    """
+
+    if bind.dialect.name != "postgresql":
+        return
+
+    if not sa_inspect(bind).has_table("tasks"):
+        return  # schema not created yet -- nothing to compare
+
+    live_labels = set(
+        bind.scalars(
+            text(
+                "SELECT e.enumlabel "
+                "FROM pg_catalog.pg_attribute a "
+                "JOIN pg_catalog.pg_enum e ON e.enumtypid = a.atttypid "
+                "WHERE a.attrelid = pg_catalog.to_regclass('tasks') "
+                "AND a.attname = 'status'"
+            )
+        )
+    )
+
+    expected_labels = set(Task.__table__.c.status.type.enums)
+    if live_labels == expected_labels:
+        return
+
+    missing = sorted(expected_labels - live_labels)
+    extra = sorted(live_labels - expected_labels)
+    if missing and extra:
+        remedy = (
+            f"{_MISSING_LABEL_REMEDY} The unexpected label(s) indicate this "
+            "process is older than the database and cannot be reconciled by "
+            "a migration, since PostgreSQL has no ALTER TYPE ... DROP VALUE."
+        )
+    elif missing:
+        remedy = _MISSING_LABEL_REMEDY
+    else:
+        remedy = (
+            "No migration can remove them -- PostgreSQL has no ALTER TYPE ... "
+            "DROP VALUE -- so this process is older than the database it is "
+            "pointed at."
+        )
+    raise TaskStatusEnumDriftError(
+        "PostgreSQL 'taskstatus' enum type has drifted from TaskStatus: "
+        f"missing labels {missing}, unexpected labels {extra}. {remedy}"
+    )
 
 
 class DAGExecutionPhase(enum.Enum):

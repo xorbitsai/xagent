@@ -8,20 +8,27 @@ from xagent.web.tools.mcp import chartmogul
 
 class MockResponse:
     def __init__(self, json_data=None, status_code: int = 200, text: str = ""):
-        self._json_data = json_data if json_data is not None else {}
         self.status_code = status_code
         # `json_data is not None`, not truthiness: an explicit `{}` must
         # still serialize to the text "{}" rather than falling through to
         # the empty-string default, or a test constructing MockResponse({})
         # to check error-detail-extraction-on-empty-body would silently
         # exercise the wrong code path.
-        self.text = text or (
-            json.dumps(self._json_data) if json_data is not None else ""
-        )
+        self.text = text or (json.dumps(json_data) if json_data is not None else "")
         self.content = self.text.encode()
 
     def json(self):
-        return self._json_data
+        # Parses ``self.text`` for real, rather than returning a
+        # precomputed dict unconditionally -- otherwise a test constructing
+        # MockResponse(text="<html>...</html>") to exercise
+        # _extract_error_detail's `except ValueError` branch would pass
+        # without ever actually reaching it, since .json() would never
+        # raise. Matches real requests.Response.json()'s contract: invalid
+        # JSON raises, it doesn't silently return something else.
+        try:
+            return json.loads(self.text)
+        except json.JSONDecodeError as e:
+            raise ValueError("No JSON object could be decoded") from e
 
 
 @pytest.fixture(autouse=True)

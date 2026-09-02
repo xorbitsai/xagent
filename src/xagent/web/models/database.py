@@ -217,7 +217,9 @@ def configure_db(
 
 
 def _initialize_database_schema(engine: Engine) -> list[dict[str, Any]]:
-    """Migrate, create, and seed the schema under one startup ownership lock."""
+    """Migrate, create, and seed the schema under one startup ownership lock,
+    and refuse to serve if the live ``taskstatus`` enum has drifted from
+    ``TaskStatus`` (``check_task_status_enum_drift``, ``models/task.py``)."""
 
     from ...db.migration import (
         database_startup_lock,
@@ -228,6 +230,7 @@ def _initialize_database_schema(engine: Engine) -> list[dict[str, Any]]:
         seed_builtin_oauth_and_public_mcp_apps,
         validate_builtin_public_mcp_apps,
     )
+    from .task import check_task_status_enum_drift
 
     with database_startup_lock(engine) as locked_connection:
         startup_bind: Engine | Connection = (
@@ -240,12 +243,21 @@ def _initialize_database_schema(engine: Engine) -> list[dict[str, Any]]:
         )
         Base.metadata.create_all(bind=startup_bind)
 
+        # Checked on both branches rather than only where locked_connection is
+        # set: database_startup_lock yields None outright on any non-PostgreSQL
+        # backend (see that function's own docstring), so PostgreSQL always
+        # takes the locked branch and the other branch's check is a no-op there
+        # -- but tying the check to "schema is ready" rather than to "which
+        # branch we're on" means a future change to the lock's backend behavior
+        # can't silently drop it.
         if locked_connection is not None:
+            check_task_status_enum_drift(locked_connection)
             if should_seed_builtin_mcp_registry:
                 seed_builtin_oauth_and_public_mcp_apps(locked_connection)
             return validate_builtin_public_mcp_apps(locked_connection)
 
         with engine.begin() as connection:
+            check_task_status_enum_drift(connection)
             if should_seed_builtin_mcp_registry:
                 seed_builtin_oauth_and_public_mcp_apps(connection)
             return validate_builtin_public_mcp_apps(connection)

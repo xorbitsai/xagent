@@ -120,7 +120,10 @@ from ..services.external_task_cancel import (
     cancel_external_task_unserialized,
     external_cancel_exhausted_message,
 )
-from ..services.external_task_input import execute_external_task_input_command
+from ..services.external_task_input import (
+    execute_external_task_input_command,
+    external_input_terminal_message,
+)
 from ..services.file_reference_output_service import (
     load_assistant_file_reference_records,
     reconcile_assistant_file_references,
@@ -163,11 +166,11 @@ from ..services.task_command_terminal_events import (
     TerminalTaskEventMessageCode,
     bind_terminal_event_draft,
     is_external_cancel_command,
+    terminal_event_draft_for_error,
 )
 from ..services.task_command_transport import (
     COMMAND_FAILED,
     COMMAND_ID_PATTERN,
-    MAX_COMMAND_DEFERS,
     MAX_COMMAND_FAILURES,
     ClaimedTaskCommand,
     EnqueuedTaskCommand,
@@ -177,6 +180,7 @@ from ..services.task_command_transport import (
     TaskCommandTaskMissing,
     dispatch_task_command_promptly,
     enqueue_task_command,
+    max_command_defers,
     task_has_live_foreign_runner,
     task_has_live_runner,
 )
@@ -450,9 +454,21 @@ def client_safe_task_command_failure(
     status in. Saying the response was interrupted when the task is still
     running would be false, and the visitor would keep waiting on a turn
     nobody stopped.
+
+    An external-scope MESSAGE gets the same courtesy for the opposite
+    reason: the generic fallback ends in "Please try again.", which is
+    false for the non-retryable rejections this broadcast exists to
+    surface (revoked principal, stale request, spent id). Its wording is
+    picked by what the terminal exception proves -- non-application is
+    asserted only when it is established, uncertainty otherwise -- and
+    needs no task status, so the caller does not read the task for it.
     """
     if is_external_cancel_command(kind=kind.value, scope=scope):
         return external_cancel_exhausted_message(task_status)
+    if scope == EXTERNAL_COMMAND_SCOPE and kind == TaskCommandKind.MESSAGE:
+        return external_input_terminal_message(error)
+    # kind.value in the text is safe only while every external-scope kind is
+    # handled above; a new external-scope kind needs its own branch first.
     return f"Task command {kind.value} failed: {client_safe_error_message(error)}"
 
 
@@ -9699,7 +9715,7 @@ async def _broadcast_terminal_command_error(
     # wording has to be true about the turn, which takes reading the task.
     # And ``command_kind``/``command_id`` are operator handles: an anonymous
     # visitor cannot act on them and should not be shown the durable command
-    # identity of a task they do not own. Two payload literals rather than
+    # identity of a task they do not own. Three payload literals rather than
     # one built and trimmed: the client-safe guard only inspects dict
     # literals passed straight to the sink, and a payload assembled in a
     # variable would drop this site out of its view entirely.
@@ -9713,6 +9729,29 @@ async def _broadcast_terminal_command_error(
                     error,
                     scope=scope,
                     task_status=task_status,
+                ),
+                "task_id": command.task_id,
+                "timestamp": datetime.now(timezone.utc).timestamp(),
+            },
+            command.task_id,
+        )
+        return
+    if scope == EXTERNAL_COMMAND_SCOPE:
+        # Every other external-scope command mirrors the persisted-event
+        # rule (``include_command_identity=scope != EXTERNAL_COMMAND_SCOPE``):
+        # the live frame must not disclose what the durable record withholds,
+        # because an embedding application's stream projection may forward
+        # ``agent_error`` frames verbatim to the anonymous audience. No task
+        # status read either -- the wording asserts nothing about the turn,
+        # and this branch runs inside exception handlers where an unguarded
+        # database read would escape the disposition that is being reported.
+        await manager.broadcast_to_task(
+            {
+                "type": "agent_error",
+                "message": client_safe_task_command_failure(
+                    command.kind,
+                    error,
+                    scope=scope,
                 ),
                 "task_id": command.task_id,
                 "timestamp": datetime.now(timezone.utc).timestamp(),
@@ -9794,7 +9833,7 @@ async def execute_durable_task_command(
     try:
         result = await _execute_durable_task_command(command)
     except TaskCommandDeferred as exc:
-        if command.defer_count + 1 >= MAX_COMMAND_DEFERS:
+        if command.defer_count + 1 >= max_command_defers():
             _command_origins.discard_command(command.command_id, command.task_id)
             bind_terminal_event_draft(
                 exc,
@@ -9803,10 +9842,45 @@ async def execute_durable_task_command(
             await _broadcast_terminal_command_error(command, exc)
         # A deferral that will retry keeps its origin entry.
         raise
-    except TaskCommandRejected:
+    except TaskCommandRejected as exc:
         # Rejections come from handlers that already expose their durable
         # domain-level outcome. The dispatcher makes them terminal immediately.
         _command_origins.discard_command(command.command_id, command.task_id)
+        if (
+            command.kind == TaskCommandKind.MESSAGE
+            and _command_scope(command) == EXTERNAL_COMMAND_SCOPE
+        ):
+            # The one command whose handler has no channel of its own: the
+            # external audience's answer travels through the seam executor,
+            # which reports outcomes only as these exceptions. Without a
+            # broadcast, a deferred answer that is later terminally rejected
+            # (revoked principal, stale request, spent id, quota) vanishes
+            # silently — the task stays parked and nobody is told
+            # (xorbitsai/xagent-saas#952 B2). First-party rejections keep
+            # their handler-owned notifications and are deliberately not
+            # re-broadcast here. An executor-bound presentation draft is
+            # preserved; the standard one is derived only when none was
+            # bound, so the persisted terminal event is classified either
+            # way.
+            if terminal_event_draft_for_error(exc) is None:
+                bind_terminal_event_draft(
+                    exc,
+                    await _terminal_command_event_draft(command, exc),
+                )
+            try:
+                await _broadcast_terminal_command_error(command, exc)
+            except Exception:
+                # The rejection is already classified and its draft is
+                # bound; a failed notification must not supersede the
+                # terminal rejection into a retried failure (the finalize
+                # broadcast in external_task_cancel.py keeps the same rule).
+                # Exception, never BaseException: cancellation propagates.
+                logger.warning(
+                    "task %s external input rejection is terminal but its "
+                    "broadcast failed",
+                    command.task_id,
+                    exc_info=True,
+                )
         raise
     except Exception as exc:
         if command.failure_count + 1 >= MAX_COMMAND_FAILURES:

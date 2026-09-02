@@ -26,6 +26,7 @@ on:
       - 'src/xagent/web/models/task.py'
       - 'tests/web/services/task_status_storage_shared.py'
       - 'tests/web/services/test_task_status_storage_postgresql.py'
+      - 'tests/web/services/test_task_status_enum_drift.py'
       - 'src/xagent/web/api/monitor.py'
       - 'tests/web/api/test_monitor_postgresql.py'
       - 'tests/web/api/monitor_daily_window_shared.py'
@@ -114,6 +115,7 @@ jobs:
             src/xagent/web/models/task.py
             tests/web/services/task_status_storage_shared.py
             tests/web/services/test_task_status_storage_postgresql.py
+            tests/web/services/test_task_status_enum_drift.py
             src/xagent/web/api/monitor.py
             tests/web/api/test_monitor_postgresql.py
             tests/web/api/monitor_daily_window_shared.py
@@ -378,6 +380,27 @@ jobs:
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
           pytest tests/web/services/test_task_status_storage_postgresql.py -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      # -m postgresql because this file is mixed: the PostgreSQL cells need a
+      # live server, and the non-PostgreSQL cells pin the check being skipped
+      # outright and already run in the ordinary suite. Each PostgreSQL cell
+      # creates and drops its own disposable database, so this step has no
+      # ordering dependency on the others -- and dropping/recreating the
+      # taskstatus type, which several of the cells do, never reaches the
+      # base database this URL names.
+      - name: Test taskstatus enum drift startup guard (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/web/services/test_task_status_enum_drift.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test taskstatus enum repair migration (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/migrations/test_20260901_add_task_status_waiting_for_user_enum_label.py -m postgresql -q
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 

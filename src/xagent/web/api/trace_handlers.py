@@ -4,6 +4,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Any, Dict, Optional
 
 from sqlalchemy import func, update
@@ -92,24 +93,36 @@ class _AnchorFallback:
     anchored but not scanned, see _load_pk_anchored_checkpoint), and an
     excluded row must never let an unreadable checkpoint become "no
     checkpoint". A row that exists but is missing its run-partition field
-    carries the same problem for a different reason: the row itself is not
-    unreadable, but this reader has no field to check it against, so it
-    cannot prove it is the one allowed to observe the row -- see
-    ``run_provenance_unavailable`` below.
+    carries the same problem for a different reason: its payload was read
+    successfully in the same pass, but this reader has no field to check it
+    against, so it cannot prove it is the one allowed to observe the row --
+    see ``run_provenance_unavailable`` below.
     """
 
     undecodable: bool = False
     generic_failure: bool = False
-    # Set when the anchored row exists and decodes fine, but is missing the
-    # run-partition field entirely, so this reader cannot verify its own
-    # authority over it (see the branch in _load_pk_anchored_checkpoint that
-    # calls is_missing_run_partition_only). The row may still be there; this
-    # reader just cannot prove it is allowed to observe it. Deliberately
-    # excluded from saw_any_row (see _sync_load_latest_checkpoint): the
-    # legacy scan's own candidate filter would exclude this exact row too, so
-    # it must not make the scan's "no matching row" verdict register as "a
-    # row was seen".
+    # Set when the anchored row exists, its payload decoded and carried a
+    # snapshot, and the only thing this reader could not establish is the
+    # run partition (see _classify_anchor_identity and the ruling in
+    # _load_pk_anchored_checkpoint). The row may still be there; this reader
+    # just cannot prove it is allowed to observe it. Deliberately excluded
+    # from saw_any_row (see _sync_load_latest_checkpoint): the legacy scan's
+    # own candidate filter would exclude this exact row too, so it must not
+    # make the scan's "no matching row" verdict register as "a row was
+    # seen".
     run_provenance_unavailable: bool = False
+
+
+class _AnchorIdentity(Enum):
+    """What the anchored row's identity check concluded.
+
+    Two members, not three: a row that fails any condition other than an
+    absent run partition raises ``CheckpointCorruptError`` inside the
+    classification stage, so no verdict for that case ever leaves it.
+    """
+
+    VERIFIED = "verified"
+    PROVENANCE_UNVERIFIABLE = "provenance_unverifiable"
 
 
 def _checkpoint_execution_id_predicate(execution_id: str) -> Any:
@@ -549,36 +562,35 @@ class DatabaseTraceHandler(BaseTraceHandler):
     ) -> Dict[str, Any] | _AnchorFallback:
         """Resolve the checkpoint through the task's exact-row pointer.
 
-        Returns an ``_AnchorFallback`` when the read defers to the legacy
-        scan. An empty one means there was nothing to anchor on: the
-        pointer is unset, or it names a row that no longer exists (only
-        possible on a database upgraded through Alembic rather than created
-        fresh, since that path has no DB-level FK -- see the migration that
-        adds this column).
+        Four stages, each with exactly one way out, run in a fixed order so
+        that no conclusion can preempt one that depends on a fact a later
+        stage establishes:
 
-        Once a target row is found, its *identity* is authoritative: a
-        validation mismatch raises rather than falling back to search other
-        rows. One shape is carved out of that rule rather than being an
-        exception to it: a row whose only failed condition is the run
-        partition, and only because the field is absent entirely, is not a
-        mismatch at all -- it is a row written before that field existed,
-        which the legacy scan below would itself have excluded, so this
-        defers to that scan instead of raising (see the branch at the
-        judgment below, and ``is_missing_run_partition_only``). Its
-        *payload* is not authoritative either. A row that is correctly
-        identified but whose payload cannot be read defers to the scan as
-        well, so the
-        older rows history pruning deliberately retains can still answer
-        the read (see _prune_checkpoint_history). That fallback carries the
-        row's own verdict flag on the returned ``_AnchorFallback``, because
-        the scan may legitimately exclude the very row the pointer named,
-        and a scan that then finds nothing must not report "no checkpoint"
-        for a checkpoint that exists and is unreadable.
+        1. Locate the row the pointer names (``_locate_anchor_row``). No row
+           to try -- an unset pointer, or one naming a row that no longer
+           exists -- returns an empty ``_AnchorFallback``; a database
+           failure raises ``CheckpointUnavailableError`` instead, because
+           that is not an answer about the row at all.
+        2. Classify the row's identity (``_classify_anchor_identity``). Can
+           raise ``CheckpointCorruptError`` on its own; see that method for
+           which condition does and why. Otherwise hands onward whether the
+           run partition could be verified.
+        3. Read the row's payload (``_read_anchor_payload``), for either
+           verdict stage 2 reached; see that method for the payload verdicts
+           it can reach and why they run regardless of stage 2's verdict.
+        4. Rule. Only once stage 3 has handed back a snapshot does the
+           identity verdict from stage 2 matter: verified returns the
+           snapshot, unverifiable returns the refusal flag on
+           ``_AnchorFallback`` (see ``run_provenance_unavailable`` there).
+           This ordering is the point of the split -- a verdict from stage 2
+           is never consumed until stage 3 has run, so it can never preempt
+           a payload verdict the way the single-pass version of this
+           function once could.
 
-        The execution-identity check here is verification, not the legacy
-        scan's filtering: that scan excludes non-matching rows from its
-        candidate set via ``_checkpoint_execution_id_predicate`` before it
-        ever sees them, but the pointer names one row unconditionally, so
+        The execution-identity check inside stage 2 is verification, not the
+        legacy scan's filtering: that scan excludes non-matching rows from
+        its candidate set via ``_checkpoint_execution_id_predicate`` before
+        it ever sees them, but the pointer names one row unconditionally, so
         the row's own claimed identity (if it has one) has to be checked
         against the caller's after the fact. A row carrying no execution
         identity at all passes this check, because
@@ -601,6 +613,45 @@ class DatabaseTraceHandler(BaseTraceHandler):
         # dangling signal -- and is the same cross-task coarseness the
         # signal already has in the registering direction.
         clear_degradation(CHECKPOINT_PK_ANCHOR_DANGLING)
+
+        located = self._locate_anchor_row(db)
+        if located is None:
+            return _AnchorFallback()
+        pointer_id, row, row_data = located
+
+        identity = self._classify_anchor_identity(
+            row,
+            row_data,
+            pointer_id=pointer_id,
+            run_id=run_id,
+            execution_id=execution_id,
+        )
+
+        payload = self._read_anchor_payload(db, row_data, pointer_id=pointer_id)
+        if isinstance(payload, _AnchorFallback):
+            # A payload verdict outranks an unverifiable provenance (see
+            # _read_anchor_payload for why); returned alone, without the
+            # provenance flag, so the scan's existing ranking and its
+            # saw_any_row rule (see _sync_load_latest_checkpoint) need no new
+            # case for it.
+            return payload
+
+        if identity is _AnchorIdentity.PROVENANCE_UNVERIFIABLE:
+            return _AnchorFallback(run_provenance_unavailable=True)
+        return payload
+
+    def _locate_anchor_row(
+        self, db: Session
+    ) -> tuple[int, DatabaseTraceEvent, Dict[str, Any]] | None:
+        """Stage 1: the row the task's exact-row pointer names.
+
+        ``None`` means there is nothing to anchor on -- an unset pointer, or
+        one naming a row that no longer exists (only possible on a database
+        upgraded through Alembic rather than created fresh, since that path
+        has no DB-level FK -- see the migration that adds this column). A
+        database failure while establishing that is not an answer and
+        raises instead.
+        """
         try:
             pointer = (
                 db.query(Task.last_checkpoint_trace_event_id)
@@ -616,7 +667,7 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 f"task {self.task_id}: checkpoint pointer lookup failed"
             ) from exc
         if pointer is None or pointer[0] is None:
-            return _AnchorFallback()
+            return None
 
         pointer_id = pointer[0]
         try:
@@ -636,9 +687,45 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 "no matching trace_events row; falling back to the legacy "
                 "scan",
             )
-            return _AnchorFallback()
+            return None
 
         row_data: Dict[str, Any] = row.data if isinstance(row.data, dict) else {}
+        return pointer_id, row, row_data
+
+    def _classify_anchor_identity(
+        self,
+        row: DatabaseTraceEvent,
+        row_data: Dict[str, Any],
+        *,
+        pointer_id: int,
+        run_id: str | None,
+        execution_id: str,
+    ) -> _AnchorIdentity:
+        """Stage 2: whether this reader can verify the row's identity.
+
+        Rules on identity only. The one verdict this stage may reach on its
+        own is ``CheckpointCorruptError``, for a row that fails a condition
+        other than an absent run partition -- that is a statement about the
+        pointer, not about the payload, so it needs nothing the payload
+        stage would produce. A row whose only failed condition is the run
+        partition, and only because the field is absent entirely, is not a
+        mismatch at all: it is a row written before that field existed,
+        which the legacy scan below would itself have excluded (see
+        ``is_missing_run_partition_only``), so its verdict is carried out of
+        here as a value rather than raised (see ``_load_pk_anchored_checkpoint``
+        for why that value is not consumed until the payload stage has run).
+
+        The warning and counter fire here, where the condition itself is
+        established, and stay independent of what the payload stage then
+        concludes: they are the record of how often a pointer row without a
+        run-partition field is read at all, not of how the read eventually
+        resolved. The refusal this condition can eventually produce is also
+        what every caller must handle explicitly -- including the websocket
+        ``resume_task`` handler (``_handle_resume_task_unserialized``), which
+        has no ``post_user_message`` gate ahead of it unlike the other three
+        ``execute_resume_background`` call sites -- rather than silently
+        starting the resumed run from an empty context.
+        """
         failed = failed_checkpoint_row_conditions(
             row,
             row_data,
@@ -646,49 +733,40 @@ class DatabaseTraceHandler(BaseTraceHandler):
             run_id=run_id,
             execution_id=execution_id,
         )
-        if failed:
-            if is_missing_run_partition_only(failed, row_data):
-                # A pre-existing row, not a corrupt one. Before the pointer
-                # column existed this row reached the legacy scan below,
-                # which filters candidates by run partition and so excludes
-                # it, concluding "no checkpoint". Deferring reaches that
-                # same verdict rather than turning a pre-existing row into a
-                # permanent corruption error.
-                #
-                # Warning, not info, and counted: this row's own identity
-                # check passed, so the anchor cannot tell the caller "this
-                # is not a checkpoint" (CheckpointCorruptError) -- only that
-                # this reader has no run-partition field to check it
-                # against. Deferring to the legacy scan lets an older,
-                # verifiable row still answer the read if one exists; when
-                # none does, the flag set on the returned _AnchorFallback
-                # makes _sync_load_latest_checkpoint raise
-                # CheckpointAccessRefusedError (reason
-                # "run_provenance_unavailable") instead of resolving to
-                # None, so every caller of this read -- including the
-                # websocket ``resume_task`` handler
-                # (``_handle_resume_task_unserialized``), which has no
-                # ``post_user_message`` gate ahead of it unlike the other
-                # three ``execute_resume_background`` call sites -- must
-                # handle the refusal explicitly rather than silently
-                # starting the resumed run from an empty context. This line
-                # and its counter remain as the record of how often the
-                # condition itself occurs, independent of how each caller
-                # now reacts to the refusal it triggers.
-                logger.warning(
-                    "Task %s's checkpoint pointer %s is missing its "
-                    "run-partition field; deferring to the legacy scan "
-                    "rather than reporting the row as corrupt",
-                    self.task_id,
-                    pointer_id,
-                )
-                increment_counter(COUNTER_CHECKPOINT_ABSENT_MISSING_RUN_PARTITION)
-                return _AnchorFallback(run_provenance_unavailable=True)
+        if not failed:
+            return _AnchorIdentity.VERIFIED
+        if not is_missing_run_partition_only(failed, row_data):
             raise CheckpointCorruptError(
                 f"task {self.task_id}: checkpoint pointer {pointer_id} does "
                 "not match the row it anchors"
             )
+        logger.warning(
+            "Task %s's checkpoint pointer %s is missing its "
+            "run-partition field; deferring to the legacy scan "
+            "rather than reporting the row as corrupt",
+            self.task_id,
+            pointer_id,
+        )
+        increment_counter(COUNTER_CHECKPOINT_ABSENT_MISSING_RUN_PARTITION)
+        return _AnchorIdentity.PROVENANCE_UNVERIFIABLE
 
+    def _read_anchor_payload(
+        self,
+        db: Session,
+        row_data: Dict[str, Any],
+        *,
+        pointer_id: int,
+    ) -> Dict[str, Any] | _AnchorFallback:
+        """Stage 3: the row's payload, classified exactly as the legacy
+        scan classifies one of its own candidate rows.
+
+        Runs for either identity verdict stage 2 can produce, which is the
+        point of the split: a row missing its run-partition field is still a
+        row whose blob reference can be broken, whose blob fetch can fail
+        transiently, or which can carry no snapshot at all, and those are
+        permanent-corruption / retryable-unavailable facts about the row
+        itself that must not be shadowed by an unverifiable provenance.
+        """
         try:
             decoded = decode_trace_event_data(
                 db,
@@ -730,12 +808,14 @@ class DatabaseTraceHandler(BaseTraceHandler):
         # load signal once a page query returns, the decode-fallback signal
         # once a row decodes. An anchored read establishes both in one round
         # trip, so both clears land here -- and here rather than at the top
-        # of this function, where the dangling clear sits, because that one
-        # reports on the pointer every attempt re-reads while these report
-        # that the read actually got through. An anchored read returns
-        # without ever entering the scan, so without these a decode-fallback
-        # signal set by one bad row could never retire in the steady state
-        # this anchor exists to produce.
+        # of the main function, where the dangling clear sits, because that
+        # one reports on the pointer every attempt re-reads while these
+        # report that the read actually got through. That is true whichever
+        # identity verdict stage 2 reached: a row this reader cannot claim
+        # authority over still proves the read and decode layers are
+        # healthy. An anchored read returns without ever entering the scan,
+        # so without these a decode-fallback signal set by one bad row could
+        # never retire in the steady state this anchor exists to produce.
         clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
         clear_degradation(CHECKPOINT_DECODE_FALLBACK)
 

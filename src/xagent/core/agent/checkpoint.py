@@ -90,9 +90,10 @@ class CheckpointAccessRefusedError(CheckpointReadError):
     its own lease), ``"superseded_legacy"`` (a tagged run has already
     superseded the untagged/legacy partition this reader is confined to),
     or ``"run_provenance_unavailable"`` (the checkpoint pointer names a row
-    that exists and decodes fine but has no run-partition field to check,
-    and no other readable row was found either, so this reader cannot prove
-    it is allowed to observe it). Defaults to ``"active_run"``, the most
+    that exists, whose payload decoded and carried a snapshot, but has no
+    run-partition field to check, and no other readable row was found
+    either, so this reader cannot prove it is allowed to observe it).
+    Defaults to ``"active_run"``, the most
     common case, so existing call sites that do not pass ``reason`` keep
     working unchanged.
     """

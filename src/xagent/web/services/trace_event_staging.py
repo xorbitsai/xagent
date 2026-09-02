@@ -343,7 +343,9 @@ def is_missing_run_partition_only(
     (``task_interaction_anchor.py``) resolves an empty scan as absence, same
     as before this function existed. The by-primary-key read path
     (``_load_pk_anchored_checkpoint``, ``api/trace_handlers.py``) does not
-    -- an empty scan there raises ``CheckpointAccessRefusedError`` (reason
+    -- and only reaches that point at all once the anchored row's own
+    payload has decoded and carried a snapshot: an empty scan there then
+    raises ``CheckpointAccessRefusedError`` (reason
     ``"run_provenance_unavailable"``) instead, since that caller cannot
     tell a genuinely absent checkpoint apart from one it simply could not
     verify.

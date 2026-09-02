@@ -1391,12 +1391,22 @@ async def test_refresh_5xx_with_oauth_shaped_body_is_transient(db_session, monke
     end -- e.g. a proxy/gateway outage, or a misbehaving custom/admin-
     configured token endpoint -- never proof that this specific grant is
     dead. It must stay transient even if its body happens to carry an
-    otherwise-recognized permanent error code."""
+    otherwise-recognized permanent error code.
+
+    Uses GitHub + bad_refresh_token (a code that IS in
+    _PROVIDER_DEAD_REFRESH_TOKEN_ERROR_CODES for this provider) rather than
+    a generic provider + invalid_grant: since generic invalid_grant is
+    never trusted for any provider regardless of status (see
+    test_user_oauth_refresh_generic_invalid_grant_retains_row), that
+    combination would pass this assertion even if the status_code >= 500
+    guard were removed entirely, silently testing nothing about the 5xx
+    exclusion itself.
+    """
     db, user = db_session
     db.add(
         OAuthProvider(
-            provider_name="google",
-            name="Google",
+            provider_name="github",
+            name="GitHub",
             client_id=encrypt_value("client-id-secret"),
             client_secret=encrypt_value("client-secret-value"),
             auth_url="https://auth.example/authorize",
@@ -1404,7 +1414,7 @@ async def test_refresh_5xx_with_oauth_shaped_body_is_transient(db_session, monke
         )
     )
     oauth_account = _add_user_oauth(
-        db, user, provider="google", access_token="expired-access-secret"
+        db, user, provider="github", access_token="expired-access-secret"
     )
     oauth_account.refresh_token = "refresh-secret-value"
     oauth_account.expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
@@ -1418,7 +1428,7 @@ async def test_refresh_5xx_with_oauth_shaped_body_is_transient(db_session, monke
             return False
 
         async def post(self, *args, **kwargs):
-            return httpx.Response(502, json={"error": "invalid_grant"})
+            return httpx.Response(502, json={"error": "bad_refresh_token"})
 
     monkeypatch.setattr(
         web_tools_config.httpx,
@@ -1428,7 +1438,7 @@ async def test_refresh_5xx_with_oauth_shaped_body_is_transient(db_session, monke
 
     assert (
         await web_tools_config.refresh_oauth_token_if_needed(
-            db, oauth_account, "google"
+            db, oauth_account, "github"
         )
         is False
     )

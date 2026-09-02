@@ -26,6 +26,13 @@ setup_proxy_env()
 
 mcp = FastMCP("zendesk-mcp")
 
+# A shared Session (HTTP keep-alive / connection pooling) rather than a bare
+# requests.request() per call -- most benefit accrues to this module's own
+# 429-retry (a second request to the same host right after the first), and
+# to any single tool call that happens to make more than one request; a
+# fresh connection per call is otherwise a fixed cost this avoids for free.
+_session = requests.Session()
+
 DEFAULT_TIMEOUT_SECONDS = 30
 MAX_LIMIT = 100
 MAX_RETRY_AFTER_SECONDS = 30
@@ -147,7 +154,7 @@ def _request(
     url = f"{_base_url()}{path}"
     try:
         for attempt in (0, 1):
-            response = requests.request(
+            response = _session.request(
                 method=method,
                 url=url,
                 auth=_auth(),
@@ -255,7 +262,7 @@ def _list_cursor_paginated(
     list_key: str,
     summary_fn: Callable[[dict[str, Any]], dict[str, Any]],
     limit: int,
-    after_cursor: str,
+    after_cursor: str | None,
 ) -> str:
     """Shared body for every cursor-paginated "list X" tool below (tickets,
     ticket comments, users, organizations) -- only the path, response key,
@@ -378,7 +385,7 @@ def zendesk_search(query: str, limit: int = 25, page: int = 1) -> str:
 
 
 @mcp.tool()
-def zendesk_list_tickets(limit: int = 25, after_cursor: str = "") -> str:
+def zendesk_list_tickets(limit: int = 25, after_cursor: str | None = None) -> str:
     """
     List all tickets in Zendesk's default order. For a filtered view (by
     status, priority, assignee, etc.) use zendesk_search instead, e.g.
@@ -415,9 +422,9 @@ def zendesk_get_ticket(ticket_id: int) -> str:
 def zendesk_create_ticket(
     subject: str,
     comment: str,
-    requester_email: str = "",
-    priority: str = "",
-    tags: str = "",
+    requester_email: str | None = None,
+    priority: str | None = None,
+    tags: list[str] | None = None,
 ) -> str:
     """
     Create a new Zendesk ticket.
@@ -426,7 +433,7 @@ def zendesk_create_ticket(
     requester_email: optional email of the end user this ticket is on
     behalf of; defaults to the connected agent if omitted.
     priority: optional, one of "low", "normal", "high", "urgent".
-    tags: optional comma-separated tags.
+    tags: optional list of tags.
     """
     try:
         _require_non_blank(subject, "subject")
@@ -437,7 +444,7 @@ def zendesk_create_ticket(
         if priority:
             ticket["priority"] = priority
         if tags:
-            ticket["tags"] = [t.strip() for t in tags.split(",") if t.strip()]
+            ticket["tags"] = tags
         result = _request("POST", "/tickets.json", json_data={"ticket": ticket})
         return _success(ticket=_ticket_summary(_unwrap(result, "ticket")))
     except Exception as e:
@@ -447,26 +454,29 @@ def zendesk_create_ticket(
 
 @mcp.tool()
 def zendesk_update_ticket(
-    ticket_id: int, status: str = "", priority: str = "", tags: str = ""
+    ticket_id: int,
+    status: str | None = None,
+    priority: str | None = None,
+    tags: list[str] | None = None,
 ) -> str:
     """
-    Update a ticket's status, priority, and/or tags. Use
-    zendesk_reply_to_ticket or zendesk_add_internal_note to add a comment
-    instead.
+    Update a ticket's status, priority, and/or tags. Only the fields
+    explicitly provided (not None) are changed. Use zendesk_reply_to_ticket
+    or zendesk_add_internal_note to add a comment instead.
     status: optional, one of "new", "open", "pending", "hold", "solved",
     "closed".
     priority: optional, one of "low", "normal", "high", "urgent".
-    tags: optional comma-separated tags -- replaces the ticket's existing
-    tags entirely, it does not add to them.
+    tags: optional list of tags -- replaces the ticket's existing tags
+    entirely (pass an empty list to clear them), it does not add to them.
     """
     try:
         fields: dict[str, Any] = {}
-        if status:
+        if status is not None:
             fields["status"] = status
-        if priority:
+        if priority is not None:
             fields["priority"] = priority
-        if tags:
-            fields["tags"] = [t.strip() for t in tags.split(",") if t.strip()]
+        if tags is not None:
+            fields["tags"] = tags
         if not fields:
             raise ValueError("at least one of status/priority/tags must be provided")
         result = _request(
@@ -482,7 +492,7 @@ def zendesk_update_ticket(
 
 @mcp.tool()
 def zendesk_list_ticket_comments(
-    ticket_id: int, limit: int = 25, after_cursor: str = ""
+    ticket_id: int, limit: int = 25, after_cursor: str | None = None
 ) -> str:
     """
     List the comment thread on a ticket, oldest first (the first comment is
@@ -528,7 +538,7 @@ def zendesk_add_internal_note(ticket_id: int, body: str) -> str:
 
 
 @mcp.tool()
-def zendesk_list_users(limit: int = 25, after_cursor: str = "") -> str:
+def zendesk_list_users(limit: int = 25, after_cursor: str | None = None) -> str:
     """
     List all users (agents and end users) in this Zendesk account.
     limit: max users to return (default 25, hard cap 100).
@@ -583,7 +593,7 @@ def zendesk_search_users(query: str, limit: int = 25, page: int = 1) -> str:
 
 
 @mcp.tool()
-def zendesk_list_organizations(limit: int = 25, after_cursor: str = "") -> str:
+def zendesk_list_organizations(limit: int = 25, after_cursor: str | None = None) -> str:
     """
     List all organizations in this Zendesk account.
     limit: max organizations to return (default 25, hard cap 100).

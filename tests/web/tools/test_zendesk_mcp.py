@@ -271,7 +271,7 @@ def test_offset_page_not_more_when_no_next_page():
 
 def test_request_uses_configured_host_and_auth(monkeypatch):
     mock_request = Mock(return_value=MockResponse(json_data={"ok": True}))
-    monkeypatch.setattr(zendesk.requests, "request", mock_request)
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
 
     result = zendesk._request("GET", "/tickets.json")
 
@@ -290,7 +290,7 @@ def test_request_uses_configured_host_and_auth(monkeypatch):
 @pytest.mark.parametrize("status_code", [301, 302, 303, 307, 308])
 def test_request_rejects_redirect_response(monkeypatch, status_code):
     monkeypatch.setattr(
-        zendesk.requests,
+        zendesk._session,
         "request",
         Mock(
             return_value=MockResponse(
@@ -305,7 +305,7 @@ def test_request_rejects_redirect_response(monkeypatch, status_code):
 
 def test_request_passes_configured_timeout(monkeypatch):
     mock_request = Mock(return_value=MockResponse(json_data={"ok": True}))
-    monkeypatch.setattr(zendesk.requests, "request", mock_request)
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
 
     zendesk._request("GET", "/tickets.json")
 
@@ -314,7 +314,7 @@ def test_request_passes_configured_timeout(monkeypatch):
 
 def test_request_returns_empty_dict_for_204(monkeypatch):
     monkeypatch.setattr(
-        zendesk.requests,
+        zendesk._session,
         "request",
         Mock(return_value=MockResponse(status_code=204, text="")),
     )
@@ -328,7 +328,7 @@ def test_request_retries_once_on_429_with_retry_after(monkeypatch):
         MockResponse(json_data={"ok": True}),
     ]
     mock_request = Mock(side_effect=responses)
-    monkeypatch.setattr(zendesk.requests, "request", mock_request)
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
     monkeypatch.setattr(zendesk.time, "sleep", Mock())
 
     result = zendesk._request("GET", "/tickets.json")
@@ -341,7 +341,7 @@ def test_request_retries_once_on_429_with_retry_after(monkeypatch):
 def test_request_does_not_retry_a_second_429(monkeypatch):
     response = MockResponse(status_code=429, url="x", headers={"Retry-After": "1"})
     mock_request = Mock(return_value=response)
-    monkeypatch.setattr(zendesk.requests, "request", mock_request)
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
     monkeypatch.setattr(zendesk.time, "sleep", Mock())
 
     with pytest.raises(RuntimeError):
@@ -357,7 +357,7 @@ def test_request_redacts_connection_error_message(monkeypatch):
             "https://user:sp-secret-proxy-pass@proxy.internal:8080/"
         )
 
-    monkeypatch.setattr(zendesk.requests, "request", _raise)
+    monkeypatch.setattr(zendesk._session, "request", _raise)
 
     with pytest.raises(RuntimeError) as excinfo:
         zendesk._request("GET", "/tickets.json")
@@ -367,7 +367,7 @@ def test_request_redacts_connection_error_message(monkeypatch):
 
 def test_request_raises_with_structured_error_detail(monkeypatch):
     monkeypatch.setattr(
-        zendesk.requests,
+        zendesk._session,
         "request",
         Mock(
             return_value=MockResponse(
@@ -383,7 +383,7 @@ def test_request_raises_with_structured_error_detail(monkeypatch):
 
 def test_request_raises_clear_error_for_non_json_2xx_body(monkeypatch):
     monkeypatch.setattr(
-        zendesk.requests,
+        zendesk._session,
         "request",
         Mock(
             return_value=MockResponse(
@@ -399,7 +399,7 @@ def test_request_raises_clear_error_for_non_json_2xx_body(monkeypatch):
 def test_request_truncates_unstructured_error_body(monkeypatch):
     long_body = "x" * 5000
     monkeypatch.setattr(
-        zendesk.requests,
+        zendesk._session,
         "request",
         Mock(return_value=MockResponse(status_code=500, text=long_body)),
     )
@@ -430,7 +430,7 @@ def test_search_sends_per_page_and_page_params(monkeypatch):
             }
         )
     )
-    monkeypatch.setattr(zendesk.requests, "request", mock_request)
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
 
     result = json.loads(
         zendesk.zendesk_search("type:ticket status:open", limit=10, page=2)
@@ -452,7 +452,7 @@ def test_search_clamps_page_to_at_least_one(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(json_data={"results": [], "count": 0})
     )
-    monkeypatch.setattr(zendesk.requests, "request", mock_request)
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
 
     zendesk.zendesk_search("type:ticket", page=0)
 
@@ -465,7 +465,7 @@ def test_list_tickets_sends_page_size_and_cursor(monkeypatch):
             json_data={"tickets": [{"id": 1}], "meta": {"has_more": False}}
         )
     )
-    monkeypatch.setattr(zendesk.requests, "request", mock_request)
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
 
     zendesk.zendesk_list_tickets(limit=10, after_cursor="cur1")
 
@@ -476,7 +476,7 @@ def test_list_tickets_sends_page_size_and_cursor(monkeypatch):
 
 def test_get_ticket_returns_summary(monkeypatch):
     monkeypatch.setattr(
-        zendesk.requests,
+        zendesk._session,
         "request",
         Mock(
             return_value=MockResponse(
@@ -503,7 +503,7 @@ def test_create_ticket_sends_expected_body(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(json_data={"ticket": {"id": 1, "subject": "Help"}})
     )
-    monkeypatch.setattr(zendesk.requests, "request", mock_request)
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
 
     result = json.loads(
         zendesk.zendesk_create_ticket(
@@ -511,7 +511,7 @@ def test_create_ticket_sends_expected_body(monkeypatch):
             "Something's broken",
             requester_email="jane@example.com",
             priority="high",
-            tags="bug, urgent",
+            tags=["bug", "urgent"],
         )
     )
 
@@ -535,7 +535,7 @@ def test_update_ticket_sends_only_provided_fields(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(json_data={"ticket": {"id": 1, "status": "solved"}})
     )
-    monkeypatch.setattr(zendesk.requests, "request", mock_request)
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
 
     zendesk.zendesk_update_ticket(1, status="solved")
 
@@ -547,7 +547,7 @@ def test_update_ticket_sends_only_provided_fields(monkeypatch):
 
 def test_list_ticket_comments_returns_summaries(monkeypatch):
     monkeypatch.setattr(
-        zendesk.requests,
+        zendesk._session,
         "request",
         Mock(
             return_value=MockResponse(
@@ -571,7 +571,7 @@ def test_reply_to_ticket_sends_public_true(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(json_data={"ticket": {"id": 1, "status": "open"}})
     )
-    monkeypatch.setattr(zendesk.requests, "request", mock_request)
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
 
     result = json.loads(zendesk.zendesk_reply_to_ticket(1, "Thanks for reaching out"))
 
@@ -587,7 +587,7 @@ def test_add_internal_note_sends_public_false(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(json_data={"ticket": {"id": 1, "status": "open"}})
     )
-    monkeypatch.setattr(zendesk.requests, "request", mock_request)
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
 
     zendesk.zendesk_add_internal_note(1, "Escalating to tier 2")
 
@@ -606,7 +606,7 @@ def test_add_comment_rejects_blank_body():
 
 def test_list_users_returns_summaries(monkeypatch):
     monkeypatch.setattr(
-        zendesk.requests,
+        zendesk._session,
         "request",
         Mock(
             return_value=MockResponse(
@@ -626,7 +626,7 @@ def test_list_users_returns_summaries(monkeypatch):
 
 def test_get_user_returns_summary(monkeypatch):
     monkeypatch.setattr(
-        zendesk.requests,
+        zendesk._session,
         "request",
         Mock(return_value=MockResponse(json_data={"user": {"id": 1, "name": "Jane"}})),
     )
@@ -649,7 +649,7 @@ def test_search_users_sends_query_and_page_params(monkeypatch):
             json_data={"users": [{"id": 1, "name": "Jane"}], "next_page": None}
         )
     )
-    monkeypatch.setattr(zendesk.requests, "request", mock_request)
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
 
     result = json.loads(zendesk.zendesk_search_users("jane@example.com", limit=5))
 
@@ -664,7 +664,7 @@ def test_search_users_sends_query_and_page_params(monkeypatch):
 
 def test_list_organizations_returns_summaries(monkeypatch):
     monkeypatch.setattr(
-        zendesk.requests,
+        zendesk._session,
         "request",
         Mock(
             return_value=MockResponse(
@@ -684,7 +684,7 @@ def test_list_organizations_returns_summaries(monkeypatch):
 
 def test_get_organization_returns_summary(monkeypatch):
     monkeypatch.setattr(
-        zendesk.requests,
+        zendesk._session,
         "request",
         Mock(
             return_value=MockResponse(
@@ -697,6 +697,69 @@ def test_get_organization_returns_summary(monkeypatch):
 
     assert result["status"] == "success"
     assert result["organization"]["name"] == "Acme"
+
+
+def test_session_is_a_requests_session_reused_across_calls():
+    assert isinstance(zendesk._session, requests.Session)
+
+
+@pytest.mark.parametrize(
+    "tool_name, arguments",
+    [
+        (
+            "zendesk_create_ticket",
+            {
+                "subject": "Help",
+                "comment": "Something broke",
+                "requester_email": None,
+                "priority": None,
+                "tags": None,
+            },
+        ),
+        (
+            "zendesk_update_ticket",
+            {"ticket_id": 1, "status": "solved", "priority": None, "tags": None},
+        ),
+        ("zendesk_list_tickets", {"limit": 25, "after_cursor": None}),
+        ("zendesk_list_ticket_comments", {"ticket_id": 1, "after_cursor": None}),
+        ("zendesk_list_users", {"after_cursor": None}),
+        ("zendesk_list_organizations", {"after_cursor": None}),
+    ],
+)
+async def test_optional_params_accept_explicit_none_through_tool_schema(
+    monkeypatch, tool_name, arguments
+):
+    """Regression test for a real MCP-specific failure mode: a `str = ""`
+    (non-Optional) tool parameter's generated JSON schema has no "null"
+    variant, so an MCP client explicitly passing null for an unused
+    optional argument (common LLM behavior) gets a hard Pydantic
+    ValidationError before this module's own code ever runs -- confirmed
+    by reproducing it directly against FastMCP's schema validation. Every
+    optional parameter listed here must accept an explicit None through
+    zendesk.mcp.call_tool (not just a plain Python call, which bypasses
+    Pydantic's schema validation entirely and would not have caught the
+    original bug)."""
+    monkeypatch.setattr(
+        zendesk._session,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "ticket": {"id": 1},
+                    "tickets": [],
+                    "comments": [],
+                    "users": [],
+                    "organizations": [],
+                    "meta": {"has_more": False},
+                }
+            )
+        ),
+    )
+
+    content, structured = await zendesk.mcp.call_tool(tool_name, arguments)
+
+    result = json.loads(structured["result"])
+    assert result["status"] == "success"
 
 
 def test_zendesk_app_registry_requires_subdomain_email_and_token():

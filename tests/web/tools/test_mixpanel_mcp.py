@@ -213,6 +213,24 @@ def test_extract_error_detail_returns_none_when_error_field_missing():
     assert mixpanel._extract_error_detail(response) is None
 
 
+def test_extract_error_detail_returns_none_for_non_dict_json_body():
+    response = MockResponse(json_data=["not", "a", "dict"])
+
+    assert mixpanel._extract_error_detail(response) is None
+
+
+def test_extract_error_detail_returns_none_for_empty_string_error():
+    response = MockResponse(json_data={"error": ""})
+
+    assert mixpanel._extract_error_detail(response) is None
+
+
+def test_extract_error_detail_returns_none_for_non_string_error():
+    response = MockResponse(json_data={"error": {"nested": "object"}})
+
+    assert mixpanel._extract_error_detail(response) is None
+
+
 def test_request_uses_configured_host_project_id_and_auth(monkeypatch):
     mock_request = Mock(return_value=MockResponse(json_data={"ok": True}))
     monkeypatch.setattr(mixpanel.requests, "request", mock_request)
@@ -346,6 +364,64 @@ def test_request_does_not_retry_a_second_429(monkeypatch):
         mixpanel._request("GET", "mixpanel.com", "/api/query/events/names")
 
     assert mock_request.call_count == 2
+
+
+def test_request_does_not_retry_429_without_retry_after_header(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(status_code=429, url="x"))
+    monkeypatch.setattr(mixpanel.requests, "request", mock_request)
+    monkeypatch.setattr(mixpanel.time, "sleep", Mock())
+
+    with pytest.raises(RuntimeError):
+        mixpanel._request("GET", "mixpanel.com", "/api/query/events/names")
+
+    assert mock_request.call_count == 1
+    mixpanel.time.sleep.assert_not_called()
+
+
+def test_request_does_not_retry_429_with_non_integer_retry_after(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            status_code=429, url="x", headers={"Retry-After": "not-a-number"}
+        )
+    )
+    monkeypatch.setattr(mixpanel.requests, "request", mock_request)
+    monkeypatch.setattr(mixpanel.time, "sleep", Mock())
+
+    with pytest.raises(RuntimeError):
+        mixpanel._request("GET", "mixpanel.com", "/api/query/events/names")
+
+    assert mock_request.call_count == 1
+    mixpanel.time.sleep.assert_not_called()
+
+
+def test_request_does_not_retry_429_with_retry_after_exceeding_max(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            status_code=429,
+            url="x",
+            headers={"Retry-After": str(mixpanel.MAX_RETRY_AFTER_SECONDS + 1)},
+        )
+    )
+    monkeypatch.setattr(mixpanel.requests, "request", mock_request)
+    monkeypatch.setattr(mixpanel.time, "sleep", Mock())
+
+    with pytest.raises(RuntimeError):
+        mixpanel._request("GET", "mixpanel.com", "/api/query/events/names")
+
+    assert mock_request.call_count == 1
+    mixpanel.time.sleep.assert_not_called()
+
+
+def test_request_returns_empty_dict_for_non_streamed_empty_body(monkeypatch):
+    monkeypatch.setattr(
+        mixpanel.requests,
+        "request",
+        Mock(return_value=MockResponse(status_code=200, text="")),
+    )
+
+    result = mixpanel._request("GET", "mixpanel.com", "/api/query/events/names")
+
+    assert result == {}
 
 
 def test_request_redacts_connection_error_message(monkeypatch):
@@ -617,10 +693,38 @@ def test_query_engage_includes_pagination_params_when_continuing(monkeypatch):
     assert form["page"] == 2
 
 
-def test_list_annotations_requires_valid_dates():
+def test_query_engage_rejects_page_without_session_id(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(mixpanel.requests, "request", mock_request)
+
+    result = json.loads(mixpanel.mixpanel_query_engage(page=2))
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
+def test_list_annotations_requires_valid_dates(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(mixpanel.requests, "request", mock_request)
+
     result = json.loads(mixpanel.mixpanel_list_annotations("bad", "2026-01-31"))
 
     assert result["status"] == "error"
+    assert "from_date" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_list_annotations_returns_empty_list_when_results_key_missing(monkeypatch):
+    monkeypatch.setattr(
+        mixpanel.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data={"status": "ok"})),
+    )
+
+    result = json.loads(mixpanel.mixpanel_list_annotations("2026-01-01", "2026-01-31"))
+
+    assert result["status"] == "success"
+    assert result["annotations"]["annotations"] == []
 
 
 def test_list_annotations_uses_app_api_path_and_camelcase_dates(monkeypatch):
@@ -700,9 +804,12 @@ def test_export_events_parses_ndjson_and_caps_result(monkeypatch):
     result = json.loads(mixpanel.mixpanel_export_events("2026-01-01", "2026-01-31"))
 
     assert result["status"] == "success"
-    assert result["events"]["count"] == 3
+    assert len(result["events"]["events"]) == 3
     assert result["events"]["row_limit_reached"] is False
     assert result["events"]["events"][0] == {"event": "Signup", "n": 0}
+    # No "count" field: it would go stale if success_with_capped_dict's own
+    # size-based capping halves the list further after this point.
+    assert "count" not in result["events"]
     # Streamed, not buffered whole -- a wide date range must not pull the
     # entire NDJSON body into memory before the row cap applies.
     assert mock_request.call_args.kwargs["stream"] is True
@@ -721,8 +828,27 @@ def test_export_events_truncates_at_max_events(monkeypatch):
 
     result = json.loads(mixpanel.mixpanel_export_events("2026-01-01", "2026-01-31"))
 
-    assert result["events"]["count"] == mixpanel.MAX_EXPORT_EVENTS
+    assert len(result["events"]["events"]) == mixpanel.MAX_EXPORT_EVENTS
     assert result["events"]["row_limit_reached"] is True
+
+
+def test_export_events_treats_malformed_trailing_line_as_end_of_stream(monkeypatch):
+    # A truncated final line (a realistic mid-stream connection reset) must
+    # not discard the events already parsed before it.
+    lines = (
+        "\n".join(json.dumps({"event": "Signup", "n": i}) for i in range(3))
+        + '\n{"event": "Signup", "n": 3, truncated'
+    )
+    monkeypatch.setattr(
+        mixpanel.requests,
+        "request",
+        Mock(return_value=MockResponse(status_code=200, text=lines)),
+    )
+
+    result = json.loads(mixpanel.mixpanel_export_events("2026-01-01", "2026-01-31"))
+
+    assert result["status"] == "success"
+    assert len(result["events"]["events"]) == 3
 
 
 def test_export_events_uses_export_host_and_encodes_event_filter(monkeypatch):
@@ -741,10 +867,45 @@ def test_export_events_uses_export_host_and_encodes_event_filter(monkeypatch):
     )
 
 
-def test_export_events_requires_valid_dates():
+def test_export_events_requires_valid_dates(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(mixpanel.requests, "request", mock_request)
+
     result = json.loads(mixpanel.mixpanel_export_events("2026/01/01", "2026-01-31"))
 
     assert result["status"] == "error"
+    assert "from_date" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_export_events_uses_eu_export_host_for_eu_region(monkeypatch):
+    monkeypatch.setenv("MIXPANEL_REGION", "eu")
+    mock_request = Mock(return_value=MockResponse(status_code=200, text=""))
+    monkeypatch.setattr(mixpanel.requests, "request", mock_request)
+
+    mixpanel.mixpanel_export_events("2026-01-01", "2026-01-31")
+
+    assert mock_request.call_args.kwargs["url"] == (
+        "https://data-eu.mixpanel.com/api/2.0/export"
+    )
+
+
+def test_list_annotations_uses_eu_query_host_for_eu_region(monkeypatch):
+    monkeypatch.setenv("MIXPANEL_REGION", "eu")
+    mock_request = Mock(return_value=MockResponse(json_data={"results": []}))
+    monkeypatch.setattr(mixpanel.requests, "request", mock_request)
+
+    mixpanel.mixpanel_list_annotations("2026-01-01", "2026-01-31")
+
+    assert mock_request.call_args.kwargs["url"] == (
+        "https://eu.mixpanel.com/api/app/projects/12345/annotations"
+    )
+
+
+@pytest.mark.parametrize("value", [None, 123])
+def test_validate_annotation_datetime_rejects_non_string(value):
+    with pytest.raises(ValueError, match="date"):
+        mixpanel._validate_annotation_datetime(value, "date")
 
 
 def test_mixpanel_app_registry_requires_service_account_and_project():

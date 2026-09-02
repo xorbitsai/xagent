@@ -11,7 +11,7 @@ from mcp.server.fastmcp import FastMCP
 
 from ....core.utils.security import redact_sensitive_text
 from ...utils.graphql_errors import truncate_error_text
-from .utils import clamp_limit, setup_proxy_env, success_with_capped_dict
+from .utils import clamp_limit, setup_proxy_env, success_with_capped_dict, url_path_id
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mixpanel-mcp")
@@ -260,8 +260,16 @@ def _request(
         if detail:
             # The response body is attacker/host-controlled content, not
             # something this module wrote; if it happens to echo request
-            # headers, redact any credential-shaped substring before it
-            # reaches logs or the LLM's context.
+            # headers, this redacts Bearer tokens, key=/secret=-style
+            # assignments, and a couple of named API-key headers -- NOT an
+            # echoed "Authorization: Basic <base64>" (this connector's own
+            # auth scheme), which redact_sensitive_text has no pattern for
+            # today. Narrower coverage than the comment in sibling
+            # Bearer-auth connectors this was adapted from implies for a
+            # Basic-auth one; tracked as a follow-up to add a Basic-auth
+            # pattern to core/utils/security.py rather than fixed here,
+            # since that module is shared by every connector, not owned by
+            # this file.
             message = f"{message} - {redact_sensitive_text(detail)}"
         raise RuntimeError(message) from exc
 
@@ -494,9 +502,13 @@ def mixpanel_query_engage(
     e.g. "$email,$last_name" -- restricting this can speed up large queries.
     session_id, page: pass the previous call's own session_id and page + 1
     to fetch the next page -- Mixpanel's engage results are cursor-paginated
-    server-side, not by a client-specified offset.
+    server-side, not by a client-specified offset. page is only meaningful
+    together with session_id; passing page without session_id is rejected
+    rather than silently ignored.
     """
     try:
+        if page and not session_id:
+            return _error("page requires session_id from a previous call's response")
         form: dict[str, Any] = {}
         if where:
             form["where"] = where
@@ -529,11 +541,13 @@ def mixpanel_list_annotations(from_date: str, to_date: str) -> str:
         result = _request(
             "GET",
             _region_hosts()["query"],
-            f"/api/app/projects/{_project_id()}/annotations",
+            f"/api/app/projects/{url_path_id(_project_id(), 'project_id')}/annotations",
             params={"fromDate": from_date, "toDate": to_date},
             include_project_id=False,
         )
-        annotations = result.get("results") if isinstance(result, dict) else result
+        annotations = (
+            (result.get("results") or []) if isinstance(result, dict) else result
+        )
         return success_with_capped_dict("annotations", {"annotations": annotations})
     except Exception as e:
         logger.error(f"Error listing Mixpanel annotations: {e}")
@@ -553,7 +567,7 @@ def mixpanel_create_annotation(date: str, description: str) -> str:
         result = _request(
             "POST",
             _region_hosts()["query"],
-            f"/api/app/projects/{_project_id()}/annotations",
+            f"/api/app/projects/{url_path_id(_project_id(), 'project_id')}/annotations",
             json_data={"date": date, "description": description},
             include_project_id=False,
         )
@@ -615,12 +629,28 @@ def mixpanel_export_events(
                 if len(events) >= MAX_EXPORT_EVENTS:
                     row_limit_reached = True
                     break
-                events.append(json.loads(line))
+                try:
+                    events.append(json.loads(line))
+                except ValueError:
+                    # A truncated/malformed line -- realistic on a
+                    # mid-stream connection reset (requests.iter_lines()
+                    # can split a chunk boundary mid-record) -- is treated
+                    # as the effective end of the stream rather than
+                    # discarding every event already parsed by letting this
+                    # propagate to the outer except below.
+                    break
+        # No "count" field: success_with_capped_dict can still halve
+        # `events` further if the JSON payload built here exceeds the
+        # platform's own output-size cap, which would leave a
+        # precomputed count out of sync with the array actually returned.
+        # Its own "truncated" flag (size-driven) plus row_limit_reached
+        # (this function's own MAX_EXPORT_EVENTS cap) are the two signals
+        # that actually stay accurate; len(events) is trivial for a caller
+        # to derive from the array itself.
         return success_with_capped_dict(
             "events",
             {
                 "events": events,
-                "count": len(events),
                 "row_limit_reached": row_limit_reached,
             },
         )

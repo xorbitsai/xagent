@@ -2540,12 +2540,33 @@ def test_unknown_format_is_not_emitted(value, emitted):
 
 
 def test_rejected_metadata_is_reported_once_per_tool(caplog):
-    """Keys dropped on their own contents are counted and reported per tool."""
+    """Everything the connector declared and lost is counted, in one line.
+
+    Three ways a declaration is lost are counted together: a supported key
+    whose value failed its check, a key this adapter never reads, and a field
+    whose schema cannot be read at all. The last is counted separately
+    because it has no keys to enumerate.
+
+    The single line is the shape being pinned. A malformed connector can drop
+    keys across many fields at once, and a line per key would make one bad
+    connector a flood at debug level.
+    """
     properties = {
         "kept": {"type": "string", "description": "Kept."},
         "bad_minimum": {"type": "number", "minimum": float("inf")},
         "bad_format": {"type": "string", "format": "not-a-known-format"},
         "bad_description": {"type": "string", "description": 123},
+        # Four keys this adapter never reads: they reach neither the emitted
+        # schema nor the field's type.
+        "unread_keys": {
+            "type": "integer",
+            "exclusiveMinimum": 1,
+            "multipleOf": 2,
+            "const": 7,
+            "title": "Ignored",
+        },
+        # No keys to enumerate at all.
+        "unreadable": 5,
     }
 
     with caplog.at_level(logging.DEBUG, logger=mcp_adapter_module.logger.name):
@@ -2557,7 +2578,26 @@ def test_rejected_metadata_is_reported_once_per_tool(caplog):
         if "field schema metadata keys" in record.getMessage()
     ]
     assert len(lines) == 1
-    assert lines[0] == "MCP tool reject_probe rejected 3 field schema metadata keys"
+    assert lines[0] == (
+        "MCP tool reject_probe dropped 7 field schema metadata keys "
+        "and 1 unreadable field schemas"
+    )
+
+
+def test_an_unreadable_field_schema_is_reported_on_its_own_count(caplog):
+    """A field with no readable schema is reported without inventing a key count."""
+    with caplog.at_level(logging.DEBUG, logger=mcp_adapter_module.logger.name):
+        _emitted_schema({"unreadable": 5}, [], tool_name="unreadable_probe")
+
+    lines = [
+        record.getMessage()
+        for record in caplog.records
+        if "field schema metadata keys" in record.getMessage()
+    ]
+    assert lines == [
+        "MCP tool unreadable_probe dropped 0 field schema metadata keys "
+        "and 1 unreadable field schemas"
+    ]
 
 
 def test_no_report_when_every_metadata_key_is_kept(caplog):

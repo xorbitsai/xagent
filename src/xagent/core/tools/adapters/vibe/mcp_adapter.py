@@ -245,6 +245,28 @@ def _is_non_negative_integer(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
+# Every field-schema key this adapter reads: the eight it carries into the
+# emitted schema, the four `_json_schema_to_python_type` resolves a type from,
+# and `default`. A key outside this set reaches neither the emitted schema nor
+# the field's type, so it is dropped -- `items`, `const`, `multipleOf`,
+# `exclusiveMinimum` and `title` among them -- and is counted as such.
+_READ_FIELD_SCHEMA_KEYS = frozenset(
+    {
+        "description",
+        "enum",
+        "pattern",
+        "format",
+        "minLength",
+        "maxLength",
+        "minimum",
+        "maximum",
+        "default",
+        "type",
+        "anyOf",
+        "oneOf",
+        "allOf",
+    }
+)
 # Numeric field-schema keys carried through, in the order they are emitted,
 # each with the check its own JSON Schema definition calls for. Every key is
 # accepted or dropped on its own value; one key never affects another.
@@ -381,6 +403,12 @@ def _field_metadata_candidates(
         else:
             rejected += 1
 
+    # A key this adapter never reads is dropped just as surely as one that
+    # failed its check, and the author has no way to tell the two apart from
+    # the outside. Counting it keeps the reported number the number of things
+    # the connector declared that did not survive.
+    rejected += sum(1 for key in field_schema if key not in _READ_FIELD_SCHEMA_KEYS)
+
     return candidates, rejected
 
 
@@ -397,24 +425,39 @@ class _FieldMetadata(NamedTuple):
     extra: dict[str, Any]
 
 
+class _ToolFieldMetadata(NamedTuple):
+    """Every field's record for one tool, with what was dropped reaching it.
+
+    The two counts are kept apart because they count different things. A
+    field schema that is not a mapping has no keys to enumerate, so folding
+    it into the key count would report a number nothing measured.
+    """
+
+    fields: dict[str, _FieldMetadata]
+    rejected_keys: int
+    unreadable_fields: int
+
+
 def _tool_field_metadata(
     properties: Mapping[str, Any],
     required: Any,
     excluded_names: set[str],
-) -> tuple[dict[str, _FieldMetadata], int]:
+) -> _ToolFieldMetadata:
     """Decide what every field of one tool emits.
 
     Fields are independent: each key is judged on its own, so nothing one
     field declares can change what another field emits.
 
     Returns one record per field the args model will carry -- the default it
-    emits, its description, and its other schema keys -- plus how many present
-    metadata keys were rejected on their own contents. The default is decided
-    here rather than by the caller so that it is derived exactly once per
-    field: the enum rules already need to know it.
+    emits, its description, and its other schema keys -- alongside how much
+    was dropped on the way: the present keys that did not survive, and the
+    fields whose schema could not be read at all. The default is decided here
+    rather than by the caller so that it is derived exactly once per field:
+    the enum rules already need to know it.
     """
     metadata: dict[str, _FieldMetadata] = {}
     rejected_keys = 0
+    unreadable_fields = 0
 
     for field_name, field_schema in properties.items():
         if field_name in excluded_names:
@@ -427,6 +470,7 @@ def _tool_field_metadata(
             # would raise past the caller instead and cost the tool every one
             # of its arguments over one malformed field.
             metadata[field_name] = _FieldMetadata(None, None, {})
+            unreadable_fields += 1
             continue
 
         if field_name in required:
@@ -454,7 +498,7 @@ def _tool_field_metadata(
 
         metadata[field_name] = _FieldMetadata(emitted_default, description, extra)
 
-    return metadata, rejected_keys
+    return _ToolFieldMetadata(metadata, rejected_keys, unreadable_fields)
 
 
 def _bounded_exception_nodes(
@@ -905,9 +949,10 @@ class MCPToolAdapter(AbstractBaseTool):
             # Build field definitions for create_model
             fields: Dict[str, Any] = {}
             runtime_bound_args = self._runtime_bound_tool_argument_names(properties)
-            metadata, rejected_keys = _tool_field_metadata(
+            tool_metadata = _tool_field_metadata(
                 properties, required, runtime_bound_args
             )
+            metadata = tool_metadata.fields
 
             for field_name, field_schema in properties.items():
                 if field_name in runtime_bound_args:
@@ -940,11 +985,16 @@ class MCPToolAdapter(AbstractBaseTool):
                         field_metadata.emitted_default,
                     )
 
-            if rejected_keys:
+            if tool_metadata.rejected_keys or tool_metadata.unreadable_fields:
+                # One line per tool, whatever the connector declared. A
+                # malformed schema can drop keys on many fields at once, and
+                # a line per key would turn one bad connector into a flood.
                 logger.debug(
-                    "MCP tool %s rejected %d field schema metadata keys",
+                    "MCP tool %s dropped %d field schema metadata keys "
+                    "and %d unreadable field schemas",
                     self.mcp_tool.name,
-                    rejected_keys,
+                    tool_metadata.rejected_keys,
+                    tool_metadata.unreadable_fields,
                 )
 
             # Create the model

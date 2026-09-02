@@ -1,7 +1,7 @@
 """seed built-in Mixpanel (key-based) MCP connector
 
 Revision ID: 20260901_seed_mixpanel_mcp_app
-Revises: 20260901_taskstatus_waiting_for_user
+Revises: 20260902_mcp_generations
 Create Date: 2026-09-01 00:00:00.000000
 
 """
@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 # revision identifiers, used by Alembic.
 revision: str = "20260901_seed_mixpanel_mcp_app"
-down_revision: Union[str, None] = "20260901_taskstatus_waiting_for_user"
+down_revision: Union[str, None] = "20260902_mcp_generations"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

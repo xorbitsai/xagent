@@ -934,6 +934,67 @@ async def test_meta_expired_token_refresh_uses_fb_exchange_token(
     ]
 
 
+@pytest.mark.asyncio
+async def test_meta_refresh_with_revoked_session_raises_permanent(
+    db_session, monkeypatch
+):
+    """Meta nests its refresh error as an object instead of the standard
+    top-level string `error` code; OAuthException + code 190 is Meta's
+    documented "access token is invalid/expired" signal and must still be
+    recognized as a permanent (not merely transient) failure.
+    """
+    db, user = db_session
+    db.add(
+        OAuthProvider(
+            provider_name="meta",
+            name="Meta",
+            client_id=encrypt_value("meta-client-id"),
+            client_secret=encrypt_value("meta-client-secret"),
+            auth_url="https://www.facebook.com/v25.0/dialog/oauth",
+            token_url="https://graph.facebook.com/v25.0/oauth/access_token",
+            redirect_uri="https://app.example.com/api/auth/meta/callback",
+            userinfo_url="https://graph.facebook.com/v25.0/me?fields=id,email",
+            user_id_path="id",
+            email_path="email",
+            default_scopes=["public_profile"],
+        )
+    )
+    oauth_account = UserOAuth(
+        user_id=user.id,
+        provider="facebook",
+        access_token="old-long-token",
+        refresh_token=None,
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        provider_user_id="meta-user-1",
+    )
+    db.add(oauth_account)
+    db.commit()
+
+    class RevokedAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def get(self, url, **kwargs):
+            return MockResponse(
+                {
+                    "error": {
+                        "message": "Error validating access token: Session has expired.",
+                        "type": "OAuthException",
+                        "code": 190,
+                    }
+                },
+                status_code=400,
+            )
+
+    monkeypatch.setattr(tool_config.httpx, "AsyncClient", RevokedAsyncClient)
+
+    with pytest.raises(tool_config._OAuthRefreshPermanentlyInvalid):
+        await tool_config.refresh_oauth_token_if_needed(db, oauth_account, "meta")
+
+
 def test_generic_oauth_batch_skips_non_oauth_app_and_connects_oauth_app(
     db_session, monkeypatch
 ):

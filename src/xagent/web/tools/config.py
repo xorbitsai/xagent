@@ -10,6 +10,7 @@ import copy
 import inspect
 import logging
 import os
+import random
 import re
 import shlex
 from dataclasses import dataclass, field
@@ -608,6 +609,217 @@ def _oauth_launch_config_mapping(
     raise _OAuthLaunchConfigInvalid(field="type")
 
 
+OAUTH_REFRESH_MAX_ATTEMPTS = 2
+OAUTH_REFRESH_RETRY_BASE_DELAY_SECONDS = 0.5
+# Only failures that guarantee the request body was never transmitted are
+# safe to retry blindly. A grant_type=refresh_token POST is not idempotent
+# on providers that rotate refresh tokens: if the server processed the
+# grant and issued a new refresh_token but the response was lost to a
+# ReadTimeout/WriteTimeout (request already sent, outcome unknown), a
+# retry would resend the now-stale refresh_token and get back a genuine
+# invalid_grant for a token that, moments ago, was perfectly valid --
+# indistinguishable from an actually-dead token and forcing an
+# unnecessary reconnect. A connect-phase failure never got that far, so
+# it's unconditionally safe to retry. A 5xx is conventionally treated the
+# same way (the provider's own signal that it didn't process the
+# request) -- not an absolute guarantee, but the standard assumption
+# behind retrying 5xx across virtually every HTTP client's default retry
+# policy, and a much narrower risk window than a timeout that could land
+# on either side of the provider actually persisting the grant.
+_OAUTH_REFRESH_RETRYABLE_EXCEPTIONS = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    # A proxy-handshake failure (e.g. an env-configured egress proxy,
+    # trust_env=True is httpx's default) means the request never reached
+    # the actual token endpoint either -- same "never transmitted"
+    # guarantee as ConnectError, just one hop earlier.
+    httpx.ProxyError,
+    # Timing out waiting for a free connection from the client's own pool
+    # happens before a single byte is written to the wire -- same
+    # guarantee again, and the likeliest of the four to actually fire in
+    # this function's own motivating scenario: a burst of concurrent
+    # refreshes contending for a still-small connection pool right after
+    # a cold start.
+    httpx.PoolTimeout,
+)
+
+
+async def _request_oauth_refresh_with_retries(
+    request: Callable[[], Awaitable[httpx.Response]],
+    *,
+    provider_name: str,
+) -> httpx.Response:
+    """Retry a token-endpoint request across transient failures that are
+    safe to resend -- see _OAUTH_REFRESH_RETRYABLE_EXCEPTIONS. Useful for
+    the cold-start network blip right after a container restart, when a
+    backlog of triggers firing at once produces a burst of concurrent
+    refreshes just as egress is still warming up. A 4xx is the provider's
+    definitive answer about this specific token; retrying cannot change
+    it, so it's returned immediately without spending a retry on it.
+    """
+    for attempt in range(OAUTH_REFRESH_MAX_ATTEMPTS):
+        is_last_attempt = attempt == OAUTH_REFRESH_MAX_ATTEMPTS - 1
+        try:
+            response = await request()
+            if response.status_code < 500 or is_last_attempt:
+                return response
+        except _OAUTH_REFRESH_RETRYABLE_EXCEPTIONS:
+            if is_last_attempt:
+                raise
+
+        # Jittered so a burst of concurrent refreshes (the exact scenario
+        # above) doesn't retry in lockstep and reproduce the same
+        # contention on the next attempt.
+        delay = OAUTH_REFRESH_RETRY_BASE_DELAY_SECONDS * (2**attempt)
+        delay += random.uniform(0, OAUTH_REFRESH_RETRY_BASE_DELAY_SECONDS)
+        logger.info(
+            "Retrying %s token refresh after a transient failure (attempt %s/%s)",
+            provider_name,
+            attempt + 2,
+            OAUTH_REFRESH_MAX_ATTEMPTS,
+        )
+        await asyncio.sleep(delay)
+
+    raise AssertionError("unreachable: the last attempt always returns or raises")
+
+
+# No error code is trusted globally across every provider -- not even RFC
+# 6749's invalid_grant. Per RFC 6749 section 5.2, invalid_grant also
+# covers a refresh token "issued to another client": a client-binding
+# mismatch that a shared OAuthProvider row's credential rotation can
+# trigger for every existing UserOAuth account at once (the new
+# client_id/secret get sent alongside a refresh_token issued under the
+# old ones), without any of those grants actually being dead -- the same
+# class of "one admin credential change mass-deletes every user's
+# connection" bug already fixed below for invalid_client/
+# unauthorized_client, just reachable through invalid_grant's more
+# overloaded RFC meaning instead of a missing-credential check.
+#
+# Only a provider's own unambiguous, non-standard dead-token vocabulary
+# is trusted, gated on provider_name (an unrelated provider -- including
+# a future one, or an admin-added custom OAuthProvider row with an
+# arbitrary token endpoint -- that coincidentally uses the same string
+# for a different, non-fatal reason can't be misread as a dead-token
+# signal). Meta's own OAuthException codes (190/102, normalized to the
+# string "invalid_grant" by oauth_provider_quirks.
+# meta_invalid_token_error_code) are Meta-specific and unambiguous, unlike
+# RFC 6749's own invalid_grant string, so they're listed here too rather
+# than trusted for every provider.
+_PROVIDER_DEAD_REFRESH_TOKEN_ERROR_CODES: dict[str, frozenset[str]] = {
+    # GitHub's classic OAuth Apps token endpoint reports a dead
+    # refresh_token via a 200 response with this code, not a 4xx.
+    "github": frozenset({"bad_refresh_token"}),
+    # Slack's Web API convention -- HTTP 200 with {"ok": false, "error":
+    # ...} -- applies to its oauth.v2.access refresh grant too, for
+    # workspaces with token rotation enabled.
+    "slack": frozenset({"invalid_refresh_token"}),
+    # See meta_invalid_token_error_code -- normalizes Meta's own
+    # OAuthException codes to this string.
+    "meta": frozenset({"invalid_grant"}),
+}
+
+
+class _OAuthRefreshPermanentlyInvalid(Exception):
+    """The provider (or our own stored config) confirms this connection's
+    refresh token is dead -- revoked, expired, or the token/config it needs
+    to refresh is simply missing -- as opposed to a transient failure
+    (timeout, network error, provider 5xx) that may well succeed on a later
+    retry. Only this case should cost the user their stored connection.
+    """
+
+
+def _oauth_refresh_error_code(
+    response: httpx.Response, provider_name: str
+) -> str | None:
+    """Best-effort OAuth ``error`` code from a failed refresh response body.
+
+    Most providers use the standard top-level string ``error`` field.
+    Meta's differently-shaped nested error object is normalized via
+    oauth_provider_quirks.meta_invalid_token_error_code -- gated on
+    provider_name so an unrelated provider whose error object happens to
+    carry the same type/code-shaped keys isn't misread as Meta's.
+    """
+    from ..oauth_provider_quirks import meta_invalid_token_error_code
+
+    try:
+        data = response.json()
+    except Exception:
+        # response.json() isn't guaranteed to raise only ValueError/
+        # JSONDecodeError -- a sufficiently pathological body (e.g. deeply
+        # nested enough to blow the parser's recursion limit) can raise
+        # something else entirely. This is a best-effort extraction either
+        # way, so any failure to parse means "no code", not a reason to
+        # let an exotic exception escape uncaught to the caller's generic
+        # handler and lose the status-code-bearing log line above it.
+        return None
+    if not data or not isinstance(data, Mapping):
+        return None
+    error = data.get("error")
+    if isinstance(error, str) and error:
+        return error
+    if provider_name.lower() == "meta":
+        return meta_invalid_token_error_code(error)
+    return None
+
+
+def _is_permanent_oauth_refresh_error(
+    provider_name: str, status_code: int, error_code: str | None
+) -> bool:
+    """Whether the provider's error body unambiguously says the refresh
+    token itself is dead. Any other failure (an unrecognized error code, a
+    malformed/absent body) is left to the caller as a transient failure --
+    see _OAuthRefreshPermanentlyInvalid.
+
+    A 5xx is excluded regardless of what the body claims: it's the
+    provider's own signal that something went wrong on its end, never
+    proof that this specific grant is dead (a proxy/gateway outage, or a
+    misbehaving custom/admin-configured token endpoint, could easily wrap
+    a stale cached or otherwise-unrelated error body in a 500). Every
+    other status is eligible, deliberately including 2xx: GitHub's classic
+    OAuth Apps token endpoint reports a dead refresh token (``{"error":
+    "bad_refresh_token"}``) via a 200 response rather than a 4xx, so
+    requiring 400/401 here would make that case unclassifiable no matter
+    what the caller checks.
+
+    See _PROVIDER_DEAD_REFRESH_TOKEN_ERROR_CODES for why no code
+    (including RFC 6749's own invalid_grant) is trusted for every
+    provider.
+    """
+    if status_code >= 500:
+        return False
+    return error_code in _PROVIDER_DEAD_REFRESH_TOKEN_ERROR_CODES.get(
+        provider_name.lower(), frozenset()
+    )
+
+
+def _log_and_classify_failed_refresh(
+    *, response: httpx.Response, provider_name: str
+) -> None:
+    """Log a failed refresh response and raise _OAuthRefreshPermanentlyInvalid
+    when its body confirms the refresh token itself is dead. Shared by
+    every response shape that means "this refresh did not produce a usable
+    access_token" -- a non-200 status, and a 200 status whose body still
+    lacks access_token (see _is_permanent_oauth_refresh_error).
+    """
+    # Providers occasionally echo something far longer than a short error
+    # code/slug into `error` -- capped to bound the resulting log line,
+    # reusing api/auth.py's own limit for provider-controlled
+    # token-endpoint text rather than a second, independently-tunable copy.
+    from ..api.auth import _OAUTH_ERROR_MESSAGE_LIMIT
+
+    error_code = _oauth_refresh_error_code(response, provider_name)
+    logger.error(
+        "Failed to refresh %s token (status %s, error=%s)",
+        provider_name,
+        response.status_code,
+        (error_code or "unknown")[:_OAUTH_ERROR_MESSAGE_LIMIT],
+    )
+    if _is_permanent_oauth_refresh_error(
+        provider_name, response.status_code, error_code
+    ):
+        raise _OAuthRefreshPermanentlyInvalid()
+
+
 async def refresh_oauth_token_if_needed(
     db: Any, oauth_account: Any, provider_name: str
 ) -> bool:
@@ -666,15 +878,18 @@ async def refresh_oauth_token_if_needed(
 
         if normalized_provider == "meta":
             async with httpx.AsyncClient() as client:
-                response = await client.get(
-                    provider_config.token_url,
-                    params={
-                        "grant_type": "fb_exchange_token",
-                        "client_id": client_id,
-                        "client_secret": client_secret,
-                        "fb_exchange_token": oauth_account.access_token,
-                    },
-                    timeout=10.0,
+                response = await _request_oauth_refresh_with_retries(
+                    lambda: client.get(
+                        provider_config.token_url,
+                        params={
+                            "grant_type": "fb_exchange_token",
+                            "client_id": client_id,
+                            "client_secret": client_secret,
+                            "fb_exchange_token": oauth_account.access_token,
+                        },
+                        timeout=10.0,
+                    ),
+                    provider_name=provider_name,
                 )
 
             if response.status_code == 200:
@@ -690,19 +905,24 @@ async def refresh_oauth_token_if_needed(
                         f"Successfully refreshed {provider_name} token for user {oauth_account.user_id}"
                     )
                     return True
-            else:
-                logger.error(
-                    "Failed to refresh %s token (status %s)",
-                    provider_name,
-                    response.status_code,
-                )
+            # Not a successful refresh -- a non-200 status, or (e.g. GitHub's
+            # classic OAuth Apps token endpoint reporting a dead
+            # refresh_token) a 200 whose body still lacks access_token.
+            _log_and_classify_failed_refresh(
+                response=response, provider_name=provider_name
+            )
             return False
 
         if not oauth_account.refresh_token:
+            # Unlike the provider-config checks above (which can self-heal
+            # once an admin fixes the OAuthProvider row, so are left as a
+            # transient False), a missing refresh_token is a property of
+            # this specific account row -- no retry will ever produce one,
+            # so this is permanent.
             logger.warning(
                 f"Token expired for {provider_name} but no refresh_token available."
             )
-            return False
+            raise _OAuthRefreshPermanentlyInvalid()
 
         data = {
             "grant_type": "refresh_token",
@@ -762,12 +982,15 @@ async def refresh_oauth_token_if_needed(
             # use-time validation of that same stored value.
             stored_instance_url = getattr(oauth_account, "instance_url", None)
             if not stored_instance_url:
+                # A per-account data problem (like the missing refresh_token
+                # check above), not a provider-config one -- retrying will
+                # never produce an instance_url, so this is permanent.
                 logger.warning(
                     f"Cannot refresh Deputy token for user "
                     f"{oauth_account.user_id}: no instance_url stored on "
                     "this connection."
                 )
-                return False
+                raise _OAuthRefreshPermanentlyInvalid()
             refresh_token_url = f"{stored_instance_url}/oauth/access_token"
 
         headers = {}
@@ -784,12 +1007,15 @@ async def refresh_oauth_token_if_needed(
             body_kwarg = {"json": data}
 
         async with httpx.AsyncClient() as client:
-            response = await client.post(
-                refresh_token_url,
-                headers=headers,
-                timeout=10.0,
-                **body_kwarg,
-                **post_kwargs,
+            response = await _request_oauth_refresh_with_retries(
+                lambda: client.post(
+                    refresh_token_url,
+                    headers=headers,
+                    timeout=10.0,
+                    **body_kwarg,
+                    **post_kwargs,
+                ),
+                provider_name=provider_name,
             )
 
         if response.status_code == 200:
@@ -847,13 +1073,13 @@ async def refresh_oauth_token_if_needed(
                     f"Successfully refreshed {provider_name} token for user {oauth_account.user_id}"
                 )
                 return True
-        else:
-            logger.error(
-                "Failed to refresh %s token (status %s)",
-                provider_name,
-                response.status_code,
-            )
+        # Not a successful refresh -- a non-200 status, or (e.g. GitHub's
+        # classic OAuth Apps token endpoint reporting a dead refresh_token)
+        # a 200 whose body still lacks access_token.
+        _log_and_classify_failed_refresh(response=response, provider_name=provider_name)
 
+    except _OAuthRefreshPermanentlyInvalid:
+        raise
     except Exception as e:
         logger.error(
             "Exception refreshing token for %s with %s",
@@ -3450,12 +3676,34 @@ class WebToolConfig(BaseToolConfig):
             oauth_account.expires_at,
         )
         account_id = int(oauth_account.id)
-        is_valid = await refresh_oauth_token_if_needed(
-            oauth_db,
-            oauth_account,
-            str(provider_name) if provider_name else "",
-        )
-        if not is_valid:
+        permanently_invalid = False
+        try:
+            is_valid = await refresh_oauth_token_if_needed(
+                oauth_db,
+                oauth_account,
+                str(provider_name) if provider_name else "",
+            )
+        except _OAuthRefreshPermanentlyInvalid:
+            is_valid = False
+            permanently_invalid = True
+
+        if not is_valid and not permanently_invalid:
+            # A transient failure (network error, timeout, provider outage)
+            # during refresh -- unlike a confirmed dead refresh token, this
+            # may well succeed the next time the connector is used, so the
+            # connection is kept rather than forcing the user to reconnect.
+            logger.warning(
+                "OAUTH CONFIG: Token for '%s' could not be refreshed due to "
+                "a transient error; keeping the connection for a later retry.",
+                provider_name,
+            )
+            oauth_db.rollback()
+            return _LegacyOAuthTokenResolution(
+                access_token=None,
+                refresh_failed=True,
+            )
+
+        if permanently_invalid:
             logger.warning(
                 "OAUTH CONFIG: Token for '%s' is invalid and could not be refreshed. "
                 "Deleting OAuth record to prompt user for reconnection.",

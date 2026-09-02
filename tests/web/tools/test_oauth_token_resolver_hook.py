@@ -953,10 +953,15 @@ async def test_unexpected_server_config_failure_retains_failure_and_later_server
 
 
 @pytest.mark.asyncio
-async def test_user_oauth_refresh_failure_retains_unavailable_and_deletes_invalid_record(
+async def test_user_oauth_refresh_transient_failure_retains_unavailable_without_deleting_record(
     db_session,
     monkeypatch,
 ):
+    """A refresh failure that doesn't confirm the refresh token is dead --
+    e.g. a network error, timeout, or provider outage -- must not delete the
+    connection: it may well succeed the next time it's used. See
+    _OAuthRefreshPermanentlyInvalid.
+    """
     db, user = db_session
     oauth_server = _add_oauth_server(db, user, launch_config=_launch_config())
     oauth_account = _add_user_oauth(
@@ -993,13 +998,116 @@ async def test_user_oauth_refresh_failure_retains_unavailable_and_deletes_invali
     assert "expired-secret-token" not in repr(configs[0])
     assert pending_app in db.new
     with isolated_session_factory() as verification_db:
-        assert verification_db.get(UserOAuth, account_id) is None
+        assert verification_db.get(UserOAuth, account_id) is not None
         assert (
             verification_db.query(PublicMCPApp)
             .filter(PublicMCPApp.app_id == pending_app.app_id)
             .first()
             is None
         )
+
+
+@pytest.mark.asyncio
+async def test_user_oauth_refresh_permanently_invalid_deletes_record(
+    db_session,
+    monkeypatch,
+):
+    """Only a confirmed-dead refresh token (_OAuthRefreshPermanentlyInvalid)
+    should cost the user their stored connection.
+    """
+    db, user = db_session
+    oauth_server = _add_oauth_server(db, user, launch_config=_launch_config())
+    oauth_account = _add_user_oauth(
+        db, user, provider="google", access_token="expired-secret-token"
+    )
+    account_id = oauth_account.id
+    isolated_session_factory = sessionmaker(
+        bind=db.get_bind(), autoflush=False, autocommit=False
+    )
+
+    async def fail_refresh(*args, **kwargs):
+        raise web_tools_config._OAuthRefreshPermanentlyInvalid()
+
+    monkeypatch.setattr(web_tools_config, "refresh_oauth_token_if_needed", fail_refresh)
+
+    configs = await _tool_config(
+        db, user, db_factory=isolated_session_factory
+    ).get_mcp_server_configs()
+
+    assert [config["name"] for config in configs] == ["Google Drive"]
+    _assert_unavailable_mcp_config(
+        configs[0],
+        oauth_server,
+        reason="oauth_token_refresh_failed",
+        oauth_token_required=True,
+    )
+    with isolated_session_factory() as verification_db:
+        assert verification_db.get(UserOAuth, account_id) is None
+
+
+@pytest.mark.asyncio
+async def test_user_oauth_refresh_generic_invalid_grant_retains_row(
+    db_session, monkeypatch
+):
+    """RFC 6749 section 5.2's invalid_grant also covers a refresh token
+    "issued to another client" -- reachable if a shared OAuthProvider
+    row's client_id/secret get rotated while an existing UserOAuth row
+    still holds a refresh_token issued under the old ones. A generic
+    (non-github/slack/meta) invalid_grant must not be trusted as proof
+    THIS account's grant is dead end-to-end through the real resolver, or
+    one credential rotation would mass-delete every user's connection to
+    that provider."""
+    db, user = db_session
+    db.add(
+        OAuthProvider(
+            provider_name="google",
+            name="Google",
+            client_id=encrypt_value("rotated-client-id"),
+            client_secret=encrypt_value("rotated-client-secret"),
+            auth_url="https://accounts.google.com/o/oauth2/v2/auth",
+            token_url="https://oauth2.googleapis.com/token",
+        )
+    )
+    oauth_server = _add_oauth_server(db, user, launch_config=_launch_config())
+    oauth_account = _add_user_oauth(
+        db, user, provider="google", access_token="old-token"
+    )
+    oauth_account.refresh_token = "refresh-token-issued-under-old-client"
+    oauth_account.expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+    account_id = oauth_account.id
+    db.commit()
+
+    isolated_session_factory = sessionmaker(
+        bind=db.get_bind(), autoflush=False, autocommit=False
+    )
+
+    class RotatedCredentialAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        async def post(self, *args, **kwargs):
+            return httpx.Response(400, json={"error": "invalid_grant"})
+
+    monkeypatch.setattr(
+        web_tools_config.httpx, "AsyncClient", RotatedCredentialAsyncClient
+    )
+
+    configs = await _tool_config(
+        db, user, db_factory=isolated_session_factory
+    ).get_mcp_server_configs()
+
+    assert [config["name"] for config in configs] == ["Google Drive"]
+    _assert_unavailable_mcp_config(
+        configs[0],
+        oauth_server,
+        reason="oauth_token_refresh_failed",
+        oauth_token_required=True,
+    )
+    with isolated_session_factory() as verification_db:
+        assert verification_db.get(UserOAuth, account_id) is not None
 
 
 @pytest.mark.asyncio
@@ -1091,8 +1199,8 @@ async def test_user_oauth_refresh_failure_logs_only_safe_metadata(
     exception_secret = "transport-exception-secret-token"
     db.add(
         OAuthProvider(
-            provider_name="google",
-            name="Google",
+            provider_name="github",
+            name="GitHub",
             client_id=encrypt_value("client-id-secret"),
             client_secret=encrypt_value("client-secret-value"),
             auth_url="https://auth.example/authorize",
@@ -1100,7 +1208,7 @@ async def test_user_oauth_refresh_failure_logs_only_safe_metadata(
         )
     )
     oauth_account = _add_user_oauth(
-        db, user, provider="google", access_token="expired-access-secret"
+        db, user, provider="github", access_token="expired-access-secret"
     )
     oauth_account.refresh_token = "refresh-secret-value"
     oauth_account.expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
@@ -1119,7 +1227,7 @@ async def test_user_oauth_refresh_failure_logs_only_safe_metadata(
             return httpx.Response(
                 400,
                 json={
-                    "error": "invalid_grant",
+                    "error": "bad_refresh_token",
                     "error_description": response_secret,
                     "access_token": "leaked-response-access-token",
                 },
@@ -1132,16 +1240,336 @@ async def test_user_oauth_refresh_failure_logs_only_safe_metadata(
     )
 
     with caplog.at_level(logging.ERROR):
-        is_valid = await web_tools_config.refresh_oauth_token_if_needed(
-            db, oauth_account, "google"
-        )
+        if failure_kind == "response":
+            # GitHub's own confirmed-dead bad_refresh_token is a permanent
+            # failure (see _OAuthRefreshPermanentlyInvalid) and is
+            # signalled by raising, not by returning False, so the caller
+            # knows to drop the connection instead of retrying it later.
+            with pytest.raises(web_tools_config._OAuthRefreshPermanentlyInvalid):
+                await web_tools_config.refresh_oauth_token_if_needed(
+                    db, oauth_account, "github"
+                )
+        else:
+            is_valid = await web_tools_config.refresh_oauth_token_if_needed(
+                db, oauth_account, "github"
+            )
+            assert is_valid is False
 
-    assert is_valid is False
     assert response_secret not in caplog.text
     assert exception_secret not in caplog.text
     assert "leaked-response-access-token" not in caplog.text
     assert "client-secret-value" not in caplog.text
     assert "refresh-secret-value" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(400, json={"error": ""}),
+        httpx.Response(400, json={}),
+        httpx.Response(400, json=[]),
+        httpx.Response(400, json="not a mapping"),
+        httpx.Response(400, content=b"not json"),
+    ],
+)
+def test_oauth_refresh_error_code_rejects_malformed_bodies(response):
+    """An empty/absent `error`, a non-dict JSON body (list/string), or a
+    non-JSON body must all resolve to "no error code extracted" rather than
+    a falsy-but-truthy value (e.g. "") that would defeat the `error_code or
+    "unknown"` logging fallback or accidentally satisfy an `in` check
+    against _PROVIDER_DEAD_REFRESH_TOKEN_ERROR_CODES."""
+    assert web_tools_config._oauth_refresh_error_code(response, "google") is None
+
+
+def test_oauth_refresh_error_code_swallows_non_value_error_parse_failures():
+    """response.json() isn't guaranteed to raise only ValueError -- a
+    pathological body (e.g. deeply nested enough to hit the parser's
+    recursion limit) can raise something else entirely. Catching only
+    ValueError would let that escape uncaught to the caller's generic
+    exception handler, losing the status-code-bearing log line this
+    function's caller emits."""
+
+    class ExplodingJsonResponse:
+        def json(self):
+            raise RecursionError("maximum recursion depth exceeded")
+
+    assert (
+        web_tools_config._oauth_refresh_error_code(ExplodingJsonResponse(), "google")
+        is None
+    )
+
+
+def test_oauth_refresh_error_code_gates_meta_shape_on_provider():
+    """Meta's nested-error-object normalization must only apply when the
+    caller is actually refreshing a Meta connection -- an unrelated
+    provider whose error body happens to carry the same {"type":
+    "OAuthException", "code": 190} shape must not be misread as Meta's
+    "access token is invalid/expired" signal."""
+    response = httpx.Response(
+        400, json={"error": {"type": "OAuthException", "code": 190}}
+    )
+    assert web_tools_config._oauth_refresh_error_code(response, "meta") == (
+        "invalid_grant"
+    )
+    assert web_tools_config._oauth_refresh_error_code(response, "google") is None
+
+
+@pytest.mark.asyncio
+async def test_refresh_unknown_provider_is_transient(db_session):
+    """No OAuthProvider row for this provider name is an admin-fixable
+    config problem (the row was never created, or was deleted), not
+    evidence this account's refresh token is dead -- must not raise
+    _OAuthRefreshPermanentlyInvalid, unlike a confirmed-dead token."""
+    db, user = db_session
+    oauth_account = UserOAuth(
+        user_id=user.id,
+        provider="not-a-configured-provider",
+        access_token="old-token",
+        refresh_token="old-refresh",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        provider_user_id="42",
+    )
+    db.add(oauth_account)
+    db.commit()
+
+    assert (
+        await web_tools_config.refresh_oauth_token_if_needed(
+            db, oauth_account, "not-a-configured-provider"
+        )
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_refresh_missing_provider_credentials_is_transient(
+    db_session, monkeypatch
+):
+    """A provider row with no client_id/client_secret (and no env-var
+    fallback) is the same admin-fixable config problem as an unknown
+    provider -- must not raise _OAuthRefreshPermanentlyInvalid.
+
+    Deletes the actual fallback env vars (_resolve_oauth_secret /
+    _oauth_env_name resolve "google" + "CLIENT_ID" to plain
+    GOOGLE_CLIENT_ID, not an XAGENT_-prefixed name) and asserts via an
+    exploding AsyncClient that the missing-credentials early return is
+    genuinely what's under test -- a real GOOGLE_CLIENT_ID/SECRET present
+    in a developer or Docker environment would otherwise resolve real
+    credentials and build an unmocked HTTP client, making this pass or
+    fail for ambient reasons instead of exercising the code path at all.
+    """
+    db, user = db_session
+    monkeypatch.delenv("GOOGLE_CLIENT_ID", raising=False)
+    monkeypatch.delenv("GOOGLE_CLIENT_SECRET", raising=False)
+    db.add(
+        OAuthProvider(
+            provider_name="google",
+            name="Google",
+            client_id="",
+            client_secret="",
+            auth_url="https://accounts.google.com/o/oauth2/v2/auth",
+            token_url="https://oauth2.googleapis.com/token",
+            redirect_uri="https://app.example.com/api/auth/google/callback",
+            userinfo_url="https://openidconnect.googleapis.com/v1/userinfo",
+            user_id_path="sub",
+            email_path="email",
+            default_scopes=["email"],
+        )
+    )
+    oauth_account = UserOAuth(
+        user_id=user.id,
+        provider="google",
+        access_token="old-token",
+        refresh_token="old-refresh",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        provider_user_id="42",
+    )
+    db.add(oauth_account)
+    db.commit()
+
+    class ExplodingAsyncClient:
+        def __call__(self, *args, **kwargs):
+            raise AssertionError(
+                "refresh_oauth_token_if_needed must not open an HTTP client "
+                "when provider credentials are missing"
+            )
+
+    monkeypatch.setattr(web_tools_config.httpx, "AsyncClient", ExplodingAsyncClient())
+
+    assert (
+        await web_tools_config.refresh_oauth_token_if_needed(
+            db, oauth_account, "google"
+        )
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_refresh_5xx_with_oauth_shaped_body_is_transient(db_session, monkeypatch):
+    """A 5xx is the provider's own signal that something went wrong on its
+    end -- e.g. a proxy/gateway outage, or a misbehaving custom/admin-
+    configured token endpoint -- never proof that this specific grant is
+    dead. It must stay transient even if its body happens to carry an
+    otherwise-recognized permanent error code.
+
+    Uses GitHub + bad_refresh_token (a code that IS in
+    _PROVIDER_DEAD_REFRESH_TOKEN_ERROR_CODES for this provider) rather than
+    a generic provider + invalid_grant: since generic invalid_grant is
+    never trusted for any provider regardless of status (see
+    test_user_oauth_refresh_generic_invalid_grant_retains_row), that
+    combination would pass this assertion even if the status_code >= 500
+    guard were removed entirely, silently testing nothing about the 5xx
+    exclusion itself.
+    """
+    db, user = db_session
+    db.add(
+        OAuthProvider(
+            provider_name="github",
+            name="GitHub",
+            client_id=encrypt_value("client-id-secret"),
+            client_secret=encrypt_value("client-secret-value"),
+            auth_url="https://auth.example/authorize",
+            token_url="https://auth.example/token",
+        )
+    )
+    oauth_account = _add_user_oauth(
+        db, user, provider="github", access_token="expired-access-secret"
+    )
+    oauth_account.refresh_token = "refresh-secret-value"
+    oauth_account.expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+    db.commit()
+
+    class FiveHundredAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        async def post(self, *args, **kwargs):
+            return httpx.Response(502, json={"error": "bad_refresh_token"})
+
+    monkeypatch.setattr(
+        web_tools_config.httpx,
+        "AsyncClient",
+        FiveHundredAsyncClient,
+    )
+
+    assert (
+        await web_tools_config.refresh_oauth_token_if_needed(
+            db, oauth_account, "github"
+        )
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_refresh_slack_style_200_invalid_refresh_token_is_permanent(
+    db_session, monkeypatch
+):
+    """Slack's Web API convention -- HTTP 200 with {"ok": false, "error":
+    ...} -- applies to its oauth.v2.access refresh grant too (for
+    workspaces with token rotation enabled). invalid_refresh_token is
+    Slack's non-standard equivalent of invalid_grant/bad_refresh_token and
+    must still raise _OAuthRefreshPermanentlyInvalid despite the 200
+    status, the same way GitHub's bad_refresh_token does."""
+    db, user = db_session
+    db.add(
+        OAuthProvider(
+            provider_name="slack",
+            name="Slack",
+            client_id=encrypt_value("slack-client-id"),
+            client_secret=encrypt_value("slack-client-secret"),
+            auth_url="https://slack.com/oauth/v2/authorize",
+            token_url="https://slack.com/api/oauth.v2.access",
+        )
+    )
+    oauth_account = UserOAuth(
+        user_id=user.id,
+        provider="slack",
+        access_token="old-token",
+        refresh_token="old-refresh",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        provider_user_id="42",
+    )
+    db.add(oauth_account)
+    db.commit()
+
+    class SlackAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        async def post(self, *args, **kwargs):
+            return httpx.Response(
+                200, json={"ok": False, "error": "invalid_refresh_token"}
+            )
+
+    monkeypatch.setattr(
+        web_tools_config.httpx,
+        "AsyncClient",
+        SlackAsyncClient,
+    )
+
+    with pytest.raises(web_tools_config._OAuthRefreshPermanentlyInvalid):
+        await web_tools_config.refresh_oauth_token_if_needed(db, oauth_account, "slack")
+
+
+@pytest.mark.asyncio
+async def test_refresh_provider_specific_dead_token_codes_are_gated_by_provider(
+    db_session, monkeypatch
+):
+    """bad_refresh_token/invalid_refresh_token are GitHub's/Slack's own
+    non-standard vocabulary, not a generic OAuth2 code -- an unrelated
+    provider that happens to return one of these strings for a different,
+    non-fatal reason must not be misread as a dead-token signal, the same
+    way Meta's differently-shaped error object is gated on provider_name
+    rather than trusted for any provider."""
+    db, user = db_session
+    db.add(
+        OAuthProvider(
+            provider_name="google",
+            name="Google",
+            client_id=encrypt_value("client-id-secret"),
+            client_secret=encrypt_value("client-secret-value"),
+            auth_url="https://auth.example/authorize",
+            token_url="https://auth.example/token",
+        )
+    )
+    oauth_account = UserOAuth(
+        user_id=user.id,
+        provider="google",
+        access_token="old-token",
+        refresh_token="old-refresh",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        provider_user_id="42",
+    )
+    db.add(oauth_account)
+    db.commit()
+
+    class GoogleAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        async def post(self, *args, **kwargs):
+            return httpx.Response(400, json={"error": "bad_refresh_token"})
+
+    monkeypatch.setattr(
+        web_tools_config.httpx,
+        "AsyncClient",
+        GoogleAsyncClient,
+    )
+
+    assert (
+        await web_tools_config.refresh_oauth_token_if_needed(
+            db, oauth_account, "google"
+        )
+        is False
+    )
 
 
 @pytest.mark.asyncio

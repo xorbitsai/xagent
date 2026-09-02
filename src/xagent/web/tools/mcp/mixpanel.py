@@ -590,7 +590,11 @@ def mixpanel_export_events(
     events itself (via the API's own `limit` param) and additionally
     enforces that cap client-side, reporting row_limit_reached=true if more
     were available -- narrow the date range or add event/where filters to
-    see the rest.
+    see the rest. stream_error=true instead means the connection broke or
+    returned a malformed line partway through -- the returned events are
+    only what was successfully read before that point, not a complete
+    answer for the requested range even though row_limit_reached is false;
+    retry the same call to get the rest.
     event: an optional single event name to filter by.
     where: an optional Mixpanel expression to filter events by.
     """
@@ -615,6 +619,7 @@ def mixpanel_export_events(
         )
         events: list[Any] = []
         row_limit_reached = False
+        stream_error = False
         # Streamed rather than buffered whole: the `limit` param above asks
         # Mixpanel to cap the export server-side, but this is the actual
         # enforcement -- iterating line-by-line and stopping (closing the
@@ -637,21 +642,29 @@ def mixpanel_export_events(
                     # can split a chunk boundary mid-record) -- is treated
                     # as the effective end of the stream rather than
                     # discarding every event already parsed by letting this
-                    # propagate to the outer except below.
+                    # propagate to the outer except below. Tracked as a
+                    # distinct signal from row_limit_reached: this stopped
+                    # because the stream broke, not because the requested
+                    # range was fully covered up to the row cap, and a
+                    # caller conflating the two would wrongly read a
+                    # truncated result as "the complete answer."
+                    stream_error = True
                     break
         # No "count" field: success_with_capped_dict can still halve
         # `events` further if the JSON payload built here exceeds the
         # platform's own output-size cap, which would leave a
         # precomputed count out of sync with the array actually returned.
-        # Its own "truncated" flag (size-driven) plus row_limit_reached
-        # (this function's own MAX_EXPORT_EVENTS cap) are the two signals
-        # that actually stay accurate; len(events) is trivial for a caller
-        # to derive from the array itself.
+        # Its own "truncated" flag (size-driven), row_limit_reached (this
+        # function's own MAX_EXPORT_EVENTS cap), and stream_error (an
+        # abnormal mid-stream stop) are the signals that stay accurate;
+        # len(events) is trivial for a caller to derive from the array
+        # itself.
         return success_with_capped_dict(
             "events",
             {
                 "events": events,
                 "row_limit_reached": row_limit_reached,
+                "stream_error": stream_error,
             },
         )
     except Exception as e:

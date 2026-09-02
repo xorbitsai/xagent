@@ -806,6 +806,7 @@ def test_export_events_parses_ndjson_and_caps_result(monkeypatch):
     assert result["status"] == "success"
     assert len(result["events"]["events"]) == 3
     assert result["events"]["row_limit_reached"] is False
+    assert result["events"]["stream_error"] is False
     assert result["events"]["events"][0] == {"event": "Signup", "n": 0}
     # No "count" field: it would go stale if success_with_capped_dict's own
     # size-based capping halves the list further after this point.
@@ -830,6 +831,7 @@ def test_export_events_truncates_at_max_events(monkeypatch):
 
     assert len(result["events"]["events"]) == mixpanel.MAX_EXPORT_EVENTS
     assert result["events"]["row_limit_reached"] is True
+    assert result["events"]["stream_error"] is False
 
 
 def test_export_events_treats_malformed_trailing_line_as_end_of_stream(monkeypatch):
@@ -849,6 +851,11 @@ def test_export_events_treats_malformed_trailing_line_as_end_of_stream(monkeypat
 
     assert result["status"] == "success"
     assert len(result["events"]["events"]) == 3
+    # Distinct from row_limit_reached: this stopped because the stream
+    # broke, not because MAX_EXPORT_EVENTS was hit -- a caller must not
+    # read this partial result as "the complete answer for the range."
+    assert result["events"]["row_limit_reached"] is False
+    assert result["events"]["stream_error"] is True
 
 
 def test_export_events_uses_export_host_and_encodes_event_filter(monkeypatch):

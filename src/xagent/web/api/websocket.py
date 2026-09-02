@@ -3119,6 +3119,7 @@ def _finalize_resumed_task(
     """
     from ..models.agent import Agent
     from ..services.chat_history_service import persist_assistant_message_no_commit
+    from ..services.task_orchestrator import TERMINAL_TASK_STATUSES
 
     finalized: dict[str, Any] = {
         "task_title": None,
@@ -3255,10 +3256,7 @@ def _finalize_resumed_task(
         finalized["lease_released"] = True
         finalized["final_status"] = final_task_status.value
         finalized["control_event_state"] = control_snapshot.as_dict()
-        if turn_id is not None and final_task_status in {
-            TaskStatus.COMPLETED,
-            TaskStatus.FAILED,
-        }:
+        if turn_id is not None and final_task_status in TERMINAL_TASK_STATUSES:
             try:
                 from ..services.connector_runtime import pop_ephemeral_runtime_values
 
@@ -4173,6 +4171,14 @@ async def execute_resume_background(
                     and not lease_released
                     and not defer_db_cleanup_to_ttl_recovery
                 ):
+                    # When this IS deferred, _finalize_resumed_task's
+                    # turn_id-scoped pop never runs for this turn - and
+                    # cannot safely run here either, for the same reason as
+                    # task_orchestrator.py's matching branch: this coroutine
+                    # does not know whether the task will land on a terminal
+                    # status or resume again under this same turn_id.
+                    # connector_runtime.py's _EPHEMERAL_RUNTIME_TTL_SECONDS
+                    # bounds that leak instead.
                     try:
                         settled = await run_db_io_cancellation_safe(
                             lambda: _settle_resumed_task_lease(

@@ -129,6 +129,17 @@ _APPENDABLE_STATUSES = (
     TaskStatus.PAUSED,
 )
 
+# A turn's outcome that ends here for good, as opposed to WAITING_FOR_USER/
+# PAUSED (the same turn resuming again later under the same turn_id) - the
+# single source of truth for "is this outcome terminal" so a future status
+# added to the finished/not-finished distinction only needs one edit. Every
+# ``finish_turn`` branch that pops a turn's ephemeral connector secrets
+# (COMPLETED, FAILED, RUNNING-fallback) commits into this set by
+# construction; ``_finalize_resumed_task`` (websocket.py), the separate
+# finalizer for the resume path, checks its own computed outcome against it
+# directly since resume has no matching branch structure to fall out of.
+TERMINAL_TASK_STATUSES = frozenset({TaskStatus.COMPLETED, TaskStatus.FAILED})
+
 
 def timezone_schedule_context(timezone: str | None) -> dict[str, Any] | None:
     """Build the schedule ``context`` carrying the caller's clock timezone.
@@ -2058,6 +2069,14 @@ def _schedule_bg(
                     )
 
                 if not defer_settlement_to_ttl_recovery:
+                    # When this IS deferred (lease lost, DB pool exhaustion,
+                    # unhealthy heartbeat), finish_turn's turn_id-scoped pop
+                    # below never runs for this turn - and cannot safely run
+                    # here either: this coroutine deliberately does not know
+                    # (and must not guess by querying) whether the task will
+                    # land on a terminal status or resume again under this
+                    # same turn_id. connector_runtime.py's
+                    # _EPHEMERAL_RUNTIME_TTL_SECONDS bounds that leak instead.
                     lease_settled = False
                     try:
                         settled = await run_db_io_cancellation_safe(

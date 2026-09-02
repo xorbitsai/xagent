@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from threading import RLock
@@ -112,8 +113,38 @@ class _ConnectorRuntimeResolverRegistration:
 # through the resolver hook or a deployment-owned distributed secret store.
 _EPHEMERAL_RUNTIME_VALUES: dict[str, dict[str, Any]] = {}
 _EPHEMERAL_RUNTIME_MANIFESTS: dict[str, dict[str, dict[str, set[str]]]] = {}
+_EPHEMERAL_RUNTIME_STORED_AT: dict[str, float] = {}
 _EPHEMERAL_RUNTIME_VALUES_LOCK = RLock()
 _RUNTIME_RESOLVER_REGISTRATION: _ConnectorRuntimeResolverRegistration | None = None
+
+# Not a real interaction deadline - production already allows a native
+# waiting-for-user interaction to stay open for up to
+# task_interaction_service.py's _MAX_INTERACTION_TTL_SECONDS (7 days), so
+# this has to be at least that generous to never clip a legitimate pause.
+# Its only job is to turn what would otherwise be a permanent leak into a
+# bounded one: task_orchestrator.py's and websocket.py's deferred-to-TTL-
+# recovery branches (lease lost, DB pool exhaustion, unhealthy heartbeat at
+# shutdown) cannot safely pop a turn's secrets themselves, because at the
+# point they bail out they genuinely do not know whether the task will land
+# on a terminal status or resume again under the same turn_id - and
+# task_lease_recovery.py's batch sweep, which does later decide that,
+# has no way to look up which turn_id belongs to which recovered task_id.
+_EPHEMERAL_RUNTIME_TTL_SECONDS = 7 * 24 * 3600
+
+
+def _prune_expired_ephemeral_runtime_values_locked() -> None:
+    """Evict stale entries. Caller must hold _EPHEMERAL_RUNTIME_VALUES_LOCK."""
+
+    now = time.monotonic()
+    stale_turn_ids = [
+        turn_id
+        for turn_id, stored_at in _EPHEMERAL_RUNTIME_STORED_AT.items()
+        if now - stored_at > _EPHEMERAL_RUNTIME_TTL_SECONDS
+    ]
+    for turn_id in stale_turn_ids:
+        _EPHEMERAL_RUNTIME_VALUES.pop(turn_id, None)
+        _EPHEMERAL_RUNTIME_MANIFESTS.pop(turn_id, None)
+        _EPHEMERAL_RUNTIME_STORED_AT.pop(turn_id, None)
 
 
 def set_connector_runtime_resolver(
@@ -200,13 +231,20 @@ def store_ephemeral_runtime_values(
         for ref, sections in values_by_ref.items()
     }
     with _EPHEMERAL_RUNTIME_VALUES_LOCK:
+        # Opportunistic reaper: there is no dedicated background sweep for
+        # this process-local store, so each new store is what eventually
+        # reclaims an entry a settlement path could never safely pop (see
+        # _EPHEMERAL_RUNTIME_TTL_SECONDS above).
+        _prune_expired_ephemeral_runtime_values_locked()
         _EPHEMERAL_RUNTIME_VALUES[turn_id] = encoded
         _EPHEMERAL_RUNTIME_MANIFESTS[turn_id] = manifest
+        _EPHEMERAL_RUNTIME_STORED_AT[turn_id] = time.monotonic()
 
 
 def pop_ephemeral_runtime_values(turn_id: str) -> dict[str, Any] | None:
     with _EPHEMERAL_RUNTIME_VALUES_LOCK:
         _EPHEMERAL_RUNTIME_MANIFESTS.pop(turn_id, None)
+        _EPHEMERAL_RUNTIME_STORED_AT.pop(turn_id, None)
         return _EPHEMERAL_RUNTIME_VALUES.pop(turn_id, None)
 
 

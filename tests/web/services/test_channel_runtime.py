@@ -947,6 +947,7 @@ async def test_prepare_channel_task_keeps_event_loop_responsive(
         task_id=11,
         is_new_task=False,
         lease=TaskLease(task_id=11, runner_id="runner-a", run_id="run-a"),
+        prior_status=TaskStatus.RUNNING,
     )
     managed = object()
 
@@ -1197,6 +1198,7 @@ async def test_prepare_channel_task_compensates_late_claim_before_cancellation(
         task_id=19,
         is_new_task=True,
         lease=TaskLease(task_id=19, runner_id="runner-a", run_id="run-a"),
+        prior_status=TaskStatus.PENDING,
     )
     compensated: list[channel_runtime._ChannelTaskClaimSnapshot] = []
 

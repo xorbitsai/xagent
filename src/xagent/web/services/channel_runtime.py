@@ -107,7 +107,16 @@ class ClaimedChannelTask:
     # use this to tell a genuine resume-from-pause apart from an ordinary
     # continuing message, e.g. to decide whether a cached agent's connector
     # runtime tools actually need refreshing.
-    prior_status: TaskStatus = TaskStatus.PENDING
+    #
+    # No default: a construction site that forgets this must fail loudly
+    # (see __post_init__) rather than silently getting a value that can
+    # never equal PAUSED/WAITING_FOR_USER, which would just as silently
+    # disable the refresh-on-resume check every consumer runs against it.
+    prior_status: TaskStatus | None = None
+
+    def __post_init__(self) -> None:
+        if self.prior_status is None:
+            raise ValueError("ClaimedChannelTask requires an explicit prior_status")
 
 
 @dataclass(frozen=True)
@@ -119,7 +128,14 @@ class _ChannelTaskClaimSnapshot:
     is_new_task: bool
     lease: TaskLease
     requested_agent_missing: bool = False
-    prior_status: TaskStatus = TaskStatus.PENDING
+    # See ClaimedChannelTask.prior_status: no default, for the same reason.
+    prior_status: TaskStatus | None = None
+
+    def __post_init__(self) -> None:
+        if self.prior_status is None:
+            raise ValueError(
+                "_ChannelTaskClaimSnapshot requires an explicit prior_status"
+            )
 
 
 @dataclass(frozen=True)

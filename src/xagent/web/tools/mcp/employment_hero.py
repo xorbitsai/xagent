@@ -43,8 +43,13 @@ def _headers() -> dict[str, str]:
 def _extract_error_detail(response: requests.Response) -> str | None:
     """Pull the human-readable message out of an Employment Hero error body.
 
-    Returns None if the body isn't in the expected shape, so the caller can
-    fall back to the raw response text.
+    Employment Hero's API reference documents `error` as a top-level message
+    container and `errors` as an array of per-field validation details (see
+    https://developer.employmenthero.com/api-references/introduction) --
+    a validation failure can carry only `errors`, with no `message`/`error`
+    string, so this also unpacks that shape rather than only the top-level
+    fields. Returns None if the body isn't in any recognized shape, so the
+    caller can fall back to the raw response text.
     """
     try:
         payload = response.json()
@@ -53,7 +58,21 @@ def _extract_error_detail(response: requests.Response) -> str | None:
     if not isinstance(payload, dict):
         return None
     message = payload.get("message") or payload.get("error")
-    return message if isinstance(message, str) and message else None
+    if isinstance(message, str) and message:
+        return message
+    errors = payload.get("errors")
+    if isinstance(errors, list) and errors:
+        first = errors[0]
+        detail = first.get("message") if isinstance(first, dict) else first
+        if isinstance(detail, str) and detail:
+            return detail
+    elif isinstance(errors, dict) and errors:
+        field, detail = next(iter(errors.items()))
+        if isinstance(detail, list) and detail:
+            detail = detail[0]
+        if isinstance(detail, str) and detail:
+            return f"{field}: {detail}"
+    return None
 
 
 def _request(

@@ -49,6 +49,53 @@ def test_request_raises_with_structured_message(monkeypatch):
     assert "401" in str(excinfo.value)
 
 
+def test_request_raises_with_errors_list_of_dicts(monkeypatch):
+    monkeypatch.setattr(
+        employment_hero.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                status_code=422,
+                json_data={"errors": [{"message": "date is required"}]},
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="date is required"):
+        employment_hero._request("GET", "/organisations")
+
+
+def test_request_raises_with_errors_list_of_strings(monkeypatch):
+    monkeypatch.setattr(
+        employment_hero.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                status_code=422, json_data={"errors": ["date is required"]}
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="date is required"):
+        employment_hero._request("GET", "/organisations")
+
+
+def test_request_raises_with_errors_dict_of_field_to_list(monkeypatch):
+    monkeypatch.setattr(
+        employment_hero.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                status_code=422,
+                json_data={"errors": {"date": ["is required"]}},
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="date: is required"):
+        employment_hero._request("GET", "/organisations")
+
+
 def test_request_falls_back_to_raw_text_for_unstructured_error_body(monkeypatch):
     monkeypatch.setattr(
         employment_hero.requests,

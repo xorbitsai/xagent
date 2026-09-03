@@ -417,6 +417,19 @@ def test_update_resource_rejects_an_empty_get_response(monkeypatch):
     mock_request.assert_called_once()  # the GET only -- no PUT attempted
 
 
+def test_update_resource_rejects_a_non_dict_get_response(monkeypatch):
+    # A truthy non-dict (e.g. a bare list) passes `not current` alone --
+    # must still be rejected with the same clear message, not left to blow
+    # up as an opaque TypeError at the dict-spread merge below.
+    mock_request = Mock(return_value=MockResponse(json_data=[1, 2, 3]))
+    monkeypatch.setattr(myob.requests, "request", mock_request)
+
+    with pytest.raises(RuntimeError, match="no existing record"):
+        myob._update_resource("Contact/Customer/", "c1", {"CompanyName": "New Name"})
+
+    mock_request.assert_called_once()  # the GET only -- no PUT attempted
+
+
 def test_update_supplier_merges_fetched_record_with_changes(monkeypatch):
     current = {"UID": "s1", "CompanyName": "Old Supplier", "RowVersion": "abc=="}
     updated = {**current, "CompanyName": "New Supplier"}

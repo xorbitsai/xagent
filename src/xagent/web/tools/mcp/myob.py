@@ -246,13 +246,16 @@ def _update_resource(path: str, uid: str, fields: dict[str, Any]) -> dict[str, A
     """
     safe_uid = url_path_id(uid, "uid")
     current = _request("GET", f"{path}{safe_uid}/")
-    # Rejects an empty dict too, not just a non-dict -- _request returns {}
-    # on a 204/empty response, and {} would otherwise pass straight through
-    # to `merged = {**{}, **fields}` below, silently wiping every field
-    # this record has other than the ones the caller named (including
+    # Both checks needed, not just one: `not current` alone lets a truthy
+    # non-dict (e.g. a bare list) through, which would blow up as an opaque
+    # TypeError at the dict-spread below instead of this clear message;
+    # `isinstance` alone lets an empty {} through -- _request returns {} on
+    # a 204/empty response, and {} would otherwise pass straight through to
+    # `merged = {**{}, **fields}` below, silently wiping every field this
+    # record has other than the ones the caller named (including
     # RowVersion, which MYOB needs back on the PUT for optimistic
     # concurrency).
-    if not current:
+    if not current or not isinstance(current, dict):
         raise RuntimeError(f"MYOB returned no existing record for uid {uid}")
     merged = {**current, **fields}
     response = _raw_request(

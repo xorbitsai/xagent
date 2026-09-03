@@ -32,6 +32,10 @@ from xagent.core.agent.language import (
 )
 from xagent.core.agent.utils.context_builder import ContextBuilder
 from xagent.core.context_ref import CONTEXT_REFS_KEY, SUPERSEDES_SCOPE_KEY
+from xagent.core.model.chat.types import (
+    CONTENT_SOURCE_KEY,
+    CONTENT_SOURCE_REASONING_FALLBACK,
+)
 from xagent.web.user_isolated_memory import current_user_id
 
 
@@ -629,7 +633,7 @@ def test_get_messages_for_llm_filters_hidden_and_truncates() -> None:
     result = ctx.get_messages_for_llm(max_tokens=4)
     assert result[0]["role"] == "system"
     assert result[0]["content"].startswith("You are helpful")
-    assert "Current date and time:" in result[0]["content"]
+    assert "Turn started at:" in result[0]["content"]
     # Max tokens = 4 should keep only last assistant message (3 tokens)
     assert len(result) == 2
     assert result[-1]["content"] == "visible-3"
@@ -642,7 +646,7 @@ def test_get_messages_for_llm_injects_time_context_without_system_prompt() -> No
     result = ctx.get_messages_for_llm()
 
     assert result[0]["role"] == "system"
-    assert "Current date and time:" in result[0]["content"]
+    assert "Turn started at:" in result[0]["content"]
     assert "relative dates" in result[0]["content"]
     assert result[1] == {"role": "user", "content": "what happened recently?"}
 
@@ -689,9 +693,73 @@ def test_get_messages_for_llm_uses_compact_dag_output_language_policy() -> None:
     assert "Current user request:" not in system_content
     assert "DAG step execution scope:" in system_content
     assert "Output language: English" in system_content
+    # A caller-pinned language is authoritative; the soft request quote would
+    # contradict it.
+    assert "Current user request, quoted for response language only:" not in (
+        system_content
+    )
     assert "Create two posters." not in system_content
     assert "Only execute the current DAG step" in system_content
     assert [message["role"] for message in result].count("system") == 1
+
+
+def test_dag_step_without_output_language_quotes_the_request_for_language() -> None:
+    ctx = ExecutionContext()
+    ctx.metadata["task"] = "Crée deux affiches."
+    ctx.metadata["dag_step_id"] = "step-1"
+    ctx.metadata["dag_step_name"] = "Extract release notes"
+    ctx.add_user_message("Crée deux affiches.")
+
+    system_content = ctx.get_messages_for_llm()[0]["content"]
+
+    assert "Current user request, quoted for response language only:" in system_content
+    assert "Crée deux affiches." in system_content
+    assert "Response language rules:" in system_content
+    assert "Output language:" not in system_content
+
+
+def test_dag_step_language_quote_keeps_a_mid_request_directive() -> None:
+    request = "A" * 900 + " Reply in French. " + "B" * 900 + " Ship it."
+    ctx = ExecutionContext()
+    ctx.metadata["dag_step_id"] = "step-1"
+    ctx.metadata["dag_step_name"] = "Extract release notes"
+    ctx.add_user_message(request)
+
+    system_content = ctx.get_messages_for_llm()[0]["content"]
+
+    assert request in system_content
+    assert "middle truncated" not in system_content
+
+
+def test_dag_step_language_quote_uses_the_typed_message() -> None:
+    typed = "请把发布说明整理成一段话。"
+    ctx = ExecutionContext()
+    ctx.metadata["dag_step_id"] = "step-1"
+    ctx.metadata["dag_step_name"] = "Extract release notes"
+    ctx.add_user_message(
+        typed + "\n\nAttached file(s):\n- notes.pdf\nInspect every attached "
+        "file with the provided tools before answering, and reference each one "
+        "by the exact path shown above.",
+        metadata={"display_message": typed},
+    )
+
+    system_content = ctx.get_messages_for_llm()[0]["content"]
+    quote = system_content.split(
+        "Current user request, quoted for response language only:\n"
+    )[1]
+
+    assert quote.startswith(typed)
+    assert "Attached file(s)" not in quote
+
+
+def test_root_request_without_output_language_constrains_tool_arguments() -> None:
+    ctx = ExecutionContext()
+    ctx.add_user_message("Crée un agent pour moi.")
+
+    system_content = ctx.get_messages_for_llm()[0]["content"]
+
+    assert "tool arguments that persist user-facing prose" in system_content
+    assert "Output language:" not in system_content
 
 
 def test_get_messages_for_llm_coalesces_system_messages() -> None:
@@ -704,7 +772,7 @@ def test_get_messages_for_llm_coalesces_system_messages() -> None:
     assert [message["role"] for message in result].count("system") == 1
     assert result[0]["role"] == "system"
     assert "Base prompt." in result[0]["content"]
-    assert "Current date and time:" in result[0]["content"]
+    assert "Turn started at:" in result[0]["content"]
     assert "Recovered system context." not in result[0]["content"]
     assert result[1]["role"] == "user"
     assert "Previous system-context message" in result[1]["content"]
@@ -1729,8 +1797,13 @@ def _clock_context(timezone_name: str | None) -> ExecutionContext:
 
 
 UTC_ONLY_CLOCK_LINE = (
-    "Current date and time: 2026-08-24 22:03:37 UTC. Use this as the reference "
-    "for relative dates such as today, recent, latest, yesterday, and tomorrow."
+    "Turn started at: 2026-08-24 22:03:37 UTC. "
+    "Real time keeps advancing while this turn runs, so treat this as "
+    "the start of the turn rather than the exact current time. Use it "
+    "as the reference for relative dates such as today, recent, latest, "
+    "yesterday, and tomorrow. When the answer depends on the actual "
+    "time now, call the get_current_time tool if it is available "
+    "instead of computing from this value."
 )
 
 
@@ -1738,15 +1811,26 @@ def test_clock_line_is_byte_identical_to_utc_wording_without_a_timezone() -> Non
     assert _clock_context(None)._current_time_context() == UTC_ONLY_CLOCK_LINE
 
 
+def test_clock_line_is_honest_about_being_the_turn_start() -> None:
+    # #1676: the stamp is frozen at turn start, so the prompt must not claim it
+    # is the current time, and must point at the current-time tool.
+    line = _clock_context(None)._current_time_context()
+
+    assert line.startswith("Turn started at:")
+    assert "Current date and time" not in line
+    assert "get_current_time" in line
+    assert "keeps advancing" in line
+
+
 def test_clock_line_leads_with_local_date_for_a_caller_timezone() -> None:
     line = _clock_context("Australia/Melbourne")._current_time_context()
 
     assert line.startswith(
-        "Current date and time: 2026-08-25 08:03:37 "
+        "Turn started at: 2026-08-25 08:03:37 "
         "(Australia/Melbourne, UTC+10:00), which is 2026-08-24 22:03:37 UTC."
     )
     # The wrong answer in production came from the model reading 08-24 as today.
-    assert not line.startswith("Current date and time: 2026-08-24")
+    assert not line.startswith("Turn started at: 2026-08-24")
 
 
 def test_clock_line_renders_a_half_hour_offset() -> None:
@@ -1805,3 +1889,107 @@ def test_clock_timezone_survives_serialization_and_child_contexts() -> None:
 
     child = context.create_child_context(task="sub-task")
     assert child.clock_zone().key == "Australia/Melbourne"
+
+
+def _context_over_threshold(threshold: int) -> ExecutionContext:
+    ctx = ExecutionContext()
+    ctx.compact_config.threshold = threshold
+    ctx.add_user_message("current request")
+    # Token estimation is chars//4, so this clears the threshold and makes the
+    # request materialize.
+    ctx.add_tool_result(
+        "read_file", {"output": "x" * (threshold * 8)}, tool_call_id="call-1"
+    )
+    return ctx
+
+
+def test_llm_compact_budget_scales_with_the_threshold() -> None:
+    """Below the absolute ceiling the budget tracks the threshold.
+
+    The old ceiling of 1024 bound at every realistic window, leaving a
+    reasoning model no room -- its reasoning comes out of this same allowance.
+    """
+    request = _context_over_threshold(20_000).build_llm_compact_request_if_needed()
+
+    assert request is not None
+    assert request["max_tokens"] == 5_000
+
+
+def test_llm_compact_budget_stays_under_provider_output_limits() -> None:
+    """The absolute ceiling is what makes a large window safe.
+
+    The threshold scales with the *input* window, while providers cap the
+    *output* separately and much lower. Without a ceiling a 1M-token window
+    asks for ~187k output tokens, the request is rejected, and compaction
+    collapses into the message-dropping fallback it exists to avoid.
+    """
+    for window_threshold in (96_000, 150_000, 750_000):
+        request = _context_over_threshold(
+            window_threshold
+        ).build_llm_compact_request_if_needed()
+
+        assert request is not None
+        assert request["max_tokens"] == 8192
+
+
+def _compactable_context() -> ExecutionContext:
+    ctx = ExecutionContext()
+    ctx.compact_config.threshold = 1
+    ctx.add_user_message("current request")
+    ctx.add_tool_result("read_file", {"output": "x" * 200}, tool_call_id="call-1")
+    return ctx
+
+
+def test_compact_rejects_content_the_client_marked_as_a_reasoning_fallback() -> None:
+    """Accepting one would rewrite the whole history into a chain of thought.
+
+    The summary replaces every prior message, so a substituted reasoning trace
+    does not merely add noise -- it becomes the agent's account of what it
+    already did, describing deliberation it never concluded. Having no summary
+    is better: the fallback keeps real messages.
+    """
+    ctx = _compactable_context()
+    original = list(ctx.messages)
+
+    result = ctx.compact_with_llm_response(
+        {
+            "type": "text",
+            "content": "Let me think. The user wants a report. First I should",
+            CONTENT_SOURCE_KEY: CONTENT_SOURCE_REASONING_FALLBACK,
+            "reasoning_content": "Let me think. The user wants a report. First I should",
+        },
+        llm=None,
+    )
+
+    assert not result.compacted
+    assert result.strategy == "none"
+    assert ctx.messages == original
+
+
+def test_compact_config_round_trip_drops_the_retired_strategy_key() -> None:
+    """Pins the rolling-deploy contract for the removed ``strategy`` knob.
+
+    ``to_dict`` must stop emitting the key, and a legacy payload that still
+    carries it -- every row persisted before the removal, reloaded by every
+    resumed execution -- must restore the surrounding fields unchanged. The
+    ``from_dict`` half cannot break as long as the reader uses per-key
+    ``get``; it is pinned because switching to ``CompactConfig(**compact)``
+    would turn those live rows into a crash. The ``hasattr`` check guards the
+    other direction: re-adding the field with a default would silently revive
+    the dispatch this change removed.
+    """
+    context = ExecutionContext()
+    context.compact_config.enabled = False
+    context.compact_config.threshold = 1234
+    context.compact_config.max_messages = 7
+
+    payload = context.to_dict()
+    assert "strategy" not in payload["compact_config"]
+    payload["compact_config"]["strategy"] = "truncate"
+
+    restored = ExecutionContext.from_dict(payload)
+
+    assert restored.compact_config.enabled is False
+    assert restored.compact_config.threshold == 1234
+    assert restored.compact_config.max_messages == 7
+    assert not hasattr(restored.compact_config, "strategy")

@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react"
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
 import { Interaction } from "@/contexts/app-context-chat"
 import { Input } from "@/components/ui/input"
 import { Button } from "@/components/ui/button"
@@ -15,11 +15,17 @@ import { ChevronDown, ChevronRight, MessageSquare, Upload, File as FileIcon, X, 
 import { ConnectAppsField } from "./connect-apps-field"
 import type { MessageDeliveryDisposition } from "@/hooks/use-websocket"
 import type { TranslationKey } from "@/i18n/translations"
+import {
+  clientErrorTranslationKey,
+  readClientErrorCode,
+  type ClientErrorCode,
+} from "@/lib/client-errors"
 
 interface ClarificationFormProps {
   message?: string
   interactions: Interaction[]
   messageId?: string
+  requestId?: string
   active?: boolean
   filesDisabled?: boolean
   onSend?: (message: string, files?: File[], metadata?: any) => Promise<void> | void
@@ -89,6 +95,11 @@ const readSendReason = (error: unknown): string => {
   return typeof message === "string" ? message.trim() : ""
 }
 
+const readSendErrorCode = (error: unknown): ClientErrorCode | null => {
+  if (typeof error !== "object" || error === null) return null
+  return readClientErrorCode((error as { errorCode?: unknown }).errorCode)
+}
+
 /**
  * The hint that belongs with a disposition, as a key rather than a translated
  * string: the toast needs it once at failure time, while the persistent alert
@@ -115,6 +126,7 @@ const LIVE_WIDGET_TYPES = new Set(["connect_apps"])
 export function ClarificationForm({
   interactions,
   messageId,
+  requestId,
   active = true,
   filesDisabled: filesDisabledOverride,
   onSend,
@@ -158,14 +170,31 @@ export function ClarificationForm({
       : interaction.label || interaction.field
 
   const [formState, setFormState] = useState<Record<string, any>>({})
+  const previousRequestIdRef = useRef(requestId)
+  const latestRequestIdRef = useRef(requestId)
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [isSubmitted, setIsSubmitted] = useState(!active && !isConnectAppsOnly)
   const [isOpen, setIsOpen] = useState(active || isConnectAppsOnly)
   // Raw evidence only. Translating at render (not at failure time) is what
   // lets a locale switch reach an alert that is already on screen.
   const [sendFailure, setSendFailure] = useState<
-    { detail: string; disposition: MessageDeliveryDisposition | null } | null
+    {
+      detail: string
+      disposition: MessageDeliveryDisposition | null
+      errorCode: ClientErrorCode | null
+    } | null
   >(null)
+
+  useLayoutEffect(() => {
+    latestRequestIdRef.current = requestId
+    if (previousRequestIdRef.current === requestId) return
+    previousRequestIdRef.current = requestId
+    setFormState({})
+    setIsSubmitting(false)
+    setIsSubmitted(!active && !isConnectAppsOnly)
+    setIsOpen(active || isConnectAppsOnly)
+    setSendFailure(null)
+  }, [active, isConnectAppsOnly, requestId])
 
   useEffect(() => {
     if (active) {
@@ -208,7 +237,7 @@ export function ClarificationForm({
           description: typeof opt?.description === "string" ? opt.description : undefined,
           action_type: typeof opt?.action_type === "string" ? opt.action_type : undefined,
         }))
-        .filter((opt: { value: string; label: string }) => opt.value && opt.label)
+        .filter((opt: { value: string; label: string }) => opt.value.trim() !== "" && opt.label.trim() !== "")
       return {
         ...interaction,
         type,
@@ -260,8 +289,9 @@ export function ClarificationForm({
   }
 
   const handleSubmit = async () => {
+    const submittedRequestId = requestId
     // Construct the message
-    const metadata: any = {}
+    const metadata: any = requestId ? { request_id: requestId } : {}
     const lines = normalizedInteractions.flatMap(interaction => {
       const value = formState[interaction.field]
 
@@ -360,19 +390,22 @@ export function ClarificationForm({
         await sendMessage(finalMessage, { force: true, metadata }, outboundFiles)
       }
 
+      if (latestRequestIdRef.current !== submittedRequestId) return
       setIsSubmitted(true)
       setIsOpen(false)
       if (!onSend && dispatch) {
         dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "running" } })
       }
     } catch (error) {
+      if (latestRequestIdRef.current !== submittedRequestId) return
       console.error("Failed to send clarification response", error)
       // The rejection reason ("a previous guidance message is still being
       // applied") is the only actionable part of the failure; the fixed
       // string is a last resort.
       const detail = readSendReason(error)
       const disposition = readSendDisposition(error)
-      setSendFailure({ detail, disposition })
+      const errorCode = readSendErrorCode(error)
+      setSendFailure({ detail, disposition, errorCode })
       // The toast is a snapshot - it keeps whatever language was active when
       // it fired. The alert below is not, and re-resolves on every render.
       // The draft is preserved and Submit stays enabled in every case, so the
@@ -380,12 +413,17 @@ export function ClarificationForm({
       // outcome mints a fresh delivery and could answer the question twice.
       const hintKey = sendHintKey(disposition)
       const hint = hintKey ? t(hintKey) : null
+      const errorMessage = errorCode
+        ? t(clientErrorTranslationKey(errorCode))
+        : detail || t("chatPage.clarification.sendError")
       toast.error(
-        detail || t("chatPage.clarification.sendError"),
+        errorMessage,
         hint ? { description: hint } : undefined,
       )
     } finally {
-      setIsSubmitting(false)
+      if (latestRequestIdRef.current === submittedRequestId) {
+        setIsSubmitting(false)
+      }
     }
   }
 
@@ -395,11 +433,12 @@ export function ClarificationForm({
   // formState machinery handleSubmit above uses (there's nothing to gather).
   const handleSkipConnectApps = async () => {
     const message = t("chatPage.clarification.connectApps.skip")
+    const metadata = requestId ? { request_id: requestId } : {}
     try {
       if (onSend) {
-        await onSend(message, [], {})
+        await onSend(message, [], metadata)
       } else if (sendMessage) {
-        await sendMessage(message, { force: true }, [])
+        await sendMessage(message, { force: true, metadata }, [])
       }
     } catch (error) {
       console.error("Failed to send connect-apps skip response", error)
@@ -614,6 +653,9 @@ export function ClarificationForm({
   // Recomputed on every render, which is the point: a locale change re-renders
   // this component without remounting it.
   const sendFailureHintKey = sendFailure ? sendHintKey(sendFailure.disposition) : null
+  const sendFailureMessage = sendFailure?.errorCode
+    ? t(clientErrorTranslationKey(sendFailure.errorCode))
+    : sendFailure?.detail || t("chatPage.clarification.sendError")
 
   return (
     <Collapsible
@@ -673,7 +715,7 @@ export function ClarificationForm({
 
             {sendFailure && (
               <div role="alert" className="rounded-md border border-destructive/40 bg-destructive/5 p-3 text-sm text-destructive">
-                <div>{sendFailure.detail || t("chatPage.clarification.sendError")}</div>
+                <div>{sendFailureMessage}</div>
                 {sendFailureHintKey && (
                   <div className="mt-1 text-xs text-destructive/80">{t(sendFailureHintKey)}</div>
                 )}

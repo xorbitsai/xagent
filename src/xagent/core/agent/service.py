@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable, cast
+from typing import TYPE_CHECKING, Any, Callable, cast
 
 from ...config import get_uploads_dir
 from ..memory import MemoryStore
@@ -26,8 +26,12 @@ from ..tools.adapters.vibe.config import (
 )
 from ..tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
 from ..workspace import TaskWorkspace, create_workspace
+from .context.execution import TRANSCRIPT_WATERMARK_METADATA_KEY
 from .trace import Tracer
 from .transcript import normalize_transcript_messages
+
+if TYPE_CHECKING:
+    from .runner import UserMessageInjectionOutcome
 
 logger = logging.getLogger(__name__)
 
@@ -349,10 +353,11 @@ class AgentService:
         turn_id: str | None = None,
         request_interrupt: bool = True,
         reason: str | None = None,
-    ) -> bool:
+    ) -> "UserMessageInjectionOutcome":
         if self._execution_adapter is None:
             self._execution_adapter = self._build_execution_adapter()
-        return bool(
+        return cast(
+            "UserMessageInjectionOutcome",
             await self._execution_adapter.post_user_message(
                 execution_id,
                 message,
@@ -362,7 +367,7 @@ class AgentService:
                 turn_id=turn_id,
                 request_interrupt=request_interrupt,
                 reason=reason,
-            )
+            ),
         )
 
     async def resume_execution_by_id(
@@ -423,11 +428,35 @@ class AgentService:
     def get_dag_pattern(self) -> Any | None:
         return None
 
-    def set_conversation_history(self, messages: list[dict[str, Any]]) -> None:
+    def set_conversation_history(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        watermark: int | None = None,
+    ) -> None:
+        """Install the prior conversation, and where a summary may pick up.
+
+        ``watermark`` is the largest stored transcript row ``messages``
+        covers. It rides along in ``execution_metadata`` so a compaction
+        during this turn can record which stored rows its summary stands in
+        for; the next turn then replays the summary instead of those rows.
+        Callers without one leave the slot cleared, and compaction emits a
+        summary that no later turn can position -- correct, just not reusable.
+        """
         self._conversation_history = list(messages)
+        if isinstance(watermark, int) and not isinstance(watermark, bool):
+            self.execution_metadata[TRANSCRIPT_WATERMARK_METADATA_KEY] = watermark
+        else:
+            # Cleared rather than left stale: a watermark from an earlier turn
+            # describes a window this one is not replaying, and reusing it
+            # would tell compaction it absorbed rows nobody showed it.
+            self.execution_metadata.pop(TRANSCRIPT_WATERMARK_METADATA_KEY, None)
         if self._execution_adapter is not None:
             self._execution_adapter.config.conversation_history = (
                 self._conversation_history
+            )
+            self._execution_adapter.config.execution_metadata = dict(
+                self.execution_metadata
             )
 
     def set_execution_context_messages(self, messages: list[dict[str, Any]]) -> None:

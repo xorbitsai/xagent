@@ -34,6 +34,7 @@ from ..models.user import User
 from ..models.user_channel import UserChannel
 from ..models.workforce import Workforce, WorkforceRun
 from ..schemas.chat import TaskCreateRequest, TaskCreateResponse
+from ..services.client_error_messages import ClientErrorCode, client_error_message
 from ..services.connector_runtime import (
     bind_connector_runtime_selection_snapshot,
     prepare_connector_runtime_selection_snapshot,
@@ -1007,6 +1008,7 @@ async def _create_workforce_widget_chat_task(
         workforce,
         message=request.description or "",
         selected_file_ids=request.files,
+        timezone=request.timezone,
         source="widget",
         is_visible=False,
         extra_agent_config={
@@ -1172,6 +1174,7 @@ async def _create_workforce_share_chat_task(
         workforce,
         message=request.description or "",
         selected_file_ids=request.files,
+        timezone=request.timezone,
         source="shared_link",
         is_visible=False,
         extra_agent_config={
@@ -1408,15 +1411,15 @@ async def _reject_rate_limited_turn(websocket: WebSocket, message_data: dict) ->
     surfaces it and can retry) rather than closing the connection.
     """
     client_message_id = message_data.get("client_message_id")
-    rate_limited_message = (
-        "You're sending messages too quickly. Please wait a moment and try again."
-    )
+    rate_limited_code = ClientErrorCode.MESSAGE_RATE_LIMITED
+    rate_limited_message = client_error_message(rate_limited_code)
     await send_message_delivery(
         websocket,
         client_message_id=client_message_id,
         turn_id=str(client_message_id or ""),
         accepted=False,
         message=rate_limited_message,
+        error_code=rate_limited_code.value,
         rejection_outcome="not_accepted",
     )
     # send_message_delivery no-ops without a client_message_id, so a client
@@ -1425,7 +1428,11 @@ async def _reject_rate_limited_turn(websocket: WebSocket, message_data: dict) ->
     # is always surfaced.
     if client_message_id is None:
         await manager.send_personal_message(
-            {"type": "error", "message": rate_limited_message},
+            {
+                "type": "error",
+                "error_code": rate_limited_code.value,
+                "message": rate_limited_message,
+            },
             websocket,
         )
 

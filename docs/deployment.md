@@ -201,6 +201,77 @@ SQLite can commit each schema operation separately during a batch-table rebuild.
 
 The migration refuses the downgrade if a non-null owner row exists. If a caller created such a row, disable that caller. Revoke and remove the credential with an approved procedure. Then retry the downgrade.
 
+## 2026-08-24 — Gmail ordinary-owner fence
+
+### Scope
+
+This release adds no schema, dependency, environment variable, or cleanup state. It restricts Gmail watch and trigger code to ordinary OAuth rows.
+
+Mailbox release now calls Gmail `users.stop` before Pub/Sub cleanup. Each release can add one Gmail API request.
+
+Actor-owned Gmail credentials remain available to builtin MCP tools. Gmail provisioning, renewal, callback, trigger, and release paths reject these rows.
+
+### Prerequisites and configuration
+
+Keep every actor-owned credential writer disabled during this rollout. The owner-aware OAuth migration above must already be current.
+
+### Gmail trigger binding contract
+
+`oauth_account_id` has three states:
+
+1. An absent key is a persisted legacy binding. Its mailbox (`resource_id`) must be non-empty.
+2. A positive integer or ASCII decimal string is an explicit binding. It must match a same-user ordinary Gmail account.
+3. Any other present value is invalid. New API requests reject it. Persisted invalid bindings fail closed, are marked failed, and prevent mailbox teardown until repaired.
+
+Provisioning resolves a legacy binding only when its mailbox matches exactly one same-user ordinary Gmail account. It does not add an account ID to the stored legacy configuration. A missing or ambiguous match fails closed.
+
+New or edited Gmail trigger configurations must use an explicit account ID. You can re-enable a persisted legacy trigger without editing its configuration. To repair an unavailable legacy binding, replace it with the matching ordinary Gmail account ID.
+
+Do not remove an invalid key to repair a trigger unless it is a confirmed legacy mailbox binding. Do not use `0`, `null`, booleans, floats, or non-decimal strings as Gmail account IDs.
+
+### Deployment and migration steps
+
+1. Deploy this release to every Gmail API, callback, trigger, dispatcher, and worker process.
+2. Make sure that no older process remains.
+3. Run the ownership query below.
+4. If the result is not zero, keep actor credential writers disabled. The fence does not clean invalid watches. Track the approved cleanup path in [issue #1652](https://github.com/xorbitsai/xagent/issues/1652).
+5. Enable actor credential writers only after the result is zero.
+
+### Verification and monitoring
+
+Run this query before actor credential writers become active:
+
+```sql
+SELECT count(*)
+FROM gmail_watch_states AS watch
+LEFT JOIN user_oauth AS account ON account.id = watch.oauth_account_id
+WHERE account.id IS NULL
+   OR watch.user_id <> account.user_id
+   OR account.provider <> 'gmail'
+   OR account.resource_owner_key IS NOT NULL;
+```
+
+The result must be zero. Existing ordinary Gmail watch and trigger tests must also pass before deployment.
+
+A callback with only invalid or actor-owned trigger bindings is acknowledged as unknown and does not advance the Gmail history cursor. Restore a valid ordinary trigger binding before callback processing can continue.
+
+If a trigger reports `Gmail trigger has an invalid OAuth account binding`, replace its `oauth_account_id` with the matching ordinary Gmail account ID. Remove the key only for a confirmed legacy mailbox binding. Do not change actor-owned credentials or watch rows as part of this rollout.
+
+### Rollback
+
+Keep this fence during an actor-feature rollback. Disable actor credential writers before you roll back another actor layer.
+
+The watch-ownership query above detects invalid watch bindings. Before you revert this fence, also run:
+
+```sql
+SELECT count(*)
+FROM user_oauth
+WHERE provider = 'gmail'
+  AND resource_owner_key IS NOT NULL;
+```
+
+Both query results must be zero only when you revert this fence. The second query proves that no actor-owned Gmail credential remains. This includes credentials without watch state. Actor-owned credentials can exist while the fence remains. A normal actor-feature rollback does not revert this release.
+
 ## 2026-08-26 — PostgreSQL 17 default for the bundled Compose database
 
 ### Deployment impact

@@ -8,11 +8,9 @@ import io
 import json
 import logging
 import mimetypes
-import os
 import re
 import shutil
 import threading
-import time
 import unicodedata
 import uuid
 from dataclasses import dataclass
@@ -1616,72 +1614,6 @@ async def _rollback_failed_cloud_ingestion(
         if restore_error is not None:
             message = f"{message}; backup restore also failed: {restore_error}"
         raise RollbackFailureError(message) from exc
-
-
-def cleanup_orphaned_temp_files(upload_dir: Optional[Path] = None) -> int:
-    """Clean up orphaned temporary files from interrupted atomic replacements.
-
-    Removes files matching patterns like:
-    - *.tmp-replace (old pattern)
-    - .*.tmp (new NamedTemporaryFile pattern)
-
-    Args:
-        upload_dir: Base uploads directory to clean. If None, uses default uploads dir.
-
-    Returns:
-        Number of files cleaned up.
-    """
-    from ..config import get_uploads_dir
-
-    base_dir = upload_dir or get_uploads_dir()
-    if not base_dir.exists():
-        return 0
-
-    cleaned_count = 0
-    now = time.time()
-
-    # Walk through uploads directory and clean up temp files older than 1 hour
-    # to avoid deleting files that might still be in use
-    for root, dirs, files in os.walk(base_dir):
-        for filename in files:
-            file_path = Path(root) / filename
-
-            # Check for old temp file pattern (*.tmp-replace)
-            if filename.endswith(".tmp-replace"):
-                file_age = now - file_path.stat().st_mtime
-                if file_age > 3600:  # 1 hour
-                    try:
-                        file_path.unlink()
-                        cleaned_count += 1
-                        logger.debug("Cleaned up orphaned temp file: %s", file_path)
-                    except OSError as e:
-                        logger.warning(
-                            "Failed to clean up orphaned temp file %s: %s", file_path, e
-                        )
-
-            # Check for new temp file pattern (.*.tmp from NamedTemporaryFile)
-            # Pattern: filename.XXXXXX.tmp where X is random hex
-            if filename.endswith(".tmp") and "." in filename[:-4]:
-                # Verify it looks like our temp pattern (has multiple extensions)
-                parts = filename.split(".")
-                if len(parts) >= 3 and parts[-1] == "tmp":
-                    file_age = now - file_path.stat().st_mtime
-                    if file_age > 3600:  # 1 hour
-                        try:
-                            file_path.unlink()
-                            cleaned_count += 1
-                            logger.debug("Cleaned up orphaned temp file: %s", file_path)
-                        except OSError as e:
-                            logger.warning(
-                                "Failed to clean up orphaned temp file %s: %s",
-                                file_path,
-                                e,
-                            )
-
-    if cleaned_count > 0:
-        logger.info("Cleaned up %d orphaned temporary file(s)", cleaned_count)
-
-    return cleaned_count
 
 
 def _get_file_sha256(file_path: Path) -> str:

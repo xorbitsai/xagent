@@ -7,6 +7,9 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import unquote, urlparse
 
 from ....core.file_ref import parse_file_id_ref
+from ...services.assistant_history_safety import (
+    LEGACY_UNTRUSTED_ASSISTANT_MESSAGE_TYPE,
+)
 
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
@@ -214,12 +217,15 @@ async def restore_telegram_task_context(
     task_id: int,
 ) -> None:
     """Restore prior chat transcript and execution context for a Telegram turn."""
-    from ...services.chat_history_service import load_task_transcript
+    from ...services.chat_history_service import load_task_transcript_window
     from ...services.task_execution_context_service import (
         load_task_execution_recovery_state,
     )
 
-    agent_service.set_conversation_history(load_task_transcript(db, task_id))
+    transcript_window = load_task_transcript_window(db, task_id)
+    agent_service.set_conversation_history(
+        transcript_window.messages, watermark=transcript_window.watermark
+    )
 
     recovery_state: dict[str, Any] = await load_task_execution_recovery_state(
         db, task_id
@@ -234,7 +240,7 @@ def persist_telegram_assistant_turn(
     user_id: int,
     content: str,
     interactions: list[dict[str, Any]] | None = None,
-    message_type: str = "assistant_message",
+    message_type: str = LEGACY_UNTRUSTED_ASSISTANT_MESSAGE_TYPE,
 ) -> None:
     """Persist a Telegram assistant turn when it has text or structured prompts."""
     from ...services.chat_history_service import persist_assistant_message

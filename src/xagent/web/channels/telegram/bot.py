@@ -1693,7 +1693,8 @@ class TelegramBotInstance:
                 task_owner_user_id=owner_user_id,
             )
             agent_service.set_conversation_history(
-                [dict(message) for message in setup_snapshot.conversation_history]
+                [dict(message) for message in setup_snapshot.conversation_history],
+                watermark=setup_snapshot.conversation_watermark,
             )
             recovery_state = await materialize_task_execution_recovery_state(
                 setup_snapshot.execution_recovery
@@ -1903,6 +1904,8 @@ class TelegramBotInstance:
                 assistant_content=projection.transcript_content,
                 interactions=projection.interactions,
                 message_type=projection.message_type,
+                error_message=projection.diagnostic_error,
+                execution_result=result,
             ):
                 raise TaskLeaseLostError(
                     f"task {task_id} ownership changed before Telegram result"
@@ -2088,6 +2091,7 @@ class TelegramBotInstance:
                 try:
                     finalized = await managed_lease.finalize_result(
                         status=TaskStatus.FAILED,
+                        error_message=str(e),
                     )
                 except Exception:
                     logger.warning(

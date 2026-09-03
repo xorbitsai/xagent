@@ -262,6 +262,79 @@ def mock_start_task():
 # ===== POST /v1/chat/tasks =====
 
 
+def test_create_task_forwards_timezone_to_the_first_turn(mock_start_task):
+    """SDK callers have no websocket, so the create body is their only chance
+    to declare a zone for the turn that task creation starts."""
+    agent_id, full_key = _create_agent_with_key()
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "how many shifts tomorrow?"},
+            "timezone": "Australia/Melbourne",
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    assert mock_start_task.call_args.kwargs["context"] == {
+        "timezone": "Australia/Melbourne"
+    }
+
+
+def test_create_task_without_timezone_sends_no_context(mock_start_task):
+    agent_id, full_key = _create_agent_with_key()
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "hello"},
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    assert mock_start_task.call_args.kwargs["context"] is None
+
+
+def test_create_task_rejects_an_over_long_timezone(mock_start_task):
+    # Guest-reachable free-text field is bounded to IANA lengths (max_length=64).
+    agent_id, full_key = _create_agent_with_key()
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "hello"},
+            "timezone": "A" * 65,
+        },
+    )
+
+    assert resp.status_code == 422, resp.text
+
+
+def test_create_task_treats_a_blank_timezone_as_absent(mock_start_task):
+    # The shared helper normalizes whitespace-only to None, so the SDK path
+    # matches the workforce path rather than sending {"timezone": "  "}.
+    agent_id, full_key = _create_agent_with_key()
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "hello"},
+            "timezone": "   ",
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    assert mock_start_task.call_args.kwargs["context"] is None
+
+
 def test_create_task_happy_path(mock_start_task):
     """Returns 202 + task_id, writes hidden SDK Task + input,
     persists first user message, kicks off background, and leaves the

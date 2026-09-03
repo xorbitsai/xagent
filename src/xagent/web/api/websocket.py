@@ -1,6 +1,7 @@
 """WebSocket real-time communication handler"""
 
 import asyncio
+import enum
 import json
 import logging
 import re
@@ -52,6 +53,7 @@ from ...core.agent.checkpoint import (
     CheckpointReadError,
     CheckpointUnavailableError,
 )
+from ...core.agent.runner import UserMessageInjectionOutcome
 from ...core.agent.trace import TraceEvent, TraceHandler
 from ...core.execution_scope import (
     EXECUTION_SCOPE_NOT_PROVIDED,
@@ -80,6 +82,14 @@ from ...core.file_storage.keys import (
     build_task_output_storage_key,
     build_upload_storage_key,
 )
+from ..services.assistant_history_safety import (
+    ASSISTANT_RESPONSE_MESSAGE_TYPE,
+    TASK_FAILURE_MESSAGE_TYPE,
+    assistant_history_has_safe_ancillary_payload,
+    assistant_history_values_for_persistence,
+    client_safe_assistant_history_content,
+    safe_str,
+)
 from ..services.chat_history_service import (
     DELIVERY_COMPLETED,
     DELIVERY_DISPATCHED,
@@ -90,6 +100,13 @@ from ..services.chat_history_service import (
     inspect_user_message_delivery,
     mark_user_message_delivery_sync,
 )
+from ..services.client_error_messages import (
+    CLIENT_SAFE_GUIDANCE_IN_PROGRESS,
+    CLIENT_SAFE_TASK_FAILURE,
+    CLIENT_SAFE_VALIDATION_ERROR,
+    ClientErrorCode,
+    client_error_message,
+)
 from ..services.db_runtime import (
     await_task_settlement,
     cancel_and_drain_async_task,
@@ -97,6 +114,15 @@ from ..services.db_runtime import (
     is_database_pool_timeout,
     propagate_deferred_cancellation,
     run_db_io_cancellation_safe,
+)
+from ..services.external_task_cancel import (
+    EXTERNAL_COMMAND_SCOPE,
+    cancel_external_task_unserialized,
+    external_cancel_exhausted_message,
+)
+from ..services.external_task_input import (
+    execute_external_task_input_command,
+    external_input_terminal_message,
 )
 from ..services.file_reference_output_service import (
     load_assistant_file_reference_records,
@@ -126,10 +152,25 @@ from ..services.hot_path_cache import (
     task_cache_ttl_seconds,
     web_task_history_key,
 )
+from ..services.managed_file_ref import (
+    DurableObjectIntegrityError,
+    DurableStorageOperationError,
+    log_durable_storage_fault,
+)
+from ..services.mcp_runtime import (
+    MCPBuiltinOAuthActorPolicy,
+    MCPBuiltinOAuthActorPolicyRequiredError,
+)
+from ..services.task_command_terminal_events import (
+    TerminalTaskEventDraft,
+    TerminalTaskEventMessageCode,
+    bind_terminal_event_draft,
+    is_external_cancel_command,
+    terminal_event_draft_for_error,
+)
 from ..services.task_command_transport import (
     COMMAND_FAILED,
     COMMAND_ID_PATTERN,
-    MAX_COMMAND_DEFERS,
     MAX_COMMAND_FAILURES,
     ClaimedTaskCommand,
     EnqueuedTaskCommand,
@@ -139,10 +180,13 @@ from ..services.task_command_transport import (
     TaskCommandTaskMissing,
     dispatch_task_command_promptly,
     enqueue_task_command,
+    max_command_defers,
     task_has_live_foreign_runner,
+    task_has_live_runner,
 )
 from ..services.task_execution_controller import (
     StaleTaskRunError,
+    StaleTaskStateVersionError,
     TaskControlSnapshot,
     TaskControlState,
     apply_task_control_transition,
@@ -170,6 +214,7 @@ from ..services.task_lease_service import (
 )
 from ..services.task_runtime import (
     SELECTED_FILE_IDS_AGENT_CONFIG_KEY,
+    mcp_runtime_authorization_policy_required,
     task_extension_bindings_from_agent_config,
 )
 from ..services.uploaded_file_store import (
@@ -199,6 +244,7 @@ from .websocket_auth import (
     WebSocketPrincipal,
     _WebSocketAuthenticationTerminated,
     get_authenticated_user,
+    send_websocket_authentication_infrastructure_failure,
 )
 
 logger = logging.getLogger(__name__)
@@ -246,26 +292,13 @@ def _waiting_or_paused_event_fields(status: TaskStatus) -> tuple[str, str]:
     return "task_paused", "Task paused"
 
 
-# User-facing messages for turn rejections that are NOT transient. The
-# default "busy" message tells the user to retry, which is actively
-# misleading for workforce rejections where retrying can never succeed.
-_TURN_REJECTION_MESSAGES = {
-    "workforce_archived": (
-        "This workforce has been archived; the conversation can no longer "
-        "accept new messages."
-    ),
-    "workforce_config_changed": (
-        "The workforce configuration has changed since this conversation "
-        "started; please start a new conversation."
-    ),
-    "workforce_run_not_found": (
-        "This workforce conversation is no longer available; please start "
-        "a new conversation."
-    ),
-    "workforce_run_not_active": (
-        "This workforce conversation was cancelled and can no longer accept "
-        "new messages; please start a new conversation."
-    ),
+# Non-transient turn rejections must not fall back to retryable busy guidance.
+_TURN_REJECTION_CODES = {
+    "actor_task_reuse_unsupported": (ClientErrorCode.MESSAGE_CONTINUATION_UNSUPPORTED),
+    "workforce_archived": ClientErrorCode.WORKFORCE_ARCHIVED,
+    "workforce_config_changed": ClientErrorCode.WORKFORCE_UNAVAILABLE,
+    "workforce_run_not_found": ClientErrorCode.WORKFORCE_UNAVAILABLE,
+    "workforce_run_not_active": ClientErrorCode.WORKFORCE_UNAVAILABLE,
 }
 
 
@@ -285,11 +318,14 @@ def _task_error_payload(
     message: str,
     *,
     event_type: str = "error",
+    error_code: str | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "type": event_type,
         "message": message,
     }
+    if error_code is not None:
+        payload["error_code"] = error_code
     task_payload = _task_status_payload(db, task_id)
     if task_payload is not None:
         payload["task"] = task_payload
@@ -329,24 +365,9 @@ def _client_message_id(value: Any) -> str | None:
 # error bubble and the message_rejected ack, so an *incidental* validation
 # failure only ever surfaces as this fixed string; the detail stays in the log.
 #
-# Agent RuntimeError text is passed through to the INITIATING SENDER only -
-# the rejection ack and the personal error bubble - which is the existing
-# contract, and narrowing that wording is the product decision left in #1479.
-#
-# The broadcast half of that passthrough is closed (maintainer scope ruling
-# on #1514): once a task resolves, the task-wide broadcast reaches every
-# connection under the task_id, anonymous widget and share visitors included,
-# and DurableStorageOperationError subclasses RuntimeError with tenant-scope
-# text in its message - so broadcasts carry CLIENT_SAFE_TASK_FAILURE, never
-# the exception text. Still #1479: whether the sender copy should also be
-# narrowed when the initiator is an anonymous public connection.
-CLIENT_SAFE_VALIDATION_ERROR = "The message could not be processed. Please try again."
-
-# Broadcast audiences did not send anything, so the validation wording above
-# would be misdirected; task-level failure broadcasts use this instead.
-CLIENT_SAFE_TASK_FAILURE = "Task execution failed."
-
-
+# RuntimeError text follows the same rule for every audience. The task-wide
+# broadcast, rejection ack, and personal error bubble expose stable safe
+# fields; provider responses and internal paths remain operator-only logs.
 class ClientVisibleError(Exception):
     """Marker: this exception's text was written for the end user.
 
@@ -355,6 +376,16 @@ class ClientVisibleError(Exception):
     else reaching a client-facing handler is treated as incidental and
     redacted, so forgetting the marker fails closed.
     """
+
+    def __init__(
+        self,
+        *args: object,
+        error_code: ClientErrorCode = ClientErrorCode.MESSAGE_PROCESSING_FAILED,
+    ) -> None:
+        if type(self) is ClientVisibleError:
+            raise TypeError("ClientVisibleError must be subclassed")
+        self.error_code = error_code
+        super().__init__(*args)
 
 
 class ClientVisibleValidationError(ClientVisibleError, ValueError):
@@ -375,40 +406,69 @@ class ClientVisibleTaskCommandDeferred(ClientVisibleError, TaskCommandDeferred):
     """
 
 
-def client_safe_error_message(error: BaseException) -> str:
+def client_safe_error_message(
+    error: BaseException,
+    *,
+    fallback: str = CLIENT_SAFE_VALIDATION_ERROR,
+) -> str:
     """The only way an exception may become text a chat client can see.
 
     ``tests/web/api/test_websocket_client_safe_errors.py`` enforces this for
-    the shapes it recognizes: direct calls to the delivery producers, and
-    ``error``/``agent_error`` dict *literals* handed to ``send_personal_message``,
-    ``broadcast_to_task`` or ``send_text``.
+    the shapes it recognizes: delivery producers and known error-event payloads
+    handed to ``send_personal_message``, ``broadcast_to_task`` or ``send_text``.
 
-    It does not reach payloads assembled by a helper, spread into a dict, or
-    forwarded through a wrapper (#1497). It also only ever inspects the
-    ``message`` key of a literal ``type`` it already knows: the background
-    failure broadcast at ``execute_task_background`` is invisible on both
-    counts at once, carrying its text under ``error`` with type ``task_error``
-    (#1497). A ``type`` built from a variable is likewise unseen (#1547).
+    The sweep recognizes the client egress shapes used by this module,
+    including terminal task helpers, dict-spread overrides, both ``message``
+    and ``error`` fields, and the deferred-delivery wrapper. It is still a
+    deliberately small static check rather than general data-flow analysis;
+    for example, a payload ``type`` built from a variable remains outside its
+    scope (#1547).
 
-    Read a passing sweep as "the recognized shapes are clean", never as
-    "nothing reaches a client raw".
+    Read a passing sweep as "the recognized egress shapes are clean", never
+    as "arbitrary Python data flow cannot reach a client raw".
     """
-    return (
-        str(error)
-        if isinstance(error, ClientVisibleError)
-        else CLIENT_SAFE_VALIDATION_ERROR
-    )
+    if not isinstance(error, ClientVisibleError):
+        return fallback
+    message = str(error)
+    return message if message.strip() else fallback
 
 
 def client_safe_task_command_failure(
-    kind: TaskCommandKind, error: BaseException
+    kind: TaskCommandKind,
+    error: BaseException,
+    *,
+    scope: str | None = None,
+    task_status: TaskStatus | None = None,
 ) -> str:
     """Terminal command failure: server-owned kind prefix + redacted detail.
 
     The frontend renders ``message`` verbatim for ``agent_error``, so dropping
     the prefix entirely removed user-visible context. The kind comes from our
     own enum, never from the exception, which is what makes the prefix safe.
+
+    An external-scope cancel is the one command a task's audience issues
+    without any account behind it, and its whole meaning is "stop this
+    response". That audience gets neither the command identity nor the
+    exception detail - and it gets a sentence about the turn rather than
+    about the command, which is why the caller reads the task and hands the
+    status in. Saying the response was interrupted when the task is still
+    running would be false, and the visitor would keep waiting on a turn
+    nobody stopped.
+
+    An external-scope MESSAGE gets the same courtesy for the opposite
+    reason: the generic fallback ends in "Please try again.", which is
+    false for the non-retryable rejections this broadcast exists to
+    surface (revoked principal, stale request, spent id). Its wording is
+    picked by what the terminal exception proves -- non-application is
+    asserted only when it is established, uncertainty otherwise -- and
+    needs no task status, so the caller does not read the task for it.
     """
+    if is_external_cancel_command(kind=kind.value, scope=scope):
+        return external_cancel_exhausted_message(task_status)
+    if scope == EXTERNAL_COMMAND_SCOPE and kind == TaskCommandKind.MESSAGE:
+        return external_input_terminal_message(error)
+    # kind.value in the text is safe only while every external-scope kind is
+    # handled above; a new external-scope kind needs its own branch first.
     return f"Task command {kind.value} failed: {client_safe_error_message(error)}"
 
 
@@ -424,10 +484,41 @@ def log_client_facing_failure(error: Exception, template: str, *args: object) ->
     ``template`` ends in the ``%s`` that receives ``error``; ``args`` fill the
     placeholders before it.
     """
+    rendered_message: str | None = None
+    try:
+        if str.endswith(template, "%s"):
+            rendered_message = str.__str__(template % (*args, error))
+    except Exception:
+        pass
+    if rendered_message is None:
+        safe_template = _safe_log_argument(template)
+        safe_args = tuple(_safe_log_argument(arg) for arg in args)
+        safe_error = _safe_log_argument(error)
+        logger.log(
+            logging.WARNING if isinstance(error, ClientVisibleError) else logging.ERROR,
+            "Malformed client-facing log template %r with args=%r; original error: %s",
+            safe_template,
+            safe_args,
+            safe_error,
+            exc_info=None if isinstance(error, ClientVisibleError) else True,
+        )
+        return
     if isinstance(error, ClientVisibleError):
-        logger.warning(template, *args, error)
+        logger.warning(rendered_message)
     else:
-        logger.error(template, *args, error, exc_info=True)
+        logger.error(rendered_message, exc_info=True)
+
+
+def _safe_log_argument(value: object) -> object:
+    """Snapshot malformed-log values without trusting hostile string methods."""
+    # Exact types preserve builtin logging representations without admitting subclasses.
+    if type(value) in (str, int, float, bytes):
+        return value
+    try:
+        # The unbound call strips any surviving ``str``-subclass overrides.
+        return str.__str__(str(value))
+    except Exception as rendering_error:
+        return f"<unprintable {type(value).__name__}: {type(rendering_error).__name__}>"
 
 
 async def send_message_delivery(
@@ -437,6 +528,7 @@ async def send_message_delivery(
     turn_id: str,
     accepted: bool,
     message: str | None = None,
+    error_code: str | None = None,
     retry_with_new_id: bool = False,
     rejection_outcome: Literal["not_accepted", "outcome_unknown"] | None = None,
 ) -> None:
@@ -454,6 +546,8 @@ async def send_message_delivery(
     }
     if message:
         payload["message"] = message
+    if error_code is not None:
+        payload["error_code"] = error_code
     if retry_with_new_id:
         payload["retry_with_new_id"] = True
     if rejection_outcome is not None:
@@ -532,7 +626,7 @@ def _terminal_task_error_payload(
             current_payload = _task_error_payload(
                 db,
                 task_id,
-                message,
+                CLIENT_SAFE_TASK_FAILURE,
                 event_type=event_type,
             )
             logger.info(
@@ -562,8 +656,8 @@ def _terminal_task_error_payload(
                         db,
                         task_id=task_id,
                         user_id=int(task_user_id),
-                        content=message,
-                        message_type="chat_response",
+                        content=CLIENT_SAFE_TASK_FAILURE,
+                        message_type=TASK_FAILURE_MESSAGE_TYPE,
                     )
                 except Exception:
                     logger.warning(
@@ -574,7 +668,7 @@ def _terminal_task_error_payload(
         return _task_error_payload(
             db,
             task_id,
-            message,
+            CLIENT_SAFE_TASK_FAILURE,
             event_type=event_type,
         )
     except Exception:
@@ -582,7 +676,7 @@ def _terminal_task_error_payload(
         logger.warning("Failed to persist terminal task error", exc_info=True)
         return {
             "type": event_type,
-            "message": message,
+            "message": CLIENT_SAFE_TASK_FAILURE,
             "task": {
                 "id": task_id,
                 "status": TaskStatus.FAILED.value,
@@ -597,16 +691,26 @@ def _read_task_error_payload_isolated(
     message: str,
     *,
     event_type: str = "agent_error",
+    error_code: str | None = None,
 ) -> dict[str, Any]:
     """Read a task error payload in a short Session owned by this worker."""
     SessionLocal = get_session_local()
     with SessionLocal() as db:
         try:
-            return _task_error_payload(db, task_id, message, event_type=event_type)
+            return _task_error_payload(
+                db,
+                task_id,
+                message,
+                event_type=event_type,
+                error_code=error_code,
+            )
         except Exception:
             db.rollback()
             logger.warning("Failed to read terminal task error payload", exc_info=True)
-            return {"type": event_type, "message": message}
+            payload = {"type": event_type, "message": message}
+            if error_code is not None:
+                payload["error_code"] = error_code
+            return payload
 
 
 async def _read_task_error_payload_offloop(
@@ -614,6 +718,7 @@ async def _read_task_error_payload_offloop(
     message: str,
     *,
     event_type: str = "agent_error",
+    error_code: str | None = None,
 ) -> dict[str, Any]:
     """Keep a potentially blocked pool checkout off the asyncio event loop."""
     return await run_db_io_cancellation_safe(
@@ -621,6 +726,7 @@ async def _read_task_error_payload_offloop(
             task_id,
             message,
             event_type=event_type,
+            error_code=error_code,
         )
     )
 
@@ -822,11 +928,16 @@ def create_stream_event(
     task_id: Union[int, str],
     data: Dict[str, Any],
     timestamp: Optional[Any] = None,
+    *,
+    event_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Create unified stream event format"""
+    """Create a stream event, preserving a producer-supplied event identity."""
+    resolved_event_id = (
+        event_id if isinstance(event_id, str) and event_id else str(uuid.uuid4())
+    )
     return {
         "type": "trace_event",
-        "event_id": str(uuid.uuid4()),
+        "event_id": resolved_event_id,
         "event_type": event_type,
         "task_id": task_id,
         "timestamp": _stream_timestamp(timestamp),
@@ -1009,6 +1120,7 @@ def make_agent_outbound_handler(task_id: int) -> Any:
                 "visible": bool(payload.get("visible", True)),
                 "metadata": payload.get("metadata") or {},
             },
+            event_id=payload.get("event_id"),
         )
         await asyncio.to_thread(_persist_agent_outbound_event, task_id, event)
         await manager.broadcast_to_task(event, task_id)
@@ -2437,6 +2549,15 @@ def _finalize_task_execution_result_isolated(
                     status=final_status,
                     expected_run_id=expected_run_id,
                 )
+                if final_status == TaskStatus.FAILED:
+                    diagnostic_error = safe_str(result.get("error")).strip()
+                    setattr(
+                        task_updated,
+                        "error_message",
+                        diagnostic_error
+                        or safe_str(ai_response).strip()
+                        or CLIENT_SAFE_TASK_FAILURE,
+                    )
                 sync_workforce_run_status(
                     finalize_db,
                     task_updated,
@@ -2453,17 +2574,25 @@ def _finalize_task_execution_result_isolated(
                         f"Task {task_id}: cannot persist assistant message "
                         "without a resolved user_id"
                     )
+                history_content, history_message_type = (
+                    assistant_history_values_for_persistence(
+                        content=safe_str(ai_response),
+                        message_type=ASSISTANT_RESPONSE_MESSAGE_TYPE,
+                        is_failure=task_updated.status == TaskStatus.FAILED,
+                    )
+                )
                 persist_assistant_message_no_commit(
                     finalize_db,
                     task_id=task_id,
                     user_id=task_user_id,
-                    content=str(ai_response),
-                    message_type="chat_response"
-                    if isinstance(chat_response, dict)
-                    else "final_answer",
-                    interactions=chat_response.get("interactions")
-                    if isinstance(chat_response, dict)
-                    else None,
+                    content=history_content,
+                    message_type=history_message_type,
+                    interactions=(
+                        chat_response.get("interactions")
+                        if isinstance(chat_response, dict)
+                        and task_updated.status != TaskStatus.FAILED
+                        else None
+                    ),
                     content_is_reconciled=True,
                 )
                 finalize_db.commit()
@@ -2521,6 +2650,7 @@ async def execute_task_background(
     resolved_execution_scope: Union[
         ExecutionScope, None, ExecutionScopeNotProvided
     ] = EXECUTION_SCOPE_NOT_PROVIDED,
+    mcp_runtime_authorization_policy: MCPBuiltinOAuthActorPolicy | None = None,
 ) -> None:
     """Execute one task without checking out a DB connection on the event loop.
 
@@ -2554,7 +2684,10 @@ async def execute_task_background(
                 )
             )
         if snapshot is None:
-            raise ClientVisibleValidationError(f"Task {task_id} not found")
+            raise ClientVisibleValidationError(
+                f"Task {task_id} not found",
+                error_code=ClientErrorCode.TASK_UNAVAILABLE,
+            )
 
         context_dict = context if isinstance(context, dict) else {}
         logger.info(f"Background task execution started for task {task_id}")
@@ -2592,6 +2725,7 @@ async def execute_task_background(
                 connector_runtime_turn_id=context_dict.get("turn_id")
                 if isinstance(context_dict.get("turn_id"), str)
                 else None,
+                mcp_runtime_authorization_policy=(mcp_runtime_authorization_policy),
                 resolved_execution_scope=execution_scope,
             )
             if hasattr(agent_service, "set_outbound_message_handler"):
@@ -2599,7 +2733,8 @@ async def execute_task_background(
                     make_agent_outbound_handler(task_id)
                 )
             agent_service.set_conversation_history(
-                [dict(message) for message in snapshot.conversation_history]
+                [dict(message) for message in snapshot.conversation_history],
+                watermark=snapshot.conversation_watermark,
             )
             recovery_state = await materialize_task_execution_recovery_state(
                 snapshot.execution_recovery
@@ -2709,7 +2844,6 @@ async def execute_task_background(
             # Send task completion event (includes agent response info)
             await manager.broadcast_to_task(
                 {
-                    "type": "task_completed",
                     "task": {
                         "id": broadcast_meta["id"],
                         "title": broadcast_meta["title"],
@@ -2726,6 +2860,7 @@ async def execute_task_background(
                     "error_code": result.get("error_code"),
                     "error_details": result.get("error_details"),
                     **control_event_state,
+                    "type": "task_completed",
                     "chat_response": chat_response
                     if isinstance(chat_response, dict)
                     else None,
@@ -2783,6 +2918,12 @@ async def execute_task_background(
             raise
 
         error_message = str(e)
+        error_code = (
+            e.error_code
+            if isinstance(e, ClientVisibleError)
+            else ClientErrorCode.TASK_EXECUTION_FAILED
+        )
+        safe_error_message = client_error_message(error_code)
         terminal_payload = await run_db_io_cancellation_safe(
             lambda: _terminal_task_error_payload(
                 task_id,
@@ -2808,14 +2949,18 @@ async def execute_task_background(
                 f"Background task {task_id} execution failed: {e}", exc_info=True
             )
             # Genuine failure: _terminal_task_error_payload persists FAILED
-            # + the real error_message and builds the notification payload.
+            # + the real error_message for diagnostics. Replace every
+            # client-visible copy in the notification payload: the spread
+            # already carries ``message``, while older clients also read
+            # ``error``.
             try:
-                message = str(e)
                 await manager.broadcast_to_task(
                     {
                         **terminal_payload,
                         "task_id": task_id,
-                        "error": message,
+                        "message": safe_error_message,
+                        "error": safe_error_message,
+                        "error_code": error_code.value,
                         "timestamp": datetime.now(timezone.utc).timestamp(),
                     },
                     task_id,
@@ -3077,7 +3222,7 @@ def _finalize_resumed_task(
                 task_id=task_id,
                 user_id=task_owner_user_id,
                 content=output,
-                message_type="final_answer",
+                message_type=ASSISTANT_RESPONSE_MESSAGE_TYPE,
                 turn_id=_latest_result_user_turn_id(result),
                 content_is_reconciled=True,
             )
@@ -3085,9 +3230,23 @@ def _finalize_resumed_task(
             orm_task.output = output
             orm_task.error_message = None
         elif final_task_status == TaskStatus.FAILED:
+            if task_owner_user_id is not None:
+                persist_assistant_message_no_commit(
+                    db,
+                    task_id=task_id,
+                    user_id=task_owner_user_id,
+                    content=CLIENT_SAFE_TASK_FAILURE,
+                    message_type=TASK_FAILURE_MESSAGE_TYPE,
+                    turn_id=_latest_result_user_turn_id(result),
+                    content_is_reconciled=True,
+                )
             orm_task = cast(Any, task)
             orm_task.output = None
-            orm_task.error_message = output or "Task execution failed."
+            orm_task.error_message = (
+                str(result.get("error") or "").strip()
+                or output
+                or CLIENT_SAFE_TASK_FAILURE
+            )
 
         sync_workforce_run_status(db, task, final_task_status)
         lease_released = release_task_lease_no_commit(
@@ -3137,6 +3296,11 @@ async def execute_resume_background(
     delivery_already_dispatched: bool = False,
     delivery_websocket: WebSocket | None = None,
     delivery_client_message_id: str | None = None,
+    # Defaulting to None is a structurally open door, not exercised by any
+    # caller today: acquire_task_lease_no_commit (task_lease_service.py)
+    # mints a fresh uuid for a None here, so a future call site that
+    # forgets to pass its own run id would silently claim a lease under a
+    # run nobody else knows about instead of failing loudly.
     expected_run_id: str | None = None,
     resolved_execution_scope: Union[
         ExecutionScope, None, ExecutionScopeNotProvided
@@ -3193,6 +3357,7 @@ async def execute_resume_background(
         accepted: bool,
         message: str | None = None,
         *,
+        error_code: ClientErrorCode | None = None,
         retry_with_new_id: bool = False,
         rejection_outcome: Literal["not_accepted", "outcome_unknown"] | None = None,
     ) -> None:
@@ -3205,6 +3370,7 @@ async def execute_resume_background(
                 turn_id=delivery_turn_id or delivery_client_message_id,
                 accepted=accepted,
                 message=message,
+                error_code=error_code.value if error_code is not None else None,
                 retry_with_new_id=retry_with_new_id,
                 rejection_outcome=rejection_outcome,
             )
@@ -3324,14 +3490,16 @@ async def execute_resume_background(
                     )
                     await notify_deferred_delivery(
                         False,
-                        "The deferred message could not be delivered. Please retry.",
+                        client_error_message(ClientErrorCode.MESSAGE_DELIVERY_FAILED),
+                        error_code=ClientErrorCode.MESSAGE_DELIVERY_FAILED,
                         retry_with_new_id=True,
                         rejection_outcome="not_accepted",
                     )
                 await manager.broadcast_to_task(
                     {
                         "type": "agent_error",
-                        "message": "Task is already running on another worker.",
+                        "message": client_error_message(ClientErrorCode.TASK_BUSY),
+                        "error_code": ClientErrorCode.TASK_BUSY.value,
                         "task": {"id": task_id, "status": TaskStatus.RUNNING.value},
                         "timestamp": datetime.now(timezone.utc).timestamp(),
                     },
@@ -3397,35 +3565,52 @@ async def execute_resume_background(
             # staged since, not the one the message answered. Bound to a
             # plain local before the lambda below, like close_run_id above.
             close_interaction_id = pending_user_message.get("interaction_id")
-            try:
-                await run_db_io_cancellation_safe(
-                    lambda: close_legacy_resume_interaction_sync(
-                        task_id=task_id,
-                        run_id=close_run_id,
-                        interaction_id=close_interaction_id,
+            # Distinct from the "unconditional" argument above, which is
+            # only about not borrowing the delivery_turn_id branch's
+            # condition: this task can itself be retried across runs with
+            # the same pending_user_message, and post_user_message reports
+            # that retry explicitly as a replay instead of a bare truthy
+            # `posted`. What the guard buys here is narrower than at the
+            # sites that read their own id: the id carried above is a
+            # primary key the first attempt already retired, and the close
+            # statement binds to it, so on a replay the close would be a
+            # no-op rather than a retirement of a live question. The guard
+            # stays as defense in depth -- it is what keeps this site safe
+            # if it ever stops carrying the id forward and starts deriving
+            # its own. See task_interaction_close's module docstring for
+            # the rule, the other sites, and why the v1 reply resume-input
+            # path needs no guard at all.
+            if posted is UserMessageInjectionOutcome.POSTED_FRESH:
+                try:
+                    await run_db_io_cancellation_safe(
+                        lambda: close_legacy_resume_interaction_sync(
+                            task_id=task_id,
+                            run_id=close_run_id,
+                            interaction_id=close_interaction_id,
+                        )
                     )
-                )
-            except Exception:
-                logger.warning(
-                    "legacy resume interaction close failed after deferred "
-                    "message seal for task %s run %s",
-                    task_id,
-                    close_run_id,
-                    exc_info=True,
-                )
-            except asyncio.CancelledError:
-                # See run_db_io_cancellation_safe's docstring: it drains its
-                # worker to completion before propagating a cancellation
-                # raised while awaiting it, so the close-and-clear
-                # transaction has already committed or failed by the time
-                # this branch runs. Only the log statement was interrupted.
-                logger.warning(
-                    "legacy resume interaction close was cancelled after "
-                    "deferred message seal for task %s run %s; continuing "
-                    "resume",
-                    task_id,
-                    close_run_id,
-                )
+                except Exception:
+                    logger.warning(
+                        "legacy resume interaction close failed after deferred "
+                        "message seal for task %s run %s",
+                        task_id,
+                        close_run_id,
+                        exc_info=True,
+                    )
+                except asyncio.CancelledError:
+                    # See run_db_io_cancellation_safe's docstring: it drains
+                    # its worker to completion before propagating a
+                    # cancellation raised while awaiting it, so the
+                    # close-and-clear transaction has already committed or
+                    # failed by the time this branch runs. Only the log
+                    # statement was interrupted.
+                    logger.warning(
+                        "legacy resume interaction close was cancelled after "
+                        "deferred message seal for task %s run %s; continuing "
+                        "resume",
+                        task_id,
+                        close_run_id,
+                    )
             if delivery_turn_id is not None:
                 try:
                     await run_db_io_cancellation_safe(
@@ -3650,7 +3835,6 @@ async def execute_resume_background(
 
         await manager.broadcast_to_task(
             {
-                "type": "task_completed",
                 "task": {
                     "id": task_id,
                     "title": task_title,
@@ -3666,6 +3850,7 @@ async def execute_resume_background(
                 "error_code": result.get("error_code"),
                 "error_details": result.get("error_details"),
                 **control_event_state,
+                "type": "task_completed",
                 "metadata": result.get("metadata", {}),
                 "timestamp": datetime.now(timezone.utc).timestamp(),
             },
@@ -3685,7 +3870,8 @@ async def execute_resume_background(
             if await mark_deferred_delivery_failed():
                 await notify_deferred_delivery(
                     False,
-                    "The deferred message was cancelled. Please retry.",
+                    client_error_message(ClientErrorCode.MESSAGE_DELIVERY_FAILED),
+                    error_code=ClientErrorCode.MESSAGE_DELIVERY_FAILED,
                     retry_with_new_id=True,
                     rejection_outcome="not_accepted",
                 )
@@ -3745,7 +3931,8 @@ async def execute_resume_background(
                 if await mark_deferred_delivery_failed():
                     await notify_deferred_delivery(
                         False,
-                        "The task's saved progress could not be read. Please retry.",
+                        client_error_message(ClientErrorCode.MESSAGE_DELIVERY_FAILED),
+                        error_code=ClientErrorCode.MESSAGE_DELIVERY_FAILED,
                         retry_with_new_id=True,
                         rejection_outcome="not_accepted",
                     )
@@ -3757,12 +3944,15 @@ async def execute_resume_background(
                 exc_info=True,
             )
             settlement_error = error_message
-            broadcast_error_message = error_message
+            broadcast_error_message = client_safe_error_message(
+                e,
+                fallback=CLIENT_SAFE_TASK_FAILURE,
+            )
             if delivery_turn_id is not None and not delivery_was_dispatched:
                 if await mark_deferred_delivery_failed():
                     await notify_deferred_delivery(
                         False,
-                        error_message,
+                        CLIENT_SAFE_VALIDATION_ERROR,
                         retry_with_new_id=True,
                         rejection_outcome="not_accepted",
                     )
@@ -3786,10 +3976,22 @@ async def execute_resume_background(
                 )
                 return
         if lease is None:
-            await manager.broadcast_to_task(
-                create_terminal_task_error_event(task_id, error_message),
-                task_id,
-            )
+            if broadcast_error_message is not None:
+                await manager.broadcast_to_task(
+                    create_terminal_task_error_event(
+                        task_id,
+                        broadcast_error_message,
+                    ),
+                    task_id,
+                )
+            else:
+                await manager.broadcast_to_task(
+                    create_terminal_task_error_event(
+                        task_id,
+                        CLIENT_SAFE_TASK_FAILURE,
+                    ),
+                    task_id,
+                )
     finally:
 
         async def finalize_resume_resources() -> None:
@@ -3905,7 +4107,6 @@ async def execute_resume_background(
                                 )
                                 await manager.broadcast_to_task(
                                     {
-                                        "type": event_type,
                                         "task_id": task_id,
                                         "message": message,
                                         "timestamp": datetime.now(
@@ -3916,6 +4117,7 @@ async def execute_resume_background(
                                             if restored_snapshot is not None
                                             else {}
                                         ),
+                                        "type": event_type,
                                     },
                                     task_id,
                                 )
@@ -3993,19 +4195,80 @@ class BackgroundTaskCancelOutcome:
     requested: bool
 
 
+class ResumeReservationOutcome(str, enum.Enum):
+    """Result of trying to take the single live-control resume slot."""
+
+    RESERVED = "reserved"
+    # Another caller owns the pre-registration window. Its transition or
+    # coordinator registration may still fail, so this is not yet proof that
+    # the task is resuming.
+    RESERVATION_HELD = "reservation_held"
+    # A registered resume coordinator is already responsible for the task.
+    COORDINATOR_RUNNING = "coordinator_running"
+    # This process no longer admits new background work.
+    SHUTTING_DOWN = "shutting_down"
+
+
+class AnyResumeRun:
+    """Marker admitting a coordinator for *any* run as idempotency evidence.
+
+    Distinguishes "do not check the run" from an explicit ``None``, which
+    means "this task has no run id, so only a coordinator registered without
+    one is evidence". Without the marker a caller that simply had no run id
+    to hand would silently accept a coordinator belonging to a different run.
+    """
+
+    __slots__ = ()
+
+
+ANY_RESUME_RUN = AnyResumeRun()
+
+
+class ResumeCommandOutcome(str, enum.Enum):
+    """Durable meaning of one handled RESUME command."""
+
+    SCHEDULED = "scheduled"
+    ALREADY_IN_PROGRESS = "already_in_progress"
+    DEFERRED = "deferred"
+    REJECTED = "rejected"
+
+
+@dataclass(frozen=True)
+class ResumeCommandResult:
+    outcome: ResumeCommandOutcome
+    # Human-readable text. Lands in the command row's ``error`` column and,
+    # for deferrals, in the message a budget exhaustion reports.
+    reason: str | None = None
+    # Stable machine-readable code, mirroring the ``stale_run`` code the
+    # CANCEL branch already emits. Populates ``result["rejection_reason"]``
+    # so a client can branch without matching human-readable text.
+    reason_code: str | None = None
+    # Whether ``reason`` is wording this module wrote for the sender. Terminal
+    # deferral broadcasts go through the redaction chokepoint, so without this
+    # the text is replaced by the generic string and the deferral becomes
+    # indistinguishable from an outright failure -- see
+    # ``ClientVisibleTaskCommandDeferred``.
+    client_visible: bool = False
+
+
 # Background task manager: ensures only one active background execution per task
 class BackgroundTaskManager:
     """Manages background task execution, ensuring only one background process per task at a time"""
 
     def __init__(self) -> None:
         # task_id -> asyncio.Task
-        self.running_tasks: Dict[int, asyncio.Task] = {}
+        self.running_tasks: dict[int, asyncio.Task] = {}
         # Resume coordinators are deliberately tracked separately while they
         # wait for the current execution. Replacing ``running_tasks[task_id]``
         # too early creates a cycle: the original execution waits for the new
         # resume task while that resume task waits for the original execution.
-        self.resume_tasks: Dict[int, asyncio.Task] = {}
+        self.resume_tasks: dict[int, asyncio.Task] = {}
+        # The coordinator is evidence only for the exact run it was created
+        # to resume. A lingering old-run task must not complete a command for
+        # a newer run as an idempotent success.
+        self._resume_run_ids: dict[int, str | None] = {}
         self._resume_reservations: set[int] = set()
+        self._resume_owner_started_at: dict[int, float] = {}
         self._shutting_down = False
         self._shutdown_lock = asyncio.Lock()
 
@@ -4016,7 +4279,9 @@ class BackgroundTaskManager:
             self._shutdown_lock.locked()
             or self.running_tasks
             or self.resume_tasks
+            or self._resume_run_ids
             or self._resume_reservations
+            or self._resume_owner_started_at
         ):
             raise RuntimeError("Background task manager still owns background work")
         # asyncio synchronization primitives are bound to the event loop that
@@ -4052,35 +4317,110 @@ class BackgroundTaskManager:
         self.running_tasks[task_id] = task
         logger.info(f"Registered background task for task {task_id}")
 
-    def reserve_resume(self, task_id: int) -> bool:
-        """Atomically reserve the single live-control resume slot."""
+    def resume_admission_state(
+        self,
+        task_id: int,
+        *,
+        expected_run_id: str | None | AnyResumeRun,
+    ) -> ResumeReservationOutcome | None:
+        """Classify existing resume ownership without taking an empty slot.
+
+        Returns ``None`` when the slot is free. Not a pure read: a coordinator
+        that has already finished is reclaimed here, dropping both its task
+        and its registered run id, so a finished registration never reports
+        the slot as occupied.
+
+        ``expected_run_id`` is the evidence axis. Pass :data:`ANY_RESUME_RUN`
+        to accept a coordinator for any run; an explicit ``None`` means the
+        task has no run id and only a coordinator registered without one
+        counts.
+        """
 
         if self._shutting_down:
-            return False
-        # Keep this check-and-add block synchronous: asyncio task switches can
-        # only happen at ``await``, so it is the in-process atomic guard.
+            return ResumeReservationOutcome.SHUTTING_DOWN
+        if task_id in self._resume_reservations:
+            return ResumeReservationOutcome.RESERVATION_HELD
         existing = self.resume_tasks.get(task_id)
-        if task_id in self._resume_reservations or (
-            existing is not None and not existing.done()
-        ):
-            return False
-        self._resume_reservations.add(task_id)
-        return True
+        if existing is not None and not existing.done():
+            registered_run_id = self._resume_run_ids.get(task_id)
+            if (
+                isinstance(expected_run_id, AnyResumeRun)
+                or registered_run_id == expected_run_id
+            ):
+                return ResumeReservationOutcome.COORDINATOR_RUNNING
+            # The task id is still locally occupied, but by a coordinator for
+            # another run. It is not evidence that this run is resuming and it
+            # is not safe to overwrite its registration.
+            return ResumeReservationOutcome.RESERVATION_HELD
+        if existing is not None:
+            self.resume_tasks.pop(task_id, None)
+            self._resume_run_ids.pop(task_id, None)
+            self._resume_owner_started_at.pop(task_id, None)
+        return None
 
-    def register_reserved_resume(self, task_id: int, task: asyncio.Task) -> None:
+    def resume_holder_age_seconds(self, task_id: int) -> float | None:
+        """Return the local resume-slot holder's monotonic age, if known."""
+
+        started_at = self._resume_owner_started_at.get(task_id)
+        if started_at is None:
+            return None
+        return max(0.0, time.monotonic() - started_at)
+
+    def try_reserve_resume(
+        self,
+        task_id: int,
+        *,
+        expected_run_id: str | None | AnyResumeRun,
+    ) -> ResumeReservationOutcome:
+        """Atomically classify admission to the live-control resume slot."""
+
+        # Keep this inspect-and-add block synchronous: asyncio task switches
+        # can only happen at ``await``, so it is the in-process atomic guard.
+        existing_state = self.resume_admission_state(
+            task_id,
+            expected_run_id=expected_run_id,
+        )
+        if existing_state is not None:
+            return existing_state
+        self._resume_reservations.add(task_id)
+        self._resume_owner_started_at[task_id] = time.monotonic()
+        return ResumeReservationOutcome.RESERVED
+
+    def reserve_resume(self, task_id: int) -> bool:
+        """Boolean compatibility wrapper for callers that cannot classify.
+
+        Keeps the pre-classification contract: any unfinished coordinator
+        reports the slot as taken, whichever run it belongs to.
+        """
+
+        return (
+            self.try_reserve_resume(task_id, expected_run_id=ANY_RESUME_RUN)
+            is ResumeReservationOutcome.RESERVED
+        )
+
+    def register_reserved_resume(
+        self,
+        task_id: int,
+        task: asyncio.Task,
+        *,
+        run_id: str | None,
+    ) -> None:
         if self._shutting_down:
             task.cancel()
             raise RuntimeError("Background task manager is shutting down")
         if task_id not in self._resume_reservations:
             raise RuntimeError(f"Task {task_id} has no reserved resume slot")
         self._resume_reservations.discard(task_id)
+        self._resume_owner_started_at.setdefault(task_id, time.monotonic())
         self.resume_tasks[task_id] = task
+        self._resume_run_ids[task_id] = run_id
         logger.info("Registered resume coordinator for task %s", task_id)
 
     def release_resume_reservation(self, task_id: int) -> None:
         if self._shutting_down:
             return
         self._resume_reservations.discard(task_id)
+        self._resume_owner_started_at.pop(task_id, None)
 
     def promote_resume_task(self, task_id: int, task: asyncio.Task) -> None:
         if self._shutting_down:
@@ -4116,6 +4456,8 @@ class BackgroundTaskManager:
         resume_task = self.resume_tasks.get(task_id)
         if resume_task is not None and owns_registration(resume_task):
             self.resume_tasks.pop(task_id, None)
+            self._resume_run_ids.pop(task_id, None)
+            self._resume_owner_started_at.pop(task_id, None)
             logger.info("Cleaned up resume coordinator for task %s", task_id)
 
     async def cancel_task(
@@ -4131,6 +4473,12 @@ class BackgroundTaskManager:
             )
             if task is not None
         }
+        if not self._shutting_down:
+            # A cancel can race the await between reservation and coordinator
+            # registration. Clear that pre-registration owner even when there
+            # is no asyncio task to cancel yet.
+            self._resume_reservations.discard(task_id)
+            self._resume_owner_started_at.pop(task_id, None)
         if not tasks:
             return BackgroundTaskCancelOutcome(requested=False)
 
@@ -4159,7 +4507,8 @@ class BackgroundTaskManager:
         if not self._shutting_down:
             self.running_tasks.pop(task_id, None)
             self.resume_tasks.pop(task_id, None)
-            self._resume_reservations.discard(task_id)
+            self._resume_run_ids.pop(task_id, None)
+            self._resume_owner_started_at.pop(task_id, None)
         return BackgroundTaskCancelOutcome(requested=requested)
 
     async def shutdown(self) -> None:
@@ -4189,7 +4538,9 @@ class BackgroundTaskManager:
                 # caller is cancelled.
                 self.running_tasks.clear()
                 self.resume_tasks.clear()
+                self._resume_run_ids.clear()
                 self._resume_reservations.clear()
+                self._resume_owner_started_at.clear()
 
 
 # Global background task manager
@@ -5066,7 +5417,8 @@ def _claim_user_message_delivery_isolated(
                 )
                 if missing:
                     raise ClientVisibleValidationError(
-                        "Files are no longer bindable: " + ", ".join(missing)
+                        "Files are no longer bindable: " + ", ".join(missing),
+                        error_code=ClientErrorCode.MESSAGE_ATTACHMENT_UNAVAILABLE,
                     )
             claim_snapshot = _snapshot_user_message_delivery(claim)
             try:
@@ -5171,20 +5523,31 @@ async def handle_chat_message(
             command_id=_client_message_id(message_data.get("client_message_id")),
             allow_missing_task=True,
         )
-    except (PermissionError, ValueError) as exc:
+    except (
+        MCPBuiltinOAuthActorPolicyRequiredError,
+        PermissionError,
+        ValueError,
+    ) as exc:
         log_client_facing_failure(exc, "Chat command rejected for task %s: %s", task_id)
         client_message_id = _client_message_id(message_data.get("client_message_id"))
-        message = client_safe_error_message(exc)
+        error_code = (
+            exc.error_code
+            if isinstance(exc, ClientVisibleError)
+            else ClientErrorCode.MESSAGE_PROCESSING_FAILED
+        )
+        message = client_error_message(error_code)
         await send_message_delivery(
             websocket,
             client_message_id=client_message_id,
             turn_id=client_message_id or str(uuid.uuid4()),
             accepted=False,
             message=message,
+            error_code=error_code.value,
             rejection_outcome="not_accepted",
         )
         await manager.send_personal_message(
-            {"type": "error", "message": message}, websocket
+            {"type": "error", "message": message, "error_code": error_code.value},
+            websocket,
         )
         return
     if enqueued is None:
@@ -5200,7 +5563,8 @@ async def handle_chat_message(
             client_message_id=_client_message_id(message_data.get("client_message_id")),
             turn_id=enqueued.client_command_id,
             accepted=False,
-            message="Message id was already used for different content or files.",
+            message=client_error_message(ClientErrorCode.MESSAGE_ID_CONFLICT),
+            error_code=ClientErrorCode.MESSAGE_ID_CONFLICT.value,
             retry_with_new_id=True,
             rejection_outcome="not_accepted",
         )
@@ -5211,7 +5575,8 @@ async def handle_chat_message(
             client_message_id=_client_message_id(message_data.get("client_message_id")),
             turn_id=enqueued.client_command_id,
             accepted=False,
-            message="The previous delivery attempt failed. Please retry the draft.",
+            message=client_error_message(ClientErrorCode.MESSAGE_DELIVERY_FAILED),
+            error_code=ClientErrorCode.MESSAGE_DELIVERY_FAILED.value,
             retry_with_new_id=True,
             rejection_outcome="not_accepted",
         )
@@ -5253,10 +5618,20 @@ def _enqueue_websocket_task_command_sync(
         if task is None:
             if allow_missing_task:
                 return None
-            raise ClientVisibleValidationError(f"Task {task_id} not found")
+            raise ClientVisibleValidationError(
+                f"Task {task_id} not found",
+                error_code=ClientErrorCode.TASK_UNAVAILABLE,
+            )
         if not actor_is_admin and int(task.user_id) != actor_user_id:
+            # Keep the permission-specific text for operator logs, but expose
+            # the same code as a missing task so task IDs cannot be probed.
             raise ClientVisiblePermissionError(
-                f"Access denied: Task {task_id} does not belong to you"
+                f"Access denied: Task {task_id} does not belong to you",
+                error_code=ClientErrorCode.TASK_UNAVAILABLE,
+            )
+        if mcp_runtime_authorization_policy_required(task.agent_config):
+            raise MCPBuiltinOAuthActorPolicyRequiredError(
+                f"Task {task_id} is actor-marked; generic task commands are unsupported"
             )
         if kind == TaskCommandKind.MESSAGE:
             from ..services.chat_history_service import (
@@ -5309,7 +5684,10 @@ def _enqueue_websocket_task_command_sync(
             # The sentinel is a bare ValueError, so re-raising it as-is let
             # the pause/resume catch redact "not found" on this race alone.
             # Converted at this boundary only; transport semantics unchanged.
-            raise ClientVisibleValidationError(str(exc)) from exc
+            raise ClientVisibleValidationError(
+                str(exc),
+                error_code=ClientErrorCode.TASK_UNAVAILABLE,
+            ) from exc
         return result
 
 
@@ -5324,7 +5702,8 @@ async def _enqueue_websocket_task_command(
     user = message_data.get("user")
     if user is None:
         raise ClientVisibleValidationError(
-            "User authentication required for task command"
+            "User authentication required for task command",
+            error_code=ClientErrorCode.AUTHENTICATION_REQUIRED,
         )
     resolved_command_id = command_id or f"{kind.value}:{uuid.uuid4()}"
     # User ORM instances and server-only authentication fields are never put
@@ -5334,6 +5713,16 @@ async def _enqueue_websocket_task_command(
         for key, value in message_data.items()
         if key not in {"user", "user_id"} and not key.startswith("_durable_")
     }
+    if "scope" in payload:
+        # ``scope`` routes a durable command to a non-first-party execution
+        # core (see ``_execute_durable_task_command``); only server-side
+        # producers may name one. A client frame that carries it is refused
+        # rather than silently stripped, so the sender learns the frame was
+        # not accepted as written.
+        raise ClientVisibleValidationError(
+            "Reserved field 'scope' is not accepted from clients",
+            error_code=ClientErrorCode.INVALID_MESSAGE,
+        )
     if kind == TaskCommandKind.MESSAGE:
         # The durable command identity is also the delivery/turn identity.
         # This remains stable across retries even when an API client omitted
@@ -5598,8 +5987,10 @@ def _prepare_websocket_turn_sync(
                     requested_task_id,
                     existing_task.user_id,
                 )
-                raise ValueError(
-                    f"Access denied: Task {requested_task_id} does not belong to you"
+                # Match the public opacity contract at command enqueue above.
+                raise ClientVisiblePermissionError(
+                    f"Access denied: Task {requested_task_id} does not belong to you",
+                    error_code=ClientErrorCode.TASK_UNAVAILABLE,
                 )
             task_created = True
 
@@ -5865,6 +6256,7 @@ async def _handle_chat_message_unserialized(
         accepted: bool,
         message: str | None = None,
         *,
+        error_code: str | None = None,
         retry_with_new_id: bool = False,
         rejection_outcome: Literal["not_accepted", "outcome_unknown"] | None = None,
     ) -> None:
@@ -5882,11 +6274,16 @@ async def _handle_chat_message_unserialized(
             turn_id=turn_id,
             accepted=accepted,
             message=message,
+            error_code=error_code,
             retry_with_new_id=retry_with_new_id,
             rejection_outcome=rejection_outcome,
         )
 
-    async def finish_delivery_failure(message: str) -> bool:
+    async def finish_delivery_failure(
+        message: str,
+        *,
+        error_code: str | None = None,
+    ) -> bool:
         """Reject pre-dispatch failures; never confuse persistence with delivery."""
 
         nonlocal delivery_failure_persist_attempted, delivery_failure_pool_timeout
@@ -5927,6 +6324,7 @@ async def _handle_chat_message_unserialized(
             await finish_delivery(
                 False,
                 message,
+                error_code=error_code,
                 rejection_outcome=(
                     "outcome_unknown"
                     if delivery_failure_pool_timeout or delivery_injected
@@ -5935,27 +6333,85 @@ async def _handle_chat_message_unserialized(
             )
         return not delivery_failure_pool_timeout
 
+    async def answer_durable_turn_failure(sender_error_code: ClientErrorCode) -> bool:
+        """Answer a durable turn failure, addressing each audience as #1514 does.
+
+        The rejection ack and its suppressed-ack replacement bubble carry the
+        specific sender code. The task-wide broadcast also reaches widget and
+        share subscribers who did not initiate the turn, so it carries only the
+        neutral task-failure code and fallback.
+
+        The durable arms below precede the ``RuntimeError`` arm they subclass.
+        On main those faults reached that arm and were broadcast from it, so
+        answering with the ack alone would quietly stop notifying the task.
+        This keeps that notification while giving the sender the specific
+        wording each fault deserves.
+
+        Returns ``False`` when the delivery layer says the caller must stop.
+        """
+        ack_message = client_error_message(sender_error_code)
+        if not await finish_delivery_failure(
+            ack_message,
+            error_code=sender_error_code.value,
+        ):
+            return False
+        timestamp = datetime.now(timezone.utc).timestamp()
+        if authorized_task_id is not None:
+            safe_error_payload = await _read_task_error_payload_offloop(
+                authorized_task_id,
+                CLIENT_SAFE_TASK_FAILURE,
+                error_code=ClientErrorCode.TASK_EXECUTION_FAILED.value,
+            )
+            await manager.broadcast_to_task(
+                {**safe_error_payload, "timestamp": timestamp},
+                authorized_task_id,
+            )
+            if suppress_delivery_ack:
+                await manager.send_personal_message(
+                    {
+                        "type": "error",
+                        "message": ack_message,
+                        "error_code": sender_error_code.value,
+                        "timestamp": timestamp,
+                    },
+                    websocket,
+                )
+        else:
+            await manager.send_personal_message(
+                {
+                    "type": "error",
+                    "message": ack_message,
+                    "error_code": sender_error_code.value,
+                    "timestamp": timestamp,
+                },
+                websocket,
+            )
+        return True
+
     async def finish_existing_delivery(
         claim: Union[UserMessageDeliveryClaim, _UserMessageDeliverySnapshot],
     ) -> None:
         if not claim.payload_matches:
             await finish_delivery(
                 False,
-                "Message id was already used for different content or files.",
+                client_error_message(ClientErrorCode.MESSAGE_ID_CONFLICT),
+                error_code=ClientErrorCode.MESSAGE_ID_CONFLICT.value,
                 retry_with_new_id=True,
                 rejection_outcome="not_accepted",
             )
         elif claim.failed:
             await finish_delivery(
                 False,
-                "The previous delivery attempt failed. Please retry the draft.",
+                client_error_message(ClientErrorCode.MESSAGE_DELIVERY_FAILED),
+                error_code=ClientErrorCode.MESSAGE_DELIVERY_FAILED.value,
                 retry_with_new_id=True,
                 rejection_outcome="not_accepted",
             )
         elif claim.pending:
             await finish_delivery(
                 False,
-                "The message is still being applied. Please retry shortly.",
+                client_error_message(ClientErrorCode.GUIDANCE_IN_PROGRESS),
+                error_code=ClientErrorCode.GUIDANCE_IN_PROGRESS.value,
                 rejection_outcome="outcome_unknown",
             )
         else:
@@ -5970,14 +6426,24 @@ async def _handle_chat_message_unserialized(
 
         if user is None:
             raise ClientVisibleValidationError(
-                "User authentication required for task access"
+                "User authentication required for task access",
+                error_code=ClientErrorCode.AUTHENTICATION_REQUIRED,
             )
         if not isinstance(user_message, str):
-            raise ClientVisibleValidationError("Chat message must be a string")
+            raise ClientVisibleValidationError(
+                "Chat message must be a string",
+                error_code=ClientErrorCode.INVALID_MESSAGE,
+            )
         if not isinstance(raw_context, dict):
-            raise ClientVisibleValidationError("Chat context must be an object")
+            raise ClientVisibleValidationError(
+                "Chat context must be an object",
+                error_code=ClientErrorCode.INVALID_MESSAGE,
+            )
         if not isinstance(raw_files, list):
-            raise ClientVisibleValidationError("Chat files must be a list")
+            raise ClientVisibleValidationError(
+                "Chat files must be a list",
+                error_code=ClientErrorCode.INVALID_MESSAGE,
+            )
 
         actor_user_id = int(user.id)
         actor_is_admin = bool(user.is_admin)
@@ -6124,11 +6590,50 @@ async def _handle_chat_message_unserialized(
             if task_uses_live_control and supports_live_control:
                 logger.info(f"Using agent message control for task {task_id}")
                 assert agent_service is not None
-                if not background_task_manager.reserve_resume(task_id):
+                reservation = background_task_manager.try_reserve_resume(
+                    task_id,
+                    expected_run_id=task_run_id,
+                )
+                if reservation is not ResumeReservationOutcome.RESERVED:
+                    if suppress_delivery_ack:
+                        # Durable commands own their retry budget. All three
+                        # occupied states can clear without this attempt doing
+                        # anything: a reservation can register or release, a
+                        # coordinator can finish, and shutdown is retained as
+                        # a defensive state even though normal shutdown stops
+                        # the dispatcher before setting the manager flag.
+                        holder_age_seconds = (
+                            background_task_manager.resume_holder_age_seconds(task_id)
+                        )
+                        holder_age_text = (
+                            f"{holder_age_seconds:.3f}"
+                            if holder_age_seconds is not None
+                            else "unknown"
+                        )
+                        logger.info(
+                            "Deferring message %s for task %s: resume slot "
+                            "unavailable (%s), holder_age_seconds=%s",
+                            turn_id,
+                            task_id,
+                            reservation.value,
+                            holder_age_text,
+                        )
+                        message_data["_durable_command_defer"] = turn_id
+                        message_data["_durable_command_defer_reason"] = (
+                            f"Message {turn_id} is waiting for the live-control "
+                            f"resume slot ({reservation.value})"
+                        )
+                        if recovered_delivery is not None:
+                            # A prior attempt claimed the durable delivery and
+                            # may have injected it. Task/run-local occupancy is
+                            # not evidence that this command owns the live
+                            # coordinator after a worker handoff.
+                            message_data["_durable_command_defer_unsafe"] = turn_id
+                        return
                     await finish_delivery(
                         False,
-                        "A previous guidance message is still being applied. "
-                        "Please wait for it to finish.",
+                        CLIENT_SAFE_GUIDANCE_IN_PROGRESS,
+                        error_code=ClientErrorCode.GUIDANCE_IN_PROGRESS.value,
                         rejection_outcome="not_accepted",
                     )
                     return
@@ -6179,7 +6684,7 @@ async def _handle_chat_message_unserialized(
                         lambda: active_interaction_id_sync(task_id)
                     )
 
-                    posted = False
+                    posted = UserMessageInjectionOutcome.NOT_POSTED
                     if live_task_lease is not None:
                         with bind_task_lease_context(live_task_lease):
                             try:
@@ -6193,14 +6698,14 @@ async def _handle_chat_message_unserialized(
                                     reason="new websocket user message",
                                 )
                             except CheckpointUnavailableError:
-                                # Fold into the existing posted=False path
+                                # Fold into the existing not-posted path
                                 # below: the durable message is deferred to
                                 # the resume owner instead of injected live,
                                 # exactly as when there was no exact lease
                                 # or checkpoint to inject into. Distinct
                                 # from corrupt/refused, which are not
                                 # retryable by simply deferring.
-                                posted = False
+                                posted = UserMessageInjectionOutcome.NOT_POSTED
                             except CheckpointReadError:
                                 # Corrupt and refused reach here today. The
                                 # base class is deliberate: a read failure
@@ -6216,11 +6721,11 @@ async def _handle_chat_message_unserialized(
                                 background_task_manager.release_resume_reservation(
                                     task_id
                                 )
-                                await finish_delivery_failure(
-                                    "The task's saved progress could not be read."
+                                await answer_durable_turn_failure(
+                                    ClientErrorCode.TASK_CHECKPOINT_UNREADABLE
                                 )
                                 return
-                    delivery_injected = posted
+                    delivery_injected = bool(posted)
                     if not posted:
                         logger.warning(
                             "Agent execution %s had no exact live lease or "
@@ -6228,7 +6733,7 @@ async def _handle_chat_message_unserialized(
                             "until the resume owner is ready",
                             task_id,
                         )
-                    await task_execution_controller.transition(
+                    handoff_snapshot = await task_execution_controller.transition(
                         task_id,
                         TaskControlState.RESUME_REQUESTED,
                         expected_run_id=task_run_id,
@@ -6240,7 +6745,27 @@ async def _handle_chat_message_unserialized(
                             task_id=task_id,
                             agent_service=agent_service,
                             task_owner_user_id=task_owner_user_id,
-                            expected_run_id=task_run_id,
+                            # Also the transition's run, for the same reason
+                            # as the registration below: a ``None`` here
+                            # reaches ``acquire_task_lease_no_commit``, whose
+                            # ``candidate_run_id = expected_run_id or uuid4()``
+                            # would mint a *second* run and claim the lease
+                            # under it -- leaving the row, the coordinator
+                            # registration, and the execution on three
+                            # different answers for one resume.
+                            #
+                            # Two further effects on that formerly-NULL path,
+                            # both intended. The claim now carries
+                            # ``WHERE run_id = :expected``, so if the run
+                            # rotates before it lands -- the window includes
+                            # the unbounded ``await previous_task`` -- the
+                            # claim returns None and the delivery fails
+                            # cleanly instead of stealing the lease. And the
+                            # ``expected_run_id is None`` branch that clears
+                            # the checkpoint pointers is now skipped, which
+                            # is what a resume wants: those pointers are the
+                            # anchor it is resuming from.
+                            expected_run_id=handoff_snapshot.run_id,
                             previous_task=previous_task,
                             resolved_execution_scope=resolved_execution_scope,
                             pending_user_message=(
@@ -6260,7 +6785,7 @@ async def _handle_chat_message_unserialized(
                                 }
                             ),
                             delivery_turn_id=turn_id,
-                            delivery_already_dispatched=posted,
+                            delivery_already_dispatched=bool(posted),
                             delivery_websocket=(
                                 None if posted or suppress_delivery_ack else websocket
                             ),
@@ -6271,7 +6796,20 @@ async def _handle_chat_message_unserialized(
                             ),
                         )
                     )
-                    background_task_manager.register_reserved_resume(task_id, bg_task)
+                    background_task_manager.register_reserved_resume(
+                        task_id,
+                        bg_task,
+                        # The transition's run id, not the routing snapshot's.
+                        # ``apply_task_control_transition`` mints a fresh run
+                        # for a legacy row whose ``run_id`` is NULL, so the
+                        # pre-transition value would register this coordinator
+                        # under ``None`` while the task runs under a uuid. A
+                        # later RESUME asking about that uuid would then read
+                        # a live resume as RESERVATION_HELD and defer itself
+                        # to a terminal failure. The other three registration
+                        # sites already use their post-transition value.
+                        run_id=handoff_snapshot.run_id,
+                    )
                     handoff_registered = True
                     if posted:
                         # Registration completes the local resume handoff.
@@ -6295,44 +6833,27 @@ async def _handle_chat_message_unserialized(
                                 turn_id,
                                 exc_info=True,
                             )
-                        # `posted` is true, meaning a message with this turn
-                        # id is in a live checkpoint. Retire the interaction
-                        # row observed before the injection and clear the
-                        # task's marker in the same short transaction: the
-                        # message went in outside the native interaction
-                        # protocol's answer path, so a question this run had
-                        # open under that protocol was answered by other
-                        # means.
+                        # For a first attempt, retiring the interaction row
+                        # observed before the injection and clearing the
+                        # task's marker in the same short transaction is
+                        # correct: the message went in outside the native
+                        # interaction protocol's answer path, so a question
+                        # this run had open under that protocol was
+                        # answered by other means.
                         #
-                        # That reading holds for a first attempt and not for
-                        # a replay, and `posted` cannot tell the two apart.
-                        # AgentRunner.inject_user_message short-circuits a
-                        # repeated turn id by returning the existing context
-                        # without persisting anything, which reaches here as
-                        # the same `True`. On a replay the id read just above
-                        # is not the question the replayed message answered
-                        # -- that one was retired by the first attempt -- but
-                        # whatever the resumed agent has asked since, and
-                        # retiring it discards a live question nobody
-                        # answered. This close call is live production code --
-                        # it runs on every websocket chat message that
-                        # reaches a running task -- so what makes the window
-                        # harmless today is not that the code is dormant. It
-                        # is that there is nothing for it to retire: the only
-                        # INSERT into task_interaction_requests is
-                        # stage_interaction_request
-                        # (task_interaction_staging.py), which has no caller
-                        # in src/ and is held at none by
-                        # tests/web/services/test_interaction_staging_production_gate.py.
-                        # The pre-injection read therefore returns None on
-                        # every call, and the close matches zero rows. The
-                        # change that wires the first production writer has
-                        # to close this window before that writer ships:
-                        # the runner has to report whether it persisted a
-                        # new message or replayed an existing turn, and this
-                        # site has to skip the close on the replay answer.
-                        # The A2A injection site (a2a.py) carries the same
-                        # window and the same precondition.
+                        # That reading breaks on a replay. This site reads
+                        # its own id fresh on every attempt, so on a replay
+                        # the id above is not the question the replayed
+                        # message answered -- the first attempt retired
+                        # that one -- it is whatever the resumed agent has
+                        # staged since, and closing on it would retire a
+                        # live question. `posted` alone cannot tell a fresh
+                        # write from a replay; AgentRunner.inject_user_message
+                        # reports the distinction explicitly and this guard
+                        # reads that report. See task_interaction_close's
+                        # module docstring for the rule, the other sites,
+                        # and why the v1 reply resume-input path needs no
+                        # guard at all.
                         #
                         # The run fence
                         # is live_task_lease.run_id, not task_run_id: posted
@@ -6347,40 +6868,41 @@ async def _handle_chat_message_unserialized(
                         assert live_task_lease.run_id is not None
                         close_run_id = live_task_lease.run_id
                         close_interaction_id = active_interaction_id
-                        try:
-                            await run_db_io_cancellation_safe(
-                                lambda: close_legacy_resume_interaction_sync(
-                                    task_id=task_id,
-                                    run_id=close_run_id,
-                                    interaction_id=close_interaction_id,
+                        if posted is UserMessageInjectionOutcome.POSTED_FRESH:
+                            try:
+                                await run_db_io_cancellation_safe(
+                                    lambda: close_legacy_resume_interaction_sync(
+                                        task_id=task_id,
+                                        run_id=close_run_id,
+                                        interaction_id=close_interaction_id,
+                                    )
                                 )
-                            )
-                        except Exception:
-                            logger.warning(
-                                "legacy resume interaction close failed after "
-                                "registered resume handoff for task %s run %s",
-                                task_id,
-                                close_run_id,
-                                exc_info=True,
-                            )
-                        except asyncio.CancelledError:
-                            # run_db_io_cancellation_safe drains its worker
-                            # thread to completion before propagating a
-                            # cancellation raised while awaiting it, so by the
-                            # time this branch runs the close-and-clear
-                            # transaction has already committed or failed on
-                            # its own; there is nothing left in flight to
-                            # protect. This only logs the interruption instead
-                            # of letting it escape as an unhandled
-                            # cancellation. Unlike the delivery marker above,
-                            # this branch is deliberate, not a gap to copy.
-                            logger.warning(
-                                "legacy resume interaction close was cancelled "
-                                "for task %s run %s; the resume proceeds "
-                                "unaffected",
-                                task_id,
-                                close_run_id,
-                            )
+                            except Exception:
+                                logger.warning(
+                                    "legacy resume interaction close failed after "
+                                    "registered resume handoff for task %s run %s",
+                                    task_id,
+                                    close_run_id,
+                                    exc_info=True,
+                                )
+                            except asyncio.CancelledError:
+                                # run_db_io_cancellation_safe drains its worker
+                                # thread to completion before propagating a
+                                # cancellation raised while awaiting it, so by the
+                                # time this branch runs the close-and-clear
+                                # transaction has already committed or failed on
+                                # its own; there is nothing left in flight to
+                                # protect. This only logs the interruption instead
+                                # of letting it escape as an unhandled
+                                # cancellation. Unlike the delivery marker above,
+                                # this branch is deliberate, not a gap to copy.
+                                logger.warning(
+                                    "legacy resume interaction close was cancelled "
+                                    "for task %s run %s; the resume proceeds "
+                                    "unaffected",
+                                    task_id,
+                                    close_run_id,
+                                )
                 except BaseException:
                     if bg_task is not None and not handoff_registered:
                         bg_task.cancel()
@@ -6402,13 +6924,21 @@ async def _handle_chat_message_unserialized(
                 await manager.send_personal_message(
                     {
                         "type": "error",
-                        "message": "Task does not support message continuation",
+                        "message": client_error_message(
+                            ClientErrorCode.MESSAGE_CONTINUATION_UNSUPPORTED
+                        ),
+                        "error_code": (
+                            ClientErrorCode.MESSAGE_CONTINUATION_UNSUPPORTED.value
+                        ),
                     },
                     websocket,
                 )
                 await finish_delivery(
                     False,
-                    "Task does not support message continuation.",
+                    client_error_message(
+                        ClientErrorCode.MESSAGE_CONTINUATION_UNSUPPORTED
+                    ),
+                    error_code=ClientErrorCode.MESSAGE_CONTINUATION_UNSUPPORTED.value,
                     rejection_outcome="not_accepted",
                 )
                 return
@@ -6442,11 +6972,11 @@ async def _handle_chat_message_unserialized(
                     }:
                         error_payload = await _read_task_error_payload_offloop(
                             task_id,
-                            (
-                                "Task pause is still being applied; "
-                                "please retry shortly."
+                            client_error_message(
+                                ClientErrorCode.TASK_PAUSE_IN_PROGRESS
                             ),
                             event_type="agent_error",
+                            error_code=ClientErrorCode.TASK_PAUSE_IN_PROGRESS.value,
                         )
                         await manager.broadcast_to_task(
                             {
@@ -6457,7 +6987,10 @@ async def _handle_chat_message_unserialized(
                         )
                         await finish_delivery(
                             False,
-                            "Task pause is still being applied; please retry shortly.",
+                            client_error_message(
+                                ClientErrorCode.TASK_PAUSE_IN_PROGRESS
+                            ),
+                            error_code=ClientErrorCode.TASK_PAUSE_IN_PROGRESS.value,
                             rejection_outcome="not_accepted",
                         )
                         return
@@ -6540,8 +7073,9 @@ async def _handle_chat_message_unserialized(
                     )
                     error_payload = await _read_task_error_payload_offloop(
                         task_id,
-                        "Internal dispatch error; please retry.",
+                        client_error_message(ClientErrorCode.MESSAGE_PROCESSING_FAILED),
                         event_type="agent_error",
+                        error_code=ClientErrorCode.MESSAGE_PROCESSING_FAILED.value,
                     )
                     await manager.broadcast_to_task(
                         {
@@ -6552,7 +7086,8 @@ async def _handle_chat_message_unserialized(
                     )
                     await finish_delivery(
                         False,
-                        "Internal dispatch error; please retry.",
+                        client_error_message(ClientErrorCode.MESSAGE_PROCESSING_FAILED),
+                        error_code=ClientErrorCode.MESSAGE_PROCESSING_FAILED.value,
                         rejection_outcome="not_accepted",
                     )
                     return
@@ -6583,7 +7118,10 @@ async def _handle_chat_message_unserialized(
                     message_data["_commit_outcome_unknown"] = turn_id
                     await finish_delivery(
                         False,
-                        "Message acceptance is still being reconciled. Please retry shortly.",
+                        client_error_message(
+                            ClientErrorCode.MESSAGE_ACCEPTANCE_PENDING
+                        ),
+                        error_code=ClientErrorCode.MESSAGE_ACCEPTANCE_PENDING.value,
                         rejection_outcome="outcome_unknown",
                     )
                 except TaskTurnNotFoundError:
@@ -6596,8 +7134,9 @@ async def _handle_chat_message_unserialized(
                     )
                     error_payload = await _read_task_error_payload_offloop(
                         task_id,
-                        "Task is no longer available.",
+                        client_error_message(ClientErrorCode.TASK_UNAVAILABLE),
                         event_type="agent_error",
+                        error_code=ClientErrorCode.TASK_UNAVAILABLE.value,
                     )
                     await manager.broadcast_to_task(
                         {
@@ -6608,7 +7147,8 @@ async def _handle_chat_message_unserialized(
                     )
                     await finish_delivery(
                         False,
-                        "Task is no longer available.",
+                        client_error_message(ClientErrorCode.TASK_UNAVAILABLE),
+                        error_code=ClientErrorCode.TASK_UNAVAILABLE.value,
                         rejection_outcome="not_accepted",
                     )
                 except TaskTurnError as busy_err:
@@ -6621,15 +7161,15 @@ async def _handle_chat_message_unserialized(
                     logger.warning(
                         f"Refused to schedule bg for task {task_id}: {busy_err.reason}"
                     )
-                    rejection_message = _TURN_REJECTION_MESSAGES.get(
-                        busy_err.reason,
-                        "Task is currently busy; please wait for the previous "
-                        "turn to finish before sending another message.",
+                    rejection_code = _TURN_REJECTION_CODES.get(
+                        busy_err.reason, ClientErrorCode.TASK_BUSY
                     )
+                    rejection_message = client_error_message(rejection_code)
                     error_payload = await _read_task_error_payload_offloop(
                         task_id,
                         rejection_message,
                         event_type="agent_error",
+                        error_code=rejection_code.value,
                     )
                     await manager.broadcast_to_task(
                         {
@@ -6641,6 +7181,7 @@ async def _handle_chat_message_unserialized(
                     await finish_delivery(
                         False,
                         rejection_message,
+                        error_code=rejection_code.value,
                         rejection_outcome="not_accepted",
                     )
 
@@ -6648,20 +7189,46 @@ async def _handle_chat_message_unserialized(
             message_data["_commit_outcome_unknown"] = turn_id
             await finish_delivery(
                 False,
-                "Message acceptance is still being reconciled. Please retry shortly.",
+                client_error_message(ClientErrorCode.MESSAGE_ACCEPTANCE_PENDING),
+                error_code=ClientErrorCode.MESSAGE_ACCEPTANCE_PENDING.value,
                 rejection_outcome="outcome_unknown",
             )
         except (ValueError, KeyError, TypeError) as e:
             # Data validation and format error
-            message = client_safe_error_message(e)
+            if (
+                isinstance(e, ClientVisibleError)
+                and e.error_code == ClientErrorCode.MESSAGE_ATTACHMENT_UNAVAILABLE
+            ):
+                # Preparation verified the attachment before the later atomic
+                # bind lost its race.  The specific state belongs only to the
+                # verified origin; task subscribers receive the same neutral
+                # execution failure as every other sender-specific durable
+                # attachment fault.
+                log_client_facing_failure(
+                    e,
+                    "Attachment bind race in agent execution: %s",
+                )
+                if not await answer_durable_turn_failure(e.error_code):
+                    return
+                return
+            error_code = (
+                e.error_code
+                if isinstance(e, ClientVisibleError)
+                else ClientErrorCode.MESSAGE_PROCESSING_FAILED
+            )
+            message = client_error_message(error_code)
             log_client_facing_failure(e, "Data validation error in agent execution: %s")
-            if not await finish_delivery_failure(message):
+            if not await finish_delivery_failure(
+                message,
+                error_code=error_code.value,
+            ):
                 return
             timestamp = datetime.now(timezone.utc).timestamp()
             if authorized_task_id is not None:
                 error_payload = await _read_task_error_payload_offloop(
                     authorized_task_id,
                     message,
+                    error_code=error_code.value,
                 )
                 await manager.broadcast_to_task(
                     {
@@ -6675,52 +7242,56 @@ async def _handle_chat_message_unserialized(
                     {
                         "type": "error",
                         "message": message,
+                        "error_code": error_code.value,
                         "timestamp": timestamp,
                     },
                     websocket,
                 )
-        except RuntimeError as e:
-            # Runtime error. The sender's rejection ack keeps the wording
-            # (#1479 contract); the task-wide broadcast reaches anonymous
-            # subscribers and gets the fixed string instead.
-            message = f"Runtime error: {str(e)}"
-            logger.error("Runtime error in agent execution: %s", e, exc_info=True)
-            if not await finish_delivery_failure(message):
+        except DurableObjectIntegrityError:
+            # Precedes the durable-fault arm below, which this subclasses. A
+            # checksum mismatch is permanent corruption, already recorded at
+            # ERROR with both checksums where it is raised, so it must not also
+            # be logged as a transient outage. It still owes the client an
+            # answer, and a distinct one: retrying cannot help, the stored copy
+            # has to be replaced.
+            #
+            # The allowlisted code selects a fixed fallback for every audience;
+            # no exception text crosses the boundary.
+            if not await answer_durable_turn_failure(
+                ClientErrorCode.MESSAGE_ATTACHMENT_CORRUPT
+            ):
                 return
-            timestamp = datetime.now(timezone.utc).timestamp()
-            if authorized_task_id is not None:
-                error_payload = await _read_task_error_payload_offloop(
-                    authorized_task_id,
-                    CLIENT_SAFE_TASK_FAILURE,
-                )
-                await manager.broadcast_to_task(
-                    {
-                        **error_payload,
-                        "timestamp": timestamp,
-                    },
-                    authorized_task_id,
-                )
-                # Only the durable path needs this: there the rejection ack
-                # is suppressed, so the detail bubble is the sender's only
-                # copy. On the live path finish_delivery_failure already sent
-                # the ack with the same wording, so a bubble would duplicate
-                # it. The origin socket came from the registry and is a
-                # discarding stub when unverifiable, so this is
-                # origin-or-nowhere by construction.
-                if suppress_delivery_ack:
-                    await manager.send_personal_message(
-                        {"type": "error", "message": message, "timestamp": timestamp},
-                        websocket,
-                    )
-            else:
-                await manager.send_personal_message(
-                    {
-                        "type": "error",
-                        "message": message,
-                        "timestamp": timestamp,
-                    },
-                    websocket,
-                )
+        except DurableStorageOperationError as exc:
+            # Must precede the RuntimeError arm below, which this subclasses.
+            # This is the selected-file attachment path: the fault arrives here
+            # first, is answered to the client, and is swallowed -- so this is
+            # both the only place its provider cause can be recorded and the
+            # last place its text could escape.
+            #
+            # Fixed contract fallback rather than ``str(exc)``: the wrap's own
+            # text is not what a client should read, and this arm is also the
+            # sole logging owner for this path -- the fault does not re-raise,
+            # so the endpoint-level arm never sees it and cannot double-record.
+            log_durable_storage_fault(
+                logger,
+                "websocket agent execution",
+                exc,
+                task_id=authorized_task_id,
+            )
+            if not await answer_durable_turn_failure(
+                ClientErrorCode.MESSAGE_ATTACHMENT_UNAVAILABLE
+            ):
+                return
+        except RuntimeError as e:
+            # RuntimeError is incidental server detail. Reuse the same
+            # audience split as the durable-failure arms above: the initiator
+            # gets the message-processing code while task subscribers get the
+            # neutral task-failure code.
+            logger.error("Runtime error in agent execution: %s", e, exc_info=True)
+            if not await answer_durable_turn_failure(
+                ClientErrorCode.MESSAGE_PROCESSING_FAILED
+            ):
+                return
         except Exception as e:
             # Other unknown errors, re-raise
             # The branch that withholds the detail logs it, rather than
@@ -6732,17 +7303,69 @@ async def _handle_chat_message_unserialized(
             await finish_delivery_failure(client_safe_error_message(e))
             raise
 
+    except ClientVisiblePermissionError as e:
+        log_client_facing_failure(e, "Message permission error: %s")
+        message = client_error_message(e.error_code)
+        await finish_delivery_failure(message, error_code=e.error_code.value)
+        await manager.send_personal_message(
+            {"type": "error", "message": message, "error_code": e.error_code.value},
+            websocket,
+        )
     except (ValueError, KeyError, TypeError) as e:
         # Message format error
         log_client_facing_failure(e, "Message format error: %s")
-        message = client_safe_error_message(e)
-        await finish_delivery_failure(message)
+        error_code = (
+            e.error_code
+            if isinstance(e, ClientVisibleError)
+            else ClientErrorCode.MESSAGE_PROCESSING_FAILED
+        )
+        message = client_error_message(error_code)
+        await finish_delivery_failure(message, error_code=error_code.value)
         await manager.send_personal_message(
-            {"type": "error", "message": message}, websocket
+            {"type": "error", "message": message, "error_code": error_code.value},
+            websocket,
         )
     except (ConnectionError, WebSocketDisconnect) as e:
         # Connection error
         logger.error("Connection error handling chat message: %s", e)
+        raise
+    except DurableObjectIntegrityError:
+        # Attachment preparation runs in this outer scope (see the
+        # ``_prepare_websocket_turn_sync`` call above), *before* the inner
+        # agent-execution try. So a stored-file fault surfaces here, not in the
+        # arms guarding that inner block -- which is why the fixed detail has to
+        # be applied at this level too.
+        #
+        # Corruption is permanent: the copy has to be replaced, so the client is
+        # told that rather than to retry. No exception text goes outbound; the
+        # integrity ERROR with both checksums is already logged where it is
+        # raised.
+        # The allowlisted code selects the fixed re-upload guidance.
+        await finish_delivery_failure(
+            client_error_message(ClientErrorCode.MESSAGE_ATTACHMENT_CORRUPT),
+            error_code=ClientErrorCode.MESSAGE_ATTACHMENT_CORRUPT.value,
+        )
+        raise
+    except DurableStorageOperationError as exc:
+        # Same scope reasoning as above. ``str(exc)`` is the wrap's message and
+        # carries the storage key, whose scope segments encode the owning user's
+        # id -- it must not reach a socket frame, a persisted rejection, or a
+        # broadcast, any more than it may reach an HTTP body or a model (#1467).
+        #
+        # Logging here rather than leaving it to the endpoint arm: the
+        # durable-command route invokes this handler directly and never reaches
+        # that arm. Double-recording is prevented at the logger, which marks the
+        # fault, so both arms are safe to write independently.
+        log_durable_storage_fault(
+            logger,
+            "websocket chat turn preparation",
+            exc,
+            task_id=task_id,
+        )
+        await finish_delivery_failure(
+            client_error_message(ClientErrorCode.MESSAGE_ATTACHMENT_UNAVAILABLE),
+            error_code=ClientErrorCode.MESSAGE_ATTACHMENT_UNAVAILABLE.value,
+        )
         raise
     except Exception as e:
         # Other errors, re-raise
@@ -6858,7 +7481,8 @@ async def handle_execute_task(
         authorized_task_id: int | None = None
         if not user:
             raise ClientVisibleValidationError(
-                "User authentication required for task execution"
+                "User authentication required for task execution",
+                error_code=ClientErrorCode.AUTHENTICATION_REQUIRED,
             )
         actor_user_id = int(user.id)
         actor_is_admin = bool(user.is_admin)
@@ -6882,7 +7506,8 @@ async def handle_execute_task(
         )
         if request is None:
             raise ClientVisibleValidationError(
-                f"Task {task_id} not found or access denied"
+                f"Task {task_id} not found or access denied",
+                error_code=ClientErrorCode.TASK_UNAVAILABLE,
             )
         authorized_task_id = request.task_id
 
@@ -6916,15 +7541,27 @@ async def handle_execute_task(
         # ordering while the scheduled coroutine owns all runtime DB work.
         await background_task
 
-    except (ValueError, KeyError, TypeError) as e:
-        # Data validation and format error
-        message = client_safe_error_message(e)
-        log_client_facing_failure(e, "Data validation error in task execution: %s")
+    except (
+        MCPBuiltinOAuthActorPolicyRequiredError,
+        ValueError,
+        KeyError,
+        TypeError,
+    ) as e:
+        # Data validation and actor-policy errors are client-safe only when
+        # explicitly marked with a stable code.
+        error_code = (
+            e.error_code
+            if isinstance(e, ClientVisibleError)
+            else ClientErrorCode.MESSAGE_PROCESSING_FAILED
+        )
+        message = client_error_message(error_code)
+        log_client_facing_failure(e, "Task execution rejected: %s")
         timestamp = datetime.now(timezone.utc).isoformat()
         if authorized_task_id is not None:
             error_payload = await _read_task_error_payload_offloop(
                 authorized_task_id,
                 message,
+                error_code=error_code.value,
             )
             await manager.broadcast_to_task(
                 {
@@ -6938,21 +7575,23 @@ async def handle_execute_task(
                 {
                     "type": "error",
                     "message": message,
+                    "error_code": error_code.value,
                     "timestamp": timestamp,
                 },
                 websocket,
             )
     except RuntimeError as e:
-        # Runtime error. The initiating sender keeps the wording (#1479
-        # contract); the task-wide broadcast reaches anonymous subscribers
-        # and gets the fixed string instead.
-        message = f"Runtime error: {str(e)}"
+        # Runtime failures can contain provider responses, paths, and other
+        # operator-only details. Keep those in the log and expose only the
+        # stable client contract to every audience.
+        message = CLIENT_SAFE_TASK_FAILURE
         logger.error("Runtime error in task execution: %s", e, exc_info=True)
         timestamp = datetime.now(timezone.utc).isoformat()
         if authorized_task_id is not None:
             error_payload = await _read_task_error_payload_offloop(
                 authorized_task_id,
                 CLIENT_SAFE_TASK_FAILURE,
+                error_code=ClientErrorCode.TASK_EXECUTION_FAILED.value,
             )
             await manager.broadcast_to_task(
                 {
@@ -6961,17 +7600,25 @@ async def handle_execute_task(
                 },
                 authorized_task_id,
             )
-            # This handler is invoked with its real ingress socket (it is not
-            # dispatched durably), so the initiating sender keeps the detail.
             await manager.send_personal_message(
-                {"type": "error", "message": message, "timestamp": timestamp},
+                {
+                    "type": "error",
+                    "error_code": ClientErrorCode.TASK_EXECUTION_FAILED.value,
+                    "message": client_error_message(
+                        ClientErrorCode.TASK_EXECUTION_FAILED
+                    ),
+                    "timestamp": timestamp,
+                },
                 websocket,
             )
         else:
             await manager.send_personal_message(
                 {
                     "type": "error",
-                    "message": message,
+                    "error_code": ClientErrorCode.TASK_EXECUTION_FAILED.value,
+                    "message": client_error_message(
+                        ClientErrorCode.TASK_EXECUTION_FAILED
+                    ),
                     "timestamp": timestamp,
                 },
                 websocket,
@@ -7290,6 +7937,10 @@ def _load_historical_stream_snapshot_sync(
                 role = str(chat_message.role)
                 content = str(chat_message.content or "").strip()
                 if role == "assistant":
+                    content = client_safe_assistant_history_content(
+                        content=content,
+                        message_type=str(chat_message.message_type),
+                    )
                     content = reconcile_assistant_file_references(
                         db,
                         task_id=int(task_id),
@@ -7300,7 +7951,14 @@ def _load_historical_stream_snapshot_sync(
                 # Read attachments off the row so file-only turns (empty
                 # content + non-empty attachments) survive replay and so the
                 # chip metadata reaches the synthesized user_message event.
-                _attachments_raw = chat_message.attachments
+                assistant_ancillary_is_safe = role != "assistant" or (
+                    assistant_history_has_safe_ancillary_payload(
+                        str(chat_message.message_type)
+                    )
+                )
+                _attachments_raw = (
+                    chat_message.attachments if assistant_ancillary_is_safe else None
+                )
                 row_attachments: Optional[list] = (
                     _attachments_raw
                     if isinstance(_attachments_raw, list) and _attachments_raw
@@ -7347,7 +8005,11 @@ def _load_historical_stream_snapshot_sync(
                         in trace_message_keys
                     ):
                         continue
-                    interactions = chat_message.interactions
+                    interactions = (
+                        chat_message.interactions
+                        if assistant_ancillary_is_safe
+                        else None
+                    )
                     data = {
                         "message": content,
                         "content": content,
@@ -7580,7 +8242,10 @@ async def send_historical_data_as_stream(
             "error",
             task_id,
             {
-                "message": f"Data format error: {str(e)}",
+                "message": client_safe_error_message(
+                    e,
+                    fallback="Task history could not be loaded. Please try again.",
+                ),
             },
         )
         await manager.send_personal_message(error_event, websocket)
@@ -7602,6 +8267,54 @@ async def handle_status_request(
     await send_historical_data_as_stream(websocket, task_id, user)
 
 
+# Operation labels for the endpoint-level fault arms, keyed by message type.
+# A closed map rather than interpolation: ``type`` is client-supplied, and
+# ``operation`` is meant to be a bounded, aggregatable value -- it is also not
+# sanitised the way rendered fields are (#1520), so a client must not be able to
+# reach it.
+#
+# Only the message types whose handler lets a fault propagate are listed.
+# ``execute_task`` and ``intervention`` end in ``except RuntimeError``
+# with no re-raise, so a durable fault from either is swallowed there and can
+# never reach the arms below; giving them a label would claim a reachability
+# that does not exist, and the label would read as covered while never being
+# emitted. Making them reachable means giving those two handlers a durable arm
+# of their own, which is absorber work and belongs to #1515 -- at which point
+# they get a label here. ``_SWALLOWED_DISPATCH_TYPES`` in the tests pins the
+# omission against the handlers, so this cannot silently become wrong.
+# ``chat`` is absent for a third reason, distinct from the two above: every
+# fault arm of its handler that re-raises reports through
+# ``log_durable_storage_fault`` first, and the logger marks the instance, so
+# the call here is a no-op rather than a second record. A label for it would
+# name a line that is never emitted.
+# ``test_chat_is_unlabelled_only_because_its_arms_report_first`` pins the
+# report-before-re-raise half against the handler's own arms.
+_DISPATCH_OPERATIONS = {
+    "status_request": "websocket status request",
+    "pause_task": "websocket pause_task",
+    "resume_task": "websocket resume_task",
+}
+_UNKNOWN_DISPATCH_OPERATION = "websocket unknown message type"
+
+
+def _private_websocket_task_access_sync(
+    *,
+    task_id: int,
+    actor_user_id: int,
+    actor_is_admin: bool,
+) -> Literal["authorized", "missing", "foreign"]:
+    """Classify private task access before a socket joins its live audience."""
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        owner_id = db.query(Task.user_id).filter(Task.id == task_id).scalar()
+        if owner_id is None:
+            return "missing"
+        if actor_is_admin or int(owner_id) == actor_user_id:
+            return "authorized"
+        return "foreign"
+
+
 @ws_router.websocket("/ws/chat/{task_id}")
 async def websocket_chat_endpoint(
     websocket: WebSocket,
@@ -7618,7 +8331,39 @@ async def websocket_chat_endpoint(
         await websocket.close(code=4001, reason="Authentication required")
         return
 
-    await manager.connect(websocket, task_id)
+    # Accept before closing an access denial so the fixed close reason survives
+    # the WebSocket handshake.  Do not register until ownership has been
+    # checked: task broadcasts are an owner-scoped private audience.
+    await websocket.accept()
+    try:
+        access = await run_db_io_cancellation_safe(
+            lambda: _private_websocket_task_access_sync(
+                task_id=task_id,
+                actor_user_id=int(user.id),
+                actor_is_admin=bool(user.is_admin),
+            )
+        )
+    except Exception as exc:
+        await send_websocket_authentication_infrastructure_failure(websocket, exc)
+        return
+    if access == "foreign":
+        await websocket.close(
+            code=4003,
+            reason=client_error_message(ClientErrorCode.TASK_UNAVAILABLE),
+        )
+        return
+    if access == "authorized":
+        manager.register_connection(websocket, task_id)
+    # A missing id deliberately stays accepted but unregistered.  The legacy
+    # first-chat recovery path creates a replacement task, then
+    # ``move_connection`` registers this already-accepted socket on that id.
+
+    # Which message the loop is currently applying, for the fault arms below:
+    # they guard the whole dispatch, so a fixed label would report a resume or
+    # an execute_task fault as a chat turn in the one line meant to name it.
+    # Initialised here, not in the loop, because the initial status request runs
+    # before the first message is ever parsed.
+    dispatching = "websocket initial status request"
 
     try:
         # Send initial state
@@ -7636,6 +8381,15 @@ async def websocket_chat_endpoint(
             # Add user info to message data
             message_data["user_id"] = user.id
             message_data["user"] = user
+
+            # ``str()`` before the lookup, not for the ``None`` case -- a
+            # missing type misses the map either way -- but because ``type``
+            # is client-supplied and need not be hashable: ``{"type": []}``
+            # would raise ``TypeError`` from ``dict.get`` itself. Every value
+            # that does not name a handler lands on the bounded fallback.
+            dispatching = _DISPATCH_OPERATIONS.get(
+                str(message_data.get("type")), _UNKNOWN_DISPATCH_OPERATION
+            )
 
             if message_data.get("type") == "chat":
                 await handle_chat_message(websocket, task_id, message_data)
@@ -7657,6 +8411,20 @@ async def websocket_chat_endpoint(
 
     except WebSocketDisconnect:
         pass
+    except DurableObjectIntegrityError:
+        # Precedes the parent arm: permanent corruption, already recorded at
+        # ERROR with both checksums where it is raised, so it must not also be
+        # logged as a transient outage. Swallowed exactly as the parent arm
+        # swallows -- the socket is going away either way.
+        pass
+    except DurableStorageOperationError as exc:
+        # Must precede the RuntimeError arm below, which this subclasses. A
+        # storage fault reaching here would otherwise be logged as "Connection
+        # error in WebSocket" and swallowed -- mislabelled and cause-less on
+        # the very path #1467 was filed about. Still swallowed, as before:
+        # the socket is going away regardless and the client has already been
+        # answered; only the diagnosis changes.
+        log_durable_storage_fault(logger, dispatching, exc, task_id=task_id)
     except (ConnectionError, RuntimeError) as e:
         # Connection error
         logger.error(f"Connection error in WebSocket: {e}")
@@ -7702,10 +8470,19 @@ async def handle_intervention(
             {"type": "error", "message": client_safe_error_message(e)}, websocket
         )
     except RuntimeError as e:
-        # Runtime error
+        # RuntimeError is incidental server detail, never display prose. A
+        # stable code lets current clients localize the fixed fallback while
+        # old clients still receive safe English text.
         logger.error("Runtime error in intervention: %s", e, exc_info=True)
         await manager.send_personal_message(
-            {"type": "error", "message": f"Runtime error: {str(e)}"}, websocket
+            {
+                "type": "error",
+                "error_code": ClientErrorCode.MESSAGE_PROCESSING_FAILED.value,
+                "message": client_error_message(
+                    ClientErrorCode.MESSAGE_PROCESSING_FAILED
+                ),
+            },
+            websocket,
         )
     except Exception as e:
         # Re-raised, but the callers do not own the stack: the chat endpoint
@@ -7726,12 +8503,25 @@ async def handle_pause_task(
             kind=TaskCommandKind.PAUSE,
             command_id=_client_message_id(message_data.get("command_id")),
         )
-    except (PermissionError, ValueError) as exc:
+    except (
+        MCPBuiltinOAuthActorPolicyRequiredError,
+        PermissionError,
+        ValueError,
+    ) as exc:
         log_client_facing_failure(
             exc, "Pause command rejected for task %s: %s", task_id
         )
+        error_code = (
+            exc.error_code
+            if isinstance(exc, ClientVisibleError)
+            else ClientErrorCode.MESSAGE_PROCESSING_FAILED
+        )
         await manager.send_personal_message(
-            {"type": "error", "message": client_safe_error_message(exc)},
+            {
+                "type": "error",
+                "message": client_error_message(error_code),
+                "error_code": error_code.value,
+            },
             websocket,
         )
         return
@@ -7970,12 +8760,16 @@ async def _handle_pause_task_unserialized(
             {"type": "error", "message": client_safe_error_message(e)}, websocket
         )
     except RuntimeError as e:
-        # Runtime error
-        # No traceback: this branch passes the text through to the client
-        # unredacted (#1479), so nothing is being withheld from the log.
-        logger.error("Runtime error pausing task %s: %s", task_id, e)
+        logger.error("Runtime error pausing task %s: %s", task_id, e, exc_info=True)
         await manager.send_personal_message(
-            {"type": "error", "message": f"Runtime error: {str(e)}"}, websocket
+            {
+                "type": "error",
+                "error_code": ClientErrorCode.MESSAGE_PROCESSING_FAILED.value,
+                "message": client_error_message(
+                    ClientErrorCode.MESSAGE_PROCESSING_FAILED
+                ),
+            },
+            websocket,
         )
         raise
     except Exception as e:
@@ -7996,12 +8790,25 @@ async def handle_resume_task(
             kind=TaskCommandKind.RESUME,
             command_id=_client_message_id(message_data.get("command_id")),
         )
-    except (PermissionError, ValueError) as exc:
+    except (
+        MCPBuiltinOAuthActorPolicyRequiredError,
+        PermissionError,
+        ValueError,
+    ) as exc:
         log_client_facing_failure(
             exc, "Resume command rejected for task %s: %s", task_id
         )
+        error_code = (
+            exc.error_code
+            if isinstance(exc, ClientVisibleError)
+            else ClientErrorCode.MESSAGE_PROCESSING_FAILED
+        )
         await manager.send_personal_message(
-            {"type": "error", "message": client_safe_error_message(exc)},
+            {
+                "type": "error",
+                "message": client_error_message(error_code),
+                "error_code": error_code.value,
+            },
             websocket,
         )
         return
@@ -8037,7 +8844,7 @@ async def handle_resume_task(
 
 async def _handle_resume_task_unserialized(
     websocket: WebSocket, task_id: int, message_data: dict
-) -> None:
+) -> ResumeCommandResult:
     """Handle task resume request"""
     try:
         user = message_data.get("user")
@@ -8061,48 +8868,20 @@ async def _handle_resume_task_unserialized(
                 task_id,
                 user.id,
             )
-            message_data["_durable_command_error"] = "Task not found or access denied"
+            reason = "Task not found or access denied"
             await manager.send_personal_message(
                 {"type": "error", "message": "Task not found or access denied"},
                 websocket,
             )
-            return
+            return ResumeCommandResult(
+                ResumeCommandOutcome.REJECTED,
+                reason,
+                reason_code="task_not_found",
+            )
 
         task_fields = task_setup_snapshot.task
         task_owner_user_id = int(task_fields.user_id)
         task_status = cast(TaskStatus, task_fields.status)
-        # Off-turn: on an agent-cache hit this only locates the paused task's
-        # existing workspace/sandbox for ``get_agent_for_task`` below. On a
-        # miss (or a cached-scope-fingerprint mismatch), that call builds a
-        # fresh agent from this value, which can materialize a workspace
-        # directory tree and acquire a sandbox lease.
-        # resolve_execution_scope_off_turn resolves this value through three
-        # distinct outcomes:
-        # - resolver authoritative, snapshot disagrees on a namespace field:
-        #   downgrades to the resolver's own answer (with a warning) instead
-        #   of raising, so the resume still proceeds -- the value here is the
-        #   trusted resolver answer, not the snapshot.
-        # - resolver abstains, snapshot widens the abstention's fallback:
-        #   ExecutionScopeAbstentionMismatchError is re-raised rather than
-        #   downgraded, so the resume is refused outright -- an abstention
-        #   never produced an authoritative value to fall back to.
-        # - resolver abstains, snapshot narrows the abstention's fallback:
-        #   the returned value IS the snapshot (policy fields overlaid from
-        #   the fallback). That is persisted, client-influenceable data, and
-        #   it is trusted here only because it was already validated as a
-        #   narrowing of what the resolver granted, so anything the build
-        #   below materializes from it still lands inside the authorised
-        #   subtree.
-        # The turn this handler schedules is a different consumer: it is
-        # passed ``EXECUTION_SCOPE_NOT_PROVIDED`` instead of this value below
-        # so ``execute_resume_background`` performs its own fail-closed
-        # resolution before producing the resumed turn's own output, rather
-        # than inheriting this off-turn result -- that protects where the
-        # turn's own new bytes land, not the workspace/sandbox root a build
-        # above may already have fixed.
-        resolved_execution_scope = await run_db_io_cancellation_safe(
-            lambda: resolve_execution_scope_off_turn(task_id)
-        )
         raw_control_state = task_fields.control_state
         try:
             control_state = TaskControlState(str(raw_control_state))
@@ -8178,7 +8957,7 @@ async def _handle_resume_task_unserialized(
                     task_fields.run_id,
                     active_interaction_id,
                 )
-                message_data["_durable_command_error"] = (
+                reason = (
                     "This task has an unanswered question; answer it before resuming."
                 )
                 await manager.send_personal_message(
@@ -8192,7 +8971,220 @@ async def _handle_resume_task_unserialized(
                     },
                     websocket,
                 )
-                return
+                return ResumeCommandResult(
+                    ResumeCommandOutcome.REJECTED,
+                    reason,
+                    reason_code="interaction_pending",
+                )
+
+        attempt_count = message_data.get("_durable_attempt_count")
+
+        def _log_resume_deferral(classification: str) -> None:
+            # Deferrals are deliberately silent to the client (a retry that
+            # usually resolves within a second is not a failure), so the
+            # command row's ``error`` column is otherwise the only trace. A
+            # stuck queue has to be diagnosable from application logs alone.
+            logger.info(
+                "Deferring resume for task %s run %s: %s (attempt %s)",
+                task_id,
+                task_fields.run_id,
+                classification,
+                attempt_count,
+            )
+
+        def _defer_for_slot(outcome: ResumeReservationOutcome) -> ResumeCommandResult:
+            _log_resume_deferral(
+                f"live-control resume slot is unavailable ({outcome.value})"
+            )
+            return ResumeCommandResult(
+                ResumeCommandOutcome.DEFERRED,
+                "Resume command is waiting for the live-control resume slot "
+                f"({outcome.value})",
+            )
+
+        async def _resync_client_to_running_task() -> None:
+            """Correct a stale client on the one path nothing else corrects.
+
+            Used only by the already-RUNNING branch. There the row genuinely
+            reads ``running``, and no resume is starting, so no
+            ``task_resumed`` broadcast will ever arrive to clear the client's
+            belief that the task is paused -- the resume control renders on
+            local status alone. The coordinator branches are deliberately
+            silent instead: their row still reads ``paused`` until the lease
+            claim, and their coordinator broadcasts the correction itself.
+
+            No state tuple is supplied. ``send_personal_message`` runs
+            ``_with_current_task_control_state``, which attaches the live row
+            exactly when the producer supplied none; passing this handler's
+            setup snapshot would ship a value already stale by construction.
+
+            ``task_resumed`` rather than ``error``: the command succeeded, and
+            ``case "error"`` in ``app-context-chat.tsx`` unconditionally
+            appends a failed chat bubble, so an error frame would report a
+            success as a failure. ``case "task_resumed"`` is the codebase's
+            control-only shape -- it dispatches ``UPDATE_TASK_STATUS`` with
+            status, run id, state version and control state, and adds no
+            message.
+
+            This type is only usable *here*. ``taskEventMatchesControlState``
+            maps ``task_resumed`` to ``["running"]``, and this branch is the
+            one place that has already established ``control_state`` is
+            ``RUNNING`` -- via a fresh ``task_has_live_runner`` read that also
+            requires an unexpired lease on this exact run. On a branch whose
+            control state is ``resume_requested`` the same frame would fail
+            that match and re-apply the stale status instead.
+
+            A ``task_info`` trace event cannot stand in: the client rebuilds
+            the whole task record from that frame, so a partial payload
+            blanks the title, description, and model ids.
+
+            Best-effort by construction: the origin socket is same-worker
+            only, so a command claimed after a restart or by another worker
+            sends this into the discarding sink. The durable outcome, not
+            this frame, is the authoritative record.
+            """
+
+            try:
+                await manager.send_personal_message(
+                    {
+                        "type": "task_resumed",
+                        "message": "Task is already running.",
+                        "task": {"id": task_id},
+                    },
+                    websocket,
+                )
+            except Exception:
+                # A half-open socket must not turn an idempotent success into
+                # a durable command failure: the resume really is in flight.
+                logger.warning(
+                    "Could not deliver the resume-already-in-progress notice "
+                    "for task %s",
+                    task_id,
+                    exc_info=True,
+                )
+
+        if control_state is TaskControlState.PAUSE_REQUESTED:
+            _log_resume_deferral("pending pause has not settled")
+            return ResumeCommandResult(
+                ResumeCommandOutcome.DEFERRED,
+                "Resume command is waiting for the pending pause to settle",
+            )
+
+        admission_state = background_task_manager.resume_admission_state(
+            task_id,
+            expected_run_id=task_fields.run_id,
+        )
+        if admission_state is ResumeReservationOutcome.COORDINATOR_RUNNING:
+            logger.info(
+                "Task %s already has a coordinator for run %s",
+                task_id,
+                task_fields.run_id,
+            )
+            # No client frame here, and this is a trade rather than a pure
+            # win. A registration lasts the whole resumed execution, so for
+            # most of this window the row already reads ``running`` and a
+            # frame would have carried the correction. Only the slice before
+            # the lease claim reads ``paused`` -- the RESUME_REQUESTED
+            # transition writes just ``control_state`` -- and there a frame
+            # re-confirms the state it was meant to correct.
+            #
+            # The correction is instead the coordinator's own ``task_resumed``
+            # broadcast at lease commit. That is a single unrepeated event,
+            # where re-clicking Resume used to be retriable, so a client that
+            # was momentarily not in ``connections_for_task`` when it fired
+            # stays stale until it reloads. Tracked with the rest of the
+            # coordinator-evidence gaps in #1781.
+            return ResumeCommandResult(ResumeCommandOutcome.ALREADY_IN_PROGRESS)
+        if admission_state is not None:
+            # Only RESERVATION_HELD and SHUTTING_DOWN remain: RESERVED is
+            # never returned by an inspection and COORDINATOR_RUNNING
+            # returned above. Both are uncertain rather than terminal, so
+            # they defer for a durable retry.
+            return _defer_for_slot(admission_state)
+
+        if task_status is TaskStatus.RUNNING:
+            live_runner = await run_db_io_cancellation_safe(
+                lambda: task_has_live_runner(
+                    task_id,
+                    expected_run_id=task_fields.run_id,
+                )
+            )
+            if control_state is TaskControlState.RUNNING and live_runner:
+                logger.info(
+                    "Task %s run %s has an active execution lease",
+                    task_id,
+                    task_fields.run_id,
+                )
+                await _resync_client_to_running_task()
+                return ResumeCommandResult(ResumeCommandOutcome.ALREADY_IN_PROGRESS)
+            if live_runner:
+                # The lease is live; it is the control state that has not
+                # settled. Naming the lease here would send whoever reads the
+                # log after the wrong thing.
+                _log_resume_deferral(
+                    "running task holds a live lease but its control state is "
+                    f"{control_state.value}"
+                )
+                return ResumeCommandResult(
+                    ResumeCommandOutcome.DEFERRED,
+                    "Resume command is waiting for the running task's control "
+                    "state to settle",
+                )
+            _log_resume_deferral("running task has no live lease yet")
+            return ResumeCommandResult(
+                ResumeCommandOutcome.DEFERRED,
+                "Resume command is waiting for running-task lease recovery",
+            )
+        if task_status in {
+            TaskStatus.PAUSED,
+            TaskStatus.WAITING_FOR_USER,
+        } and await run_db_io_cancellation_safe(
+            lambda: task_has_live_foreign_runner(task_id)
+        ):
+            # The idempotency evidence above only classifies RUNNING rows,
+            # but a settling turn commits PAUSED/WAITING_FOR_USER while still
+            # holding its lease: the finalizer writes the status and the lease
+            # columns are only cleared later, by ``finish_turn``. Scheduling
+            # into that window steals a live lease, and the previous owner's
+            # ownership-fenced settlement then matches no row and silently
+            # skips its delivery reconciliation. Deferring is bounded: a lease
+            # on a non-RUNNING row cannot be refreshed, so it expires within
+            # ``XAGENT_TASK_LEASE_TTL_SECONDS``. Same-process holds are not
+            # foreign and are already serialised through ``previous_task``.
+            _log_resume_deferral("another process still holds a live task lease")
+            return ResumeCommandResult(
+                ResumeCommandOutcome.DEFERRED,
+                "Resume command is waiting for the active task lease owner",
+                # Same wording, and the same reason for it, as the PAUSE and
+                # CANCEL arms of the shared guard this branch replaces for
+                # RESUME. It has to survive the redaction chokepoint for the
+                # same reason theirs does.
+                client_visible=True,
+            )
+
+        # Scope resolution is a scheduling prerequisite, not evidence that an
+        # execution already exists. Idempotent and deferred outcomes above
+        # deliberately avoid this potentially expensive off-turn work: on an
+        # agent-cache miss, or a cached-scope-fingerprint mismatch,
+        # ``get_agent_for_task`` below builds a fresh agent from this value,
+        # which can materialize a workspace directory tree and acquire a
+        # sandbox lease.
+        #
+        # ``resolve_execution_scope_off_turn`` has three distinct outcomes:
+        # resolver authoritative with a snapshot disagreement downgrades to
+        # the resolver's own answer; resolver abstention with a widening
+        # snapshot re-raises, refusing the resume outright; resolver
+        # abstention with a narrowing snapshot returns the snapshot itself,
+        # which is persisted, client-influenceable data trusted only because
+        # it was already validated as a narrowing of what the resolver
+        # granted. The turn scheduled below is a different consumer and gets
+        # ``EXECUTION_SCOPE_NOT_PROVIDED`` instead, so it resolves its own
+        # scope fail-closed rather than inheriting this off-turn result. The
+        # equivalent call in ``_handle_pause_task_unserialized`` carries the
+        # same reasoning in full.
+        resolved_execution_scope = await run_db_io_cancellation_safe(
+            lambda: resolve_execution_scope_off_turn(task_id)
+        )
 
         agent_service = await get_agent_manager().get_agent_for_task(
             task_id,
@@ -8204,9 +9196,7 @@ async def _handle_resume_task_unserialized(
         )
         if getattr(agent_service, "supports_live_control", lambda: False)():
             if task_status not in {TaskStatus.PAUSED, TaskStatus.WAITING_FOR_USER}:
-                message_data["_durable_command_error"] = (
-                    "Task is not paused and cannot be resumed."
-                )
+                reason = "Task is not paused and cannot be resumed."
                 await manager.send_personal_message(
                     {
                         "type": "error",
@@ -8215,17 +9205,25 @@ async def _handle_resume_task_unserialized(
                     },
                     websocket,
                 )
-                return
-            if not background_task_manager.reserve_resume(task_id):
-                await manager.send_personal_message(
-                    {
-                        "type": "error",
-                        "message": "Task resume is already in progress.",
-                        "task": {"id": task_id, **resume_control_state},
-                    },
-                    websocket,
+                return ResumeCommandResult(
+                    ResumeCommandOutcome.REJECTED,
+                    reason,
+                    reason_code="not_resumable",
                 )
-                return
+            reservation = background_task_manager.try_reserve_resume(
+                task_id,
+                expected_run_id=task_fields.run_id,
+            )
+            if reservation is ResumeReservationOutcome.COORDINATOR_RUNNING:
+                logger.info(
+                    "Task %s already has a registered resume coordinator",
+                    task_id,
+                )
+                # Silent for the same reason, and with the same trade, as
+                # the admission-state branch above.
+                return ResumeCommandResult(ResumeCommandOutcome.ALREADY_IN_PROGRESS)
+            if reservation is not ResumeReservationOutcome.RESERVED:
+                return _defer_for_slot(reservation)
             resume_snapshot: Any | None = None
             bg_task: asyncio.Task[None] | None = None
             try:
@@ -8233,7 +9231,75 @@ async def _handle_resume_task_unserialized(
                     task_id,
                     TaskControlState.RESUME_REQUESTED,
                     expected_run_id=task_fields.run_id,
+                    # Every admission decision above was made from the setup
+                    # snapshot. ``expected_run_id`` alone cannot notice a
+                    # writer that moved the row while preserving its run id,
+                    # and the reachable such writer is a competing resume,
+                    # not a cancel: ``_acquire_reply_prelease_sync`` and
+                    # ``_acquire_a2a_resume_prelease_sync`` come in over HTTP,
+                    # bypassing the durable queue entirely, and
+                    # ``acquire_task_lease_no_commit`` keeps the existing run
+                    # (``candidate_run_id = expected_run_id or uuid4()``)
+                    # while bumping ``state_version``. Without this fence a
+                    # v1 reply and a websocket Resume landing together both
+                    # transition the row and schedule two coordinators
+                    # against one lease.
+                    #
+                    # An A2A cancel writes the same shape -- FAILED, lease
+                    # cleared, run id preserved -- but cannot actually
+                    # interleave here: cancels reach the DB only through the
+                    # durable queue, and ``_unfinished_earlier_command``
+                    # serialises commands per task, so a PROCESSING resume
+                    # blocks the cancel from being claimed at all.
+                    expected_state_version=task_fields.state_version,
                 )
+            except StaleTaskStateVersionError as exc:
+                # Only the version fence lands here. A rotated run raises the
+                # base class and keeps its old meaning -- the command targets
+                # an execution that no longer exists, nothing will make it
+                # valid, so it propagates and stays terminal.
+                #
+                # The fence added a trigger with the opposite meaning: the row
+                # is still this run's, someone simply wrote first, and the
+                # writer is overwhelmingly a competing resume -- the same
+                # situation the RUNNING branch calls an idempotent success.
+                # Letting that through as terminal would hand one interleaving
+                # of that race the harshest outcome in the handler, and
+                # (because these are RuntimeErrors) leak the raw diagnostic to
+                # the client through the arm below on the way out. That arm
+                # still does so for the rotated-run raise -- deliberate, per
+                # the #1479 note on it -- so what this closes is the leak the
+                # fence itself introduced, not the arm.
+                #
+                # Deferring re-runs the whole admission decision against a
+                # fresh row, so it lands on whichever outcome is actually true
+                # rather than guessing from a snapshot already known to be
+                # stale.
+                #
+                # One imprecision is deliberate: a rotated run caught by the
+                # SQL fence rather than the pre-check cannot be told apart
+                # from a moved version -- the UPDATE carried both predicates
+                # and reports only that it matched nothing -- so it lands here
+                # too and defers once. That costs a single retry, because the
+                # dispatcher re-reads the run before re-entering this handler
+                # and rejects a genuinely rotated one terminally.
+                background_task_manager.release_resume_reservation(task_id)
+                _log_resume_deferral(f"row moved under the admission snapshot ({exc})")
+                return ResumeCommandResult(
+                    ResumeCommandOutcome.DEFERRED,
+                    "Resume command is waiting to re-read a task row that "
+                    "changed while it was being admitted",
+                )
+            except BaseException:
+                # Everything else the transition can fail with -- a rotated
+                # run, a deleted row, a DB error -- keeps its previous
+                # meaning and propagates. The reservation still has to go
+                # back: this arm exists only because splitting the deferral
+                # case out of the block below would otherwise let these
+                # escape without releasing it.
+                background_task_manager.release_resume_reservation(task_id)
+                raise
+            try:
                 previous_task = background_task_manager.running_tasks.get(task_id)
                 bg_task = asyncio.create_task(
                     execute_resume_background(
@@ -8255,26 +9321,58 @@ async def _handle_resume_task_unserialized(
                         resolved_execution_scope=EXECUTION_SCOPE_NOT_PROVIDED,
                     )
                 )
-                background_task_manager.register_reserved_resume(task_id, bg_task)
+                background_task_manager.register_reserved_resume(
+                    task_id,
+                    bg_task,
+                    run_id=resume_snapshot.run_id,
+                )
             except BaseException:
                 if bg_task is not None:
                     bg_task.cancel()
                 background_task_manager.release_resume_reservation(task_id)
                 if resume_snapshot is not None:
-                    await asyncio.shield(
-                        task_execution_controller.transition(
-                            task_id,
-                            (
-                                TaskControlState.WAITING_FOR_USER
-                                if resume_snapshot.status == TaskStatus.WAITING_FOR_USER
-                                else TaskControlState.PAUSED
-                            ),
-                            expected_run_id=resume_snapshot.run_id,
+                    try:
+                        await asyncio.shield(
+                            task_execution_controller.transition(
+                                task_id,
+                                (
+                                    TaskControlState.WAITING_FOR_USER
+                                    if resume_snapshot.status
+                                    == TaskStatus.WAITING_FOR_USER
+                                    else TaskControlState.PAUSED
+                                ),
+                                expected_run_id=resume_snapshot.run_id,
+                                expected_state_version=resume_snapshot.state_version,
+                            )
                         )
-                    )
+                    except (StaleTaskRunError, ValueError) as rollback_exc:
+                        # Someone else moved the row since the transition this
+                        # is undoing -- a cancel, the coordinator's own lease
+                        # claim, or a hard delete, which surfaces as the bare
+                        # ValueError ``transition_task_control_state_sync``
+                        # raises for a missing row. Their outcome wins;
+                        # rolling back would resurrect the state we are
+                        # abandoning. Swallowed rather than raised so it
+                        # cannot mask the failure that brought us here, which
+                        # is the whole point of this arm -- so it has to
+                        # cover every way the rollback can legitimately fail
+                        # to find its row, not just the version fence.
+                        # The reason has to come from the exception, not from
+                        # the version fence: this arm also catches a row that
+                        # was deleted outright, and reporting that as an
+                        # ordinary version-fence skip sends whoever reads the
+                        # log after a race that did not happen.
+                        logger.info(
+                            "Skipped resume rollback for task %s (expected "
+                            "state version %s): %s",
+                            task_id,
+                            resume_snapshot.state_version,
+                            rollback_exc,
+                            exc_info=True,
+                        )
                 raise
             logger.info(f"Task {task_id} v2 resume scheduled")
-            return
+            return ResumeCommandResult(ResumeCommandOutcome.SCHEDULED)
 
         # Unreachable: ``supports_live_control`` is defined once, on
         # ``AgentService``, and returns True unconditionally, so the block above
@@ -8286,20 +9384,29 @@ async def _handle_resume_task_unserialized(
 
     except (ValueError, KeyError, TypeError) as e:
         # Data validation error
-        message_data["_durable_command_error"] = str(e)
+        reason = str(e)
         logger.error(
             "Data validation error resuming task %s: %s", task_id, e, exc_info=True
         )
         await manager.send_personal_message(
             {"type": "error", "message": client_safe_error_message(e)}, websocket
         )
+        return ResumeCommandResult(
+            ResumeCommandOutcome.REJECTED,
+            reason,
+            reason_code="invalid_command_payload",
+        )
     except RuntimeError as e:
-        # Runtime error
-        # No traceback: this branch passes the text through to the client
-        # unredacted (#1479), so nothing is being withheld from the log.
-        logger.error("Runtime error resuming task %s: %s", task_id, e)
+        logger.error("Runtime error resuming task %s: %s", task_id, e, exc_info=True)
         await manager.send_personal_message(
-            {"type": "error", "message": f"Runtime error: {str(e)}"}, websocket
+            {
+                "type": "error",
+                "error_code": ClientErrorCode.MESSAGE_PROCESSING_FAILED.value,
+                "message": client_error_message(
+                    ClientErrorCode.MESSAGE_PROCESSING_FAILED
+                ),
+            },
+            websocket,
         )
         raise
     except Exception as e:
@@ -8346,6 +9453,26 @@ async def _execute_durable_task_command(
     task-level state/error events are still broadcast normally.
     """
 
+    if command.kind == TaskCommandKind.MESSAGE and "scope" in command.payload:
+        # The first-party chat adapter below resolves its actor, origin
+        # socket, and delivery ledger from first-party rows. A MESSAGE that
+        # names a scope is not that command: "external" belongs to the
+        # embedding application's execution core, reached through the
+        # registered seam, and any other value names a core that does not
+        # exist here -- running the first-party core against it would inject
+        # the message while attributing it to the wrong audience. Equality
+        # rather than set membership so an unhashable payload value lands in
+        # the terminal rejection instead of raising ``TypeError`` into the
+        # retry path.
+        scope_value = command.payload["scope"]
+        if scope_value != EXTERNAL_COMMAND_SCOPE:
+            raise TaskCommandRejected(
+                f"Message command {command.command_id} names task scope "
+                f"{scope_value!r}, which has no execution core",
+                reason="unsupported_scope",
+            )
+        return await execute_external_task_input_command(command)
+
     websocket: Any = _command_origins.resolve(command.command_id, command.task_id)
     if websocket is None:
         websocket = _DiscardingCommandWebSocket()
@@ -8374,7 +9501,6 @@ async def _execute_durable_task_command(
             )
     if command.kind in {
         TaskCommandKind.PAUSE,
-        TaskCommandKind.RESUME,
         TaskCommandKind.CANCEL,
     } and await run_db_io_cancellation_safe(
         lambda: task_has_live_foreign_runner(command.task_id)
@@ -8384,10 +9510,33 @@ async def _execute_durable_task_command(
             "for the active task lease owner"
         )
 
+    resume_result: ResumeCommandResult | None = None
     if command.kind == TaskCommandKind.MESSAGE:
         await _handle_chat_message_unserialized(
             websocket, command.task_id, message_data
         )
+        if message_data.get("_durable_command_defer") == command.command_id:
+            # This marker is mutually exclusive with commit-outcome-unknown:
+            # the handler returns immediately after recording contention.
+            raise TaskCommandDeferred(
+                str(message_data["_durable_command_defer_reason"]),
+                resend_safe=(
+                    # Every settled contention increments defer_count once.
+                    # Equality proves there is no extra expired/failed claim
+                    # whose worker might still resume and inject after this
+                    # attempt observed no delivery row.
+                    #
+                    # The equality couples two write sites: claiming is the
+                    # only writer of attempt_count and defer_task_command the
+                    # only writer of defer_count. retry_failed_task_command
+                    # resets defer_count but not attempt_count, so an
+                    # operator-retried command can never prove safety again
+                    # (the safe direction for a duplicate-send decision).
+                    command.attempt_count == command.defer_count + 1
+                    and message_data.get("_durable_command_defer_unsafe")
+                    != command.command_id
+                ),
+            )
         if message_data.get("_commit_outcome_unknown") == command.command_id:
             raise ClientVisibleTaskCommandDeferred(
                 f"Message {command.command_id} has an unknown commit outcome"
@@ -8421,14 +9570,24 @@ async def _execute_durable_task_command(
                     message_data,
                 )
             elif command.kind == TaskCommandKind.RESUME:
-                await _handle_resume_task_unserialized(
+                resume_result = await _handle_resume_task_unserialized(
                     websocket,
                     command.task_id,
                     message_data,
                 )
+                if resume_result.outcome is ResumeCommandOutcome.DEFERRED:
+                    deferral_message = (
+                        resume_result.reason or "Resume command will be retried"
+                    )
+                    if resume_result.client_visible:
+                        raise ClientVisibleTaskCommandDeferred(deferral_message)
+                    raise TaskCommandDeferred(deferral_message)
+                if resume_result.outcome is ResumeCommandOutcome.REJECTED:
+                    raise TaskCommandRejected(
+                        resume_result.reason or "Resume command was rejected",
+                        reason=resume_result.reason_code,
+                    )
             elif command.kind == TaskCommandKind.CANCEL:
-                from .a2a import _cancel_task_unserialized
-
                 agent_id_value = message_data.get("agent_id")
                 if agent_id_value is None:
                     raise ValueError(
@@ -8451,13 +9610,49 @@ async def _execute_durable_task_command(
                         "state-version target",
                         reason="stale_run",
                     )
-                async with task_execution_controller.command(command.task_id):
-                    await _cancel_task_unserialized(
-                        task_id=command.task_id,
-                        agent_id=agent_id,
-                        expected_run_id=command.target_run_id,
-                        expected_state_version=target_state_version,
+                # The A2A execution core loads its target as an A2A task, so
+                # a cancel for any other task source needs its own core. The
+                # scope names which one, and the absence of the key is itself
+                # a value: it is the only shape this command had before the
+                # external core existed, so it stays on the A2A path. Any
+                # other value names a core that does not exist here, and
+                # silently running the A2A one against it would cancel
+                # nothing while reporting success.
+                if "scope" not in message_data:
+                    scope_value = EXTERNAL_COMMAND_SCOPE_ABSENT
+                else:
+                    scope_value = message_data["scope"]
+                # Identity and equality checks rather than set membership:
+                # an unhashable payload value (a dict or list) must land in
+                # the same terminal rejection, not raise ``TypeError`` into
+                # the retry path.
+                if (
+                    scope_value is not EXTERNAL_COMMAND_SCOPE_ABSENT
+                    and scope_value != EXTERNAL_COMMAND_SCOPE
+                ):
+                    raise TaskCommandRejected(
+                        f"Cancel command {command.command_id} names task scope "
+                        f"{scope_value!r}, which has no execution core",
+                        reason="unsupported_scope",
                     )
+                async with task_execution_controller.command(command.task_id):
+                    if scope_value == EXTERNAL_COMMAND_SCOPE:
+                        await cancel_external_task_unserialized(
+                            task_id=command.task_id,
+                            agent_id=agent_id,
+                            expected_run_id=command.target_run_id,
+                            expected_state_version=target_state_version,
+                            turn_id=_command_turn_id(command.task_id, message_data),
+                        )
+                    else:
+                        from .a2a import _cancel_task_unserialized
+
+                        await _cancel_task_unserialized(
+                            task_id=command.task_id,
+                            agent_id=agent_id,
+                            expected_run_id=command.target_run_id,
+                            expected_state_version=target_state_version,
+                        )
             else:  # pragma: no cover - enum construction rejects this earlier
                 raise ValueError(f"Unsupported task command kind: {command.kind}")
         except StaleTaskRunError as exc:
@@ -8465,30 +9660,169 @@ async def _execute_durable_task_command(
     durable_error = message_data.get("_durable_command_error")
     if isinstance(durable_error, str) and durable_error:
         raise TaskCommandRejected(durable_error)
-    return {
+    result = {
         "task_id": command.task_id,
         "command_id": command.command_id,
         "kind": command.kind.value,
     }
+    if resume_result is not None:
+        result["resume_outcome"] = resume_result.outcome.value
+    return result
+
+
+# "no scope key at all" needs a value the scope check can compare against
+# and no payload can ever carry. A JSON payload cannot hold this object, so
+# a producer cannot forge the pre-external shape by writing a string.
+EXTERNAL_COMMAND_SCOPE_ABSENT = object()
+
+
+def _command_scope(command: ClaimedTaskCommand) -> str | None:
+    """The scope a command payload names, or ``None`` when it names none."""
+
+    scope = command.payload.get("scope")
+    return scope if isinstance(scope, str) else None
+
+
+def _command_turn_id(task_id: int, message_data: dict[str, Any]) -> str | None:
+    """The turn a command names, or ``None`` when it names none usably.
+
+    The value only picks which delivery row a cancel closes. A producer that
+    writes something other than a non-empty string is a bug, but refusing
+    the stop over it would leave the visitor's turn running, so the target
+    falls back to the running turn and the bug is logged rather than raised.
+    """
+
+    if "turn_id" not in message_data:
+        return None
+    raw = message_data["turn_id"]
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    logger.warning(
+        "task %s cancel command carries an unusable turn_id of type %s; "
+        "falling back to the running turn's delivery row",
+        task_id,
+        type(raw).__name__,
+    )
+    return None
 
 
 async def _broadcast_terminal_command_error(
     command: ClaimedTaskCommand,
     error: BaseException,
 ) -> None:
+    scope = _command_scope(command)
+    # Two things separate an external-scope cancel from every other command
+    # that exhausts its budget, and both come from who reads the frame. The
+    # wording has to be true about the turn, which takes reading the task.
+    # And ``command_kind``/``command_id`` are operator handles: an anonymous
+    # visitor cannot act on them and should not be shown the durable command
+    # identity of a task they do not own. Three payload literals rather than
+    # one built and trimmed: the client-safe guard only inspects dict
+    # literals passed straight to the sink, and a payload assembled in a
+    # variable would drop this site out of its view entirely.
+    if is_external_cancel_command(kind=command.kind.value, scope=scope):
+        task_status = await _load_terminal_command_task_status(command.task_id)
+        await manager.broadcast_to_task(
+            {
+                "type": "agent_error",
+                "message": client_safe_task_command_failure(
+                    command.kind,
+                    error,
+                    scope=scope,
+                    task_status=task_status,
+                ),
+                "task_id": command.task_id,
+                "timestamp": datetime.now(timezone.utc).timestamp(),
+            },
+            command.task_id,
+        )
+        return
+    if scope == EXTERNAL_COMMAND_SCOPE:
+        # Every other external-scope command mirrors the persisted-event
+        # rule (``include_command_identity=scope != EXTERNAL_COMMAND_SCOPE``):
+        # the live frame must not disclose what the durable record withholds,
+        # because an embedding application's stream projection may forward
+        # ``agent_error`` frames verbatim to the anonymous audience. No task
+        # status read either -- the wording asserts nothing about the turn,
+        # and this branch runs inside exception handlers where an unguarded
+        # database read would escape the disposition that is being reported.
+        await manager.broadcast_to_task(
+            {
+                "type": "agent_error",
+                "message": client_safe_task_command_failure(
+                    command.kind,
+                    error,
+                    scope=scope,
+                ),
+                "task_id": command.task_id,
+                "timestamp": datetime.now(timezone.utc).timestamp(),
+            },
+            command.task_id,
+        )
+        return
     await manager.broadcast_to_task(
         {
             "type": "agent_error",
             # A blessed constructor rather than an f-string at the call
             # site: the guard cannot see inside an interpolation. The kind
             # also travels as a structured field for consumers that want it.
-            "message": client_safe_task_command_failure(command.kind, error),
+            "message": client_safe_task_command_failure(
+                command.kind,
+                error,
+                scope=scope,
+            ),
             "command_kind": command.kind.value,
             "task_id": command.task_id,
             "command_id": command.command_id,
             "timestamp": datetime.now(timezone.utc).timestamp(),
         },
         command.task_id,
+    )
+
+
+async def _terminal_command_event_draft(
+    command: ClaimedTaskCommand,
+    error: BaseException,
+) -> TerminalTaskEventDraft:
+    """Build safe presentation metadata; disposition code persists it."""
+
+    scope = _command_scope(command)
+    if is_external_cancel_command(kind=command.kind.value, scope=scope):
+        try:
+            task_status = await _load_terminal_command_task_status(command.task_id)
+        except Exception as exc:
+            logger.warning(
+                "Could not classify external terminal command outcome; "
+                "using conservative client message task_id=%s error_type=%s",
+                command.task_id,
+                type(exc).__name__,
+            )
+            task_status = None
+        return TerminalTaskEventDraft(
+            message_code=(
+                TerminalTaskEventMessageCode.EXTERNAL_TURN_INTERRUPTED
+                if task_status in {TaskStatus.COMPLETED, TaskStatus.FAILED}
+                else TerminalTaskEventMessageCode.EXTERNAL_CANCEL_NOT_APPLIED
+            ),
+            resend_safe=False,
+            include_command_identity=False,
+        )
+    return TerminalTaskEventDraft(
+        message_code=(
+            TerminalTaskEventMessageCode.TASK_COMMAND_DEFERRED
+            if isinstance(error, TaskCommandDeferred)
+            else TerminalTaskEventMessageCode.TASK_COMMAND_FAILED
+        ),
+        resend_safe=(
+            error.resend_safe if isinstance(error, TaskCommandDeferred) else False
+        ),
+        # The disclosure rule the cancel branch above states — an anonymous
+        # external audience cannot act on durable command identity and is not
+        # shown it — holds for every external-scope command, including the
+        # external input MESSAGEs routed through the registered seam. This
+        # rebind runs after the executor's own draft and would otherwise
+        # silently restore the identity the executor withheld.
+        include_command_identity=scope != EXTERNAL_COMMAND_SCOPE,
     )
 
 
@@ -8500,19 +9834,62 @@ async def execute_durable_task_command(
     try:
         result = await _execute_durable_task_command(command)
     except TaskCommandDeferred as exc:
-        if command.defer_count + 1 >= MAX_COMMAND_DEFERS:
+        if command.defer_count + 1 >= max_command_defers():
             _command_origins.discard_command(command.command_id, command.task_id)
+            bind_terminal_event_draft(
+                exc,
+                await _terminal_command_event_draft(command, exc),
+            )
             await _broadcast_terminal_command_error(command, exc)
         # A deferral that will retry keeps its origin entry.
         raise
-    except TaskCommandRejected:
+    except TaskCommandRejected as exc:
         # Rejections come from handlers that already expose their durable
         # domain-level outcome. The dispatcher makes them terminal immediately.
         _command_origins.discard_command(command.command_id, command.task_id)
+        if (
+            command.kind == TaskCommandKind.MESSAGE
+            and _command_scope(command) == EXTERNAL_COMMAND_SCOPE
+        ):
+            # The one command whose handler has no channel of its own: the
+            # external audience's answer travels through the seam executor,
+            # which reports outcomes only as these exceptions. Without a
+            # broadcast, a deferred answer that is later terminally rejected
+            # (revoked principal, stale request, spent id, quota) vanishes
+            # silently — the task stays parked and nobody is told
+            # (xorbitsai/xagent-saas#952 B2). First-party rejections keep
+            # their handler-owned notifications and are deliberately not
+            # re-broadcast here. An executor-bound presentation draft is
+            # preserved; the standard one is derived only when none was
+            # bound, so the persisted terminal event is classified either
+            # way.
+            if terminal_event_draft_for_error(exc) is None:
+                bind_terminal_event_draft(
+                    exc,
+                    await _terminal_command_event_draft(command, exc),
+                )
+            try:
+                await _broadcast_terminal_command_error(command, exc)
+            except Exception:
+                # The rejection is already classified and its draft is
+                # bound; a failed notification must not supersede the
+                # terminal rejection into a retried failure (the finalize
+                # broadcast in external_task_cancel.py keeps the same rule).
+                # Exception, never BaseException: cancellation propagates.
+                logger.warning(
+                    "task %s external input rejection is terminal but its "
+                    "broadcast failed",
+                    command.task_id,
+                    exc_info=True,
+                )
         raise
     except Exception as exc:
         if command.failure_count + 1 >= MAX_COMMAND_FAILURES:
             _command_origins.discard_command(command.command_id, command.task_id)
+            bind_terminal_event_draft(
+                exc,
+                await _terminal_command_event_draft(command, exc),
+            )
             await _broadcast_terminal_command_error(command, exc)
         raise
     _command_origins.discard_command(command.command_id, command.task_id)
@@ -8547,6 +9924,36 @@ def _load_command_task_run_id(task_id: int) -> str | None:
         if task is None:
             raise ValueError(f"Task {task_id} no longer exists")
         return str(task.run_id) if task.run_id is not None else None
+
+
+async def _load_terminal_command_task_status(task_id: int) -> TaskStatus | None:
+    """The task's status right now, or ``None`` when it cannot be read.
+
+    This read only chooses wording for a notification that is already the
+    last act of a terminal command, and it runs inside the ``except`` bodies
+    of ``execute_durable_task_command``. An exception raised here would
+    replace the failure that dispatcher is handling, turning "the command
+    failed" into "the database failed", so an unreadable row - deleted, pool
+    exhausted, database down - is answered as ``None`` and logged.
+    ``CancelledError`` is deliberately not caught: a cancelled dispatcher
+    still has to unwind.
+    """
+
+    def _read() -> TaskStatus | None:
+        SessionLocal = get_session_local()
+        with SessionLocal() as db:
+            task = db.query(Task).filter(Task.id == task_id).first()
+            return task.status if task is not None else None
+
+    try:
+        return await run_db_io_cancellation_safe(_read)
+    except Exception:
+        logger.warning(
+            "could not read task %s status while wording a terminal command broadcast",
+            task_id,
+            exc_info=True,
+        )
+        return None
 
 
 @ws_router.websocket("/ws/build/chat")
@@ -8751,6 +10158,7 @@ clarification questions as plain assistant text.
                             "visible": bool(payload.get("visible", True)),
                             "metadata": payload.get("metadata") or {},
                         },
+                        event_id=payload.get("event_id"),
                     )
                 )
             )

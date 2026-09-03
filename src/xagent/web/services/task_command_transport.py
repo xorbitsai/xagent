@@ -15,6 +15,7 @@ import enum
 import json
 import logging
 import re
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
@@ -29,11 +30,17 @@ from ...config import (
 )
 from ..models.task import Task, TaskStatus
 from ..models.task_command import TaskExecutionCommand
+from ..models.user import User
 from .db_runtime import (
     await_task_settlement,
     is_database_pool_timeout,
     propagate_deferred_cancellation,
     run_db_io_cancellation_safe,
+)
+from .task_command_terminal_events import (
+    TerminalTaskEventDraft,
+    stage_terminal_event,
+    terminal_event_draft_for_error,
 )
 from .task_lease_service import get_runner_id
 
@@ -47,7 +54,37 @@ COMMAND_TERMINAL = (COMMAND_COMPLETED, COMMAND_FAILED)
 
 COMMAND_ID_PATTERN = re.compile(r"[A-Za-z0-9._:-]{1,64}")
 MAX_COMMAND_FAILURES = 5
+# Since the budget was coupled to the lease TTL, this constant is the FLOOR
+# of the effective defer budget, not the budget itself — compare against
+# max_command_defers(), never against this constant directly.
 MAX_COMMAND_DEFERS = 60
+
+
+def max_command_defers() -> int:
+    """The defer budget, a TTL-coupled heuristic rather than a guarantee.
+
+    A deferral's shortest canonical wait is a task lease another holder has
+    not released yet: on a non-RUNNING row the lease cannot be refreshed, so
+    it clears within one TTL. The budget (spent roughly once per second —
+    ``defer_task_command`` re-arms the claim one second out) must outlast
+    that with real margin: a fixed 60 was silently smaller than any raised
+    ``XAGENT_TASK_LEASE_TTL_SECONDS``, turning every long park into a
+    terminal failure for an already-accepted command
+    (xorbitsai/xagent-saas#952 B3). Twice the TTL keeps 100% headroom at
+    every setting; the historical constant stays as the floor so short-TTL
+    deployments keep their existing patience. Read per call, not cached:
+    the TTL is env-driven and tests vary it.
+
+    This mitigates rather than closes the exhaustion: a RUNNING row's lease
+    is heartbeat-refreshed for the whole turn, so a command deferring behind
+    a turn longer than the budget still fails terminally. The structural
+    fix — patience as a wall-clock deadline against the command's
+    ``created_at`` instead of a defer count — is #1995.
+    """
+
+    return max(MAX_COMMAND_DEFERS, get_task_lease_ttl_seconds() * 2)
+
+
 DISPATCHER_IDLE_SECONDS = 0.5
 DISPATCHER_CONCURRENCY = 4
 
@@ -70,7 +107,16 @@ class TaskCommandTaskMissing(ValueError):
 
 
 class TaskCommandDeferred(RuntimeError):
-    """The command is durable but its downstream handoff is still pending."""
+    """The command is durable but its downstream handoff is still pending.
+
+    ``resend_safe`` is true only when the failed handoff proves this command
+    never reached the downstream operation. The terminal-event projection can
+    then tell the sender to retry without risking a duplicate.
+    """
+
+    def __init__(self, message: str, *, resend_safe: bool = False) -> None:
+        super().__init__(message)
+        self.resend_safe = resend_safe
 
 
 class TaskCommandRejected(RuntimeError):
@@ -227,6 +273,7 @@ def _matches_existing(
     command: TaskExecutionCommand,
     *,
     actor_user_id: int | None,
+    actor_subject: str | None,
     kind: TaskCommandKind,
     payload: dict[str, Any],
 ) -> bool:
@@ -234,11 +281,45 @@ def _matches_existing(
         command.payload if isinstance(command.payload, dict) else {}
     )
     stored_actor_user_id = getattr(command, "actor_user_id", None)
+    stored_actor_subject = getattr(command, "actor_subject", None)
+    actors_match = (
+        stored_actor_user_id is None and stored_actor_subject is None
+        if actor_user_id is None
+        else actor_subject is not None and stored_actor_subject == actor_subject
+    )
     return (
-        stored_actor_user_id == actor_user_id
+        actors_match
         and str(command.kind) == kind.value
         and _canonical_payload(stored_payload) == _canonical_payload(payload)
     )
+
+
+def _load_actor_subject(db: Session, actor_user_id: int | None) -> str | None:
+    if actor_user_id is None:
+        return None
+    stored_subject = db.execute(
+        select(User.actor_subject).where(User.id == actor_user_id)
+    ).scalar_one_or_none()
+    return str(stored_subject) if stored_subject is not None else None
+
+
+def _resolve_actor_subject(db: Session, actor_user_id: int | None) -> str | None:
+    stored_subject = _load_actor_subject(db, actor_user_id)
+    if actor_user_id is None or stored_subject is not None:
+        return stored_subject
+    candidate_subject = str(uuid.uuid4())
+    (
+        db.query(User)
+        .filter(
+            User.id == actor_user_id,
+            User.actor_subject.is_(None),
+        )
+        .update(
+            {User.actor_subject: candidate_subject},
+            synchronize_session=False,
+        )
+    )
+    return _load_actor_subject(db, actor_user_id)
 
 
 def stage_task_command(
@@ -266,10 +347,13 @@ def stage_task_command(
        is not served from the identity map, so it observes a caller's own
        uncommitted CAS-style update to the same row instead of a stale cached
        instance.
-    4. Check for an existing command with this (task_id, command_id) before
+    4. Resolve the actor and task owner's stable internal subjects in this
+       transaction, so idempotency and terminal delivery never treat a reused
+       integer user id as the same identity.
+    5. Check for an existing command with this (task_id, command_id) before
        adding a new row, so a repeated call is idempotent without relying on
        the unique constraint to reject it.
-    5. Add and flush the new row last, so any remaining IntegrityError is
+    6. Add and flush the new row last, so any remaining IntegrityError is
        attributable to the command insert itself.
 
     Caller obligations:
@@ -306,13 +390,42 @@ def stage_task_command(
     # window across everything it did in between, so existence is re-checked
     # here, by query, before inserting a command that references the row.
     snapshot = db.execute(
-        select(Task.status, Task.runner_id, Task.run_id).where(
-            Task.id == resolved_task_id
+        select(
+            Task.status,
+            Task.runner_id,
+            Task.run_id,
+            Task.state_version,
+            Task.user_id,
+            User.id.label("task_owner_row_id"),
+            User.actor_subject.label("task_owner_subject"),
         )
+        .select_from(Task)
+        .outerjoin(
+            User,
+            and_(
+                User.id == Task.user_id,
+                User.created_at.is_not(None),
+                Task.created_at.is_not(None),
+                User.created_at <= Task.created_at,
+            ),
+        )
+        .where(Task.id == resolved_task_id)
     ).one_or_none()
     if snapshot is None:
         raise TaskCommandTaskMissing(f"Task {task_id} not found")
 
+    actor_subject = _resolve_actor_subject(db, actor_user_id)
+    task_owner_subject = (
+        str(snapshot.task_owner_subject)
+        if snapshot.task_owner_subject is not None
+        else None
+    )
+    if snapshot.task_owner_row_id is not None and task_owner_subject is None:
+        task_owner_subject = (
+            actor_subject
+            if actor_user_id == int(snapshot.user_id)
+            else _resolve_actor_subject(db, int(snapshot.user_id))
+        )
     existing = (
         db.query(TaskExecutionCommand)
         .filter(
@@ -325,6 +438,7 @@ def stage_task_command(
         matches = _matches_existing(
             existing,
             actor_user_id=actor_user_id,
+            actor_subject=actor_subject,
             kind=kind,
             payload=payload,
         )
@@ -344,10 +458,14 @@ def stage_task_command(
     command = TaskExecutionCommand(
         task_id=resolved_task_id,
         actor_user_id=actor_user_id,
+        actor_subject=actor_subject,
+        task_owner_user_id=int(snapshot.user_id),
+        task_owner_subject=task_owner_subject,
         command_id=normalized_id,
         kind=kind.value,
         payload=payload,
         target_run_id=snapshot.run_id,
+        target_state_version=int(snapshot.state_version or 0),
         target_runner_id=active_runner_id,
         status=COMMAND_PENDING,
     )
@@ -415,9 +533,11 @@ def classify_task_command_conflict(
         .one_or_none()
     )
     if raced is not None:
+        actor_subject = _load_actor_subject(db, actor_user_id)
         matches = _matches_existing(
             raced,
             actor_user_id=actor_user_id,
+            actor_subject=actor_subject,
             kind=kind,
             payload=payload,
         )
@@ -755,6 +875,8 @@ def finish_task_command(
             },
             synchronize_session=False,
         )
+        if updated == 1:
+            stage_terminal_event(db, command_db_id=command_db_id)
         db.commit()
         return updated == 1
 
@@ -767,6 +889,7 @@ def fail_task_command(
     force_terminal: bool = False,
     expected_attempt_count: int | None = None,
     result: dict[str, Any] | None = None,
+    terminal_event: TerminalTaskEventDraft | None = None,
 ) -> bool:
     """Retry a failed claim, or make it terminal after bounded attempts."""
 
@@ -823,6 +946,12 @@ def fail_task_command(
                 synchronize_session=False,
             )
         )
+        if updated == 1 and terminal:
+            stage_terminal_event(
+                db,
+                command_db_id=command_db_id,
+                draft=terminal_event,
+            )
         db.commit()
         if updated != 1:
             return False
@@ -837,6 +966,7 @@ def defer_task_command(
     reason: str,
     *,
     expected_attempt_count: int | None = None,
+    terminal_event: TerminalTaskEventDraft | None = None,
 ) -> bool:
     """Release a claim for retry without consuming the failure budget."""
 
@@ -863,7 +993,7 @@ def defer_task_command(
         observed_defer_count = int(snapshot.defer_count or 0)
         observed_attempt_count = int(snapshot.attempt_count or 0)
         defer_count = observed_defer_count + 1
-        terminal = defer_count >= MAX_COMMAND_DEFERS
+        terminal = defer_count >= max_command_defers()
         updated = (
             db.query(TaskExecutionCommand)
             .filter(
@@ -896,6 +1026,12 @@ def defer_task_command(
                 synchronize_session=False,
             )
         )
+        if updated == 1 and terminal:
+            stage_terminal_event(
+                db,
+                command_db_id=command_db_id,
+                draft=terminal_event,
+            )
         db.commit()
         if updated != 1:
             return False
@@ -964,6 +1100,36 @@ def task_has_live_foreign_runner(
             .first()
             is not None
         )
+
+
+def task_has_live_runner(
+    task_id: int,
+    *,
+    expected_run_id: str | None,
+) -> bool:
+    """Return whether the target run currently has an unexpired task lease.
+
+    ``expected_run_id`` is required and has no wildcard: an omitted default
+    would let a lease belonging to a different run stand in as idempotency
+    evidence for the run actually being asked about. An explicit ``None``
+    means the row's own run id is NULL, matching how ``expected_run_id`` reads
+    on ``BackgroundTaskManager.resume_admission_state``. Callers that really
+    do want "any run" should ask ``task_has_live_foreign_runner`` instead.
+    """
+
+    from ..models.database import get_session_local
+
+    SessionLocal = get_session_local()
+    now = _utc_now()
+    with SessionLocal() as db:
+        query = db.query(Task.id).filter(
+            Task.id == task_id,
+            Task.status == TaskStatus.RUNNING,
+            Task.runner_id.is_not(None),
+            Task.lease_expires_at.is_not(None),
+            Task.lease_expires_at >= now,
+        )
+        return query.filter(Task.run_id == expected_run_id).first() is not None
 
 
 CommandExecutor = Callable[[ClaimedTaskCommand], Awaitable[dict[str, Any] | None]]
@@ -1050,6 +1216,7 @@ async def dispatch_one_task_command(
         raise
     except TaskCommandDeferred as exc:
         reason = str(exc)
+        terminal_event = terminal_event_draft_for_error(exc)
 
         def persist_deferral() -> bool:
             return defer_task_command(
@@ -1057,6 +1224,7 @@ async def dispatch_one_task_command(
                 runner_id,
                 reason,
                 expected_attempt_count=command.attempt_count,
+                terminal_event=terminal_event,
             )
 
         disposition_name = "defer_task_command"
@@ -1067,6 +1235,16 @@ async def dispatch_one_task_command(
             {"rejection_reason": exc.reason} if exc.reason is not None else None
         )
 
+        # An executor that bound its own presentation draft wins; the neutral
+        # literal is only the fallback. The other two dispositions already
+        # read the bound draft — hardcoding here silently discarded the
+        # external input executor's identity-withholding draft
+        # (xorbitsai/xagent-saas#952 M3).
+        rejection_event = terminal_event_draft_for_error(exc) or TerminalTaskEventDraft(
+            message_code=None,
+            resend_safe=False,
+        )
+
         def persist_rejection() -> bool:
             return fail_task_command(
                 command.id,
@@ -1075,6 +1253,7 @@ async def dispatch_one_task_command(
                 force_terminal=True,
                 expected_attempt_count=command.attempt_count,
                 result=rejection_result,
+                terminal_event=rejection_event,
             )
 
         disposition_name = "fail_task_command"
@@ -1104,6 +1283,7 @@ async def dispatch_one_task_command(
                 command.attempt_count,
             )
             error = str(exc)
+            terminal_event = terminal_event_draft_for_error(exc)
 
             def persist_failure() -> bool:
                 return fail_task_command(
@@ -1111,6 +1291,7 @@ async def dispatch_one_task_command(
                     runner_id,
                     error,
                     expected_attempt_count=command.attempt_count,
+                    terminal_event=terminal_event,
                 )
 
             disposition_name = "fail_task_command"

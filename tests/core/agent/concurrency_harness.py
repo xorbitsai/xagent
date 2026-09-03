@@ -223,8 +223,17 @@ class FakeRuntime:
     async def should_interrupt(self) -> bool:
         return bool(self._interrupt)
 
-    async def send_message(self, **kwargs: Any) -> None:
-        self.events.append(("send_message", dict(kwargs)))
+    async def send_message(self, **kwargs: Any) -> dict[str, Any]:
+        payload = dict(kwargs)
+        if bool(payload.get("expect_response")) or payload.get("message_type") == (
+            "question"
+        ):
+            message_number = 1 + sum(
+                kind == "send_message" for kind, _payload in self.events
+            )
+            payload["event_id"] = f"fake-agent-message-{message_number}"
+        self.events.append(("send_message", payload))
+        return payload
 
     def request_interrupt(self, reason: str | None = None) -> None:
         self._interrupt = True

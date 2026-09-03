@@ -16,7 +16,7 @@ from xagent.core.agent import (
 )
 from xagent.core.agent import registry as registry_module
 from xagent.core.agent.registry import ExecutionRegistry
-from xagent.core.agent.runner import AgentRunner
+from xagent.core.agent.runner import AgentRunner, UserMessageInjectionOutcome
 
 
 @pytest.fixture(autouse=True)
@@ -151,15 +151,15 @@ async def test_registry_routes_live_execution_control_and_resume(
     assert registry.get_status(execution_id) == stored.to_dict()
     assert registry.list_statuses() == [stored.to_dict()]
 
-    context = await registry.post_user_message(
+    result = await registry.post_user_message(
         execution_id,
         "Reply with only the number.",
         request_interrupt=False,
     )
-    assert context is not None
+    assert result.context is not None
     assert any(
         message.role == "user" and message.content == "Reply with only the number."
-        for message in context.messages
+        for message in result.context.messages
     )
 
     resumed_agent = Agent(
@@ -359,9 +359,10 @@ async def test_registry_unregisters_completed_execution_tasks(tmp_path: Path) ->
 async def test_registry_returns_none_for_unknown_execution_on_message_post() -> None:
     registry = ExecutionRegistry()
 
-    context = await registry.post_user_message("missing", "hello")
+    result = await registry.post_user_message("missing", "hello")
 
-    assert context is None
+    assert result.context is None
+    assert result.outcome is UserMessageInjectionOutcome.NOT_POSTED
 
 
 @pytest.mark.asyncio
@@ -449,6 +450,62 @@ async def test_registry_cancel_non_running_handle_marks_terminal_and_unregisters
         "execution.cancelled",
     ]
     assert events[-1]["handle"]["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scenario", ["fresh", "replay", "conflicting_content"])
+async def test_registry_post_user_message_reports_fresh_vs_replay(
+    tmp_path: Path, scenario: str
+) -> None:
+    """The registry layer forwards AgentRunner.inject_user_message's report
+    unmodified: a first write is POSTED_FRESH, a repeat of the same turn id
+    with the same content short-circuits as POSTED_REPLAY without a second
+    write, and a repeat with different content still raises -- the
+    pre-existing conflict behavior, untouched by this contract."""
+    tracer = TracerCheckpointStore()
+    execution_id = "exec-registry-fresh-replay"
+    registry = ExecutionRegistry()
+    agent = Agent(name="writer", patterns=[])
+    runner = AgentRunner(
+        agent=agent,
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    agent.patterns = [InterruptingPattern(runner, execution_id)]
+    handle = registry.start(runner, execution_id=execution_id, task="Calculate 6*7")
+    await handle.task
+
+    first = await registry.post_user_message(
+        execution_id,
+        "Choose B",
+        turn_id="turn-registry-fresh-replay",
+        request_interrupt=False,
+    )
+    assert first.outcome is UserMessageInjectionOutcome.POSTED_FRESH
+    assert first.context is not None
+
+    if scenario == "fresh":
+        return
+
+    if scenario == "replay":
+        second = await registry.post_user_message(
+            execution_id,
+            "Choose B",
+            turn_id="turn-registry-fresh-replay",
+            request_interrupt=False,
+        )
+        assert second.outcome is UserMessageInjectionOutcome.POSTED_REPLAY
+        assert second.context is first.context
+        return
+
+    assert scenario == "conflicting_content"
+    with pytest.raises(ValueError, match="different user message"):
+        await registry.post_user_message(
+            execution_id,
+            "Choose C",
+            turn_id="turn-registry-fresh-replay",
+            request_interrupt=False,
+        )
 
 
 @pytest.mark.asyncio

@@ -222,6 +222,82 @@ def _workforce_runtime_with_worker_tools(*tool_names: str) -> WorkforceTaskRunti
 
 
 @pytest.mark.asyncio
+async def test_create_workforce_run_forwards_the_caller_timezone(
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The opening turn starts inside task creation, so the zone has to ride
+    the create request; there is no chat frame to carry it."""
+    scheduled = _patch_schedule_bg(monkeypatch)
+
+    user = _create_user(db_session, "tz-owner")
+    manager = _create_agent(db_session, user, "Manager")
+    workforce = _create_workforce(db_session, user, manager)
+    _add_worker(db_session, user, workforce, _create_agent(db_session, user, "Analyst"))
+    db_session.commit()
+
+    result = await create_workforce_run(
+        db_session,
+        user,
+        workforce,
+        message="how many shifts do we have on tomorrow?",
+        timezone="Australia/Melbourne",
+    )
+    await result.background_task
+
+    assert scheduled["context"] == {"timezone": "Australia/Melbourne"}
+
+
+@pytest.mark.asyncio
+async def test_create_workforce_run_sends_no_context_without_a_timezone(
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduled = _patch_schedule_bg(monkeypatch)
+
+    user = _create_user(db_session, "no-tz-owner")
+    manager = _create_agent(db_session, user, "Manager")
+    workforce = _create_workforce(db_session, user, manager)
+    _add_worker(db_session, user, workforce, _create_agent(db_session, user, "Analyst"))
+    db_session.commit()
+
+    result = await create_workforce_run(
+        db_session,
+        user,
+        workforce,
+        message="hello",
+    )
+    await result.background_task
+
+    assert scheduled["context"] is None
+
+
+@pytest.mark.asyncio
+async def test_create_workforce_run_treats_a_blank_timezone_as_absent(
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduled = _patch_schedule_bg(monkeypatch)
+
+    user = _create_user(db_session, "blank-tz-owner")
+    manager = _create_agent(db_session, user, "Manager")
+    workforce = _create_workforce(db_session, user, manager)
+    _add_worker(db_session, user, workforce, _create_agent(db_session, user, "Analyst"))
+    db_session.commit()
+
+    result = await create_workforce_run(
+        db_session,
+        user,
+        workforce,
+        message="hello",
+        timezone="   ",
+    )
+    await result.background_task
+
+    assert scheduled["context"] is None
+
+
+@pytest.mark.asyncio
 async def test_create_workforce_run_creates_task_run_and_starts_turn(
     db_session: Session,
     monkeypatch: pytest.MonkeyPatch,
@@ -287,6 +363,71 @@ async def test_create_workforce_run_creates_task_run_and_starts_turn(
         .count()
         == 1
     )
+
+
+@pytest.mark.asyncio
+async def test_create_preview_workforce_run_forwards_the_caller_timezone(
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduled = _patch_schedule_bg(monkeypatch)
+
+    user = _create_user(db_session, "preview-tz-owner")
+    manager = _create_agent(db_session, user, "Draft Manager")
+    worker_agent = _create_agent(db_session, user, "Draft Analyst")
+    db_session.commit()
+
+    result = await create_preview_workforce_run(
+        db_session,
+        user_id=user.id,
+        name="Launch Team",
+        description=None,
+        manager_agent_id=manager.id,
+        workers=[
+            {
+                "agent_id": worker_agent.id,
+                "alias": "Analyst",
+                "assignment_instructions": "Do the work.",
+            }
+        ],
+        message="how many shifts do we have on tomorrow?",
+        timezone="Australia/Melbourne",
+    )
+    await result.background_task
+
+    assert scheduled["context"] == {"timezone": "Australia/Melbourne"}
+
+
+@pytest.mark.asyncio
+async def test_create_preview_workforce_run_sends_no_context_without_a_timezone(
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduled = _patch_schedule_bg(monkeypatch)
+
+    user = _create_user(db_session, "preview-no-tz-owner")
+    manager = _create_agent(db_session, user, "Draft Manager")
+    worker_agent = _create_agent(db_session, user, "Draft Analyst")
+    db_session.commit()
+
+    result = await create_preview_workforce_run(
+        db_session,
+        user_id=user.id,
+        name="Launch Team",
+        description=None,
+        manager_agent_id=manager.id,
+        workers=[
+            {
+                "agent_id": worker_agent.id,
+                "alias": "Analyst",
+                "assignment_instructions": "Do the work.",
+            }
+        ],
+        message="hello",
+    )
+    await result.background_task
+
+    assert scheduled["context"] is None
 
 
 @pytest.mark.asyncio

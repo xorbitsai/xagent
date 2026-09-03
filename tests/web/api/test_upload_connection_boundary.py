@@ -28,6 +28,7 @@ from xagent.web.api.public_chat_access import (
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 from xagent.web.services.managed_file_ref import (
+    DURABLE_FAULT_LOG_PREFIX,
     DurableStorageOperationError,
     ManagedFileRef,
 )
@@ -811,6 +812,7 @@ async def test_cancel_after_upload_registration_compensates_metadata_and_bytes(
 async def test_failed_compensation_does_not_skip_request_local_cleanup(
     monkeypatch: pytest.MonkeyPatch,
     isolated_upload_storage,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     _upload_root, _object_root = isolated_upload_storage
     _admin_headers()
@@ -860,6 +862,21 @@ async def test_failed_compensation_does_not_skip_request_local_cleanup(
 
     assert local_paths
     assert all(not path.exists() for path in local_paths)
+
+    # The double fault -- the upload failed against durable storage and
+    # compensating against it failed too -- is the incident this reporting
+    # exists for, so it must not be recorded as an unlabelled traceback. The
+    # AST sweep pins that the site declares these fields; this pins that the
+    # record actually carries them, with the values from this request.
+    fault_lines = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "xagent.web.api.files"
+        and DURABLE_FAULT_LOG_PREFIX in record.getMessage()
+    ]
+    assert len(fault_lines) == 1, caplog.records
+    assert "upload compensation" in fault_lines[0]
+    assert f"user_id={user_id}" in fault_lines[0]
 
 
 @pytest.mark.asyncio

@@ -25,17 +25,28 @@ from ....config import (
 )
 from ...models.gmail_watch import GmailWatchState
 from ...models.trigger import AgentTrigger, TriggerProvisioningStatus, TriggerType
+from ...models.user_oauth import UserOAuth
 from ..gmail_provisioning import (
     GMAIL_WATCH_DISABLED_ERROR,
     gmail_callback_url,
     provision_gmail_trigger,
     release_gmail_mailbox_if_unused,
 )
+from ..gmail_triggers import (
+    gmail_binding_id,
+    is_legacy_gmail_binding,
+    ordinary_gmail_triggers,
+)
 from ..ops_signals import (
     GMAIL_OIDC_SERVICE_ACCOUNT_UNVERIFIED,
     GMAIL_WATCH_REGISTRATION_DISABLED,
     clear_degradation,
     register_degradation,
+)
+from ..user_oauth import (
+    get_scoped_user_oauth_account,
+    is_ordinary_gmail,
+    ordinary_gmail_clause,
 )
 from .base import (
     CallbackRequestContext,
@@ -106,16 +117,6 @@ def warn_if_gmail_watch_registration_degraded() -> None:
     logger.warning(message)
 
 
-def _binding_oauth_account_id(config: Any) -> int | None:
-    """Read the bound OAuth account from a binding config.
-
-    CRUD dispatch always passes the previous config as a plain dict
-    (AgentTrigger.config is a JSON column).
-    """
-    value = (config or {}).get("oauth_account_id")
-    return int(value) if value is not None else None
-
-
 def _accepted_callback_audiences(
     state: GmailWatchState, callback_id: str
 ) -> tuple[str, ...]:
@@ -162,9 +163,15 @@ def _as_utc(value: datetime) -> datetime:
 
 
 def _watch_state_for_callback(db: Session, callback_id: str) -> GmailWatchState | None:
+    """Resolve a callback only through a same-user ordinary Gmail account."""
     return (
         db.query(GmailWatchState)
-        .filter(GmailWatchState.callback_id == callback_id)
+        .join(UserOAuth, UserOAuth.id == GmailWatchState.oauth_account_id)
+        .filter(
+            GmailWatchState.callback_id == callback_id,
+            UserOAuth.user_id == GmailWatchState.user_id,
+            ordinary_gmail_clause(),
+        )
         .first()
     )
 
@@ -313,10 +320,8 @@ class GmailProvider:
         state = _watch_state_for_callback(db, callback_id)
         if state is None:
             return None
-        # Prefer triggers bound to this callback's mailbox so the disabled
-        # check applies to the right binding; fall back to the user's other
-        # Gmail triggers so cross-mailbox events still surface as audited
-        # rejected_resource outcomes instead of unknown callbacks.
+        # Prefer this mailbox. Explicit bindings to another account fail
+        # closed; only unbound legacy triggers use mailbox matching.
         mailbox_matches = case(
             (
                 func.lower(AgentTrigger.resource_id) == _normalized_email(state.email),
@@ -324,7 +329,7 @@ class GmailProvider:
             ),
             else_=1,
         )
-        return (
+        candidates = (
             db.query(AgentTrigger)
             .filter(
                 AgentTrigger.user_id == int(state.user_id),
@@ -332,12 +337,20 @@ class GmailProvider:
                 AgentTrigger.provider == self.name,
             )
             .order_by(
-                mailbox_matches,
                 AgentTrigger.enabled.desc(),
+                mailbox_matches,
                 AgentTrigger.id.asc(),
             )
-            .first()
+            .all()
         )
+        ordinary = ordinary_gmail_triggers(
+            triggers=candidates,
+            oauth_account_id=int(state.oauth_account_id),
+            mailbox=_normalized_email(state.email),
+        )
+        # An invalid binding is acknowledged as unknown before parsing. The
+        # cursor stays unchanged until an ordinary trigger can consume it.
+        return ordinary[0] if ordinary else None
 
     def handle_challenge(
         self, context: CallbackRequestContext, raw_body: bytes
@@ -458,14 +471,46 @@ class GmailProvider:
             error=trigger.provisioning_error,
         )
 
-    async def unregister(self, db: Session, trigger: AgentTrigger, config: Any) -> None:
-        # The binding must come from config: CRUD passes the trigger's
-        # previous config, and on delete the trigger row no longer exists.
-        oauth_account_id = _binding_oauth_account_id(config)
-        if oauth_account_id is not None:
-            await asyncio.to_thread(
-                release_gmail_mailbox_if_unused, db, oauth_account_id
+    async def unregister(
+        self,
+        db: Session,
+        trigger: AgentTrigger,
+        config: Any,
+        *,
+        resource_id: str | None = None,
+    ) -> None:
+        oauth_account_id = gmail_binding_id(config)
+        if oauth_account_id is None:
+            if not is_legacy_gmail_binding(config):
+                return
+            mailbox = _normalized_email(resource_id)
+            if not mailbox:
+                return
+            matches = (
+                db.query(UserOAuth)
+                .filter(
+                    UserOAuth.user_id == int(trigger.user_id),
+                    ordinary_gmail_clause(),
+                    func.lower(UserOAuth.email) == mailbox,
+                )
+                .order_by(UserOAuth.id)
+                .limit(2)
+                .all()
             )
+            if len(matches) != 1:
+                return
+            oauth_account_id = int(matches[0].id)
+        else:
+            oauth_account = get_scoped_user_oauth_account(
+                db,
+                user_id=int(trigger.user_id),
+                account_id=oauth_account_id,
+                resource_owner_key=None,
+            )
+            if oauth_account is None or not is_ordinary_gmail(oauth_account):
+                return
+
+        await asyncio.to_thread(release_gmail_mailbox_if_unused, db, oauth_account_id)
 
     async def parse_events(
         self,
@@ -541,9 +586,34 @@ class GmailProvider:
         )
         if not _history_cursor_advances(state.history_id, notification.history_id):
             return
-        setattr(state, "history_id", notification.history_id)
-        setattr(state, "last_error", None)
-        db.add(state)
+        ordinary_account_exists = (
+            db.query(UserOAuth.id)
+            .filter(
+                UserOAuth.id == GmailWatchState.oauth_account_id,
+                UserOAuth.user_id == GmailWatchState.user_id,
+                ordinary_gmail_clause(),
+            )
+            .exists()
+        )
+        updated = (
+            db.query(GmailWatchState)
+            .filter(
+                GmailWatchState.id == int(state.id),
+                GmailWatchState.oauth_account_id == int(state.oauth_account_id),
+                GmailWatchState.user_id == int(state.user_id),
+                ordinary_account_exists,
+            )
+            .update(
+                {
+                    GmailWatchState.history_id: notification.history_id,
+                    GmailWatchState.last_error: None,
+                },
+                synchronize_session=False,
+            )
+        )
+        if updated == 0:
+            db.rollback()
+            return
         db.commit()
 
 

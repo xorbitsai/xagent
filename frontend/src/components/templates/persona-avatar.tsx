@@ -17,6 +17,9 @@ interface PersonaAvatarProps {
    * text node inside the same interactive control gets its accessible
    * name announced twice ("Maya Maya"). */
   decorative?: boolean;
+  /** Inline style pass-through - e.g. a caller-computed box-shadow ring color
+   * that can't be expressed as a static Tailwind class. */
+  style?: React.CSSProperties;
 }
 
 /** A persona's circular avatar image, falling back to its first initial on a
@@ -29,12 +32,14 @@ export function PersonaAvatar({
   textClassName = "text-sm",
   className,
   decorative = false,
+  style,
 }: PersonaAvatarProps) {
   if (persona.avatar) {
     return (
       <img
         src={persona.avatar}
         alt={decorative ? "" : persona.name}
+        style={style}
         className={cn(sizeClassName, "flex-shrink-0 rounded-full object-cover", className)}
       />
     );
@@ -43,6 +48,7 @@ export function PersonaAvatar({
   return (
     <div
       aria-hidden={decorative || undefined}
+      style={style}
       className={cn(
         sizeClassName,
         "flex flex-shrink-0 items-center justify-center rounded-full bg-muted font-semibold text-muted-foreground",

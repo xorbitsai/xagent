@@ -12,9 +12,12 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 from uuid import uuid4
+
+from sqlalchemy import or_
 
 from ...config import get_default_task_execution_mode
 from ...core.file_storage.keys import build_task_output_storage_key
@@ -37,7 +40,15 @@ from .managed_task_lease import (
     finalize_managed_task_lease_result,
     start_managed_task_lease,
 )
-from .task_lease_service import TaskLease, acquire_task_lease_no_commit
+from .mcp_runtime import MCPBuiltinOAuthActorPolicyRequiredError
+from .task_lease_service import TaskLease, acquire_task_lease_no_commit, utc_now
+from .task_runtime import (
+    MCP_RUNTIME_AUTHORIZATION_POLICY_IDENTITY_KEY,
+    MCP_RUNTIME_AUTHORIZATION_POLICY_REQUIRED_KEY,
+)
+from .task_runtime import (
+    mcp_runtime_authorization_policy_required as task_requires_mcp_actor_policy,
+)
 from .uploaded_file_store import (
     StagedUploadedFile,
     UploadedFileStore,
@@ -49,6 +60,14 @@ from .workforce_runtime import sync_workforce_run_status
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TASK_LIST_LIMIT = 50
+ACTOR_TASK_SOURCE = "external"
+
+
+class ChannelTaskMode(StrEnum):
+    """The trusted task-selection contract for one channel turn."""
+
+    DEFAULT = "default"
+    ACTOR_INTERACTION = "actor_interaction"
 
 
 class ChannelConfigurationError(RuntimeError):
@@ -606,6 +625,86 @@ async def get_channel_owner_agent(
     )
 
 
+def _actor_interaction_task_matches(
+    task: Task | None,
+    agent: Agent | None,
+    *,
+    owner_id: int,
+    agent_id: int,
+    status: TaskStatus,
+) -> bool:
+    return bool(
+        agent is not None
+        and task is not None
+        and int(task.user_id) == owner_id
+        and task.agent_id is not None
+        and int(task.agent_id) == agent_id
+        and int(agent.id) == agent_id
+        and task.source == ACTOR_TASK_SOURCE
+        and task.status == status
+        and task.is_visible is False
+        and task_requires_mcp_actor_policy(task.agent_config)
+    )
+
+
+def _actor_interaction_claim_predicates(
+    *,
+    owner_id: int,
+    agent_id: int,
+) -> tuple[Any, ...]:
+    now = utc_now()
+    return (
+        Task.user_id == owner_id,
+        Task.agent_id == agent_id,
+        Task.source == ACTOR_TASK_SOURCE,
+        Task.is_visible.is_(False),
+        Task.agent_config[MCP_RUNTIME_AUTHORIZATION_POLICY_REQUIRED_KEY]
+        .as_boolean()
+        .is_(True),
+        # WAITING_FOR_USER can be visible before the prior run releases its
+        # lease. Do not let the same process overwrite that live lease.
+        or_(
+            Task.runner_id.is_(None),
+            Task.lease_expires_at.is_(None),
+            Task.lease_expires_at < now,
+        ),
+    )
+
+
+def _load_actor_interaction_task(
+    db: Any,
+    *,
+    owner_id: int,
+    active_task_id: int,
+    agent_id: int,
+) -> tuple[Task, Agent]:
+    """Load one exact waiting actor task without a fresh-task fallback."""
+
+    agent = (
+        _owned_channel_agents_query(db, owner_id).filter(Agent.id == agent_id).first()
+    )
+    task = (
+        db.query(Task)
+        .filter(
+            Task.id == active_task_id,
+            Task.user_id == owner_id,
+        )
+        .first()
+    )
+    if not _actor_interaction_task_matches(
+        task,
+        agent,
+        owner_id=owner_id,
+        agent_id=agent_id,
+        status=TaskStatus.WAITING_FOR_USER,
+    ):
+        raise ChannelAuthorizationError("The actor interaction task is unavailable")
+
+    assert task is not None
+    assert agent is not None
+    return task, agent
+
+
 def _prepare_channel_task_sync(
     *,
     channel_id: int | None,
@@ -615,7 +714,23 @@ def _prepare_channel_task_sync(
     channel_name: str | None,
     expected_owner_user_id: int | None,
     agent_id: int | None = None,
+    new_task_is_visible: bool = True,
+    mcp_runtime_authorization_policy_required: bool = False,
+    mcp_runtime_authorization_policy_identity: str | None = None,
+    task_mode: ChannelTaskMode = ChannelTaskMode.DEFAULT,
 ) -> _ChannelTaskClaimSnapshot | None:
+    if not isinstance(task_mode, ChannelTaskMode):
+        raise ValueError("Unsupported channel task mode")
+    if task_mode is ChannelTaskMode.ACTOR_INTERACTION:
+        if active_task_id is None or active_task_id <= 0:
+            raise ValueError("Actor interaction requires an active task")
+        if expected_owner_user_id is None:
+            raise ValueError("Actor interaction requires an expected owner")
+        if agent_id is None:
+            raise ValueError("Actor interaction requires an agent")
+        if not mcp_runtime_authorization_policy_required:
+            raise ValueError("Actor interaction requires an actor policy")
+
     SessionLocal = get_session_local()
     with SessionLocal() as db:
         try:
@@ -637,7 +752,7 @@ def _prepare_channel_task_sync(
                 )
 
             is_telegram = str(channel.channel_type) == "telegram"
-            if is_telegram:
+            if is_telegram and task_mode is ChannelTaskMode.DEFAULT:
                 claimed_legacy_task = _claim_legacy_active_telegram_task_sync(
                     db,
                     channel=channel,
@@ -654,7 +769,41 @@ def _prepare_channel_task_sync(
                     db.flush()
 
             task = None
-            if active_task_id is not None and active_task_id != -1:
+            agent_row = None
+            requested_agent_missing = False
+            if task_mode is ChannelTaskMode.ACTOR_INTERACTION:
+                assert active_task_id is not None
+                assert agent_id is not None
+                task, agent_row = _load_actor_interaction_task(
+                    db,
+                    owner_id=owner_id,
+                    active_task_id=active_task_id,
+                    agent_id=agent_id,
+                )
+            else:
+                # Actor-owned channel turns are fresh-only. Ignoring an active
+                # id on the default marked path prevents it from becoming an
+                # accidental continuation API.
+                if mcp_runtime_authorization_policy_required is True:
+                    active_task_id = None
+
+            if (
+                task_mode is ChannelTaskMode.DEFAULT
+                and active_task_id is not None
+                and active_task_id != -1
+            ):
+                active_config = (
+                    db.query(Task.agent_config)
+                    .filter(
+                        Task.id == active_task_id,
+                        Task.user_id == owner_id,
+                    )
+                    .scalar()
+                )
+                if task_requires_mcp_actor_policy(active_config):
+                    raise MCPBuiltinOAuthActorPolicyRequiredError(
+                        f"Task {active_task_id} is actor-marked; channel reuse is unsupported"
+                    )
                 query = db.query(Task).filter(
                     Task.id == active_task_id,
                     Task.user_id == owner_id,
@@ -676,15 +825,16 @@ def _prepare_channel_task_sync(
                         Task.is_visible.is_(True),
                     )
                 task = query.first()
+                if task is not None and task_requires_mcp_actor_policy(
+                    task.agent_config
+                ):
+                    raise MCPBuiltinOAuthActorPolicyRequiredError(
+                        f"Task {int(task.id)} is actor-marked; channel reuse is unsupported"
+                    )
 
-            # Revalidate the requested selection on every turn, not only for
-            # new tasks. A conversation may only continue when its task binding
-            # still matches the selection: a stale selection (agent deleted or
-            # visibility revoked) or a drifted binding evicts to a fresh task
-            # instead of resuming with stale cached agent state.
-            agent_row = None
-            requested_agent_missing = False
-            if agent_id is not None:
+            # Revalidate the requested selection on every ordinary turn. Actor
+            # interaction mode uses the stricter exact-task check above.
+            if task_mode is ChannelTaskMode.DEFAULT and agent_id is not None:
                 agent_row = (
                     _owned_channel_agents_query(db, owner_id)
                     .filter(Agent.id == int(agent_id))
@@ -718,6 +868,27 @@ def _prepare_channel_task_sync(
                     channel_name=channel_name,
                     telegram_user_id=external_user_id if is_telegram else None,
                     agent_id=task_agent_id,
+                    is_visible=(
+                        False
+                        if mcp_runtime_authorization_policy_required is True
+                        else new_task_is_visible
+                    ),
+                    agent_config=(
+                        {
+                            MCP_RUNTIME_AUTHORIZATION_POLICY_REQUIRED_KEY: True,
+                            **(
+                                {
+                                    MCP_RUNTIME_AUTHORIZATION_POLICY_IDENTITY_KEY: (
+                                        mcp_runtime_authorization_policy_identity
+                                    )
+                                }
+                                if mcp_runtime_authorization_policy_identity
+                                else {}
+                            ),
+                        }
+                        if mcp_runtime_authorization_policy_required is True
+                        else None
+                    ),
                 )
                 selected_refs = prepare_connector_runtime_selection_snapshot(
                     db=db,
@@ -731,7 +902,25 @@ def _prepare_channel_task_sync(
                 db.flush()
 
             task_id = int(task.id)
-            lease = acquire_task_lease_no_commit(db, task_id, new_run=True)
+            claim_predicates = ()
+            if task_mode is ChannelTaskMode.ACTOR_INTERACTION:
+                assert agent_id is not None
+                claim_predicates = _actor_interaction_claim_predicates(
+                    owner_id=owner_id,
+                    agent_id=agent_id,
+                )
+
+            lease = acquire_task_lease_no_commit(
+                db,
+                task_id,
+                expected_status=(
+                    TaskStatus.WAITING_FOR_USER
+                    if task_mode is ChannelTaskMode.ACTOR_INTERACTION
+                    else None
+                ),
+                new_run=True,
+                claim_predicates=claim_predicates,
+            )
             if lease is None:
                 db.rollback()
                 return None
@@ -741,6 +930,23 @@ def _prepare_channel_task_sync(
             # PENDING row before its RUNNING owner is durable.
             db.expire_all()
             claimed_task = db.query(Task).filter(Task.id == task_id).one()
+            if task_mode is ChannelTaskMode.ACTOR_INTERACTION:
+                assert agent_id is not None
+                claimed_agent = (
+                    _owned_channel_agents_query(db, owner_id)
+                    .filter(Agent.id == agent_id)
+                    .with_for_update()
+                    .first()
+                )
+                if not _actor_interaction_task_matches(
+                    claimed_task,
+                    claimed_agent,
+                    owner_id=owner_id,
+                    agent_id=agent_id,
+                    status=TaskStatus.RUNNING,
+                ):
+                    db.rollback()
+                    return None
             sync_workforce_run_status(db, claimed_task, TaskStatus.RUNNING)
             db.commit()
             return _ChannelTaskClaimSnapshot(
@@ -764,8 +970,17 @@ async def prepare_channel_task(
     channel_name: str | None,
     expected_owner_user_id: int | None = None,
     agent_id: int | None = None,
+    new_task_is_visible: bool = True,
+    mcp_runtime_authorization_policy_required: bool = False,
+    mcp_runtime_authorization_policy_identity: str | None = None,
+    task_mode: ChannelTaskMode = ChannelTaskMode.DEFAULT,
 ) -> ClaimedChannelTask | None:
-    """Authorize, resolve/create, and claim one exact channel run atomically."""
+    """Authorize, resolve or create, and claim one channel run atomically.
+
+    The trusted actor path sets both ``new_task_is_visible=False`` and
+    ``mcp_runtime_authorization_policy_required=True``. That marker is written
+    in the creation transaction before the returned lease can be executed.
+    """
 
     worker = asyncio.create_task(
         asyncio.to_thread(
@@ -777,6 +992,14 @@ async def prepare_channel_task(
             channel_name=channel_name,
             expected_owner_user_id=expected_owner_user_id,
             agent_id=agent_id,
+            new_task_is_visible=new_task_is_visible,
+            mcp_runtime_authorization_policy_required=(
+                mcp_runtime_authorization_policy_required
+            ),
+            mcp_runtime_authorization_policy_identity=(
+                mcp_runtime_authorization_policy_identity
+            ),
+            task_mode=task_mode,
         )
     )
     snapshot, cancellation = await await_task_settlement(worker)

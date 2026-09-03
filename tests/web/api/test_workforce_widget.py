@@ -559,6 +559,48 @@ def test_disabled_widget_invalidates_existing_guest_tokens() -> None:
 # ===== Guest task creation → create_workforce_run =====
 
 
+def test_widget_task_create_forwards_timezone_to_the_opening_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The widget opening turn starts inside this request and never reaches the
+    websocket chat frame, so the zone has to travel on the create body."""
+    workforce_id = _create_workforce("Widget Timezone Workforce")
+    key = _enable_widget(workforce_id)
+    guest_headers = _authenticate_widget_guest_by_key(key)
+    scheduled = patch_schedule_bg(monkeypatch)
+
+    response = client.post(
+        "/api/widget/chat/task/create",
+        headers=guest_headers,
+        json={
+            "title": "how many shifts do we have on tomorrow?",
+            "description": "how many shifts do we have on tomorrow?",
+            "timezone": "Australia/Melbourne",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert scheduled["context"] == {"timezone": "Australia/Melbourne"}
+
+
+def test_widget_task_create_without_timezone_sends_no_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workforce_id = _create_workforce("Widget No Timezone Workforce")
+    key = _enable_widget(workforce_id)
+    guest_headers = _authenticate_widget_guest_by_key(key)
+    scheduled = patch_schedule_bg(monkeypatch)
+
+    response = client.post(
+        "/api/widget/chat/task/create",
+        headers=guest_headers,
+        json={"title": "hello", "description": "hello"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert scheduled["context"] is None
+
+
 def test_widget_task_create_starts_workforce_run(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -308,6 +308,12 @@ class GeminiLLM(BaseLLM):
         self, messages: List[Dict[str, Any]]
     ) -> tuple[Optional[str], List[Dict[str, Any]]]:
         """Convert OpenAI format messages to Gemini format."""
+        # No explicit ``_xagent_``-prefixed key stripping happens here: every
+        # output message below is rebuilt field-by-field, never a
+        # ``dict(msg)`` copy, so an internal marker like
+        # ``_xagent_provider_state`` on the input is never read and cannot
+        # leak into the Gemini request. Switching any branch here to copy
+        # ``msg`` wholesale would reopen that leak.
         gemini_messages = []
         system_instruction = None
 

@@ -242,6 +242,20 @@ def test_task_lease_acquire_refresh_and_release(db_session) -> None:
     assert task.lease_expires_at is None
 
 
+def test_refresh_owned_terminal_task_is_settlement_ready(db_session) -> None:
+    task = _create_task(db_session)
+    lease = acquire_task_lease(db_session, int(task.id), runner_id="runner-a")
+    assert lease is not None
+
+    task.status = TaskStatus.COMPLETED
+    task.control_state = "completed"
+    db_session.commit()
+
+    assert (
+        refresh_task_lease(db_session, lease) == TaskLeaseRefreshState.SETTLEMENT_READY
+    )
+
+
 def test_acquire_returns_run_id_from_update_without_followup_select(
     queue_pool_runtime_db,
 ) -> None:
@@ -1045,18 +1059,32 @@ async def test_stop_heartbeat_reports_lost_ownership(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_heartbeat_does_not_report_owned_terminal_task_as_lease_lost(
-    db_session,
+async def test_heartbeat_does_not_report_settlement_ready_as_lease_lost(
     monkeypatch,
 ) -> None:
-    task = _create_task(db_session)
-    lease = acquire_task_lease(db_session, int(task.id), runner_id="runner-a")
-    assert lease is not None
+    def settlement_ready_refresh(
+        leases: tuple[TaskLease, ...],
+    ) -> dict[tuple[int, str, str | None], TaskLeaseRefreshState]:
+        return {
+            (lease.task_id, lease.runner_id, lease.run_id): (
+                TaskLeaseRefreshState.SETTLEMENT_READY
+            )
+            for lease in leases
+        }
 
-    task.status = TaskStatus.COMPLETED
-    task.control_state = "completed"
-    db_session.commit()
+    async def run_db_io_inline(operation):
+        return operation()
 
+    monkeypatch.setattr(
+        task_lease_service,
+        "refresh_task_leases_isolated",
+        settlement_ready_refresh,
+    )
+    monkeypatch.setattr(
+        task_lease_service,
+        "run_db_io_cancellation_safe",
+        run_db_io_inline,
+    )
     monkeypatch.setattr(
         task_lease_service,
         "get_task_lease_heartbeat_seconds",
@@ -1064,8 +1092,11 @@ async def test_heartbeat_does_not_report_owned_terminal_task_as_lease_lost(
     )
 
     outcome = await asyncio.wait_for(
-        run_task_lease_heartbeat(lease, asyncio.Event()),
-        timeout=1,
+        run_task_lease_heartbeat(
+            TaskLease(task_id=1, runner_id="runner-a", run_id="run-a"),
+            asyncio.Event(),
+        ),
+        timeout=5,
     )
     await task_lease_service.wait_for_heartbeat_manager_idle()
 

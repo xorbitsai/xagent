@@ -29,6 +29,7 @@ from ...core.file_storage import (
     StoredObject,
     get_user_file_storage,
 )
+from ...core.file_storage.faults import classify_provider_fault
 from ...core.file_storage.keys import (
     build_task_output_storage_key as build_task_output_storage_key,
 )
@@ -126,6 +127,12 @@ def log_durable_storage_fault(
     the logs an incident is read from. Values are escaped and bounded because
     some are client-supplied; that bounds the fields, not the whole record,
     whose ``exc_info`` text the formatter still renders verbatim (#1516).
+
+    The classified provider fault is appended so a burst of these can be
+    aggregated by cause -- one throttle reads very differently from a thousand,
+    and both differ from a rejected credential. ``retryable=False`` there is a
+    diagnostic claim, not a routing one: every fault in this family still
+    answers the same status.
     """
     # One record per fault instance: a wrap can cross several arms that each
     # legitimately report it, and the mark is what makes them safe to write
@@ -141,9 +148,19 @@ def log_durable_storage_fault(
         if exc.storage_key and "storage_key" not in fields:
             fields = {**fields, "storage_key": exc.storage_key}
 
+    # One renderer for both the caller's identifiers and the classified fault,
+    # so escaping and layout are decided in a single place. Values from the
+    # classifier are sanitised on the same terms as request identifiers: a
+    # provider ``Code`` is read out of a duck-typed response dict, so a
+    # loosely-conforming backend could put a space or newline in it.
+    # Classified fields last: they are derived from the exception itself, so
+    # where a caller passes a key of the same name the exception's own answer
+    # is the one to keep. No caller does today; the precedence is stated so a
+    # future collision is a decision rather than a surprise.
+    merged = {**fields, **classify_provider_fault(exc).as_fields()}
     rendered = "".join(
         f" {name}={_sanitize_log_value(value)}"
-        for name, value in fields.items()
+        for name, value in merged.items()
         if value is not None
     )
     # The prefix stays a literal in the template, not an argument: this repo

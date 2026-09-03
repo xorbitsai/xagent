@@ -23,7 +23,11 @@ from xagent.core.model.chat.basic.router import (
 )
 from xagent.core.model.chat.error import retry_on
 from xagent.core.model.chat.exceptions import LLMToolProtocolError
-from xagent.core.model.chat.types import ChunkType, StreamChunk
+from xagent.core.model.chat.types import (
+    PROVIDER_STATE_METADATA_KEY,
+    ChunkType,
+    StreamChunk,
+)
 from xagent.core.retry.strategy import FixedDelay
 from xagent.core.retry.wrapper import create_retry_wrapper
 
@@ -297,6 +301,155 @@ def test_route_sync_forwards_advisory_modalities_when_supported(monkeypatch) -> 
 
     assert selected == ["openai/gpt-5.5"]
     assert calls == [("image", "audio")]
+
+
+def test_route_sync_excludes_configured_models(monkeypatch) -> None:
+    calls: list[dict[str, Any]] = []
+
+    class Service:
+        configs = {
+            "auto": SimpleNamespace(
+                models=("z-ai/glm-5.3-flash", "openai/gpt-5.6-luna")
+            )
+        }
+
+        def route(
+            self,
+            prompt: str,
+            *,
+            config_name: str,
+            models: list[str] | None = None,
+        ) -> dict[str, Any]:
+            calls.append(
+                {"prompt": prompt, "config_name": config_name, "models": models}
+            )
+            return {"selected": [models[0]] if models else []}
+
+    monkeypatch.setenv("XAGENT_XROUTER_EXCLUDED_MODELS", "z-ai/glm-5.3-flash")
+    monkeypatch.setattr(
+        "xagent.core.model.chat.basic.router._get_service",
+        lambda: Service(),
+    )
+
+    selected = RouterLLM()._route_sync("inspect")
+
+    assert selected == ["openai/gpt-5.6-luna"]
+    assert calls == [
+        {
+            "prompt": "inspect",
+            "config_name": "auto",
+            "models": ["openai/gpt-5.6-luna"],
+        }
+    ]
+
+
+@pytest.mark.parametrize("excluded_models", ["", "unknown/model"])
+def test_route_sync_leaves_models_unset_without_matching_exclusions(
+    monkeypatch,
+    excluded_models: str,
+) -> None:
+    calls: list[list[str] | None] = []
+
+    class Service:
+        configs = {
+            "auto": SimpleNamespace(
+                models=("z-ai/glm-5.3-flash", "openai/gpt-5.6-luna")
+            )
+        }
+
+        def route(
+            self,
+            prompt: str,
+            *,
+            config_name: str,
+            models: list[str] | None = None,
+        ) -> dict[str, Any]:
+            del prompt, config_name
+            calls.append(models)
+            return {"selected": ["z-ai/glm-5.3-flash"]}
+
+    monkeypatch.setenv("XAGENT_XROUTER_EXCLUDED_MODELS", excluded_models)
+    monkeypatch.setattr(
+        "xagent.core.model.chat.basic.router._get_service",
+        lambda: Service(),
+    )
+
+    selected = RouterLLM()._route_sync("inspect")
+
+    assert selected == ["z-ai/glm-5.3-flash"]
+    assert calls == [None]
+
+
+def test_route_sync_rejects_excluding_every_candidate(monkeypatch) -> None:
+    class Service:
+        configs = {
+            "auto": SimpleNamespace(models=("z-ai/glm-5.3-flash",)),
+        }
+
+        def route(
+            self,
+            prompt: str,
+            *,
+            config_name: str,
+            models: list[str] | None = None,
+        ) -> dict[str, Any]:
+            raise AssertionError("route must not run without an eligible candidate")
+
+    monkeypatch.setenv("XAGENT_XROUTER_EXCLUDED_MODELS", "z-ai/glm-5.3-flash")
+    monkeypatch.setattr(
+        "xagent.core.model.chat.basic.router._get_service",
+        lambda: Service(),
+    )
+
+    with pytest.raises(RuntimeError, match="no candidates"):
+        RouterLLM()._route_sync("inspect")
+
+
+@pytest.mark.asyncio
+async def test_exclusion_failure_uses_explicit_fallback(monkeypatch) -> None:
+    class Service:
+        configs = {
+            "auto": SimpleNamespace(models=("z-ai/glm-5.3-flash",)),
+        }
+
+        def route(
+            self,
+            prompt: str,
+            *,
+            config_name: str,
+            models: list[str] | None = None,
+        ) -> dict[str, Any]:
+            raise AssertionError("route must not run without an eligible candidate")
+
+    monkeypatch.setenv("XAGENT_XROUTER_EXCLUDED_MODELS", "z-ai/glm-5.3-flash")
+    monkeypatch.setenv("XAGENT_ROUTER_FALLBACK_MODEL", "fallback/model")
+    monkeypatch.setattr(
+        "xagent.core.model.chat.basic.router._get_service",
+        lambda: Service(),
+    )
+
+    assert await RouterLLM()._select_model("inspect") == "fallback/model"
+
+
+def test_route_sync_rejects_older_router_api_for_exclusions(monkeypatch) -> None:
+    class Service:
+        configs = {
+            "auto": SimpleNamespace(
+                models=("z-ai/glm-5.3-flash", "openai/gpt-5.6-luna")
+            )
+        }
+
+        def route(self, prompt: str, *, config_name: str) -> dict[str, Any]:
+            return {"selected": ["z-ai/glm-5.3-flash"]}
+
+    monkeypatch.setenv("XAGENT_XROUTER_EXCLUDED_MODELS", "z-ai/glm-5.3-flash")
+    monkeypatch.setattr(
+        "xagent.core.model.chat.basic.router._get_service",
+        lambda: Service(),
+    )
+
+    with pytest.raises(RuntimeError, match="upgrade xrouter-llm"):
+        RouterLLM()._route_sync("inspect")
 
 
 def test_route_sync_rejects_older_router_api_for_modality_requests(
@@ -714,3 +867,134 @@ async def test_sandwiched_deepseek_prefix_sanitizes_messages_once(monkeypatch, m
     # sanitized success: the sanitized messages carry over across compat
     # iterations, so the prefix rejection never fires a second time.
     assert mock_client.chat.completions.create.await_count == 3
+
+
+# ---------------------------------------------------------------------------
+# ``_resolve_route``'s fallback branch (no injected ``downstream_resolver``):
+# the abilities passed to the ``ChatModelConfig`` it builds must be the
+# caller's original configuration, not ``RouterLLM._abilities`` (which always
+# excludes vision/thinking_mode -- see ``_UNROUTED_ROUTER_ABILITIES`` -- since
+# a virtual router cannot claim a candidate's dynamic abilities before
+# routing picks one). Before this fix, a user-declared
+# ``thinking_mode``/``vision`` ability was silently dropped from the
+# actually-constructed downstream client on this branch.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_router_fallback_downstream_supports_thinking_mode_matches_configured_abilities(
+    monkeypatch,
+):
+    router = RouterLLM(
+        api_key="test-key",
+        abilities=["chat", "tool_calling", "thinking_mode"],
+    )
+    monkeypatch.setattr(router, "_select_model", _select_deepseek)
+
+    model_id, downstream = await router._resolve_route(
+        [{"role": "user", "content": "hi"}]
+    )
+
+    assert model_id == "deepseek/deepseek-v4-flash"
+    # The router's own advertised abilities never include thinking_mode...
+    assert router.supports_thinking_mode is False
+    # ...but the downstream client the fallback branch actually built must
+    # still see it, because that is what the user configured.
+    assert downstream.supports_thinking_mode is True
+
+
+@pytest.mark.asyncio
+async def test_router_fallback_downstream_has_ability_vision_matches_configured_abilities(
+    monkeypatch,
+):
+    router = RouterLLM(
+        api_key="test-key",
+        abilities=["chat", "tool_calling", "vision"],
+    )
+    monkeypatch.setattr(router, "_select_model", _select_deepseek)
+
+    _model_id, downstream = await router._resolve_route(
+        [{"role": "user", "content": "hi"}]
+    )
+
+    assert router.has_ability("vision") is False
+    assert downstream.has_ability("vision") is True
+
+
+@pytest.mark.asyncio
+async def test_router_auto_fallback_vision_deepseek_round_trips_reasoning(
+    monkeypatch, mocker
+):
+    """Auto routing to a deepseek model on a vision call still captures reasoning.
+
+    This is where two separate behaviors meet: ``vision_chat`` inheriting
+    reasoning capture, and the fallback branch building its downstream
+    client from the caller's configured abilities. The combination is a real
+    user situation -- an image in the conversation, no explicit model
+    chosen, routed by "auto" to a deepseek slug, on the code path with no
+    injected ``downstream_resolver`` -- so it must run end-to-end with
+    capture firing.
+    """
+    tool_call = SimpleNamespace(
+        id="call_1",
+        type="function",
+        function=SimpleNamespace(name="search", arguments="{}"),
+    )
+    message = SimpleNamespace(
+        content=None,
+        tool_calls=[tool_call],
+        reasoning_content="Looking at the picture first.",
+    )
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(message=message)],
+        usage=None,
+        model_dump=lambda: {"id": "auto-fallback-vision-deepseek"},
+    )
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.return_value = response
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+
+    async def select_deepseek(_prompt: str, **_kwargs: Any) -> str:
+        return "deepseek/deepseek-v4-flash"
+
+    router = RouterLLM(
+        api_key="test-key",
+        abilities=["chat", "tool_calling", "vision", "thinking_mode"],
+    )
+    monkeypatch.setattr(router, "_select_model", select_deepseek)
+    monkeypatch.setattr(router, "_profile_context_window", lambda _model_id: None)
+    monkeypatch.setattr(
+        RouterLLM,
+        "_profile_input_modalities",
+        staticmethod(lambda _model_id: ("image",)),
+    )
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "what is in this image?"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,x"}},
+            ],
+        }
+    ]
+
+    prepared = await router.prepare_for_call(messages)
+    # xrouter's profile reports this model supports the image modality, so
+    # the resolved wrapper's own abilities pick up "vision" too (separate
+    # from the fallback-construction fix above, but both must hold for this
+    # combined scenario to actually reach vision_chat successfully).
+    assert prepared.has_ability("vision") is True
+
+    result = await prepared.vision_chat(
+        messages,
+        tools=[_tool_schema()],
+        thinking={"type": "enabled"},
+    )
+
+    assert result[PROVIDER_STATE_METADATA_KEY] == {
+        "deepseek": {"reasoning_content": "Looking at the picture first."}
+    }

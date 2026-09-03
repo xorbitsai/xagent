@@ -156,6 +156,21 @@ describe("ChatMessage Session file capability", () => {
     )
   })
 
+  it("passes the rendered interaction request id to the clarification form", () => {
+    render(
+      <ChatMessage
+        role="assistant"
+        content="Clarification required"
+        interactions={[{ type: "text_input", field: "city", label: "City" }]}
+        interactionRequestId="inputreq_q1"
+      />,
+    )
+
+    expect(clarificationFormMock).toHaveBeenCalledWith(
+      expect.objectContaining({ requestId: "inputreq_q1" }),
+    )
+  })
+
   it("renders Computer use context on a user message", () => {
     render(
       <ChatMessage

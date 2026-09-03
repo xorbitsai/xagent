@@ -34,7 +34,6 @@ from ..models.trigger import (
     TriggerType,
 )
 from ..models.user import User
-from ..models.user_oauth import UserOAuth
 from ..models.workforce import Workforce
 from .agent_team_scope import get_agent_team_scope, owned_agent_clause
 from .background_jobs import create_background_job, enqueue_background_job
@@ -61,6 +60,7 @@ from .trigger_providers.schemas import (
     normalize_weekdays,
     parse_trigger_config,
 )
+from .user_oauth import get_scoped_user_oauth_account, is_ordinary_gmail
 
 logger = logging.getLogger(__name__)
 
@@ -600,10 +600,15 @@ def _resolve_gmail_resource(
     """Validate the bound Gmail account and return the normalized mailbox."""
     if oauth_account_id is None:
         raise TriggerServiceError("gmail trigger requires oauth_account_id")
-    account = db.query(UserOAuth).filter(UserOAuth.id == int(oauth_account_id)).first()
-    if account is None or int(account.user_id) != int(user_id):
+    account = get_scoped_user_oauth_account(
+        db,
+        user_id=int(user_id),
+        account_id=int(oauth_account_id),
+        resource_owner_key=None,
+    )
+    if account is None:
         raise TriggerServiceError("Gmail account not found")
-    if str(account.provider) != "gmail":
+    if not is_ordinary_gmail(account):
         raise TriggerServiceError("Selected account is not a Gmail account")
     email = str(account.email or "").strip().lower()
     if not email:
@@ -781,21 +786,19 @@ def _unregister_trigger_binding(
     *,
     trigger_type: str,
     config: dict[str, Any],
+    resource_id: str | None,
 ) -> None:
-    """Tear down the delivery binding described by a trigger's previous config.
-
-    The trigger row may already hold a different binding or be deleted, so
-    the previous config is passed explicitly; providers resolve the binding
-    from it alone and no-op when other triggers still reference it.
-    """
+    """Tear down a trigger's previous delivery-binding snapshot."""
     provider = maybe_get_trigger_provider(trigger_type)
     if provider is None:
         return
-    _run_provider_coro(provider.unregister(db, trigger, config))
+    _run_provider_coro(
+        provider.unregister(db, trigger, config, resource_id=resource_id)
+    )
 
 
 def unregister_deleted_trigger_bindings(
-    teardowns: list[tuple[AgentTrigger, str, dict[str, Any]]],
+    teardowns: list[tuple[AgentTrigger, str, dict[str, Any], str | None]],
 ) -> None:
     """Best-effort provider teardown for trigger rows deleted outside the
     trigger CRUD path (workforce hard delete cascades them away).
@@ -814,8 +817,8 @@ def unregister_deleted_trigger_bindings(
     Mirrors ``_delete_trigger``'s tail otherwise: the rows are already gone
     and committed, so a teardown failure is logged rather than surfaced -- it
     must not turn an already-successful delete into an error. Each
-    ``(trigger, trigger_type, config)`` tuple must have been captured BEFORE
-    the delete committed, with ``trigger`` expunged from the capturing
+    ``(trigger, trigger_type, config, resource_id)`` tuple must be captured
+    BEFORE the delete commits, with ``trigger`` expunged from the capturing
     session so it stays a plain, already-hydrated object safe to read from
     any of these worker threads.
     """
@@ -826,12 +829,18 @@ def unregister_deleted_trigger_bindings(
 
     SessionLocal = get_session_local()
 
-    def _teardown_one(item: tuple[AgentTrigger, str, dict[str, Any]]) -> None:
-        trigger, trigger_type, config = item
+    def _teardown_one(
+        item: tuple[AgentTrigger, str, dict[str, Any], str | None],
+    ) -> None:
+        trigger, trigger_type, config, resource_id = item
         try:
             with SessionLocal() as db:
                 _unregister_trigger_binding(
-                    db, trigger, trigger_type=trigger_type, config=config
+                    db,
+                    trigger,
+                    trigger_type=trigger_type,
+                    config=config,
+                    resource_id=resource_id,
                 )
         except Exception:
             logger.exception(
@@ -1080,6 +1089,7 @@ def _apply_trigger_updates(
     old_type = str(trigger.type)
     old_enabled = bool(trigger.enabled)
     old_config = dict(trigger.config or {})
+    old_resource_id = str(trigger.resource_id) if trigger.resource_id else None
 
     plain_secret: str | None = None
     if "name" in updates and updates["name"] is not None:
@@ -1212,7 +1222,11 @@ def _apply_trigger_updates(
     if old_enabled and (not bool(trigger.enabled) or old_config != new_config):
         try:
             _unregister_trigger_binding(
-                db, trigger, trigger_type=old_type, config=old_config
+                db,
+                trigger,
+                trigger_type=old_type,
+                config=old_config,
+                resource_id=old_resource_id,
             )
         except Exception:
             # The new binding above is already committed. Letting a teardown
@@ -1302,11 +1316,16 @@ def _delete_trigger(db: Session, trigger: AgentTrigger) -> None:
     trigger_type = str(trigger.type)
     trigger_id = trigger.id
     binding_config = dict(trigger.config or {})
+    binding_resource_id = str(trigger.resource_id) if trigger.resource_id else None
     db.delete(trigger)
     db.commit()
     try:
         _unregister_trigger_binding(
-            db, trigger, trigger_type=trigger_type, config=binding_config
+            db,
+            trigger,
+            trigger_type=trigger_type,
+            config=binding_config,
+            resource_id=binding_resource_id,
         )
     except Exception:
         # The delete itself already succeeded and is committed above — a

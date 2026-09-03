@@ -231,7 +231,10 @@ async def test_resume_cache_miss_builds_under_resolver_namespace_not_snapshot(
     connection_manager = _connection_manager()
     background_manager = MagicMock()
     background_manager.running_tasks = {}
-    background_manager.reserve_resume.return_value = True
+    background_manager.resume_admission_state.return_value = None
+    background_manager.try_reserve_resume.return_value = (
+        websocket_api.ResumeReservationOutcome.RESERVED
+    )
     transition = AsyncMock(
         return_value=SimpleNamespace(run_id="run-1", status=TaskStatus.PAUSED)
     )
@@ -257,6 +260,14 @@ async def test_resume_cache_miss_builds_under_resolver_namespace_not_snapshot(
         )
         stack.enter_context(
             patch.object(websocket_api, "background_task_manager", background_manager)
+        )
+        # The handler asks the DB whether another process still holds a live
+        # lease before it schedules; these suites drive the handler without a
+        # task row, so answer "no foreign owner" explicitly.
+        stack.enter_context(
+            patch.object(
+                websocket_api, "task_has_live_foreign_runner", return_value=False
+            )
         )
         stack.enter_context(
             patch.object(

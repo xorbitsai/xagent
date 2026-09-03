@@ -7,6 +7,8 @@ type TestWebSocketMessage = {
   type: string
   timestamp: string
   data?: unknown
+  error_code?: unknown
+  message?: string
   task_id?: number
   step_id?: string
   task?: Record<string, unknown>
@@ -14,6 +16,7 @@ type TestWebSocketMessage = {
   run_id?: string | null
   state_version?: number
   control_state?: string
+  request_id?: string
 }
 
 const webSocketOptions = vi.hoisted(() => ({
@@ -28,6 +31,7 @@ const webSocketOptions = vi.hoisted(() => ({
       credentialOwner: { kind: "external" }
     } | null
     deliveryGeneration?: number
+    legacyErrorProse?: "trusted" | "untrusted"
     onConnectionClose?: (event: CloseEvent) => "handled" | "default"
     onConnectionFailure?: (failure: {
       recoverable: boolean
@@ -48,6 +52,7 @@ const webSocketOptions = vi.hoisted(() => ({
   },
   all: [] as Array<{
     onMessage?: (message: TestWebSocketMessage) => void
+    legacyErrorProse?: "trusted" | "untrusted"
     token?: string
   }>,
 }))
@@ -90,6 +95,7 @@ vi.mock("@/hooks/use-websocket", () => ({
       credentialOwner: { kind: "external" }
     } | null
     deliveryGeneration?: number
+    legacyErrorProse?: "trusted" | "untrusted"
     onConnectionClose?: (event: CloseEvent) => "handled" | "default"
     onConnectionFailure?: (failure: {
       recoverable: boolean
@@ -162,6 +168,7 @@ function StateProbe() {
               typeof message.content === "string" ? message.content : "react-node",
             isOptimistic: message.isOptimistic,
             isResult: message.isResult,
+            interactionRequestId: message.interactionRequestId,
           }))
         )}
       </div>
@@ -177,6 +184,8 @@ function StateProbe() {
         )}
       </div>
       <div data-testid="task-status">{state.currentTask?.status || ""}</div>
+      <div data-testid="waiting-request-id">{state.currentTask?.waitingRequestId || ""}</div>
+      <div data-testid="waiting-interactions">{JSON.stringify(state.currentTask?.waitingInteractions || [])}</div>
       <div data-testid="task-dag-terminated-at">{state.currentTask?.dagTerminatedAt ?? ""}</div>
       <div data-testid="task-title">{state.currentTask?.title || ""}</div>
       <div data-testid="task-id">{state.taskId ?? ""}</div>
@@ -1127,6 +1136,81 @@ describe("AppProvider websocket message routing", () => {
         isOptimistic: true,
       }),
     ])
+  })
+
+  it("rejects an unsuccessful 2xx pre-task upload instead of dropping files", async () => {
+    apiRequestMock.mockResolvedValue(new Response(JSON.stringify({
+      success: false,
+      error_code: "upload_too_large",
+      detail: "private storage detail",
+    }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }))
+
+    let send: (() => Promise<void>) | undefined
+    function CreateTaskWithFileProbe() {
+      const { sendMessage } = useApp()
+      send = () => sendMessage(
+        "analyze attachment",
+        { clientMessageId: "turn-upload-failure" },
+        [new File(["data"], "data.txt")],
+      )
+      return null
+    }
+
+    render(
+      <AppProvider token="token">
+        <CreateTaskWithFileProbe />
+      </AppProvider>
+    )
+
+    await expect(send?.()).rejects.toThrow("clientErrors.uploadTooLarge")
+    expect(apiRequestMock).toHaveBeenCalledOnce()
+    expect(sendChatMessageMock).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    {
+      name: "blank",
+      files: [{ file_id: "   " }, { file_id: "file-2" }],
+    },
+    {
+      name: "duplicate",
+      files: [{ file_id: "file-1" }, { file_id: " file-1 " }],
+    },
+  ])("rejects $name pre-task upload identifiers before task creation", async ({ files }) => {
+    apiRequestMock.mockResolvedValue(new Response(JSON.stringify({
+      success: true,
+      files,
+    }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }))
+
+    let send: (() => Promise<void>) | undefined
+    function CreateTaskWithMalformedFilesProbe() {
+      const { sendMessage } = useApp()
+      send = () => sendMessage(
+        "analyze attachments",
+        { clientMessageId: "turn-malformed-upload" },
+        [
+          new File(["first"], "first.txt"),
+          new File(["second"], "second.txt"),
+        ],
+      )
+      return null
+    }
+
+    render(
+      <AppProvider token="token">
+        <CreateTaskWithMalformedFilesProbe />
+      </AppProvider>
+    )
+
+    await expect(send?.()).rejects.toThrow("clientErrors.uploadFailed")
+    expect(apiRequestMock).toHaveBeenCalledOnce()
+    expect(sendChatMessageMock).not.toHaveBeenCalled()
   })
 
   it("sends selected task runtime extensions in the create request", async () => {
@@ -3010,7 +3094,8 @@ describe("AppProvider websocket message routing", () => {
         timestamp: "2026-05-27T05:00:05Z",
         data: {
           type: "agent_error",
-          message: "Runtime error",
+          error_code: "task_execution_failed",
+          message: "provider token=secret",
           task: {
             id: 1,
             status: "failed",
@@ -3023,9 +3108,170 @@ describe("AppProvider websocket message routing", () => {
       expect(screen.getByTestId("task-status").textContent).toBe("failed")
       expect(screen.getByTestId("processing").textContent).toBe("false")
       expect(screen.getByTestId("messages").textContent).toContain(
-        "Runtime error"
+        "clientErrors.taskExecutionFailed"
+      )
+      expect(screen.getByTestId("messages").textContent).not.toContain("token=secret")
+    })
+  })
+
+  it.each(
+    [
+      { name: "object", value: { code: "task_execution_failed" } },
+      { name: "number", value: 42 },
+      { name: "array", value: ["task_execution_failed"] },
+      { name: "boolean", value: true },
+      { name: "null", value: null },
+    ].flatMap(({ name, value }) => [
+      { location: "nested", name, value },
+      { location: "root", name, value },
+    ]),
+  )("fails closed for a $location $name WebSocket error code", async ({ location, value }) => {
+    render(
+      <AppProvider token="token">
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.(location === "nested"
+        ? {
+            type: "agent_error",
+            timestamp: "2026-05-27T05:00:05Z",
+            data: {
+              type: "agent_error",
+              error_code: value,
+              message: "provider token=secret",
+            },
+          }
+        : {
+            type: "agent_error",
+            timestamp: "2026-05-27T05:00:05Z",
+            error_code: value,
+            message: "provider token=secret",
+          })
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain("Unknown error")
+    })
+    expect(screen.getByTestId("messages").textContent).not.toContain("token=secret")
+  })
+
+  it.each(
+    (["error", "agent_error", "task_error"] as const).flatMap((eventType) => [
+      { eventType, location: "nested" as const },
+      { eventType, location: "root" as const },
+    ]),
+  )("hides absent-code $eventType prose at the untrusted $location boundary", async ({ eventType, location }) => {
+    render(
+      <AppProvider
+        token="public-token"
+        transport={{ legacyErrorProse: "untrusted" }}
+      >
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+    expect(webSocketOptions.current?.legacyErrorProse).toBe("untrusted")
+    const secret = "provider=openai path=/srv/private token=secret"
+
+    act(() => {
+      onMessage?.(location === "nested"
+        ? {
+            type: eventType,
+            timestamp: "2026-05-27T05:00:05Z",
+            data: { type: eventType, message: secret },
+          }
+        : {
+            type: eventType,
+            timestamp: "2026-05-27T05:00:05Z",
+            message: secret,
+          } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain("Unknown error")
+    })
+    expect(screen.getByTestId("messages").textContent).not.toContain(secret)
+  })
+
+  it("preserves absent-code legacy prose for the authenticated default transport", async () => {
+    render(
+      <AppProvider token="authenticated-token">
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+    expect(webSocketOptions.current?.legacyErrorProse).toBe("trusted")
+
+    act(() => {
+      onMessage?.({
+        type: "agent_error",
+        timestamp: "2026-05-27T05:00:05Z",
+        data: {
+          type: "agent_error",
+          message: "Legacy actionable authenticated error",
+        },
+      })
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "Legacy actionable authenticated error",
       )
     })
+  })
+
+  it.each(
+    (["error", "agent_error", "task_error"] as const).flatMap((eventType) => [
+      { eventType, location: "nested" as const },
+      { eventType, location: "root" as const },
+    ]),
+  )("localizes recognized $location codes for untrusted $eventType events", async ({ eventType, location }) => {
+    render(
+      <AppProvider
+        token="public-token"
+        transport={{ legacyErrorProse: "untrusted" }}
+      >
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.(location === "nested"
+        ? {
+            type: eventType,
+            timestamp: "2026-05-27T05:00:05Z",
+            data: {
+              type: eventType,
+              error_code: "task_execution_failed",
+              message: "provider token=secret",
+            },
+          }
+        : {
+            type: eventType,
+            timestamp: "2026-05-27T05:00:05Z",
+            error_code: "task_execution_failed",
+            message: "provider token=secret",
+          } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "clientErrors.taskExecutionFailed",
+      )
+    })
+    expect(screen.getByTestId("messages").textContent).not.toContain("token=secret")
   })
 
   it("stops processing when a task waits for user input", async () => {
@@ -3048,11 +3294,10 @@ describe("AppProvider websocket message routing", () => {
       onMessage?.({
         type: "task_waiting_for_user",
         timestamp: "2026-05-27T05:00:06Z",
-        data: {
-          question: "Which file should I use?",
-          interactions: [],
-        },
-      })
+        question: "Which file should I use?",
+        interactions: [],
+        request_id: "inputreq_0011223344556677889900aabbccddee",
+      } as TestWebSocketMessage)
     })
 
     await waitFor(() => {
@@ -3063,6 +3308,261 @@ describe("AppProvider websocket message routing", () => {
       expect(screen.getByTestId("messages").textContent).toContain(
         "Which file should I use?"
       )
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "inputreq_0011223344556677889900aabbccddee"
+      )
+      expect(screen.getByTestId("waiting-request-id").textContent).toBe(
+        "inputreq_0011223344556677889900aabbccddee"
+      )
+    })
+  })
+
+  it("keeps the request identity when paired waiting producers publish the same prompt", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("running")
+    })
+
+    act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:05Z",
+        task_id: 1,
+        data: {
+          event_id: "agent-r1",
+          event_type: "agent_message",
+          data: {
+            message: "Which file should I use?",
+            content: "Which file should I use?",
+            role: "assistant",
+            expect_response: true,
+            request_id: "inputreq_r1",
+          },
+        },
+      })
+      webSocketOptions.current?.onMessage?.({
+        type: "task_waiting_for_user",
+        timestamp: "2026-05-27T05:00:06Z",
+        task_id: 1,
+        question: "Which file should I use?",
+        interactions: [],
+        request_id: "inputreq_r1",
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      const rendered = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]",
+      ) as Array<{
+        role: string
+        content: string
+        interactionRequestId?: string
+      }>
+      const matchingAssistantMessages = rendered.filter(
+        (message) =>
+          message.role === "assistant" &&
+          message.content === "Which file should I use?",
+      )
+      expect(matchingAssistantMessages).toEqual([expect.objectContaining({
+        interactionRequestId: "inputreq_r1",
+      })])
+    })
+  })
+
+  const renderRunningTaskProbe = async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+    await waitFor(() => expect(screen.getByTestId("task-status").textContent).toBe("running"))
+  }
+
+  const publishTraceEvent = (
+    event_type: string,
+    data: Record<string, unknown>,
+    timestamp = "2026-05-27T05:00:05Z",
+  ) => webSocketOptions.current?.onMessage?.({
+    type: "trace_event",
+    timestamp,
+    task_id: 1,
+    data: { event_type, data },
+  })
+
+  const publishWaitingOccurrence = (
+    prompt: string,
+    requestId?: string,
+    timestamp = "2026-05-27T05:00:05Z",
+  ) => {
+    publishTraceEvent("agent_message", {
+      message: prompt, role: "assistant", expect_response: true, request_id: requestId,
+    }, timestamp)
+    webSocketOptions.current?.onMessage?.({
+      type: "task_waiting_for_user",
+      timestamp,
+      task_id: 1,
+      question: prompt,
+      interactions: [],
+      request_id: requestId,
+    } as TestWebSocketMessage)
+  }
+
+  const assistantMessagesFor = (prompt: string) => (
+    JSON.parse(screen.getByTestId("messages").textContent || "[]") as Array<{
+      role: string
+      content: string
+      interactionRequestId?: string
+    }>
+  ).filter((message) => message.role === "assistant" && message.content === prompt)
+
+  it("keeps identical prompts from different waiting occurrences separate", async () => {
+    await renderRunningTaskProbe()
+    act(() => {
+      publishWaitingOccurrence("Which file should I use?", "inputreq_r1")
+      publishWaitingOccurrence("Which file should I use?", "inputreq_r2", "2026-05-27T05:00:07Z")
+    })
+
+    await waitFor(() => {
+      expect(assistantMessagesFor("Which file should I use?")).toEqual([
+        expect.objectContaining({ interactionRequestId: "inputreq_r1" }),
+        expect.objectContaining({ interactionRequestId: "inputreq_r2" }),
+      ])
+      expect(screen.getByTestId("waiting-request-id").textContent).toBe(
+        "inputreq_r2",
+      )
+    })
+  })
+
+  it("keeps ai_message dedupe independent of request identity", async () => {
+    await renderRunningTaskProbe()
+    act(() => {
+      for (const request_id of ["inputreq_r1", "inputreq_r2"]) {
+        publishTraceEvent("ai_message", {
+          message: "Same final answer", role: "assistant", request_id,
+        })
+      }
+    })
+    expect(assistantMessagesFor("Same final answer")).toHaveLength(1)
+  })
+
+  it("keeps delimiter-like legacy content distinct from an identified occurrence", async () => {
+    await renderRunningTaskProbe()
+    act(() => {
+      publishTraceEvent("agent_message", {
+        message: "Choose file:occurrence:inputreq_r2", role: "assistant",
+      })
+      publishWaitingOccurrence("Choose file", "inputreq_r2")
+    })
+    expect(assistantMessagesFor("Choose file:occurrence:inputreq_r2")).toHaveLength(1)
+    expect(assistantMessagesFor("Choose file")).toEqual([
+      expect.objectContaining({ interactionRequestId: "inputreq_r2" }),
+    ])
+  })
+
+  it("continues to content-dedupe id-less legacy waiting siblings", async () => {
+    await renderRunningTaskProbe()
+    act(() => publishWaitingOccurrence("Which legacy file should I use?"))
+    await waitFor(() => expect(
+      assistantMessagesFor("Which legacy file should I use?"),
+    ).toHaveLength(1))
+  })
+
+  it("lets the latest identified occurrence suppress an id-less legacy sibling for 30 seconds", async () => {
+    await renderRunningTaskProbe()
+    const prompt = "Which compatibility file should I use?"
+    vi.useFakeTimers()
+    try {
+      act(() => {
+        publishWaitingOccurrence(prompt, "inputreq_r1")
+        vi.advanceTimersByTime(20_000)
+        publishWaitingOccurrence(prompt, "inputreq_r2")
+        vi.advanceTimersByTime(11_000)
+        publishTraceEvent("react_task_end", {
+          result: { status: "waiting_for_user", message: prompt },
+        })
+      })
+
+      expect(assistantMessagesFor(prompt)).toEqual([
+        expect.objectContaining({ interactionRequestId: "inputreq_r1" }),
+        expect.objectContaining({ interactionRequestId: "inputreq_r2" }),
+      ])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("keeps a projected waiting occurrence together over stale nested legacy fields", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    await waitFor(() => expect(screen.getByTestId("task-status").textContent).toBe("running"))
+
+    act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type: "task_waiting_for_user",
+        timestamp: "2026-05-27T05:00:06Z",
+        question: "Which projected hotel should I use?",
+        interactions: [{ type: "text_input", field: "hotel", label: "Hotel" }],
+        request_id: "inputreq_0011223344556677889900aabbccddee",
+        data: {
+          question: "Which stale city should I use?",
+          interactions: [{ type: "text_input", field: "city", label: "City" }],
+        },
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain("Which projected hotel should I use?")
+      expect(screen.getByTestId("messages").textContent).not.toContain("Which stale city should I use?")
+      expect(screen.getByTestId("waiting-interactions").textContent).toContain("hotel")
+      expect(screen.getByTestId("waiting-interactions").textContent).not.toContain("city")
+      expect(screen.getByTestId("waiting-request-id").textContent).toBe(
+        "inputreq_0011223344556677889900aabbccddee"
+      )
+    })
+  })
+
+  it("replaces structured interactions when a concurrent wait becomes text-only", async () => {
+    await renderRunningTaskProbe()
+
+    act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type: "task_waiting_for_user",
+        timestamp: "2026-05-27T05:00:06Z",
+        task_id: 1,
+        question: "Which city should I use?",
+        interactions: [{ type: "text_input", field: "city", label: "City" }],
+        request_id: "inputreq_r1",
+      } as TestWebSocketMessage)
+      webSocketOptions.current?.onMessage?.({
+        type: "task_waiting_for_user",
+        timestamp: "2026-05-27T05:00:07Z",
+        task_id: 1,
+        question: "Anything else I should know?",
+        interactions: [],
+        request_id: "inputreq_r2",
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("waiting-request-id").textContent).toBe(
+        "inputreq_r2"
+      )
+      expect(screen.getByTestId("waiting-interactions").textContent).toBe("[]")
+      expect(assistantMessagesFor("Anything else I should know?")).toEqual([
+        expect.objectContaining({ interactionRequestId: "inputreq_r2" }),
+      ])
     })
   })
 
@@ -3109,7 +3609,8 @@ describe("AppProvider websocket message routing", () => {
       "First Session turn",
       undefined,
       undefined,
-      "session-turn-1"
+      "session-turn-1",
+      undefined,
     )
     expect(screen.getByTestId("messages").textContent).not.toContain(
       "First Session turn"
@@ -3127,6 +3628,36 @@ describe("AppProvider websocket message routing", () => {
       "First Session turn"
     )
     expect(apiRequestMock).not.toHaveBeenCalled()
+  })
+
+  it("forwards the rendered interaction request id to the Session socket", async () => {
+    const transport = makeSessionTransport()
+    render(
+      <AppProvider token="token" transport={transport}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+    act(() => webSocketOptions.current?.onConnect?.())
+    act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(42)))
+    await waitFor(() => expect(screen.getByTestId("task-id").textContent).toBe("42"))
+
+    await act(async () => {
+      await getSessionControls().sendMessage("City: Sydney", {
+        clientMessageId: "answer-q1",
+        metadata: {
+          request_id: "inputreq_0011223344556677889900aabbccddee",
+        },
+      })
+    })
+
+    expect(sendChatMessageMock).toHaveBeenLastCalledWith(
+      "City: Sydney",
+      undefined,
+      undefined,
+      "answer-q1",
+      "inputreq_0011223344556677889900aabbccddee",
+    )
   })
 
   it("forwards taskless Session files so unsupported delivery rejects instead of sending text alone", async () => {
@@ -3173,6 +3704,7 @@ describe("AppProvider websocket message routing", () => {
       [file],
       undefined,
       "session-file-turn",
+      undefined,
     )
     expect(apiRequestMock).not.toHaveBeenCalled()
     expect(transport.uploadFiles).not.toHaveBeenCalled()
@@ -3513,7 +4045,8 @@ describe("AppProvider websocket message routing", () => {
       "Start replacement conversation",
       undefined,
       undefined,
-      "session-turn-after-reset"
+      "session-turn-after-reset",
+      undefined,
     )
 
     act(() => {
@@ -4187,6 +4720,59 @@ describe("AppProvider websocket message routing", () => {
     })
   })
 
+  it("replaces a cached waiting identity with the request replayed after reconnect", async () => {
+    const { rerender } = render(
+      <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection("waiting-old"))}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+    act(() => {
+      webSocketOptions.current?.onMessage?.(taskInfoMessage(103))
+      webSocketOptions.current?.onMessage?.({
+        type: "task_waiting_for_user",
+        timestamp: "2026-05-27T05:00:05Z",
+        task_id: 103,
+        question: "Which city?",
+        interactions: [],
+        request_id: "inputreq_0011223344556677889900aabbccddee",
+      } as TestWebSocketMessage)
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("waiting-request-id").textContent).toBe(
+        "inputreq_0011223344556677889900aabbccddee"
+      )
+    })
+
+    rerender(
+      <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection("waiting-new"))}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+    act(() => {
+      webSocketOptions.current?.onMessage?.(taskInfoMessage(103))
+      webSocketOptions.current?.onMessage?.({
+        type: "task_waiting_for_user",
+        timestamp: "2026-05-27T05:00:06Z",
+        task_id: 103,
+        question: "Which hotel?",
+        interactions: [],
+        request_id: "inputreq_ffeeddccbbaa00998877665544332211",
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("session-conversation-state").textContent).toBe("bound")
+      expect(screen.getByTestId("waiting-request-id").textContent).toBe(
+        "inputreq_ffeeddccbbaa00998877665544332211"
+      )
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "inputreq_ffeeddccbbaa00998877665544332211"
+      )
+    })
+  })
+
   it("requires reload when the current replacement connection publishes a different task", async () => {
     const { rerender } = render(
       <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection("different-task-old"))}>
@@ -4207,6 +4793,129 @@ describe("AppProvider websocket message routing", () => {
     await waitFor(() => {
       expect(screen.getByTestId("session-conversation-state").textContent).toBe("reload_required")
     })
+  })
+
+  it("requires reload before replacing a rebound Session task the server cannot replay", async () => {
+    const { rerender } = render(
+      <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection("unreplayable-old"))}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+    act(() => {
+      webSocketOptions.current?.onMessage?.(taskInfoMessage(102))
+      webSocketOptions.current?.onMessage?.(assistantMessage("Preserved transcript", 102))
+    })
+
+    rerender(
+      <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection("unreplayable-new"))}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+    act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type: "conversation_reload_required",
+        timestamp: "2026-05-27T05:00:03Z",
+        task_id: 102,
+        data: {},
+      })
+    })
+
+    expect(screen.getByTestId("session-conversation-state").textContent).toBe("reload_required")
+    expect(screen.getByTestId("task-id").textContent).toBe("102")
+    expect(screen.getByTestId("messages").textContent).toContain("Preserved transcript")
+    await expect(getSessionControls().sendMessage("Replacement")).rejects.toThrow(/reload required/i)
+    await expect(getSessionControls().startNewConversation()).rejects.toThrow(/reload required/i)
+    expect(sendChatMessageMock).not.toHaveBeenCalled()
+    expect(sendRawMessageMock).not.toHaveBeenCalled()
+  })
+
+  it("requires reload when a stale sibling reset is fenced before acknowledgement", async () => {
+    render(
+      <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection("stale-reset"))}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+    act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(102)))
+
+    let reset!: Promise<void>
+    act(() => {
+      reset = getSessionControls().startNewConversation()
+    })
+    act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type: "conversation_reload_required",
+        timestamp: "2026-05-27T05:00:03Z",
+        task_id: 102,
+        data: {},
+      })
+    })
+
+    await expect(reset).rejects.toThrow(/reload required/i)
+    expect(screen.getByTestId("session-conversation-state").textContent).toBe("reload_required")
+    expect(screen.getByTestId("task-id").textContent).toBe("102")
+    await expect(getSessionControls().sendMessage("Must not send")).rejects.toThrow(/reload required/i)
+    await expect(getSessionControls().startNewConversation()).rejects.toThrow(/reload required/i)
+  })
+
+  it("ignores a stale, invalid, or mismatched server reload requirement", () => {
+    const { rerender } = render(
+      <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection("unreplayable-old"))}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+    act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(102)))
+    const staleOnMessage = webSocketOptions.current?.onMessage
+
+    rerender(
+      <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection("unreplayable-current"))}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    act(() => staleOnMessage?.({
+      type: "conversation_reload_required",
+      timestamp: "2026-05-27T05:00:03Z",
+      task_id: 102,
+      data: {},
+    }))
+
+    for (const taskId of [undefined, true, 0, 103]) {
+      act(() => {
+        webSocketOptions.current?.onMessage?.({
+          type: "conversation_reload_required",
+          timestamp: "2026-05-27T05:00:03Z",
+          ...(taskId === undefined ? {} : { task_id: taskId as unknown as number }),
+          data: {},
+        })
+      })
+    }
+
+    expect(screen.getByTestId("session-conversation-state").textContent).toBe("bound")
+    expect(screen.getByTestId("task-id").textContent).toBe("102")
+  })
+
+  it("ignores a server reload requirement before the Session adopts a task", () => {
+    render(
+      <AppProvider token="token" transport={makeSessionTransport()}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    act(() => webSocketOptions.current?.onMessage?.({
+      type: "conversation_reload_required",
+      timestamp: "2026-05-27T05:00:03Z",
+      task_id: 102,
+      data: {},
+    }))
+
+    expect(screen.getByTestId("session-conversation-state").textContent).toBe("unbound")
+    expect(screen.getByTestId("task-id").textContent).toBe("")
   })
 
   it("rejects an outstanding reset when AppProvider unmounts", async () => {

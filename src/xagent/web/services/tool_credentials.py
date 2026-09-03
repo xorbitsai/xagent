@@ -66,6 +66,51 @@ def has_user_tool_policy_hooks() -> bool:
     )
 
 
+def has_user_tool_overrides_hook() -> bool:
+    """Return whether an application registered the overrides hook specifically.
+
+    A caller deciding that an overrides read was *unresolvable* needs this
+    rather than :func:`has_user_tool_policy_hooks`: with no overrides hook
+    registered, ``get_user_tool_overrides`` returns ``{}`` without consulting
+    ``user`` at all, so a missing runtime user resolves that input rather than
+    leaving it unresolved.
+    """
+    return _get_user_tool_overrides_hook is not None
+
+
+# The allowlist value that means "policy could not be resolved". A registering
+# application enforces authorization through the hooks above, so a failed or
+# missing runtime ``User`` reload must not be reported as "no policy
+# configured": that would build the globally available tool set and run the
+# turn unrestricted. Resolving to an empty allowlist reuses the hook's existing
+# "an empty list means no tools allowed" contract, so every consumer that
+# already honours a concrete allowlist fails closed with no new branch.
+#
+# Only meaningful while ``has_user_tool_policy_hooks()`` is true. With no hook
+# registered there is no policy to lose, and standalone xagent keeps its
+# unrestricted default.
+#
+# A tuple so the constant itself cannot be mutated in place: this is the value
+# that denies every tool, and a caller that appended to it would silently widen
+# what an unresolved policy grants.
+TOOL_POLICY_UNAVAILABLE_ALLOWLIST: tuple[str, ...] = ()
+
+
+def unresolved_tool_policy_allowlist() -> list[str] | None:
+    """Return the fail-closed allowlist for an unresolvable policy read.
+
+    ``None`` (no filtering) when no application hook is registered, so the
+    fail-closed behaviour is scoped to deployments that actually delegate
+    authorization to the hooks.
+
+    Returns a fresh ``list`` because the allowlist contract consumers implement
+    is ``Optional[list]``; the immutable constant above is the source value.
+    """
+    if not has_user_tool_policy_hooks():
+        return None
+    return list(TOOL_POLICY_UNAVAILABLE_ALLOWLIST)
+
+
 TOOL_CREDENTIAL_SPECS: dict[str, dict[str, ToolFieldSpec]] = {
     "exa_web_search": {
         "api_key": {

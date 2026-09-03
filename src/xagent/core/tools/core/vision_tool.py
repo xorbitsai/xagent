@@ -14,7 +14,7 @@ import shutil
 import subprocess
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, NamedTuple, Optional, Union
 from urllib.parse import unquote_to_bytes, urlsplit
 
 import httpx
@@ -36,6 +36,146 @@ logger = logging.getLogger(__name__)
 
 _MAX_INLINE_VIDEO_BYTES = 64 * 1024 * 1024
 _MAX_INLINE_SVG_SOURCE_CHARS = 32_000
+
+_VISION_RAW_DISPLAY_TRUNCATION_LIMIT = 4000
+
+
+def _truncate_vision_raw_display(
+    value: str, limit: int = _VISION_RAW_DISPLAY_TRUNCATION_LIMIT
+) -> str:
+    """Bound a diagnostic string so a provider payload cannot balloon a tool result.
+
+    ``limit`` is a prefix limit, not a total-length limit. An oversized value
+    keeps its first ``limit`` characters and then carries the marker
+    ``...<truncated N chars>``, so the returned string is
+    ``limit + 21 + len(str(N))`` characters long -- 4025 for a 9000-character
+    value at the default limit of 4000. A caller that needs a hard total
+    budget has to add that marker allowance itself.
+
+    Mirrors the truncation shape already used for chat error bodies
+    (``openai.py``'s ``_truncate_error_detail``) so vision diagnostics look
+    the same as the rest of the model layer's truncated output. This bounds
+    length only; it performs no key-level redaction of provider-internal
+    fields (e.g. ``system_fingerprint``) that may happen to fall within the
+    limit.
+    """
+    if len(value) <= limit:
+        return value
+    return f"{value[:limit]}...<truncated {len(value) - limit} chars>"
+
+
+class _NormalizedVisionResponse(NamedTuple):
+    """One of four shapes a ``chat``/``vision_chat`` return value reduces to.
+
+    ``kind`` is one of ``"text"``, ``"empty"``, ``"tool_call"``, ``"unknown"``.
+    ``text`` is a ``str`` when ``kind`` is ``"text"`` or ``"empty"``, and
+    ``None`` for ``"tool_call"``/``"unknown"``. ``tool_calls`` is populated
+    only for ``"tool_call"`` and is otherwise an empty list. ``raw_display``
+    is a length-bounded string meant for logging and diagnostic fields: an
+    oversized value keeps a fixed-length prefix and carries a truncation
+    marker past it, so it is bounded rather than capped at an exact total.
+    It must never be surfaced as a user-visible answer.
+    """
+
+    kind: str
+    text: Optional[str]
+    tool_calls: List[Any]
+    raw_display: str
+
+
+def _normalize_vision_response(result: Any) -> _NormalizedVisionResponse:
+    """Reduce a ``vision_chat`` return value to a text/empty/tool_call/unknown shape.
+
+    ``vision_chat`` is typed ``str | dict[str, Any]``: OpenAI-family
+    providers wrap a reply in an envelope (``{"type": "text", "content":
+    ..., "raw": ...}`` or a tool-call envelope), while other providers
+    return a bare string. This function is a pure classifier: it does not
+    raise for the shapes providers actually return -- bare strings, ``None``,
+    and dicts of plain JSON data -- and it never decides whether a shape
+    counts as a failure; callers own that decision because only they know
+    what they need from the response. Diagnostic rendering for any other
+    input goes through ``str(result)``, so an object with a raising
+    ``__str__`` (or a raising ``__repr__`` on a value nested inside a dict)
+    propagates that exception to the caller's own exception handling.
+    An exception raised by ``vision_chat`` itself never reaches this
+    function; it is handled by the caller's own exception handling
+    before a return value exists to classify.
+    """
+    if isinstance(result, str):
+        if not result.strip():
+            return _NormalizedVisionResponse(
+                kind="empty",
+                text=result,
+                tool_calls=[],
+                raw_display=_truncate_vision_raw_display(result),
+            )
+        return _NormalizedVisionResponse(
+            kind="text",
+            text=result,
+            tool_calls=[],
+            raw_display=_truncate_vision_raw_display(result),
+        )
+
+    if result is None:
+        return _NormalizedVisionResponse(
+            kind="unknown", text=None, tool_calls=[], raw_display="None"
+        )
+
+    if isinstance(result, dict):
+        response_type = result.get("type")
+
+        if response_type == "text":
+            content = result.get("content")
+            if isinstance(content, str):
+                if not content.strip():
+                    # xinference's text exit gates on bare truthiness, so
+                    # whitespace-only content is not rejected there; openai
+                    # rejects it via .strip().
+                    return _NormalizedVisionResponse(
+                        kind="empty",
+                        text=content,
+                        tool_calls=[],
+                        raw_display=_truncate_vision_raw_display(content),
+                    )
+                return _NormalizedVisionResponse(
+                    kind="text",
+                    text=content,
+                    tool_calls=[],
+                    raw_display=_truncate_vision_raw_display(content),
+                )
+            # A "text" envelope whose content is not a string carries no
+            # usable text payload, so it is classified as unknown rather
+            # than text.
+            return _NormalizedVisionResponse(
+                kind="unknown",
+                text=None,
+                tool_calls=[],
+                raw_display=_truncate_vision_raw_display(str(result)),
+            )
+
+        if response_type == "tool_call":
+            return _NormalizedVisionResponse(
+                kind="tool_call",
+                text=None,
+                tool_calls=result.get("tool_calls", []),
+                raw_display=_truncate_vision_raw_display(str(result)),
+            )
+
+        # Unrecognized envelope shape: unknown or missing "type" key.
+        return _NormalizedVisionResponse(
+            kind="unknown",
+            text=None,
+            tool_calls=[],
+            raw_display=_truncate_vision_raw_display(str(result)),
+        )
+
+    # Any other type (int, list, custom object, ...).
+    return _NormalizedVisionResponse(
+        kind="unknown",
+        text=None,
+        tool_calls=[],
+        raw_display=_truncate_vision_raw_display(str(result)),
+    )
 
 
 class UnderstandMediaResult(BaseModel):
@@ -751,12 +891,33 @@ class VisionCore:
             )
 
             # Process the result
-            if isinstance(result, str):
-                answer = result
-            elif isinstance(result, dict) and result.get("type") == "tool_call":
-                answer = f"Model triggered tool call instead of answering: {result.get('tool_calls', [])}"
+            normalized = _normalize_vision_response(result)
+
+            if normalized.kind == "unknown":
+                logger.warning(
+                    "Media understanding received an unsupported response shape"
+                )
+                return UnderstandMediaResult(
+                    success=False,
+                    error="Vision model returned an unsupported response shape",
+                    warnings=warnings,
+                )
+
+            if normalized.kind == "empty":
+                logger.warning("Media understanding received an empty response")
+                return UnderstandMediaResult(
+                    success=False,
+                    error="Vision model returned an empty response",
+                    warnings=warnings,
+                )
+
+            if normalized.kind == "tool_call":
+                answer = (
+                    "Model triggered tool call instead of answering: "
+                    f"{normalized.tool_calls}"
+                )
             else:
-                answer = str(result)
+                answer = normalized.text
 
             return UnderstandMediaResult(
                 success=True,
@@ -956,83 +1117,114 @@ class VisionCore:
             )
 
             # Parse the result
+            normalized = _normalize_vision_response(raw_result)
+
+            if normalized.kind == "tool_call":
+                logger.warning(
+                    "Object detection received a tool-call response instead of a"
+                    " detection payload"
+                )
+                return DetectObjectsResult(
+                    success=False,
+                    error=(
+                        "Vision model returned a tool call instead of a"
+                        " detection payload"
+                    ),
+                    parsing_method="tool_call_response",
+                    raw_response=normalized.raw_display,
+                    confidence_threshold=confidence_threshold,
+                    prompt_sent=prompt,
+                )
+
+            if normalized.kind == "unknown":
+                logger.warning(
+                    "Object detection received an unsupported response shape"
+                )
+                return DetectObjectsResult(
+                    success=False,
+                    error="Vision model returned an unsupported response shape",
+                    parsing_method="unknown_type",
+                    raw_response=normalized.raw_display,
+                    confidence_threshold=confidence_threshold,
+                    prompt_sent=prompt,
+                )
+
+            if normalized.kind == "empty":
+                logger.warning("Object detection received an empty response")
+                return DetectObjectsResult(
+                    success=False,
+                    error="Vision model returned an empty response",
+                    parsing_method="empty_response",
+                    raw_response=normalized.raw_display,
+                    confidence_threshold=confidence_threshold,
+                    prompt_sent=prompt,
+                )
+
+            # Every non-text kind has returned above, so normalized.kind is
+            # "text" here and normalized.text is a non-blank str.
+            assert normalized.text is not None
+            raw_response = normalized.text
             detections = []
             parsing_method = "unknown"
             parsing_error = None
 
-            if isinstance(raw_result, str):
-                raw_response = raw_result
+            try:
+                detections = self._extract_detections_from_text(raw_response)
+                if detections:
+                    parsing_method = "regex"
+                else:
+                    try:
+                        import json
 
-                try:
-                    detections = self._extract_detections_from_text(raw_response)
-                    if detections:
-                        parsing_method = "regex"
-                    else:
-                        try:
-                            import json
+                        parsed_result = json.loads(raw_response)
+                        detections = parsed_result.get("detections", [])
+                        parsing_method = "json"
 
-                            parsed_result = json.loads(raw_result)
-                            detections = parsed_result.get("detections", [])
-                            parsing_method = "json"
+                        validated_detections = []
+                        for detection in detections:
+                            if isinstance(detection, dict):
+                                obj_class = detection.get("class", "unknown")
+                                bbox = detection.get("bbox", [0, 0, 1, 1])
+                                confidence = float(detection.get("confidence", 0.5))
 
-                            validated_detections = []
-                            for detection in detections:
-                                if isinstance(detection, dict):
-                                    obj_class = detection.get("class", "unknown")
-                                    bbox = detection.get("bbox", [0, 0, 1, 1])
-                                    confidence = float(detection.get("confidence", 0.5))
-
-                                    if (
-                                        isinstance(bbox, list)
-                                        and len(bbox) == 4
-                                        and all(
-                                            isinstance(coord, (int, float))
-                                            for coord in bbox
-                                        )
-                                        and 0 <= bbox[0] <= 1
-                                        and 0 <= bbox[1] <= 1
-                                        and 0 <= bbox[2] <= 1
-                                        and 0 <= bbox[3] <= 1
-                                        and bbox[0] < bbox[2]
-                                        and bbox[1] < bbox[3]
-                                    ):
-                                        validated_detections.append(
-                                            {
-                                                "class": obj_class,
-                                                "bbox": bbox,
-                                                "confidence": min(
-                                                    max(confidence, 0.0), 1.0
-                                                ),
-                                            }
-                                        )
-
-                            detections = validated_detections
-
-                        except json.JSONDecodeError as e:
-                            parsing_error = f"JSON parsing failed: {str(e)}"
-                            if not detections:
-                                detections = (
-                                    self._extract_detections_from_text_fallback(
-                                        raw_response
+                                if (
+                                    isinstance(bbox, list)
+                                    and len(bbox) == 4
+                                    and all(
+                                        isinstance(coord, (int, float))
+                                        for coord in bbox
                                     )
-                                )
-                                parsing_method = "regex_fallback"
+                                    and 0 <= bbox[0] <= 1
+                                    and 0 <= bbox[1] <= 1
+                                    and 0 <= bbox[2] <= 1
+                                    and 0 <= bbox[3] <= 1
+                                    and bbox[0] < bbox[2]
+                                    and bbox[1] < bbox[3]
+                                ):
+                                    validated_detections.append(
+                                        {
+                                            "class": obj_class,
+                                            "bbox": bbox,
+                                            "confidence": min(
+                                                max(confidence, 0.0), 1.0
+                                            ),
+                                        }
+                                    )
 
-                except Exception as e:
-                    parsing_error = f"General parsing error: {str(e)}"
-                    detections = self._extract_detections_from_text_fallback(
-                        raw_response
-                    )
-                    parsing_method = "simple_text"
+                        detections = validated_detections
 
-            elif isinstance(raw_result, dict):
-                raw_response = str(raw_result)
-                parsing_method = "dict_response"
-                detections = []
-            else:
-                raw_response = str(raw_result)
-                parsing_method = "unknown_type"
-                detections = []
+                    except json.JSONDecodeError as e:
+                        parsing_error = f"JSON parsing failed: {str(e)}"
+                        if not detections:
+                            detections = self._extract_detections_from_text_fallback(
+                                raw_response
+                            )
+                            parsing_method = "regex_fallback"
+
+            except Exception as e:
+                parsing_error = f"General parsing error: {str(e)}"
+                detections = self._extract_detections_from_text_fallback(raw_response)
+                parsing_method = "simple_text"
 
             # Base result
             result_data = {
@@ -1043,7 +1235,7 @@ class VisionCore:
                 "confidence_threshold": confidence_threshold,
                 "prompt_sent": prompt,
                 "box_color": box_color if mark_objects else None,
-                "raw_response": raw_response,
+                "raw_response": normalized.raw_display,
                 "parsing_method": parsing_method,
             }
 

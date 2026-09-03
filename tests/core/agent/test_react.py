@@ -5,6 +5,7 @@ import inspect
 import json
 import logging
 import re
+import unicodedata
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
@@ -22,7 +23,13 @@ from xagent.core.agent import (
     ToolCallRecord,
 )
 from xagent.core.agent.context.execution import CLOCK_TIMEZONE_METADATA_KEY
+from xagent.core.agent.pattern.final_answer_stream import ReActFinalAnswerStreamer
+from xagent.core.agent.pattern.react.react import (
+    _INTERACTION_TRIM_CHARS,
+    _normalize_ask_user_interactions,
+)
 from xagent.core.agent.result import tool_result_succeeded
+from xagent.core.agent.runtime import NO_DELIVERABLE_FINAL_ANSWER_REASON
 from xagent.core.file_ref import WORKSPACE_OUTPUT_FILES_TOOL_NAME
 from xagent.core.model.chat.basic.router import RouterLLM
 from xagent.core.model.chat.exceptions import LLMToolProtocolError
@@ -889,6 +896,44 @@ class StreamingRepeatedGuardFinalAnswerLLM:
         yield StreamChunk(type=ChunkType.END)
 
 
+class ScriptedStreamLLM:
+    """Streams one scripted tool-call batch per ``stream_chat`` call.
+
+    Each batch is a list of ``(tool_name, args_dict)`` pairs. Every call's
+    arguments are streamed in two fragments (a truncated prefix, then the
+    full JSON) so the answer streamer sees a partial candidate before the
+    complete one, matching the production streaming shape. This is the one
+    general-purpose fake model for the #486 batch-shape matrix - covering a
+    new shape means adding a batch here, not a new fake model class.
+    """
+
+    def __init__(self, batches: list[list[tuple[str, dict[str, Any]]]]) -> None:
+        self.batches = batches
+        self.stream_calls: list[dict[str, Any]] = []
+
+    async def chat(self, **kwargs: Any) -> Any:
+        raise AssertionError("ScriptedStreamLLM should not fall back to chat()")
+
+    async def stream_chat(self, **kwargs: Any) -> Any:
+        self.stream_calls.append(kwargs)
+        index = min(len(self.stream_calls) - 1, len(self.batches) - 1)
+        for position, (name, args) in enumerate(self.batches[index]):
+            serialized = json.dumps(args)
+            cut = max(1, len(serialized) // 2)
+            for fragment in (serialized[:cut], serialized):
+                yield StreamChunk(
+                    type=ChunkType.TOOL_CALL,
+                    tool_calls=[
+                        {
+                            "index": position,
+                            "id": f"call_{position}",
+                            "function": {"name": name, "arguments": fragment},
+                        }
+                    ],
+                )
+        yield StreamChunk(type=ChunkType.END)
+
+
 class OutboundCollector:
     def __init__(self) -> None:
         self.events: list[dict[str, Any]] = []
@@ -1067,7 +1112,7 @@ async def test_react_pattern_runs_tool_call_then_final_answer() -> None:
     assert llm.calls[0]["tools"][0]["function"]["name"] == "calculator"
     system_prompt = llm.calls[0]["messages"][0]["content"]
     assert "latest user message" in system_prompt
-    assert re.search(r"Current date \(UTC\): \d{4}-\d{2}-\d{2}", system_prompt)
+    assert re.search(r"Turn-start date \(UTC\): \d{4}-\d{2}-\d{2}", system_prompt)
     assert "use this date when forming search queries" in system_prompt
     assert "not supported by the conversation" in system_prompt
     assert "available context is insufficient" in system_prompt
@@ -1473,6 +1518,14 @@ def test_react_grounding_rule_present_in_both_answer_paths() -> None:
         assert "illustrative placeholders" in prompt
     assert "use an appropriate tool to verify" in tool_prompt
     assert "use an appropriate tool" not in forced_prompt
+    for prompt in (tool_prompt, lookup_tool_prompt):
+        assert "tool-call arguments that assert facts" in prompt
+        assert "never guess one" in prompt
+        assert (
+            "This does not restrict values you are expected to compose yourself"
+            in prompt
+        )
+    assert "tool-call arguments that assert facts" not in forced_prompt
     assert "## FINAL DELIVERABLE FILE REFERENCES" not in tool_prompt
     assert "exact markdown_link" in tool_prompt
     assert "lookup is unavailable" in tool_prompt
@@ -1482,6 +1535,113 @@ def test_react_grounding_rule_present_in_both_answer_paths() -> None:
     )
     assert forced_prompt.count("## FINAL DELIVERABLE FILE REFERENCES") == 1
     assert "call get_workspace_output_files once before finalizing" not in forced_prompt
+
+
+@pytest.mark.parametrize("user_interaction_enabled", [True, False])
+def test_react_missing_argument_value_instruction_matches_interaction_policy(
+    user_interaction_enabled: bool,
+) -> None:
+    """A missing argument value routes to whichever remedy the run allows.
+
+    The grounding rule tells the model to classify an unsourced fact-carrying
+    argument as missing information; this instruction is what turns that
+    classification into an action, and the two branches must never both be
+    present.
+    """
+    ask_instruction = (
+        "including a fact-carrying argument value (one that asserts a "
+        "real-world fact) the user has not provided, call ask_user_question"
+    )
+    blocked_instruction = (
+        "including a fact-carrying argument value (one that asserts a "
+        "real-world fact) the user has not provided, do not ask the user"
+    )
+    pattern = ReActPattern(user_interaction_enabled=user_interaction_enabled)
+    context = ExecutionContext(system_prompt="You are helpful.")
+    context.add_user_message("update Jane Doe")
+
+    # tool_names is derived per branch only to keep the input shaped like
+    # production, where the interaction control tools are filtered out of the
+    # schema when interaction is disabled. It drives nothing here:
+    # missing_information_instruction never reads tool_names, so every
+    # assertion below is driven solely by user_interaction_enabled.
+    tool_names = ["update_record"]
+    if user_interaction_enabled:
+        tool_names.append("ask_user_question")
+    prompt = pattern._messages_for_llm(context, has_tools=True, tool_names=tool_names)[
+        0
+    ]["content"]
+
+    if user_interaction_enabled:
+        assert ask_instruction in prompt
+        assert blocked_instruction not in prompt
+        assert "do not fill the value in yourself" in prompt
+    else:
+        assert blocked_instruction in prompt
+        assert ask_instruction not in prompt
+        assert "finish with outcome=blocked and explain what is missing" in prompt
+
+
+@pytest.mark.asyncio
+async def test_react_tool_argument_rule_tracks_ask_user_question_availability() -> None:
+    """The prohibition and its remedy must reach the model on the same call.
+
+    The grounding rule tells the model to treat an unsourceable fact-carrying
+    argument as missing information; ask_user_question is the tool that acts on
+    that classification. Telling the model not to invent a value on a turn
+    where it cannot ask for one would leave it with no legal move. Both are
+    gated by ``force_final_answer`` today, so the coupling holds only
+    incidentally; this pins both directions of it against a later change that
+    narrows one gate without the other.
+    """
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "Need calculation.",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    }
+                ],
+                "done": False,
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "final_call",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"The result is 4."}',
+                        },
+                    }
+                ],
+                "done": False,
+            },
+        ]
+    )
+    pattern = ReActPattern(max_iterations=3, finalize_after_tool_result=True)
+    context = ExecutionContext(system_prompt="You are helpful.")
+    context.add_user_message("Calculate 2+2")
+
+    result = await pattern.run(context=context, tools=[FakeTool()], llm=llm)
+
+    assert result["success"] is True
+    coupling = [
+        (
+            "ask_user_question"
+            in [schema["function"]["name"] for schema in call["tools"]],
+            "tool-call arguments that assert facts" in call["messages"][0]["content"],
+        )
+        for call in llm.calls
+    ]
+    # One run covers both cells: the open turn offers ask_user_question and
+    # carries the rule, the forced final turn offers neither.
+    assert coupling == [(True, True), (False, False)]
 
 
 @pytest.mark.asyncio
@@ -3986,6 +4146,13 @@ async def test_react_pattern_reserves_control_tool_names_in_schema() -> None:
     )
     assert "Do not use it to confirm execution strategy" in ask_user_description
     assert "whether to use memory" in ask_user_description
+    assert (
+        "a fact-carrying value (one that asserts a real-world fact) for a tool "
+        "argument that the user has not provided" in ask_user_description
+    )
+    # The qualifier must match the grounding rule's scope: without it the
+    # description would invite pausing for a search query the model composes.
+    assert "require inventing a fact-carrying argument value" in ask_user_description
     system_prompt = llm.calls[0]["messages"][0]["content"]
     assert "Only call tools that are present in the current tool schema" in (
         system_prompt
@@ -4491,6 +4658,510 @@ async def test_react_pattern_ask_user_question_drops_invalid_options() -> None:
     assert result["interactions"][0]["options"] == [
         {"label": "A", "value": "a"},
         {"label": "B", "value": "b", "description": "Bee"},
+    ]
+
+
+# Independent reference for JavaScript's String.prototype.trim() semantics,
+# derived from unicodedata rather than the production _INTERACTION_TRIM_CHARS
+# constant -- reusing that constant here would make every assertion below
+# self-proving instead of an independent check. Built once at module scope
+# and reused, instead of being rebuilt inline in each function that needs it.
+_JS_TRIM = {chr(c) for c in range(0x110000) if unicodedata.category(chr(c)) == "Zs"}
+_JS_TRIM |= {"\t", "\n", "\v", "\f", "\r", "\ufeff", "\u2028", "\u2029"}
+
+
+def _js_trim_equivalent(value: str) -> str:
+    """Reference JavaScript String.prototype.trim(), via the independent
+    _JS_TRIM set above."""
+    return value.strip("".join(_JS_TRIM))
+
+
+def test_trim_table_covers_every_javascript_trimmed_code_point() -> None:
+    """Coverage check, superset half: _INTERACTION_TRIM_CHARS must contain
+    every code point JavaScript's trim() removes, or writing the normalized
+    field back into item["field"] and relying on the frontend's own trim()
+    being a no-op on it stops holding."""
+    assert _JS_TRIM <= set(_INTERACTION_TRIM_CHARS)
+
+
+def test_trim_table_python_only_difference_is_exactly_five_code_points() -> None:
+    """Coverage check, differential half: pins the five Python-only code
+    points exactly. The superset check above alone would still pass if one
+    of these five were mistyped (e.g. U+001C typoed into U+001B), since a
+    typo like that only shrinks the Python-only difference by one member and
+    stays within a superset of the JavaScript table."""
+    assert set(_INTERACTION_TRIM_CHARS) - _JS_TRIM == {
+        "\x1c",
+        "\x1d",
+        "\x1e",
+        "\x1f",
+        "\x85",
+    }
+
+
+def test_python_whitespace_set_is_a_subset_of_the_frozen_trim_table() -> None:
+    """task_interaction_service.py's write-side field/option checks use
+    plain str.strip() rather than importing _INTERACTION_TRIM_CHARS -- that
+    is only safe to reason about at all if every code point Python's own
+    str.isspace() treats as whitespace is already inside the frozen table.
+    Computed independently (via isspace(), not by re-deriving from
+    _INTERACTION_TRIM_CHARS or from _JS_TRIM), so a typo that dropped one of
+    the five Python-only code points from the frozen table would be caught
+    here even if it happened to still pass the two JS-side checks above."""
+    python_whitespace = {chr(c) for c in range(0x110000) if chr(c).isspace()}
+    assert python_whitespace <= set(_INTERACTION_TRIM_CHARS)
+
+
+def test_normalize_keeps_well_formed_options_and_fields() -> None:
+    """A normal option and a normal field pass through unchanged."""
+    normalized = _normalize_ask_user_interactions(
+        [
+            {
+                "type": "select_one",
+                "field": "choice",
+                "options": [{"label": "A", "value": "a"}],
+            }
+        ]
+    )
+    assert normalized[0]["options"] == [{"label": "A", "value": "a"}]
+    assert normalized[0]["field"] == "choice"
+
+
+def test_normalize_returns_empty_list_for_non_list_interactions() -> None:
+    """A top-level interactions value that is not a list -- the model
+    sending a dict or a string instead of an array, say -- is rejected
+    outright rather than partially processed."""
+    assert _normalize_ask_user_interactions("not-a-list") == []
+    assert _normalize_ask_user_interactions({"field": "choice"}) == []
+    assert _normalize_ask_user_interactions(None) == []
+
+
+def test_normalize_skips_non_dict_elements_within_the_list() -> None:
+    """A non-dict element inside an otherwise well-formed interactions list
+    is dropped, and the well-formed interactions around it are still
+    normalized -- one malformed element does not fail the whole batch."""
+    normalized = _normalize_ask_user_interactions(
+        [
+            "not-a-dict",
+            {
+                "type": "select_one",
+                "field": "choice",
+                "options": [{"label": "A", "value": "a"}],
+            },
+            42,
+            None,
+        ]
+    )
+    assert len(normalized) == 1
+    assert normalized[0]["field"] == "choice"
+
+
+_BLANK_TEXT_CASES = [
+    ("v1_empty", ""),
+    ("v2_ascii_spaces", "   "),
+    ("v3_mixed_whitespace", "\t\n "),
+    ("v4_fullwidth_space", "\u3000"),
+    ("v5_bom_only", "\ufeff"),
+    ("v8_python_only_control", "\x1c"),
+    ("v9_js_line_separator", "\u2028"),
+    ("v10_nbsp", "\xa0"),
+]
+
+
+@pytest.mark.parametrize("case_id,value", _BLANK_TEXT_CASES)
+def test_normalize_drops_blank_options(case_id: str, value: str) -> None:
+    """An option whose label or value is blank under
+    _INTERACTION_TRIM_CHARS is dropped -- the same treatment the existing
+    empty-string-label case already gets (see the regression test above
+    for missing/empty label or value), widened from "the empty string" to
+    "blank under the trim table"."""
+    normalized = _normalize_ask_user_interactions(
+        [
+            {
+                "type": "select_one",
+                "field": "choice",
+                "options": [
+                    {"label": value, "value": "kept-value"},
+                    {"label": "kept-label", "value": value},
+                    {"label": "A", "value": "a"},
+                ],
+            }
+        ]
+    )
+    assert normalized[0]["options"] == [{"label": "A", "value": "a"}]
+
+
+@pytest.mark.parametrize("case_id,value", _BLANK_TEXT_CASES)
+def test_normalize_substitutes_blank_field(case_id: str, value: str) -> None:
+    """A field name blank under _INTERACTION_TRIM_CHARS falls back to
+    response_{index}."""
+    normalized = _normalize_ask_user_interactions(
+        [{"type": "select_one", "field": value, "label": "Choice"}]
+    )
+    assert normalized[0]["field"] == "response_0"
+
+
+def test_normalize_substitutes_blank_field_using_its_own_index() -> None:
+    """The fallback is f"response_{index}" for the interaction's own
+    position, not a fixed "response_0" -- a well-formed interaction ahead
+    of the blank one must not shift what the blank one falls back to."""
+    normalized = _normalize_ask_user_interactions(
+        [
+            {"type": "select_one", "field": "choice", "label": "Choice"},
+            {"type": "select_one", "field": "   ", "label": "Other"},
+        ]
+    )
+    assert normalized[0]["field"] == "choice"
+    assert normalized[1]["field"] == "response_1"
+
+
+@pytest.mark.parametrize(
+    "case_id,value,expected",
+    [
+        ("v6_bom_prefix", "\ufeffabc", "abc"),
+        ("v7_bom_and_space_both_ends", "\ufeff abc\ufeff", "abc"),
+    ],
+)
+def test_normalize_field_bom_normalizes_to_frontend_equivalent(
+    case_id: str, value: str, expected: str
+) -> None:
+    """A field wrapped in a BOM (with or without interior spacing)
+    normalizes to the same string the frontend's own trim() produces. The
+    same normalization applies when the value arrives through the field/id/
+    name alias chain rather than "field" directly."""
+    normalized = _normalize_ask_user_interactions(
+        [{"type": "select_one", "field": value, "label": "Choice"}]
+    )
+    assert normalized[0]["field"] == expected
+
+    normalized_via_alias = _normalize_ask_user_interactions(
+        [{"type": "select_one", "id": value, "label": "Choice"}]
+    )
+    assert normalized_via_alias[0]["field"] == expected
+
+
+@pytest.mark.parametrize(
+    "case_id,value",
+    [
+        ("v1_empty", ""),
+        ("v2_ascii_spaces", "   "),
+        ("v3_mixed_whitespace", "\t\n "),
+        ("v4_fullwidth_space", "\u3000"),
+        ("v5_bom_only", "\ufeff"),
+        ("v6_bom_prefix", "\ufeffabc"),
+        ("v7_bom_and_space_both_ends", "\ufeff abc\ufeff"),
+        ("v8_python_only_control", "\x1c"),
+        ("v9_js_line_separator", "\u2028"),
+    ],
+)
+def test_normalized_field_is_stable_under_javascript_trim(
+    case_id: str, value: str
+) -> None:
+    """Whatever field the normalizer produces must already be a fixed
+    point of the frontend's own trim(). If it were not, writing the result
+    back into item["field"] and trusting the frontend to leave it alone
+    would silently stop being true for that input."""
+    normalized = _normalize_ask_user_interactions(
+        [{"type": "select_one", "field": value, "label": "Choice"}]
+    )
+    field = normalized[0]["field"]
+    assert _js_trim_equivalent(field) == field
+
+
+def test_normalize_logs_when_all_options_are_dropped(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An interaction whose options are all blank keeps the
+    interaction (the question still goes out) and logs exactly one warning.
+    The warning's extra keys are exactly {dropped, total, interaction_index},
+    all ints, and its message format args are also all ints -- no
+    model-controlled string (the field name, a label, a value) is allowed
+    into either half of this log line."""
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.core.agent.pattern.react.react"
+    ):
+        normalized = _normalize_ask_user_interactions(
+            [
+                {
+                    "type": "select_one",
+                    "field": "choice",
+                    "options": [
+                        {"label": "   ", "value": "   "},
+                        {"label": "\ufeff", "value": "\ufeff"},
+                    ],
+                }
+            ]
+        )
+
+    assert len(normalized) == 1
+    assert normalized[0]["options"] == []
+
+    dropped_records = [r for r in caplog.records if "dropped all" in r.getMessage()]
+    assert len(dropped_records) == 1
+    record = dropped_records[0]
+
+    baseline_attrs = set(
+        logging.LogRecord("n", logging.WARNING, "p", 1, "m", None, None).__dict__
+    )
+    # "taskName" is a LogRecord attribute added in 3.12. "message" and
+    # (when some other test module's logging setup is still attached to the
+    # root logger) "asctime" are added by a Formatter.format() pass -- set
+    # record.message / record.asctime as a side effect of formatting, not by
+    # this log call's own extra= payload. All three are excluded so this
+    # comparison is stable regardless of Python version, test runner, or
+    # which other test modules ran earlier in the same process.
+    extra_keys = (
+        set(record.__dict__) - baseline_attrs - {"taskName", "message", "asctime"}
+    )
+    assert extra_keys == {"dropped", "total", "interaction_index"}
+    assert all(isinstance(record.__dict__[k], int) for k in extra_keys)
+    assert record.args is None or all(isinstance(a, int) for a in record.args)
+    # Both options in this interaction were blank, so dropped == total == 2,
+    # not just "some int" -- pins the actual count, not merely its type.
+    assert record.__dict__["dropped"] == 2
+    assert record.__dict__["total"] == 2
+    assert record.__dict__["interaction_index"] == 0
+
+
+def test_normalize_keeps_surviving_option_text_verbatim() -> None:
+    """An option that survives the blank filter keeps its label and
+    value exactly as given -- normalization only judges blankness, it never
+    rewrites content. A BOM-wrapped value is the only kind of input that can
+    tell "judge blank" apart from "judge blank and also rewrite": a purely
+    blank value would be dropped under either implementation, so it would
+    not catch a rewrite regression."""
+    raw = {"label": "\ufeffImport", "value": "\ufeffimport"}
+    normalized = _normalize_ask_user_interactions(
+        [{"type": "select_one", "field": "choice", "options": [raw]}]
+    )
+    assert normalized[0]["options"] == [raw]
+
+
+def test_normalize_keeps_colliding_fields_at_single_tool_callsite(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Within one ask_user_question call, a BOM-wrapped field name and
+    its plain counterpart now normalize to the same field. This function
+    does not deduplicate -- both interactions are kept unchanged. Both
+    call sites deduplicate afterward: the multi-tool one is covered
+    below in this file, the single-tool one in
+    test_react_ask_user_question_dedup.py. One warning is logged, with
+    an integer-only extra/message-args payload."""
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.core.agent.pattern.react.react"
+    ):
+        normalized = _normalize_ask_user_interactions(
+            [
+                {"type": "select_one", "field": "\ufeffchoice"},
+                {"type": "select_one", "field": "choice"},
+            ]
+        )
+
+    assert [item["field"] for item in normalized] == ["choice", "choice"]
+
+    collision_records = [
+        r for r in caplog.records if "colliding field name" in r.getMessage()
+    ]
+    assert len(collision_records) == 1
+    record = collision_records[0]
+
+    baseline_attrs = set(
+        logging.LogRecord("n", logging.WARNING, "p", 1, "m", None, None).__dict__
+    )
+    # "taskName" is a LogRecord attribute added in 3.12. "message" and
+    # (when some other test module's logging setup is still attached to the
+    # root logger) "asctime" are added by a Formatter.format() pass -- set
+    # record.message / record.asctime as a side effect of formatting, not by
+    # this log call's own extra= payload. All three are excluded so this
+    # comparison is stable regardless of Python version, test runner, or
+    # which other test modules ran earlier in the same process.
+    extra_keys = (
+        set(record.__dict__) - baseline_attrs - {"taskName", "message", "asctime"}
+    )
+    assert extra_keys == {"colliding_field_count", "total"}
+    assert all(isinstance(record.__dict__[k], int) for k in extra_keys)
+    assert record.args is None or all(isinstance(a, int) for a in record.args)
+
+
+def test_normalize_blank_alias_does_not_fall_through_to_next_key() -> None:
+    """The field/id/name alias chain keeps its raw truthiness
+    check on purpose. A BOM-only field is truthy before normalization, so it
+    wins the alias chain and is only normalized away to blank afterward --
+    id="ok" is never reached. Widening the blankness judgment to include BOM
+    does not create a new alias-chain outcome, it only adds a new way to
+    reach the one a plain whitespace field already produced (the second
+    case below, pinned as a regression)."""
+    normalized_bom = _normalize_ask_user_interactions(
+        [{"type": "select_one", "field": "\ufeff", "id": "ok"}]
+    )
+    assert normalized_bom[0]["field"] == "response_0"
+
+    normalized_whitespace = _normalize_ask_user_interactions(
+        [{"type": "select_one", "field": "   ", "id": "ok"}]
+    )
+    assert normalized_whitespace[0]["field"] == "response_0"
+
+
+@pytest.mark.parametrize(
+    "case_id,raw",
+    [
+        (
+            "case1_alias_only",
+            {
+                "type": "select_one",
+                "field": "f",
+                "actions": [{"label": "A", "value": "a"}],
+            },
+        ),
+        (
+            "case2_options_and_unrelated_actions",
+            {
+                "type": "select_one",
+                "field": "f",
+                "options": [{"label": "A", "value": "a"}],
+                "actions": [{"label": "X", "value": "x"}],
+            },
+        ),
+        (
+            "case3_options_not_a_list",
+            {
+                "type": "select_one",
+                "field": "f",
+                "options": "auto",
+                "actions": [{"label": "B", "value": "b"}],
+            },
+        ),
+        (
+            "case4_actions_not_a_list",
+            {
+                "type": "select_one",
+                "field": "f",
+                "options": "auto",
+                "actions": "bad",
+            },
+        ),
+    ],
+)
+def test_normalize_strips_actions_alias_from_output(case_id: str, raw: dict) -> None:
+    """The output never carries an actions key, unconditionally --
+    whether options was missing, a well-formed list, or a malformed
+    non-list value, and whether actions itself was a list or not. Case 1
+    additionally asserts the alias survived into options: without that
+    second assertion, moving the pop above the alias branch would still
+    pass this case (actions is gone either way, just for the wrong reason)
+    while silently losing the alias's only copy of the data -- a gap only
+    test_normalize_aliases_actions_when_options_is_not_a_list below would
+    otherwise catch alone."""
+    normalized = _normalize_ask_user_interactions([raw])
+    assert "actions" not in normalized[0]
+    if case_id == "case1_alias_only":
+        assert normalized[0]["options"] == [{"label": "A", "value": "a"}]
+
+
+def test_normalize_aliases_actions_when_options_is_not_a_list() -> None:
+    """When options is present but not a list, the alias branch --
+    widened from "options" not in item to "options is not a list" -- still
+    rescues actions into options, and the usual blank-option filter still
+    runs on what it rescued. This is the test that would catch the pop
+    running before the alias branch: with the pop moved earlier, actions
+    would already be gone by the time the alias branch runs, options would
+    stay "auto", and this assertion would fail even though every case in
+    test_normalize_strips_actions_alias_from_output would still pass (that
+    test only checks that actions is gone, not that its data went
+    anywhere)."""
+    normalized = _normalize_ask_user_interactions(
+        [
+            {
+                "type": "select_one",
+                "field": "f",
+                "options": "auto",
+                "actions": [
+                    {"label": "   ", "value": "   "},
+                    {"label": "B", "value": "b"},
+                ],
+            }
+        ]
+    )
+    assert normalized[0]["options"] == [{"label": "B", "value": "b"}]
+    assert "actions" not in normalized[0]
+
+
+def test_normalize_logs_when_options_is_not_a_list(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """options present but neither a list nor rescued by an actions alias
+    is a malformed shape the model produced; today it silently renders as
+    no available options (the renderer falls back to interaction.options ||
+    []), and this warning is the only signal that it happened. Same
+    integer-only payload discipline as the other two warnings in this
+    same function (the all-options-blank warning and the colliding-field-
+    name warning)."""
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.core.agent.pattern.react.react"
+    ):
+        normalized = _normalize_ask_user_interactions(
+            [{"type": "select_one", "field": "choice", "options": "auto"}]
+        )
+
+    assert normalized[0]["options"] == "auto"
+    assert "actions" not in normalized[0]
+
+    records = [r for r in caplog.records if "non-list options" in r.getMessage()]
+    assert len(records) == 1
+    record = records[0]
+
+    baseline_attrs = set(
+        logging.LogRecord("n", logging.WARNING, "p", 1, "m", None, None).__dict__
+    )
+    # Same three attributes excluded for the same reasons as the other two
+    # warning tests in this module: "taskName" (3.12+ LogRecord attribute),
+    # "message" and "asctime" (added by a Formatter.format() pass, not by
+    # this call's own extra= payload).
+    extra_keys = (
+        set(record.__dict__) - baseline_attrs - {"taskName", "message", "asctime"}
+    )
+    assert extra_keys == {"interaction_index"}
+    assert all(isinstance(record.__dict__[k], int) for k in extra_keys)
+    assert record.args is None or all(isinstance(a, int) for a in record.args)
+
+
+@pytest.mark.asyncio
+async def test_pause_for_tool_results_deduplicates_normalized_fields() -> None:
+    """_pause_for_tool_results runs its own field-name dedup after
+    calling the normalizer for each tool. Two tools whose fields now
+    normalize (via the BOM fix) to the same string still end up with
+    distinct field names in the published interactions -- narrowing the
+    normalizer's output domain does not break the existing dedup loop."""
+    pattern = ReActPattern(max_iterations=2)
+    runtime = PatternRuntime(execution_id="exec-1")
+    context = ExecutionContext()
+    context.add_user_message("Ask")
+
+    tool_call_a = {"id": "call_a", "name": "tool_a"}
+    tool_call_b = {"id": "call_b", "name": "tool_b"}
+    result_a = {
+        "status": "waiting_for_user",
+        "message": "Pick one",
+        "message_type": "question",
+        "interactions": [{"type": "select_one", "field": "\ufeffchoice"}],
+    }
+    result_b = {
+        "status": "waiting_for_user",
+        "message": "Pick another",
+        "message_type": "question",
+        "interactions": [{"type": "select_one", "field": "choice"}],
+    }
+
+    outcome = await pattern._pause_for_tool_results(
+        waiting_pairs=[(tool_call_a, result_a), (tool_call_b, result_b)],
+        context=context,
+        runtime=runtime,
+    )
+
+    assert outcome["status"] == "waiting_for_user"
+    assert [item["field"] for item in outcome["interactions"]] == [
+        "choice",
+        "choice_2",
     ]
 
 
@@ -5029,7 +5700,10 @@ async def test_react_pattern_traces_context_compaction() -> None:
     result = await ReActPattern(max_iterations=1).run(
         context=context,
         tools=[],
-        llm=FakeLLM([{"content": "done"}]),
+        # Two responses: compaction now summarizes with the main model when no
+        # compact model is configured, so it consumes one before the turn's
+        # own call.
+        llm=FakeLLM([{"content": "summary"}, {"content": "done"}]),
         runtime=runtime,
     )
 
@@ -7170,18 +7844,20 @@ def _react_clock_prompt(timezone_name: str | None) -> str:
     return messages[0]["content"]
 
 
-# Verbatim pre-PR sentence, so a change to any part of the fallback instruction
-# fails rather than only a change to its "Current date" prefix.
+# Covers the whole fallback instruction through the get_current_time pointer, so
+# reverting any part of it fails rather than only a change to the prefix.
 UTC_DATE_INSTRUCTION = (
-    "Current date (UTC): 2026-08-24. "
+    "Turn-start date (UTC): 2026-08-24. "
     "For recent, latest, current, or time-sensitive requests, use this "
-    "date when forming search queries and judging source relevance."
+    "date when forming search queries and judging source relevance. If the "
+    "exact current time matters or the turn may have crossed midnight, call "
+    "the get_current_time tool if it is available."
 )
 
 
 def _date_instruction(prompt: str) -> str:
-    start = prompt.index("Current date (")
-    end = prompt.index("source relevance.", start) + len("source relevance.")
+    start = prompt.index("Turn-start date (")
+    end = prompt.index("if it is available.", start) + len("if it is available.")
     return prompt[start:end]
 
 
@@ -7193,12 +7869,831 @@ def test_tool_call_date_line_uses_the_caller_timezone() -> None:
     prompt = _react_clock_prompt("Australia/Melbourne")
 
     assert _date_instruction(prompt) == UTC_DATE_INSTRUCTION.replace(
-        "Current date (UTC): 2026-08-24. ",
-        "Current date (Australia/Melbourne): 2026-08-25. ",
+        "Turn-start date (UTC): 2026-08-24. ",
+        "Turn-start date (Australia/Melbourne): 2026-08-25. ",
     )
     # The UTC date is what produced the wrong "tomorrow" in production.
-    assert "Current date (UTC)" not in prompt
+    assert "Turn-start date (UTC)" not in prompt
 
 
 def test_tool_call_date_line_degrades_to_utc_for_an_unusable_timezone() -> None:
     assert _date_instruction(_react_clock_prompt("Not/AZone")) == UTC_DATE_INSTRUCTION
+
+
+# ---------------------------------------------------------------------------
+# xagent#486: every final_answer stream that gets opened must be closed with
+# exactly one terminal event, regardless of how the batch that opened it
+# resolves. See _close_streamed_answer's docstring in react.py for the R0-R3
+# contract these tests pin down.
+# ---------------------------------------------------------------------------
+
+
+def _fa(answer: str) -> tuple[str, dict[str, Any]]:
+    return ("final_answer", {"answer": answer})
+
+
+def _send_message_call(*, expect_response: bool) -> tuple[str, dict[str, Any]]:
+    return (
+        "send_message",
+        {
+            "message": "Side note",
+            "message_type": "question" if expect_response else "progress",
+            "expect_response": expect_response,
+        },
+    )
+
+
+def _ask_user_question_call() -> tuple[str, dict[str, Any]]:
+    return (
+        "ask_user_question",
+        {
+            "message": "Which one?",
+            "interactions": [
+                {"type": "select_one", "field": "choice", "label": "Choice"}
+            ],
+        },
+    )
+
+
+def _work_tool_call() -> tuple[str, dict[str, Any]]:
+    return ("calculator", {"expression": "2+2"})
+
+
+_FALLBACK_ANSWER = "Fallback answer."
+_FALLBACK_BATCH: list[tuple[str, dict[str, Any]]] = [_fa(_FALLBACK_ANSWER)]
+
+
+def _terminal_events_by_message_id(
+    events: list[dict[str, Any]],
+) -> dict[str, list[str]]:
+    """Group final_answer_start/end/error events by message_id.
+
+    Used to check that every started message_id gets exactly one terminal
+    event (end or error), never zero and never two.
+    """
+
+    by_id: dict[str, list[str]] = {}
+    for event in events:
+        event_type = event.get("type")
+        if event_type not in (
+            "final_answer_start",
+            "final_answer_end",
+            "final_answer_error",
+        ):
+            continue
+        by_id.setdefault(event["message_id"], []).append(event_type)
+    return by_id
+
+
+_I1_RUN_CASES: list[dict[str, Any]] = [
+    {
+        "label": "C1_single_final_answer",
+        "batches": [[_fa("Answer one.")]],
+        "needs_tool": False,
+        "user_interaction_enabled": True,
+        "max_iterations": 1,
+        "expected_sequences": [["final_answer_start", "final_answer_end"]],
+    },
+    {
+        "label": "C2_identical_final_answers",
+        "batches": [[_fa("Same answer."), _fa("Same answer.")]],
+        "needs_tool": False,
+        "user_interaction_enabled": True,
+        "max_iterations": 1,
+        "expected_sequences": [["final_answer_start", "final_answer_end"]],
+    },
+    {
+        "label": "C3_distinct_final_answers",
+        "batches": [[_fa("First."), _fa("Second."), _fa("Third.")]],
+        "needs_tool": False,
+        "user_interaction_enabled": True,
+        "max_iterations": 1,
+        "expected_sequences": [["final_answer_start", "final_answer_end"]],
+    },
+    {
+        "label": "C4_final_answer_before_send_message",
+        "batches": [[_fa("Answer one."), _send_message_call(expect_response=False)]],
+        "needs_tool": False,
+        "user_interaction_enabled": True,
+        "max_iterations": 1,
+        "expected_sequences": [["final_answer_start", "final_answer_end"]],
+    },
+    {
+        "label": "C5_final_answer_before_ask_user_question",
+        "batches": [[_fa("Answer one."), _ask_user_question_call()]],
+        "needs_tool": False,
+        "user_interaction_enabled": True,
+        "max_iterations": 1,
+        "expected_sequences": [["final_answer_start", "final_answer_end"]],
+    },
+    {
+        "label": "C6_send_message_before_final_answer",
+        "batches": [[_send_message_call(expect_response=False), _fa("Answer one.")]],
+        "needs_tool": False,
+        "user_interaction_enabled": True,
+        "max_iterations": 1,
+        "expected_sequences": [],
+    },
+    {
+        "label": "C7_send_message_expect_response_before_final_answer",
+        "batches": [[_send_message_call(expect_response=True), _fa("Answer one.")]],
+        "needs_tool": False,
+        "user_interaction_enabled": True,
+        "max_iterations": 1,
+        "expected_sequences": [],
+    },
+    {
+        "label": "C8_ask_user_question_before_final_answer",
+        "batches": [[_ask_user_question_call(), _fa("Answer one.")]],
+        "needs_tool": False,
+        "user_interaction_enabled": True,
+        "max_iterations": 1,
+        "expected_sequences": [],
+    },
+    {
+        "label": "C9a_final_answer_before_work_tool",
+        "batches": [[_fa("Candidate."), _work_tool_call()], _FALLBACK_BATCH],
+        "needs_tool": True,
+        "user_interaction_enabled": True,
+        "max_iterations": 3,
+        "expected_sequences": [
+            ["final_answer_start", "final_answer_error"],
+            ["final_answer_start", "final_answer_end"],
+        ],
+    },
+    {
+        "label": "C9b_work_tool_before_final_answer",
+        "batches": [[_work_tool_call(), _fa("Candidate.")], _FALLBACK_BATCH],
+        "needs_tool": True,
+        "user_interaction_enabled": True,
+        "max_iterations": 3,
+        # The work tool's name arrives before any final_answer bytes, so the
+        # streamer disables itself immediately - only the fallback batch's
+        # stream ever opens.
+        "expected_sequences": [["final_answer_start", "final_answer_end"]],
+    },
+    {
+        "label": "C10_empty_final_answer_in_control_only_batch",
+        "batches": [[_fa("Valid answer."), _fa("")], _FALLBACK_BATCH],
+        "needs_tool": False,
+        "user_interaction_enabled": True,
+        "max_iterations": 3,
+        "expected_sequences": [
+            ["final_answer_start", "final_answer_error"],
+            ["final_answer_start", "final_answer_end"],
+        ],
+    },
+    {
+        "label": "C14_disabled_control_tool_cancels_first_final_answer",
+        "batches": [
+            [_fa("Answer one."), _send_message_call(expect_response=False)],
+            _FALLBACK_BATCH,
+        ],
+        "needs_tool": False,
+        "user_interaction_enabled": False,
+        "max_iterations": 3,
+        "expected_sequences": [
+            ["final_answer_start", "final_answer_error"],
+            ["final_answer_start", "final_answer_end"],
+        ],
+    },
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case", _I1_RUN_CASES, ids=[case["label"] for case in _I1_RUN_CASES]
+)
+async def test_react_every_started_answer_stream_gets_exactly_one_terminal_event(
+    case: dict[str, Any],
+) -> None:
+    """I-1: for every batch shape that can occur through a real ReAct run,
+    each final_answer_start's message_id gets exactly one terminal event
+    (final_answer_end or final_answer_error) - never zero, never two. A
+    shape whose stream never opens (R0) produces no started ids at all."""
+
+    llm = ScriptedStreamLLM(case["batches"])
+    pattern = ReActPattern(
+        max_iterations=case["max_iterations"],
+        user_interaction_enabled=case["user_interaction_enabled"],
+    )
+    tools = [FakeTool()] if case["needs_tool"] else []
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Question")
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+
+    await pattern.run(context=context, tools=tools, llm=llm, runtime=runtime)
+
+    by_id = _terminal_events_by_message_id(outbound.events)
+    actual_sequences = list(by_id.values())
+    assert actual_sequences == case["expected_sequences"]
+    for sequence in actual_sequences:
+        assert sequence[0] == "final_answer_start"
+        assert len(sequence) == 2
+        assert sequence[1] in ("final_answer_end", "final_answer_error")
+
+
+@pytest.mark.asyncio
+async def test_react_every_started_answer_stream_gets_exactly_one_terminal_event_without_outbound_handler() -> (
+    None
+):
+    """I-1, front condition (no outbound handler): start_final_answer_stream
+    returns None with no handler to send to, so the answer streamer never
+    accumulates content and never starts - the run still delivers the
+    correct answer through the non-streaming path, and there is nothing to
+    close."""
+
+    llm = ScriptedStreamLLM([[_fa("Answer one.")]])
+    pattern = ReActPattern(max_iterations=1)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Question")
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=None)
+
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    assert result["success"] is True
+    assert result["response"] == "Answer one."
+    assert runtime.last_final_answer_stream_message_id is None
+
+
+@pytest.mark.asyncio
+async def test_react_every_started_answer_stream_gets_exactly_one_terminal_event_without_native_streaming() -> (
+    None
+):
+    """I-1, front condition (no native streaming): a model without
+    stream_chat falls back to the non-streaming call path, so on_chunk is
+    never invoked and the answer streamer never starts - zero final_answer_*
+    events, even though tool_schemas were offered and a final_answer call
+    was made."""
+
+    llm = FakeLLM(
+        responses=[
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"Answer one."}',
+                        },
+                    }
+                ]
+            }
+        ]
+    )
+    pattern = ReActPattern(max_iterations=1)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Question")
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    assert result["success"] is True
+    assert result["response"] == "Answer one."
+    assert outbound.events == []
+
+
+@pytest.mark.asyncio
+async def test_react_every_started_answer_stream_gets_exactly_one_terminal_event_c12_manual() -> (
+    None
+):
+    """I-1, C12 (no tool_calls, plain assistant content, stream already
+    open): there is no known way for a real model response to leave the
+    stream open while producing zero tool_calls - reaching R1 or R3 both
+    require at least one tool call, and the only way tool_calls empties out
+    after the stream opens (the bundled-final_answer strip) always keeps a
+    work-tool entry behind. This case drives the stream open through the
+    real streaming primitive directly, then calls the close function with a
+    tool_calls=[] batch, so the R2 branch is exercised the same way I-11
+    exercises R3's otherwise-untriggerable shapes."""
+
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+    streamer = ReActFinalAnswerStreamer(runtime)
+    await streamer.handle_chunk(
+        StreamChunk(
+            type=ChunkType.TOOL_CALL,
+            tool_calls=[
+                {
+                    "id": "call_final",
+                    "function": {
+                        "name": "final_answer",
+                        "arguments": '{"answer":"Partial"}',
+                    },
+                }
+            ],
+        )
+    )
+    assert streamer.started
+    pattern = ReActPattern(max_iterations=1)
+
+    await pattern._close_streamed_answer(
+        answer_streamer=streamer,
+        assistant_content="Some plain content.",
+        tool_calls=[],
+    )
+
+    by_id = _terminal_events_by_message_id(outbound.events)
+    assert len(by_id) == 1
+    (sequence,) = by_id.values()
+    assert sequence == ["final_answer_start", "final_answer_end"]
+    end_event = next(e for e in outbound.events if e["type"] == "final_answer_end")
+    assert end_event["content"] == "Some plain content."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "label,batch,force_final_answer",
+    [
+        ("identical", [_fa("  Same answer.\n"), _fa("  Same answer.\n")], False),
+        (
+            "distinct_increasing",
+            [_fa("  First.\n"), _fa("  Second, longer.\n"), _fa("  Third, longest.\n")],
+            False,
+        ),
+        (
+            "distinct_decreasing",
+            [_fa("  First, longest.\n"), _fa("  Second.\n"), _fa("  Third.\n")],
+            False,
+        ),
+        (
+            "two_distinct_forced",
+            [_fa("  First.\n"), _fa("  Second, different.\n")],
+            True,
+        ),
+    ],
+)
+async def test_react_multi_final_answer_closes_stream_with_first_payload(
+    label: str,
+    batch: list[tuple[str, dict[str, Any]]],
+    force_final_answer: bool,
+) -> None:
+    """I-2: a batch with more than one final_answer call closes the stream on
+    the batch's first payload, verbatim (no stripping) - matching the text
+    _handle_control_tool actually delivers, whatever the later payloads say.
+
+    Every payload carries leading/trailing whitespace so this is only green
+    if the close path uses the raw text and never adds a ``.strip()``.
+    ``two_distinct_forced`` runs with ``force_final_answer_next`` set: when
+    the model is forced to answer through a single-tool ``final_answer``
+    schema, more than one call in the same batch is the shape that actually
+    reaches production, not an edge case.
+    """
+
+    llm = ScriptedStreamLLM([batch])
+    pattern = ReActPattern(max_iterations=1)
+    if force_final_answer:
+        pattern.force_final_answer_next = True
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Question")
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    first_payload = batch[0][1]["answer"]
+    assert result["success"] is True
+    assert result["response"] == first_payload
+    end_events = [e for e in outbound.events if e["type"] == "final_answer_end"]
+    assert len(end_events) == 1
+    assert end_events[0]["content"] == first_payload
+    assert not any(e["type"] == "final_answer_error" for e in outbound.events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "control_call",
+    [
+        _send_message_call(expect_response=False),
+        _ask_user_question_call(),
+    ],
+    ids=["send_message", "ask_user_question"],
+)
+async def test_react_final_answer_before_control_tool_ends_stream(
+    control_call: tuple[str, dict[str, Any]],
+) -> None:
+    """I-3: final_answer first in the batch always ends the stream with its
+    own answer, even when a control tool follows it in the same batch - that
+    trailing call never actually runs (_handle_control_tool's final_answer
+    branch finalizes the run before it is reached)."""
+
+    llm = ScriptedStreamLLM([[_fa("Answer one."), control_call]])
+    pattern = ReActPattern(max_iterations=1)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Question")
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    assert result["success"] is True
+    assert result["response"] == "Answer one."
+    assert [e["type"] for e in outbound.events] == [
+        "final_answer_start",
+        "final_answer_delta",
+        "final_answer_end",
+    ]
+    assert outbound.events[-1]["content"] == "Answer one."
+    # The trailing control tool never ran: it would have produced an
+    # agent_message event (send_message) or paused the run.
+    assert not any(e["type"] == "agent_message" for e in outbound.events)
+    assert result.get("status") != "waiting_for_user"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "control_call",
+    [
+        _send_message_call(expect_response=False),
+        _send_message_call(expect_response=True),
+        _ask_user_question_call(),
+    ],
+    ids=["send_message", "send_message_expect_response", "ask_user_question"],
+)
+async def test_react_control_tool_before_final_answer_opens_no_answer_stream(
+    control_call: tuple[str, dict[str, Any]],
+) -> None:
+    """I-4: a control tool ahead of final_answer in the same batch disables
+    the answer streamer before any answer bytes are emitted (the streamer
+    self-disables on the first non-final_answer tool name it sees), so no
+    final_answer_* event of any kind is ever produced for that response.
+    The run's delivered outcome is pinned too: the later final_answer is
+    still executed and delivered unless a response-expecting control tool
+    pauses the run before reaching it."""
+
+    llm = ScriptedStreamLLM([[control_call, _fa("Answer one.")], _FALLBACK_BATCH])
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Question")
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    assert not any(e["type"].startswith("final_answer_") for e in outbound.events)
+    control_name, control_args = control_call
+    if control_name == "ask_user_question" or control_args.get("expect_response"):
+        assert result["status"] == "waiting_for_user"
+    else:
+        assert result["success"] is True
+        assert result["response"] == "Answer one."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ordering", ["final_answer_first", "work_tool_first"])
+async def test_react_work_tool_batch_still_fails_stream_before_close(
+    ordering: str,
+) -> None:
+    """I-5: a final_answer bundled with a work tool keeps going through the
+    existing strip-and-fail path (the batch is stripped of its final_answer
+    call and the open stream is failed there), not through the close
+    function's own R3 fallback, and the stream this closes never ends as
+    though the stripped text were the delivered answer.
+
+    Streaming a work-tool name before any final_answer bytes disables the
+    answer streamer immediately (final_answer_stream.py's guard checks tool
+    names as soon as they appear, before reading any field), so
+    ``work_tool_first`` never opens a stream at all; ``final_answer_first``
+    is the only ordering that can leave a stream open for the strip point to
+    close.
+    """
+
+    if ordering == "final_answer_first":
+        batch = [_fa("Candidate."), _work_tool_call()]
+    else:
+        batch = [_work_tool_call(), _fa("Candidate.")]
+    llm = ScriptedStreamLLM([batch, _FALLBACK_BATCH])
+    pattern = ReActPattern(max_iterations=3)
+    tool = FakeTool()
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Question")
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+
+    result = await pattern.run(context=context, tools=[tool], llm=llm, runtime=runtime)
+
+    assert result["success"] is True
+    assert result["response"] == _FALLBACK_ANSWER
+    # Deltas may echo the discarded candidate while the model is still
+    # streaming - that is pre-existing emit_prefix behavior, unrelated to
+    # this invariant. What must never happen is the discarded text being
+    # delivered as a completed answer.
+    assert not any(
+        e["type"] == "final_answer_end" and e.get("content") == "Candidate."
+        for e in outbound.events
+    )
+
+    if ordering == "work_tool_first":
+        # The work tool's name arrives before any final_answer bytes, so the
+        # streamer disables itself immediately: no stream is ever opened for
+        # this batch, and only the fallback batch's stream produces events.
+        by_id = _terminal_events_by_message_id(outbound.events)
+        assert len(by_id) == 1
+        (only_sequence,) = by_id.values()
+        assert only_sequence == ["final_answer_start", "final_answer_end"]
+        return
+
+    by_id = _terminal_events_by_message_id(outbound.events)
+    assert len(by_id) == 2
+    first_id, second_id = by_id.keys()
+    assert by_id[first_id] == ["final_answer_start", "final_answer_error"]
+    assert by_id[second_id] == ["final_answer_start", "final_answer_end"]
+    first_stream_error = next(
+        e for e in outbound.events if e["type"] == "final_answer_error"
+    )
+    assert first_stream_error["error"] == (
+        "discarded an answer that arrived together with tool "
+        "calls; answering again once the tools have run"
+    )
+    second_stream_end = next(
+        e
+        for e in outbound.events
+        if e["type"] == "final_answer_end" and e["message_id"] == second_id
+    )
+    assert second_stream_end["content"] == _FALLBACK_ANSWER
+    assert runtime.last_final_answer_stream_message_id == second_id
+
+
+@pytest.mark.asyncio
+async def test_react_disabled_control_tool_fails_cancelled_answer_stream() -> None:
+    """I-6: when a disabled user-interaction control tool shares the batch
+    with the first final_answer, _disabled_control_tool_index means R1 does
+    not fire - the stream is failed, not ended, and the run recovers on the
+    next forced turn. The failed stream's id is never mistaken for the
+    delivered one."""
+
+    llm = ScriptedStreamLLM(
+        [
+            [_fa("Answer one."), _send_message_call(expect_response=False)],
+            _FALLBACK_BATCH,
+        ]
+    )
+    pattern = ReActPattern(max_iterations=3, user_interaction_enabled=False)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Question")
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    assert result["success"] is True
+    assert result["response"] == _FALLBACK_ANSWER
+    by_id = _terminal_events_by_message_id(outbound.events)
+    assert len(by_id) == 2
+    first_id, second_id = by_id.keys()
+    assert by_id[first_id] == ["final_answer_start", "final_answer_error"]
+    assert by_id[second_id] == ["final_answer_start", "final_answer_end"]
+    assert runtime.last_final_answer_stream_message_id == second_id
+    assert runtime.last_final_answer_stream_message_id != first_id
+
+
+@pytest.mark.asyncio
+async def test_react_close_streamed_answer_zero_side_effect_when_discarded_stream_is_last() -> (
+    None
+):
+    """A discarded stream's id must never leave itself behind in
+    runtime.last_final_answer_stream_message_id. max_iterations=1 forces the
+    discarded stream to be the run's only stream, which is the only
+    construction where this assertion has any discriminating power - with a
+    later round, start_final_answer_stream unconditionally clears the field
+    before a new id could be confused with the old one, so the assertion
+    would pass even if the close function wrongly called finish() instead of
+    fail() here."""
+
+    llm = ScriptedStreamLLM(
+        [[_fa("Answer one."), _send_message_call(expect_response=False)]]
+    )
+    pattern = ReActPattern(max_iterations=1, user_interaction_enabled=False)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Question")
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+
+    await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    assert runtime.last_final_answer_stream_message_id is None
+
+
+@pytest.mark.asyncio
+async def test_react_disabled_control_tool_index_is_the_single_predicate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """I-7: _close_streamed_answer and _execute_pending_tool_calls must share
+    one _disabled_control_tool_index implementation. Patching it to always
+    return None flips both call sites' observable behavior together: the
+    execution side stops canceling the first final_answer, and the streaming
+    side switches from failing to ending that same stream. A collusion where
+    the close function reimplemented the check inline would not move under
+    this patch."""
+
+    def make_pattern() -> tuple[
+        ReActPattern,
+        ScriptedStreamLLM,
+        OutboundCollector,
+        PatternRuntime,
+        ExecutionContext,
+    ]:
+        llm = ScriptedStreamLLM(
+            [
+                [_fa("Answer one."), _send_message_call(expect_response=False)],
+                _FALLBACK_BATCH,
+            ]
+        )
+        pattern = ReActPattern(max_iterations=3, user_interaction_enabled=False)
+        context = ExecutionContext(
+            system_prompt="You are helpful.", execution_id="task-1"
+        )
+        context.add_user_message("Question")
+        outbound = OutboundCollector()
+        runtime = PatternRuntime(
+            execution_id="task-1", outbound_message_handler=outbound
+        )
+        return pattern, llm, outbound, runtime, context
+
+    real_pattern, real_llm, real_outbound, real_runtime, real_context = make_pattern()
+    real_result = await real_pattern.run(
+        context=real_context, tools=[], llm=real_llm, runtime=real_runtime
+    )
+
+    assert real_result["response"] == _FALLBACK_ANSWER
+    assert any(e["type"] == "final_answer_error" for e in real_outbound.events)
+
+    (
+        mutant_pattern,
+        mutant_llm,
+        mutant_outbound,
+        mutant_runtime,
+        mutant_context,
+    ) = make_pattern()
+    monkeypatch.setattr(
+        mutant_pattern,
+        "_disabled_control_tool_index",
+        lambda tool_calls, *, user_interaction_enabled: None,
+    )
+    mutant_result = await mutant_pattern.run(
+        context=mutant_context, tools=[], llm=mutant_llm, runtime=mutant_runtime
+    )
+
+    assert mutant_result["response"] == "Answer one."
+    assert not any(e["type"] == "final_answer_error" for e in mutant_outbound.events)
+    assert any(
+        e["type"] == "final_answer_end" and e["content"] == "Answer one."
+        for e in mutant_outbound.events
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "label,tool_calls,assistant_content",
+    [
+        (
+            "C11_work_tool_only",
+            [{"name": "calculator", "args": {"expression": "2+2"}}],
+            None,
+        ),
+        ("C13_no_calls_no_content", [], None),
+        (
+            "C15_final_answer_not_first",
+            [
+                {"name": "send_message", "args": {"message": "hi"}},
+                {"name": "final_answer", "args": {"answer": "x"}},
+            ],
+            None,
+        ),
+    ],
+)
+async def test_react_close_streamed_answer_fails_open_stream_without_deliverable_final_answer(
+    label: str,
+    tool_calls: list[dict[str, Any]],
+    assistant_content: Any,
+) -> None:
+    """I-11: these three tool_calls shapes have no known way to occur through
+    a real model response, so they are pinned at the function level instead
+    of being forced into an end-to-end fake-model shape that would not occur
+    in production. Whenever the stream is open and neither R1 nor R2 applies,
+    _close_streamed_answer
+    must fail it exactly once and must never call finish."""
+
+    class RecordingStreamer:
+        def __init__(self) -> None:
+            self.started = True
+            self.finish_calls: list[str] = []
+            self.fail_calls: list[str] = []
+
+        async def finish(self, content: str) -> None:
+            self.finish_calls.append(content)
+
+        async def fail(self, error: str) -> None:
+            self.fail_calls.append(error)
+
+    pattern = ReActPattern(max_iterations=1)
+    streamer = RecordingStreamer()
+
+    await pattern._close_streamed_answer(
+        answer_streamer=streamer,
+        assistant_content=assistant_content,
+        tool_calls=tool_calls,
+    )
+
+    assert streamer.finish_calls == []
+    assert streamer.fail_calls == [NO_DELIVERABLE_FINAL_ANSWER_REASON]
+
+
+class RoutedDownstreamLLM:
+    """Downstream selection behind a router.
+
+    It needs both entry points: compaction goes through ``run_llm_call`` ->
+    ``chat``, while the turn's own call streams (``_ResolvedRouterLLM``
+    defines ``stream_chat``, so the runtime takes the native streaming path).
+    Both record into one list so call ordering is assertable.
+    """
+
+    def __init__(self, chat_responses: list[Any], final_text: str) -> None:
+        self.chat_responses = chat_responses
+        self.final_text = final_text
+        self.calls: list[dict[str, Any]] = []
+
+    async def chat(self, messages: Any = None, **kwargs: Any) -> Any:
+        self.calls.append({"messages": messages, **kwargs})
+        return self.chat_responses.pop(0)
+
+    async def stream_chat(self, messages: Any = None, **kwargs: Any) -> Any:
+        self.calls.append({"messages": messages, **kwargs})
+        yield StreamChunk(type=ChunkType.TOKEN, delta=self.final_text)
+        yield StreamChunk(type=ChunkType.END)
+
+
+def _routing_router(
+    downstream: Any, route_prompts: list[str], *, context_window: int = 4
+) -> RouterLLM:
+    """A real ``RouterLLM`` whose selection is stubbed to record its prompt.
+
+    ``context_window`` is deliberately set, matching production: ``adapter.py``
+    always stamps it from the model row, and ``prepare_llm_for_context``
+    recomputes the compaction threshold from it. Leaving it unset would put the
+    fixture in a state a real router never reaches. A window of 4 yields a
+    threshold of 3, small enough that any context compacts.
+    """
+    router = RouterLLM(downstream_resolver=lambda _model_id: downstream)
+    router.context_window = context_window
+
+    async def select_model(prompt: str) -> str:
+        route_prompts.append(prompt)
+        return "test/model"
+
+    router._select_model = select_model  # type: ignore[assignment]
+    return router
+
+
+def _react_context_with_tool_history(execution_id: str) -> ExecutionContext:
+    context = ExecutionContext(execution_id=execution_id)
+    context.add_user_message("current request")
+    context.add_assistant_message(
+        "",
+        tool_calls=[
+            {"id": "call-1", "type": "function", "function": {"name": "read_file"}},
+        ],
+    )
+    context.add_tool_result("read_file", {"output": "x" * 200}, tool_call_id="call-1")
+    return context
+
+
+@pytest.mark.asyncio
+async def test_react_summarizes_with_the_main_model_when_no_compact_model() -> None:
+    """An unset compact slot must not silently disable summary compaction.
+
+    ``PatternRuntime.compact_context_if_needed`` skips summarization entirely
+    without a compact LLM and drops all but the last few messages instead.
+    Agent preview and delegated sub-agents resolve that slot themselves and
+    validate only the default model, so an empty slot is ordinary -- and made
+    the same agent behave differently depending on how it was launched.
+    """
+    downstream = RoutedDownstreamLLM(
+        [{"content": "summarized tool result"}], final_text="done"
+    )
+    route_prompts: list[str] = []
+    router = _routing_router(downstream, route_prompts)
+    context = _react_context_with_tool_history("compact-inherits-main")
+
+    result = await ReActPattern(max_iterations=1).run(
+        context=context,
+        tools=[],
+        llm=router,
+        compact_llm=None,
+        runtime=PatternRuntime(tracer=TraceEventRecorder()),
+    )
+
+    assert result["success"] is True
+    # Two downstream calls: the summary, then the turn's own call -- and the
+    # summary reached that call, which is what proves compaction summarized
+    # rather than truncated.
+    assert len(downstream.calls) == 2
+    assert any(
+        "summarized tool result" in message.get("content", "")
+        for message in downstream.calls[1]["messages"]
+    )
+    # One routing decision for the whole turn, taken on the conversation.
+    assert len(route_prompts) == 1
+    assert "Conversation history to compact" not in route_prompts[0]

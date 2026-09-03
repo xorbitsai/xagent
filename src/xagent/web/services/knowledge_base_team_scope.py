@@ -299,9 +299,12 @@ def snapshot_knowledge_base_team_hooks() -> Iterator[None]:
     slot added to this module later must be added here too, or a snapshot
     taken before that slot exists will silently fail to restore it.
 
-    The connector seam this module otherwise mirrors has no counterpart, and
-    that asymmetry is deliberate rather than a gap to close in either
-    direction. Its tests reset by calling the setter with no arguments,
+    The connector seam this module otherwise mirrors has its own equivalent,
+    ``connector_team_scope.snapshot_connector_team_hooks``, with the same
+    save-and-restore shape. The two primitives are independent: each saves
+    and restores only its own module's hook slots, and installing or
+    resetting one has no effect on the other. Tests that do not use either
+    primitive reset by calling the relevant setter with no arguments,
     which restores the *empty* state, not the state the test found. Every
     slot here is process-global, so a test that installs one and resets by
     clearing leaves any hook the process had installed before it gone, and

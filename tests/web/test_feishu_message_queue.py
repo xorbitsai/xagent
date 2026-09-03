@@ -10,6 +10,11 @@ from xagent.web.services.task_execution_context_service import (
 )
 from xagent.web.services.task_lease_service import TaskLease
 
+# Bound shutdown waits so a regression fails instead of hanging the CI job.
+# Five seconds also leaves enough headroom for a loaded xdist worker; the
+# production Feishu disconnect path deliberately yields for 100 ms first.
+_TEST_TIMEOUT_SECONDS = 5.0
+
 
 def make_bot() -> FeishuBotInstance:
     bot = object.__new__(FeishuBotInstance)
@@ -142,7 +147,7 @@ async def test_channel_failure_suppresses_stale_error_after_exact_settlement_rej
 
     agent_service = SimpleNamespace(
         tracer=FakeTracer(),
-        set_conversation_history=lambda _messages: None,
+        set_conversation_history=lambda _messages, *, watermark=None: None,
         set_execution_context_messages=lambda _messages: None,
         set_recovered_skill_context=lambda _context: None,
     )
@@ -177,6 +182,7 @@ async def test_channel_failure_suppresses_stale_error_after_exact_settlement_rej
         lambda *_args: SimpleNamespace(
             runtime_user=None,
             conversation_history=(),
+            conversation_watermark=None,
             execution_recovery=TaskExecutionRecoverySnapshot(),
         ),
     )
@@ -216,12 +222,20 @@ async def test_channel_failure_suppresses_stale_error_after_exact_settlement_rej
 
 
 @pytest.mark.parametrize(
-    ("execution_result", "expected_status", "expected_message_type"),
+    (
+        "execution_result",
+        "expected_status",
+        "expected_message_type",
+        "expected_content",
+        "expected_error",
+    ),
     [
         (
             {"success": True, "output": "completed reply"},
             TaskStatus.COMPLETED,
-            "assistant_message",
+            "assistant_response",
+            "completed reply",
+            None,
         ),
         (
             {
@@ -234,6 +248,20 @@ async def test_channel_failure_suppresses_stale_error_after_exact_settlement_rej
             },
             TaskStatus.WAITING_FOR_USER,
             "question",
+            "Please confirm",
+            None,
+        ),
+        (
+            {
+                "success": False,
+                "status": "error",
+                "output": "provider token=secret",
+                "error": "provider token=secret",
+            },
+            TaskStatus.FAILED,
+            "assistant_response",
+            "Task execution failed.",
+            "provider token=secret",
         ),
     ],
 )
@@ -243,6 +271,8 @@ async def test_successful_channel_turn_persists_user_before_exact_assistant_sett
     execution_result: dict,
     expected_status: TaskStatus,
     expected_message_type: str,
+    expected_content: str,
+    expected_error: str | None,
 ) -> None:
     bot = object.__new__(FeishuBotInstance)
     bot.channel_id = 1
@@ -282,7 +312,7 @@ async def test_successful_channel_turn_persists_user_before_exact_assistant_sett
 
     agent_service = SimpleNamespace(
         tracer=FakeTracer(),
-        set_conversation_history=lambda _messages: None,
+        set_conversation_history=lambda _messages, *, watermark=None: None,
         set_execution_context_messages=lambda _messages: None,
         set_recovered_skill_context=lambda _context: None,
     )
@@ -326,6 +356,7 @@ async def test_successful_channel_turn_persists_user_before_exact_assistant_sett
         lambda *_args: SimpleNamespace(
             runtime_user=None,
             conversation_history=(),
+            conversation_watermark=None,
             execution_recovery=TaskExecutionRecoverySnapshot(),
         ),
     )
@@ -356,17 +387,15 @@ async def test_successful_channel_turn_persists_user_before_exact_assistant_sett
     assert finalized == [
         {
             "status": expected_status,
-            "assistant_content": (
-                "Please confirm"
-                if expected_status == TaskStatus.WAITING_FOR_USER
-                else "completed reply"
-            ),
+            "assistant_content": expected_content,
             "interactions": (
                 [{"label": "Continue?", "options": ["Yes", "No"]}]
                 if expected_status == TaskStatus.WAITING_FOR_USER
                 else []
             ),
             "message_type": expected_message_type,
+            "error_message": expected_error,
+            "execution_result": execution_result,
         }
     ]
 
@@ -433,7 +462,7 @@ async def test_stop_drains_each_feishu_turn_once_before_clearing_runtime_state()
 
     stop_task = asyncio.create_task(bot.stop())
     try:
-        await asyncio.wait_for(cleanup_started.wait(), timeout=0.5)
+        await asyncio.wait_for(cleanup_started.wait(), timeout=_TEST_TIMEOUT_SECONDS)
         await asyncio.sleep(0)
 
         assert turn_task.cancelling() == 1
@@ -442,7 +471,7 @@ async def test_stop_drains_each_feishu_turn_once_before_clearing_runtime_state()
         assert bot.user_message_queues == {"one": ["queued"]}
 
         allow_cleanup.set()
-        await asyncio.wait_for(stop_task, timeout=1)
+        await asyncio.wait_for(stop_task, timeout=_TEST_TIMEOUT_SECONDS)
 
         assert cleanup_finished.is_set()
         assert bot.user_message_tasks == {}
@@ -480,14 +509,14 @@ async def test_stop_drains_feishu_ping_cleanup() -> None:
 
     stop_task = asyncio.create_task(bot.stop())
     try:
-        await asyncio.wait_for(cleanup_started.wait(), timeout=0.5)
+        await asyncio.wait_for(cleanup_started.wait(), timeout=_TEST_TIMEOUT_SECONDS)
         await asyncio.sleep(0)
 
         assert not stop_task.done()
         assert not cleanup_finished.is_set()
 
         allow_cleanup.set()
-        await asyncio.wait_for(stop_task, timeout=1)
+        await asyncio.wait_for(stop_task, timeout=_TEST_TIMEOUT_SECONDS)
 
         assert cleanup_finished.is_set()
         assert ping_task.done()
@@ -524,12 +553,12 @@ async def test_stop_drains_feishu_ping_cleanup_after_disconnect_failure() -> Non
 
     stop_task = asyncio.create_task(bot.stop())
     try:
-        await asyncio.wait_for(cleanup_started.wait(), timeout=0.5)
+        await asyncio.wait_for(cleanup_started.wait(), timeout=_TEST_TIMEOUT_SECONDS)
         assert not stop_task.done()
 
         allow_cleanup.set()
         with pytest.raises(RuntimeError, match="disconnect failed"):
-            await asyncio.wait_for(stop_task, timeout=1)
+            await asyncio.wait_for(stop_task, timeout=_TEST_TIMEOUT_SECONDS)
 
         assert ping_task.done()
         assert bot._ping_task is None
@@ -566,7 +595,7 @@ async def test_feishu_stop_cancellation_waits_for_turn_cleanup_before_propagatin
 
     stop_task = asyncio.create_task(bot.stop())
     try:
-        await asyncio.wait_for(cleanup_started.wait(), timeout=0.5)
+        await asyncio.wait_for(cleanup_started.wait(), timeout=_TEST_TIMEOUT_SECONDS)
         stop_task.cancel()
         await asyncio.sleep(0)
 
@@ -576,7 +605,7 @@ async def test_feishu_stop_cancellation_waits_for_turn_cleanup_before_propagatin
 
         allow_cleanup.set()
         with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(stop_task, timeout=1)
+            await asyncio.wait_for(stop_task, timeout=_TEST_TIMEOUT_SECONDS)
 
         assert turn_task.done()
         assert bot.user_message_tasks == {}
@@ -604,7 +633,7 @@ async def test_stop_fence_rejects_late_feishu_ingress() -> None:
 
     stop_task = asyncio.create_task(bot.stop())
     try:
-        await asyncio.wait_for(disconnect_started.wait(), timeout=0.5)
+        await asyncio.wait_for(disconnect_started.wait(), timeout=_TEST_TIMEOUT_SECONDS)
         bot._handle_message_sync(_feishu_message())
 
         assert bot.user_message_queues == {}
@@ -654,7 +683,7 @@ async def test_manager_stop_drains_feishu_polling_cleanup_before_removal() -> No
 
     stop_task = asyncio.create_task(manager._stop_bot_for_appid("app-id"))
     try:
-        await asyncio.wait_for(cleanup_started.wait(), timeout=0.5)
+        await asyncio.wait_for(cleanup_started.wait(), timeout=_TEST_TIMEOUT_SECONDS)
         await asyncio.sleep(0)
 
         assert not stop_task.done()
@@ -662,7 +691,7 @@ async def test_manager_stop_drains_feishu_polling_cleanup_before_removal() -> No
         assert not cleanup_finished.is_set()
 
         allow_cleanup.set()
-        await asyncio.wait_for(stop_task, timeout=1)
+        await asyncio.wait_for(stop_task, timeout=_TEST_TIMEOUT_SECONDS)
 
         assert cleanup_finished.is_set()
         assert polling_task.done()
@@ -710,16 +739,18 @@ async def test_manager_stop_is_single_flight_per_feishu_bot() -> None:
         asyncio.create_task(manager._stop_bot_for_appid("app-id")),
     ]
     try:
-        await asyncio.wait_for(stop_started.wait(), timeout=0.5)
+        await asyncio.wait_for(stop_started.wait(), timeout=_TEST_TIMEOUT_SECONDS)
         await asyncio.sleep(0)
         assert stop_calls == 1
 
         allow_stop.set()
-        await asyncio.wait_for(cleanup_started.wait(), timeout=0.5)
+        await asyncio.wait_for(cleanup_started.wait(), timeout=_TEST_TIMEOUT_SECONDS)
         assert polling_task.cancelling() == 1
 
         allow_cleanup.set()
-        await asyncio.wait_for(asyncio.gather(*stop_tasks), timeout=1)
+        await asyncio.wait_for(
+            asyncio.gather(*stop_tasks), timeout=_TEST_TIMEOUT_SECONDS
+        )
         assert "app-id" not in manager.bots
     finally:
         allow_stop.set()

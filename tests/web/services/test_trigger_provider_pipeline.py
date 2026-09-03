@@ -109,7 +109,14 @@ class StubProvider:
         self.register_calls.append(int(trigger.id))
         return RegistrationResult(status=TriggerProvisioningStatus.ACTIVE)
 
-    async def unregister(self, db: Session, trigger: AgentTrigger, config: Any) -> None:
+    async def unregister(
+        self,
+        db: Session,
+        trigger: AgentTrigger,
+        config: Any,
+        *,
+        resource_id: str | None = None,
+    ) -> None:
         self.unregister_calls.append(int(trigger.id))
 
     async def finalize_callback(
@@ -307,6 +314,45 @@ class TestScheduledTriggerConfigValidation:
             "scheduled", {"next_run_at": "2026-07-03T00:00:00+00:00"}
         )
         assert by_moment.next_run_at == "2026-07-03T00:00:00+00:00"
+
+
+class TestGmailTriggerConfigValidation:
+    @pytest.mark.parametrize(
+        "oauth_account_id",
+        [None, True, 1.5, "not-an-account-id", 0, "0"],
+    )
+    def test_rejects_invalid_account_binding(self, oauth_account_id: object):
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError) as error:
+            parse_trigger_config(
+                "gmail",
+                {
+                    "watch_label": "INBOX",
+                    "oauth_account_id": oauth_account_id,
+                },
+            )
+
+        errors = error.value.errors()
+        assert len(errors) == 1
+        assert errors[0]["loc"] == ("config", "gmail", "oauth_account_id")
+        assert errors[0]["msg"] == (
+            "Value error, oauth_account_id must be a positive integer"
+        )
+        assert errors[0]["input"] == oauth_account_id
+
+    def test_accepts_missing_account_binding_for_legacy_records(self):
+        config = parse_trigger_config("gmail", {"watch_label": "INBOX"})
+
+        assert config.oauth_account_id is None
+
+    def test_accepts_numeric_string_account_binding(self):
+        config = parse_trigger_config(
+            "gmail",
+            {"watch_label": "INBOX", "oauth_account_id": "42"},
+        )
+
+        assert config.oauth_account_id == 42
 
 
 class TestCallbackPipeline:

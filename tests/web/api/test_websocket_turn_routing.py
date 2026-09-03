@@ -80,7 +80,7 @@ async def test_resume_coordinator_does_not_replace_task_that_it_waits_for() -> N
         manager.promote_resume_task(7, current)
 
     resume = asyncio.create_task(resume_runner())
-    manager.register_reserved_resume(7, resume)
+    manager.register_reserved_resume(7, resume, run_id=None)
 
     # The original remains the active execution until it finishes, so its
     # wait_for_previous call sees itself instead of the resume coordinator.

@@ -14,6 +14,9 @@ on:
       - 'tests/alembic/**'
       - '.github/workflows/test-migrations.yml'
       - 'src/xagent/db/**'
+      - 'src/xagent/web/models/generation.py'
+      - 'src/xagent/web/models/mcp.py'
+      - 'src/xagent/web/models/public_mcp.py'
       - 'src/xagent/web/services/gmail_provisioning.py'
       - 'tests/web/services/test_gmail_provisioning.py'
       - 'src/xagent/web/services/agent_management.py'
@@ -26,6 +29,7 @@ on:
       - 'src/xagent/web/models/task.py'
       - 'tests/web/services/task_status_storage_shared.py'
       - 'tests/web/services/test_task_status_storage_postgresql.py'
+      - 'tests/web/services/test_task_status_enum_drift.py'
       - 'src/xagent/web/api/monitor.py'
       - 'tests/web/api/test_monitor_postgresql.py'
       - 'tests/web/api/monitor_daily_window_shared.py'
@@ -49,6 +53,7 @@ on:
       - 'src/xagent/web/models/user.py'
       - 'src/xagent/web/models/user_oauth.py'
       - 'tests/web/test_user_oauth_actor_ownership.py'
+      - 'tests/web/test_trusted_actor_oauth_postgresql.py'
       - 'tests/shared/postgres_disposable.py'
       - 'tests/web/services/checkpoint_anchor_shared.py'
   pull_request:
@@ -72,7 +77,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -101,6 +106,9 @@ jobs:
             tests/alembic
             .github/workflows/test-migrations.yml
             src/xagent/db
+            src/xagent/web/models/generation.py
+            src/xagent/web/models/mcp.py
+            src/xagent/web/models/public_mcp.py
             src/xagent/web/services/gmail_provisioning.py
             tests/web/services/test_gmail_provisioning.py
             src/xagent/web/services/agent_management.py
@@ -113,6 +121,7 @@ jobs:
             src/xagent/web/models/task.py
             tests/web/services/task_status_storage_shared.py
             tests/web/services/test_task_status_storage_postgresql.py
+            tests/web/services/test_task_status_enum_drift.py
             src/xagent/web/api/monitor.py
             tests/web/api/test_monitor_postgresql.py
             tests/web/api/monitor_daily_window_shared.py
@@ -136,6 +145,7 @@ jobs:
             src/xagent/web/models/user.py
             src/xagent/web/models/user_oauth.py
             tests/web/test_user_oauth_actor_ownership.py
+            tests/web/test_trusted_actor_oauth_postgresql.py
             tests/shared/postgres_disposable.py
             tests/web/services/checkpoint_anchor_shared.py
           )
@@ -175,11 +185,11 @@ jobs:
 
       - name: Checkout code
         if: needs.detect-migration-changes.outputs.should-test == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
         if: needs.detect-migration-changes.outputs.should-test == 'true'
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -260,11 +270,11 @@ jobs:
 
       - name: Checkout code
         if: needs.detect-migration-changes.outputs.should-test == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
         if: needs.detect-migration-changes.outputs.should-test == 'true'
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -337,6 +347,20 @@ jobs:
         env:
           DATABASE_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 
+      - name: Test MCP lifecycle generation migration (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/migrations/test_20260902_add_mcp_lifecycle_generations.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test trusted actor OAuth concurrency (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/web/test_trusted_actor_oauth_postgresql.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
       - name: Test Gmail provisioning Postgres-only behavior
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
@@ -369,6 +393,27 @@ jobs:
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
           pytest tests/web/services/test_task_status_storage_postgresql.py -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      # -m postgresql because this file is mixed: the PostgreSQL cells need a
+      # live server, and the non-PostgreSQL cells pin the check being skipped
+      # outright and already run in the ordinary suite. Each PostgreSQL cell
+      # creates and drops its own disposable database, so this step has no
+      # ordering dependency on the others -- and dropping/recreating the
+      # taskstatus type, which several of the cells do, never reaches the
+      # base database this URL names.
+      - name: Test taskstatus enum drift startup guard (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/web/services/test_task_status_enum_drift.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test taskstatus enum repair migration (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/migrations/test_20260901_add_task_status_waiting_for_user_enum_label.py -m postgresql -q
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 

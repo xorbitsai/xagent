@@ -970,3 +970,38 @@ def test_login_fails_locally_when_client_id_is_missing(db_session, monkeypatch):
 
     assert resp.status_code == 500
     assert "MICROSOFT_CLIENT_ID" in resp.body.decode()
+
+
+def test_deputy_login_sends_scope_and_omits_pkce(db_session):
+    """generic_oauth_login has no Deputy-specific branch (its
+    longlife_refresh_token scope flows through the existing generic
+    default_scopes -> scope_str path) -- this locks that in, since nothing
+    previously exercised generic_oauth_login with provider="deputy" at
+    all (only the callback side had coverage)."""
+    db, user = db_session
+    token = _token_for(user)
+
+    provider = _provider(
+        auth_url="https://once.deputy.com/my/oauth/login",
+        default_scopes=["longlife_refresh_token"],
+        redirect_uri="https://app.example.com/api/auth/deputy/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="deputy",
+        token=token,
+        app_id=None,
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    location = _location(resp)
+    qs = parse_qs(urlparse(location).query)
+
+    assert location.startswith("https://once.deputy.com/my/oauth/login?")
+    assert qs.get("scope") == ["longlife_refresh_token"]
+    assert qs.get("response_type") == ["code"]
+    assert "code_challenge" not in qs
+    assert "code_challenge_method" not in qs
+    state_payload = verify_token(qs["state"][0])
+    assert "code_verifier" not in state_payload

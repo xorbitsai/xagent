@@ -1,3 +1,4 @@
+from .actor_oauth_flow import ActorOAuthFlowState
 from .agent import Agent
 from .agent_api_key import AgentApiKey
 from .background_job import BackgroundJob, BackgroundJobStatus, BackgroundJobType
@@ -18,6 +19,7 @@ from .skill import UserSkill, UserSkillFile
 from .system_setting import SystemSetting
 from .task import DAGExecution, Task, TaskConnectorRuntimeContext
 from .task_command import TaskExecutionCommand
+from .task_command_terminal_event import TaskCommandTerminalEvent
 from .task_interaction import TaskInteractionRequest
 from .template_stats import TemplateStats, UserTemplateRelation
 from .tool_config import ToolConfig, ToolUsage
@@ -40,6 +42,7 @@ from .workforce import Workforce, WorkforceAgent, WorkforceBuilderMessage, Workf
 
 __all__ = [
     "Base",
+    "ActorOAuthFlowState",
     "get_engine",
     "get_db",
     "get_session_local",
@@ -63,6 +66,7 @@ __all__ = [
     "DeploymentOwnerType",
     "Task",
     "TaskExecutionCommand",
+    "TaskCommandTerminalEvent",
     "TaskInteractionRequest",
     "TaskConnectorRuntimeContext",
     "DAGExecution",

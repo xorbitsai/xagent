@@ -4,7 +4,7 @@ import React, { useCallback, useMemo, useState } from "react"
 import { Loader2 } from "lucide-react"
 import { ChatStartScreen } from "@/components/chat/ChatStartScreen"
 import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
-import { Button } from "@/components/ui/button"
+import { WidgetChromeControls } from "@/components/widget/widget-chrome-controls"
 import {
   AppProvider,
   type AppProviderTransportConfig,
@@ -42,6 +42,13 @@ interface SessionConversationContentProps {
   agent: WidgetSessionAgent | null
   terminalCode: string | null
   isAbsoluteExpiryWarningVisible: boolean
+  // Lifted to the never-unmounting SessionAgentChatPage below: this
+  // component's own "active" JSX branch unmounts on a degraded/reconnect
+  // transition (see the status check further down), which would otherwise
+  // silently reset an accepted expand back to the collapsed label/icon while
+  // the panel itself is still actually expanded.
+  isExpanded: boolean
+  onExpandedChange: (expanded: boolean) => void
 }
 
 function SessionConversationContent({
@@ -49,6 +56,8 @@ function SessionConversationContent({
   agent,
   terminalCode,
   isAbsoluteExpiryWarningVisible,
+  isExpanded,
+  onExpandedChange,
 }: SessionConversationContentProps) {
   const {
     state,
@@ -155,20 +164,18 @@ function SessionConversationContent({
                 : t("widgetChat.status.connecting")}
             </p>
           </div>
-          {hasEstablishedConversation ? (
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              className="ml-auto"
-              disabled={resetDisabled}
-              onClick={() => void handleStartNewConversation()}
-            >
-              {isConversationResetPending
+          <WidgetChromeControls
+            newConversation={hasEstablishedConversation ? {
+              label: isConversationResetPending
                 ? t("widgetSession.resetting")
-                : t("widgetSession.startNewConversation")}
-            </Button>
-          ) : null}
+                : t("widgetSession.startNewConversation"),
+              onClick: () => void handleStartNewConversation(),
+              disabled: resetDisabled,
+              pending: isConversationResetPending,
+            } : undefined}
+            expanded={isExpanded}
+            onExpandedChange={onExpandedChange}
+          />
         </div>
         {isAbsoluteExpiryWarningVisible ? (
           <p
@@ -243,6 +250,7 @@ function SessionConversationContent({
 
 export function SessionAgentChatPage() {
   const bridge = useWidgetSession()
+  const [isExpanded, setIsExpanded] = useState(false)
 
   const connection = useMemo<WebSocketConnection | null>(() => {
     if (bridge.status !== "active" || !bridge.session) return null
@@ -256,11 +264,13 @@ export function SessionAgentChatPage() {
       ],
       expectedProtocol: SESSION_PROTOCOL,
       chatTaskIdMode: "omit",
+      taskBindingMode: "session-subprotocol",
       credentialOwner: { kind: "external" },
     }
   }, [bridge.session, bridge.status])
 
   const transport = useMemo<AppProviderTransportConfig>(() => ({
+    legacyErrorProse: "untrusted",
     capabilities: {
       // This page only renders for the embedded widget's session-resume
       // route, so an in-tab navigation always abandons the visitor's iframe.
@@ -295,6 +305,8 @@ export function SessionAgentChatPage() {
         isAbsoluteExpiryWarningVisible={
           bridge.isAbsoluteExpiryWarningVisible
         }
+        isExpanded={isExpanded}
+        onExpandedChange={setIsExpanded}
       />
     </AppProvider>
   )

@@ -1,21 +1,27 @@
 from __future__ import annotations
 
+import uuid
 from typing import TYPE_CHECKING, Any, Type
 
 from sqlalchemy import (
     JSON,
     Boolean,
+    CheckConstraint,
     Column,
     DateTime,
     ForeignKey,
     Integer,
     String,
     UniqueConstraint,
+    Uuid,
+    event,
+    inspect,
 )
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
 from ...core.tools.core.mcp.model import create_mcp_server_table
+from .generation import RandomUUID
 
 if TYPE_CHECKING:
     from sqlalchemy import JSON, Boolean, Column, DateTime, Integer, String, Text
@@ -90,9 +96,23 @@ class UserMCPServer(Base):  # type: ignore
     __tablename__ = "user_mcpservers"
     __table_args__ = (
         UniqueConstraint("user_id", "mcpserver_id", name="uq_user_mcpservers"),
+        UniqueConstraint(
+            "lifecycle_generation",
+            name="uq_user_mcpservers_lifecycle_generation",
+        ),
+        CheckConstraint(
+            "CAST(lifecycle_generation AS VARCHAR) <> ''",
+            name="ck_user_mcpservers_lifecycle_generation_nonempty",
+        ),
     )
 
     id = Column(Integer, primary_key=True, index=True)
+    lifecycle_generation = Column(
+        Uuid,
+        default=uuid.uuid4,
+        server_default=RandomUUID(),
+        nullable=False,
+    )
     user_id = Column(
         Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False
     )
@@ -129,3 +149,12 @@ class UserMCPServer(Base):  # type: ignore
 
     def __repr__(self) -> str:
         return f"<UserMCPServer(user_id={self.user_id}, mcpserver_id={self.mcpserver_id}, is_owner={self.is_owner})>"
+
+
+@event.listens_for(UserMCPServer, "before_update")
+def _prevent_user_mcpserver_generation_update(
+    _mapper: Any, _connection: Any, target: UserMCPServer
+) -> None:
+    """Keep an association generation tied to exactly one row lifecycle."""
+    if inspect(target).attrs.lifecycle_generation.history.has_changes():
+        raise ValueError("UserMCPServer.lifecycle_generation is immutable")

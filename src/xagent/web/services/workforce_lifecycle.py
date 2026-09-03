@@ -226,7 +226,8 @@ def delete_workforce_permanently(
     user: User,
     workforce: Workforce | None,
 ) -> tuple[
-    list[WorkforceRunPauseTarget], list[tuple[AgentTrigger, str, dict[str, Any]]]
+    list[WorkforceRunPauseTarget],
+    list[tuple[AgentTrigger, str, dict[str, Any], str | None]],
 ]:
     """Atomically hard-delete a workforce and everything that hangs off it.
 
@@ -246,7 +247,7 @@ def delete_workforce_permanently(
     non-trivial work worth keeping off the event loop for a
     heavily-used workforce.
     Returns the PAUSE targets alongside the cascade-deleted triggers'
-    teardown data (trigger, type, config); it does not perform the actual
+    teardown data (trigger, type, config, resource id); it does not perform
     provider unregister calls itself, so that network I/O also has to
     happen through the caller's own ``asyncio.to_thread`` dispatch, the same
     way :func:`pause_workforce_tasks_after_archive` already does its own.
@@ -290,7 +291,9 @@ def delete_workforce_permanently(
         # request racing the exact commit of a delete on the same
         # workforce), so it's left as a known, documented gap rather than
         # risking new contention on that shared path.
-        trigger_teardowns: list[tuple[AgentTrigger, str, dict[str, Any]]] = []
+        trigger_teardowns: list[
+            tuple[AgentTrigger, str, dict[str, Any], str | None]
+        ] = []
         for trigger in (
             db.query(AgentTrigger)
             .filter(AgentTrigger.workforce_id == workforce_id)
@@ -298,6 +301,7 @@ def delete_workforce_permanently(
         ):
             trigger_type = str(trigger.type)
             config = dict(trigger.config or {})
+            resource_id = str(trigger.resource_id) if trigger.resource_id else None
             # Expunge now, before this session's cascade-delete and commit:
             # not required for safety on the pinned SQLAlchemy version -- a
             # deleted-and-committed instance goes `detached` while keeping
@@ -310,7 +314,7 @@ def delete_workforce_permanently(
             # not including .triggers), so a later change to either can't
             # quietly reintroduce a footgun here.
             db.expunge(trigger)
-            trigger_teardowns.append((trigger, trigger_type, config))
+            trigger_teardowns.append((trigger, trigger_type, config, resource_id))
 
         # WorkforceRun.task_id is ondelete="SET NULL" with a non-cascading
         # Task relationship, and workforce-run tasks default to

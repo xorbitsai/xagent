@@ -49,6 +49,9 @@ UPLOADED_FILE_RECOVERY_INTERVAL_SECONDS = (
 )
 UPLOADED_FILE_RECOVERY_STALE_SECONDS = "XAGENT_UPLOADED_FILE_RECOVERY_STALE_SECONDS"
 UPLOADED_FILE_RECOVERY_BATCH_SIZE = "XAGENT_UPLOADED_FILE_RECOVERY_BATCH_SIZE"
+TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS = (
+    "XAGENT_TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS"
+)
 STORAGE_ROOT = "XAGENT_STORAGE_ROOT"
 NATIVE_BROWSER_ENABLED = "XAGENT_NATIVE_BROWSER_ENABLED"
 NATIVE_BROWSER_APP_NAME = "XAGENT_NATIVE_BROWSER_APP_NAME"
@@ -146,6 +149,9 @@ WORKFORCE_PREVIEW_RUN_STALE_SECONDS = "XAGENT_WORKFORCE_PREVIEW_RUN_STALE_SECOND
 TRIGGER_DISPATCHER_ENABLED = "XAGENT_TRIGGER_DISPATCHER_ENABLED"
 TRIGGER_DISPATCHER_INTERVAL_SECONDS = "XAGENT_TRIGGER_DISPATCHER_INTERVAL_SECONDS"
 TRIGGER_DISPATCHER_BATCH_SIZE = "XAGENT_TRIGGER_DISPATCHER_BATCH_SIZE"
+TRIGGER_DISPATCHER_STARTUP_JITTER_SECONDS = (
+    "XAGENT_TRIGGER_DISPATCHER_STARTUP_JITTER_SECONDS"
+)
 TRIGGER_CALLBACK_RATE_LIMIT = "XAGENT_TRIGGER_CALLBACK_RATE_LIMIT"
 TRIGGER_CALLBACK_IP_RATE_LIMIT = "XAGENT_TRIGGER_CALLBACK_IP_RATE_LIMIT"
 TRIGGER_CRUD_RATE_LIMIT = "XAGENT_TRIGGER_CRUD_RATE_LIMIT"
@@ -206,6 +212,7 @@ OIDC_LOGIN_TTL_SECONDS = "XAGENT_OIDC_LOGIN_TTL_SECONDS"
 OIDC_EXCHANGE_TTL_SECONDS = "XAGENT_OIDC_EXCHANGE_TTL_SECONDS"
 SESSION_SECRET = "XAGENT_SESSION_SECRET"
 OPENROUTER_OFFICIAL_PROVIDERS_ONLY = "XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY"
+XROUTER_EXCLUDED_MODELS = "XAGENT_XROUTER_EXCLUDED_MODELS"
 MCP_OAUTH_ALLOW_PRIVATE_HOSTS = "XAGENT_MCP_OAUTH_ALLOW_PRIVATE_HOSTS"
 MCP_OAUTH_PROXY_URL = "XAGENT_MCP_OAUTH_PROXY_URL"
 TRUSTED_EGRESS_PROXY = "XAGENT_TRUSTED_EGRESS_PROXY"
@@ -415,6 +422,32 @@ def get_uploaded_file_recovery_batch_size() -> int:
     return _get_positive_int_env(UPLOADED_FILE_RECOVERY_BATCH_SIZE, 100)
 
 
+def get_temp_file_cleanup_shutdown_timeout_seconds() -> int:
+    """Get how long shutdown waits for the orphaned temp-file sweep to unwind.
+
+    At shutdown the sweep's cooperative stop flag is set and the handler waits
+    up to this long for the walk to reach its next directory boundary and exit.
+    This bounds only the wait, not the walk: the executor thread is not
+    cancellable, so a long overrun is ultimately joined by asyncio.run()'s
+    teardown. Operators on very large uploads trees may want a larger value.
+
+    Unlike XAGENT_MCP_TOOL_INIT_TIMEOUT_SECONDS and similar getters in this
+    module, "0" is not treated as "disable the timeout" here: it already has
+    a distinct, meaningful value for a wait bound -- "don't wait at all" --
+    which is the opposite of disabling it (waiting forever). So "0" falls
+    back to the default like any other invalid value instead.
+
+    Priority:
+        1. XAGENT_TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS environment variable
+        2. Default of 10 seconds
+
+    Returns:
+        Shutdown grace period in seconds
+    """
+
+    return _get_positive_int_env(TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS, 10)
+
+
 def _get_positive_int_env(env_var: str, default: int, *, minimum: int = 1) -> int:
     value = os.getenv(env_var)
     if value is None:
@@ -574,6 +607,18 @@ def get_smtp_from_name(default: str) -> str:
 def get_openrouter_official_providers_only() -> bool:
     """Return whether OpenRouter requests should pin official provider endpoints."""
     return _get_bool_env(OPENROUTER_OFFICIAL_PROVIDERS_ONLY, False)
+
+
+def get_xrouter_excluded_models() -> tuple[str, ...]:
+    """Return model slugs excluded from xrouter candidate sets.
+
+    The environment value is a comma-separated list. Empty entries are ignored,
+    and duplicates are removed while preserving the configured order.
+    """
+    value = os.getenv(XROUTER_EXCLUDED_MODELS, "")
+    return tuple(
+        dict.fromkeys(item.strip() for item in value.split(",") if item.strip())
+    )
 
 
 def get_mcp_oauth_allow_private_hosts() -> bool:
@@ -1040,6 +1085,32 @@ def get_trigger_dispatcher_batch_size() -> int:
         TRIGGER_DISPATCHER_BATCH_SIZE,
         20,
         minimum=1,
+    )
+
+
+def get_trigger_dispatcher_startup_jitter_seconds() -> int:
+    """Return the max random delay before the dispatcher's first tick.
+
+    Priority:
+        1. XAGENT_TRIGGER_DISPATCHER_STARTUP_JITTER_SECONDS environment
+           variable
+        2. Default 30
+
+    A container restart brings every trigger that fell due while it was
+    down (Gmail watch renewals, scheduled triggers) up for processing all
+    at once, and the dispatcher's first tick runs immediately on startup --
+    before egress networking may be fully warmed up. This delay pushes that
+    first tick past the likely warm-up window; it does not shrink how much
+    that tick processes (still gated by the dispatcher's own batch-size and
+    scan-limit settings), only when it starts. On a multi-replica rolling
+    restart it also desyncs every replica's first tick from firing at the
+    same instant, spreading their combined load across the window instead
+    of concentrating it in a single moment. 0 disables the delay.
+    """
+    return _get_positive_int_env(
+        TRIGGER_DISPATCHER_STARTUP_JITTER_SECONDS,
+        30,
+        minimum=0,
     )
 
 

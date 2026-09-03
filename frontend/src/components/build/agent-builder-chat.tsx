@@ -14,6 +14,7 @@ import {
 import { useI18n } from "@/contexts/i18n-context"
 import { toast } from "@/components/ui/sonner"
 import { getBrandingFromEnv } from "@/lib/branding"
+import { normalizeUploadFileIds } from "@/lib/upload-file-ids"
 
 import { Interaction } from "@/contexts/app-context-chat"
 
@@ -202,9 +203,16 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
           }
           const uploadData = parsed.data;
           if (isJsonRecord(uploadData) && uploadData.success && Array.isArray(uploadData.files)) {
+            const normalizedFileIds = normalizeUploadFileIds(
+              uploadData.files.map((file) => isJsonRecord(file) ? file.file_id : undefined),
+              filesToUpload.length,
+            )
+            if (!normalizedFileIds) {
+              throw new Error("Failed to upload files")
+            }
             uploadedFileIds.push(
-              ...uploadData.files.map((f: any) => ({
-                file_id: f.file_id,
+              ...uploadData.files.map((f: any, index) => ({
+                file_id: normalizedFileIds[index],
                 name: f.filename || '',
                 size: f.file_size || 0,
                 type: f.mime_type || '',
@@ -212,6 +220,18 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
             );
           }
         }
+
+        const normalizedFileIds = normalizeUploadFileIds(
+          uploadedFileIds.map((file) => file.file_id),
+          files.length,
+        )
+        if (!normalizedFileIds) {
+          throw new Error("Failed to upload files")
+        }
+        uploadedFileIds = uploadedFileIds.map((file, index) => ({
+          ...file,
+          file_id: normalizedFileIds[index],
+        }))
       } catch (err) {
         console.error("Failed to upload files", err);
         toast.error(err instanceof Error ? err.message : "Failed to upload files");

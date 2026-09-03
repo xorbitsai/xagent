@@ -7,6 +7,7 @@ import {
   parseApiResponse,
 } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
+import { resolveReportedTimezone } from "@/hooks/use-websocket"
 import type {
   WorkforceAgentOption,
   WorkforceAgentExecution,
@@ -305,11 +306,23 @@ export async function removeWorkforceAgent(
   }
 }
 
+// The workforce opening turn starts inside this HTTP request and never reaches
+// the websocket send path, so the zone is attached here. An explicit value on
+// the payload wins; otherwise fall back to the browser/data-timezone resolution.
+function withReportedTimezone<T extends { timezone?: string }>(payload: T): T {
+  if (payload.timezone) return payload
+  const timezone = resolveReportedTimezone()
+  return timezone ? { ...payload, timezone } : payload
+}
+
+
 export async function runWorkforce(
   workforceId: number | string,
   payload: WorkforceRunPayload | string,
 ): Promise<WorkforceRunResponse> {
-  const body = typeof payload === "string" ? { message: payload } : payload
+  const body = withReportedTimezone(
+    typeof payload === "string" ? { message: payload } : payload,
+  )
   const response = await apiRequest(`${getApiUrl()}/api/workforces/${workforceId}/runs`, {
     method: "POST",
     headers: jsonHeaders(),
@@ -327,7 +340,7 @@ export async function runWorkforcePreview(
   const response = await apiRequest(`${getApiUrl()}/api/workforces/preview/runs`, {
     method: "POST",
     headers: jsonHeaders(),
-    body: JSON.stringify(payload),
+    body: JSON.stringify(withReportedTimezone(payload)),
   })
   if (!response.ok) {
     throw await parseApiError(response, "Failed to run workforce preview")

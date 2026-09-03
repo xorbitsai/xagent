@@ -68,17 +68,40 @@ reason as the reader fallback documented above: a reader keys off
 asking the legacy question again.
 
 The replay ``AgentRunner.inject_user_message`` short-circuits on a
-repeated turn id is not a window of that same benign family, and is
-not covered by the argument above. A replay persists nothing and still
-reports success to its caller, so an injection site cannot tell it from
-a first attempt; the row that site observed before calling is then not
-the question the replayed message answered but whatever the resumed
-agent has asked since, and closing it retires a live question instead
-of leaving a stale one behind. That is the opposite failure from the
-one this paragraph describes, and it is not fixed here -- see the
-comment at the online WebSocket injection site (``websocket.py``) for
-the precondition it puts on the change that wires the first production
-writer.
+repeated turn id is not a window of that same benign family. A replay
+persists nothing, so the first attempt has already retired the question
+it answered, and an id read for a later attempt names whatever the
+resumed agent has staged since; closing on that id would retire a live
+question instead of leaving a stale one behind. The injection layer
+reports which case it is -- ``UserMessageInjectionOutcome`` on
+``AgentRunner.inject_user_message`` and everything that forwards its
+result, rather than the same truthy value a fresh write produces -- and
+the three injection sites that can see a replay close only on
+``POSTED_FRESH``.
+
+Those three are not exposed to the same degree, and the guard means
+something different at each. The online WebSocket site and the A2A
+resume-input site both read the id fresh on every attempt
+(``active_interaction_id_sync`` immediately before their own injection
+call), so on a replay the id they hold is exactly the live question
+described above and the guard is what keeps them off it. The deferred
+WebSocket site does not re-read: it carries the id the online handler
+observed on the first attempt through ``pending_user_message``, and the
+close statement binds to that primary key, so a replay there can only
+name the row the first attempt already retired -- the close would be a
+no-op, not a hazard. Its guard is defense in depth, held in place so the
+site cannot quietly become dangerous if it is ever changed to derive its
+own key.
+
+The fourth production caller, the v1 ``POST .../reply`` resume-input
+path (``task_reply.py``), carries no guard at all and needs none: it
+builds its turn id as ``f"v1:reply:{task_id}:{uuid4()}"``, a value that
+is fresh on every single call, so it can never present a repeated turn
+id and can never reach the short circuit that produces a replay.
+
+This module's own close statement, and the lock-ordering obligation each
+caller carries, are unchanged by that guard: it decides whether the call
+happens, not what the call does.
 
 The close statement binds to one primary key, read before the injection
 by ``active_interaction_id_sync`` and carried to the close by whichever

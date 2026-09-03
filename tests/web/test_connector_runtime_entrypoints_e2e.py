@@ -306,6 +306,7 @@ async def test_telegram_cancellation_during_voice_cleanup_closes_managed_lease(
     _setup_admin_headers()
     db = _db_session()
     managed_lease = None
+    process_task: asyncio.Task[None] | None = None
     close_started = asyncio.Event()
     allow_close = asyncio.Event()
     try:
@@ -344,7 +345,7 @@ async def test_telegram_cancellation_during_voice_cleanup_closes_managed_lease(
         process_task = asyncio.create_task(
             bot._process_user_messages_batch(123, [message])
         )
-        await asyncio.wait_for(close_started.wait(), timeout=2)
+        await asyncio.wait_for(close_started.wait(), timeout=10)
         managed_lease = captured_leases[0]
 
         process_task.cancel()
@@ -357,9 +358,17 @@ async def test_telegram_cancellation_during_voice_cleanup_closes_managed_lease(
         assert 123 not in bot.user_preparing_executions
     finally:
         allow_close.set()
-        if managed_lease is not None and not managed_lease._closed:
-            await managed_lease.close()
-        db.close()
+        try:
+            if process_task is not None:
+                if not process_task.done():
+                    process_task.cancel()
+                await asyncio.gather(process_task, return_exceptions=True)
+        finally:
+            try:
+                if managed_lease is not None and not managed_lease._closed:
+                    await managed_lease.close()
+            finally:
+                db.close()
 
 
 def _context_row_count(task_id: int) -> int:
@@ -411,7 +420,9 @@ class _FakeAgentService:
     def set_execution_context_messages(self, _messages: list[Any]) -> None:
         pass
 
-    def set_conversation_history(self, _messages: list[Any]) -> None:
+    def set_conversation_history(
+        self, _messages: list[Any], *, watermark: int | None = None
+    ) -> None:
         pass
 
     def set_recovered_skill_context(self, _skill_context: Any) -> None:

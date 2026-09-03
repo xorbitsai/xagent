@@ -115,6 +115,15 @@ class CreateTaskRequest(BaseModel):
             "validated and applied below the LLM/tool-argument layer."
         ),
     )
+    timezone: Optional[str] = Field(
+        default=None,
+        max_length=64,
+        description=(
+            "IANA timezone name for the end user's local clock, used to render "
+            "the date the agent reasons from. Omit to keep UTC. An "
+            "unresolvable name degrades to UTC rather than failing the request."
+        ),
+    )
 
 
 class UploadedFileInfo(BaseModel):
@@ -486,6 +495,14 @@ class CreateWorkforceRunRequest(BaseModel):
         description=(
             "Caller-supplied dedup token. A retry with the same key returns "
             "the original run rather than creating a new one."
+        ),
+    )
+    timezone: Optional[str] = Field(
+        default=None,
+        description=(
+            "IANA timezone name for the end user's local clock, used to render "
+            "the date the workforce reasons from. Omit to keep UTC. An "
+            "unresolvable name degrades to UTC rather than failing the request."
         ),
     )
 

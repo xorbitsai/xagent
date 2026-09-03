@@ -89,6 +89,13 @@ from ...result import (
     unwrap_final_answer_content,
 )
 from ...runtime import (
+    DISCARDED_BUNDLED_FINAL_ANSWER_REASON,
+    INTERRUPTED_DURING_LLM_STREAM_REASON,
+    INVALID_TOOL_PROTOCOL_AFTER_RECOVERY_REASON,
+    INVALID_TOOL_PROTOCOL_AFTER_RETRY_REASON,
+    INVALID_TOOL_PROTOCOL_RETRYING_REASON,
+    NO_DELIVERABLE_FINAL_ANSWER_REASON,
+    UNAVAILABLE_TOOL_CALL_RESTORING_TOOLS_REASON,
     ExecutionInterrupted,
     LLMCallInterrupted,
     PatternRuntime,
@@ -168,8 +175,107 @@ class ToolCallRecord:
         )
 
 
+# Every code point that Python's str.strip() or JavaScript's
+# String.prototype.trim() treats as trimmable: ECMA-262 WhiteSpace (TAB VT FF
+# ZWNBSP + Unicode Zs) and LineTerminator (LF CR LS PS), unioned with the five
+# extra code points CPython's str.strip() treats as whitespace (U+001C-U+001F,
+# U+0085).
+#
+# The table is frozen as a literal instead of derived from CPython's
+# whitespace table for two reasons: (1) this invariant runs in the direction
+# "whatever JavaScript trims, we must also trim", and CPython's whitespace
+# table shifts with the Unicode version bundled in each interpreter release;
+# (2) the normalized value is written back into item["field"], and the
+# frontend's own trim() must be a no-op on the result -- that only holds
+# while this table is a superset of the JavaScript table, which the coverage
+# test in tests/core/agent/test_react.py pins down.
+#
+# Every code point is written as an escape, never a literal: several of them
+# (U+2028/U+2029 in particular) are silently rewritten by some editors and
+# transports when they appear as literal bytes.
+_INTERACTION_TRIM_CHARS = (
+    "\t\n\v\f\r\x1c\x1d\x1e\x1f\x20\x85\xa0"
+    "\u1680\u2000\u2001\u2002\u2003\u2004\u2005"
+    "\u2006\u2007\u2008\u2009\u200a"
+    "\u2028\u2029\u202f\u205f\u3000\ufeff"
+)  # 30 code points
+
+
+def _normalize_interaction_text(value: str) -> str:
+    """Strip every code point either Python or JavaScript treats as trimmable.
+
+    One pass over one union table, deliberately -- not ``value.strip()``
+    followed by a second pass over the JavaScript-only characters.
+
+    One pass is a fixed point by construction: ``str.strip(chars)`` deletes
+    from both ends up to the first character not in ``chars``, so the
+    returned value's first and last characters are, by definition, not in
+    ``chars``; stripping the same ``chars`` again is the identity. That is
+    what lets the caller write the result back into ``item["field"]`` and
+    rely on the frontend's own ``trim()`` being a no-op on it.
+
+    Two passes over two different tables would not be a fixed point: each
+    pass stops at a character its own table does not contain, and that
+    stopping point says nothing about the other table -- e.g. a value
+    starting with U+FEFF then U+001C would have the first pass halt
+    immediately on U+FEFF (Python does not treat it as space), then a second
+    pass over the JavaScript-only characters would remove U+FEFF and halt on
+    U+001C (JavaScript does not trim it), leaving U+001C behind. Do not
+    "optimize" this back into two passes.
+    """
+    return value.strip(_INTERACTION_TRIM_CHARS)
+
+
+def _is_non_blank_str(value: Any) -> bool:
+    """True when value is a string that stays non-empty after
+    _normalize_interaction_text -- the blankness judgment shared by option
+    label/value filtering and field-name fallback. Takes Any (not str) so
+    the isinstance check and the trim happen together, on the same value:
+    calling _normalize_interaction_text directly on a fresh dict.get(...)
+    expression defeats type-narrowing across the two calls.
+    """
+    return isinstance(value, str) and bool(_normalize_interaction_text(value))
+
+
 def _normalize_ask_user_interactions(interactions: Any) -> list[dict[str, Any]]:
-    """Normalize common model variants into the frontend interaction contract."""
+    """Normalize common model variants into the frontend interaction contract.
+
+    A label or value that is blank after ``_normalize_interaction_text`` is
+    treated the same as missing: the option is dropped. A field name that is
+    blank after normalization falls back to ``response_{index}``; a
+    well-formed field name is normalized and written back so the frontend's
+    own ``trim()`` is a no-op on it. Survivors are otherwise kept verbatim --
+    only blankness is judged here, not content.
+
+    The alias chain ``field or id or name`` intentionally keeps its raw
+    truthiness check; it is not normalization-aware. The frontend's own
+    alias chains (clarification-form.tsx, app-context-chat.tsx) make the
+    same raw-truthiness choice, and because this function always writes its
+    result back into ``item["field"]``, the frontend never evaluates its own
+    ``id``/``name`` fallback for a field this function has already resolved
+    -- so this stays consistent with the frontend regardless of which one
+    changes first.
+
+    This function does not deduplicate field names within a single call: it
+    keeps every colliding entry as its own interaction rather than dropping
+    or renaming one. Each one still goes through every other step above --
+    its field is trimmed, its options are filtered, ``actions`` is stripped
+    -- only the name collision itself is left as-is, and a warning is
+    logged. Both call sites deduplicate afterward, in the same shape
+    (append ``_2``, ``_3`` to a repeated base) but at different scope: the
+    single-tool call site (``ask_user_question`` in ``_handle_control_tool``)
+    deduplicates within that one call's own interactions only. The
+    multi-tool call site (``_pause_for_tool_results``) runs its own
+    deduplication across all tools' interactions after calling this
+    function once per tool, so a base already used by an earlier tool in
+    the same batch is not reused by a later one either.
+
+    The output never carries an ``actions`` key: ``actions`` is a model
+    alias for ``options`` (consumed above whenever ``options`` itself is
+    missing or not a list, and ``actions`` is itself a list), and leaving
+    the raw, unfiltered alias in the output would give the persisted row a
+    second, never-filtered carrier of the same option list.
+    """
 
     if not isinstance(interactions, list):
         return []
@@ -181,16 +287,26 @@ def _normalize_ask_user_interactions(interactions: Any) -> list[dict[str, Any]]:
 
         item = dict(interaction)
         field = item.get("field") or item.get("id") or item.get("name")
-        if not isinstance(field, str) or not field.strip():
-            field = f"response_{index}"
-        item["field"] = field.strip()
+        normalized_field = (
+            _normalize_interaction_text(field) if isinstance(field, str) else ""
+        )
+        item["field"] = normalized_field or f"response_{index}"
 
-        if "options" not in item and isinstance(item.get("actions"), list):
+        # Widened from "options" not in item: an interaction can carry both
+        # a malformed options (present but not a list) and a well-formed
+        # actions alias, and the alias is the only place the real data
+        # lives in that shape -- narrower than "not in item" would leave
+        # the alias unconsumed and drop every option for that interaction
+        # (verified: the malformed-options-plus-actions case loses all its
+        # options under the narrower condition).
+        if not isinstance(item.get("options"), list) and isinstance(
+            item.get("actions"), list
+        ):
             item["options"] = item["actions"]
 
         options = item.get("options")
         if isinstance(options, list):
-            item["options"] = [
+            filtered_options = [
                 {
                     key: value
                     for key, value in {
@@ -203,13 +319,79 @@ def _normalize_ask_user_interactions(interactions: Any) -> list[dict[str, Any]]:
                 }
                 for option in options
                 if isinstance(option, dict)
-                and isinstance(option.get("label"), str)
-                and option.get("label")
-                and isinstance(option.get("value"), str)
-                and option.get("value")
+                and _is_non_blank_str(option.get("label"))
+                and _is_non_blank_str(option.get("value"))
             ]
+            if options and not filtered_options:
+                # All options for this interaction were blank. The
+                # interaction is still emitted (the question still goes
+                # out), so this is the only signal that it happened. This
+                # warning's payload is bounded to integer counts, never the
+                # model-controlled field name -- the same discipline
+                # STRIP_LOG_MAX_TOOL_NAMES above applies to tool names, but
+                # that is this warning's own choice, not a blanket rule for
+                # every log call in this module (several elsewhere put raw
+                # tool names or argument keys straight into the message).
+                logger.warning(
+                    "ask_user_question dropped all %d option(s) for interaction %d",
+                    len(options),
+                    index,
+                    extra={
+                        "dropped": len(options),
+                        "total": len(options),
+                        "interaction_index": index,
+                    },
+                )
+            item["options"] = filtered_options
+        elif "options" in item:
+            # options is present but neither a list nor rescued by the
+            # actions alias above -- a malformed shape this function has
+            # always left untouched, but silently: nothing signaled that
+            # it happened. Same payload discipline as the other two
+            # warnings in this function: bounded, integer-only.
+            logger.warning(
+                "ask_user_question interaction %d has a non-list options value",
+                index,
+                extra={"interaction_index": index},
+            )
+
+        # Leave only one carrier of the option list in the output. Whether
+        # or not the alias branch above used actions to seed options,
+        # item["actions"] itself is never touched by the filter step above
+        # (that step reassigns item["options"] to a new, filtered list and
+        # leaves the actions key exactly as the model gave it) -- so
+        # whatever is left under item["actions"] is always the original,
+        # unfiltered list: either the same content options was seeded
+        # from, pre-filter, or, when options was itself already a list, a
+        # completely unrelated list the filter never saw. Either way,
+        # leaving it in the output gives the persisted row a second,
+        # unfiltered carrier of option data that gets stored verbatim into
+        # task_chat_messages.interactions and replayed unchanged.
+        # Unconditional so this holds regardless of whether options ended
+        # up a list -- must run after the alias branch above, not before:
+        # popping actions first would delete the only place a malformed
+        # options's real data lives before the alias branch can consume it,
+        # dropping every option for that interaction.
+        item.pop("actions", None)
 
         normalized.append(item)
+
+    field_counts: dict[str, int] = {}
+    for item in normalized:
+        field_counts[item["field"]] = field_counts.get(item["field"], 0) + 1
+    colliding_field_count = sum(1 for count in field_counts.values() if count > 1)
+    if colliding_field_count:
+        # Same payload discipline as the other warnings in this function:
+        # integer counts only, never the colliding field name itself.
+        logger.warning(
+            "ask_user_question interactions have %d colliding field name(s) out of %d",
+            colliding_field_count,
+            len(normalized),
+            extra={
+                "colliding_field_count": colliding_field_count,
+                "total": len(normalized),
+            },
+        )
 
     return normalized
 
@@ -494,7 +676,21 @@ class ReActPattern(AgentPattern):
             }
             await runtime.compact_context_if_needed(
                 context=context,
-                llm=compact_llm,
+                # Fall back to the main model when no compact model is
+                # configured. PatternRuntime skips summarization entirely
+                # without one and drops all but the last few messages
+                # instead, losing what the agent actually did; agent preview
+                # and delegated sub-agents resolve the compact slot on their
+                # own and validate only the default model, so an empty slot
+                # is ordinary rather than exceptional.
+                #
+                # Substituting here, rather than defaulting the field further
+                # up, keeps "unset" distinguishable from "explicitly set to
+                # the main model" -- and hands compaction the *resolved*
+                # per-call model, so a virtual model reuses this turn's
+                # routing decision instead of routing again on the compaction
+                # prompt, whose only user message is the whole transcript.
+                llm=compact_llm if compact_llm is not None else call_llm,
                 metadata={"iteration": iteration},
             )
 
@@ -538,7 +734,7 @@ class ReActPattern(AgentPattern):
                     response = await runtime.stream_final_answer(call_llm, **llm_kwargs)
             except LLMCallInterrupted:
                 if answer_streamer is not None:
-                    await answer_streamer.fail("interrupted during LLM stream")
+                    await answer_streamer.fail(INTERRUPTED_DURING_LLM_STREAM_REASON)
                 interrupted = await self._interrupt_if_requested(
                     runtime=runtime,
                     context=context,
@@ -551,7 +747,7 @@ class ReActPattern(AgentPattern):
                 unavailable_tool_call = exc.code == "unavailable_tool_call"
                 if answer_streamer is not None:
                     await answer_streamer.fail(
-                        "unavailable tool call, restoring available tools"
+                        UNAVAILABLE_TOOL_CALL_RESTORING_TOOLS_REASON
                         if unavailable_tool_call
                         else f"invalid {exc.code} tool protocol, retrying"
                     )
@@ -624,13 +820,13 @@ class ReActPattern(AgentPattern):
                         context=context,
                         iteration=iteration,
                         answer_streamer=answer_streamer,
-                        stream_failure_message=("invalid tool protocol after recovery"),
+                        stream_failure_message=INVALID_TOOL_PROTOCOL_AFTER_RECOVERY_REASON,
                         empty_final_answer=(
                             self._empty_final_answer_call(normalized) is not None
                         ),
                     )
                 if answer_streamer is not None:
-                    await answer_streamer.fail("invalid tool protocol, retrying")
+                    await answer_streamer.fail(INVALID_TOOL_PROTOCOL_RETRYING_REASON)
                 # Rejecting the whole response drops any assistant preamble it
                 # carried: the response is discarded before ``add_assistant_message``,
                 # so the retry rebuilds from context without it. Deliberate - the
@@ -697,7 +893,7 @@ class ReActPattern(AgentPattern):
                         context=context,
                         iteration=iteration,
                         answer_streamer=answer_streamer,
-                        stream_failure_message="invalid tool protocol after retry",
+                        stream_failure_message=INVALID_TOOL_PROTOCOL_AFTER_RETRY_REASON,
                         empty_final_answer=(
                             self._empty_final_answer_call(normalized) is not None
                         ),
@@ -722,16 +918,17 @@ class ReActPattern(AgentPattern):
                     # The discarded text may already be streaming to the UI.
                     # Nothing downstream closes that stream once the batch no
                     # longer carries a final_answer, so close it here.
-                    await answer_streamer.fail(
-                        "discarded an answer that arrived together with tool "
-                        "calls; answering again once the tools have run"
-                    )
+                    await answer_streamer.fail(DISCARDED_BUNDLED_FINAL_ANSWER_REASON)
             if force_final_answer_now and not normalized.get("tool_calls"):
                 normalized["done"] = True
 
             assistant_content = normalized.get("content")
             tool_calls = normalized.get("tool_calls", [])
             if assistant_content is not None or normalized.get("tool_calls"):
+                # A tool-protocol error response never carries tool_calls (see
+                # tool_protocol_error_response), so this guard never mistakes
+                # a protocol violation for a real tool-call turn worth saving
+                # provider state for.
                 metadata = (
                     self._provider_state_for_context(normalized) if tool_calls else {}
                 )
@@ -745,7 +942,7 @@ class ReActPattern(AgentPattern):
                 )
 
             if answer_streamer is not None:
-                await self._finish_streamed_answer_if_final(
+                await self._close_streamed_answer(
                     answer_streamer=answer_streamer,
                     assistant_content=assistant_content,
                     tool_calls=tool_calls,
@@ -835,33 +1032,56 @@ class ReActPattern(AgentPattern):
             },
         ).to_dict()
 
-    async def _finish_streamed_answer_if_final(
+    async def _close_streamed_answer(
         self,
         *,
         answer_streamer: ReActFinalAnswerStreamer,
         assistant_content: Any,
         tool_calls: list[dict[str, Any]],
     ) -> None:
+        """Ensure a started answer stream reaches exactly one terminal event.
+
+        The branches below are R0 (nothing streamed - no-op), R1
+        (``tool_calls[0]`` is a ``final_answer`` with a non-blank answer and
+        no disabled user-interaction control tool in the batch, per
+        ``_disabled_control_tool_index`` - ``finish`` with that answer's
+        exact, unstripped text, the same text ``_handle_control_tool``
+        delivers), R2 (no tool calls, plain assistant text - ``finish`` with
+        that text) and R3 (anything else - ``fail`` with a fixed reason;
+        ``fail`` is a no-op for a stream already closed earlier in this
+        response).
+
+        Do not relax R1's first-position condition. A later ``final_answer``
+        in a mixed batch can still be delivered
+        (``_execute_pending_tool_calls`` keeps walking past e.g. a
+        ``send_message`` that expects no response), but such a batch never
+        leaves an open stream to close: ``ReActFinalAnswerStreamer``
+        permanently disables itself as soon as a non-``final_answer`` tool
+        name appears in the response, before any answer content for a
+        non-first ``final_answer`` has accumulated, so R0 applies. Relaxing
+        the condition would finish streams with candidates whose delivery
+        this method has not checked. Do not turn R3 into a ``finish`` to
+        avoid the error event it produces - that would report an undelivered
+        candidate as the completed answer.
+        """
+
         if not answer_streamer.started:
             return
-        final_answer = self._final_answer_tool_content(tool_calls)
-        if final_answer is not None and len(tool_calls) == 1:
-            await answer_streamer.finish(final_answer)
-            return
+        if tool_calls and tool_calls[0].get("name") == "final_answer":
+            answer = self._final_answer_text(tool_calls[0].get("args"))
+            if answer.strip() and (
+                self._disabled_control_tool_index(
+                    tool_calls,
+                    user_interaction_enabled=self.user_interaction_enabled,
+                )
+                is None
+            ):
+                await answer_streamer.finish(answer)
+                return
         if not tool_calls and assistant_content is not None:
             await answer_streamer.finish(str(assistant_content))
-
-    def _final_answer_tool_content(
-        self,
-        tool_calls: list[dict[str, Any]],
-    ) -> str | None:
-        for tool_call in tool_calls:
-            if tool_call.get("name") != "final_answer":
-                continue
-            args = tool_call.get("args")
-            if isinstance(args, dict):
-                return self._final_answer_text(args)
-        return None
+            return
+        await answer_streamer.fail(NO_DELIVERABLE_FINAL_ANSWER_REASON)
 
     def _messages_for_llm(
         self,
@@ -898,11 +1118,15 @@ class ReActPattern(AgentPattern):
             )
             clock_zone_label = clock_zone.key if clock_zone is not None else "UTC"
             missing_information_instruction = (
-                "If a tool needs missing information from the user, call "
+                "If a tool needs missing information from the user, including a "
+                "fact-carrying argument value (one that asserts a real-world "
+                "fact) the user has not provided, call "
                 "ask_user_question; do not ask the question as plain assistant "
-                "text. "
+                "text and do not fill the value in yourself. "
                 if self.user_interaction_enabled
-                else "If missing user information prevents completion, do not ask "
+                else "If missing user information prevents completion, including a "
+                "fact-carrying argument value (one that asserts a real-world fact) "
+                "the user has not provided, do not ask "
                 "the user or attempt an unavailable interaction tool; finish with "
                 "outcome=blocked and explain what is missing. "
             )
@@ -931,10 +1155,13 @@ class ReActPattern(AgentPattern):
                 "When writing any final user-facing response, including plain "
                 "assistant text: "
                 f"{final_deliverable_file_reference_instructions(can_lookup=can_lookup_output_files, include_heading=False)}\n\n"
-                f"Current date ({clock_zone_label}): {current_date}. "
+                f"Turn-start date ({clock_zone_label}): {current_date}. "
                 "For recent, latest, current, or time-sensitive requests, use this "
-                "date when forming search queries and judging source relevance. Only call "
-                "tools that are present in the current tool schema for this LLM call; "
+                "date when forming search queries and judging source relevance. If the "
+                "exact current time matters or the turn may have crossed midnight, call "
+                "the get_current_time tool if it is available. "
+                "Only call tools that are present in the current tool schema for this "
+                "LLM call; "
                 "tool names mentioned in memory, previous tasks, plans, or error "
                 "messages are unavailable unless they are included in the current "
                 "schema. If a selected skill is already present in the system "
@@ -1076,7 +1303,7 @@ class ReActPattern(AgentPattern):
                 on_chunk=answer_streamer.handle_chunk,
             )
         except LLMCallInterrupted:
-            await answer_streamer.fail("interrupted during LLM stream")
+            await answer_streamer.fail(INTERRUPTED_DURING_LLM_STREAM_REASON)
             raise
         except Exception as exc:
             await answer_streamer.fail(str(exc))
@@ -1938,11 +2165,16 @@ class ReActPattern(AgentPattern):
                         "the user responds. Use this only when execution cannot "
                         "continue without missing user-provided information, such "
                         "as a required file, URL, account, target object, permission, "
+                        "a fact-carrying value (one that asserts a real-world fact) "
+                        "for a tool argument that the user has not provided, "
                         "or a choice between mutually exclusive actions with "
                         "different side effects. Do not use it to confirm execution "
                         "strategy, whether to search, whether to use memory, whether "
                         "to apply formatting preferences, or whether to proceed with "
-                        "a sufficiently specified task; decide those yourself."
+                        "a sufficiently specified task; decide those yourself. A task "
+                        "is not sufficiently specified if carrying it out would "
+                        "require inventing a fact-carrying argument value the user "
+                        "has not provided."
                     ),
                     "parameters": {
                         "type": "object",
@@ -2109,7 +2341,7 @@ class ReActPattern(AgentPattern):
             expect_response = bool(args.get("expect_response", False))
             message_type = str(args.get("message_type", "info"))
             visible = bool(args.get("visible", True))
-            await runtime.send_message(
+            outbound_message = await runtime.send_message(
                 message=message,
                 message_type=message_type,
                 expect_response=expect_response,
@@ -2136,6 +2368,7 @@ class ReActPattern(AgentPattern):
                     tool_call_id=tool_call.get("id"),
                 )
                 self.waiting_for_user_request = {
+                    "event_id": outbound_message["event_id"],
                     "tool_call_id": tool_call.get("id"),
                     "tool_name": name,
                     "message": message,
@@ -2173,7 +2406,27 @@ class ReActPattern(AgentPattern):
             interactions = _normalize_ask_user_interactions(
                 args.get("interactions", [])
             )
-            await runtime.send_message(
+            # Same dedup shape _pause_for_tool_results runs on the multi-tool
+            # path (append _2, _3 to a repeated base, first occupant keeps
+            # its own name), the only legitimate difference being scope:
+            # used_fields here spans only this one call's own interactions,
+            # never a sibling tool's, because this branch has no sibling
+            # tool to collide with.
+            used_fields: set[str] = set()
+            deduplicated_interactions: list[dict[str, Any]] = []
+            for interaction in interactions:
+                item = dict(interaction)
+                base_field = str(item.get("field") or "response")
+                field = base_field
+                suffix = 2
+                while field in used_fields:
+                    field = f"{base_field}_{suffix}"
+                    suffix += 1
+                item["field"] = field
+                used_fields.add(field)
+                deduplicated_interactions.append(item)
+            interactions = deduplicated_interactions
+            outbound_message = await runtime.send_message(
                 message=message,
                 message_type="question",
                 expect_response=True,
@@ -2201,6 +2454,7 @@ class ReActPattern(AgentPattern):
                 tool_call_id=tool_call.get("id"),
             )
             self.waiting_for_user_request = {
+                "event_id": outbound_message["event_id"],
                 "tool_call_id": tool_call.get("id"),
                 "tool_name": name,
                 "message": message,
@@ -2493,7 +2747,7 @@ class ReActPattern(AgentPattern):
             )
             message_type = "question"
 
-        await runtime.send_message(
+        outbound_message = await runtime.send_message(
             message=message,
             message_type=message_type,
             expect_response=True,
@@ -2502,6 +2756,7 @@ class ReActPattern(AgentPattern):
         )
         self.status = "waiting_for_user"
         self.waiting_for_user_request = {
+            "event_id": outbound_message["event_id"],
             "kind": "tool_waiting_for_user",
             "requests": requests,
             "message": message,
@@ -2633,6 +2888,33 @@ class ReActPattern(AgentPattern):
             if record is not None:
                 self.tool_ledger[tool_id] = record
 
+    def _disabled_control_tool_index(
+        self,
+        tool_calls: list[dict[str, Any]],
+        *,
+        user_interaction_enabled: bool,
+    ) -> int | None:
+        """Index of the first disabled user-interaction control tool, if any.
+
+        Shared by ``_execute_pending_tool_calls`` (which cancels every call
+        ahead of that index) and ``_close_streamed_answer`` (which must treat
+        a batch the same way whether or not its first call has already run).
+        Both callers pass their own ``user_interaction_enabled`` state rather
+        than this reading ``self`` directly, so the two call sites cannot
+        silently drift onto different predicates.
+        """
+
+        if user_interaction_enabled:
+            return None
+        return next(
+            (
+                index
+                for index, pending in enumerate(tool_calls)
+                if pending.get("name") in USER_INTERACTION_CONTROL_TOOL_NAMES
+            ),
+            None,
+        )
+
     async def _execute_pending_tool_calls(
         self,
         *,
@@ -2642,13 +2924,9 @@ class ReActPattern(AgentPattern):
         runtime: PatternRuntime,
     ) -> dict[str, Any] | None:
         if not self.user_interaction_enabled:
-            disabled_index = next(
-                (
-                    index
-                    for index, pending in enumerate(self.pending_tool_calls)
-                    if pending.get("name") in USER_INTERACTION_CONTROL_TOOL_NAMES
-                ),
-                None,
+            disabled_index = self._disabled_control_tool_index(
+                self.pending_tool_calls,
+                user_interaction_enabled=self.user_interaction_enabled,
             )
             if disabled_index is not None:
                 preceding = self.pending_tool_calls[:disabled_index]

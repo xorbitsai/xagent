@@ -9,7 +9,9 @@ import { useApp } from "@/contexts/app-context-chat";
 import { useAuth } from "@/contexts/auth-context";
 import { ConfigDialog } from "@/components/config-dialog";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper";
+import { apiRequest, classifyUploadError, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper";
+import { clientErrorTranslationKey, readClientErrorCode } from "@/lib/client-errors";
+import { normalizeUploadFileIds } from "@/lib/upload-file-ids";
 import { sanitizeFilesDisabledPresentationText } from "@/lib/files-disabled-presentation";
 import { isPausableTaskStatus, isStoppedTaskStatus, normalizeTaskStatus, type TaskStatus } from "@/lib/task-status";
 import { useFileMention, FileItem } from "@/hooks/use-file-mention";
@@ -42,6 +44,7 @@ interface ChatInputProps {
   onModeChange?: (mode: "task" | "process") => void;
   inputValue?: string;
   onInputChange?: (value: string) => void;
+  currentInteractionRequestId?: string;
   // Fires on the editor's own focus/blur, independent of `isLoading`/task
   // status - lets a controlled caller know it's currently unsafe to rely
   // on a programmatic `inputValue` change being reflected in the visible
@@ -84,6 +87,7 @@ interface AgentConfig {
   memorySimilarityThreshold?: number;
   executionMode?: ExecutionModeConfig;
   clientMessageId?: string;
+  metadata?: Record<string, unknown>;
   runtimeExtensions?: Record<string, Record<string, unknown>>;
 }
 
@@ -107,6 +111,7 @@ export function ChatInput({
   mode,
   inputValue,
   onInputChange,
+  currentInteractionRequestId,
   onFocusChange,
   taskStatus,
   onPause,
@@ -143,6 +148,7 @@ export function ChatInput({
   const containerRef = useRef<HTMLDivElement>(null);
   const isSubmittingRef = useRef(false);
   const deliveryAttemptRef = useRef<{ key: string; clientMessageId: string } | null>(null);
+  const draftRequestSnapshotRef = useRef<{ requestId: string | undefined } | null>(null);
   const dragDepthRef = useRef(0);
   const { t } = useI18n();
   const { user } = useAuth();
@@ -359,6 +365,7 @@ export function ChatInput({
     });
 
     const failedFiles = new Set<File>();
+    const uploadedFileIds = new Map<File, string>();
     let uploadErrorMessage: string | null = null;
 
     // Upload files individually to ensure better reliability and progress tracking
@@ -372,8 +379,9 @@ export function ChatInput({
 
         if (uploadFile) {
           const result = await uploadFile(file, { taskType: currentTaskType });
-          if (result && typeof result.file_id === 'string') {
-            (file as File & { file_id?: string }).file_id = result.file_id;
+          const fileId = normalizeUploadFileIds([result?.file_id], 1)?.[0] ?? null;
+          if (fileId) {
+            uploadedFileIds.set(file, fileId);
           } else {
             failedFiles.add(file);
           }
@@ -391,20 +399,15 @@ export function ChatInput({
 
           const parsed = await parseApiResponse(response);
 
-          if (response.ok && isJsonRecord(parsed.data)) {
-            const data = parsed.data;
-            if (data.success && typeof data.file_id === 'string') {
-              // Attach file_id to the File object
-              (file as File & { file_id?: string }).file_id = data.file_id;
-            } else {
-              failedFiles.add(file);
-            }
+          const data = isJsonRecord(parsed.data) ? parsed.data : null;
+          const fileId = normalizeUploadFileIds([data?.file_id], 1)?.[0] ?? null;
+          if (response.ok && data?.success === true && fileId) {
+            uploadedFileIds.set(file, fileId);
           } else {
             failedFiles.add(file);
-            uploadErrorMessage = uploadErrorMessage || getUploadErrorMessage(response, parsed, {
-              generic: t("files.uploadFailed") || "Failed to upload some files",
-              ...UPLOAD_ERROR_MESSAGES,
-            });
+            const uploadError = classifyUploadError(response, parsed);
+            uploadErrorMessage = uploadErrorMessage
+              || t(clientErrorTranslationKey(uploadError.errorCode));
           }
         }
       } catch (error) {
@@ -413,7 +416,7 @@ export function ChatInput({
         } else {
           console.error("Error uploading file:", error);
           failedFiles.add(file);
-          uploadErrorMessage = uploadErrorMessage || (error instanceof Error ? error.message : null);
+          uploadErrorMessage = uploadErrorMessage || t("clientErrors.uploadFailed");
         }
       } finally {
         uploadAbortControllersRef.current.delete(fileId);
@@ -424,6 +427,30 @@ export function ChatInput({
         });
       }
     }));
+
+    const successfulFiles = newFiles.filter(file => (
+      !failedFiles.has(file) && uploadedFileIds.has(file)
+    ));
+    const existingUploadedFileIds = filesRef.current
+      .filter(file => !newFiles.includes(file))
+      .map(file => (file as File & { file_id?: unknown }).file_id)
+      .filter(fileId => fileId !== undefined);
+    const normalizedFileIds = normalizeUploadFileIds(
+      [
+        ...existingUploadedFileIds,
+        ...successfulFiles.map(file => uploadedFileIds.get(file)),
+      ],
+      existingUploadedFileIds.length + successfulFiles.length,
+    );
+    if (!normalizedFileIds) {
+      successfulFiles.forEach(file => failedFiles.add(file));
+      uploadErrorMessage = uploadErrorMessage || t("clientErrors.uploadFailed");
+    } else {
+      const newFileIds = normalizedFileIds.slice(existingUploadedFileIds.length);
+      successfulFiles.forEach((file, index) => {
+        (file as File & { file_id?: string }).file_id = newFileIds[index];
+      });
+    }
 
     // Handle failed files
     if (failedFiles.size > 0) {
@@ -635,6 +662,16 @@ export function ChatInput({
   };
 
   const hasDraft = message.trim().length > 0 || enabledFiles.length > 0;
+  useEffect(() => {
+    if (!hasDraft) {
+      draftRequestSnapshotRef.current = null;
+      deliveryAttemptRef.current = null;
+    } else if (draftRequestSnapshotRef.current === null) {
+      draftRequestSnapshotRef.current = {
+        requestId: currentInteractionRequestId,
+      };
+    }
+  }, [currentInteractionRequestId, hasDraft]);
   const canSubmit = () => {
     const isUploadingFiles = uploadingFiles.size > 0;
     return hasDraft && !isInputBusy && !isUploadingFiles;
@@ -736,6 +773,16 @@ export function ChatInput({
         ? previousAttempt.clientMessageId
         : generateClientMessageId();
       deliveryAttemptRef.current = { key: deliveryKey, clientMessageId };
+      const existingMetadata = {
+        ...(agentConfig.metadata || {}),
+        ...(configIsDrivenByTaskConfig ? taskConfig?.metadata || {} : {}),
+      };
+      const draftRequestId = draftRequestSnapshotRef.current?.requestId;
+      const metadataToSend = draftRequestId
+        ? { ...existingMetadata, request_id: draftRequestId }
+        : Object.keys(existingMetadata).length > 0
+          ? existingMetadata
+          : undefined;
 
       const configToSend = {
         ...agentConfig,
@@ -756,6 +803,7 @@ export function ChatInput({
             }
           : {}),
         clientMessageId,
+        ...(metadataToSend ? { metadata: metadataToSend } : {}),
         ...(extraRuntimeExtensions
           ? {
               runtimeExtensions: {
@@ -771,6 +819,7 @@ export function ChatInput({
 
       await onSend(messageToSend, configToSend);
       deliveryAttemptRef.current = null;
+      draftRequestSnapshotRef.current = null;
       setPickedExecutionMode(undefined);
       setExecutionModeMenuOpen(false);
       setLocalBrowserTarget(null);
@@ -789,8 +838,14 @@ export function ChatInput({
       ) {
         deliveryAttemptRef.current = null;
       }
-      toast.error(
-        error instanceof Error
+      const errorCode = typeof error === "object" && error !== null
+        ? readClientErrorCode((error as { errorCode?: unknown }).errorCode)
+        : null;
+      const userFacing = typeof error === "object" && error !== null
+        && (error as { userFacing?: unknown }).userFacing === true;
+      toast.error(errorCode
+        ? t(clientErrorTranslationKey(errorCode))
+        : userFacing && error instanceof Error
           ? error.message
           : t("builds.list.chat.sendFailed") || "Message was not sent"
       );

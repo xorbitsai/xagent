@@ -4064,9 +4064,9 @@ name = "ocrmac"
 version = "1.0.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "click", marker = "sys_platform == 'darwin'" },
-    { name = "pillow", marker = "sys_platform == 'darwin'" },
-    { name = "pyobjc-framework-vision", marker = "sys_platform == 'darwin'" },
+    { name = "click" },
+    { name = "pillow" },
+    { name = "pyobjc-framework-vision" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/5e/07/3e15ab404f75875c5e48c47163300eb90b7409044d8711fc3aaf52503f2e/ocrmac-1.0.1.tar.gz", hash = "sha256:507fe5e4cbd67b2d03f6729a52bbc11f9d0b58241134eb958a5daafd4b9d93d9", size = 1454317, upload-time = "2026-01-08T16:44:26.412Z" }
 wheels = [
@@ -5404,7 +5404,7 @@ name = "pyobjc-framework-cocoa"
 version = "12.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "pyobjc-core", marker = "sys_platform == 'darwin'" },
+    { name = "pyobjc-core" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/02/a3/16ca9a15e77c061a9250afbae2eae26f2e1579eb8ca9462ae2d2c71e1169/pyobjc_framework_cocoa-12.1.tar.gz", hash = "sha256:5556c87db95711b985d5efdaaf01c917ddd41d148b1e52a0c66b1a2e2c5c1640", size = 2772191, upload-time = "2025-11-14T10:13:02.069Z" }
 wheels = [
@@ -5421,8 +5421,8 @@ name = "pyobjc-framework-coreml"
 version = "12.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "pyobjc-core", marker = "sys_platform == 'darwin'" },
-    { name = "pyobjc-framework-cocoa", marker = "sys_platform == 'darwin'" },
+    { name = "pyobjc-core" },
+    { name = "pyobjc-framework-cocoa" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/30/2d/baa9ea02cbb1c200683cb7273b69b4bee5070e86f2060b77e6a27c2a9d7e/pyobjc_framework_coreml-12.1.tar.gz", hash = "sha256:0d1a4216891a18775c9e0170d908714c18e4f53f9dc79fb0f5263b2aa81609ba", size = 40465, upload-time = "2025-11-14T10:14:02.265Z" }
 wheels = [
@@ -5439,8 +5439,8 @@ name = "pyobjc-framework-quartz"
 version = "12.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "pyobjc-core", marker = "sys_platform == 'darwin'" },
-    { name = "pyobjc-framework-cocoa", marker = "sys_platform == 'darwin'" },
+    { name = "pyobjc-core" },
+    { name = "pyobjc-framework-cocoa" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/94/18/cc59f3d4355c9456fc945eae7fe8797003c4da99212dd531ad1b0de8a0c6/pyobjc_framework_quartz-12.1.tar.gz", hash = "sha256:27f782f3513ac88ec9b6c82d9767eef95a5cf4175ce88a1e5a65875fee799608", size = 3159099, upload-time = "2025-11-14T10:21:24.31Z" }
 wheels = [
@@ -5457,10 +5457,10 @@ name = "pyobjc-framework-vision"
 version = "12.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "pyobjc-core", marker = "sys_platform == 'darwin'" },
-    { name = "pyobjc-framework-cocoa", marker = "sys_platform == 'darwin'" },
-    { name = "pyobjc-framework-coreml", marker = "sys_platform == 'darwin'" },
-    { name = "pyobjc-framework-quartz", marker = "sys_platform == 'darwin'" },
+    { name = "pyobjc-core" },
+    { name = "pyobjc-framework-cocoa" },
+    { name = "pyobjc-framework-coreml" },
+    { name = "pyobjc-framework-quartz" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/c2/5a/08bb3e278f870443d226c141af14205ff41c0274da1e053b72b11dfc9fb2/pyobjc_framework_vision-12.1.tar.gz", hash = "sha256:a30959100e85dcede3a786c544e621ad6eb65ff6abf85721f805822b8c5fe9b0", size = 59538, upload-time = "2025-11-14T10:23:21.979Z" }
 wheels = [
@@ -6897,13 +6897,13 @@ resolution-markers = [
     "python_full_version < '3.12' and sys_platform == 'darwin'",
 ]
 dependencies = [
-    { name = "filelock", marker = "sys_platform == 'darwin'" },
-    { name = "fsspec", marker = "sys_platform == 'darwin'" },
-    { name = "jinja2", marker = "sys_platform == 'darwin'" },
-    { name = "networkx", marker = "sys_platform == 'darwin'" },
-    { name = "setuptools", marker = "sys_platform == 'darwin'" },
-    { name = "sympy", marker = "sys_platform == 'darwin'" },
-    { name = "typing-extensions", marker = "sys_platform == 'darwin'" },
+    { name = "filelock" },
+    { name = "fsspec" },
+    { name = "jinja2" },
+    { name = "networkx" },
+    { name = "setuptools" },
+    { name = "sympy" },
+    { name = "typing-extensions" },
 ]
 wheels = [
     { url = "https://download-r2.pytorch.org/whl/cpu/torch-2.12.0-cp311-cp311-macosx_14_0_arm64.whl", hash = "sha256:10802fd383bbfed646212e765a72c37d2185205d4f26eb197a254e8ac7ddcb25", upload-time = "2026-05-12T16:20:07Z" },
@@ -6931,13 +6931,13 @@ resolution-markers = [
     "(python_full_version < '3.12' and platform_machine != 'aarch64' and sys_platform == 'linux') or (python_full_version < '3.12' and sys_platform != 'darwin' and sys_platform != 'linux')",
 ]
 dependencies = [
-    { name = "filelock", marker = "sys_platform != 'darwin'" },
-    { name = "fsspec", marker = "sys_platform != 'darwin'" },
-    { name = "jinja2", marker = "sys_platform != 'darwin'" },
-    { name = "networkx", marker = "sys_platform != 'darwin'" },
-    { name = "setuptools", marker = "sys_platform != 'darwin'" },
-    { name = "sympy", marker = "sys_platform != 'darwin'" },
-    { name = "typing-extensions", marker = "sys_platform != 'darwin'" },
+    { name = "filelock" },
+    { name = "fsspec" },
+    { name = "jinja2" },
+    { name = "networkx" },
+    { name = "setuptools" },
+    { name = "sympy" },
+    { name = "typing-extensions" },
 ]
 wheels = [
     { url = "https://download-r2.pytorch.org/whl/cpu/torch-2.12.0%2Bcpu-cp311-cp311-linux_s390x.whl", hash = "sha256:aaa9c1f5e8c518d7be1e3c3e1b090ca7d63b6e353a1abd6cfdaf902405093467", upload-time = "2026-05-12T23:16:01Z" },
@@ -6981,9 +6981,9 @@ resolution-markers = [
     "python_full_version < '3.12' and sys_platform == 'darwin'",
 ]
 dependencies = [
-    { name = "numpy", marker = "sys_platform == 'darwin'" },
-    { name = "pillow", marker = "sys_platform == 'darwin'" },
-    { name = "torch", version = "2.12.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform == 'darwin'" },
+    { name = "numpy" },
+    { name = "pillow" },
+    { name = "torch", version = "2.12.0", source = { registry = "https://download.pytorch.org/whl/cpu" } },
 ]
 wheels = [
     { url = "https://download-r2.pytorch.org/whl/cpu/torchvision-0.27.0-cp311-cp311-macosx_14_0_arm64.whl", hash = "sha256:df0c166b6bdf7c47f88e81e8b43bc085451d5c50d0c5d1691bc474c1227d6fed", upload-time = "2026-05-12T16:20:37Z" },
@@ -7011,9 +7011,9 @@ resolution-markers = [
     "(python_full_version < '3.12' and platform_machine != 'aarch64' and sys_platform == 'linux') or (python_full_version < '3.12' and sys_platform != 'darwin' and sys_platform != 'linux')",
 ]
 dependencies = [
-    { name = "numpy", marker = "sys_platform != 'darwin'" },
-    { name = "pillow", marker = "sys_platform != 'darwin'" },
-    { name = "torch", version = "2.12.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform != 'darwin'" },
+    { name = "numpy" },
+    { name = "pillow" },
+    { name = "torch", version = "2.12.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" } },
 ]
 wheels = [
     { url = "https://download-r2.pytorch.org/whl/cpu/torchvision-0.27.0%2Bcpu-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:99d05d071ff34305334ee1854f5edf7c2767b96ba59fe92e76d84a1fa72c8e06", upload-time = "2026-05-12T16:20:36Z" },
@@ -7937,6 +7937,7 @@ dev = [
     { name = "pytest-socket" },
     { name = "pytest-timeout" },
     { name = "pytest-xdist" },
+    { name = "python-docx" },
     { name = "ruff" },
     { name = "types-docker" },
     { name = "types-openpyxl" },
@@ -7954,6 +7955,7 @@ sandbox = [
     { name = "pandas" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
+    { name = "python-docx" },
 ]
 static-type-check = [
     { name = "types-docker" },
@@ -7979,6 +7981,7 @@ test = [
     { name = "pytest-socket" },
     { name = "pytest-timeout" },
     { name = "pytest-xdist" },
+    { name = "python-docx" },
 ]
 
 [package.metadata]
@@ -8087,8 +8090,8 @@ requires-dist = [
     { name = "volcengine-python-sdk", extras = ["ark"], specifier = ">=5.0.37" },
     { name = "websockets", specifier = ">=15.0.1" },
     { name = "xinference-client", specifier = ">=2.3.0" },
-    { name = "xrouter-llm", marker = "extra == 'all'", specifier = ">=0.1.2" },
-    { name = "xrouter-llm", marker = "extra == 'router'", specifier = ">=0.1.2" },
+    { name = "xrouter-llm", marker = "extra == 'all'", specifier = ">=0.3.3" },
+    { name = "xrouter-llm", marker = "extra == 'router'", specifier = ">=0.3.3" },
     { name = "zai-sdk", specifier = ">=0.0.3.2" },
 ]
 provides-extras = ["ai-document", "all", "browser", "chromadb", "command-path-guard", "document-processing", "duckdb", "milvus", "postgresql", "router", "waf-crawl"]
@@ -8112,7 +8115,7 @@ backend-image = [
     { name = "torchvision", index = "https://download.pytorch.org/whl/cpu" },
     { name = "typer", specifier = ">=0.9.0" },
     { name = "unstructured", specifier = ">=0.15.0" },
-    { name = "xrouter-llm", specifier = ">=0.1.2" },
+    { name = "xrouter-llm", specifier = ">=0.3.3" },
 ]
 dev = [
     { name = "asyncssh", specifier = ">=2.14.0" },
@@ -8134,6 +8137,7 @@ dev = [
     { name = "pytest-socket", specifier = ">=0.7.0" },
     { name = "pytest-timeout", specifier = ">=2.4.0" },
     { name = "pytest-xdist", specifier = ">=3.0" },
+    { name = "python-docx", specifier = ">=1.1.0" },
     { name = "ruff", specifier = ">=0.12.3" },
     { name = "types-docker", specifier = ">=7.1.0.20251009" },
     { name = "types-openpyxl", specifier = ">=3.1.5" },
@@ -8151,6 +8155,7 @@ sandbox = [
     { name = "pandas", specifier = ">=1.3.0" },
     { name = "pydantic", specifier = ">=2.11.7" },
     { name = "pydantic-settings" },
+    { name = "python-docx", specifier = ">=1.1.0" },
 ]
 static-type-check = [
     { name = "types-docker", specifier = ">=7.1.0.20251009" },
@@ -8176,6 +8181,7 @@ test = [
     { name = "pytest-socket", specifier = ">=0.7.0" },
     { name = "pytest-timeout", specifier = ">=2.4.0" },
     { name = "pytest-xdist", specifier = ">=3.0" },
+    { name = "python-docx", specifier = ">=1.1.0" },
 ]
 
 [[package]]
@@ -8233,9 +8239,11 @@ wheels = [
 
 [[package]]
 name = "xrouter-llm"
-version = "0.1.2"
+version = "0.3.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
+    { name = "alembic" },
+    { name = "fastapi" },
     { name = "huggingface-hub" },
     { name = "joblib" },
     { name = "numpy" },
@@ -8243,10 +8251,12 @@ dependencies = [
     { name = "pyyaml" },
     { name = "scikit-learn" },
     { name = "scipy" },
+    { name = "sqlalchemy" },
+    { name = "uvicorn", extra = ["standard"] },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/62/36/63ccf8f0db5c0bdb8bcd04eae05e07ec7d013c2ec9854dd0e3c720cf74df/xrouter_llm-0.1.2.tar.gz", hash = "sha256:0d3b184f749505fc80b0049ee9a466d7472171145dad98977a778e4effd3d7c9", size = 1506669, upload-time = "2026-06-23T13:41:34.143Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/25/12/87e13894b94035576d3c3efd717f87f3dabb1938d3a0685ae5bd2dc28daf/xrouter_llm-0.3.3.tar.gz", hash = "sha256:468cbba01b9122111fdf50e18d53254b117d83ec87c98feb579bee3b3d7f571e", size = 1469842, upload-time = "2026-09-02T07:40:38.239Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/3f/77/f4082e25dad8d123bd85173735e66dd547c34a43c39aa87e43713fbe83bd/xrouter_llm-0.1.2-py3-none-any.whl", hash = "sha256:df1b5c2f36c091b27f3e97355ba154c2bb0c5cfecac52b6ca3ec5e867041ada8", size = 116349, upload-time = "2026-06-23T13:41:32.776Z" },
+    { url = "https://files.pythonhosted.org/packages/7d/b0/6c5149e55c1f6598b02203c08efc4aa29bdde7ed8fac99fa77e828dc92f1/xrouter_llm-0.3.3-py3-none-any.whl", hash = "sha256:709b04c5ac189984d1cd9ea2d8763b7b83787367f030c9fd7869a058b84f4779", size = 150405, upload-time = "2026-09-02T07:40:36.453Z" },
 ]
 
 [[package]]

@@ -99,7 +99,7 @@ command-path-guard = ["bashlex>=0.18"]
 # does not declare its bundled predictor runtime deps, so keep them explicit
 # here until upstream does.
 router = [
-  "xrouter-llm>=0.1.2",
+  "xrouter-llm>=0.3.3",
   "sentence-transformers>=3.0.0",
   # xrouter-llm's embedding model is a Qwen3-architecture checkpoint; transformers
   # only registered the `qwen3` model type in 4.51.
@@ -158,7 +158,7 @@ all = [
   "curl_cffi>=0.14.0",
   "chromadb",
   "pymilvus>=2.6.9,<3.0.0",
-  "xrouter-llm>=0.1.2",
+  "xrouter-llm>=0.3.3",
   "sentence-transformers>=3.0.0",
 ]
 
@@ -175,6 +175,7 @@ sandbox = [
   "numpy>=1.21.0",
   "matplotlib>=3.5.0",
   "openpyxl>=3.1.0",
+  "python-docx>=1.1.0",
   "fsspec>=2024.0.0",
 ]
 
@@ -195,7 +196,7 @@ backend-image = [
   "pymilvus>=2.6.9,<3.0.0",
   "torch",
   "torchvision",
-  "xrouter-llm>=0.1.2",
+  "xrouter-llm>=0.3.3",
   "sentence-transformers>=3.0.0",
 ]
 
@@ -226,6 +227,7 @@ test = [
   "copilotkit==0.1.69",
   "langgraph-prebuilt<1.0.9",
   "openpyxl>=3.1.5",
+  "python-docx>=1.1.0",
   "asyncssh>=2.14.0",
 ]
 

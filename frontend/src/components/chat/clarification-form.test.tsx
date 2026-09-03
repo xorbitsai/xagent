@@ -1,6 +1,7 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import React from "react"
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -355,6 +356,28 @@ describe("ClarificationForm connect_apps interaction", () => {
     })
   })
 
+  it("binds a connect_apps skip to the rendered interaction request", async () => {
+    render(
+      <ClarificationForm
+        interactions={[CONNECT_APPS_INTERACTION]}
+        requestId="inputreq_0011223344556677889900aabbccddee"
+      />,
+    )
+
+    fireEvent.click(screen.getByText("chatPage.clarification.connectApps.skip"))
+
+    await waitFor(() => {
+      expect(appContextMock.sendMessage).toHaveBeenCalledWith(
+        "chatPage.clarification.connectApps.skip",
+        {
+          force: true,
+          metadata: { request_id: "inputreq_0011223344556677889900aabbccddee" },
+        },
+        [],
+      )
+    })
+  })
+
   it("renders the real connect_apps widget instead of an 'unsupported type' error when mixed into a list with another interaction type", () => {
     // Not producible by any seeder today (see LIVE_WIDGET_TYPES's comment in
     // clarification-form.tsx), but nothing rules it out - isConnectAppsOnly
@@ -423,7 +446,8 @@ describe("ClarificationForm delivery failures", () => {
     message: string,
     disposition: string,
     userFacing = false,
-  ) => Object.assign(new Error(message), { disposition, userFacing })
+    errorCode: string | null = null,
+  ) => Object.assign(new Error(message), { disposition, userFacing, errorCode })
 
   const submitAnswer = async (onSend: ReturnType<typeof vi.fn>) => {
     render(
@@ -438,28 +462,30 @@ describe("ClarificationForm delivery failures", () => {
     )
   }
 
-  it("surfaces the backend rejection reason instead of the generic toast", async () => {
+  it("localizes a coded backend rejection instead of trusting its prose", async () => {
     const onSend = vi.fn().mockRejectedValue(deliveryError(
-      "A previous guidance message is still being applied. Please wait for it to finish.",
+      "checkpoint row includes storage-key=secret",
       "rejected",
       true,
+      "task_checkpoint_unreadable",
     ))
 
     await submitAnswer(onSend)
 
     await waitFor(() => {
       expect(toastErrorMock).toHaveBeenCalledWith(
-        "A previous guidance message is still being applied. Please wait for it to finish.",
+        "clientErrors.taskCheckpointUnreadable",
         { description: "chatPage.clarification.sendNotSent" },
       )
     })
     const alert = await screen.findByRole("alert")
     expect(alert).toHaveTextContent(
-      "A previous guidance message is still being applied.",
+      "clientErrors.taskCheckpointUnreadable",
     )
     // The hint lives in the alert too, not only in the toast - without this
     // the inline hint could be deleted with every test still green.
     expect(alert).toHaveTextContent("chatPage.clarification.sendNotSent")
+    expect(alert).not.toHaveTextContent("storage-key=secret")
   })
 
   it("keeps the form submittable after a failure that never reached the agent", async () => {
@@ -658,5 +684,218 @@ describe("ClarificationForm delivery failures", () => {
     rerender(<ClarificationForm interactions={interactions} active />)
 
     expect(screen.queryByRole("alert")).toBeNull()
+  })
+})
+
+describe("ClarificationForm interaction identity", () => {
+  afterEach(() => {
+    cleanup()
+  })
+
+  it("resets the reused form and ignores completion from the previous request", async () => {
+    let resolveR1!: () => void
+    const onSend = vi.fn(() => new Promise<void>((resolve) => { resolveR1 = resolve }))
+    const form = (requestId: string, messageId?: string) => (
+      <ClarificationForm
+        interactions={[{ type: "text_input", field: "city", label: "City" }]}
+        requestId={requestId}
+        messageId={messageId}
+        onSend={onSend}
+      />
+    )
+    const { container, rerender } = render(form("inputreq_r1"))
+
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "Sydney" } })
+    expect(screen.getByRole("textbox")).toHaveValue("Sydney")
+
+    rerender(form("inputreq_r1", "unrelated-rerender"))
+    expect(screen.getByRole("textbox")).toHaveValue("Sydney")
+    fireEvent.click(screen.getByRole("button", { name: "chatPage.clarification.submit" }))
+
+    rerender(form("inputreq_r2"))
+
+    expect(screen.getByRole("textbox")).toHaveValue("")
+    expect(screen.getByRole("button", { name: "chatPage.clarification.submit" })).toBeEnabled()
+    expect(container.querySelector('[aria-expanded="true"]')).not.toBeNull()
+    expect(screen.queryByRole("alert")).toBeNull()
+
+    await act(async () => resolveR1())
+
+    expect(screen.getByRole("textbox")).toHaveValue("")
+    expect(screen.getByRole("button", { name: "chatPage.clarification.submit" })).toBeEnabled()
+    expect(screen.queryByRole("alert")).toBeNull()
+  })
+
+  it("submits the request id bound to this rendered form", async () => {
+    const onSend = vi.fn().mockResolvedValue(undefined)
+    render(
+      <ClarificationForm
+        interactions={[{ type: "text_input", field: "city", label: "City" }]}
+        requestId="inputreq_0011223344556677889900aabbccddee"
+        onSend={onSend}
+      />,
+    )
+
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "Sydney" } })
+    fireEvent.click(
+      screen.getByRole("button", { name: "chatPage.clarification.submit" }),
+    )
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledWith(
+      "City: Sydney",
+      [],
+      { request_id: "inputreq_0011223344556677889900aabbccddee" },
+    ))
+  })
+})
+
+describe("ClarificationForm blank option filtering", () => {
+  beforeEach(() => {
+    appContextMock.dispatch.mockReset()
+    appContextMock.filesDisabled = false
+    appContextMock.providerAvailable = true
+    appContextMock.sendMessage.mockReset()
+    toastErrorMock.mockReset()
+  })
+
+  afterEach(() => {
+    cleanup()
+  })
+
+  // The option label is rendered into a <span> on both branches this suite
+  // covers: select_one's dropdown option (ui/select.tsx, "font-medium
+  // truncate") and action_cards' card (clarification-form.tsx, "font-medium
+  // text-sm text-foreground"). action_cards renders each card as a <div
+  // onClick>, not a <button> -- getAllByRole("button") returns an empty
+  // array for it regardless of whether the blank-option filter is
+  // trim-aware, so it cannot be used to detect a blank card here. No other
+  // <span> in this component's default render (no files staged, no
+  // description set on any option) is ever blank, so a <span> with blank
+  // text content can only be a surviving blank option.
+  const blankOptionSpans = (container: HTMLElement) =>
+    Array.from(container.querySelectorAll("span")).filter(
+      (el) => el.textContent !== "" && el.textContent?.trim() === "",
+    )
+
+  it("a select_one interaction whose only option is blank shows no options", () => {
+    const interactions = [
+      {
+        type: "select_one" as const,
+        field: "choice",
+        label: "Choice",
+        options: [{ label: "   ", value: "   " }],
+      },
+    ]
+    render(<ClarificationForm interactions={interactions} onSend={vi.fn()} />)
+
+    fireEvent.click(screen.getByText("chatPage.clarification.selectOption"))
+
+    expect(screen.getByText("common.noOptions")).toBeInTheDocument()
+  })
+
+  it("a select_one interaction drops an option whose label alone is blank", () => {
+    // label and value are independent halves of the same filter
+    // (opt.value.trim() !== "" && opt.label.trim() !== ""); a blank value
+    // makes this option non-blank in isolation, so a regression that only
+    // reverted the label half back to a truthiness check would let this
+    // option survive even though a case that leaves both halves blank at
+    // once would still be dropped by the (unregressed) value half alone.
+    const interactions = [
+      {
+        type: "select_one" as const,
+        field: "choice",
+        label: "Choice",
+        options: [
+          { label: "Import", value: "import" },
+          { label: "   ", value: "blank-label-only" },
+        ],
+      },
+    ]
+    const { container } = render(
+      <ClarificationForm interactions={interactions} onSend={vi.fn()} />,
+    )
+
+    fireEvent.click(screen.getByText("chatPage.clarification.selectOption"))
+
+    expect(screen.getByText("Import")).toBeInTheDocument()
+    expect(blankOptionSpans(container)).toHaveLength(0)
+  })
+
+  it("a select_one interaction drops an option whose value alone is blank", () => {
+    // Mirrors the case above for the other half of the same filter: a
+    // non-blank label makes this option non-blank in isolation, so a
+    // regression that only reverted the value half back to a truthiness
+    // check would let this option survive.
+    const interactions = [
+      {
+        type: "select_one" as const,
+        field: "choice",
+        label: "Choice",
+        options: [
+          { label: "Import", value: "import" },
+          { label: "Blank value only", value: "   " },
+        ],
+      },
+    ]
+    const { container } = render(
+      <ClarificationForm interactions={interactions} onSend={vi.fn()} />,
+    )
+
+    fireEvent.click(screen.getByText("chatPage.clarification.selectOption"))
+
+    expect(screen.getByText("Import")).toBeInTheDocument()
+    expect(screen.queryByText("Blank value only")).not.toBeInTheDocument()
+  })
+
+  it("an action_cards interaction keeps a good option and drops a blank one", () => {
+    // Mirrors the shape the agent-builder skill instructs the model to use
+    // for this interaction type: a mix of a real choice and, in the failure
+    // case this fix targets, a blank one.
+    const interactions = [
+      {
+        type: "action_cards" as const,
+        field: "source",
+        label: "Source",
+        options: [
+          { label: "Import", value: "import" },
+          { label: "   ", value: "   " },
+        ],
+      },
+    ]
+    const { container } = render(
+      <ClarificationForm interactions={interactions} onSend={vi.fn()} />,
+    )
+
+    // No dropdown to open: action_cards renders its cards directly inside
+    // CollapsibleContent, which is open by default (active defaults to true).
+    expect(screen.getByText("Import")).toBeInTheDocument()
+    expect(blankOptionSpans(container)).toHaveLength(0)
+  })
+
+  it("renders options from a legacy message that still carries actions", () => {
+    // The backend normalizer now strips a well-formed interaction down to
+    // one options carrier and never emits actions, but that only applies to
+    // new payloads. Rows persisted before that change, and anything from
+    // Agent Builder's self-parsed chat response (which never reaches the
+    // backend normalizer at all), can still carry only actions with no
+    // options key -- this component's own fallback (rawOptions above) is
+    // the sole thing still rendering those.
+    const interactions = [
+      {
+        type: "action_cards" as const,
+        field: "source",
+        label: "Source",
+        actions: [
+          { label: "Import", value: "import" },
+          { label: "   ", value: "   " },
+        ],
+      },
+    ]
+    const { container } = render(
+      <ClarificationForm interactions={interactions} onSend={vi.fn()} />,
+    )
+
+    expect(screen.getByText("Import")).toBeInTheDocument()
+    expect(blankOptionSpans(container)).toHaveLength(0)
   })
 })

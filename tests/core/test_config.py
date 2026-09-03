@@ -102,9 +102,11 @@ from xagent.config import (
     TASK_LEASE_TTL_SECONDS,
     TASK_RUNTIME_HOOK_MAX_WORKERS,
     TASK_RUNTIME_HOOK_QUEUE_TIMEOUT_SECONDS,
+    TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS,
     TRIGGER_DISPATCHER_BATCH_SIZE,
     TRIGGER_DISPATCHER_ENABLED,
     TRIGGER_DISPATCHER_INTERVAL_SECONDS,
+    TRIGGER_DISPATCHER_STARTUP_JITTER_SECONDS,
     TRUSTED_EGRESS_PROXY,
     UPLOADED_FILE_RECOVERY_BATCH_SIZE,
     UPLOADED_FILE_RECOVERY_INTERVAL_SECONDS,
@@ -113,6 +115,7 @@ from xagent.config import (
     WEB_CRAWL_TLS_IMPERSONATE,
     WEB_DIR,
     WEB_SEARCH_PROVIDER,
+    XROUTER_EXCLUDED_MODELS,
     ExternalUploadsDirConfigurationError,
     format_file_size,
     get_agent_pattern_for_execution_mode,
@@ -207,9 +210,11 @@ from xagent.config import (
     get_task_lease_recovery_interval_seconds,
     get_task_runtime_hook_max_workers,
     get_task_runtime_hook_queue_timeout_seconds,
+    get_temp_file_cleanup_shutdown_timeout_seconds,
     get_trigger_dispatcher_batch_size,
     get_trigger_dispatcher_enabled,
     get_trigger_dispatcher_interval_seconds,
+    get_trigger_dispatcher_startup_jitter_seconds,
     get_trusted_egress_proxy_enabled,
     get_uploaded_file_recovery_batch_size,
     get_uploaded_file_recovery_interval_seconds,
@@ -218,6 +223,7 @@ from xagent.config import (
     get_web_crawl_tls_impersonate,
     get_web_dir,
     get_web_search_provider,
+    get_xrouter_excluded_models,
     in_sandbox_tool_runner,
     validate_sandbox_namespace,
 )
@@ -352,6 +358,9 @@ class TestEnvironmentVariableConstants:
             OPENROUTER_OFFICIAL_PROVIDERS_ONLY
             == "XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY"
         )
+
+    def test_xrouter_excluded_models_constant(self):
+        assert XROUTER_EXCLUDED_MODELS == "XAGENT_XROUTER_EXCLUDED_MODELS"
 
     def test_mcp_oauth_allow_private_hosts_constant(self):
         assert MCP_OAUTH_ALLOW_PRIVATE_HOSTS == "XAGENT_MCP_OAUTH_ALLOW_PRIVATE_HOSTS"
@@ -564,6 +573,21 @@ class TestOpenRouterConfig:
         monkeypatch.setenv(OPENROUTER_OFFICIAL_PROVIDERS_ONLY, value)
         assert get_openrouter_official_providers_only() is False
 
+    def test_xrouter_excluded_models_defaults_empty(self, monkeypatch):
+        monkeypatch.delenv(XROUTER_EXCLUDED_MODELS, raising=False)
+        assert get_xrouter_excluded_models() == ()
+
+    def test_xrouter_excluded_models_parses_and_deduplicates(self, monkeypatch):
+        monkeypatch.setenv(
+            XROUTER_EXCLUDED_MODELS,
+            " z-ai/glm-5.3-flash, openai/gpt-5.6-luna, z-ai/glm-5.3-flash,, ",
+        )
+
+        assert get_xrouter_excluded_models() == (
+            "z-ai/glm-5.3-flash",
+            "openai/gpt-5.6-luna",
+        )
+
 
 class TestMCPOAuthConfig:
     def test_allow_private_hosts_defaults_false(self, monkeypatch):
@@ -692,16 +716,20 @@ class TestCeleryBackgroundJobConfig:
         monkeypatch.delenv(TRIGGER_DISPATCHER_ENABLED, raising=False)
         monkeypatch.delenv(TRIGGER_DISPATCHER_INTERVAL_SECONDS, raising=False)
         monkeypatch.delenv(TRIGGER_DISPATCHER_BATCH_SIZE, raising=False)
+        monkeypatch.delenv(TRIGGER_DISPATCHER_STARTUP_JITTER_SECONDS, raising=False)
         assert get_trigger_dispatcher_enabled() is True
         assert get_trigger_dispatcher_interval_seconds() == 5
         assert get_trigger_dispatcher_batch_size() == 20
+        assert get_trigger_dispatcher_startup_jitter_seconds() == 30
 
         monkeypatch.setenv(TRIGGER_DISPATCHER_ENABLED, "false")
         monkeypatch.setenv(TRIGGER_DISPATCHER_INTERVAL_SECONDS, "9")
         monkeypatch.setenv(TRIGGER_DISPATCHER_BATCH_SIZE, "3")
+        monkeypatch.setenv(TRIGGER_DISPATCHER_STARTUP_JITTER_SECONDS, "0")
         assert get_trigger_dispatcher_enabled() is False
         assert get_trigger_dispatcher_interval_seconds() == 9
         assert get_trigger_dispatcher_batch_size() == 3
+        assert get_trigger_dispatcher_startup_jitter_seconds() == 0
 
     def test_task_lease_recovery_tuning(self, monkeypatch):
         monkeypatch.setenv(TASK_LEASE_TTL_SECONDS, "60")
@@ -741,6 +769,28 @@ class TestCeleryBackgroundJobConfig:
         assert get_uploaded_file_recovery_interval_seconds() == 60
         assert get_uploaded_file_recovery_stale_seconds() == 300
         assert get_uploaded_file_recovery_batch_size() == 100
+
+    def test_temp_file_cleanup_shutdown_timeout_tuning(self, monkeypatch):
+        assert (
+            TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS
+            == "XAGENT_TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS"
+        )
+
+        monkeypatch.delenv(TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS, raising=False)
+        assert get_temp_file_cleanup_shutdown_timeout_seconds() == 10
+
+        monkeypatch.setenv(TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS, "45")
+        assert get_temp_file_cleanup_shutdown_timeout_seconds() == 45
+
+        # Invalid / non-positive values fall back to the default.
+        monkeypatch.setenv(TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS, "0")
+        assert get_temp_file_cleanup_shutdown_timeout_seconds() == 10
+
+        monkeypatch.setenv(TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS, "abc")
+        assert get_temp_file_cleanup_shutdown_timeout_seconds() == 10
+
+        monkeypatch.setenv(TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS, "-5")
+        assert get_temp_file_cleanup_shutdown_timeout_seconds() == 10
 
 
 class TestGetWebSearchProvider:

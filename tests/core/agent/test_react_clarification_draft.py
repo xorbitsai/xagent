@@ -128,11 +128,12 @@ async def test_waiting_return_carries_draft_matching_recomputed_value(
     """
 
     pattern = ReActPattern(max_iterations=2)
+    runtime = PatternRuntime(execution_id="exec-tp1")
     context = ExecutionContext(execution_id="exec-tp1")
     context.add_user_message("Ask")
 
     result = await pattern.run(
-        context=context, tools=tools_factory(), llm=llm_factory()
+        context=context, tools=tools_factory(), llm=llm_factory(), runtime=runtime
     )
 
     assert result["status"] == "waiting_for_user"
@@ -143,6 +144,14 @@ async def test_waiting_return_carries_draft_matching_recomputed_value(
     )
     assert result["clarification_draft"] == expected
     assert result["clarification_draft"].source == expected_source
+    assert (
+        result["clarification_draft"].event_id
+        == runtime.outbound_messages[-1]["event_id"]
+    )
+    assert (
+        pattern.waiting_for_user_request["event_id"]
+        == result["clarification_draft"].event_id
+    )
 
 
 @pytest.mark.asyncio
@@ -153,6 +162,7 @@ async def test_waiting_return_via_tool_carries_tool_waiting_draft() -> None:
 
     tool = ResumableTool()
     pattern = ReActPattern(max_iterations=2)
+    runtime = PatternRuntime(execution_id="exec-tp1-tool")
     context = ExecutionContext(execution_id="exec-tp1-tool")
     context.add_user_message("Run the gated action.")
     llm = FakeLLM(
@@ -171,7 +181,7 @@ async def test_waiting_return_via_tool_carries_tool_waiting_draft() -> None:
         ]
     )
 
-    result = await pattern.run(context=context, tools=[tool], llm=llm)
+    result = await pattern.run(context=context, tools=[tool], llm=llm, runtime=runtime)
 
     assert result["status"] == "waiting_for_user"
     expected = draft_from_waiting_request(
@@ -181,6 +191,14 @@ async def test_waiting_return_via_tool_carries_tool_waiting_draft() -> None:
     )
     assert result["clarification_draft"] == expected
     assert result["clarification_draft"].source == "tool_waiting"
+    assert (
+        result["clarification_draft"].event_id
+        == runtime.outbound_messages[-1]["event_id"]
+    )
+    assert (
+        pattern.waiting_for_user_request["event_id"]
+        == result["clarification_draft"].event_id
+    )
 
 
 @pytest.mark.asyncio
@@ -277,6 +295,10 @@ async def test_reentry_without_new_message_returns_stable_draft_and_sends_nothin
     assert resumed_llm.calls == []
     assert len(resumed_runtime.outbound_messages) == 0
     assert resumed["clarification_draft"] == first["clarification_draft"]
+    assert resumed["clarification_draft"].event_id
+    assert (
+        resumed["clarification_draft"].event_id == first["clarification_draft"].event_id
+    )
 
 
 @pytest.mark.asyncio
@@ -548,6 +570,10 @@ async def test_pattern_end_trace_payload_with_draft_survives_real_serializer(
     assert serialized["result"]["status"] == "waiting_for_user"
     assert serialized["result"]["clarification_draft"]["source"] == "send_message"
     assert serialized["result"]["clarification_draft"]["message"] == "Choose A or B"
+    assert (
+        serialized["result"]["clarification_draft"]["event_id"]
+        == runtime.outbound_messages[-1]["event_id"]
+    )
     requests = serialized["result"]["clarification_draft"]["requests"]
     assert isinstance(requests, list)
     assert requests and all(isinstance(item, dict) for item in requests)

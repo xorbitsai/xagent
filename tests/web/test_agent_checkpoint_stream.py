@@ -601,6 +601,44 @@ async def test_paused_replay_event_embeds_known_control_state(monkeypatch) -> No
 
 
 @pytest.mark.asyncio
+async def test_historical_stream_format_error_redacts_exception_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.web.api import websocket as websocket_api
+
+    secret = "history-storage-secret"
+    sent_events: list[dict] = []
+
+    async def fail_load(_operation):
+        raise ValueError(f"malformed history: {secret}")
+
+    async def send_personal_message(event: dict, _websocket: object) -> None:
+        sent_events.append(event)
+
+    monkeypatch.setattr(websocket_api, "run_db_io_cancellation_safe", fail_load)
+    monkeypatch.setattr(
+        websocket_api.manager,
+        "send_personal_message",
+        send_personal_message,
+    )
+
+    with pytest.raises(ValueError, match=secret):
+        await send_historical_data_as_stream(
+            websocket=object(),
+            task_id=42,
+            user=SimpleNamespace(id=1, is_admin=False),
+        )
+
+    assert len(sent_events) == 1
+    assert sent_events[0]["event_type"] == "error"
+    assert (
+        sent_events[0]["data"]["message"]
+        == "Task history could not be loaded. Please try again."
+    )
+    assert secret not in repr(sent_events[0])
+
+
+@pytest.mark.asyncio
 async def test_historical_replay_detaches_before_slow_network_send(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,

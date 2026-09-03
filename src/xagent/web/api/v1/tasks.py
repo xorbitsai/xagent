@@ -93,6 +93,7 @@ from ...services.task_orchestrator import (
     _ClaimedTurn,
     _retire_turn_session_best_effort,
     commit_claimed_turn_or_reconcile,
+    timezone_schedule_context,
 )
 from . import _events_stream
 from ._step_mapping import map_trace_events_to_public_steps
@@ -665,6 +666,7 @@ async def create_chat_task(
                 actor_user_id=actor_user_id,
                 payload=prepared.payload,
                 claimed=prepared.claimed_turn,
+                context=timezone_schedule_context(request.timezone),
             )
         except TaskTurnError as exc:
             pop_ephemeral_runtime_values(prepared.payload.turn_id)

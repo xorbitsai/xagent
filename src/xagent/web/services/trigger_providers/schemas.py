@@ -345,6 +345,21 @@ class GmailTriggerConfig(BaseTriggerConfig):
     sender_filter: str | None = None
     subject_keyword: str | None = None
 
+    @field_validator("oauth_account_id", mode="before")
+    @classmethod
+    def _account_id(cls, value: Any) -> int:
+        if isinstance(value, bool) or value is None:
+            raise ValueError("oauth_account_id must be a positive integer")
+        if isinstance(value, int):
+            if value > 0:
+                return value
+            raise ValueError("oauth_account_id must be a positive integer")
+        if isinstance(value, str) and value.isascii() and value.isdecimal():
+            account_id = int(value)
+            if account_id > 0:
+                return account_id
+        raise ValueError("oauth_account_id must be a positive integer")
+
     @field_validator("watch_label")
     @classmethod
     def _non_empty_label(cls, value: str) -> str:

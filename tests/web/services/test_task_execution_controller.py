@@ -5,11 +5,18 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from xagent.web.models.database import Base, get_db, get_engine, init_db
+from xagent.web.models.database import (
+    Base,
+    get_db,
+    get_engine,
+    get_session_local,
+    init_db,
+)
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
 from xagent.web.services.task_execution_controller import (
     StaleTaskRunError,
+    StaleTaskStateVersionError,
     TaskControlState,
     TaskExecutionController,
     apply_task_control_transition,
@@ -269,6 +276,107 @@ def test_transition_rejects_a_stale_state_version(db_session) -> None:
     assert stored is not None
     assert stored.status == TaskStatus.RUNNING
     assert stored.state_version == running.state_version
+
+
+def test_run_and_version_fences_raise_distinguishable_errors(db_session) -> None:
+    """A rotated run and a moved version must not look alike to a caller.
+
+    They mean opposite things: a rotated run targets an execution that no
+    longer exists and is terminal, while a moved version is still this run's
+    row and is worth re-reading. Callers cannot tell them apart by message,
+    so the version fence raises its own subclass.
+    """
+
+    task = _create_task(db_session)
+    running = transition_task_control_state_sync(
+        int(task.id),
+        TaskControlState.RUNNING,
+        status=TaskStatus.RUNNING,
+        new_run=True,
+    )
+
+    with pytest.raises(StaleTaskRunError) as rotated:
+        transition_task_control_state_sync(
+            int(task.id),
+            TaskControlState.PAUSED,
+            expected_run_id="some-other-run",
+        )
+    assert not isinstance(rotated.value, StaleTaskStateVersionError)
+
+    with pytest.raises(StaleTaskStateVersionError):
+        transition_task_control_state_sync(
+            int(task.id),
+            TaskControlState.PAUSED,
+            expected_run_id=running.run_id,
+            expected_state_version=running.state_version - 1,
+        )
+
+
+def test_transition_rejects_a_version_that_moved_under_a_stale_orm_row(
+    db_session,
+) -> None:
+    """The SQL fence, not the Python pre-check, is what stops a lost update.
+
+    ``apply_task_control_transition`` compares ``expected_state_version``
+    against the ORM row it was handed. When that row was loaded before a
+    concurrent writer committed, the comparison passes and only the
+    ``WHERE coalesce(state_version, 0) = :expected`` predicate on the UPDATE
+    is left to catch it. This is the branch that raises from the rowcount
+    check rather than the pre-check, and its message has to name both fences:
+    an operator reading "no longer belongs to run X" while the run never
+    changed is sent the wrong way.
+    """
+
+    task = _create_task(db_session)
+    running = transition_task_control_state_sync(
+        int(task.id),
+        TaskControlState.RUNNING,
+        status=TaskStatus.RUNNING,
+        new_run=True,
+    )
+
+    SessionLocal = get_session_local()
+    reader = SessionLocal()
+    try:
+        # Loaded before the concurrent write, so its in-memory version is the
+        # one the pre-check will (wrongly) accept.
+        stale_row = reader.query(Task).filter(Task.id == int(task.id)).first()
+        assert stale_row is not None
+        stale_version = int(stale_row.state_version)
+
+        with SessionLocal() as writer:
+            winner = writer.query(Task).filter(Task.id == int(task.id)).first()
+            assert winner is not None
+            apply_task_control_transition(
+                winner,
+                TaskControlState.PAUSED,
+                status=TaskStatus.PAUSED,
+                expected_run_id=running.run_id,
+            )
+            writer.commit()
+
+        # The rowcount miss cannot tell which fence rejected it, so when a
+        # version was supplied it reports the deferrable type -- the safe half
+        # of that ambiguity, since the retry reads a fresh row and can then
+        # tell precisely. This is the only path that reaches that selection;
+        # the pre-check above covers the unambiguous cases.
+        with pytest.raises(StaleTaskStateVersionError, match="at state version"):
+            apply_task_control_transition(
+                stale_row,
+                TaskControlState.RESUME_REQUESTED,
+                expected_run_id=running.run_id,
+                expected_state_version=stale_version,
+            )
+    finally:
+        reader.rollback()
+        reader.close()
+
+    # The concurrent writer's state survives; nothing was clobbered.
+    db_session.expire_all()
+    stored = db_session.get(Task, int(task.id))
+    assert stored is not None
+    assert stored.status == TaskStatus.PAUSED
+    assert stored.control_state == TaskControlState.PAUSED.value
 
 
 def test_concurrent_transitions_get_distinct_atomic_versions(db_session) -> None:

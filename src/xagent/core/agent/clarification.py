@@ -14,14 +14,13 @@ result dict verbatim into ``AutoPattern.last_result`` (see
 ``pattern/auto/auto.py``), and a waiting ReAct child's result carries the
 draft under ``result["clarification_draft"]``.
 
-``turn_marker`` is the only idempotency-relevant value this module produces,
-and it carries no persistence-format promise of its own: it is a stable,
-opaque string. Its idempotency scope is a single ``(task_id, run_id)``
-partition -- two different tasks or runs may legitimately produce equal
-markers, since neither identifier is a marker component. Deriving a storage
-key (length limits, character-set validation, or any other on-disk
-contract) is a web-layer concern that reads this string; this module does
-not know what that contract looks like.
+``event_id`` is the clarification's stable identity. The runtime allocates it
+before publishing the question and stores that same value in the waiting
+request, so a draft reconstructed after checkpoint restore still names the
+published question occurrence. ``turn_marker`` remains a deterministic,
+opaque description of the waiting turn, but it is not a second publication
+identity. Storage validation and on-disk key constraints remain web-layer
+concerns; this core module does not know what those contracts look like.
 """
 
 from __future__ import annotations
@@ -29,6 +28,8 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, replace
 from typing import Any
+
+from pydantic import JsonValue
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +65,9 @@ class ClarificationRequestItem:
 class ClarificationDraft:
     """A typed view over a waiting turn, common to all clarification sources.
 
-    ``requests`` carries one item per pending question: the single-source
+    ``event_id`` names the already-published question occurrence. Legacy
+    absence is empty; malformed restored values remain unchanged for web
+    validation. ``requests`` carries one item per pending question: the single-source
     waiting points (``send_message`` / ``ask_user_question``) contribute
     exactly one item, and the multi-tool waiting point contributes one item
     per waiting tool. A malformed or legacy waiting payload can yield an
@@ -98,6 +101,7 @@ class ClarificationDraft:
     origin_execution_id: str
     turn_message_count: int
     turn_marker: str
+    event_id: JsonValue = ""
 
     def with_origin_step(self, step_id: str) -> "ClarificationDraft":
         """Return a copy attributed to ``step_id``, with the marker redone.
@@ -141,6 +145,7 @@ class ClarificationDraft:
 
         return {
             "source": self.source,
+            "event_id": self.event_id,
             "message": self.message,
             "message_type": self.message_type,
             "interactions": list(self.interactions),
@@ -326,6 +331,7 @@ def draft_from_waiting_request(
 
     return ClarificationDraft(
         source=source,
+        event_id=request.get("event_id", ""),
         message=message,
         message_type=message_type,
         interactions=interactions,

@@ -345,7 +345,7 @@ def _install_one_slot_queue_pool(
     return engine
 
 
-def patch_schedule_bg(monkeypatch: pytest.MonkeyPatch) -> None:
+def patch_schedule_bg(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     """Replace the leaf that starts a real background turn with a no-op task.
 
     The workforce guest create path reaches
@@ -362,10 +362,15 @@ def patch_schedule_bg(monkeypatch: pytest.MonkeyPatch) -> None:
     anyway.
     """
 
-    def fake_schedule_bg(**_kwargs: Any) -> "asyncio.Task[None]":
+    scheduled: dict[str, Any] = {}
+
+    def fake_schedule_bg(**kwargs: Any) -> "asyncio.Task[None]":
+        scheduled.update(kwargs)
+
         async def noop() -> None:
             return None
 
         return asyncio.create_task(noop())
 
     monkeypatch.setattr(task_orchestrator_service, "_schedule_bg", fake_schedule_bg)
+    return scheduled

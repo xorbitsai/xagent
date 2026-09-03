@@ -347,7 +347,9 @@ import {
   type WebSocketConnectionFailure,
 } from "@/hooks/use-websocket"
 import { generateClientMessageId, getApiUrl, getUploadApiUrl, shouldAutoOpenTaskPreview } from "@/lib/utils"
-import { apiRequest, getApiErrorMessage, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper"
+import { apiRequest, classifyUploadError, getApiErrorMessage, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper"
+import { clientErrorTranslationKey, readClientErrorCode } from "@/lib/client-errors"
+import { normalizeUploadFileIds } from "@/lib/upload-file-ids"
 import { useI18n } from "@/contexts/i18n-context"
 import { normalizeTimestampMs } from "@/lib/time-utils"
 import { unwrapFinalAnswerContent } from "@/lib/final-answer"
@@ -634,6 +636,7 @@ interface Message {
   streamMessageId?: string
   traceEvents?: TraceEvent[]
   interactions?: Interaction[]
+  interactionRequestId?: string
   isSystemNotice?: boolean
   isOptimistic?: boolean
 }
@@ -673,6 +676,7 @@ export interface Task {
   runtimeExtensionBindings?: string[]
   waitingQuestion?: string
   waitingInteractions?: Interaction[]
+  waitingRequestId?: string
   runId?: string | null
   stateVersion?: number
   controlState?: TaskControlState
@@ -883,10 +887,35 @@ const taskFromTaskInfoData = (
   controlState: taskData.control_state as TaskControlState | undefined,
 })
 
-const getWebSocketErrorMessage = (message: WebSocketMessage): string => {
+const getWebSocketErrorCodeField = (message: WebSocketMessage): {
+  present: boolean
+  value: unknown
+} => {
   const root = message as unknown as Record<string, unknown>
   const data = isJsonRecord(message.data) ? message.data : null
+  if (data && Object.prototype.hasOwnProperty.call(data, "error_code")) {
+    return { present: true, value: data.error_code }
+  }
+  if (Object.prototype.hasOwnProperty.call(root, "error_code")) {
+    return { present: true, value: root.error_code }
+  }
+  return { present: false, value: undefined }
+}
+
+const getWebSocketErrorMessage = (
+  message: WebSocketMessage,
+  trustLegacyErrorProse: boolean,
+): string => {
+  const root = message as unknown as Record<string, unknown>
+  const data = isJsonRecord(message.data) ? message.data : null
+  if (getWebSocketErrorCodeField(message).present) return "Unknown error"
+  if (!trustLegacyErrorProse) return "Unknown error"
   return getString(data?.message) || getString(data?.error) || getString(root.message) || getString(root.error) || "Unknown error"
+}
+
+const getWebSocketErrorCode = (message: WebSocketMessage) => {
+  const errorCode = getWebSocketErrorCodeField(message)
+  return errorCode.present ? readClientErrorCode(errorCode.value) : null
 }
 
 const getWebSocketTaskStatus = (message: WebSocketMessage): Task["status"] | null => {
@@ -1056,7 +1085,7 @@ type AppAction =
   | { type: "UPSERT_STREAMING_FINAL_ANSWER"; payload: { messageId: string; delta?: string; content?: string; status?: Message["status"]; timestamp: string } }
   | { type: "SET_CURRENT_TASK"; payload: Task | null }
   | { type: "SET_TASK_RUNTIME_EXTENSIONS"; payload: { taskId: number; extensions: TaskRuntimeExtensions } }
-  | { type: "UPDATE_TASK_STATUS"; payload: { status: Task["status"]; waitingQuestion?: string; waitingInteractions?: Interaction[]; runId?: string | null; stateVersion?: number; controlState?: TaskControlState; updatedAt?: string } }
+  | { type: "UPDATE_TASK_STATUS"; payload: { status: Task["status"]; waitingQuestion?: string; waitingInteractions?: Interaction[]; waitingRequestId?: string; runId?: string | null; stateVersion?: number; controlState?: TaskControlState; updatedAt?: string } }
   | { type: "TRIGGER_TASK_UPDATE" }
   | { type: "SET_DAG_EXECUTION"; payload: DAGExecution | null }
   | { type: "RESET_DAG_STATE" }
@@ -1415,6 +1444,9 @@ function projectAppState(state: AppState, action: AppAction): AppState {
           dagTerminatedAt = new Date().toISOString()
         }
       }
+      const replacesWaitingOccurrence = isWaitingForUser
+        && action.payload.waitingRequestId !== undefined
+        && action.payload.waitingRequestId !== state.currentTask.waitingRequestId
       return {
         ...state,
         isProcessing: shouldStopProcessingForTaskStatus(nextStatus)
@@ -1433,10 +1465,22 @@ function projectAppState(state: AppState, action: AppAction): AppState {
           dagTerminatedAt,
           dagTerminatedAtProvisional,
           waitingQuestion: isWaitingForUser
-            ? action.payload.waitingQuestion ?? state.currentTask.waitingQuestion
+            ? action.payload.waitingQuestion ?? (
+              replacesWaitingOccurrence ? undefined : state.currentTask.waitingQuestion
+            )
             : undefined,
           waitingInteractions: isWaitingForUser
-            ? action.payload.waitingInteractions ?? state.currentTask.waitingInteractions
+            ? action.payload.waitingInteractions ?? (
+              replacesWaitingOccurrence ? undefined : state.currentTask.waitingInteractions
+            )
+            : undefined,
+          waitingRequestId: isWaitingForUser
+            ? action.payload.waitingRequestId ?? (
+              action.payload.waitingQuestion === undefined
+              && action.payload.waitingInteractions === undefined
+                ? state.currentTask.waitingRequestId
+                : undefined
+            )
             : undefined,
           runId: action.payload.runId ?? state.currentTask.runId,
           stateVersion: action.payload.stateVersion ?? state.currentTask.stateVersion,
@@ -1748,6 +1792,7 @@ interface PendingMessage {
   targetTaskId?: number
   force?: boolean
   clientMessageId?: string
+  requestId?: string
   resolve?: () => void
   reject?: (error: Error) => void
 }
@@ -1803,6 +1848,12 @@ export interface AppProviderTransportCapabilities {
 }
 
 export interface AppProviderTransportConfig {
+  /**
+   * Whether no-code error frames may render server prose during a temporary
+   * old-backend/new-frontend deployment skew. Public and external-credential
+   * transports must opt out; the authenticated page keeps its legacy default.
+   */
+  legacyErrorProse?: "trusted" | "untrusted"
   buildWebSocketUrl?: (params: { baseUrl: string; taskId: number; token?: string }) => string
   /**
    * Owns every file URL and request made below this provider. Public
@@ -1889,20 +1940,29 @@ export function AppProvider({
   const startDelayedPlaybackRef = useRef<() => void>(() => {})
   const isHistoricalDataLoadingRef = useRef(false)
   const historicalDataRequestMapRef = useRef(new Map<number, boolean>())
-  const recentMessagesRef = useRef(new Set<string>())
+  const recentMessagesRef = useRef(new Map<string, ReturnType<typeof setTimeout>>())
   const isDuplicateMessage = useCallback((
     content: string | React.ReactNode,
     type = "general",
     force = false,
     shouldCache = true,
+    occurrenceIdentity?: string,
   ) => {
     const contentStr = normalizeMessageContent(content)
-    const key = `${type}:${contentStr}`
+    const key = JSON.stringify([type, contentStr])
+    const occurrenceKey = occurrenceIdentity
+      ? JSON.stringify([type, contentStr, occurrenceIdentity])
+      : undefined
     const cache = recentMessagesRef.current
-    if (!force && cache.has(key)) return true
+    if (!force && cache.has(occurrenceKey || key)) return true
     if (shouldCache) {
-      cache.add(key)
-      setTimeout(() => cache.delete(key), 30_000)
+      for (const cacheKey of occurrenceKey ? [key, occurrenceKey] : [key]) {
+        clearTimeout(cache.get(cacheKey))
+        const expiry = setTimeout(() => {
+          if (cache.get(cacheKey) === expiry) cache.delete(cacheKey)
+        }, 30_000)
+        cache.set(cacheKey, expiry)
+      }
     }
     return false
   }, [])
@@ -1941,6 +2001,7 @@ export function AppProvider({
     }
   }, [])
   const sessionTransport = transport?.session
+  const trustLegacyErrorProse = transport?.legacyErrorProse !== "untrusted"
   const filesDisabled = !resolveTransportCapability(
     sessionTransport,
     sessionTransport?.files,
@@ -2297,6 +2358,7 @@ export function AppProvider({
       sessionTransport === undefined
         ? undefined
         : deliveryGeneration,
+    legacyErrorProse: trustLegacyErrorProse ? "trusted" : "untrusted",
     onSessionConnectionClose: sessionTransport?.onConnectionClose,
     onSessionConnectionFailure: sessionTransport?.onConnectionFailure,
     onMessage: (message) => {
@@ -2363,6 +2425,7 @@ export function AppProvider({
           pendingMessage.files,
           pendingMessage.force,
           pendingMessage.clientMessageId,
+          pendingMessage.requestId,
         )
       ).then(() => {
         pendingMessage.resolve?.()
@@ -2511,7 +2574,8 @@ export function AppProvider({
     const isDuplicateMessageForViewedTask = (
       content: string | React.ReactNode,
       type = "general",
-    ) => isDuplicateMessage(content, type, false, !isMessageForOtherTask)
+      occurrenceIdentity?: string,
+    ) => isDuplicateMessage(content, type, false, !isMessageForOtherTask, occurrenceIdentity)
     // Shared by both dag_execution shapes this handler processes below (the
     // modern trace_event-wrapped one, and the legacy bare "dag_execution"
     // message type) - duplicating this logic per call site is exactly how a
@@ -3001,6 +3065,9 @@ export function AppProvider({
               return
             }
             const interactions = normalizeInteractions(eventData.metadata?.interactions)
+            const interactionRequestId = typeof eventData.request_id === "string"
+              ? eventData.request_id
+              : undefined
             const isAgentMessage = eventType === "agent_message"
             const isAiMessage = eventType === "ai_message"
             const expectsUserResponse =
@@ -3038,6 +3105,7 @@ export function AppProvider({
                   status: "waiting_for_user",
                   waitingQuestion: messageContent,
                   waitingInteractions: interactions.length > 0 ? interactions : undefined,
+                  waitingRequestId: interactionRequestId,
                 }
               })
             }
@@ -3048,7 +3116,11 @@ export function AppProvider({
             if (shouldHideAgentMessage) {
               return
             }
-            if (!streamMessageId && isDuplicateMessageForViewedTask(messageContent, 'agent-message')) {
+            if (!streamMessageId && isDuplicateMessageForViewedTask(
+              messageContent,
+              'agent-message',
+              isAgentMessage ? interactionRequestId : undefined,
+            )) {
               return
             }
             const msgId = generateMessageId("msg-agent")
@@ -3064,6 +3136,7 @@ export function AppProvider({
                 isResult: true,
                 streamMessageId,
                 interactions: interactions.length > 0 ? interactions : undefined,
+                interactionRequestId,
               }
             })
             if (eventData.status === "completed") {
@@ -5470,15 +5543,26 @@ export function AppProvider({
 
       case "task_waiting_for_user":
         console.trace('Original message:', JSON.stringify(message), 'Handler: handleMessage (task_waiting_for_user)')
-        const waitingData = message.data as any
-        const waitingMessage = waitingData?.question || waitingData?.message || ""
-        const interactions = normalizeInteractions(waitingData?.interactions)
+        const waitingRoot = asMessageRecord(message)
+        const waitingData = asMessageRecord(message.data)
+        const waitingMessage = getString(waitingRoot.question)
+          || getString(waitingData.question)
+          || getString(waitingRoot.message)
+          || getString(waitingData.message)
+        const interactions = normalizeInteractions(
+          waitingRoot.interactions ?? waitingData.interactions
+        )
+        const waitingRequestIdValue = waitingRoot.request_id ?? waitingData.request_id
+        const waitingRequestId = typeof waitingRequestIdValue === "string"
+          ? waitingRequestIdValue
+          : undefined
         dispatch({
           type: "UPDATE_TASK_STATUS",
           payload: {
             status: controlEnvelope.status || "waiting_for_user",
             waitingQuestion: waitingMessage && waitingMessage !== "Task waiting for user response" ? waitingMessage : undefined,
             waitingInteractions: interactions.length > 0 ? interactions : undefined,
+            waitingRequestId,
             runId: controlEnvelope.runId,
             stateVersion: controlEnvelope.stateVersion,
             controlState: controlEnvelope.controlState || "waiting_for_user",
@@ -5488,7 +5572,11 @@ export function AppProvider({
         if (
           waitingMessage &&
           waitingMessage !== "Task waiting for user response" &&
-          !isDuplicateMessageForViewedTask(waitingMessage, 'agent-message')
+          !isDuplicateMessageForViewedTask(
+            waitingMessage,
+            'agent-message',
+            waitingRequestId,
+          )
         ) {
           dispatch({
             type: "ADD_MESSAGE",
@@ -5501,6 +5589,7 @@ export function AppProvider({
               status: "running",
               isResult: true,
               interactions: interactions.length > 0 ? interactions : undefined,
+              interactionRequestId: waitingRequestId,
             }
           })
         }
@@ -5521,7 +5610,10 @@ export function AppProvider({
 
       case "agent_error":
         console.trace('Original message:', JSON.stringify(message), 'Handler: handleMessage (agent_error)')
-        const agentErrorMessage = getWebSocketErrorMessage(message)
+        const agentErrorCode = getWebSocketErrorCode(message)
+        const agentErrorMessage = agentErrorCode
+          ? t(clientErrorTranslationKey(agentErrorCode))
+          : getWebSocketErrorMessage(message, trustLegacyErrorProse)
         const agentErrorTaskStatus = getWebSocketTaskStatus(message)
 
         if (agentErrorTaskStatus) {
@@ -5565,7 +5657,10 @@ export function AppProvider({
       case "error":
       case "task_error":
         console.trace('Original message:', JSON.stringify(message), 'Handler: handleMessage (error)')
-        const websocketErrorMessage = getWebSocketErrorMessage(message)
+        const websocketErrorCode = getWebSocketErrorCode(message)
+        const websocketErrorMessage = websocketErrorCode
+          ? t(clientErrorTranslationKey(websocketErrorCode))
+          : getWebSocketErrorMessage(message, trustLegacyErrorProse)
         const websocketTaskStatus = getWebSocketTaskStatus(message)
 
         if (websocketTaskStatus) {
@@ -5611,7 +5706,7 @@ export function AppProvider({
         }
         break
     }
-  }, [])
+  }, [trustLegacyErrorProse])
 
   const handleSessionMessage = (
     message: WebSocketMessage,
@@ -5621,6 +5716,28 @@ export function AppProvider({
     if (
       owner.connectionIdentity !== sessionConnectionIdentityRef.current
     ) {
+      return
+    }
+
+    if (message.type === "conversation_reload_required") {
+      const binding = extractSessionTaskBinding(message)
+      const lifecycle = sessionConversationRef.current
+      if (
+        !binding.present
+        || !binding.valid
+        || (
+          lifecycle.phase !== "bound"
+          && lifecycle.phase !== "reset_requested"
+        )
+        || lifecycle.connectionIdentity !== owner.connectionIdentity
+        || lifecycle.taskId !== binding.taskId
+        || sessionTaskIdRef.current !== binding.taskId
+      ) {
+        return
+      }
+      requireSessionReload(
+        new Error("The current conversation cannot be restored; reload required.")
+      )
       return
     }
 
@@ -5878,6 +5995,9 @@ export function AppProvider({
     const clientMessageId = typeof config?.clientMessageId === 'string'
       ? config.clientMessageId
       : generateClientMessageId()
+    const requestId = typeof config?.metadata?.request_id === 'string'
+      ? config.metadata.request_id
+      : undefined
     const sessionDeliveryOwner =
       sessionTransport && sessionConnectionIdentityRef.current
         ? {
@@ -5995,6 +6115,7 @@ export function AppProvider({
           files,
           config?.force,
           clientMessageId,
+          requestId,
         )
         if (startsReplacementConversation) {
           if (!replacementSendStillOwned()) {
@@ -6099,28 +6220,37 @@ export function AppProvider({
 
               const parsed = await parseApiResponse(uploadResponse)
 
-              if (uploadResponse.ok && isJsonRecord(parsed.data)) {
-                const uploadData = parsed.data
-                if (uploadData.success && Array.isArray(uploadData.files)) {
-                  uploadData.files
-                    .filter((f): f is { file_id: string } => isJsonRecord(f) && typeof f.file_id === 'string')
-                    .forEach(f => uploadedFileIds.push(f.file_id))
-                }
-              } else {
-                throw new Error(getUploadErrorMessage(uploadResponse, parsed, {
-                  generic: t("files.uploadFailed") || "Upload failed",
-                  ...UPLOAD_ERROR_MESSAGES,
-                }))
+              if (
+                !uploadResponse.ok
+                || !isJsonRecord(parsed.data)
+                || parsed.data.success !== true
+                || !Array.isArray(parsed.data.files)
+              ) {
+                const uploadError = classifyUploadError(uploadResponse, parsed)
+                throw new Error(t(clientErrorTranslationKey(uploadError.errorCode)))
               }
+              const newFileIds = normalizeUploadFileIds(
+                parsed.data.files.map(f => isJsonRecord(f) ? f.file_id : null),
+                filesToUpload.length,
+              )
+              if (!newFileIds) {
+                throw new Error(t("clientErrors.uploadFailed"))
+              }
+              uploadedFileIds.push(...newFileIds)
             } catch (e) {
               console.error('Error uploading files before task creation:', e)
               throw e
             }
           }
 
-          if (uploadedFileIds.length > 0) {
-            requestBody.files = uploadedFileIds
+          const normalizedFileIds = normalizeUploadFileIds(
+            uploadedFileIds,
+            files.length,
+          )
+          if (!normalizedFileIds) {
+            throw new Error(t("clientErrors.uploadFailed"))
           }
+          requestBody.files = normalizedFileIds
         }
 
         // Agent chats should use the published agent's own model configuration.
@@ -6223,6 +6353,7 @@ export function AppProvider({
             targetTaskId: newTaskId,
             force: config?.force,
             clientMessageId,
+            requestId,
           })
           addOptimisticUserMessage(newTaskId)
         } else {
@@ -6268,7 +6399,7 @@ export function AppProvider({
       // deliberately runs only after this succeeds - clearing dagExecution/
       // steps first and then throwing would remove the Progress panel and its
       // header toggle for a run that never actually changed.
-      await sendChatMessage(message, files, config?.force, clientMessageId)
+      await sendChatMessage(message, files, config?.force, clientMessageId, requestId)
 
       // A prior turn's DAG plan/steps must not linger into this turn - otherwise
       // the Progress panel would auto-open (or stay open) showing stale steps

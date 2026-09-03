@@ -411,7 +411,11 @@ async def _schedule_waiting_reply_resume(
                 preacquired_prior_status=TaskStatus.WAITING_FOR_USER,
             )
         )
-        websocket.background_task_manager.register_reserved_resume(task_id, bg_task)
+        websocket.background_task_manager.register_reserved_resume(
+            task_id,
+            bg_task,
+            run_id=task_lease.run_id,
+        )
     except BaseException:
         if bg_task is not None:
             await cancel_and_drain_async_task(bg_task)

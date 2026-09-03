@@ -153,6 +153,15 @@ def _run_tracker_ownership_race(
     return result["owned"], persisted
 
 
+# Loop progress is waited for, not counted inside a fixed window: an
+# oversubscribed CI runner can starve the loop for longer than the window, so a
+# rate assertion fails on scheduling rather than on the property under test
+# (#1993). The window stays under the pool's 1s timeout, which keeps the worker
+# parked while the assertions run.
+_REQUIRED_LOOP_TICKS = 3
+_LOOP_PROGRESS_WINDOW_SECONDS = 0.5
+
+
 def _create_tracker_pool_db(tmp_path, filename):
     engine = create_engine(
         f"sqlite:///{tmp_path / filename}",
@@ -215,7 +224,7 @@ async def _assert_tracker_operation_keeps_loop_responsive_under_pool_pressure(
     def traced_helper(*args, **kwargs):
         nonlocal window_timer, worker_thread_id
         worker_thread_id = threading.get_ident()
-        window_timer = threading.Timer(0.1, end_window)
+        window_timer = threading.Timer(_LOOP_PROGRESS_WINDOW_SECONDS, end_window)
         if timer_created is not None:
             timer_created(window_timer)
         window_timer.start()
@@ -227,6 +236,10 @@ async def _assert_tracker_operation_keeps_loop_responsive_under_pool_pressure(
         while not ticker_stop.is_set():
             await asyncio.sleep(0.01)
             ticker_ticks += 1
+            if ticker_ticks >= _REQUIRED_LOOP_TICKS:
+                # The timer is only the safety net; enough loop progress closes
+                # the window on its own.
+                end_window()
 
     def end_window():
         ticker_stop.set()
@@ -246,9 +259,10 @@ async def _assert_tracker_operation_keeps_loop_responsive_under_pool_pressure(
         )
 
         assert await asyncio.wait_for(
-            asyncio.to_thread(window_elapsed.wait, 0.2), timeout=0.3
+            asyncio.to_thread(window_elapsed.wait, _LOOP_PROGRESS_WINDOW_SECONDS + 0.1),
+            timeout=_LOOP_PROGRESS_WINDOW_SECONDS + 0.2,
         )
-        assert ticker_ticks >= 3
+        assert ticker_ticks >= _REQUIRED_LOOP_TICKS
         assert not operation_task.done()
         assert worker_thread_id is not None
         assert worker_thread_id != event_loop_thread_id

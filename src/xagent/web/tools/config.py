@@ -1005,7 +1005,16 @@ async def refresh_oauth_token_if_needed(
             # Matches the code-exchange branch in api/auth.py: Employment
             # Hero's partner guide requires grant_type and refresh_token as
             # query parameters on the refresh request too, with only the
-            # credential fields in the form body.
+            # credential fields in the form body. Putting a long-lived
+            # credential (refresh_token) in a query string is a generic
+            # secret-exposure anti-pattern (it can end up in proxy/server
+            # access logs a form body wouldn't) -- accepted here as a
+            # residual risk forced by Employment Hero's documented contract,
+            # not a choice this codebase would otherwise make. No httpx/
+            # httpcore request-logging middleware exists in this codebase
+            # today (those loggers are pinned to WARNING) and the
+            # configured HTTPS proxy only sees a CONNECT tunnel, never this
+            # URL's query string -- reassess this note if either changes.
             post_kwargs["params"] = {
                 "grant_type": data.pop("grant_type"),
                 "refresh_token": data.pop("refresh_token"),

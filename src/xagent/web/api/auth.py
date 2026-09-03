@@ -53,6 +53,7 @@ from ..models.system_setting import SystemSetting
 from ..models.user import User
 from ..models.user_oauth import UserOAuth
 from ..oauth_provider_quirks import (
+    host_matches_suffix,
     matches_provider_family,
     requires_json_accept_header,
     requires_pkce,
@@ -165,7 +166,11 @@ def _oauth_env_name(provider: str, suffix: str) -> str:
     # family) would otherwise produce an env var name no deployment could
     # ever set (env vars can't contain "-"), silently breaking this
     # fallback for every hyphenated provider. Every non-hyphenated provider
-    # name is unaffected by this replacement.
+    # name is unaffected by this replacement. Note this makes two distinct
+    # provider names that differ only in "-" vs "_" (e.g. a hypothetical
+    # "foo-bar" and "foo_bar") resolve to the same env var name -- no such
+    # pair exists among current providers, so this is a dormant, not
+    # currently reachable, collision.
     return f"{provider.upper().replace('-', '_')}_{suffix}"
 
 
@@ -238,8 +243,8 @@ def _normalize_deputy_endpoint(raw_endpoint: object) -> Optional[str]:
     except ValueError:
         return None
     hostname = (parsed.hostname or "").rstrip(".")
-    if parsed.scheme != "https" or not (
-        hostname == _DEPUTY_HOST_SUFFIX or hostname.endswith(f".{_DEPUTY_HOST_SUFFIX}")
+    if parsed.scheme != "https" or not host_matches_suffix(
+        hostname, _DEPUTY_HOST_SUFFIX
     ):
         return None
     return f"{parsed.scheme}://{hostname}{port}"
@@ -662,6 +667,10 @@ _EMPLOYMENT_HERO_HOST_SUFFIX = "employmenthero.com"
 # hang this callback in an unbounded fetch; 50 pages at 100 items each
 # (5000 organisations) is far beyond any real grant's scope.
 _EMPLOYMENT_HERO_IDENTITY_MAX_PAGES = 50
+# Comfortably under Postgres's ~2704-byte btree index row-size limit that
+# UserOAuth's (user_id, provider, provider_user_id) uniqueness index enforces
+# -- see _fetch_employment_hero_identity's docstring.
+_PROVIDER_USER_ID_SAFE_LENGTH = 500
 
 
 def _is_employment_hero_token_url(token_url: str) -> bool:
@@ -687,14 +696,10 @@ def _is_employment_hero_token_url(token_url: str) -> bool:
         hostname = (urlparse(token_url).hostname or "").rstrip(".")
     except ValueError:
         return False
-    return hostname == _EMPLOYMENT_HERO_HOST_SUFFIX or hostname.endswith(
-        f".{_EMPLOYMENT_HERO_HOST_SUFFIX}"
-    )
+    return host_matches_suffix(hostname, _EMPLOYMENT_HERO_HOST_SUFFIX)
 
 
-def _fetch_employment_hero_identity(
-    access_token: str,
-) -> tuple[Optional[str], Optional[str]]:
+def _fetch_employment_hero_identity(access_token: str) -> Optional[str]:
     """Fetch the accessible organisations for this grant from Employment
     Hero's `GET /organisations` -- the same endpoint employment_hero.py's own
     employment_hero_list_organisations tool calls, and the closest thing to
@@ -712,8 +717,8 @@ def _fetch_employment_hero_identity(
     Deputy/Linear's own identity fetches each close for their provider (see
     the Salesforce branch's comment above).
 
-    A grant with zero accessible organisations returns (None, None) rather
-    than failing the whole connect -- a token scoped to no organisation at
+    A grant with zero accessible organisations returns None rather than
+    failing the whole connect -- a token scoped to no organisation at
     all is an edge case no tool in this connector could do anything useful
     with anyway, so a hard connect-time error would be disproportionate;
     the duplicate-row race is simply not closed for that one case, the same
@@ -723,9 +728,29 @@ def _fetch_employment_hero_identity(
     Paginates through every page rather than trusting a single 100-item
     page: a grant with more than 100 accessible organisations would
     otherwise have its provider_user_id derived from only the first 100,
-    silently excluding the rest from the uniqueness key. Capped at
-    _EMPLOYMENT_HERO_IDENTITY_MAX_PAGES pages as a safety bound against a
-    misbehaving/malicious response that never shrinks below a full page.
+    silently excluding the rest from the uniqueness key. Termination is
+    driven by the response envelope's own `total_pages` (confirmed present
+    in Employment Hero's actual response shape -- see
+    test_list_organisations_requests_expected_path_and_params's fixture),
+    not by comparing the returned page size against the 100 this function
+    itself requested: this API's documented max page size is a ceiling on
+    what a caller may ask for, not a guarantee the server always returns
+    that many when more results exist, so a page shorter than requested is
+    not on its own reliable proof there's nothing left. Falls back to that
+    same short-page heuristic only if a response is ever missing
+    `total_pages` entirely. Capped at _EMPLOYMENT_HERO_IDENTITY_MAX_PAGES
+    pages as a safety bound against a misbehaving/malicious response that
+    never reports completion; logs a warning if that cap is actually hit; a
+    truncated organisation set at that point is still used rather than
+    failing the whole connect, matching the zero-organisation tradeoff
+    above.
+
+    The resulting id set is hashed rather than stored as a raw joined
+    string once it's long enough to risk exceeding Postgres's ~2704-byte
+    btree index row-size limit (UUID-shaped organisation ids at real scale
+    -- a partner/bookkeeper account with 70+ accessible organisations --
+    can exceed it): a hash is still a stable, deterministic value per exact
+    organisation set, which is all the uniqueness key actually needs.
 
     Raises RuntimeError on a failed/unparsable response, matching
     _fetch_deputy_identity/_fetch_linear_viewer_identity.
@@ -763,10 +788,23 @@ def _fetch_employment_hero_identity(
             for item in items
             if isinstance(item, dict) and item.get("id") not in (None, "")
         )
-        if len(items) < item_per_page:
+        total_pages = data.get("total_pages") if isinstance(data, dict) else None
+        if isinstance(total_pages, int) and total_pages > 0:
+            if page_index >= total_pages:
+                break
+        elif len(items) < item_per_page:
             break
+    else:
+        logger.warning(
+            "Employment Hero organisation lookup hit the %s-page safety cap; "
+            "provider_user_id may be derived from an incomplete organisation "
+            "set.",
+            _EMPLOYMENT_HERO_IDENTITY_MAX_PAGES,
+        )
     provider_user_id = ",".join(sorted(organisation_ids)) if organisation_ids else None
-    return provider_user_id, None
+    if provider_user_id and len(provider_user_id) > _PROVIDER_USER_ID_SAFE_LENGTH:
+        provider_user_id = hashlib.sha256(provider_user_id.encode()).hexdigest()
+    return provider_user_id
 
 
 def create_access_token(
@@ -3115,7 +3153,10 @@ def generic_oauth_callback(
             # whose token_url is actually Employment Hero's own -- see that
             # function's docstring.
             try:
-                provider_user_id, email = _fetch_employment_hero_identity(access_token)
+                # No email slot -- Employment Hero grants are org-scoped,
+                # not user-scoped (see the function's docstring); `email`
+                # stays at its outer-scope None default.
+                provider_user_id = _fetch_employment_hero_identity(access_token)
             except RuntimeError as e:
                 # A deliberate failure raised by _fetch_employment_hero_
                 # identity itself -- Employment Hero's API responded, just

@@ -515,6 +515,56 @@ def test_github_login_requests_exact_canonical_scope(db_session):
     assert qs["scope"] == ["read:user repo user:email"]
 
 
+def test_employment_hero_login_requests_exact_canonical_scope(db_session):
+    """Employment Hero has no default_scopes of its own (every scope it
+    needs lives entirely on the app row's oauth_scopes) -- the only test
+    covering its login route before this ran with app_id=None, bypassing
+    this app-level scope-merge path (and the canonical-registry overlay
+    test_github_login_requests_exact_canonical_scope above exercises)
+    entirely. Verified by sabotage: deleting a scope from the registry row
+    produced zero failures anywhere in the oauth + employment-hero suite
+    before this test existed."""
+    db, user = db_session
+    token = _token_for(user)
+    db.add(
+        PublicMCPApp(
+            app_id="employment-hero",
+            name="Employment Hero",
+            description="Employment Hero connector",
+            transport="oauth",
+            provider_name="employment-hero",
+            category="HR",
+            # Deliberately stale/wrong to prove the registry, not this
+            # row's oauth_scopes, is what actually gets requested.
+            oauth_scopes=["organisations:list"],
+            is_visible_in_connector=True,
+            launch_config={},
+        )
+    )
+    db.commit()
+
+    provider = _provider(
+        auth_url="https://oauth.employmenthero.com/oauth2/authorize",
+        default_scopes=[],
+        redirect_uri="https://app.example.com/api/auth/employment-hero/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="employment-hero",
+        token=token,
+        app_id="employment-hero",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert qs["scope"] == [
+        "employees:list employees:show organisations:list teams:list "
+        "timesheet_entries:list"
+    ]
+
+
 def test_bare_github_login_config_error_takes_precedence_over_bare_route_guard(
     db_session,
 ):

@@ -1,6 +1,8 @@
 import pytest
 
 from xagent.web.oauth_provider_quirks import (
+    host_matches_suffix,
+    matches_provider_family,
     meta_invalid_token_error_code,
     requires_json_accept_header,
 )
@@ -18,6 +20,28 @@ def test_requires_json_accept_header_is_case_insensitive():
 def test_requires_json_accept_header_false_for_other_providers():
     for provider in ("zoom", "slack", "google", "linkedin", "hubspot", "intercom"):
         assert requires_json_accept_header(provider) is False
+
+
+def test_matches_provider_family_is_case_insensitive_on_base_name_too():
+    """The docstring promises case-insensitive matching overall -- a caller
+    passing a differently-cased base_name (e.g. from a constant that isn't
+    already a lowercase literal) must not silently stop matching."""
+    assert matches_provider_family("salesforce-sandbox", "Salesforce") is True
+    assert matches_provider_family("SALESFORCE", "SALESFORCE") is True
+
+
+@pytest.mark.parametrize(
+    "hostname,suffix,expected",
+    [
+        ("deputy.com", "deputy.com", True),
+        ("acme.au.deputy.com", "deputy.com", True),
+        ("notdeputy.com", "deputy.com", False),
+        ("deputy.com.evil.com", "deputy.com", False),
+        ("", "deputy.com", False),
+    ],
+)
+def test_host_matches_suffix(hostname, suffix, expected):
+    assert host_matches_suffix(hostname, suffix) is expected
 
 
 @pytest.mark.parametrize("code", [190, 102])

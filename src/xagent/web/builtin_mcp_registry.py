@@ -358,13 +358,17 @@ def get_builtin_oauth_provider_rows() -> list[dict[str, Any]]:
             # closest resource, GET /api/v1/organisations, returns a *list*
             # of organisations the token can access rather than a single
             # object with an id/email shape this callback's flat
-            # user_id_path/email_path lookup could use. Left empty, same
-            # tradeoff as salesforce/linear's rows above: generic_oauth_
-            # callback's `if userinfo_url and access_token:` guard skips the
-            # lookup, so UserOAuth.email/provider_user_id stay NULL for
-            # every grant — is_connected still works from access_token
-            # alone, and an agent calls employment_hero_list_organisations
-            # to discover the organisation_id every other tool needs anyway.
+            # user_id_path/email_path lookup could use. Left empty so that
+            # lookup is skipped entirely (generic_oauth_callback's `if
+            # userinfo_url and access_token:` guard); identity comes instead
+            # from a dedicated `elif matches_provider_family(provider,
+            # "employment-hero")` branch there that calls
+            # _fetch_employment_hero_identity, deriving provider_user_id
+            # from the grant's accessible organisation ids (None only for a
+            # grant with zero accessible organisations) — is_connected still
+            # works from access_token alone regardless, and an agent calls
+            # employment_hero_list_organisations to discover the
+            # organisation_id every other tool needs anyway.
             "userinfo_url": "",
             "user_id_path": "id",
             "email_path": "email",

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -232,11 +233,15 @@ def test_callback_backfills_identity_across_multiple_organisation_pages(
         ),
     )
 
-    page_1_items = [{"id": f"org-{i}"} for i in range(100)]
-    page_2_items = [{"id": "org-100"}]
+    # Short numeric ids, not "org-N" -- the joined set must stay under
+    # _PROVIDER_USER_ID_SAFE_LENGTH here so this test actually checks
+    # pagination completeness, not the separate length-safety hashing
+    # covered by test_callback_hashes_provider_user_id_when_too_long_for_index.
+    page_1_items = [{"id": str(i)} for i in range(100)]
+    page_2_items = [{"id": "100"}]
     responses = [
-        MockResponse({"data": {"items": page_1_items}}),
-        MockResponse({"data": {"items": page_2_items}}),
+        MockResponse({"data": {"items": page_1_items, "total_pages": 2}}),
+        MockResponse({"data": {"items": page_2_items, "total_pages": 2}}),
     ]
     get = Mock(side_effect=responses)
     monkeypatch.setattr(auth_api.requests, "get", get)
@@ -255,8 +260,229 @@ def test_callback_backfills_identity_across_multiple_organisation_pages(
         .one()
     )
     assert oauth_account.provider_user_id == ",".join(
-        sorted(f"org-{i}" for i in range(101))
+        sorted(str(i) for i in range(101))
     )
+
+
+def test_callback_keeps_paginating_when_server_returns_short_pages(
+    db_session, monkeypatch
+):
+    """The Employment Hero API's documented max item_per_page (100) is a
+    ceiling on what a caller may request, not a guarantee the server always
+    returns that many when more results exist -- termination must be driven
+    by the response envelope's own total_pages, not by comparing the
+    returned page size against what this function itself requested. A
+    server that clamps its effective page size below 100 while still
+    reporting more pages via total_pages must not have the fetch stop
+    early."""
+    db, user = db_session
+    request = _callback_request(user, code_verifier="verifier-value")
+
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {"access_token": "eh-token", "token_type": "bearer", "expires_in": 900}
+            )
+        ),
+    )
+
+    # Each page returns only 20 items (a server-side clamp below the 100
+    # this function requests), but total_pages says there are 3 pages --
+    # the old "len(items) < item_per_page" heuristic would have stopped
+    # after page 1, since 20 < 100.
+    responses = [
+        MockResponse(
+            {
+                "data": {
+                    "items": [{"id": f"p1-{i}"} for i in range(20)],
+                    "total_pages": 3,
+                }
+            }
+        ),
+        MockResponse(
+            {
+                "data": {
+                    "items": [{"id": f"p2-{i}"} for i in range(20)],
+                    "total_pages": 3,
+                }
+            }
+        ),
+        MockResponse(
+            {
+                "data": {
+                    "items": [{"id": f"p3-{i}"} for i in range(20)],
+                    "total_pages": 3,
+                }
+            }
+        ),
+    ]
+    get = Mock(side_effect=responses)
+    monkeypatch.setattr(auth_api.requests, "get", get)
+
+    response = generic_oauth_callback(
+        "employment-hero", request, db, _employment_hero_provider()
+    )
+
+    assert response.status_code == 200
+    assert get.call_count == 3
+    oauth_account = (
+        db.query(UserOAuth)
+        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "employment-hero")
+        .one()
+    )
+    expected_ids = [f"p{page}-{i}" for page in (1, 2, 3) for i in range(20)]
+    assert oauth_account.provider_user_id == ",".join(sorted(expected_ids))
+
+
+def test_callback_hashes_provider_user_id_when_too_long_for_index(
+    db_session, monkeypatch
+):
+    """provider_user_id participates in a real unique Postgres btree index
+    (~2704-byte row-size limit). UUID-shaped organisation ids at real scale
+    (a partner/bookkeeper account with many accessible organisations) can
+    exceed it -- past a safe length, the joined id set must be hashed to a
+    fixed-size, still-deterministic value instead of stored raw."""
+    db, user = db_session
+    request = _callback_request(user, code_verifier="verifier-value")
+
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {"access_token": "eh-token", "token_type": "bearer", "expires_in": 900}
+            )
+        ),
+    )
+    # UUID-shaped ids, enough of them to exceed _PROVIDER_USER_ID_SAFE_LENGTH.
+    org_ids = [f"00000000-0000-0000-0000-{i:012d}" for i in range(20)]
+    monkeypatch.setattr(
+        auth_api.requests,
+        "get",
+        Mock(
+            return_value=MockResponse(
+                {"data": {"items": [{"id": oid} for oid in org_ids], "total_pages": 1}}
+            )
+        ),
+    )
+
+    response = generic_oauth_callback(
+        "employment-hero", request, db, _employment_hero_provider()
+    )
+
+    assert response.status_code == 200
+    oauth_account = (
+        db.query(UserOAuth)
+        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "employment-hero")
+        .one()
+    )
+    joined = ",".join(sorted(org_ids))
+    assert len(joined) > auth_api._PROVIDER_USER_ID_SAFE_LENGTH
+    assert oauth_account.provider_user_id == hashlib.sha256(joined.encode()).hexdigest()
+
+
+def test_callback_warns_and_uses_partial_set_when_pagination_hits_page_cap(
+    db_session, monkeypatch, caplog
+):
+    """A response that never reports total_pages reached and never shrinks
+    below a full page must not hang the callback forever -- it stops at
+    _EMPLOYMENT_HERO_IDENTITY_MAX_PAGES, logs a warning (an incomplete
+    organisation set is otherwise indistinguishable from a complete one),
+    and still completes the connect with whatever it collected."""
+    db, user = db_session
+    request = _callback_request(user, code_verifier="verifier-value")
+
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {"access_token": "eh-token", "token_type": "bearer", "expires_in": 900}
+            )
+        ),
+    )
+
+    def _full_page(*args, **kwargs):
+        page_index = kwargs["params"]["page_index"]
+        return MockResponse(
+            {"data": {"items": [{"id": f"p{page_index}-{i}"} for i in range(100)]}}
+        )
+
+    monkeypatch.setattr(auth_api.requests, "get", Mock(side_effect=_full_page))
+
+    with caplog.at_level("WARNING"):
+        response = generic_oauth_callback(
+            "employment-hero", request, db, _employment_hero_provider()
+        )
+
+    assert response.status_code == 200
+    assert any("safety cap" in record.message for record in caplog.records), (
+        "expected a warning when the pagination page cap is hit"
+    )
+    oauth_account = (
+        db.query(UserOAuth)
+        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "employment-hero")
+        .one()
+    )
+    assert oauth_account.provider_user_id is not None
+
+
+def test_callback_reports_error_when_organisations_lookup_returns_non_json(
+    db_session, monkeypatch
+):
+    db, user = db_session
+    request = _callback_request(user, code_verifier="verifier-value")
+
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {"access_token": "eh-token", "token_type": "bearer", "expires_in": 900}
+            )
+        ),
+    )
+    bad_response = Mock(status_code=200, text="<html>not json</html>")
+    bad_response.json.side_effect = ValueError("no JSON object could be decoded")
+    monkeypatch.setattr(auth_api.requests, "get", Mock(return_value=bad_response))
+
+    response = generic_oauth_callback(
+        "employment-hero", request, db, _employment_hero_provider()
+    )
+
+    assert response.status_code == 400
+    assert "non-JSON response" in response.body.decode()
+
+
+def test_callback_reports_error_when_organisations_body_shape_is_unexpected(
+    db_session, monkeypatch
+):
+    db, user = db_session
+    request = _callback_request(user, code_verifier="verifier-value")
+
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {"access_token": "eh-token", "token_type": "bearer", "expires_in": 900}
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "get",
+        Mock(return_value=MockResponse({"data": {"items": "not-a-list"}})),
+    )
+
+    response = generic_oauth_callback(
+        "employment-hero", request, db, _employment_hero_provider()
+    )
+
+    assert response.status_code == 400
+    assert "unexpected response body" in response.body.decode()
 
 
 def test_callback_reports_error_when_organisations_lookup_fails(

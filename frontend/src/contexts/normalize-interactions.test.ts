@@ -17,12 +17,25 @@ describe("normalizeInteractions", () => {
     ])
   })
 
-  it("drops non-string entries from apps", () => {
+  it("drops primitive non-string entries from apps", () => {
     const result = normalizeInteractions([
       { type: "connect_apps", field: "connect_apps", label: "Connect", apps: ["Gmail", 42, null] },
     ])
 
     expect(result[0].apps).toEqual(["Gmail"])
+  })
+
+  it("keeps an {id, name} object entry from apps, not just plain strings", () => {
+    const result = normalizeInteractions([
+      {
+        type: "connect_apps",
+        field: "connect_apps",
+        label: "Connect",
+        apps: [{ id: "gmail", name: "Gmail" }, "HubSpot"],
+      },
+    ])
+
+    expect(result[0].apps).toEqual([{ id: "gmail", name: "Gmail" }, "HubSpot"])
   })
 
   it("still filters out an unrecognized interaction type", () => {

@@ -606,7 +606,15 @@ export const normalizeInteractions = (value: unknown): Interaction[] => {
       if (Array.isArray(item.accept) || typeof item.accept === "string") normalized.accept = item.accept
       if (typeof item.multiple === "boolean") normalized.multiple = item.multiple
       if (Array.isArray(item.apps)) {
-        normalized.apps = item.apps.filter((app: unknown): app is string => typeof app === "string")
+        // A plain string is the legacy display-name-only shape; an object
+        // additionally carries the catalog's stable id (see Interaction.apps's
+        // own doc comment) - _build_unavailable_mcp_config now sends that
+        // shape whenever it resolved one, so dropping non-string entries here
+        // would silently empty out every live connect_apps pause's apps list.
+        normalized.apps = item.apps.filter(
+          (app: unknown): app is string | { id?: string; name?: string } =>
+            typeof app === "string" || (!!app && typeof app === "object")
+        )
       }
 
       return normalized

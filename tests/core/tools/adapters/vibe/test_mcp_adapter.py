@@ -882,6 +882,43 @@ def test_normalize_args_by_schema_wraps_scalar_for_array_only_field():
     assert normalized["add_label_ids"] == ["TRASH"]
 
 
+def test_normalize_args_by_schema_parses_json_encoded_array_string():
+    """Regression test: an LLM sometimes double-encodes an array-only
+    argument as a JSON string (e.g. '["date"]' instead of ["date"]). Without
+    parsing it first, the naive scalar-wrap path used to produce
+    ['["date"]'] — a single list item containing the literal brackets and
+    quotes — which then reached the downstream API as a garbled field name.
+    """
+    mcp_tool = SimpleNamespace(
+        name="google_analytics_run_report",
+        description="Run a GA4 report",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "property_id": {"type": "string"},
+                "dimensions": {
+                    "anyOf": [
+                        {"type": "array", "items": {"type": "string"}},
+                        {"type": "null"},
+                    ],
+                    "default": None,
+                },
+            },
+            "required": ["property_id"],
+        },
+    )
+    adapter = MCPToolAdapter(
+        mcp_tool=mcp_tool,
+        connection={"transport": "stdio", "command": "python", "args": []},
+    )
+
+    normalized = adapter._normalize_args_by_schema(
+        {"property_id": "550713710", "dimensions": '["date"]'}
+    )
+
+    assert normalized["dimensions"] == ["date"]
+
+
 def test_normalize_args_by_schema_keeps_scalar_for_union_scalar_or_array_field():
     mcp_tool = SimpleNamespace(
         name="multi_shape_tool",

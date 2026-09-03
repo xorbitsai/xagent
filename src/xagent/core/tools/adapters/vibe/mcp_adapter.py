@@ -1123,6 +1123,14 @@ class MCPToolAdapter(AbstractBaseTool):
             if value is None:
                 continue
             if self._schema_is_array_only(field_schema) and not isinstance(value, list):
+                if isinstance(value, str):
+                    try:
+                        parsed_value = json.loads(value)
+                    except (ValueError, TypeError):
+                        parsed_value = None
+                    if isinstance(parsed_value, list):
+                        normalized_args[field_name] = parsed_value
+                        continue
                 normalized_args[field_name] = [value]
 
         return normalized_args

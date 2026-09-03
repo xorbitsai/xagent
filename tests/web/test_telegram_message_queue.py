@@ -437,7 +437,6 @@ async def test_message_racing_switch_pauses_rather_than_failing_the_task(
             user_id=5,
             task_id=42,
             is_new_task=False,
-            prior_status=TaskStatus.RUNNING,
             managed_lease=lease,
             requested_agent_missing=False,
         )
@@ -488,7 +487,6 @@ async def test_fence_replies_even_when_settling_the_claim_fails(
             user_id=5,
             task_id=42,
             is_new_task=False,
-            prior_status=TaskStatus.RUNNING,
             managed_lease=lease,
             requested_agent_missing=False,
         )
@@ -559,7 +557,6 @@ async def test_fence_settle_exception_does_not_reach_the_generic_error_path(
             user_id=5,
             task_id=42,
             is_new_task=False,
-            prior_status=TaskStatus.RUNNING,
             managed_lease=lease,
             requested_agent_missing=False,
         )
@@ -601,7 +598,6 @@ async def test_stale_fenced_turn_pauses_the_old_task_and_still_replies(
             user_id=5,
             task_id=7,
             is_new_task=False,
-            prior_status=TaskStatus.RUNNING,
             managed_lease=lease,
             requested_agent_missing=False,
         )
@@ -651,7 +647,6 @@ async def test_stop_during_the_loading_message_removes_it_and_replies(
             user_id=5,
             task_id=42,
             is_new_task=False,
-            prior_status=TaskStatus.RUNNING,
             managed_lease=lease,
             requested_agent_missing=False,
         )
@@ -677,9 +672,6 @@ async def test_stop_during_the_loading_message_removes_it_and_replies(
     class FakeAgentManager:
         async def get_agent_for_task(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
             return agent_service
-
-        def refresh_connector_runtime_tools(self, _task_id):  # type: ignore[no-untyped-def]
-            pass
 
     monkeypatch.setattr(
         "xagent.web.channels.telegram.bot.get_agent_manager",
@@ -756,7 +748,6 @@ async def test_stop_request_fence_pauses_and_replies(
             user_id=5,
             task_id=42,
             is_new_task=False,
-            prior_status=TaskStatus.RUNNING,
             managed_lease=lease,
             requested_agent_missing=False,
         )
@@ -821,7 +812,6 @@ async def test_stop_after_prepare_settles_preclaimed_task_instead_of_orphaning_i
             user_id=5,
             task_id=44,
             is_new_task=True,
-            prior_status=TaskStatus.PENDING,
             managed_lease=managed,
             requested_agent_missing=False,
         )
@@ -1437,14 +1427,9 @@ async def test_empty_output_edits_the_loading_message_with_a_placeholder(
         set_recovered_skill_context=lambda _context: None,
     )
 
-    refresh_calls: list[int] = []
-
     class FakeAgentManager:
         async def get_agent_for_task(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
             return agent_service
-
-        def refresh_connector_runtime_tools(self, task_id):  # type: ignore[no-untyped-def]
-            refresh_calls.append(task_id)
 
         def execute_task(self, **_kwargs):  # type: ignore[no-untyped-def]
             async def run() -> str:
@@ -1465,11 +1450,6 @@ async def test_empty_output_edits_the_loading_message_with_a_placeholder(
             is_new_task=True,
             managed_lease=FakeManagedLease(),
             requested_agent_missing=False,
-            # Only prior_status (not is_new_task) gates
-            # refresh_connector_runtime_tools - set here purely to exercise
-            # that gate (see the assertion on refresh_calls below), separate
-            # from this test's own new-task bookkeeping concerns.
-            prior_status=TaskStatus.WAITING_FOR_USER,
         )
 
     async def persist_message(**_kwargs) -> None:  # type: ignore[no-untyped-def]
@@ -1534,7 +1514,6 @@ async def test_empty_output_edits_the_loading_message_with_a_placeholder(
     message = Message()
     await bot._process_user_messages_batch(123, [message])  # type: ignore[arg-type]
 
-    assert refresh_calls == [44]
     assert len(edits) == 1
     assert edits[0].strip() != ""
     assert "Task completed." in edits[0]
@@ -1596,9 +1575,6 @@ async def test_successful_telegram_turn_hands_finalize_the_execution_result(
         async def get_agent_for_task(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
             return agent_service
 
-        def refresh_connector_runtime_tools(self, _task_id):  # type: ignore[no-untyped-def]
-            pass
-
         async def execute_task(self, **_kwargs):  # type: ignore[no-untyped-def]
             return execution_result
 
@@ -1613,7 +1589,6 @@ async def test_successful_telegram_turn_hands_finalize_the_execution_result(
             user_id=5,
             task_id=48,
             is_new_task=True,
-            prior_status=TaskStatus.PENDING,
             managed_lease=FakeManagedLease(),
             requested_agent_missing=False,
         )
@@ -1733,9 +1708,6 @@ async def test_channel_failure_suppresses_stale_error_after_exact_settlement_rej
         async def get_agent_for_task(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
             return agent_service
 
-        def refresh_connector_runtime_tools(self, _task_id):  # type: ignore[no-untyped-def]
-            pass
-
         async def execute_task(self, **_kwargs):  # type: ignore[no-untyped-def]
             raise RuntimeError("channel execution failed")
 
@@ -1750,7 +1722,6 @@ async def test_channel_failure_suppresses_stale_error_after_exact_settlement_rej
             user_id=5,
             task_id=44,
             is_new_task=True,
-            prior_status=TaskStatus.PENDING,
             managed_lease=managed,
             requested_agent_missing=False,
         )
@@ -2150,7 +2121,6 @@ async def test_batch_passes_selected_agent_and_clears_stale_selection(
             user_id=5,
             task_id=44,
             is_new_task=True,
-            prior_status=TaskStatus.PENDING,
             managed_lease=FakeManagedLease(),
             requested_agent_missing=True,
         )
@@ -2271,7 +2241,6 @@ async def test_batch_discards_prepared_task_after_conversation_switch(
             user_id=5,
             task_id=44,
             is_new_task=True,
-            prior_status=TaskStatus.PENDING,
             managed_lease=FakeManagedLease(),
             requested_agent_missing=True,
         )

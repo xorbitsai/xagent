@@ -1692,22 +1692,6 @@ class TelegramBotInstance:
                 task_setup_snapshot=setup_snapshot,
                 task_owner_user_id=owner_user_id,
             )
-            # Same nudge as the websocket/A2A/v1 resume paths: a cached
-            # AgentService whose tools were already built (e.g. paused
-            # waiting for the user to connect an app) would otherwise keep
-            # its stale MCP config forever, and a Telegram reply is one of
-            # the ways a connect_apps pause gets answered. Gated on
-            # prior_status (this task's status just before this claim, not
-            # its now-RUNNING status) - an ordinary continuing message has
-            # no reason to believe connector state changed, and invalidating
-            # a warm cached agent's tools on every message forces a full
-            # MCP/OAuth rebuild each time instead of only on a genuine
-            # resume from a connect_apps pause.
-            if prepared_task.prior_status in {
-                TaskStatus.PAUSED,
-                TaskStatus.WAITING_FOR_USER,
-            }:
-                agent_manager.refresh_connector_runtime_tools(task_id)
             agent_service.set_conversation_history(
                 [dict(message) for message in setup_snapshot.conversation_history]
             )

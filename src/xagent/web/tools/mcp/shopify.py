@@ -16,7 +16,7 @@ from ....core.utils.security import (
     reject_private_network_host,
 )
 from ...utils.graphql_errors import graphql_errors_message, truncate_error_text
-from .utils import clamp_limit, setup_proxy_env, success_with_capped_dict
+from .utils import clamp_limit, setup_proxy_env
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("shopify-mcp")
@@ -45,9 +45,12 @@ MAX_RETRY_AFTER_SECONDS = 30
 # hardcoded-enum hostnames.
 _SUBDOMAIN_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 
-_GID_PATTERN = re.compile(r"^gid://shopify/[A-Za-z]+/\d+$")
+# [0-9], not \d -- \d matches any Unicode decimal digit in a str pattern
+# (e.g. Arabic-Indic), which would let a lookalike id through this format
+# check even though Shopify's own numeric ids are always ASCII.
+_GID_PATTERN = re.compile(r"^gid://shopify/[A-Za-z]+/[0-9]+$")
 
-_PRODUCT_STATUSES = frozenset({"ACTIVE", "ARCHIVED", "DRAFT"})
+_PRODUCT_STATUSES = frozenset({"ACTIVE", "ARCHIVED", "DRAFT", "UNLISTED"})
 
 
 def _success(*, _errors: list[Any] | None = None, **payload: Any) -> str:
@@ -96,10 +99,6 @@ def _graphql_url() -> str:
     except OSError as exc:
         raise ValueError(f"Shopify host could not be resolved: {exc}") from exc
     return f"https://{hostname}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
-
-
-def _clamp_limit(limit: int) -> int:
-    return clamp_limit(limit, max_limit=MAX_LIMIT)
 
 
 def _require_non_blank(value: str, field_name: str) -> str:
@@ -161,20 +160,6 @@ def _user_errors_message(user_errors: list[dict[str, Any]]) -> str:
         message = err.get("message") or "unknown error"
         parts.append(f"{field_path}: {message}" if field_path else message)
     return "; ".join(parts) if parts else "Shopify reported a validation error"
-
-
-def _mutation_failure_message(
-    user_errors: list[dict[str, Any]], errors: list[Any]
-) -> str:
-    """`userErrors` alone can omit useful context a top-level GraphQL
-    `errors` entry carries (e.g. a query-level access-scope warning attached
-    to the same response) -- fold both in, mirroring linear.py's
-    `_mutation_failure_message`, which does the same for Linear's boolean
-    `success` discriminator."""
-    message = _user_errors_message(user_errors)
-    if errors:
-        message = f"{message} ({_errors_detail(errors)})"
-    return message
 
 
 def _errors_detail(errors_field: Any) -> str:
@@ -383,7 +368,7 @@ def _list_connection(
     """Shared body for every paginated "list X" tool below (products,
     orders, customers, collections) -- only the field name, per-item GraphQL
     selection, and summarizer differ between them."""
-    max_results = _clamp_limit(limit)
+    max_results = clamp_limit(limit, max_limit=MAX_LIMIT)
     args = ["first: $first"]
     signature = ["$first: Int!"]
     variables: dict[str, Any] = {"first": max_results}
@@ -401,15 +386,19 @@ def _list_connection(
         variables,
     )
     items, has_more, next_cursor = _extract_connection(data, root_field, summary_fn)
-    # success_with_capped_dict wraps its `data` argument under `root_field`
-    # itself (-> {"status": "success", root_field: data, ...}); nesting a
-    # same-named key inside `data` too (e.g. {"products": {"products": [...]}})
-    # would bury has_more/after_cursor a level deeper than every other tool
-    # in this file puts them, so the inner list key is named generically
-    # instead of repeating root_field.
-    return success_with_capped_dict(
-        root_field,
-        {"items": items, "has_more": has_more, "after_cursor": next_cursor},
+    # Deliberately not run through a size-capping helper: after_cursor is
+    # Shopify's endCursor for the *full* page this call fetched (the
+    # selection is nodes + pageInfo, not per-item edges { cursor }), so
+    # trimming `items` down to fit an output-size cap without also rewinding
+    # the cursor would silently drop the untrimmed items -- the next call
+    # resumes past them, and they're never returned by any call. MAX_LIMIT
+    # already bounds the page to at most 100 of these flat summary objects,
+    # matching posthog.py's list tools, which don't cap either.
+    return _success(
+        **{root_field: items},
+        has_more=has_more,
+        after_cursor=next_cursor,
+        _errors=errors,
     )
 
 
@@ -442,7 +431,15 @@ def _run_mutation(
         return _error(f"Shopify returned no result for {mutation_field}")
     user_errors = result.get("userErrors") or []
     if user_errors:
-        return _error(_mutation_failure_message(user_errors, errors))
+        # userErrors alone can omit useful context a top-level GraphQL
+        # `errors` entry carries (e.g. a query-level access-scope warning
+        # attached to the same response) -- fold both in, mirroring
+        # linear.py's `_mutation_failure_message`, which does the same for
+        # Linear's boolean `success` discriminator.
+        message = _user_errors_message(user_errors)
+        if errors:
+            message = f"{message} ({_errors_detail(errors)})"
+        return _error(message)
     object_value = result.get(object_key)
     if not object_value:
         # userErrors is empty, but the object itself is also null -- e.g. an
@@ -456,6 +453,16 @@ def _run_mutation(
             else f"Shopify did not return a {object_key} for {mutation_field}"
         )
     return _success(**{object_key: summary_fn(object_value)}, _errors=errors)
+
+
+def _shop_summary(shop: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "name": shop.get("name"),
+        "domain": shop.get("myshopifyDomain"),
+        "email": shop.get("email"),
+        "currency": shop.get("currencyCode"),
+        "timezone": shop.get("ianaTimezone"),
+    }
 
 
 _PRODUCT_FIELDS = (
@@ -542,7 +549,7 @@ def shopify_get_shop() -> str:
         data, errors = _graphql(
             "query { shop { name myshopifyDomain email currencyCode ianaTimezone } }"
         )
-        return _success(shop=data.get("shop") or {}, _errors=errors)
+        return _success(shop=_shop_summary(data.get("shop") or {}), _errors=errors)
     except Exception as e:
         logger.error(f"Error fetching Shopify shop info: {e}", exc_info=True)
         return _error(str(e))
@@ -602,9 +609,10 @@ def shopify_create_product(
     vendor: optional supplier/brand name.
     product_type: optional category/classification.
     tags: optional comma-separated tags.
-    status: one of "ACTIVE", "ARCHIVED", "DRAFT" (default "DRAFT" -- Shopify
-    creates products unpublished by default; publish it separately once
-    it's ready).
+    status: one of "ACTIVE", "ARCHIVED", "DRAFT", "UNLISTED" (default
+    "DRAFT" -- Shopify creates products unavailable to customers by
+    default; note that "ACTIVE" alone does not add it to a sales channel,
+    which this connector has no tool for).
     """
     try:
         _require_non_blank(title, "title")
@@ -648,7 +656,7 @@ def shopify_update_product(
     Update an existing product. Only the fields explicitly provided (not
     None) are changed -- pass an empty string for description/vendor/
     product_type to clear that field (title cannot be cleared to blank).
-    status: optional, one of "ACTIVE", "ARCHIVED", "DRAFT".
+    status: optional, one of "ACTIVE", "ARCHIVED", "DRAFT", "UNLISTED".
     """
     try:
         product_input: dict[str, Any] = {"id": _gid("Product", product_id)}

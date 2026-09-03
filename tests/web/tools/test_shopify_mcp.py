@@ -135,21 +135,6 @@ def test_graphql_url_raises_when_dns_resolution_fails(monkeypatch):
         shopify._graphql_url()
 
 
-@pytest.mark.parametrize(
-    "limit, expected",
-    [
-        (0, 1),
-        (-5, 1),
-        (1, 1),
-        (shopify.MAX_LIMIT, shopify.MAX_LIMIT),
-        (shopify.MAX_LIMIT + 1, shopify.MAX_LIMIT),
-        (10_000, shopify.MAX_LIMIT),
-    ],
-)
-def test_clamp_limit_boundaries(limit, expected):
-    assert shopify._clamp_limit(limit) == expected
-
-
 @pytest.mark.parametrize("value", ["", "   ", None])
 def test_require_non_blank_rejects_empty_values(value):
     with pytest.raises(ValueError, match="field"):
@@ -171,7 +156,17 @@ def test_gid_normalizes_numeric_and_passes_through_full_gid(value, expected):
 
 @pytest.mark.parametrize(
     "value",
-    ["", "abc", "gid://shopify/Order/123", "12.5", "١٢٣"],
+    [
+        "",
+        "abc",
+        "gid://shopify/Order/123",
+        "12.5",
+        "١٢٣",
+        # A full gid with non-ASCII (Arabic-Indic) digits must be rejected
+        # the same way a bare non-ASCII numeric id is -- \\d in a str
+        # pattern matches any Unicode decimal digit, not just ASCII ones.
+        "gid://shopify/Product/١٢٣",
+    ],
 )
 def test_gid_rejects_invalid_or_mismatched_values(value):
     with pytest.raises(ValueError, match="product_id"):
@@ -206,21 +201,29 @@ def test_user_errors_message_defaults_when_empty():
     assert shopify._user_errors_message([]) == "Shopify reported a validation error"
 
 
-def test_mutation_failure_message_folds_in_top_level_errors():
-    message = shopify._mutation_failure_message(
-        [{"field": ["title"], "message": "too long"}],
-        [{"message": "a sub-field failed"}],
+def test_run_mutation_folds_top_level_errors_into_user_errors_message(monkeypatch):
+    monkeypatch.setattr(
+        shopify.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "data": {
+                        "productCreate": {
+                            "product": None,
+                            "userErrors": [{"field": ["title"], "message": "too long"}],
+                        }
+                    },
+                    "errors": [{"message": "a sub-field failed"}],
+                }
+            )
+        ),
     )
 
-    assert message == "title: too long (a sub-field failed)"
+    result = json.loads(shopify.shopify_create_product("Shirt"))
 
-
-def test_mutation_failure_message_without_top_level_errors():
-    message = shopify._mutation_failure_message(
-        [{"field": None, "message": "failed"}], []
-    )
-
-    assert message == "failed"
+    assert result["status"] == "error"
+    assert result["message"] == "title: too long (a sub-field failed)"
 
 
 def test_split_tags_strips_and_drops_empty_entries():
@@ -420,6 +423,18 @@ def test_graphql_rejects_response_with_more_than_one_top_level_field(monkeypatch
         shopify._graphql("query { a b }")
 
 
+@pytest.mark.parametrize("status_code", [301, 302, 303, 307, 308])
+def test_graphql_rejects_redirect_response(monkeypatch, status_code):
+    monkeypatch.setattr(
+        shopify.requests,
+        "post",
+        Mock(return_value=MockResponse(status_code=status_code)),
+    )
+
+    with pytest.raises(RuntimeError, match="redirect"):
+        shopify._graphql("query { shop { id } }")
+
+
 def test_graphql_retries_once_on_throttled_and_then_succeeds(monkeypatch):
     responses = [
         MockResponse(status_code=429),
@@ -515,13 +530,39 @@ def test_extract_connection_treats_missing_end_cursor_as_no_more_pages():
     assert after_cursor is None
 
 
+def test_shop_summary_snake_cases_fields():
+    assert shopify._shop_summary(
+        {
+            "name": "Acme",
+            "myshopifyDomain": "acme.myshopify.com",
+            "email": "owner@acme.com",
+            "currencyCode": "USD",
+            "ianaTimezone": "America/New_York",
+        }
+    ) == {
+        "name": "Acme",
+        "domain": "acme.myshopify.com",
+        "email": "owner@acme.com",
+        "currency": "USD",
+        "timezone": "America/New_York",
+    }
+
+
 def test_get_shop_returns_shop_info(monkeypatch):
     monkeypatch.setattr(
         shopify.requests,
         "post",
         Mock(
             return_value=MockResponse(
-                json_data={"data": {"shop": {"name": "Acme", "currencyCode": "USD"}}}
+                json_data={
+                    "data": {
+                        "shop": {
+                            "name": "Acme",
+                            "myshopifyDomain": "acme.myshopify.com",
+                            "currencyCode": "USD",
+                        }
+                    }
+                }
             )
         ),
     )
@@ -530,6 +571,8 @@ def test_get_shop_returns_shop_info(monkeypatch):
 
     assert result["status"] == "success"
     assert result["shop"]["name"] == "Acme"
+    assert result["shop"]["domain"] == "acme.myshopify.com"
+    assert result["shop"]["currency"] == "USD"
 
 
 def test_list_products_sends_query_limit_and_after(monkeypatch):
@@ -552,7 +595,7 @@ def test_list_products_sends_query_limit_and_after(monkeypatch):
     )
 
     assert result["status"] == "success"
-    assert result["products"]["items"][0]["title"] == "Shirt"
+    assert result["products"][0]["title"] == "Shirt"
     body = mock_post.call_args.kwargs["json"]
     assert body["variables"] == {"first": 10, "query": "status:active", "after": "cur0"}
     assert "$query: String!" in body["query"]
@@ -574,6 +617,52 @@ def test_list_products_omits_query_and_after_when_not_provided(monkeypatch):
     body = mock_post.call_args.kwargs["json"]
     assert body["variables"] == {"first": 25}
     assert "query" not in body["query"] or "$query" not in body["query"]
+
+
+def test_list_products_clamps_limit_to_max(monkeypatch):
+    mock_post = Mock(
+        return_value=MockResponse(
+            json_data={
+                "data": {"products": {"nodes": [], "pageInfo": {"hasNextPage": False}}}
+            }
+        )
+    )
+    monkeypatch.setattr(shopify.requests, "post", mock_post)
+
+    shopify.shopify_list_products(limit=10_000)
+
+    assert mock_post.call_args.kwargs["json"]["variables"]["first"] == shopify.MAX_LIMIT
+
+
+def test_list_products_surfaces_partial_success_warnings(monkeypatch):
+    # A genuine partial GraphQL success (data still returned alongside a
+    # top-level errors entry, e.g. a nullable nested field that failed to
+    # resolve) must surface as a warning at the tool boundary, not be
+    # silently dropped.
+    monkeypatch.setattr(
+        shopify.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "data": {
+                        "products": {
+                            "nodes": [
+                                {"id": "gid://shopify/Product/1", "title": "Shirt"}
+                            ],
+                            "pageInfo": {"hasNextPage": False},
+                        }
+                    },
+                    "errors": [{"message": "a sub-field failed"}],
+                }
+            )
+        ),
+    )
+
+    result = json.loads(shopify.shopify_list_products())
+
+    assert result["status"] == "success"
+    assert result["warnings"] == ["a sub-field failed"]
 
 
 def test_get_product_normalizes_id_and_returns_summary(monkeypatch):
@@ -623,6 +712,41 @@ def test_create_product_rejects_invalid_status():
     result = json.loads(shopify.shopify_create_product("Shirt", status="PUBLISHED"))
 
     assert result["status"] == "error"
+
+
+def test_create_product_rejects_lowercase_status():
+    # Status values are matched exactly against Shopify's enum spelling;
+    # a caller passing "active" instead of "ACTIVE" gets a clear local
+    # error rather than a Shopify-side enum validation failure.
+    result = json.loads(shopify.shopify_create_product("Shirt", status="active"))
+
+    assert result["status"] == "error"
+
+
+def test_create_product_accepts_unlisted_status(monkeypatch):
+    mock_post = Mock(
+        return_value=MockResponse(
+            json_data={
+                "data": {
+                    "productCreate": {
+                        "product": {
+                            "id": "gid://shopify/Product/1",
+                            "status": "UNLISTED",
+                        },
+                        "userErrors": [],
+                    }
+                }
+            }
+        )
+    )
+    monkeypatch.setattr(shopify.requests, "post", mock_post)
+
+    result = json.loads(shopify.shopify_create_product("Shirt", status="UNLISTED"))
+
+    assert result["status"] == "success"
+    assert mock_post.call_args.kwargs["json"]["variables"]["product"]["status"] == (
+        "UNLISTED"
+    )
 
 
 def test_create_product_sends_expected_input(monkeypatch):
@@ -683,6 +807,16 @@ def test_update_product_requires_at_least_one_field():
     result = json.loads(shopify.shopify_update_product("1"))
 
     assert result["status"] == "error"
+
+
+def test_update_product_rejects_invalid_status(monkeypatch):
+    mock_post = Mock()
+    monkeypatch.setattr(shopify.requests, "post", mock_post)
+
+    result = json.loads(shopify.shopify_update_product("1", status="PUBLISHED"))
+
+    assert result["status"] == "error"
+    mock_post.assert_not_called()
 
 
 def test_update_product_sends_only_provided_fields(monkeypatch):
@@ -954,10 +1088,38 @@ def test_list_customers_returns_summaries(monkeypatch):
 
     result = json.loads(shopify.shopify_list_customers())
 
-    customer = result["customers"]["items"][0]
+    customer = result["customers"][0]
     assert customer["first_name"] == "Jane"
     assert customer["email"] == "jane@example.com"
     assert customer["number_of_orders"] == "3"
+
+
+def test_get_customer_returns_summary(monkeypatch):
+    monkeypatch.setattr(
+        shopify.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "data": {
+                        "customer": {
+                            "id": "gid://shopify/Customer/1",
+                            "firstName": "Jane",
+                            "lastName": "Doe",
+                            "defaultEmailAddress": {"emailAddress": "jane@example.com"},
+                            "numberOfOrders": "2",
+                        }
+                    }
+                }
+            )
+        ),
+    )
+
+    result = json.loads(shopify.shopify_get_customer("1"))
+
+    assert result["status"] == "success"
+    assert result["customer"]["email"] == "jane@example.com"
+    assert result["customer"]["number_of_orders"] == "2"
 
 
 def test_get_customer_returns_error_when_not_found(monkeypatch):
@@ -998,7 +1160,7 @@ def test_list_collections_returns_summaries_with_products_count(monkeypatch):
 
     result = json.loads(shopify.shopify_list_collections())
 
-    collection = result["collections"]["items"][0]
+    collection = result["collections"][0]
     assert collection["title"] == "Summer"
     assert collection["products_count"] == 12
 

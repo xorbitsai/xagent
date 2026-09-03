@@ -88,7 +88,7 @@ def test_upgrade_is_idempotent(tmp_path):
         assert rows == 1
 
 
-def test_upgrade_warns_and_still_inserts_when_column_missing(tmp_path):
+def test_upgrade_warns_and_still_inserts_when_column_missing(tmp_path, caplog):
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
     with engine.begin() as connection:
@@ -107,8 +107,13 @@ def test_upgrade_warns_and_still_inserts_when_column_missing(tmp_path):
             )
         )
         with patch.object(migration, "op", _operations(connection)):
-            migration.upgrade()
+            with caplog.at_level("WARNING"):
+                migration.upgrade()
         assert "shopify" in _app_ids(connection)
+        assert any(
+            "shopify" in record.message and "description" in record.message
+            for record in caplog.records
+        )
 
 
 def test_seed_row_matches_registry():

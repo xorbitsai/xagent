@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import secrets
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Dict, List, Literal, Optional, cast
 
@@ -667,6 +668,13 @@ _EMPLOYMENT_HERO_HOST_SUFFIX = "employmenthero.com"
 # hang this callback in an unbounded fetch; 50 pages at 100 items each
 # (5000 organisations) is far beyond any real grant's scope.
 _EMPLOYMENT_HERO_IDENTITY_MAX_PAGES = 50
+# Wall-clock companion to the page-count cap above: generic_oauth_callback
+# runs as a sync def, so it occupies a FastAPI threadpool worker (not the
+# event loop) for its whole duration. The page-count cap alone bounds
+# *requests*, not elapsed time -- a slow/misconfigured token_url host could
+# still occupy a worker for MAX_PAGES * DEFAULT_TIMEOUT_SECONDS in the
+# worst case. This bounds actual wall-clock time spent paginating.
+_EMPLOYMENT_HERO_IDENTITY_MAX_SECONDS = 15.0
 # Comfortably under Postgres's ~2704-byte btree index row-size limit that
 # UserOAuth's (user_id, provider, provider_user_id) uniqueness index enforces
 # -- see _fetch_employment_hero_identity's docstring.
@@ -739,8 +747,11 @@ def _fetch_employment_hero_identity(access_token: str) -> Optional[str]:
     not on its own reliable proof there's nothing left. Falls back to that
     same short-page heuristic only if a response is ever missing
     `total_pages` entirely. Capped at _EMPLOYMENT_HERO_IDENTITY_MAX_PAGES
-    pages as a safety bound against a misbehaving/malicious response that
-    never reports completion; logs a warning if that cap is actually hit; a
+    pages, and separately at _EMPLOYMENT_HERO_IDENTITY_MAX_SECONDS of
+    wall-clock time (this runs inside a sync callback occupying a FastAPI
+    threadpool worker for its duration, so a slow token_url host could
+    otherwise hold one for page-count-many timeouts) -- either safety bound
+    against a misbehaving/malicious/slow response logs a warning when hit; a
     truncated organisation set at that point is still used rather than
     failing the whole connect, matching the zero-organisation tradeoff
     above.
@@ -757,7 +768,21 @@ def _fetch_employment_hero_identity(access_token: str) -> Optional[str]:
     """
     item_per_page = 100
     organisation_ids: set[str] = set()
+    deadline = time.monotonic() + _EMPLOYMENT_HERO_IDENTITY_MAX_SECONDS
     for page_index in range(1, _EMPLOYMENT_HERO_IDENTITY_MAX_PAGES + 1):
+        if time.monotonic() > deadline:
+            # This is a `break`, not a `for...else` fall-through -- logged
+            # here rather than relying on the loop's own cap-exhaustion
+            # warning below, since exceeding the time budget can happen
+            # well before exhausting the page-count one.
+            logger.warning(
+                "Employment Hero organisation lookup exceeded its %.0fs "
+                "time budget after %d page(s); provider_user_id may be "
+                "derived from an incomplete organisation set.",
+                _EMPLOYMENT_HERO_IDENTITY_MAX_SECONDS,
+                page_index - 1,
+            )
+            break
         response = requests.get(
             f"{_EMPLOYMENT_HERO_API_BASE}/organisations",
             headers={"Authorization": f"Bearer {access_token}"},

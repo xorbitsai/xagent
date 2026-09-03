@@ -425,6 +425,92 @@ def test_callback_accepts_integer_valued_float_total_pages(db_session, monkeypat
     assert get.call_count == 2
 
 
+def test_callback_accepts_numeric_string_total_pages(db_session, monkeypatch):
+    """total_pages serialized as a numeric string ("2", not 2) must still
+    drive pagination -- nothing guarantees this field is always JSON-typed
+    as a number rather than a string on Employment Hero's side."""
+    db, user = db_session
+    request = _callback_request(user, code_verifier="verifier-value")
+
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {"access_token": "eh-token", "token_type": "bearer", "expires_in": 900}
+            )
+        ),
+    )
+    responses = [
+        MockResponse(
+            {
+                "data": {
+                    "items": [{"id": f"p1-{i}"} for i in range(5)],
+                    "total_pages": "2",
+                }
+            }
+        ),
+        MockResponse(
+            {
+                "data": {
+                    "items": [{"id": f"p2-{i}"} for i in range(5)],
+                    "total_pages": "2",
+                }
+            }
+        ),
+    ]
+    get = Mock(side_effect=responses)
+    monkeypatch.setattr(auth_api.requests, "get", get)
+
+    response = generic_oauth_callback(
+        "employment-hero", request, db, _employment_hero_provider()
+    )
+
+    assert response.status_code == 200
+    assert get.call_count == 2
+
+
+def test_callback_treats_boolean_total_pages_as_absent(db_session, monkeypatch):
+    """bool is an int subclass in Python (isinstance(True, int) is True) --
+    a stray boolean in the envelope must not be misread as a page count of
+    1, which would wrongly stop pagination after a single (short) page."""
+    db, user = db_session
+    request = _callback_request(user, code_verifier="verifier-value")
+
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {"access_token": "eh-token", "token_type": "bearer", "expires_in": 900}
+            )
+        ),
+    )
+    responses = [
+        MockResponse(
+            {
+                "data": {
+                    "items": [{"id": f"p1-{i}"} for i in range(100)],
+                    "total_pages": True,
+                }
+            }
+        ),
+        MockResponse({"data": {"items": [{"id": "p2-0"}], "total_pages": True}}),
+    ]
+    get = Mock(side_effect=responses)
+    monkeypatch.setattr(auth_api.requests, "get", get)
+
+    response = generic_oauth_callback(
+        "employment-hero", request, db, _employment_hero_provider()
+    )
+
+    assert response.status_code == 200
+    # If `total_pages: True` were misread as page count 1, the loop would
+    # stop after page 1 (which is full, 100 items) instead of falling back
+    # to the short-page heuristic and fetching page 2.
+    assert get.call_count == 2
+
+
 def test_callback_hashes_provider_user_id_when_too_long_for_index(
     db_session, monkeypatch
 ):
@@ -509,6 +595,58 @@ def test_callback_warns_and_uses_partial_set_when_pagination_hits_page_cap(
     assert response.status_code == 200
     assert any("safety cap" in record.message for record in caplog.records), (
         "expected a warning when the pagination page cap is hit"
+    )
+    oauth_account = (
+        db.query(UserOAuth)
+        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "employment-hero")
+        .one()
+    )
+    assert oauth_account.provider_user_id is not None
+
+
+def test_callback_warns_and_stops_when_pagination_exceeds_time_budget(
+    db_session, monkeypatch, caplog
+):
+    """A slow/misconfigured token_url host reporting more pages via
+    total_pages must not hold this sync callback's threadpool worker for
+    page-count-many timeouts -- the wall-clock budget must stop it first,
+    with a warning distinguishing it from the page-count cap above."""
+    db, user = db_session
+    request = _callback_request(user, code_verifier="verifier-value")
+
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {"access_token": "eh-token", "token_type": "bearer", "expires_in": 900}
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "get",
+        Mock(
+            return_value=MockResponse(
+                {"data": {"items": [{"id": "org-1"}], "total_pages": 5}}
+            )
+        ),
+    )
+    # 1st call: deadline computed before the loop. 2nd call: page 1's
+    # top-of-loop check, still within budget. 3rd call: page 2's
+    # top-of-loop check, now past the deadline -- breaks before any
+    # further request.
+    monotonic_values = iter([0.0, 0.0, 999.0])
+    monkeypatch.setattr(auth_api.time, "monotonic", lambda: next(monotonic_values))
+
+    with caplog.at_level("WARNING"):
+        response = generic_oauth_callback(
+            "employment-hero", request, db, _employment_hero_provider()
+        )
+
+    assert response.status_code == 200
+    assert any("time budget" in record.message for record in caplog.records), (
+        "expected a warning when the pagination time budget is exceeded"
     )
     oauth_account = (
         db.query(UserOAuth)

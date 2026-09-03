@@ -109,7 +109,20 @@ def _request(
 
     if response.status_code == 204 or not response.content:
         return {}
-    return response.json()
+    try:
+        return response.json()
+    except ValueError:
+        # A 200 with a non-JSON body (e.g. an HTML gateway/proxy page) is
+        # rare but not impossible -- every @mcp.tool() caller already
+        # wraps this in try/except Exception, so raising here still
+        # returns a clean _error(...) envelope, just with a message that
+        # names the actual problem instead of a raw JSONDecodeError.
+        detail = response.text.strip()
+        if len(detail) > MAX_ERROR_RESPONSE_TEXT_CHARS:
+            detail = detail[:MAX_ERROR_RESPONSE_TEXT_CHARS] + "... [truncated]"
+        raise RuntimeError(
+            f"Employment Hero returned a non-JSON response: {detail}"
+        ) from None
 
 
 def _unwrap_data(payload: Any) -> Any:
@@ -118,6 +131,26 @@ def _unwrap_data(payload: Any) -> Any:
     if isinstance(payload, dict) and "data" in payload:
         return payload["data"]
     return payload
+
+
+def _list_payload(result: Any, resource: str) -> dict[str, Any]:
+    """Unwrap a list endpoint's `data` payload, raising if it isn't the
+    {"items": [...], ...} shape Employment Hero's documented response
+    envelope guarantees.
+
+    success_with_capped_dict only applies its own output-size cap when its
+    `data` argument is a dict -- silently returning an unbounded response
+    otherwise -- so this guards every list tool against a live response
+    that ever deviates from the documented shape (this connector has not
+    been exercised against a live Employment Hero account) rather than
+    letting a stray list/None sail through uncapped.
+    """
+    data = _unwrap_data(result)
+    if not isinstance(data, dict):
+        raise RuntimeError(
+            f"Employment Hero returned an unexpected response for {resource}"
+        )
+    return data
 
 
 def _pagination_params(page_index: int, item_per_page: int) -> dict[str, Any]:
@@ -145,7 +178,9 @@ def employment_hero_list_organisations(
             "/organisations",
             params=_pagination_params(page_index, item_per_page),
         )
-        return success_with_capped_dict("organisations", _unwrap_data(result))
+        return success_with_capped_dict(
+            "organisations", _list_payload(result, "organisations")
+        )
     except Exception as e:
         logger.error(f"Error listing Employment Hero organisations: {e}")
         return _error(str(e))
@@ -161,8 +196,8 @@ def employment_hero_list_employees(
     """
     List employees (and contractors) in an organisation.
     organisation_id: id from employment_hero_list_organisations.
-    member_type: optional filter, e.g. "employee" or "contractor". Leave
-    empty to return both.
+    member_type: optional filter. Must be exactly "employee" or
+    "contractor" (lowercase) if given. Leave empty to return both.
     page_index: 1-based page number.
     item_per_page: results per page (max 100).
     """
@@ -179,7 +214,7 @@ def employment_hero_list_employees(
         result = _request(
             "GET", f"/organisations/{safe_org_id}/employees", params=params
         )
-        return success_with_capped_dict("employees", _unwrap_data(result))
+        return success_with_capped_dict("employees", _list_payload(result, "employees"))
     except Exception as e:
         logger.error(f"Error listing Employment Hero employees: {e}")
         return _error(str(e))
@@ -233,7 +268,7 @@ def employment_hero_list_teams(
             f"/organisations/{safe_org_id}/teams",
             params=_pagination_params(page_index, item_per_page),
         )
-        return success_with_capped_dict("teams", _unwrap_data(result))
+        return success_with_capped_dict("teams", _list_payload(result, "teams"))
     except Exception as e:
         logger.error(f"Error listing Employment Hero teams: {e}")
         return _error(str(e))
@@ -261,7 +296,7 @@ def employment_hero_list_team_employees(
             f"/organisations/{safe_org_id}/teams/{safe_team_id}/employees",
             params=_pagination_params(page_index, item_per_page),
         )
-        return success_with_capped_dict("employees", _unwrap_data(result))
+        return success_with_capped_dict("employees", _list_payload(result, "employees"))
     except Exception as e:
         logger.error(f"Error listing Employment Hero team employees: {e}")
         return _error(str(e))
@@ -300,7 +335,9 @@ def employment_hero_list_timesheet_entries(
             f"/organisations/{safe_org_id}/employees/{safe_employee_id}/timesheet_entries",
             params=params,
         )
-        return success_with_capped_dict("timesheet_entries", _unwrap_data(result))
+        return success_with_capped_dict(
+            "timesheet_entries", _list_payload(result, "timesheet_entries")
+        )
     except Exception as e:
         logger.error(f"Error listing Employment Hero timesheet entries: {e}")
         return _error(str(e))

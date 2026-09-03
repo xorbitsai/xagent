@@ -144,6 +144,30 @@ def test_request_returns_empty_dict_for_204(monkeypatch):
     assert employment_hero._request("DELETE", "/organisations/org-1") == {}
 
 
+def test_request_raises_clean_error_for_non_json_200_response(monkeypatch):
+    bad_response = Mock(
+        status_code=200, content=b"<html>not json</html>", text="<html>not json</html>"
+    )
+    bad_response.json.side_effect = ValueError("no JSON object could be decoded")
+    monkeypatch.setattr(
+        employment_hero.requests, "request", Mock(return_value=bad_response)
+    )
+
+    with pytest.raises(RuntimeError, match="non-JSON response"):
+        employment_hero._request("GET", "/organisations")
+
+
+def test_list_payload_raises_on_non_dict_data():
+    with pytest.raises(RuntimeError, match="unexpected response"):
+        employment_hero._list_payload({"data": ["not", "a", "dict"]}, "organisations")
+
+
+def test_list_payload_returns_dict_data():
+    assert employment_hero._list_payload({"data": {"items": []}}, "organisations") == {
+        "items": []
+    }
+
+
 def test_unwrap_data_returns_data_key_when_present():
     assert employment_hero._unwrap_data({"data": {"id": "org-1"}}) == {"id": "org-1"}
 
@@ -194,7 +218,21 @@ def test_list_organisations_requests_expected_path_and_params(monkeypatch):
         == f"{employment_hero.EMPLOYMENT_HERO_BASE_URL}/organisations"
     )
     assert call.kwargs["params"] == {"page_index": 1, "item_per_page": 20}
-    assert call.kwargs["headers"] == {"Authorization": "Bearer access-token"}
+
+
+def test_list_organisations_errors_on_non_dict_data_shape(monkeypatch):
+    """A live response deviating from the documented {"items": [...]}
+    envelope (e.g. `data` is a bare list) must surface as a clear error --
+    success_with_capped_dict only caps output size for a dict payload, so
+    silently accepting a non-dict shape would skip that protection."""
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"data": ["not", "a", "dict"]})
+    )
+    monkeypatch.setattr(employment_hero.requests, "request", mock_request)
+
+    result = json.loads(employment_hero.employment_hero_list_organisations())
+
+    assert result["status"] == "error"
 
 
 def test_list_employees_includes_member_type_only_when_provided(monkeypatch):

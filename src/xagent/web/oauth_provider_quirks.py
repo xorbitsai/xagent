@@ -70,10 +70,12 @@ def matches_provider_family(provider: str, base_name: str) -> bool:
     per example.env's documented workaround for providers with no per-user
     environment toggle.
 
-    Shared by every family-matching predicate in this codebase
-    (auth.py's _is_salesforce_provider, requires_pkce below) so the matching
-    algorithm itself has exactly one implementation -- a caller composing a
-    new family check should use this rather than re-deriving the same
+    Shared by every family-matching predicate and call site in this codebase
+    (auth.py's _is_salesforce_provider and its Employment Hero query-param
+    wire-format branch, requires_pkce below, tools/config.py's refresh-leg
+    counterpart of that same wire-format branch) so the matching algorithm
+    itself has exactly one implementation -- a caller composing a new
+    family check should use this rather than re-deriving the same
     equality/prefix logic.
     """
     lowered = provider.lower()

@@ -70,7 +70,11 @@ def test_upgrade_inserts_magento(tmp_path):
         assert row[0] == "stdio"
         assert row[1] is None
         assert "xagent.web.tools.mcp.magento" in str(row[2])
-        for env_key in ("MAGENTO_BASE_URL", "MAGENTO_ACCESS_TOKEN"):
+        for env_key in (
+            "MAGENTO_BASE_URL",
+            "MAGENTO_ACCESS_TOKEN",
+            "MAGENTO_STORE_CODE",
+        ):
             assert env_key in str(row[2])
 
 

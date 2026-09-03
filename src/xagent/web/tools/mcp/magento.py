@@ -12,6 +12,7 @@ import requests
 import urllib3.util.connection as urllib3_connection
 from mcp.server.fastmcp import FastMCP
 
+from ....core.tools.core.web_content import get_trusted_proxy_url
 from ....core.utils.security import (
     PrivateNetworkHostError,
     redact_sensitive_text,
@@ -115,6 +116,17 @@ def _resolve_store_host() -> tuple[str, int | None, str]:
     if not hostname:
         raise ValueError("MAGENTO_BASE_URL must include a hostname")
     try:
+        # IDNA-encoded (punycode) up front, matching what urllib3's own URL
+        # parsing (`_normalize_host`) does to the host it actually connects
+        # to -- without this, a non-ASCII hostname would leave `hostname`
+        # (used below for the pinning comparison) as raw Unicode while the
+        # real connection's `self.host` is punycode, so `_pinned_dns`'s
+        # `host == hostname` check would never match and silently skip
+        # pinning for exactly this input.
+        hostname = hostname.encode("idna").decode("ascii")
+    except UnicodeError as exc:
+        raise ValueError(f"MAGENTO_BASE_URL has an invalid hostname: {exc}") from exc
+    try:
         port = parsed.port
     except ValueError as exc:
         raise ValueError(f"MAGENTO_BASE_URL has an invalid port: {exc}") from exc
@@ -176,6 +188,16 @@ def _store_path_prefix() -> str:
             "MAGENTO_STORE_CODE must contain only letters, digits, and "
             f"underscores, got {store_code!r}"
         )
+    if store_code.lower() == "v1":
+        # A literal "V1" is a plausible copy-paste mistake (confusing the
+        # store code with the API version segment already in this prefix)
+        # -- letting it through would build /rest/V1/V1/... rather than
+        # failing with a clear reason.
+        raise ValueError(
+            f"MAGENTO_STORE_CODE must not be {store_code!r} -- that's the API "
+            "version segment already included in this connector's request "
+            "path, not a store view code"
+        )
     return f"/rest/{store_code}/V1"
 
 
@@ -236,6 +258,18 @@ def _require_non_blank(value: str, field_name: str) -> str:
     return value
 
 
+def _escape_like(value: str) -> str:
+    """Escape SQL LIKE metacharacters before wrapping a caller-supplied
+    substring in %...% for a "like" searchCriteria filter. Magento's `like`
+    condition_type compiles to a SQL LIKE clause server-side, where "%" and
+    "_" are wildcards -- a real SKU/email containing one literally (e.g.
+    "ABC_1") would otherwise have that character reinterpreted as a
+    wildcard, silently matching more/less than the caller intended with no
+    error. Backslash is escaped first so escaping the other two characters
+    doesn't introduce a second, accidental escape sequence."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def _validate_choice(
     value: int, allowed: frozenset[int], field_name: str
 ) -> str | None:
@@ -282,7 +316,7 @@ def _extract_error_detail(response: requests.Response) -> str | None:
     parameters = payload.get("parameters")
     if isinstance(parameters, dict):
         message = _NAMED_PLACEHOLDER_PATTERN.sub(
-            lambda m: str(parameters[m.group(1)])
+            lambda m: _stringify_param(parameters[m.group(1)])
             if m.group(1) in parameters
             else m.group(0),
             message,
@@ -292,11 +326,24 @@ def _extract_error_detail(response: requests.Response) -> str | None:
         def _substitute_positional(match: re.Match[str]) -> str:
             index = int(match.group(1))
             if 1 <= index <= len(parameters):
-                return str(parameters[index - 1])
+                return _stringify_param(parameters[index - 1])
             return match.group(0)
 
         message = _POSITIONAL_PLACEHOLDER_PATTERN.sub(_substitute_positional, message)
     return message
+
+
+def _stringify_param(value: Any) -> str:
+    """Render one substituted placeholder value for a Magento error message.
+    A plain str/int/float/bool renders as its natural text (str() is
+    correct and unsurprising there); a nested dict/list value -- unusual
+    for this API, but not contractually ruled out -- renders as JSON rather
+    than Python's repr() (str()'s fallback for non-str types), so the LLM
+    sees standard `{"a": 1}` instead of confusing single-quoted
+    `{'a': 1}`."""
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
 
 
 def _request(
@@ -306,6 +353,24 @@ def _request(
     params: dict[str, Any] | None = None,
     json_data: dict[str, Any] | None = None,
 ) -> Any:
+    # An ambient HTTP(S) proxy makes the *proxy* perform DNS resolution and
+    # the actual outbound TCP connection, not this process -- urllib3's
+    # connection pool dials the proxy's own address in that case, never the
+    # target's, so _pinned_dns below (which only intercepts a connection
+    # this process itself dials) would silently never match and pinning
+    # would have no effect, reopening the exact DNS-rebinding TOCTOU window
+    # it exists to close. Mirrors web_content.py's fetch_web_content:
+    # get_trusted_proxy_url() raises unless the proxy is explicitly marked
+    # trusted to enforce its own private-range egress policy
+    # (XAGENT_TRUSTED_EGRESS_PROXY=1), rather than silently trusting every
+    # ambient proxy setup_proxy_env() promotes from the OS's own settings.
+    # The result is then passed to `requests` explicitly (not left to its
+    # default trust_env=True env-var auto-pickup) so "no proxy" here is an
+    # actual guarantee for this call, not just the absence of one var this
+    # code happened to check.
+    proxy_url = get_trusted_proxy_url()
+    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else {}
+
     # Resolved once here (not via _api_base_url()/_base_url()) so this
     # single request gets exactly one DNS lookup, and the connection below
     # can be pinned to the same address that lookup validated.
@@ -321,6 +386,7 @@ def _request(
                 params=params,
                 json=json_data,
                 timeout=DEFAULT_TIMEOUT_SECONDS,
+                proxies=proxies,
                 # A redirect response is never followed with the Bearer header
                 # still attached: a self-hosted store redirecting an API call
                 # (e.g. an http->https or www-canonicalization rule misapplied
@@ -400,8 +466,15 @@ def _paginated_result(
         raise ValueError(
             f"Expected a JSON object from Magento, got {type(payload).__name__}"
         )
-    items = payload.get("items") or []
-    if not isinstance(items, list):
+    # The isinstance check runs on the *raw* value, before any "or []"
+    # fallback -- checking after would let a falsy-but-wrong-type value
+    # (e.g. {"items": 0} or {"items": ""}) silently pass as "no items"
+    # instead of being caught as the malformed response it actually is;
+    # only a genuinely absent/None "items" key should default to [].
+    items = payload.get("items")
+    if items is None:
+        items = []
+    elif not isinstance(items, list):
         raise ValueError(
             f'Expected Magento\'s "items" field to be a list, got {type(items).__name__}'
         )
@@ -520,7 +593,7 @@ def magento_list_products(
                 return _error(err)
         filters: list[tuple[str, str, str]] = []
         if sku_like:
-            filters.append(("sku", "like", f"%{sku_like}%"))
+            filters.append(("sku", "like", f"%{_escape_like(sku_like)}%"))
         if status is not None:
             filters.append(("status", "eq", str(status)))
         return _list_search(
@@ -682,7 +755,7 @@ def magento_get_order(order_id: int) -> str:
     not the customer-facing increment_id like "000000123").
     """
     try:
-        result = _request("GET", f"/orders/{order_id}")
+        result = _request("GET", f"/orders/{url_path_id(str(order_id), 'order_id')}")
         return _success(order=_order_summary(result))
     except Exception as e:
         logger.error(f"Error fetching Magento order {order_id}: {e}")
@@ -719,7 +792,7 @@ def magento_add_order_comment(
             status_history["status"] = status
         result = _request(
             "POST",
-            f"/orders/{order_id}/comments",
+            f"/orders/{url_path_id(str(order_id), 'order_id')}/comments",
             json_data={"statusHistory": status_history},
         )
         return _success(added=bool(result))
@@ -740,7 +813,7 @@ def magento_list_customers(email_like: str = "", limit: int = 25, page: int = 1)
     try:
         filters: list[tuple[str, str, str]] = []
         if email_like:
-            filters.append(("email", "like", f"%{email_like}%"))
+            filters.append(("email", "like", f"%{_escape_like(email_like)}%"))
         return _list_search(
             "/customers/search", "customers", filters, limit, page, _customer_summary
         )
@@ -755,7 +828,9 @@ def magento_get_customer(customer_id: int) -> str:
     Get a Magento customer by numeric id.
     """
     try:
-        result = _request("GET", f"/customers/{customer_id}")
+        result = _request(
+            "GET", f"/customers/{url_path_id(str(customer_id), 'customer_id')}"
+        )
         return _success(customer=_customer_summary(result))
     except Exception as e:
         logger.error(f"Error fetching Magento customer {customer_id}: {e}")
@@ -795,7 +870,9 @@ def magento_get_category(category_id: int) -> str:
     depth=1 instead if you need this category's children or product count.
     """
     try:
-        result = _request("GET", f"/categories/{category_id}")
+        result = _request(
+            "GET", f"/categories/{url_path_id(str(category_id), 'category_id')}"
+        )
         return _success(category=_category_summary(result))
     except Exception as e:
         logger.error(f"Error fetching Magento category {category_id}: {e}")

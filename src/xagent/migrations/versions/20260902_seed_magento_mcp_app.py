@@ -49,7 +49,11 @@ ROW = {
     "launch_config": {
         "command": "python",
         "args": ["-m", "xagent.web.tools.mcp.magento"],
-        "required_env": ["MAGENTO_BASE_URL", "MAGENTO_ACCESS_TOKEN"],
+        "required_env": [
+            "MAGENTO_BASE_URL",
+            "MAGENTO_ACCESS_TOKEN",
+            "MAGENTO_STORE_CODE",
+        ],
     },
 }
 

@@ -156,6 +156,19 @@ def test_resolve_store_host_returns_hostname_port_and_first_valid_ip(monkeypatch
     assert pinned_ip == "1.1.1.1"
 
 
+def test_resolve_store_host_idna_encodes_non_ascii_hostname(monkeypatch):
+    # urllib3's own URL parsing IDNA-encodes a non-ASCII host to punycode
+    # before it ever reaches the connection pool -- if `hostname` here
+    # stayed raw Unicode, _pinned_dns's `host == hostname` comparison would
+    # never match the punycode `host` urllib3 actually dials, silently
+    # skipping the pinning defense for exactly this input.
+    monkeypatch.setenv("MAGENTO_BASE_URL", "https://münchen.example.com")
+
+    hostname, _port, _pinned_ip = magento._resolve_store_host()
+
+    assert hostname == "xn--mnchen-3ya.example.com"
+
+
 def test_pinned_dns_redirects_matching_host_to_pinned_ip(monkeypatch):
     calls = []
 
@@ -250,6 +263,17 @@ def test_api_base_url_rejects_invalid_store_code(monkeypatch, store_code):
         magento._api_base_url()
 
 
+@pytest.mark.parametrize("store_code", ["V1", "v1"])
+def test_api_base_url_rejects_v1_as_store_code(monkeypatch, store_code):
+    # A literal "V1" store code would build the confusing, wrong
+    # /rest/V1/V1/... path (V1 is the API version segment, not a store
+    # view) -- reject it with a clear reason instead.
+    monkeypatch.setenv("MAGENTO_STORE_CODE", store_code)
+
+    with pytest.raises(ValueError, match="MAGENTO_STORE_CODE"):
+        magento._api_base_url()
+
+
 @pytest.mark.parametrize(
     "limit, expected",
     [
@@ -321,6 +345,42 @@ def test_paginated_result_rejects_non_dict_payload():
 def test_paginated_result_rejects_non_list_items():
     with pytest.raises(ValueError, match="items"):
         magento._paginated_result({"items": "nope"}, page_size=10, current_page=1)
+
+
+@pytest.mark.parametrize("items_value", [0, "", False])
+def test_paginated_result_rejects_falsy_wrong_type_items(items_value):
+    # A naive `payload.get("items") or []` would silently treat any of
+    # these as "no items" instead of the malformed response they actually
+    # are, since they're falsy but not a list.
+    with pytest.raises(ValueError, match="items"):
+        magento._paginated_result({"items": items_value}, page_size=10, current_page=1)
+
+
+def test_paginated_result_defaults_missing_items_to_empty_list():
+    items, has_more = magento._paginated_result(
+        {"total_count": 0}, page_size=10, current_page=1
+    )
+
+    assert items == []
+    assert has_more is False
+
+
+def test_escape_like_escapes_percent_and_underscore():
+    assert magento._escape_like("ABC_1%off") == "ABC\\_1\\%off"
+
+
+def test_escape_like_escapes_backslash_first():
+    assert magento._escape_like("a\\b_c") == "a\\\\b\\_c"
+
+
+def test_stringify_param_renders_scalars_as_str():
+    assert magento._stringify_param(42) == "42"
+    assert magento._stringify_param("sku") == "sku"
+
+
+def test_stringify_param_renders_dict_and_list_as_json():
+    assert magento._stringify_param({"a": 1}) == '{"a": 1}'
+    assert magento._stringify_param([1, "x"]) == '[1, "x"]'
 
 
 def test_extract_error_detail_substitutes_named_parameters():
@@ -402,6 +462,62 @@ def test_request_uses_configured_host_and_bearer_token(monkeypatch):
         mock_request.call_args.kwargs["headers"]["Authorization"] == "Bearer test-token"
     )
     assert mock_request.call_args.kwargs["allow_redirects"] is False
+
+
+def test_request_uses_store_code_in_the_real_request_url(monkeypatch):
+    # _base_url()/_api_base_url() have their own store-code coverage above,
+    # but _request() builds the URL independently (for the single-DNS-
+    # lookup/pinning guarantee) -- this asserts the store-code prefix
+    # actually reaches a real _request() call, not just the unused helpers.
+    monkeypatch.setenv("MAGENTO_STORE_CODE", "default")
+    mock_request = Mock(return_value=MockResponse(json_data={"ok": True}))
+    monkeypatch.setattr(magento.requests, "request", mock_request)
+
+    magento._request("GET", "/products/abc")
+
+    assert (
+        mock_request.call_args.kwargs["url"]
+        == "https://store.example.com/rest/default/V1/products/abc"
+    )
+
+
+def test_request_passes_empty_proxies_when_none_configured(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"ok": True}))
+    monkeypatch.setattr(magento.requests, "request", mock_request)
+
+    magento._request("GET", "/products/abc")
+
+    assert mock_request.call_args.kwargs["proxies"] == {}
+
+
+def test_request_raises_when_proxy_is_configured_but_not_trusted(monkeypatch):
+    # An ambient proxy makes the *proxy* resolve DNS for the real
+    # connection, silently defeating _pinned_dns -- this must fail loudly
+    # instead of quietly connecting through an unvetted proxy.
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.internal:8080")
+    monkeypatch.delenv("XAGENT_TRUSTED_EGRESS_PROXY", raising=False)
+    mock_request = Mock()
+    monkeypatch.setattr(magento.requests, "request", mock_request)
+
+    with pytest.raises(ValueError, match="not marked as trusted"):
+        magento._request("GET", "/products/abc")
+
+    mock_request.assert_not_called()
+
+
+def test_request_passes_proxy_explicitly_when_trusted(monkeypatch):
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.internal:8080")
+    monkeypatch.setenv("XAGENT_TRUSTED_EGRESS_PROXY", "1")
+    mock_request = Mock(return_value=MockResponse(json_data={"ok": True}))
+    monkeypatch.setattr(magento.requests, "request", mock_request)
+
+    result = magento._request("GET", "/products/abc")
+
+    assert result == {"ok": True}
+    assert mock_request.call_args.kwargs["proxies"] == {
+        "http": "http://proxy.internal:8080",
+        "https": "http://proxy.internal:8080",
+    }
 
 
 @pytest.mark.parametrize("status_code", [301, 302, 303, 307, 308])
@@ -522,6 +638,21 @@ def test_list_products_rejects_invalid_status():
     result = json.loads(magento.magento_list_products(status=9))
 
     assert result["status"] == "error"
+
+
+def test_list_products_escapes_like_wildcards_in_sku_like(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"items": [], "total_count": 0})
+    )
+    monkeypatch.setattr(magento.requests, "request", mock_request)
+
+    magento.magento_list_products(sku_like="ABC_1%off")
+
+    params = mock_request.call_args.kwargs["params"]
+    assert (
+        params["searchCriteria[filter_groups][0][filters][0][value]"]
+        == "%ABC\\_1\\%off%"
+    )
 
 
 def test_get_product_returns_summary(monkeypatch):
@@ -689,6 +820,25 @@ def test_get_order_returns_summary(monkeypatch):
     assert result["order"]["currency"] == "USD"
 
 
+def test_get_order_percent_encodes_id_in_path(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"entity_id": 1}))
+    monkeypatch.setattr(magento.requests, "request", mock_request)
+
+    magento.magento_get_order("1")
+
+    assert mock_request.call_args.kwargs["url"].endswith("/orders/1")
+
+
+def test_get_order_rejects_path_traversal_id():
+    # order_id is typed int, so a real MCP call can never reach this value
+    # (FastMCP validates the wire argument first) -- this is a
+    # defense-in-depth check on the underlying function, matching the
+    # protection magento_get_product's sku already has.
+    result = json.loads(magento.magento_get_order("1/../../customers/5"))
+
+    assert result["status"] == "error"
+
+
 def test_add_order_comment_requires_non_blank_comment():
     result = json.loads(magento.magento_add_order_comment(1, "   "))
 
@@ -715,6 +865,14 @@ def test_add_order_comment_sends_status_history(monkeypatch):
         "status": "complete",
     }
     assert mock_request.call_args.kwargs["url"].endswith("/orders/1/comments")
+
+
+def test_add_order_comment_rejects_path_traversal_id():
+    result = json.loads(
+        magento.magento_add_order_comment("1/../../customers/5", "Note")
+    )
+
+    assert result["status"] == "error"
 
 
 def test_add_order_comment_omits_status_when_not_provided(monkeypatch):
@@ -755,6 +913,20 @@ def test_list_customers_sends_email_like_filter(monkeypatch):
     assert mock_request.call_args.kwargs["url"].endswith("/customers/search")
 
 
+def test_list_customers_escapes_like_wildcards_in_email_like(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"items": [], "total_count": 0})
+    )
+    monkeypatch.setattr(magento.requests, "request", mock_request)
+
+    magento.magento_list_customers(email_like="j_ane%")
+
+    params = mock_request.call_args.kwargs["params"]
+    assert (
+        params["searchCriteria[filter_groups][0][filters][0][value]"] == "%j\\_ane\\%%"
+    )
+
+
 def test_get_customer_returns_summary(monkeypatch):
     monkeypatch.setattr(
         magento.requests,
@@ -770,6 +942,12 @@ def test_get_customer_returns_summary(monkeypatch):
 
     assert result["status"] == "success"
     assert result["customer"]["email"] == "jane@example.com"
+
+
+def test_get_customer_rejects_path_traversal_id():
+    result = json.loads(magento.magento_get_customer("1/../../orders/5"))
+
+    assert result["status"] == "error"
 
 
 def test_get_category_tree_sends_optional_params(monkeypatch):
@@ -807,6 +985,12 @@ def test_get_category_returns_summary(monkeypatch):
 
     assert result["status"] == "success"
     assert result["category"]["name"] == "Shirts"
+
+
+def test_get_category_rejects_path_traversal_id():
+    result = json.loads(magento.magento_get_category("1/../../orders/5"))
+
+    assert result["status"] == "error"
 
 
 def test_category_summary_returns_empty_dict_for_none():
@@ -857,4 +1041,5 @@ def test_magento_app_registry_requires_base_url_and_token():
     assert magento_app["launch_config"]["required_env"] == [
         "MAGENTO_BASE_URL",
         "MAGENTO_ACCESS_TOKEN",
+        "MAGENTO_STORE_CODE",
     ]

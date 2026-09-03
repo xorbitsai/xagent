@@ -1375,15 +1375,30 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             # origin (Magento is commonly self-hosted at an arbitrary
             # domain, unlike Shopify/Zendesk's fixed "*.myshopify.com"/
             # "*.zendesk.com" suffix) -- validated in magento.py as a bare
-            # https origin, then resolved and checked against private/
+            # https origin, then resolved and pinned against private/
             # internal IP ranges before every request, since here (unlike
             # those two) there is no small fixed-hostname allowlist to lean
-            # on first; this is the primary SSRF defense for this
-            # connector, not just defense-in-depth.
+            # on first. That pinning only holds when no HTTP(S) proxy is in
+            # play (a proxy does its own DNS resolution this process can't
+            # see -- magento.py's _request() calls the same
+            # get_trusted_proxy_url() gate web_content.py uses, raising
+            # unless the proxy is explicitly marked trusted via
+            # XAGENT_TRUSTED_EGRESS_PROXY=1); upfront private-IP rejection
+            # at validation time is the unconditional baseline either way.
+            # MAGENTO_STORE_CODE is in required_env (there is no
+            # optional_env concept in the connect flow) even though
+            # magento.py itself defaults to the default store view when
+            # it's empty -- same precedent as the mixpanel row's
+            # MIXPANEL_REGION above, so a multi-storefront install isn't
+            # stuck unable to select a non-default store view.
             "launch_config": {
                 "command": "python",
                 "args": ["-m", "xagent.web.tools.mcp.magento"],
-                "required_env": ["MAGENTO_BASE_URL", "MAGENTO_ACCESS_TOKEN"],
+                "required_env": [
+                    "MAGENTO_BASE_URL",
+                    "MAGENTO_ACCESS_TOKEN",
+                    "MAGENTO_STORE_CODE",
+                ],
             },
         },
     ]

@@ -127,6 +127,15 @@ def _base_url() -> str:
     return f"https://{hostname}/api/v2"
 
 
+def _ensure_configured() -> None:
+    """Raise the usual config error if the subdomain/credentials are
+    missing or invalid, for a code path (the search-window-ceiling guards)
+    that returns before ever reaching _request(), which normally does this
+    validation as a side effect of building the request."""
+    _base_url()
+    _auth()
+
+
 def _clamp_limit(limit: int) -> int:
     return clamp_limit(limit, max_limit=MAX_LIMIT)
 
@@ -312,6 +321,22 @@ def _offset_page(
     return page, has_more
 
 
+def _force_has_more_when_truncated(response: str, field_name: str) -> str:
+    """success_with_capped_dict sets `truncated` but leaves the nested
+    `has_more` it was given untouched -- a truncated page must report
+    has_more=True regardless of what Zendesk's own response said, or a
+    caller that trusts has_more alone will stop paging and silently lose
+    the trimmed items. Mirrors _list_cursor_paginated's identical guard,
+    applied here after the fact since zendesk_search/zendesk_search_users
+    build their payload through the generic success_with_capped_dict
+    rather than a truncation-aware loop of their own."""
+    payload = json.loads(response)
+    nested = payload.get(field_name)
+    if payload.get("truncated") and isinstance(nested, dict):
+        nested["has_more"] = True
+    return json.dumps(payload, ensure_ascii=False)
+
+
 def _list_cursor_paginated(
     path: str,
     list_key: str,
@@ -469,10 +494,13 @@ def zendesk_search(query: str, limit: int = 25, page: int = 1) -> str:
     "type:user email:jane@example.com".
     limit: max results to return (default 25, hard cap 100).
     page: 1-based page number; pass the previous page + 1 to continue. If a
-    call is truncated for size (`truncated: true` in the response), retry
-    the *same* page with a smaller `limit` rather than advancing -- Zendesk
-    has already served this page, and the trimmed results are only
-    recoverable by re-fetching it in smaller pieces, not by paging past it.
+    call is truncated for size (`truncated: true` in the response,
+    `has_more` forced true), the trimmed items are not recoverable by
+    retrying the same `page` with a smaller `limit` -- Zendesk's `page`
+    means a different item range once `limit` changes. Instead, re-run the
+    search with a smaller `limit` starting from `page=1` and page through
+    normally; that re-partitions the same result set into pieces small
+    enough to avoid truncation.
     """
     try:
         query = _require_non_blank(query, "query")
@@ -483,6 +511,11 @@ def zendesk_search(query: str, limit: int = 25, page: int = 1) -> str:
             # itself would answer with an opaque HTTP error here, so return
             # a clean, predictable "no more results" instead of forwarding
             # a caller mechanically incrementing `page` into that error.
+            # Validate config here too (normally _request's job) -- this
+            # branch never reaches _request, so a misconfigured
+            # subdomain/credential would otherwise be masked as "no
+            # results" instead of surfacing as the usual config error.
+            _ensure_configured()
             # Nested the same way as the success_with_capped_dict call
             # below -- a flat shape here would make this tool return two
             # different response shapes depending on how far it paged.
@@ -495,13 +528,16 @@ def zendesk_search(query: str, limit: int = 25, page: int = 1) -> str:
             params={"query": query, "per_page": max_results, "page": page},
         )
         results, has_more = _offset_page(result, "results", max_results)
-        return success_with_capped_dict(
+        return _force_has_more_when_truncated(
+            success_with_capped_dict(
+                "results",
+                {
+                    "results": [_search_result_summary(r) for r in results],
+                    "count": result.get("count"),
+                    "has_more": has_more,
+                },
+            ),
             "results",
-            {
-                "results": [_search_result_summary(r) for r in results],
-                "count": result.get("count"),
-                "has_more": has_more,
-            },
         )
     except Exception as e:
         # The query can carry end-user PII (the tool's own docstring
@@ -732,10 +768,11 @@ def zendesk_search_users(query: str, limit: int = 25, page: int = 1) -> str:
     Search users by name, email, or external_id, e.g. "jane@example.com".
     limit: max results to return (default 25, hard cap 100).
     page: 1-based page number; pass the previous page + 1 to continue. If a
-    call is truncated for size (`truncated: true` in the response), retry
-    the *same* page with a smaller `limit` rather than advancing -- Zendesk
-    has already served this page, and the trimmed results are only
-    recoverable by re-fetching it in smaller pieces, not by paging past it.
+    call is truncated for size (`truncated: true` in the response,
+    `has_more` forced true), the trimmed users are not recoverable by
+    retrying the same `page` with a smaller `limit` -- see zendesk_search's
+    identical note for why; re-run with a smaller `limit` from `page=1`
+    instead.
     """
     try:
         query = _require_non_blank(query, "query")
@@ -743,9 +780,9 @@ def zendesk_search_users(query: str, limit: int = 25, page: int = 1) -> str:
         page = max(1, page)
         if (page - 1) * max_results >= _MAX_SEARCH_RESULT_WINDOW:
             # Past Zendesk's own documented result-window ceiling -- see
-            # zendesk_search's identical guard for why. Nested the same way
-            # as the success_with_capped_dict call below, for the same
-            # reason zendesk_search's guard is.
+            # zendesk_search's identical guard for why (including the
+            # config-validation and response-shape rationale).
+            _ensure_configured()
             return success_with_capped_dict("users", {"users": [], "has_more": False})
         result = _request(
             "GET",
@@ -753,9 +790,12 @@ def zendesk_search_users(query: str, limit: int = 25, page: int = 1) -> str:
             params={"query": query, "per_page": max_results, "page": page},
         )
         users, has_more = _offset_page(result, "users", max_results)
-        return success_with_capped_dict(
+        return _force_has_more_when_truncated(
+            success_with_capped_dict(
+                "users",
+                {"users": [_user_summary(u) for u in users], "has_more": has_more},
+            ),
             "users",
-            {"users": [_user_summary(u) for u in users], "has_more": has_more},
         )
     except Exception as e:
         # The query can carry end-user PII (name/email/external_id) --

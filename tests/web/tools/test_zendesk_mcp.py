@@ -497,6 +497,32 @@ def test_search_sends_per_page_and_page_params(monkeypatch):
     }
 
 
+def test_search_forces_has_more_when_output_truncated(monkeypatch):
+    # Zendesk's own next_page says this is the last page (has_more would
+    # normally be False), but the results are large enough to get locally
+    # truncated for output size -- has_more must reflect that truncation
+    # regardless of what Zendesk said, or a caller trusting has_more alone
+    # would stop paging and silently lose the trimmed results.
+    big_results = [
+        {"result_type": "ticket", "id": i, "subject": "x" * 1000} for i in range(50)
+    ]
+    monkeypatch.setattr(
+        zendesk._session,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={"results": big_results, "count": 50, "next_page": None}
+            )
+        ),
+    )
+    monkeypatch.setattr(zendesk, "get_tool_max_output_length", lambda: 2000)
+
+    result = json.loads(zendesk.zendesk_search("type:ticket", limit=50))
+
+    assert result["truncated"] is True
+    assert result["results"]["has_more"] is True
+
+
 def test_search_clamps_page_to_at_least_one(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(json_data={"results": [], "count": 0})
@@ -527,6 +553,20 @@ def test_search_returns_empty_past_result_window_without_calling_zendesk(monkeyp
         "truncated": False,
     }
     mock_request.assert_not_called()
+
+
+def test_search_past_result_window_still_surfaces_missing_credentials(monkeypatch):
+    # The past-window guard returns before ever calling _request(), which
+    # is normally what validates ZENDESK_SUBDOMAIN/EMAIL/API_TOKEN -- a
+    # misconfigured environment must not be masked as a clean "no results"
+    # just because the caller happened to page past the window.
+    monkeypatch.delenv("ZENDESK_API_TOKEN")
+    page = zendesk._MAX_SEARCH_RESULT_WINDOW // 100 + 1
+
+    result = json.loads(zendesk.zendesk_search("type:ticket", limit=100, page=page))
+
+    assert result["status"] == "error"
+    assert "ZENDESK_API_TOKEN" in result["message"]
 
 
 def test_list_tickets_sends_page_size_and_cursor(monkeypatch):
@@ -936,6 +976,20 @@ def test_search_users_returns_empty_past_result_window_without_calling_zendesk(
     mock_request.assert_not_called()
 
 
+def test_search_users_past_result_window_still_surfaces_missing_credentials(
+    monkeypatch,
+):
+    monkeypatch.delenv("ZENDESK_API_TOKEN")
+    page = zendesk._MAX_SEARCH_RESULT_WINDOW // 100 + 1
+
+    result = json.loads(
+        zendesk.zendesk_search_users("jane@example.com", limit=100, page=page)
+    )
+
+    assert result["status"] == "error"
+    assert "ZENDESK_API_TOKEN" in result["message"]
+
+
 def test_search_users_sends_query_and_page_params(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(
@@ -953,6 +1007,25 @@ def test_search_users_sends_query_and_page_params(monkeypatch):
         "per_page": 5,
         "page": 1,
     }
+
+
+def test_search_users_forces_has_more_when_output_truncated(monkeypatch):
+    big_users = [
+        {"id": i, "name": "x" * 1000, "email": "jane@example.com"} for i in range(50)
+    ]
+    monkeypatch.setattr(
+        zendesk._session,
+        "request",
+        Mock(
+            return_value=MockResponse(json_data={"users": big_users, "next_page": None})
+        ),
+    )
+    monkeypatch.setattr(zendesk, "get_tool_max_output_length", lambda: 2000)
+
+    result = json.loads(zendesk.zendesk_search_users("jane@example.com", limit=50))
+
+    assert result["truncated"] is True
+    assert result["users"]["has_more"] is True
 
 
 def test_list_organizations_returns_summaries(monkeypatch):

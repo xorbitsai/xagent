@@ -725,6 +725,76 @@ def test_follow_up_infers_context_for_input_required_task() -> None:
         db.close()
 
 
+def test_follow_up_refreshes_connector_runtime_tools_before_injecting() -> None:
+    # A cached AgentService whose tools were already built (e.g. paused
+    # waiting for the user to connect an app) keeps its stale MCP config
+    # forever otherwise - a connect_apps pause answered via this A2A
+    # input-required path must bust that cache the same way the websocket
+    # resume paths do.
+    agent_id, full_key = _create_published_agent_with_key()
+    with patch(
+        "xagent.web.services.task_orchestrator._schedule_bg",
+        new=MagicMock(),
+    ):
+        created = client.post(
+            f"/api/a2a/agents/{agent_id}/message:send",
+            headers=_bearer(full_key),
+            json={
+                "message": {
+                    "messageId": "msg-initial",
+                    "contextId": "ctx-refresh",
+                    "role": "ROLE_USER",
+                    "parts": [{"text": "initial"}],
+                },
+                "configuration": {"returnImmediately": True},
+            },
+        )
+    task_id = created.json()["task"]["id"]
+    db = _direct_db_session()
+    try:
+        row = db.query(Task).filter(Task.id == int(task_id)).one()
+        row.status = TaskStatus.WAITING_FOR_USER
+        row.control_state = TaskControlState.WAITING_FOR_USER.value
+        row.runner_id = None
+        row.last_heartbeat_at = None
+        row.lease_expires_at = None
+        db.commit()
+    finally:
+        db.close()
+
+    agent_service = MagicMock()
+    agent_service.post_user_message = AsyncMock(return_value=True)
+    agent_manager = MagicMock()
+    agent_manager.get_agent_for_task = AsyncMock(return_value=agent_service)
+    with (
+        patch(
+            "xagent.web.api.chat.get_agent_manager",
+            return_value=agent_manager,
+        ),
+        patch("xagent.web.api.a2a._schedule_waiting_a2a_resume"),
+        patch(
+            "xagent.web.api.a2a.TaskTurnOrchestrator.begin_turn",
+            new=AsyncMock(),
+        ),
+    ):
+        response = client.post(
+            f"/api/a2a/agents/{agent_id}/message:send",
+            headers=_bearer(full_key),
+            json={
+                "message": {
+                    "messageId": "msg-follow-up",
+                    "taskId": task_id,
+                    "role": "ROLE_USER",
+                    "parts": [{"text": "follow up"}],
+                },
+                "configuration": {"returnImmediately": True},
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    agent_manager.refresh_connector_runtime_tools.assert_called_once_with(int(task_id))
+
+
 def test_checkpoint_resume_schedule_failure_exactly_restores_waiting_task() -> None:
     agent_id, full_key = _create_published_agent_with_key()
     db = _direct_db_session()

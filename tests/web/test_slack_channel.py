@@ -1210,6 +1210,11 @@ async def test_successful_slack_turn_reuses_channel_runtime(
 ) -> None:
     bot = make_bot()
     bot._save_active_tasks = lambda: None  # type: ignore[method-assign]
+    # A continuing conversation, not a brand-new task: refresh_calls below
+    # only fires for a turn resuming a prior connect_apps-style pause, which
+    # requires an existing task (is_new_task=False) whose prior_status was
+    # actually WAITING_FOR_USER - a fresh task has no such pause to resume.
+    bot.active_tasks["T1:D1:U1:direct"] = 45
     lease = TaskLease(task_id=45, runner_id="runner-a", run_id="run-a")
     finalized: list[tuple[TaskStatus, str]] = []
     finalized_execution_results: list[Any] = []
@@ -1243,8 +1248,9 @@ async def test_successful_slack_turn_reuses_channel_runtime(
         return SimpleNamespace(
             user_id=5,
             task_id=45,
-            is_new_task=True,
+            is_new_task=False,
             managed_lease=managed,
+            prior_status=TaskStatus.WAITING_FOR_USER,
         )
 
     class FakeTracer:
@@ -1262,11 +1268,15 @@ async def test_successful_slack_turn_reuses_channel_runtime(
         set_recovered_skill_context=lambda _context: None,
     )
 
+    refresh_calls: list[int] = []
     execution_result = {"success": True, "output": "Slack reply"}
 
     class FakeAgentManager:
         async def get_agent_for_task(self, *_args: Any, **_kwargs: Any) -> Any:
             return agent_service
+
+        def refresh_connector_runtime_tools(self, task_id: int) -> None:
+            refresh_calls.append(task_id)
 
         async def execute_task(self, **_kwargs: Any) -> dict[str, Any]:
             return execution_result
@@ -1327,6 +1337,7 @@ async def test_successful_slack_turn_reuses_channel_runtime(
 
     assert bot.active_tasks == {"T1:D1:U1:direct": 45}
     assert persisted[0]["content"] == "hello"
+    assert refresh_calls == [45]
     assert finalized == [(TaskStatus.COMPLETED, "Slack reply")]
     assert finalized_execution_results == [execution_result]
     assert final_messages == [

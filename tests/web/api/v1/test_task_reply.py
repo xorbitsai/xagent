@@ -248,6 +248,41 @@ def test_reply_happy_path_resumes_the_same_run(mock_start_task):
         db.close()
 
 
+def test_reply_refreshes_connector_runtime_tools_before_injecting(mock_start_task):
+    # A cached AgentService whose tools were already built (e.g. paused
+    # waiting for the user to connect an app) keeps its stale MCP config
+    # forever otherwise - a connect_apps pause answered via this v1 REST
+    # path must bust that cache the same way the websocket resume paths do.
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_waiting_task(full_key, agent_id, run_id="run-original")
+    _insert_question_message(task_id)
+
+    agent_service = MagicMock()
+    agent_service.post_user_message = AsyncMock(
+        return_value=UserMessageInjectionOutcome.POSTED_FRESH
+    )
+    agent_manager = MagicMock()
+    agent_manager.get_agent_for_task = AsyncMock(return_value=agent_service)
+    with (
+        patch(
+            "xagent.web.api.chat.get_agent_manager",
+            return_value=agent_manager,
+        ),
+        patch(
+            "xagent.web.api.v1.task_reply._schedule_waiting_reply_resume",
+            new=AsyncMock(),
+        ),
+    ):
+        resp = client.post(
+            f"/v1/chat/tasks/{task_id}/reply",
+            headers=_bearer(full_key),
+            json=_reply_body(agent_id),
+        )
+
+    assert resp.status_code == 202, resp.text
+    agent_manager.refresh_connector_runtime_tools.assert_called_once_with(task_id)
+
+
 def test_reply_turn_id_is_never_reused_across_retries(mock_start_task):
     """Documents a known structural boundary, not a behavior this endpoint
     is expected to provide: every call mints ``turn_id`` from a fresh

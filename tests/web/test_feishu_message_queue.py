@@ -67,6 +67,7 @@ async def test_error_after_prepare_settles_preclaimed_task_instead_of_orphaning_
             task_id=45,
             is_new_task=True,
             managed_lease=managed,
+            prior_status=TaskStatus.PENDING,
         )
 
     sent_messages: list[str] = []
@@ -156,6 +157,9 @@ async def test_channel_failure_suppresses_stale_error_after_exact_settlement_rej
         async def get_agent_for_task(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
             return agent_service
 
+        def refresh_connector_runtime_tools(self, _task_id):  # type: ignore[no-untyped-def]
+            pass
+
         async def execute_task(self, **_kwargs):  # type: ignore[no-untyped-def]
             raise RuntimeError("channel execution failed")
 
@@ -171,6 +175,7 @@ async def test_channel_failure_suppresses_stale_error_after_exact_settlement_rej
             task_id=45,
             is_new_task=True,
             managed_lease=managed,
+            prior_status=TaskStatus.PENDING,
         )
 
     monkeypatch.setattr(
@@ -316,9 +321,14 @@ async def test_successful_channel_turn_persists_user_before_exact_assistant_sett
         set_recovered_skill_context=lambda _context: None,
     )
 
+    refresh_calls: list[int] = []
+
     class FakeAgentManager:
         async def get_agent_for_task(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
             return agent_service
+
+        def refresh_connector_runtime_tools(self, task_id):  # type: ignore[no-untyped-def]
+            refresh_calls.append(task_id)
 
         async def execute_task(self, **_kwargs):  # type: ignore[no-untyped-def]
             events.append("execute")
@@ -332,6 +342,10 @@ async def test_successful_channel_turn_persists_user_before_exact_assistant_sett
             task_id=45,
             is_new_task=False,
             managed_lease=managed,
+            # This turn is resuming a prior connect_apps-style pause - the
+            # only scenario refresh_connector_runtime_tools should fire for
+            # (see the assertion on refresh_calls below).
+            prior_status=TaskStatus.WAITING_FOR_USER,
         )
 
     async def persist_message(**kwargs) -> None:  # type: ignore[no-untyped-def]
@@ -381,6 +395,7 @@ async def test_successful_channel_turn_persists_user_before_exact_assistant_sett
     )
     await bot._process_messages_batch("open-id", [message])
 
+    assert refresh_calls == [45]
     assert events == ["user-message", "execute", "assistant-settlement"]
     assert finalized == [
         {

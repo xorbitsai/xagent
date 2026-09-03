@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -161,7 +162,7 @@ def test_callback_exchanges_code_and_backfills_identity_from_organisations(
     )
     assert oauth_account.access_token == "eh-token"
     assert oauth_account.refresh_token == "eh-refresh"
-    assert oauth_account.provider_user_id == "org-1,org-2"
+    assert oauth_account.provider_user_id == json.dumps(["org-1", "org-2"])
     assert oauth_account.email is None
 
     server = db.query(MCPServer).filter(MCPServer.name == "Employment Hero").one()
@@ -233,12 +234,13 @@ def test_callback_backfills_identity_across_multiple_organisation_pages(
         ),
     )
 
-    # Short numeric ids, not "org-N" -- the joined set must stay under
-    # _PROVIDER_USER_ID_SAFE_LENGTH here so this test actually checks
-    # pagination completeness, not the separate length-safety hashing
-    # covered by test_callback_hashes_provider_user_id_when_too_long_for_index.
-    page_1_items = [{"id": str(i)} for i in range(100)]
-    page_2_items = [{"id": "100"}]
+    # Short numeric ids, not "org-N", and few enough of them (51, not 101)
+    # that the JSON-encoded set stays under _PROVIDER_USER_ID_SAFE_LENGTH --
+    # this test checks pagination completeness, not the separate
+    # length-safety hashing covered by
+    # test_callback_hashes_provider_user_id_when_too_long_for_index.
+    page_1_items = [{"id": str(i)} for i in range(50)]
+    page_2_items = [{"id": "50"}]
     responses = [
         MockResponse({"data": {"items": page_1_items, "total_pages": 2}}),
         MockResponse({"data": {"items": page_2_items, "total_pages": 2}}),
@@ -259,9 +261,9 @@ def test_callback_backfills_identity_across_multiple_organisation_pages(
         .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "employment-hero")
         .one()
     )
-    assert oauth_account.provider_user_id == ",".join(
-        sorted(str(i) for i in range(101))
-    )
+    expected = json.dumps(sorted(str(i) for i in range(51)))
+    assert len(expected) <= auth_api._PROVIDER_USER_ID_SAFE_LENGTH
+    assert oauth_account.provider_user_id == expected
 
 
 def test_callback_keeps_paginating_when_server_returns_short_pages(
@@ -296,7 +298,7 @@ def test_callback_keeps_paginating_when_server_returns_short_pages(
         MockResponse(
             {
                 "data": {
-                    "items": [{"id": f"p1-{i}"} for i in range(20)],
+                    "items": [{"id": f"p1-{i}"} for i in range(5)],
                     "total_pages": 3,
                 }
             }
@@ -304,7 +306,7 @@ def test_callback_keeps_paginating_when_server_returns_short_pages(
         MockResponse(
             {
                 "data": {
-                    "items": [{"id": f"p2-{i}"} for i in range(20)],
+                    "items": [{"id": f"p2-{i}"} for i in range(5)],
                     "total_pages": 3,
                 }
             }
@@ -312,7 +314,7 @@ def test_callback_keeps_paginating_when_server_returns_short_pages(
         MockResponse(
             {
                 "data": {
-                    "items": [{"id": f"p3-{i}"} for i in range(20)],
+                    "items": [{"id": f"p3-{i}"} for i in range(5)],
                     "total_pages": 3,
                 }
             }
@@ -332,8 +334,50 @@ def test_callback_keeps_paginating_when_server_returns_short_pages(
         .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "employment-hero")
         .one()
     )
-    expected_ids = [f"p{page}-{i}" for page in (1, 2, 3) for i in range(20)]
-    assert oauth_account.provider_user_id == ",".join(sorted(expected_ids))
+    expected_ids = [f"p{page}-{i}" for page in (1, 2, 3) for i in range(5)]
+    expected = json.dumps(sorted(expected_ids))
+    assert len(expected) <= auth_api._PROVIDER_USER_ID_SAFE_LENGTH
+    assert oauth_account.provider_user_id == expected
+
+
+def test_callback_paginates_across_multiple_full_pages_without_total_pages(
+    db_session, monkeypatch
+):
+    """When a response never carries total_pages at all, the fallback
+    short-page heuristic must still correctly paginate across MULTIPLE full
+    pages before it finally sees a short page -- not just stop-after-one or
+    stop-after-two by coincidence."""
+    db, user = db_session
+    request = _callback_request(user, code_verifier="verifier-value")
+
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {"access_token": "eh-token", "token_type": "bearer", "expires_in": 900}
+            )
+        ),
+    )
+
+    # No total_pages anywhere in any response -- every page must fall back
+    # to the short-page heuristic. Pages 1 and 2 are full (100 items, not
+    # < item_per_page), page 3 is short (5 items), so the fetch must run
+    # exactly 3 times, not stop after page 1 or 2.
+    responses = [
+        MockResponse({"data": {"items": [{"id": f"p1-{i}"} for i in range(100)]}}),
+        MockResponse({"data": {"items": [{"id": f"p2-{i}"} for i in range(100)]}}),
+        MockResponse({"data": {"items": [{"id": f"p3-{i}"} for i in range(5)]}}),
+    ]
+    get = Mock(side_effect=responses)
+    monkeypatch.setattr(auth_api.requests, "get", get)
+
+    response = generic_oauth_callback(
+        "employment-hero", request, db, _employment_hero_provider()
+    )
+
+    assert response.status_code == 200
+    assert get.call_count == 3
 
 
 def test_callback_hashes_provider_user_id_when_too_long_for_index(
@@ -378,7 +422,7 @@ def test_callback_hashes_provider_user_id_when_too_long_for_index(
         .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "employment-hero")
         .one()
     )
-    joined = ",".join(sorted(org_ids))
+    joined = json.dumps(sorted(org_ids))
     assert len(joined) > auth_api._PROVIDER_USER_ID_SAFE_LENGTH
     assert oauth_account.provider_user_id == hashlib.sha256(joined.encode()).hexdigest()
 

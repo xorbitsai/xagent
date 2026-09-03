@@ -3795,7 +3795,14 @@ class WebToolConfig(BaseToolConfig):
                 )
             else:
                 actor_query = actor_query.with_for_update()
-            oauth_account = actor_query.first()
+            # See the ordinary-flow branches in _resolve_legacy_oauth_access_
+            # token for why this is ordered rather than left arbitrary: the
+            # lock above prevents a *new* duplicate from forming during this
+            # resolution, but doesn't retroactively fix a namespace that
+            # already has more than one row from before locking existed (or
+            # from a provider whose identity backfill can't always derive a
+            # non-NULL provider_user_id).
+            oauth_account = actor_query.order_by(UserOAuth.id.desc()).first()
             logger.info(
                 "OAUTH CONFIG: Checked actor app credential for user %s. Found: %s",
                 user_id,

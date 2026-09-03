@@ -706,7 +706,7 @@ def _fetch_employment_hero_identity(access_token: str) -> Optional[str]:
     an identity check a token exposes (Employment Hero has no OIDC-style
     "me" endpoint, per the registry row's comment). Employment Hero grants
     are org-scoped rather than user-scoped, so there is no email to return;
-    the sorted, joined set of organisation ids becomes provider_user_id
+    the sorted, JSON-encoded set of organisation ids becomes provider_user_id
     instead -- distinguishing tokens by the organisations they can reach
     gives UserOAuth's (user_id, provider, provider_user_id) uniqueness
     constraint a real value to key on. Without this, two concurrent
@@ -788,8 +788,20 @@ def _fetch_employment_hero_identity(access_token: str) -> Optional[str]:
             for item in items
             if isinstance(item, dict) and item.get("id") not in (None, "")
         )
-        total_pages = data.get("total_pages") if isinstance(data, dict) else None
-        if isinstance(total_pages, int) and total_pages > 0:
+        total_pages_raw = data.get("total_pages") if isinstance(data, dict) else None
+        # bool is an int subclass in Python (isinstance(True, int) is True)
+        # -- excluded explicitly so a stray boolean in the envelope can't be
+        # misread as a page count. A numeric string ("3") is accepted since
+        # nothing guarantees this field is always JSON-typed as a number
+        # rather than a string on Employment Hero's side.
+        total_pages: Optional[int] = None
+        if isinstance(total_pages_raw, bool):
+            pass
+        elif isinstance(total_pages_raw, int):
+            total_pages = total_pages_raw
+        elif isinstance(total_pages_raw, str) and total_pages_raw.strip().isdigit():
+            total_pages = int(total_pages_raw.strip())
+        if total_pages is not None and total_pages > 0:
             if page_index >= total_pages:
                 break
         elif len(items) < item_per_page:
@@ -801,7 +813,16 @@ def _fetch_employment_hero_identity(access_token: str) -> Optional[str]:
             "set.",
             _EMPLOYMENT_HERO_IDENTITY_MAX_PAGES,
         )
-    provider_user_id = ",".join(sorted(organisation_ids)) if organisation_ids else None
+    # JSON-encoded, not comma-joined: a raw ",".join would let two distinct
+    # id sets collide onto the same string whenever an id itself happens to
+    # contain a literal "," (not expected for Employment Hero's UUID/numeric
+    # ids today, but not a contract this code can rely on) -- e.g.
+    # {"a,b", "c"} and {"a", "b,c"} both join to "a,b,c". JSON's own string
+    # quoting/escaping makes that collision impossible regardless of what
+    # characters an id contains.
+    provider_user_id = (
+        json.dumps(sorted(organisation_ids)) if organisation_ids else None
+    )
     if provider_user_id and len(provider_user_id) > _PROVIDER_USER_ID_SAFE_LENGTH:
         provider_user_id = hashlib.sha256(provider_user_id.encode()).hexdigest()
     return provider_user_id

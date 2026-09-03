@@ -1348,6 +1348,44 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                 "static_env": {"MYOB_API_KEY": "MYOB_CLIENT_ID"},
             },
         },
+        {
+            "app_id": "magento",
+            "name": "Magento",
+            "description": "Connect to a self-hosted Magento/Adobe Commerce store with an Integration access token to search and manage products, look up orders and add order comments, and browse customers and categories.",
+            "icon": "https://www.google.com/s2/favicons?domain=magento.com&sz=128",
+            "transport": "stdio",
+            "provider_name": None,
+            # "Commerce" is not one of the connect dialog's fixed sidebar
+            # category filters (connect-mcp-dialog.tsx only has CRM/Support/
+            # Marketing/Payments/Analytics/etc.), so this connector won't
+            # get a dedicated filter button yet -- still findable via the
+            # catalog's "All" view/search. "Payments" (Stripe's category)
+            # would be actively misleading: Magento is store/inventory/
+            # order management, not a payments processor.
+            "category": "Commerce",
+            "oauth_scopes": None,
+            "is_visible_in_connector": True,
+            # Key-based (non-oauth), like posthog/stripe: a Magento
+            # "Integration" (Admin -> System -> Extensions -> Integrations
+            # -> Add New Integration) issues a store-scoped access token
+            # self-serve, with no Magento Marketplace review -- OAuth on
+            # Magento is only a review-gated path for a *public* extension
+            # distributed to many merchants, not for a store granting
+            # itself access. MAGENTO_BASE_URL is the store's own full
+            # origin (Magento is commonly self-hosted at an arbitrary
+            # domain, unlike Shopify/Zendesk's fixed "*.myshopify.com"/
+            # "*.zendesk.com" suffix) -- validated in magento.py as a bare
+            # https origin, then resolved and checked against private/
+            # internal IP ranges before every request, since here (unlike
+            # those two) there is no small fixed-hostname allowlist to lean
+            # on first; this is the primary SSRF defense for this
+            # connector, not just defense-in-depth.
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.magento"],
+                "required_env": ["MAGENTO_BASE_URL", "MAGENTO_ACCESS_TOKEN"],
+            },
+        },
     ]
 
 

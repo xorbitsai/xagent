@@ -443,7 +443,7 @@ def _find_comment_event(result: Any) -> dict[str, Any] | None:
 
 
 def _add_comment(ticket_id: str, body: str, public: bool) -> dict[str, Any]:
-    _require_non_blank(body, "body")
+    body = _require_non_blank(body, "body")
     result = _request(
         "PUT",
         f"/tickets/{_resolve_path_id(ticket_id, _TICKET_URL_ID_PATTERN, 'ticket_id')}.json",
@@ -470,7 +470,7 @@ def zendesk_search(query: str, limit: int = 25, page: int = 1) -> str:
     recoverable by re-fetching it in smaller pieces, not by paging past it.
     """
     try:
-        _require_non_blank(query, "query")
+        query = _require_non_blank(query, "query")
         max_results = _clamp_limit(limit)
         page = max(1, page)
         if (page - 1) * max_results >= _MAX_SEARCH_RESULT_WINDOW:
@@ -554,8 +554,8 @@ def zendesk_create_ticket(
     tags: optional list of tags.
     """
     try:
-        _require_non_blank(subject, "subject")
-        _require_non_blank(comment, "comment")
+        subject = _require_non_blank(subject, "subject")
+        comment = _require_non_blank(comment, "comment")
         ticket: dict[str, Any] = {"subject": subject, "comment": {"body": comment}}
         if requester_email:
             ticket["requester"] = {"email": requester_email}
@@ -728,7 +728,7 @@ def zendesk_search_users(query: str, limit: int = 25, page: int = 1) -> str:
     recoverable by re-fetching it in smaller pieces, not by paging past it.
     """
     try:
-        _require_non_blank(query, "query")
+        query = _require_non_blank(query, "query")
         max_results = _clamp_limit(limit)
         page = max(1, page)
         if (page - 1) * max_results >= _MAX_SEARCH_RESULT_WINDOW:

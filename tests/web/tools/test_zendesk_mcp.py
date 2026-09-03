@@ -176,6 +176,42 @@ def test_require_non_blank_accepts_non_empty_value():
     assert zendesk._require_non_blank("hello", "field") == "hello"
 
 
+def test_search_sends_stripped_query(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"results": [], "count": 0})
+    )
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    zendesk.zendesk_search("  type:ticket  ")
+
+    assert mock_request.call_args.kwargs["params"]["query"] == "type:ticket"
+
+
+def test_create_ticket_sends_stripped_subject_and_comment(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"ticket": {"id": 1, "subject": "Help"}})
+    )
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    zendesk.zendesk_create_ticket("  Help  ", "  Something's broken  ")
+
+    body = mock_request.call_args.kwargs["json"]
+    assert body["ticket"]["subject"] == "Help"
+    assert body["ticket"]["comment"] == {"body": "Something's broken"}
+
+
+def test_reply_to_ticket_sends_stripped_body(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"ticket": {"id": 1, "status": "open"}})
+    )
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    zendesk.zendesk_reply_to_ticket(1, "  Thanks for reaching out  ")
+
+    body = mock_request.call_args.kwargs["json"]
+    assert body["ticket"]["comment"]["body"] == "Thanks for reaching out"
+
+
 def test_unwrap_extracts_key_from_envelope():
     assert zendesk._unwrap({"ticket": {"id": 1}}, "ticket") == {"id": 1}
 

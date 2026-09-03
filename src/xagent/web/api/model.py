@@ -52,7 +52,11 @@ from ..schemas.model import (
     UserDefaultModelCreate,
     UserDefaultModelResponse,
 )
-from ..services.llm_utils import CoreStorage
+from ..services.llm_utils import (
+    PLATFORM_MODEL_MANAGER,
+    CoreStorage,
+    is_platform_model_id,
+)
 from ..services.model_store import ModelSharingConflictError, ModelStore
 from ..user_isolated_memory import UserContext
 
@@ -436,6 +440,12 @@ async def create_model(
     logger.info(f"  Provider: {model.model_provider}")
     logger.info(f"  Abilities: {model.abilities}")
     logger.info(f"  Model name: {model.model_name}")
+
+    if is_platform_model_id(model.model_id):
+        raise HTTPException(
+            status_code=403,
+            detail="Model IDs beginning with 'platform/' are reserved",
+        )
 
     # Check if model_id already exists
     model_storage = CoreStorage(db, DBModel)
@@ -1883,6 +1893,23 @@ async def update_model(
     """Update a model configuration"""
     _, db_model_ref, user_model = _resolve_accessible_model(db, user, model_id)
 
+    category_changes = (
+        model_update.category is not None
+        and model_update.category != db_model_ref.category
+    )
+    if db_model_ref.managed_by == PLATFORM_MODEL_MANAGER and category_changes:
+        raise HTTPException(
+            status_code=409,
+            detail="The category of a platform-managed model is immutable",
+        )
+    if is_platform_model_id(db_model_ref.model_id) or (
+        db_model_ref.managed_by == PLATFORM_MODEL_MANAGER
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Platform model identities cannot be mutated by users",
+        )
+
     # Permission: only owner can edit
     if user_model.user_id != user.id or not user_model.can_edit:
         raise HTTPException(status_code=403, detail="No permission to edit this model")
@@ -1968,7 +1995,15 @@ async def delete_model(
     model_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)
 ) -> dict:
     """Delete a model configuration"""
-    model_storage, _, user_model = _resolve_accessible_model(db, user, model_id)
+    model_storage, db_model, user_model = _resolve_accessible_model(db, user, model_id)
+
+    if is_platform_model_id(db_model.model_id) or (
+        db_model.managed_by == PLATFORM_MODEL_MANAGER
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Platform model identities cannot be mutated by users",
+        )
 
     # Permission: only owner can delete
     if user_model.user_id != user.id or not user_model.can_delete:

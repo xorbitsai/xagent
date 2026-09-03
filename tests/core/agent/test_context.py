@@ -62,6 +62,84 @@ def test_create_context() -> None:
     assert ctx.memory_snapshot == {"summary": "hello"}
 
 
+def test_memory_input_prefers_display_message_after_context_rebuild() -> None:
+    typed = "Summarize the attachment"
+    augmented = f"{typed}\n\nAttached file: /private/runtime/input.txt"
+    context = ExecutionContext(execution_id="memory-input")
+    context.add_user_message(
+        augmented,
+        metadata={"display_message": typed},
+    )
+
+    rebuilt = ExecutionContext.from_dict(context.to_dict())
+
+    assert rebuilt.current_user_request_text(prefer_display=True) == typed
+
+
+def test_memory_input_preserves_legacy_content_fallback() -> None:
+    context = ExecutionContext(execution_id="legacy-memory-input")
+    context.add_user_message("Legacy execution text")
+
+    assert context.current_user_request_text(prefer_display=True) == (
+        "Legacy execution text"
+    )
+
+
+def test_memory_input_ignores_waiting_response() -> None:
+    original = "Inspect the report"
+    augmented = f"{original}\n\nAttached file: /private/runtime/report.pdf"
+    context = ExecutionContext(execution_id="resumed-memory-input")
+    context.add_user_message(augmented, metadata={"display_message": original})
+    context.add_user_message(
+        "Continue with the second option",
+        metadata={"response_to_waiting_for_user": {"question": "Which option?"}},
+    )
+
+    assert context.current_user_request_text(prefer_display=True) == original
+
+
+def test_memory_input_can_freeze_a_prior_user_message_window() -> None:
+    context = ExecutionContext(execution_id="frozen-memory-input")
+    context.add_user_message(
+        "Original execution text", metadata={"display_message": "Original request"}
+    )
+    context.add_user_message("Later clarification")
+
+    assert (
+        context.current_user_request_text(prefer_display=True, user_message_limit=1)
+        == "Original request"
+    )
+
+
+@pytest.mark.parametrize("display_message", [None, "", 42, {"text": "visible"}])
+def test_memory_input_ignores_unusable_display_metadata(
+    display_message: object,
+) -> None:
+    context = ExecutionContext(execution_id="invalid-display-memory-input")
+    context.add_user_message(
+        "Execution text fallback",
+        metadata={"display_message": display_message},
+    )
+
+    assert context.current_user_request_text(prefer_display=True) == (
+        "Execution text fallback"
+    )
+
+
+def test_dag_memory_input_ignores_internal_step_messages() -> None:
+    typed = "Plan the release"
+    augmented = f"{typed}\n\nAttached file: /private/runtime/input.txt"
+    root = ExecutionContext(execution_id="dag-memory-input")
+    root.add_user_message(augmented, metadata={"display_message": typed})
+    child = root.create_child_context(metadata={"dag_step_id": "draft"})
+    child.add_user_message(
+        "Only execute this internal step.",
+        metadata={"dag_step_id": "draft", "kind": "dag_step_instruction"},
+    )
+
+    assert child.current_user_request_text(prefer_display=True) == typed
+
+
 def test_sanitize_tool_result_for_context_hides_image_path_when_artifact_exists() -> (
     None
 ):
@@ -418,6 +496,32 @@ def test_memory_enrichment_uses_web_user_context(
 
     assert memories == [{"content": "memory"}]
     assert observed_user_ids == [42]
+    assert current_user_id.get() is None
+
+
+def test_memory_enrichment_without_user_context_fails_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_lookup(*_: object, **__: object) -> list[dict[str, str]]:
+        raise RuntimeError("memory backend unavailable")
+
+    monkeypatch.setattr(
+        enrichment_module,
+        "lookup_relevant_memories",
+        fail_lookup,
+    )
+
+    memories = _lookup_relevant_memories_with_context(
+        memory_store=object(),
+        query="query",
+        category="general",
+        include_general=True,
+        limit=5,
+        similarity_threshold=None,
+        user_id=None,
+    )
+
+    assert memories == []
     assert current_user_id.get() is None
 
 

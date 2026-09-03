@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -443,6 +444,73 @@ def _seed_manager_maps(manager: AgentServiceManager, agent: Any) -> None:
     manager._mcp_actor_policies[42] = MCPBuiltinOAuthActorPolicy(
         resource_owner_key="actor:alice"
     )
+
+
+def test_remove_agent_ignores_stale_cleanup_within_the_same_run() -> None:
+    """A resume re-claims its own run, so the run id cannot date a cleanup.
+
+    An approval continuation deliberately claims the run the waiting
+    checkpoint was written under -- that is what keeps the checkpoint
+    readable. Both the previous turn's runtime and the continuation's then
+    carry the same run id, so a late cleanup scheduled by the earlier one
+    would match and evict the runtime the continuation is executing in.
+    The generation is what tells the two acquisitions apart.
+    """
+    manager = AgentServiceManager()
+    agent = MagicMock()
+    _seed_manager_maps(manager, agent)
+    # The continuation's acquisition; the stale cleanup below belongs to the
+    # previous one, under the very same run id.
+    manager._agent_run_generations[42] = 2
+
+    manager.remove_agent(42, expected_run_id="current-run", expected_run_generation=1)
+
+    assert manager._agents[42] is agent
+    assert manager._agent_run_generations[42] == 2
+    agent.cleanup_workspace.assert_not_called()
+
+
+def test_remove_agent_evicts_when_the_generation_is_its_own() -> None:
+    """The guard must not become fail-stuck: the owning cleanup still runs."""
+    manager = AgentServiceManager()
+    agent = MagicMock()
+    _seed_manager_maps(manager, agent)
+    manager._agent_run_generations[42] = 2
+
+    manager.remove_agent(42, expected_run_id="current-run", expected_run_generation=2)
+
+    assert 42 not in manager._agents
+    assert 42 not in manager._agent_run_generations
+    agent.cleanup_workspace.assert_called_once()
+
+
+def test_get_agent_for_task_bumps_the_run_generation() -> None:
+    """Each acquisition is a new generation, including a same-run resume."""
+    manager = AgentServiceManager()
+    agent = MagicMock()
+    marker = object()
+
+    async def acquire() -> None:
+        with (
+            patch.object(manager, "_get_agent_for_task_unlocked", return_value=agent),
+        ):
+            await manager.get_agent_for_task(
+                42,
+                task_setup_snapshot=_snapshot(marker=marker),
+                task_owner_user_id=1,
+                resolved_execution_scope=None,
+            )
+
+    assert manager.current_run_generation(42) is None
+    asyncio.run(acquire())
+    first = manager.current_run_generation(42)
+    asyncio.run(acquire())
+    second = manager.current_run_generation(42)
+
+    assert first == 1
+    # The snapshot carries one run id, so only the generation distinguishes
+    # these two acquisitions -- which is the whole point of having it.
+    assert second == 2
 
 
 def test_remove_agent_ignores_stale_run_cleanup() -> None:

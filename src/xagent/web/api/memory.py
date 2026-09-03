@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from typing import Any, Callable, Optional
 
@@ -13,6 +14,9 @@ from ..auth_dependencies import get_current_user
 from ..dynamic_memory_store import get_memory_store_manager
 from ..models.user import User
 from ..user_isolated_memory import UserContext
+
+logger = logging.getLogger(__name__)
+MEMORY_READ_UNAVAILABLE_DETAIL = "Memory storage is temporarily unavailable."
 
 
 class MemoryListRequest(BaseModel):
@@ -139,19 +143,22 @@ class MemoryManagementRouter:
                     if date_to:
                         filters["date_to"] = date_to
 
-                    # Get memories
-                    if search:
-                        # Use search functionality if search query is provided
-                        search_results = self.memory_store.search(
-                            query=search,
-                            k=1000,
-                            filters=filters if filters else None,
-                            similarity_threshold=similarity_threshold,
-                        )
-                        memories = search_results
-                    else:
-                        # Use regular list_all if no search query
-                        memories = self.memory_store.list_all(filters)
+                    try:
+                        if search:
+                            memories = self.memory_store.search(
+                                query=search,
+                                k=1000,
+                                filters=filters if filters else None,
+                                similarity_threshold=similarity_threshold,
+                            )
+                        else:
+                            memories = self.memory_store.list_all(filters)
+                    except Exception:
+                        logger.exception("Memory list read failed")
+                        raise HTTPException(
+                            status_code=503,
+                            detail=MEMORY_READ_UNAVAILABLE_DETAIL,
+                        ) from None
 
                     # Apply pagination
                     total_count = len(memories)
@@ -177,10 +184,13 @@ class MemoryManagementRouter:
                         total_count=total_count,
                         filters_used=filters,
                     )
-            except Exception as e:
+            except HTTPException:
+                raise
+            except Exception:
+                logger.exception("Failed to build memory list response")
                 raise HTTPException(
-                    status_code=500, detail=f"Failed to list memories: {str(e)}"
-                )
+                    status_code=500, detail="Failed to list memories."
+                ) from None
 
         @self.router.delete("/{memory_id}")
         async def delete_memory(

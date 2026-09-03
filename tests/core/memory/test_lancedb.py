@@ -431,9 +431,27 @@ def test_embedding_fallback(memory_store):
         results = fallback_store.search("Test content", k=5)
         assert len(results) >= 1
         assert results[0].content == "Test content for fallback"
-
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def test_list_all_propagates_terminal_search_failure(temp_db_dir, monkeypatch):
+    class BrokenConnection:
+        def open_table(self, _: str):
+            raise RuntimeError("memory table unavailable")
+
+    store = LanceDBMemoryStore(
+        db_dir=temp_db_dir,
+        collection_name="terminal_list_failure",
+    )
+    monkeypatch.setattr(
+        store._vector_store,
+        "get_raw_connection",
+        lambda: BrokenConnection(),
+    )
+
+    with pytest.raises(RuntimeError, match="memory table unavailable"):
+        store.list_all()
 
 
 def test_large_content_handling(memory_store):

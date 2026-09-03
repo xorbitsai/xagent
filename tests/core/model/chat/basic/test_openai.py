@@ -1764,6 +1764,12 @@ _MAX_TOKENS_REJECTION = (
     "Use 'max_completion_tokens' instead."
 )
 
+_REASONING_TOOLS_REJECTION = (
+    "Function tools with reasoning_effort are not supported for this model in "
+    "/v1/chat/completions. To use function tools, use /v1/responses or set "
+    "reasoning_effort to 'none'."
+)
+
 
 class TestRejectedParameterDegrade:
     """Reasoning models spell the output budget ``max_completion_tokens``.
@@ -1798,6 +1804,46 @@ class TestRejectedParameterDegrade:
         # summary from re-triggering the next compaction.
         assert "max_tokens" not in retry_kwargs
         assert retry_kwargs["max_completion_tokens"] == 5000
+
+    @pytest.mark.asyncio
+    async def test_chat_disables_reasoning_for_function_tools(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _bad_request(
+                _REASONING_TOOLS_REJECTION,
+                param="reasoning_effort",
+                code="validation_error",
+            ),
+            mock_chat_completion,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "noop",
+                    "description": "No operation",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+
+        llm = OpenAILLM(**openai_llm_config)
+        response = await llm.chat(
+            [{"role": "user", "content": "Call the tool."}], tools=tools
+        )
+
+        assert response["content"] == "Hello World"
+        first_kwargs = mock_client.chat.completions.create.call_args_list[0].kwargs
+        retry_kwargs = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert "reasoning_effort" not in first_kwargs
+        assert retry_kwargs["reasoning_effort"] == "none"
+        assert retry_kwargs["tools"] == tools
 
     @pytest.mark.asyncio
     async def test_one_rejection_naming_both_degrades_both(

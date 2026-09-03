@@ -14,7 +14,7 @@ from ....task_runtime import (
 )
 from ...context.enrichment import (
     enrich_context_with_memory,
-    latest_user_text,
+    hydrate_top_level_user_request,
 )
 from ...frame import ExecutionFrame, ExecutionSnapshot, ExecutionStatus
 from ...grounding import grounding_rule
@@ -386,6 +386,7 @@ class DAGPattern(AgentPattern):
         self.active_step_contexts: dict[str, dict[str, Any]] = {}
         self.step_results: dict[str, Any] = {}
         self.planned_user_message_count = 0
+        self.memory_input_text: str | None = None
         self.completion_feedback: str | None = None
         self.completion_replan_count = 0
         # Live concurrent step tasks for the in-progress batch, maintained by
@@ -465,10 +466,10 @@ class DAGPattern(AgentPattern):
             self.status = "planning"
         try:
             if self.plan is None:
-                task_text = latest_user_text(context)
+                memory_text = self._memory_text(context)
                 await enrich_context_with_memory(
                     context=context,
-                    query=task_text,
+                    query=memory_text,
                     category="dag_plan_execute_memory",
                     memory_store=memory_store,
                     runtime=runtime,
@@ -998,6 +999,7 @@ class DAGPattern(AgentPattern):
             finalize_after_tool_result=False,
             user_interaction_enabled=self.user_interaction_enabled,
         )
+        react_pattern.seed_memory_input(self._memory_text(root_context))
         active_pattern_state = self.active_step_pattern_states.get(step.id)
         if active_pattern_state is not None:
             react_pattern.load_state(active_pattern_state)
@@ -1163,6 +1165,7 @@ class DAGPattern(AgentPattern):
             "active_step_contexts": dict(self.active_step_contexts),
             "step_results": dict(self.step_results),
             "planned_user_message_count": self.planned_user_message_count,
+            "memory_input_text": self.memory_input_text,
             "max_concurrency": self.max_concurrency,
             "completion_feedback": self.completion_feedback,
             "completion_replan_count": self.completion_replan_count,
@@ -1254,6 +1257,15 @@ class DAGPattern(AgentPattern):
         self.planned_user_message_count = int(
             state.get("planned_user_message_count", 0)
         )
+        stored_memory_input = state.get("memory_input_text")
+        if stored_memory_input:
+            self.memory_input_text = str(stored_memory_input)
+        elif self.memory_input_text is None:
+            for child_state in self.active_step_pattern_states.values():
+                child_memory_input = child_state.get("memory_input_text")
+                if child_memory_input:
+                    self.memory_input_text = str(child_memory_input)
+                    break
         self.max_concurrency = max(1, int(state.get("max_concurrency", 4)))
         feedback = state.get("completion_feedback")
         self.completion_feedback = str(feedback) if feedback else None
@@ -1262,6 +1274,16 @@ class DAGPattern(AgentPattern):
             0,
             int(state.get("max_completion_replans", self.max_completion_replans)),
         )
+
+    def _memory_text(self, context: Any) -> str:
+        if self.memory_input_text is None:
+            self.memory_input_text = context.current_user_request_text(
+                prefer_display=True,
+                user_message_limit=(
+                    self.planned_user_message_count if self.plan is not None else None
+                ),
+            )
+        return self.memory_input_text
 
     async def _fail(
         self,
@@ -1928,6 +1950,8 @@ class DAGPattern(AgentPattern):
         root_context: Any,
     ) -> None:
         """Refresh volatile routing metadata on a checkpoint-restored DAG step."""
+
+        hydrate_top_level_user_request(child_context, root_context)
 
         root_metadata = getattr(root_context, "metadata", {})
         preferred_modalities = normalize_input_modalities(

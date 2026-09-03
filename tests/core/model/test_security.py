@@ -282,11 +282,14 @@ def test_redact_sensitive_text_masks_bearer_and_header_keys() -> None:
     assert "my_api_key" not in redacted
 
 
-def test_redact_sensitive_text_masks_basic_auth() -> None:
-    text = "Authorization: Basic am9objpzZWNyZXQtcGFzcw=="
+def test_redact_sensitive_text_masks_basic_auth_credential() -> None:
+    text = "Authorization: Basic dXNlcjpzdXBlci1zZWNyZXQtdG9rZW4="
     redacted = redact_sensitive_text(text)
 
-    assert "am9objpzZWNyZXQtcGFzcw==" not in redacted
+    assert "dXNlcjpzdXBlci1zZWNyZXQtdG9rZW4=" not in redacted
+    # Not just "the secret is gone" -- confirm it was actually masked in
+    # place rather than the whole header being silently dropped.
+    assert "Authorization: Basic ***" in redacted
 
 
 def test_redact_sensitive_text_masks_assignment_style_secrets() -> None:

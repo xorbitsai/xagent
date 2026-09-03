@@ -14,6 +14,8 @@ from xagent.core.agent.context.memory_tool import (
     build_store_memory_tool,
 )
 from xagent.core.memory.core import MemoryNote, MemoryResponse
+from xagent.core.memory.lancedb import LanceDBMemoryStore
+from xagent.web.user_isolated_memory import UserIsolatedMemoryStore
 
 
 class RecordingMemoryStore:
@@ -277,6 +279,52 @@ async def test_search_memory_rejects_empty_query_and_emits_trace() -> None:
         "task_start_memory_retrieve",
         "task_end_memory_retrieve",
     ]
+    assert tracer.events[-1]["data"]["success"] is True
+
+
+@pytest.mark.asyncio
+async def test_search_memory_reports_backend_failure() -> None:
+    class BrokenSearchStore(CrudMemoryStore):
+        def search(self, **kwargs: Any) -> list[Any]:
+            raise RuntimeError("backend unavailable")
+
+    tracer = TraceEventRecorder()
+    tool = SearchMemoryTool(
+        memory_store=BrokenSearchStore(), runtime=FakeRuntime(tracer=tracer)
+    )
+
+    result = await tool.execute(query="preferences")
+
+    assert result == {"success": False, "error": "Failed to search memories."}
+    assert tracer.events[-1]["data"]["success"] is False
+    assert tracer.events[-1]["data"]["found"] is False
+
+
+@pytest.mark.asyncio
+async def test_search_memory_reports_terminal_lancedb_failure(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BrokenConnection:
+        def open_table(self, _: str) -> Any:
+            raise RuntimeError("memory table unavailable")
+
+    base_store = LanceDBMemoryStore(
+        db_dir=str(tmp_path),
+        collection_name="terminal_failure",
+    )
+    monkeypatch.setattr(
+        base_store._vector_store,
+        "get_raw_connection",
+        lambda: BrokenConnection(),
+    )
+    tool = SearchMemoryTool(
+        memory_store=UserIsolatedMemoryStore(base_store),
+    )
+
+    result = await tool.execute(query="preferences")
+
+    assert result == {"success": False, "error": "Failed to search memories."}
 
 
 @pytest.mark.asyncio

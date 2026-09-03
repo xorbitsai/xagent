@@ -12,7 +12,8 @@ import { useI18n } from "@/contexts/i18n-context"
 import { toast } from "@/components/ui/sonner"
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible"
 import { ChevronDown, ChevronRight, MessageSquare, Upload, File as FileIcon, X, Globe } from "lucide-react"
-import { ConnectAppsField } from "./connect-apps-field"
+import { ConnectAppsField, resolveRows } from "./connect-apps-field"
+import { useMcpApps, type McpApp } from "@/contexts/mcp-apps-context"
 import type { MessageDeliveryDisposition } from "@/hooks/use-websocket"
 import type { TranslationKey } from "@/i18n/translations"
 import {
@@ -123,6 +124,42 @@ const sendHintKey = (
 // switch below instead of falling through to its "unsupported type" case.
 const LIVE_WIDGET_TYPES = new Set(["connect_apps"])
 
+// requestId is undefined/"undefined" for a connect_apps card rendered from
+// the task_waiting_for_user path (resume-restore reassertion, historical
+// replay) rather than the live agent_message pause broadcast - reachable
+// not just on page load but on a live WebSocket reconnect mid-session too.
+// Falling back to the requested apps keeps the round-identity part of the
+// key stable across re-renders of the SAME occurrence (so an already-
+// answered card doesn't spuriously reset) while still changing - forcing
+// the real remount the requestId key exists for - whenever a genuinely
+// different set of apps is asked for. It cannot distinguish two rounds
+// asking for the exact same app twice in a row, which is the one case only
+// a real per-round id can cover.
+//
+// field/index are always appended, not just folded into the fallback: with
+// several simultaneously-paused connect_apps cards sharing the same live
+// requestId, returning requestId alone here would give every sibling card
+// in the isConnectAppsOnly map the SAME React key - React would warn and
+// could reuse/misattribute a DOM node and its local continued/skipped state
+// between two unrelated cards on re-render.
+//
+// An app entry can be a plain display-name string (the legacy shape) or an
+// object carrying the catalog's stable id alongside the name (see
+// Interaction.apps's own doc comment) - stringified here as id-or-name so
+// two different object entries never collapse to the same "[object Object]"
+// text under Array.prototype.join.
+const stringifyAppEntry = (entry: string | { id?: string; name?: string }): string =>
+  typeof entry === "string" ? entry : entry.id ?? entry.name ?? ""
+
+const connectAppsCardKey = (
+  requestId: string | undefined,
+  interaction: Interaction,
+  index: number,
+): string => {
+  const roundIdentity = requestId ?? `apps:${(interaction.apps ?? []).map(stringifyAppEntry).join(",")}`
+  return `${roundIdentity}-${interaction.field}-${index}`
+}
+
 export function ClarificationForm({
   interactions,
   messageId,
@@ -154,6 +191,23 @@ export function ClarificationForm({
   const isConnectAppsOnly =
     interactions.length > 0 && interactions.every((interaction) => LIVE_WIDGET_TYPES.has(interaction.type))
 
+  // requestId is undefined for the task_waiting_for_user broadcast path
+  // (resume-restore reassertion, historical replay) - unlike a live
+  // agent_message pause, it never carries one at all. Without a fallback,
+  // the requestId-keyed reset effect right below (which clears
+  // connectAppsAnswered for a new round - see that flag's own comment)
+  // would see "undefined === undefined" forever and never fire again after
+  // the first requestId-less round, permanently disabling every later one.
+  // Mirrors connectAppsCardKey's own fallback for the same reason, but
+  // covers the whole pause's requested apps, not one card's.
+  const connectAppsRoundSignal =
+    requestId ??
+    interactions
+      .filter((interaction) => interaction.type === "connect_apps")
+      .flatMap((interaction) => interaction.apps ?? [])
+      .map(stringifyAppEntry)
+      .join(",")
+
   const { t } = useI18n()
 
   // Ignore the persisted interaction.label for a live-widget type (it's only
@@ -170,8 +224,8 @@ export function ClarificationForm({
       : interaction.label || interaction.field
 
   const [formState, setFormState] = useState<Record<string, any>>({})
-  const previousRequestIdRef = useRef(requestId)
-  const latestRequestIdRef = useRef(requestId)
+  const previousRequestIdRef = useRef(connectAppsRoundSignal)
+  const latestRequestIdRef = useRef(connectAppsRoundSignal)
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [isSubmitted, setIsSubmitted] = useState(!active && !isConnectAppsOnly)
   const [isOpen, setIsOpen] = useState(active || isConnectAppsOnly)
@@ -184,17 +238,40 @@ export function ClarificationForm({
       errorCode: ClientErrorCode | null
     } | null
   >(null)
+  // Continue/Skip answer the WHOLE pause, but each ConnectAppsField card
+  // manages its own local `continued`/`skipped` state independently - with
+  // multiple simultaneously-paused cards (concurrent tool calls each naming
+  // a different unavailable app), clicking one card's button only hides
+  // that card's own button, leaving every sibling card's button still live.
+  // A second click on a sibling would fire a second answer for the same
+  // pause. This flag is a pause-level latch shared across every card: once
+  // any card's click succeeds, every card's onSkip/onContinue prop becomes
+  // undefined (see both render sites below), hiding every remaining button
+  // at once - rolled back on a failed send exactly like each card's own
+  // local optimistic state already rolls back, so a network failure doesn't
+  // strand the pause with no visible action anywhere. Declared here (not
+  // nearer its own handlers below) so the requestId-keyed reset effect right
+  // after can clear it for a genuinely new pause - the live-turn render path
+  // reuses this same component instance across rounds (see that effect's
+  // own comment), so without this a round-2 connect_apps pause would
+  // inherit round 1's answered state and never offer Skip/Continue at all.
+  const [connectAppsAnswered, setConnectAppsAnswered] = useState(false)
 
   useLayoutEffect(() => {
-    latestRequestIdRef.current = requestId
-    if (previousRequestIdRef.current === requestId) return
-    previousRequestIdRef.current = requestId
+    // connectAppsRoundSignal (not raw requestId) - see handleSubmit's
+    // matching comment on submittedRequestId for why: the two agree
+    // whenever requestId is present, and only diverge on the requestId-less
+    // path this ref exists to stay correct on too.
+    latestRequestIdRef.current = connectAppsRoundSignal
+    if (previousRequestIdRef.current === connectAppsRoundSignal) return
+    previousRequestIdRef.current = connectAppsRoundSignal
     setFormState({})
     setIsSubmitting(false)
     setIsSubmitted(!active && !isConnectAppsOnly)
     setIsOpen(active || isConnectAppsOnly)
     setSendFailure(null)
-  }, [active, isConnectAppsOnly, requestId])
+    setConnectAppsAnswered(false)
+  }, [active, isConnectAppsOnly, requestId, connectAppsRoundSignal])
 
   useEffect(() => {
     if (active) {
@@ -247,6 +324,49 @@ export function ClarificationForm({
     }) as Interaction[]
   }, [interactions])
 
+  // Multiple tools can pause together, each naming a different app, and
+  // each renders its own ConnectAppsField card (see the isConnectAppsOnly
+  // render branch below) - but Continue means "every requested app across
+  // this WHOLE pause is connected" (see handleContinueConnectApps's own
+  // doc comment), not just the apps on the one card the user happens to
+  // finish first. Without this global check, connecting the first card's
+  // app alone would let that card fire Continue while a sibling card's app
+  // is still unconnected, sending a premature/contradictory message.
+  // Called unconditionally on every render (React hooks can't be called only
+  // for connect_apps interactions), but McpAppsProvider isn't mounted on
+  // every surface this form renders on - public widget/share pages (see
+  // application-shell.tsx's isExternalRoutePath branch) only get
+  // AnonymousAuthProvider, so useMcpApps() would throw there for ANY
+  // interaction type, not just connect_apps. Same try/catch shape as
+  // useApp() above, for the same reason.
+  let mcpApps: McpApp[] = []
+  try {
+    mcpApps = useMcpApps().apps
+  } catch {
+    // Not inside a McpAppsProvider (e.g. a public widget/share page) -
+    // allConnectAppsConnected below naturally stays false with an empty
+    // list, which is correct: connect_apps cards aren't rendered on these
+    // provider-less surfaces anyway, since ConnectAppsField itself would
+    // throw the same way if it ever mounted there.
+  }
+  const allConnectAppsConnected = useMemo(() => {
+    if (!isConnectAppsOnly) return false
+    const allAppEntries = normalizedInteractions.flatMap((interaction) => interaction.apps ?? [])
+    if (allAppEntries.length === 0) return false
+    // resolveRows silently drops any requested app that doesn't resolve
+    // against the catalog at all (e.g. one hidden via
+    // is_visible_in_connector=false, which is exactly what a card's own
+    // noneMatched fallback surfaces) - checking only the rows it DID resolve
+    // would let this go true while that app can never actually be connected
+    // from here, firing Continue prematurely. hasUnresolvedApp comes from
+    // the same resolution pass (id-first, falling back to name-matching for
+    // the legacy plain-string shape) instead of a separate name-only scan,
+    // so it can't disagree with the rows resolveRows actually produced.
+    const { rows, hasUnresolvedApp } = resolveRows(allAppEntries, mcpApps)
+    if (hasUnresolvedApp) return false
+    return rows.length > 0 && rows.every((row) => row.app.is_connected)
+  }, [isConnectAppsOnly, normalizedInteractions, mcpApps])
+
   useEffect(() => {
     if (!filesDisabled) return
 
@@ -289,7 +409,14 @@ export function ClarificationForm({
   }
 
   const handleSubmit = async () => {
-    const submittedRequestId = requestId
+    // connectAppsRoundSignal, not raw requestId: when requestId is present
+    // the two are identical, but on the requestId-less task_waiting_for_user
+    // path this is what actually distinguishes "the round this submit
+    // belongs to" from a later one that arrives before this submit's promise
+    // settles - matching what the round-reset effect below compares against
+    // (previousRequestIdRef), so a late-resolving submit from a stale round
+    // can't collapse/mark-answered a newer round it raced.
+    const submittedRequestId = connectAppsRoundSignal
     // Construct the message
     const metadata: any = requestId ? { request_id: requestId } : {}
     const lines = normalizedInteractions.flatMap(interaction => {
@@ -443,6 +570,65 @@ export function ClarificationForm({
     } catch (error) {
       console.error("Failed to send connect-apps skip response", error)
       toast.error(t("chatPage.clarification.sendError"))
+      // Rethrow so the button's own click handler knows the send failed and
+      // can roll its optimistic "skipped" state back - without this, the
+      // caller has no way to tell success from failure and the button
+      // disappears even though the acknowledgement never actually went out.
+      throw error
+    }
+  }
+
+  // A distinct message from Skip's, sent once every requested app is
+  // connected. Functionally this is the same "acknowledgement becomes a
+  // chat message" mechanism as Skip - but the wording matters here beyond
+  // just what the user reads: when this card is paused mid-task (a tool
+  // itself returned waiting_for_user because a connector it needed was
+  // missing - see UnavailableMCPTool._run_unavailable), the task's own
+  // resume protocol only replans once a *new* message has been appended
+  // (ReActPattern._resume_waiting_for_user_if_needed compares message
+  // counts) - Skip's "I'll do this later" text would read as a non sequitur
+  // once every app the agent actually asked for is already connected.
+  const handleContinueConnectApps = async () => {
+    const message = t("chatPage.clarification.connectApps.continue")
+    // Matches handleSkipConnectApps's metadata exactly - no backend consumer
+    // reads request_id from this payload today, but nothing about a Continue
+    // click makes that correlation less relevant than a Skip's, and the two
+    // silently diverging here would be a trap for whichever one a future
+    // backend consumer gets wired up against first.
+    const metadata = requestId ? { request_id: requestId } : {}
+    try {
+      if (onSend) {
+        await onSend(message, [], metadata)
+      } else if (sendMessage) {
+        await sendMessage(message, { force: true, metadata }, [])
+      }
+    } catch (error) {
+      console.error("Failed to send connect-apps continue response", error)
+      toast.error(t("chatPage.clarification.sendError"))
+      // Rethrow - see handleSkipConnectApps's identical rethrow for why.
+      throw error
+    }
+  }
+
+  // connectAppsAnswered itself is declared earlier, alongside the other
+  // requestId-keyed state it's reset with - see its own doc comment there.
+  const handleSkipConnectAppsOnce = async () => {
+    setConnectAppsAnswered(true)
+    try {
+      await handleSkipConnectApps()
+    } catch (error) {
+      setConnectAppsAnswered(false)
+      throw error
+    }
+  }
+
+  const handleContinueConnectAppsOnce = async () => {
+    setConnectAppsAnswered(true)
+    try {
+      await handleContinueConnectApps()
+    } catch (error) {
+      setConnectAppsAnswered(false)
+      throw error
     }
   }
 
@@ -643,7 +829,38 @@ export function ClarificationForm({
       // today, see LIVE_WIDGET_TYPES's comment), so that path still gets the
       // real widget instead of falling to the "unsupported type" case below.
       case "connect_apps":
-        return <ConnectAppsField interaction={interaction} onSkip={handleSkipConnectApps} />
+        return (
+          // Both Skip and Continue send an ordinary chat message with the
+          // same resume/interrupt side effects on whatever the underlying
+          // task's current state is - gated on active (not just
+          // isConnectAppsOnly) so a historical/already-resolved connect_apps
+          // message can't mutate a task it no longer represents the live
+          // pause for. Hire-seed cards (active=false from their very first
+          // render) lose these two buttons but keep every per-row Connect
+          // action, which has no such side effect. Also gated on
+          // !connectAppsAnswered - see that flag's own doc comment for why
+          // (this branch is single-card today, but shares the same latch for
+          // consistency should a future change combine several here too).
+          // Keyed on requestId (not just interaction.field, which stays
+          // "connect_apps" across rounds) so a new pause round forces a real
+          // remount - the card's OWN local continued/skipped state (declared
+          // inside ConnectAppsField itself) would otherwise survive the
+          // reused live-turn instance exactly like connectAppsAnswered
+          // almost did, permanently disabling this button for every
+          // subsequent round. connectAppsCardKey's own comment covers the
+          // requestId-less fallback this needs for the task_waiting_for_user
+          // broadcast path, which never carries one.
+          <ConnectAppsField
+            key={connectAppsCardKey(requestId, interaction, 0)}
+            interaction={interaction}
+            onSkip={active && !connectAppsAnswered ? handleSkipConnectAppsOnce : undefined}
+            onContinue={
+              allConnectAppsConnected && active && !connectAppsAnswered
+                ? handleContinueConnectAppsOnce
+                : undefined
+            }
+          />
+        )
 
       default:
         return <div className="text-destructive text-sm">{t("chatPage.clarification.unsupportedType", { type: interaction.type })}</div>
@@ -689,10 +906,26 @@ export function ClarificationForm({
         {isConnectAppsOnly ? (
           <div className="space-y-4">
             {normalizedInteractions.map((interaction, index) => (
+              // See the mixed-list connect_apps case in renderField above
+              // for why both Skip and Continue are gated on active too, not
+              // just on isConnectAppsOnly/allConnectAppsConnected - and
+              // connectAppsAnswered's own doc comment for why every card here
+              // shares one latch: multiple concurrent tool-call pauses can
+              // land several cards in this exact map, each with its own
+              // independent local continued/skipped state, so answering one
+              // must hide every sibling's button too, not just its own.
+              // Also keyed on requestId - see the mixed-list case's own
+              // comment on why a new pause round must force a real remount,
+              // and connectAppsCardKey's for the requestId-less fallback.
               <ConnectAppsField
-                key={`${interaction.field}-${index}`}
+                key={connectAppsCardKey(requestId, interaction, index)}
                 interaction={interaction}
-                onSkip={handleSkipConnectApps}
+                onSkip={active && !connectAppsAnswered ? handleSkipConnectAppsOnce : undefined}
+                onContinue={
+                  allConnectAppsConnected && active && !connectAppsAnswered
+                    ? handleContinueConnectAppsOnce
+                    : undefined
+                }
               />
             ))}
           </div>

@@ -174,17 +174,24 @@ describe("ConnectAppsField", () => {
     expect(screen.getByText("G")).toBeInTheDocument();
   });
 
-  it("renders nothing if none of the requested app names resolve to a catalog entry", () => {
+  it("shows a Retry/Skip fallback, not an empty card, if none of the requested app names resolve to a catalog entry", () => {
+    // A dead-end card (nothing rendered at all) would leave a genuinely
+    // live pause with no Skip/Continue/error affordance once every
+    // requested name fails to resolve - see the noneMatched fallback below.
     mcpAppsMock.apps = [];
 
-    const { container } = render(
+    render(
       <ConnectAppsField
         interaction={{ ...LEO_INTERACTION, apps: ["Some Unknown App"] }}
         onSkip={vi.fn()}
       />
     );
 
-    expect(container).toBeEmptyDOMElement();
+    expect(
+      screen.getByText("chatPage.clarification.connectApps.noneMatched")
+    ).toBeInTheDocument();
+    expect(screen.getByText("chatPage.clarification.connectApps.retry")).toBeInTheDocument();
+    expect(screen.getByText("chatPage.clarification.connectApps.skip")).toBeInTheDocument();
   });
 
   it("resolves a requested name against an app's id, not just its display name", () => {
@@ -779,6 +786,31 @@ describe("ConnectAppsField", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("shows a Retry/Skip fallback, not a blank card, when the requested app is hidden from the connector catalog", () => {
+    // The backend can name an app the frontend catalog strong-hides (e.g. an
+    // is_visible_in_connector=False rollout gate on Intercom/Chrome) - the
+    // catalog fetch succeeds, but resolveRows can't match the requested name
+    // against it, so rows stays empty even though this is a genuinely live
+    // pause with nothing else to show.
+    mcpAppsMock.apps = [];
+    const onSkip = vi.fn();
+
+    render(
+      <ConnectAppsField
+        interaction={{ ...LEO_INTERACTION, apps: ["Intercom"] }}
+        onSkip={onSkip}
+      />
+    );
+
+    expect(
+      screen.getByText("chatPage.clarification.connectApps.noneMatched")
+    ).toBeInTheDocument();
+    expect(screen.getByText("chatPage.clarification.connectApps.retry")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByText("chatPage.clarification.connectApps.skip"));
+    expect(onSkip).toHaveBeenCalledTimes(1);
+  });
+
   it("calls onSkip once when the skip link is clicked, hides the link, and swaps the footer note", () => {
     mcpAppsMock.apps = [makeApp({ provider: "google" })];
     const onSkip = vi.fn();
@@ -801,6 +833,25 @@ describe("ConnectAppsField", () => {
     ).toBeInTheDocument();
   });
 
+  it("restores the Skip link when onSkip rejects, instead of leaving the card looking resolved", async () => {
+    mcpAppsMock.apps = [makeApp({ provider: "google" })];
+    const onSkip = vi.fn().mockRejectedValue(new Error("network error"));
+
+    render(
+      <ConnectAppsField interaction={{ ...LEO_INTERACTION, apps: ["Gmail"] }} onSkip={onSkip} />
+    );
+
+    fireEvent.click(screen.getByText("chatPage.clarification.connectApps.skip"));
+
+    await waitFor(() => {
+      expect(screen.getByText("chatPage.clarification.connectApps.skip")).toBeInTheDocument();
+    });
+    expect(
+      screen.queryByText("chatPage.clarification.connectApps.skippedNote")
+    ).not.toBeInTheDocument();
+    expect(onSkip).toHaveBeenCalledTimes(1);
+  });
+
   it("hides the Skip link and shows a completion note once every row is already Connected", () => {
     mcpAppsMock.apps = [makeApp({ provider: "google", is_connected: true })];
 
@@ -815,6 +866,75 @@ describe("ConnectAppsField", () => {
     expect(
       screen.queryByText('chatPage.clarification.connectApps.privacyNote:{"appName":"Xagent"}')
     ).not.toBeInTheDocument();
+  });
+
+  it("shows a Continue button instead of the completion note alone once every row is Connected, when onContinue is supplied", () => {
+    mcpAppsMock.apps = [makeApp({ provider: "google", is_connected: true })];
+    const onContinue = vi.fn();
+
+    render(
+      <ConnectAppsField
+        interaction={{ ...LEO_INTERACTION, apps: ["Gmail"] }}
+        onSkip={vi.fn()}
+        onContinue={onContinue}
+      />
+    );
+
+    expect(screen.queryByText("chatPage.clarification.connectApps.skip")).not.toBeInTheDocument();
+    expect(
+      screen.getByText("chatPage.clarification.connectApps.allConnectedNote")
+    ).toBeInTheDocument();
+    const continueButton = screen.getByRole("button", {
+      name: "chatPage.clarification.connectApps.continue",
+    });
+
+    fireEvent.click(continueButton);
+
+    expect(onContinue).toHaveBeenCalledTimes(1);
+    expect(
+      screen.queryByRole("button", { name: "chatPage.clarification.connectApps.continue" })
+    ).not.toBeInTheDocument();
+  });
+
+  it("restores the Continue button when onContinue rejects, instead of leaving the card looking resolved", async () => {
+    mcpAppsMock.apps = [makeApp({ provider: "google", is_connected: true })];
+    const onContinue = vi.fn().mockRejectedValue(new Error("network error"));
+
+    render(
+      <ConnectAppsField
+        interaction={{ ...LEO_INTERACTION, apps: ["Gmail"] }}
+        onSkip={vi.fn()}
+        onContinue={onContinue}
+      />
+    );
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "chatPage.clarification.connectApps.continue" })
+    );
+
+    await waitFor(() => {
+      expect(
+        screen.getByRole("button", { name: "chatPage.clarification.connectApps.continue" })
+      ).toBeInTheDocument();
+    });
+    expect(onContinue).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not show a Continue button while an app is still unconnected, even when onContinue is supplied", () => {
+    mcpAppsMock.apps = [makeApp({ provider: "google", is_connected: false })];
+
+    render(
+      <ConnectAppsField
+        interaction={{ ...LEO_INTERACTION, apps: ["Gmail"] }}
+        onSkip={vi.fn()}
+        onContinue={vi.fn()}
+      />
+    );
+
+    expect(
+      screen.queryByRole("button", { name: "chatPage.clarification.connectApps.continue" })
+    ).not.toBeInTheDocument();
+    expect(screen.getByText("chatPage.clarification.connectApps.skip")).toBeInTheDocument();
   });
 
   it("hides the Skip link once a refresh brings every row to Connected, even though it started out actionable", async () => {
@@ -843,6 +963,52 @@ describe("ConnectAppsField", () => {
     });
     expect(
       screen.getByText("chatPage.clarification.connectApps.allConnectedNote")
+    ).toBeInTheDocument();
+  });
+
+  it("does not offer Continue after Skip, even once a refresh brings every row to Connected", async () => {
+    // Skip doesn't disable the per-row Connect buttons, so a user can click
+    // Skip and then go connect the remaining app(s) anyway - without this,
+    // the footer would swap to Continue once allConnected flips true,
+    // letting the user send a second, contradictory message on top of the
+    // "I'll do this later" Skip already sent.
+    mcpAppsMock.apps = [
+      makeApp({ id: "hubspot", name: "HubSpot", provider: "hubspot", is_connected: false }),
+    ];
+    openBuiltinOAuthPopupMock.mockResolvedValue({ success: true });
+    const onSkip = vi.fn();
+    const onContinue = vi.fn();
+
+    render(
+      <ConnectAppsField
+        interaction={{ ...LEO_INTERACTION, apps: ["HubSpot"] }}
+        onSkip={onSkip}
+        onContinue={onContinue}
+      />
+    );
+
+    fireEvent.click(screen.getByText("chatPage.clarification.connectApps.skip"));
+    expect(onSkip).toHaveBeenCalledTimes(1);
+    expect(
+      screen.getByText("chatPage.clarification.connectApps.skippedNote")
+    ).toBeInTheDocument();
+
+    mcpAppsMock.refresh.mockImplementation(async () => {
+      mcpAppsMock.apps = [
+        makeApp({ id: "hubspot", name: "HubSpot", provider: "hubspot", is_connected: true }),
+      ];
+    });
+    fireEvent.click(continueButton("HubSpot"));
+
+    await waitFor(() => {
+      expect(mcpAppsMock.refresh).toHaveBeenCalled();
+    });
+    expect(
+      screen.queryByRole("button", { name: "chatPage.clarification.connectApps.continue" })
+    ).not.toBeInTheDocument();
+    expect(onContinue).not.toHaveBeenCalled();
+    expect(
+      screen.getByText("chatPage.clarification.connectApps.skippedNote")
     ).toBeInTheDocument();
   });
 });

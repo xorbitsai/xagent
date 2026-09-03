@@ -66,6 +66,7 @@ from ..models.database import (
 )
 from ..models.model import Model as DBModel
 from ..models.task import AgentType, Task, TaskStatus, TraceEvent
+from ..models.task_interaction import normalize_interaction_origin
 from ..models.user import User
 from ..models.user_channel import UserChannel
 from ..sandbox_keys import (
@@ -656,6 +657,7 @@ async def create_default_tools(
     file_operation_access_version: Any = None,
     agent_creator_user_id: Optional[int] = None,
     declared_knowledge_bases: Optional[List[str]] = None,
+    connect_apps_interactive: bool = False,
 ) -> tuple[list[Any], Any]:
     """Create default tools and tool_config for AgentService using ToolFactory.
 
@@ -759,6 +761,7 @@ async def create_default_tools(
         connector_team_id=connector_team_id,
         agent_creator_user_id=agent_creator_user_id,
         declared_knowledge_bases=declared_knowledge_bases,
+        connect_apps_interactive=connect_apps_interactive,
     )
 
     # Store excluded_agent_id in tool_config for agent tool filtering
@@ -820,6 +823,36 @@ def _task_runtime_context(
         source=str(source) if source is not None else None,
         session_factory=get_session_local(),
     )
+
+
+def _connect_apps_interactive_for_task(*, source: Any, channel_id: Any) -> bool:
+    """Whether this task's surface can render an interactive connect_apps pause.
+
+    Only web chat can: it is the only caller that both keeps the run pinned
+    to a live turn awaiting a reply and renders the ``connect_apps`` UI
+    (``ClarificationForm``) that answers it. ``source`` is ``None``/
+    ``"internal"`` for both web chat and IM-channel bot tasks (see
+    ``Task.source``'s own doc comment for the full vocabulary -- ``"sdk"``,
+    ``"a2a"``, ``"trigger"``, ``"widget"``, ``"shared_link"`` are the rest),
+    so ``channel_id`` (non-null only for the IM-bot case) is required to
+    tell them apart.
+
+    Reuses ``normalize_interaction_origin`` (the same source-vocabulary
+    normalizer ``gating_key`` in interaction_rollout.py is built on) instead
+    of re-deriving it, so at least the *vocabulary* can't drift between the
+    two. The compound condition below -- ``origin == "internal" and
+    channel_id is None`` -- is algebraically the same test ``gating_key(...)
+    == "internal"`` runs, but is re-derived here rather than calling
+    ``gating_key`` itself: that function answers a *different* question
+    (which interaction-rollout batch a task belongs to, a concern that is
+    allowed to evolve independently -- see its own module docstring) that
+    only happens to coincide with "is this web chat" today. Coupling this
+    gate to ``gating_key`` would risk the opposite failure -- a rollout-only
+    change silently changing which surfaces get an interactive pause.
+    """
+
+    origin = normalize_interaction_origin(source if source is None else str(source))
+    return origin == "internal" and channel_id is None
 
 
 def _task_runtime_context_for_tool_build(
@@ -2123,6 +2156,7 @@ class AgentServiceManager:
             prepare_root=workspace_binding.prepare_root,
         )
 
+        task_source = getattr(task, "source", None)
         return await create_default_tools(
             db,
             request=self.request,
@@ -2137,7 +2171,11 @@ class AgentServiceManager:
             task_runtime_context=_task_runtime_context_for_tool_build(
                 task_id=task_id,
                 user_id=int(task.user_id),
-                source=getattr(task, "source", None),
+                source=task_source,
+            ),
+            connect_apps_interactive=_connect_apps_interactive_for_task(
+                source=task_source,
+                channel_id=getattr(task, "channel_id", None),
             ),
             allowed_collections=agent_config["knowledge_bases"]
             if agent_config
@@ -2192,6 +2230,26 @@ class AgentServiceManager:
             ExecutionScope, None, ExecutionScopeNotProvided
         ] = EXECUTION_SCOPE_NOT_PROVIDED,
     ) -> AgentService:
+        """Fetch or build the cached ``AgentService`` for a task.
+
+        A cached instance's connector/MCP tool config can go stale between
+        calls (e.g. the user connects an app while the task was paused on a
+        ``connect_apps`` interaction). ``connector_runtime_turn_id`` is only
+        for a call site that owns a turn id genuinely tied to the execution
+        storing that turn's ephemeral connector secrets (e.g. a fresh
+        execution's own turn id) - passing a fabricated one to force a
+        rebuild corrupts that lookup for V1/SDK tasks (see
+        ``WebToolConfig.invalidate_connector_runtime_cache``'s docstring).
+
+        Any OTHER caller resuming a task that might have paused on
+        ``connect_apps`` - a resume command, an inbound message on a
+        channel, an A2A/v1 REST reply - must call
+        ``AgentServiceManager.refresh_connector_runtime_tools(task_id)``
+        itself right after this returns, instead of passing a turn id here.
+        Forgetting that call is the root cause fixed at every one of this
+        method's current resume call sites; there's no way for this method
+        to detect or enforce it on your behalf.
+        """
         lock = self._agent_build_locks.get(task_id)
         if lock is None:
             lock = asyncio.Lock()
@@ -2874,6 +2932,14 @@ class AgentServiceManager:
                     include_mcp_tools=actor_marked,
                 )
 
+                # ``task`` is the live ORM row when this path was reached
+                # without a snapshot; otherwise fall back to the snapshot's
+                # own frozen task fields. Bound once here (not inlined at
+                # each ``getattr`` below) so every field read below it can
+                # never diverge onto a different object.
+                task_for_fields = (
+                    task if task is not None else getattr(snapshot, "task", None)
+                )
                 tools = await create_default_tools(
                     db,
                     request=self.request,
@@ -2894,13 +2960,11 @@ class AgentServiceManager:
                     task_runtime_context=_task_runtime_context_for_tool_build(
                         task_id=task_id,
                         user_id=workspace_owner_id,
-                        source=getattr(
-                            task
-                            if task is not None
-                            else getattr(snapshot, "task", None),
-                            "source",
-                            None,
-                        ),
+                        source=getattr(task_for_fields, "source", None),
+                    ),
+                    connect_apps_interactive=_connect_apps_interactive_for_task(
+                        source=getattr(task_for_fields, "source", None),
+                        channel_id=getattr(task_for_fields, "channel_id", None),
                     ),
                     allowed_collections=agent_config["knowledge_bases"]
                     if agent_config
@@ -3112,10 +3176,12 @@ class AgentServiceManager:
             return
 
         tool_config = agent.tool_config
-        if tool_config is None:
+        if tool_config is None or not hasattr(
+            tool_config, "set_connector_runtime_turn_id"
+        ):
             logger.debug(
                 "Skipping connector runtime turn sync for task %s turn %s: "
-                "agent has no tool config",
+                "agent has no tool config supporting connector runtime turn sync",
                 task_id,
                 connector_runtime_turn_id,
             )
@@ -3134,6 +3200,35 @@ class AgentServiceManager:
                 task_id,
                 connector_runtime_turn_id,
             )
+
+    def refresh_connector_runtime_tools(self, task_id: int) -> None:
+        """Force a cached agent's connector runtime/MCP config to
+        re-resolve on next use (e.g. after the user connects an app while
+        the task was paused), without touching ``_connector_runtime_turn_id``.
+
+        Unlike ``get_agent_for_task``'s ``connector_runtime_turn_id`` kwarg
+        (which both busts this cache AND rebinds the turn id ephemeral
+        per-turn connector secrets are looked up under), this only busts
+        the cache. Callers that just need "connector state may have
+        changed, please rebuild" - not "this specific new turn now owns
+        the connector runtime" - must use this instead: passing a turn id
+        that isn't genuinely the one the task's own ephemeral secrets (if
+        any) were stored under can only ever mismatch that lookup, never
+        legitimately satisfy it (see websocket.py's message-resume and
+        explicit-resume handlers, which used to fabricate one for exactly
+        this purpose).
+        """
+
+        agent = self._agents.get(task_id)
+        if agent is None:
+            return
+        tool_config = agent.tool_config
+        if tool_config is None or not hasattr(
+            tool_config, "invalidate_connector_runtime_cache"
+        ):
+            return
+        tool_config.invalidate_connector_runtime_cache()
+        agent.invalidate_tools()
 
     def _sync_execution_scope(
         self, task_id: int, scope: Optional[ExecutionScope]

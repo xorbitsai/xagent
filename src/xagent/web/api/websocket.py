@@ -3123,10 +3123,20 @@ def _finalize_resumed_task(
     result: Dict[str, Any],
     task_lease: TaskLease,
     prepared_outputs: _PreparedTaskFileOutputs,
+    turn_id: str | None = None,
 ) -> dict[str, Any]:
-    """Persist one fenced resumed result in a single worker transaction."""
+    """Persist one fenced resumed result in a single worker transaction.
+
+    ``turn_id``, when given, pops that turn's ephemeral connector secrets
+    (see ``task_orchestrator.finish_turn``'s matching handling) once this
+    exact call has committed a genuine COMPLETED/FAILED transition - not
+    when the lease release below is fenced out and the whole transaction
+    rolls back, and not for the WAITING_FOR_USER/PAUSED branches, which are
+    the same turn resuming again later under this same turn_id.
+    """
     from ..models.agent import Agent
     from ..services.chat_history_service import persist_assistant_message_no_commit
+    from ..services.task_orchestrator import TERMINAL_TASK_STATUSES
 
     finalized: dict[str, Any] = {
         "task_title": None,
@@ -3263,6 +3273,18 @@ def _finalize_resumed_task(
         finalized["lease_released"] = True
         finalized["final_status"] = final_task_status.value
         finalized["control_event_state"] = control_snapshot.as_dict()
+        if turn_id is not None and final_task_status in TERMINAL_TASK_STATUSES:
+            try:
+                from ..services.connector_runtime import pop_ephemeral_runtime_values
+
+                pop_ephemeral_runtime_values(turn_id)
+            except Exception:
+                logger.warning(
+                    "connector runtime cleanup failed for task %s turn %s",
+                    task_id,
+                    turn_id,
+                    exc_info=True,
+                )
         return finalized
     finally:
         try:
@@ -3279,11 +3301,14 @@ def _settle_resumed_task_lease(
     lease: TaskLease,
     *,
     error_message: str | None,
+    turn_id: str | None = None,
 ) -> bool:
     """Delegate resume cleanup to the shared run/runner-fenced lifecycle."""
     from ..services.task_orchestrator import settle_task_lease_isolated
 
-    return settle_task_lease_isolated(lease, error_message=error_message)
+    return settle_task_lease_isolated(
+        lease, error_message=error_message, turn_id=turn_id
+    )
 
 
 async def execute_resume_background(
@@ -3318,6 +3343,22 @@ async def execute_resume_background(
     resume_owner_task = asyncio.current_task()
     if resume_owner_task is None:
         raise RuntimeError(f"Task {task_id} resume has no asyncio task")
+
+    # The turn id this task's ephemeral connector secrets (if any were ever
+    # stored) live under. A resume deliberately never rebinds this on the
+    # cached agent's tool_config (see WebToolConfig.invalidate_connector_
+    # runtime_cache's docstring), so it is still the original pausing
+    # turn's id here - exactly what a terminal settlement below must pop
+    # under to actually free those secrets.
+    connector_runtime_turn_id: str | None = None
+    _resume_tool_config = getattr(agent_service, "tool_config", None)
+    _turn_id_getter = getattr(
+        _resume_tool_config, "get_connector_runtime_turn_id", None
+    )
+    if callable(_turn_id_getter):
+        _candidate_turn_id = _turn_id_getter()
+        if isinstance(_candidate_turn_id, str):
+            connector_runtime_turn_id = _candidate_turn_id
 
     lease_stop_event = preacquired_heartbeat_stop
     lease_heartbeat_task = preacquired_heartbeat_task
@@ -3472,6 +3513,7 @@ async def execute_resume_background(
                 lambda acquired: _settle_resumed_task_lease(
                     acquired,
                     error_message="resume cancelled during lease acquisition",
+                    turn_id=connector_runtime_turn_id,
                 ),
             )
             if prior_status_box:
@@ -3772,6 +3814,7 @@ async def execute_resume_background(
                     result=result,
                     task_lease=lease,
                     prepared_outputs=outputs_for_finalizer,
+                    turn_id=connector_runtime_turn_id,
                 )
             )
         finally:
@@ -4145,11 +4188,20 @@ async def execute_resume_background(
                     and not lease_released
                     and not defer_db_cleanup_to_ttl_recovery
                 ):
+                    # When this IS deferred, _finalize_resumed_task's
+                    # turn_id-scoped pop never runs for this turn - and
+                    # cannot safely run here either, for the same reason as
+                    # task_orchestrator.py's matching branch: this coroutine
+                    # does not know whether the task will land on a terminal
+                    # status or resume again under this same turn_id.
+                    # connector_runtime.py's _EPHEMERAL_RUNTIME_TTL_SECONDS
+                    # bounds that leak instead.
                     try:
                         settled = await run_db_io_cancellation_safe(
                             lambda: _settle_resumed_task_lease(
                                 lease,
                                 error_message=settlement_error,
+                                turn_id=connector_runtime_turn_id,
                             )
                         )
                         if settled:
@@ -6579,6 +6631,29 @@ async def _handle_chat_message_unserialized(
                     task_owner_user_id=task_owner_user_id,
                     resolved_execution_scope=resolved_execution_scope,
                 )
+                # A cached AgentService whose tools were already built (e.g.
+                # paused waiting for the user to connect an app) would
+                # otherwise keep its stale MCP config forever - but this
+                # message's own `turn_id` (a client_message_id or a fresh
+                # uuid4) is not necessarily the turn id any ephemeral
+                # per-turn connector secrets this task uses were actually
+                # stored under (that's whatever a V1/SDK caller supplied at
+                # creation time, a completely different id scheme). Passing
+                # it as connector_runtime_turn_id above would rebind that
+                # lookup key and break it for any task using ephemeral
+                # secrets - refresh_connector_runtime_tools only busts the
+                # cache, leaving the real turn id (if any) untouched.
+                #
+                # Gated on task_status (this message's PRIOR status, read
+                # before this handler touched anything): an ordinary message
+                # to an already-RUNNING task has no reason to believe
+                # connector state changed, and a cached agent's tools are
+                # already warm - invalidating them here unconditionally
+                # forced a full MCP/OAuth rebuild (DB scans, per-server
+                # network handshakes) on every single message, not just a
+                # genuine resume from a connect_apps pause.
+                if task_status in {TaskStatus.PAUSED, TaskStatus.WAITING_FOR_USER}:
+                    get_agent_manager().refresh_connector_runtime_tools(task_id)
                 if hasattr(agent_service, "set_outbound_message_handler"):
                     agent_service.set_outbound_message_handler(
                         make_agent_outbound_handler(task_id)
@@ -9210,6 +9285,21 @@ async def _handle_resume_task_unserialized(
                     reason,
                     reason_code="not_resumable",
                 )
+            # No per-message turn id exists on this explicit-command resume
+            # path (unlike the new-user-message resume above), but a cached
+            # AgentService's tools still need the same nudge to rebuild
+            # against connector state that may have changed (e.g. the user
+            # connecting an app) since it paused. A fabricated uuid4 here
+            # would only ever mismatch whatever real turn id a task's own
+            # ephemeral connector secrets (if any) were stored under - see
+            # the sibling call's comment - so use
+            # refresh_connector_runtime_tools instead, which busts the
+            # cache without touching connector_runtime_turn_id. Placed
+            # after the resumability check above (not before) so a
+            # rejected resume request - task_status already confirmed
+            # PAUSED/WAITING_FOR_USER here - never pays for a wasted
+            # rebuild.
+            get_agent_manager().refresh_connector_runtime_tools(task_id)
             reservation = background_task_manager.try_reserve_resume(
                 task_id,
                 expected_run_id=task_fields.run_id,

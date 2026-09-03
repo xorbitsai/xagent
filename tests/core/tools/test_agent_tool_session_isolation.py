@@ -439,6 +439,50 @@ def test_classify_delegated_child_failure_passes_raw_placeholder_text():
     assert mod._classify_delegated_child_failure(result) is None
 
 
+def test_classify_delegated_child_failure_relays_the_childs_own_pause_message():
+    """A waiting child's own diagnostic (e.g. UnavailableMCPTool naming the
+    specific app needing reconnection) is the only actionable part of this
+    failure - without it the parent sees nothing more specific than "a
+    nested agent tried to ask something"."""
+
+    result = {
+        "status": "waiting_for_user",
+        "message": "I need access to Gmail to continue. Please connect it below.",
+    }
+
+    classified = mod._classify_delegated_child_failure(result)
+
+    assert classified is not None
+    assert classified["failure_code"] == "unsupported_nested_interaction"
+    assert "Gmail" in classified["error"]
+    assert "Gmail" in classified["output"]
+    assert "Gmail" in classified["response"]
+
+
+def test_classify_delegated_child_failure_caps_an_unbounded_pause_message():
+    """Capped the same as this module's other relayed text (output/error) -
+    an unbounded message from a misbehaving or malicious nested tool must
+    not flow uncapped into this failure's error/output/response text."""
+
+    result = {
+        "status": "waiting_for_user",
+        "message": "x" * (mod._DELEGATION_TRACE_TEXT_LIMIT + 500),
+    }
+
+    classified = mod._classify_delegated_child_failure(result)
+
+    assert classified is not None
+    # Exact equality, not just an upper-bound check - a bound alone can't
+    # tell "capped relay" apart from "no relay at all" (an empty relay is
+    # also <= the limit), so this pins both that the message is genuinely
+    # relayed AND that it's cut at exactly the limit, not merely under it.
+    assert classified["error"] == (
+        mod._NESTED_WAIT_UNSUPPORTED_MESSAGE
+        + " "
+        + "x" * mod._DELEGATION_TRACE_TEXT_LIMIT
+    )
+
+
 def test_agent_tool_result_declares_every_classified_failure_key():
     """The declared return contract covers the failure envelope.
 

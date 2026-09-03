@@ -22,6 +22,7 @@ const toastErrorMock = vi.hoisted(() => vi.fn())
 const mcpAppsMock = vi.hoisted(() => ({
   apps: [] as McpApp[],
   refresh: vi.fn(),
+  providerAvailable: true,
 }))
 
 vi.mock("@/contexts/app-context-chat", () => ({
@@ -59,7 +60,12 @@ vi.mock("@/components/ui/sonner", () => ({
 // Only exercised by connect_apps interactions (below); every other test in
 // this file never mounts ConnectAppsField, so these mocks are inert for them.
 vi.mock("@/contexts/mcp-apps-context", () => ({
-  useMcpApps: () => mcpAppsMock,
+  useMcpApps: () => {
+    if (!mcpAppsMock.providerAvailable) {
+      throw new Error("useMcpApps must be used within a McpAppsProvider")
+    }
+    return mcpAppsMock
+  },
 }))
 vi.mock("@/contexts/auth-context", () => ({
   useAuth: () => ({ token: "test-token" }),
@@ -71,6 +77,7 @@ import { ClarificationForm } from "./clarification-form"
 // swapped by one test cannot leak into a suite added below it.
 beforeEach(() => {
   i18nMock.translate = i18nMock.identity
+  mcpAppsMock.providerAvailable = true
 })
 
 describe("ClarificationForm Session file capability", () => {
@@ -260,6 +267,27 @@ describe("ClarificationForm Session file capability", () => {
   })
 })
 
+describe("ClarificationForm without a McpAppsProvider", () => {
+  it("renders an ordinary (non-connect_apps) interaction without crashing on a public widget/share page", () => {
+    // allConnectAppsConnected's useMcpApps() call is unconditional (React
+    // hooks can't be gated on interaction type), but McpAppsProvider isn't
+    // mounted on public widget/share pages (application-shell.tsx's
+    // isExternalRoutePath branch only wraps them in AnonymousAuthProvider) -
+    // useMcpApps() throwing there would crash ANY interaction rendered on
+    // those pages, not just connect_apps ones.
+    mcpAppsMock.providerAvailable = false
+
+    render(
+      <ClarificationForm
+        interactions={[{ type: "text_input", field: "note", label: "Note" }]}
+        onSend={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByText("Note:")).toBeInTheDocument()
+  })
+})
+
 describe("ClarificationForm connect_apps interaction", () => {
   const CONNECT_APPS_INTERACTION = {
     type: "connect_apps" as const,
@@ -315,6 +343,46 @@ describe("ClarificationForm connect_apps interaction", () => {
     ).toBeInTheDocument()
   })
 
+  it("does not offer Skip or Continue on an inactive (historical/already-resolved) connect_apps card, even once every app is connected", () => {
+    // Both Skip and Continue send an ordinary chat message with the same
+    // resume/interrupt side effects on whatever the underlying task's
+    // current state is - a card whose pause is no longer the live one
+    // (active=false, e.g. after a reload once the task has since resumed,
+    // completed, or is running something else) must not offer either, or
+    // clicking it can mutate an unrelated or already-finished task.
+    mcpAppsMock.apps = [
+      {
+        id: "gmail",
+        name: "Gmail",
+        description: "",
+        icon: "",
+        users: "",
+        transport: "builtin",
+        provider: "google",
+        category: "Communication",
+        is_connected: true,
+      },
+    ]
+
+    render(
+      <ClarificationForm
+        interactions={[CONNECT_APPS_INTERACTION]}
+        active={false}
+        onSend={vi.fn()}
+      />,
+    )
+
+    expect(
+      screen.queryByRole("button", { name: "chatPage.clarification.connectApps.continue" }),
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByText("chatPage.clarification.connectApps.skip"),
+    ).not.toBeInTheDocument()
+    // The per-row Connect action (no resume/interrupt side effect) stays
+    // available regardless - this is what keeps the Hire-seed flow working.
+    expect(screen.getByText("Gmail")).toBeInTheDocument()
+  })
+
   it("shows the live-translated connectApps title in the header instead of the generic 'Ask User' title, ignoring the persisted label", () => {
     // CONNECT_APPS_INTERACTION.label ("Connect your apps") stands in for the
     // DB-persisted, hire-time-translated string (see hire-agent.ts's
@@ -356,6 +424,24 @@ describe("ClarificationForm connect_apps interaction", () => {
     })
   })
 
+  it("re-shows the skip link when the send fails, instead of leaving the card looking resolved", async () => {
+    // handleSkipConnectApps must rethrow past the toast so the button's own
+    // click handler can roll its optimistic "skipped" state back - without
+    // the rethrow, a failed send would still hide the link with no way to
+    // retry.
+    const onSend = vi.fn().mockRejectedValue(new Error("network error"))
+    render(
+      <ClarificationForm interactions={[CONNECT_APPS_INTERACTION]} onSend={onSend} />,
+    )
+
+    fireEvent.click(screen.getByText("chatPage.clarification.connectApps.skip"))
+
+    await waitFor(() => {
+      expect(screen.getByText("chatPage.clarification.connectApps.skip")).toBeInTheDocument()
+    })
+    expect(onSend).toHaveBeenCalledTimes(1)
+  })
+
   it("binds a connect_apps skip to the rendered interaction request", async () => {
     render(
       <ClarificationForm
@@ -373,6 +459,77 @@ describe("ClarificationForm connect_apps interaction", () => {
           force: true,
           metadata: { request_id: "inputreq_0011223344556677889900aabbccddee" },
         },
+        [],
+      )
+    })
+  })
+
+  it("sends a Continue message once every requested app is connected", async () => {
+    // The mirror image of the "binds a skip" test above: every existing
+    // connect_apps test in this file only asserts Continue is ABSENT in
+    // various not-yet-connected scenarios - none actually drives it through
+    // to a real allConnectAppsConnected=true render and confirms clicking it
+    // sends the expected message via handleContinueConnectApps.
+    mcpAppsMock.apps = [
+      {
+        id: "gmail",
+        name: "Gmail",
+        description: "",
+        icon: "",
+        users: "",
+        transport: "builtin",
+        provider: "google",
+        category: "Communication",
+        is_connected: true,
+      },
+    ]
+
+    render(<ClarificationForm interactions={[CONNECT_APPS_INTERACTION]} />)
+
+    fireEvent.click(screen.getByRole("button", { name: "chatPage.clarification.connectApps.continue" }))
+
+    await waitFor(() => {
+      expect(appContextMock.sendMessage).toHaveBeenCalledWith(
+        "chatPage.clarification.connectApps.continue",
+        { force: true, metadata: {} },
+        [],
+      )
+    })
+  })
+
+  it("includes request_id in the Continue metadata, matching Skip", async () => {
+    // handleContinueConnectApps must carry the same request_id metadata
+    // handleSkipConnectApps already does - the two are otherwise the same
+    // "acknowledgement becomes a chat message" mechanism, and silently
+    // diverging here would be a trap for whichever gets read first by a
+    // future backend consumer.
+    mcpAppsMock.apps = [
+      {
+        id: "gmail",
+        name: "Gmail",
+        description: "",
+        icon: "",
+        users: "",
+        transport: "builtin",
+        provider: "google",
+        category: "Communication",
+        is_connected: true,
+      },
+    ]
+
+    render(
+      <ClarificationForm
+        interactions={[CONNECT_APPS_INTERACTION]}
+        requestId="inputreq_continue_metadata"
+      />,
+    )
+
+    fireEvent.click(screen.getByRole("button", { name: "chatPage.clarification.connectApps.continue" }))
+
+    await waitFor(() => {
+      expect(appContextMock.sendMessage).toHaveBeenCalledWith(
+        "chatPage.clarification.connectApps.continue",
+        { force: true, metadata: { request_id: "inputreq_continue_metadata" } },
         [],
       )
     })
@@ -405,6 +562,40 @@ describe("ClarificationForm connect_apps interaction", () => {
     ).not.toBeInTheDocument()
   })
 
+  it("never offers Continue on a connect_apps card mixed into a list with another interaction type, even when its app is connected", () => {
+    // isConnectAppsOnly is false for a mixed list, so allConnectAppsConnected
+    // is always false here (see its own guard) - Continue would let the user
+    // submit/resume the turn from this one card while the other interaction
+    // in the list (a real question needing an answer) was never gathered.
+    mcpAppsMock.apps = [
+      {
+        id: "gmail",
+        name: "Gmail",
+        description: "",
+        icon: "",
+        users: "",
+        transport: "builtin",
+        provider: "google",
+        category: "Communication",
+        is_connected: true,
+      },
+    ]
+
+    render(
+      <ClarificationForm
+        interactions={[
+          CONNECT_APPS_INTERACTION,
+          { type: "text_input", field: "note", label: "Note" },
+        ]}
+        onSend={vi.fn()}
+      />,
+    )
+
+    expect(
+      screen.queryByRole("button", { name: "chatPage.clarification.connectApps.continue" }),
+    ).not.toBeInTheDocument()
+  })
+
   it("resolves the connect_apps field label live in the mixed-list branch too, not the persisted hire-time label", () => {
     // The singleton isConnectAppsOnly header was fixed to call t() live, but
     // that branch is skipped entirely for a mixed list (isConnectAppsOnly is
@@ -426,6 +617,370 @@ describe("ClarificationForm connect_apps interaction", () => {
     expect(screen.queryByText(CONNECT_APPS_INTERACTION.label)).not.toBeInTheDocument()
     // An ordinary field's own persisted label is untouched by this.
     expect(screen.getByText("Note:")).toBeInTheDocument()
+  })
+
+  it("does not offer Continue on one card until every app across every simultaneously-paused card is connected", () => {
+    // Two different tools can pause together, each naming a different app -
+    // each renders its own ConnectAppsField, and Continue must mean "the
+    // whole pause is resolved," not just "this one card's own app is
+    // connected." Otherwise connecting Gmail alone would let the Gmail card
+    // fire a premature Continue while Salesforce is still unconnected.
+    mcpAppsMock.apps = [
+      {
+        id: "gmail",
+        name: "Gmail",
+        description: "",
+        icon: "",
+        users: "",
+        transport: "builtin",
+        provider: "google",
+        category: "Communication",
+        is_connected: true,
+      },
+      {
+        id: "salesforce",
+        name: "Salesforce",
+        description: "",
+        icon: "",
+        users: "",
+        transport: "builtin",
+        provider: "salesforce",
+        category: "Sales",
+        is_connected: false,
+      },
+    ]
+
+    render(
+      <ClarificationForm
+        interactions={[
+          CONNECT_APPS_INTERACTION,
+          { type: "connect_apps", field: "connect_apps", label: "Connect your apps", apps: ["Salesforce"] },
+        ]}
+        onSend={vi.fn()}
+      />,
+    )
+
+    expect(
+      screen.queryByRole("button", { name: "chatPage.clarification.connectApps.continue" }),
+    ).not.toBeInTheDocument()
+  })
+
+  it("gives simultaneously-paused cards distinct React keys even when they share a requestId", () => {
+    // connectAppsCardKey must not collapse to the bare requestId when one is
+    // present - with two cards from the same live pause round (same
+    // requestId), that would give every sibling card in this map the exact
+    // same React key, which React would warn about and could misattribute
+    // one card's DOM node/local state to another on re-render.
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
+    mcpAppsMock.apps = [
+      {
+        id: "gmail",
+        name: "Gmail",
+        description: "",
+        icon: "",
+        users: "",
+        transport: "builtin",
+        provider: "google",
+        category: "Communication",
+        is_connected: true,
+      },
+      {
+        id: "salesforce",
+        name: "Salesforce",
+        description: "",
+        icon: "",
+        users: "",
+        transport: "builtin",
+        provider: "salesforce",
+        category: "Sales",
+        is_connected: false,
+      },
+    ]
+
+    render(
+      <ClarificationForm
+        interactions={[
+          CONNECT_APPS_INTERACTION,
+          { type: "connect_apps", field: "connect_apps", label: "Connect your apps", apps: ["Salesforce"] },
+        ]}
+        requestId="shared-round-1"
+        onSend={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByText("Gmail")).toBeInTheDocument()
+    expect(screen.getByText("Salesforce")).toBeInTheDocument()
+    const duplicateKeyWarning = consoleErrorSpy.mock.calls.some((call) =>
+      typeof call[0] === "string" && call[0].includes("same key"),
+    )
+    expect(duplicateKeyWarning).toBe(false)
+    consoleErrorSpy.mockRestore()
+  })
+
+  it("hides every sibling card's Continue once one card's Continue is clicked", async () => {
+    // Each ConnectAppsField card owns its own local continued/skipped state,
+    // so with both apps connected (Continue visible on both cards),
+    // clicking one card's button used to leave the other card's identical
+    // button still live - a second click there would send a second,
+    // redundant answer for the same pause. connectAppsAnswered is a
+    // pause-level latch shared by every card precisely to prevent that.
+    mcpAppsMock.apps = [
+      {
+        id: "gmail",
+        name: "Gmail",
+        description: "",
+        icon: "",
+        users: "",
+        transport: "builtin",
+        provider: "google",
+        category: "Communication",
+        is_connected: true,
+      },
+      {
+        id: "salesforce",
+        name: "Salesforce",
+        description: "",
+        icon: "",
+        users: "",
+        transport: "builtin",
+        provider: "salesforce",
+        category: "Sales",
+        is_connected: true,
+      },
+    ]
+    const onSend = vi.fn().mockResolvedValue(undefined)
+
+    render(
+      <ClarificationForm
+        interactions={[
+          CONNECT_APPS_INTERACTION,
+          { type: "connect_apps", field: "connect_apps", label: "Connect your apps", apps: ["Salesforce"] },
+        ]}
+        onSend={onSend}
+      />,
+    )
+
+    const continueButtons = screen.getAllByRole("button", {
+      name: "chatPage.clarification.connectApps.continue",
+    })
+    expect(continueButtons).toHaveLength(2)
+
+    fireEvent.click(continueButtons[0])
+
+    await waitFor(() => {
+      expect(onSend).toHaveBeenCalledTimes(1)
+    })
+    expect(
+      screen.queryByRole("button", { name: "chatPage.clarification.connectApps.continue" }),
+    ).not.toBeInTheDocument()
+  })
+
+  it("hides every sibling card's Skip once one card's Skip is clicked", async () => {
+    // Mirror of the Continue test above, for the Skip path: with neither
+    // app connected yet (Skip visible on both cards, Continue on neither),
+    // clicking one card's Skip used to leave the other card's identical
+    // Skip link still live - a second click there would send a second,
+    // redundant skip acknowledgement for the same pause. connectAppsAnswered
+    // is a pause-level latch shared by every card precisely to prevent that.
+    mcpAppsMock.apps = [
+      {
+        id: "gmail",
+        name: "Gmail",
+        description: "",
+        icon: "",
+        users: "",
+        transport: "builtin",
+        provider: "google",
+        category: "Communication",
+        is_connected: false,
+      },
+      {
+        id: "salesforce",
+        name: "Salesforce",
+        description: "",
+        icon: "",
+        users: "",
+        transport: "builtin",
+        provider: "salesforce",
+        category: "Sales",
+        is_connected: false,
+      },
+    ]
+    const onSend = vi.fn().mockResolvedValue(undefined)
+
+    render(
+      <ClarificationForm
+        interactions={[
+          CONNECT_APPS_INTERACTION,
+          { type: "connect_apps", field: "connect_apps", label: "Connect your apps", apps: ["Salesforce"] },
+        ]}
+        onSend={onSend}
+      />,
+    )
+
+    const skipLinks = screen.getAllByText("chatPage.clarification.connectApps.skip")
+    expect(skipLinks).toHaveLength(2)
+
+    fireEvent.click(skipLinks[0])
+
+    await waitFor(() => {
+      expect(onSend).toHaveBeenCalledTimes(1)
+    })
+    expect(
+      screen.queryByText("chatPage.clarification.connectApps.skip"),
+    ).not.toBeInTheDocument()
+  })
+
+  it("offers Continue again for a new connect_apps pause after a prior round's Continue was answered", async () => {
+    // The live-turn render path reuses this same component instance across
+    // rounds (see the requestId-keyed reset effect's own comment) - without
+    // resetting connectAppsAnswered there too, answering round 1's pause
+    // would permanently disable Skip/Continue for every subsequent
+    // connect_apps pause on this same message, not just the one just
+    // answered.
+    mcpAppsMock.apps = [
+      {
+        id: "gmail",
+        name: "Gmail",
+        description: "",
+        icon: "",
+        users: "",
+        transport: "builtin",
+        provider: "google",
+        category: "Communication",
+        is_connected: true,
+      },
+    ]
+    const onSend = vi.fn().mockResolvedValue(undefined)
+    const { rerender } = render(
+      <ClarificationForm
+        interactions={[CONNECT_APPS_INTERACTION]}
+        requestId="round-1"
+        onSend={onSend}
+      />,
+    )
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "chatPage.clarification.connectApps.continue" }),
+    )
+    await waitFor(() => {
+      expect(onSend).toHaveBeenCalledTimes(1)
+    })
+    expect(
+      screen.queryByRole("button", { name: "chatPage.clarification.connectApps.continue" }),
+    ).not.toBeInTheDocument()
+
+    // A second, later connect_apps pause on the same reused instance - a
+    // new requestId is this component's own signal that the round changed.
+    rerender(
+      <ClarificationForm
+        interactions={[CONNECT_APPS_INTERACTION]}
+        requestId="round-2"
+        onSend={onSend}
+      />,
+    )
+
+    expect(
+      screen.getByRole("button", { name: "chatPage.clarification.connectApps.continue" }),
+    ).toBeInTheDocument()
+  })
+
+  it("offers Continue again for a new pause with no requestId, when the requested apps differ", async () => {
+    // Models the task_waiting_for_user broadcast path (resume-restore
+    // reassertion, historical replay), which never carries a request_id at
+    // all - unlike the live agent_message path the test above covers. The
+    // requestId-less fallback key must still change for a genuinely new
+    // round so this reused instance's local answered state doesn't survive
+    // it, exactly as with a real requestId.
+    mcpAppsMock.apps = [
+      {
+        id: "gmail",
+        name: "Gmail",
+        description: "",
+        icon: "",
+        users: "",
+        transport: "builtin",
+        provider: "google",
+        category: "Communication",
+        is_connected: true,
+      },
+      {
+        id: "slack",
+        name: "Slack",
+        description: "",
+        icon: "",
+        users: "",
+        transport: "builtin",
+        provider: "slack",
+        category: "Communication",
+        is_connected: true,
+      },
+    ]
+    const onSend = vi.fn().mockResolvedValue(undefined)
+    const { rerender } = render(
+      <ClarificationForm
+        interactions={[{ ...CONNECT_APPS_INTERACTION, apps: ["Gmail"] }]}
+        requestId={undefined}
+        onSend={onSend}
+      />,
+    )
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "chatPage.clarification.connectApps.continue" }),
+    )
+    await waitFor(() => {
+      expect(onSend).toHaveBeenCalledTimes(1)
+    })
+    expect(
+      screen.queryByRole("button", { name: "chatPage.clarification.connectApps.continue" }),
+    ).not.toBeInTheDocument()
+
+    rerender(
+      <ClarificationForm
+        interactions={[{ ...CONNECT_APPS_INTERACTION, apps: ["Slack"] }]}
+        requestId={undefined}
+        onSend={onSend}
+      />,
+    )
+
+    expect(
+      screen.getByRole("button", { name: "chatPage.clarification.connectApps.continue" }),
+    ).toBeInTheDocument()
+  })
+
+  it("does not offer Continue when a simultaneously-paused app is hidden from the connector catalog entirely", () => {
+    // resolveRows silently drops a requested app name that doesn't resolve
+    // to any catalog entry at all (e.g. one hidden via
+    // is_visible_in_connector=false) - that card is stuck on its own
+    // noneMatched fallback with no way to connect it, but Gmail's card must
+    // not treat "every app resolveRows kept" as "every app requested."
+    mcpAppsMock.apps = [
+      {
+        id: "gmail",
+        name: "Gmail",
+        description: "",
+        icon: "",
+        users: "",
+        transport: "builtin",
+        provider: "google",
+        category: "Communication",
+        is_connected: true,
+      },
+    ]
+
+    render(
+      <ClarificationForm
+        interactions={[
+          CONNECT_APPS_INTERACTION,
+          { type: "connect_apps", field: "connect_apps", label: "Connect your apps", apps: ["Hidden App"] },
+        ]}
+        onSend={vi.fn()}
+      />,
+    )
+
+    expect(
+      screen.queryByRole("button", { name: "chatPage.clarification.connectApps.continue" }),
+    ).not.toBeInTheDocument()
   })
 })
 

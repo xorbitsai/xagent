@@ -1669,8 +1669,23 @@ def _classify_delegated_child_failure(
     status = result.get("status")
 
     if tool_result_waits_for_user(result):
+        child_message = result.get("message")
+        # child_message itself is capped to _DELEGATION_TRACE_TEXT_LIMIT (the
+        # same bound output/error get below), not the combined relay text -
+        # a plain string, but an unbounded one from a misbehaving or
+        # malicious nested tool would otherwise flow uncapped into this
+        # failure's error/output/response text. Without relaying it at all,
+        # the parent (and the user) would see only this generic sentence
+        # with no indication of which app needs reconnecting - the only
+        # actionable part of the child's own diagnostic (e.g.
+        # UnavailableMCPTool naming the specific app).
+        detail = (
+            f" {child_message.strip()[:_DELEGATION_TRACE_TEXT_LIMIT]}"
+            if isinstance(child_message, str) and child_message.strip()
+            else ""
+        )
         return _classified_failure(
-            _NESTED_WAIT_UNSUPPORTED_MESSAGE,
+            _NESTED_WAIT_UNSUPPORTED_MESSAGE + detail,
             failure_code="unsupported_nested_interaction",
         )
 
@@ -1737,6 +1752,7 @@ class AgentTool(AbstractBaseTool):
         execution_scope: Optional[Any] = None,
         file_operation_access_version: Any = None,
         voice: Optional[str] = None,
+        connect_apps_interactive: bool = False,
     ):
         """
         Initialize an agent tool.
@@ -1773,6 +1789,11 @@ class AgentTool(AbstractBaseTool):
                 core.agent.voice_policy.apply_output_voice and
                 BaseToolConfig.get_voice), so a task's chosen voice reaches
                 every agent this user talks to, not just the top-level one.
+            connect_apps_interactive: Whether this delegated agent's own
+                tool set may pause with an interactive connect_apps card
+                (see WebToolConfig's docstring), inherited from the parent
+                config so a sub-agent can't independently open a pause its
+                caller wasn't allowed to.
         """
         self._agent_id = agent_id
         self._agent_name = agent_name
@@ -1806,6 +1827,7 @@ class AgentTool(AbstractBaseTool):
         self._runtime_metadata = dict(runtime_metadata or {})
         self._file_operation_access_version = file_operation_access_version
         self._voice = voice
+        self._connect_apps_interactive = bool(connect_apps_interactive)
         self._agent_call_stack = _normalize_agent_ids(agent_call_stack) or []
         if agent_id not in self._agent_call_stack:
             self._agent_call_stack.append(agent_id)
@@ -2253,6 +2275,7 @@ class AgentTool(AbstractBaseTool):
                 parent_tracer=self._parent_tracer,
                 agent_call_stack=self._agent_call_stack,
                 voice=self._voice,
+                connect_apps_interactive=self._connect_apps_interactive,
                 task_id=execution_task_id,
                 workspace_config={
                     "base_dir": self._workspace_base_dir,
@@ -2518,6 +2541,7 @@ def build_published_agent_tools_from_records(
     execution_scope: Optional[Any] = None,
     file_operation_access_version: Any = None,
     voice: Optional[str] = None,
+    connect_apps_interactive: bool = False,
 ) -> list[AbstractBaseTool]:
     """Construct AgentTool instances from ORM-free worker results."""
     if workspace_base_dir is None:
@@ -2606,6 +2630,7 @@ def build_published_agent_tools_from_records(
             execution_scope=execution_scope,
             file_operation_access_version=file_operation_access_version,
             voice=voice,
+            connect_apps_interactive=connect_apps_interactive,
         )
         tools.append(tool)
         logger.debug("Created agent tool: %s", tool.name)
@@ -2631,6 +2656,7 @@ def get_published_agents_tools(
     execution_scope: Optional[Any] = None,
     file_operation_access_version: Any = None,
     voice: Optional[str] = None,
+    connect_apps_interactive: bool = False,
 ) -> list[AbstractBaseTool]:
     """
     Get tools for published (and optionally draft) agents.
@@ -2693,6 +2719,7 @@ def get_published_agents_tools(
             execution_scope=execution_scope,
             file_operation_access_version=file_operation_access_version,
             voice=voice,
+            connect_apps_interactive=connect_apps_interactive,
         )
 
     except Exception as e:
@@ -2758,6 +2785,9 @@ async def create_agent_tools(config: "WebToolConfig") -> list[AbstractBaseTool]:
                 FILE_OPERATION_ACCESS_VERSION_KEY
             ),
             voice=config.get_voice(),
+            connect_apps_interactive=config.get_connect_apps_interactive()
+            if hasattr(config, "get_connect_apps_interactive")
+            else False,
         )
         records_getter = getattr(config, "get_published_agent_tool_records", None)
         records = records_getter() if callable(records_getter) else None

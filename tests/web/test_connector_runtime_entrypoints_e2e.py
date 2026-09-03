@@ -445,6 +445,9 @@ class _FakeAgentManager:
     ) -> _FakeAgentService:
         return self.service
 
+    def refresh_connector_runtime_tools(self, _task_id: int) -> None:
+        pass
+
     async def execute_task(self, **_kwargs: Any) -> dict[str, Any]:
         self.execute_calls.append(_kwargs)
         return dict(self.execution_result)

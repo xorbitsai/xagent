@@ -3375,6 +3375,66 @@ describe("AppProvider websocket message routing", () => {
     })
   })
 
+  it("falls back to the trace event's event_id when the backend sends no request_id", async () => {
+    // The live connect_apps/waiting_for_user pause broadcast (react.py's
+    // _pause_for_tool_results -> runtime.send_message ->
+    // make_agent_outbound_handler) never sends a request_id field - only
+    // event_id, a fresh uuid4 minted once per pause. This models that real
+    // shape (no request_id anywhere, event_id on the trace event's data),
+    // unlike the sibling tests above and below which inject an artificial
+    // request_id that production never actually sends for this path.
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("running")
+    })
+
+    act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:05Z",
+        task_id: 1,
+        data: {
+          event_id: "agent-fallback-1",
+          event_type: "agent_message",
+          data: {
+            message: "Connect Gmail to continue?",
+            content: "Connect Gmail to continue?",
+            role: "assistant",
+            expect_response: true,
+            event_id: "agent-fallback-1",
+          },
+        },
+      })
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("waiting-request-id").textContent).toBe(
+        "agent-fallback-1"
+      )
+      const rendered = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]",
+      ) as Array<{
+        role: string
+        content: string
+        interactionRequestId?: string
+      }>
+      const matchingAssistantMessages = rendered.filter(
+        (message) =>
+          message.role === "assistant" &&
+          message.content === "Connect Gmail to continue?",
+      )
+      expect(matchingAssistantMessages).toEqual([expect.objectContaining({
+        interactionRequestId: "agent-fallback-1",
+      })])
+    })
+  })
+
   const renderRunningTaskProbe = async () => {
     render(
       <AppProvider token="token">

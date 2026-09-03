@@ -1515,6 +1515,18 @@ class _UnavailableMCPToolResult(BaseModel):
         default=True,
         description="Whether the tool execution resulted in an error",
     )
+    message: str | None = Field(
+        default=None,
+        description="User-facing prompt for a waiting_for_user pause",
+    )
+    interactions: List[Dict[str, Any]] | None = Field(
+        default=None,
+        description=(
+            "Interactions to render for a waiting_for_user pause (e.g. a "
+            "connect_apps card) - untyped like every other interaction dict "
+            "in this codebase, not just this tool's own connect_apps shape"
+        ),
+    )
 
 
 class UnavailableMCPTool(AbstractBaseTool):
@@ -1532,6 +1544,8 @@ class UnavailableMCPTool(AbstractBaseTool):
         failure_code: str | None = None,
         reason: str | None = None,
         message: str = _DEFAULT_UNAVAILABLE_MCP_MESSAGE,
+        app_name: str | None = None,
+        app_id: str | None = None,
     ) -> None:
         from ....agent.result import normalize_tool_failure_code
         from .base import ToolCategory
@@ -1543,6 +1557,17 @@ class UnavailableMCPTool(AbstractBaseTool):
         self._failure_code = normalize_tool_failure_code(failure_code)
         self._reason = reason
         self._message = message
+        # The catalog app's own display name, when resolvable (see
+        # `_build_unavailable_mcp_config`'s `app_info` threading) - lets an
+        # OAuth-credential failure pause for the user to reconnect (see
+        # `_run_unavailable` below) with a `connect_apps` card naming the
+        # actual app, instead of only ever surfacing a raw error string.
+        self._app_name = app_name
+        # The catalog's stable id for `_app_name`, when resolvable - lets the
+        # `connect_apps` pause below name a specific catalog row instead of
+        # only a display name, which two visible apps can share (see
+        # `_build_unavailable_mcp_config`'s app_id threading).
+        self._app_id = app_id
         self._name = _format_unavailable_mcp_tool_name(server_name, server_id)
         self.source_server = normalize_mcp_server_name(server_name)
         self.category = ToolCategory.MCP
@@ -1579,9 +1604,50 @@ class UnavailableMCPTool(AbstractBaseTool):
         return None
 
     def _run_unavailable(self) -> Dict[str, Any]:
+        from ....agent.result import is_oauth_token_required_code
+
         current_user_id = _get_current_mcp_user_id()
         if not _is_mcp_user_allowed(current_user_id, self._allow_users):
             return _mcp_access_denied_result(current_user_id, self.name)
+
+        # An OAuth-credential failure for a catalog app we can name is
+        # actionable by the user right now, in-conversation - pause and ask
+        # them to (re)connect it instead of surfacing a raw error the agent
+        # can only relay. Every other failure (unknown app, non-OAuth
+        # transport issue, etc.) keeps the original error behavior: there is
+        # nothing a `connect_apps` card could offer for those.
+        if self._app_name and is_oauth_token_required_code(self._failure_code):
+            return {
+                "success": False,
+                "status": "waiting_for_user",
+                # Not an error - _UnavailableMCPToolResult.is_error defaults
+                # to True, which would otherwise mislabel this pause for any
+                # consumer that keys off is_error rather than status.
+                "is_error": False,
+                "message": (
+                    f"I need access to {self._app_name} to continue. "
+                    "Please connect it, then let me know once you have."
+                ),
+                "interactions": [
+                    {
+                        "type": "connect_apps",
+                        "field": "connect_apps",
+                        "label": "Connect your apps",
+                        # An object carries the catalog's stable id alongside
+                        # the display name so the frontend can resolve by id
+                        # first - falls back to a bare name string only when
+                        # no id was resolved (e.g. a resolver-failure path
+                        # with no app_info), matching the legacy shape older
+                        # persisted interactions/Hire-seeded cards still use.
+                        "apps": [
+                            {"id": self._app_id, "name": self._app_name}
+                            if self._app_id
+                            else self._app_name
+                        ],
+                    }
+                ],
+            }
+
         content_message = self._message
         if self._message == _DEFAULT_UNAVAILABLE_MCP_MESSAGE:
             content_message = (

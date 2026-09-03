@@ -336,10 +336,15 @@ export interface Interaction {
   default_value?: string | number | boolean | null;
   accept?: string[] | string;
   multiple?: boolean;
-  /** For "connect_apps": connector app display names (matched against
-   * useMcpApps()'s McpApp.name) to group by OAuth provider and render as
-   * connect cards - e.g. ["Gmail", "Google Calendar", "HubSpot"]. */
-  apps?: string[];
+  /** For "connect_apps": connector apps to group by OAuth provider and
+   * render as connect cards. A plain string is a display name only
+   * (matched against useMcpApps()'s McpApp.name) - the legacy shape, still
+   * used by Hire-seeded cards and older persisted interactions. An object
+   * additionally carries the catalog's stable id (McpApp.id), which
+   * resolveRows in connect-apps-field.tsx prefers over name-matching,
+   * since two visible apps can share a display name but never an id -
+   * e.g. [{ id: "gmail", name: "Gmail" }, "HubSpot"]. */
+  apps?: Array<string | { id?: string; name?: string }>;
 }
 import {
   useWebSocket,
@@ -601,7 +606,20 @@ export const normalizeInteractions = (value: unknown): Interaction[] => {
       if (Array.isArray(item.accept) || typeof item.accept === "string") normalized.accept = item.accept
       if (typeof item.multiple === "boolean") normalized.multiple = item.multiple
       if (Array.isArray(item.apps)) {
-        normalized.apps = item.apps.filter((app: unknown): app is string => typeof app === "string")
+        // A plain string is the legacy display-name-only shape; an object
+        // additionally carries the catalog's stable id (see Interaction.apps's
+        // own doc comment) - _build_unavailable_mcp_config now sends that
+        // shape whenever it resolved one, so dropping non-string entries here
+        // would silently empty out every live connect_apps pause's apps list.
+        normalized.apps = item.apps.filter(
+          (app: unknown): app is string | { id?: string; name?: string } =>
+            typeof app === "string" ||
+            (!!app &&
+              typeof app === "object" &&
+              !Array.isArray(app) &&
+              (typeof (app as { id?: unknown }).id === "string" ||
+                typeof (app as { name?: unknown }).name === "string"))
+        )
       }
 
       return normalized
@@ -3065,9 +3083,21 @@ export function AppProvider({
               return
             }
             const interactions = normalizeInteractions(eventData.metadata?.interactions)
+            // request_id is never actually populated by the backend for this
+            // event type - make_agent_outbound_handler (websocket.py) only
+            // ever sets event_id, a fresh uuid4 minted once per
+            // _pause_for_tool_results call (react.py), which is exactly the
+            // same per-pause-round identity this component needs. Preferring
+            // request_id first costs nothing if some future caller does send
+            // it, but falling back to event_id is what makes this field
+            // non-empty at all for a connect_apps (or any tool-originated)
+            // pause today - without it, every requestId-keyed reset/remount
+            // downstream (ClarificationForm) silently never fires.
             const interactionRequestId = typeof eventData.request_id === "string"
               ? eventData.request_id
-              : undefined
+              : typeof eventData.event_id === "string"
+                ? eventData.event_id
+                : undefined
             const isAgentMessage = eventType === "agent_message"
             const isAiMessage = eventType === "ai_message"
             const expectsUserResponse =

@@ -2955,6 +2955,31 @@ def test_connector_runtime_turn_switch_invalidates_runtime_caches():
     assert cfg._cached_mcp_configs is None
 
 
+def test_invalidate_connector_runtime_cache_drops_caches_without_touching_turn_id():
+    cfg = WebToolConfig(
+        db=None,
+        request=None,
+        connector_runtime_turn_id="turn-1",
+    )
+    cfg._connector_runtime_view = {"custom_api:1": {"secrets": {"token": "old"}}}
+    cfg._cached_mcp_configs = [{"id": 1, "connector_runtime": {"context": {}}}]
+    cfg._factory_runtime_snapshot = object()
+    cfg._pending_runtime_policy = object()
+
+    cfg.invalidate_connector_runtime_cache()
+
+    # Unlike set_connector_runtime_turn_id, this must never touch the turn
+    # id: it's what ephemeral per-turn connector secrets are looked up
+    # under, and a caller here (e.g. a websocket resume) has no real turn
+    # id of its own that's safe to substitute in - see the sibling
+    # AgentManager.refresh_connector_runtime_tools caller.
+    assert cfg._connector_runtime_turn_id == "turn-1"
+    assert cfg._connector_runtime_view is None
+    assert cfg._cached_mcp_configs is None
+    assert cfg._factory_runtime_snapshot is None
+    assert cfg._pending_runtime_policy is None
+
+
 @dataclass(frozen=True, eq=False)
 class _ScopeWithTurnPayload(ExecutionScope):
     """Scope subclass carrying turn-only data outside the namespace fields.

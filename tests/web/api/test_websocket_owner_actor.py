@@ -34,6 +34,7 @@ from xagent.core.agent.runner import UserMessageInjectionOutcome
 from xagent.core.execution_scope import (
     ExecutionScope,
 )
+from xagent.core.tools.adapters.vibe.connector_runtime import ConnectorRef
 from xagent.web.api import websocket as websocket_api
 from xagent.web.api.websocket import (
     ResumeReservationOutcome,
@@ -60,6 +61,11 @@ from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 from xagent.web.services import task_orchestrator
 from xagent.web.services.chat_history_service import DELIVERY_FAILED, DELIVERY_PENDING
+from xagent.web.services.connector_runtime import (
+    get_ephemeral_runtime_values,
+    pop_ephemeral_runtime_values,
+    store_ephemeral_runtime_values,
+)
 from xagent.web.services.managed_file_ref import (
     DurableObjectIntegrityError,
     DurableStorageOperationError,
@@ -2533,6 +2539,131 @@ async def test_message_handoff_registers_the_minted_run_not_the_stale_one(
 
 
 @pytest.mark.asyncio
+async def test_resuming_a_waiting_for_user_task_refreshes_connector_runtime_tools(
+    db_session,
+) -> None:
+    """A message that resumes a task genuinely paused on waiting_for_user
+    (e.g. answering a connect_apps card) must still bust the cached agent's
+    connector-runtime tools, unlike an ordinary continuing message - see the
+    RUNNING counterpart test below."""
+
+    owner = _user(db_session, "connector-refresh-waiting-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.WAITING_FOR_USER)
+    task.control_state = "waiting_for_user"
+    db_session.commit()
+
+    agent = MagicMock()
+    agent.supports_live_control.return_value = True
+    agent.get_dag_pattern.return_value = None
+    # Deferred (not injected) so this exercises the same handoff-to-resume
+    # path as test_message_handoff_registers_the_minted_run_not_the_stale_one
+    # above, without depending on that test's own run-id specifics.
+    agent.post_user_message = AsyncMock(return_value=False)
+    agent_manager = MagicMock(get_agent_for_task=AsyncMock(return_value=agent))
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+    bg_mgr = MagicMock()
+    bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
+    bg_mgr.running_tasks.get.return_value = None
+    registered_handles: list[asyncio.Task] = []
+
+    def register_resume(
+        _task_id: int,
+        task_handle: asyncio.Task,
+        *,
+        run_id: str | None = None,
+    ) -> None:
+        registered_handles.append(task_handle)
+
+    async def resume_forever(*_args, **_kwargs) -> None:
+        await asyncio.Event().wait()
+
+    bg_mgr.register_reserved_resume.side_effect = register_resume
+    with (
+        patch(
+            "xagent.web.api.chat.get_agent_manager",
+            return_value=agent_manager,
+        ),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
+        patch(
+            "xagent.web.api.websocket.execute_resume_background",
+            side_effect=resume_forever,
+        ),
+    ):
+        await _handle_chat_message_unserialized(
+            MagicMock(),
+            int(task.id),
+            {
+                "message": "I connected the app",
+                "client_message_id": "connector-refresh-waiting-turn",
+                "user": owner,
+                "files": [],
+            },
+        )
+        for handle in registered_handles:
+            handle.cancel()
+        await asyncio.gather(*registered_handles, return_exceptions=True)
+
+    agent_manager.refresh_connector_runtime_tools.assert_called_once_with(int(task.id))
+
+
+@pytest.mark.asyncio
+async def test_ordinary_running_message_does_not_refresh_connector_runtime_tools(
+    db_session,
+) -> None:
+    """An ordinary continuing message to an already-RUNNING task has no
+    reason to believe connector state changed - forcing a full MCP/OAuth
+    tool rebuild on every single message, not just a genuine connect_apps
+    resume, was a real latency/capacity regression (see the WAITING_FOR_USER
+    counterpart test above)."""
+
+    owner = _user(db_session, "connector-refresh-running-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
+    task.runner_id = "connector-refresh-running-runner"
+    task.run_id = "connector-refresh-running-run"
+    db_session.commit()
+
+    agent = MagicMock()
+    agent.supports_live_control.return_value = True
+    agent.get_dag_pattern.return_value = None
+    agent.post_user_message = AsyncMock(
+        return_value=UserMessageInjectionOutcome.POSTED_FRESH
+    )
+    agent_manager = MagicMock(get_agent_for_task=AsyncMock(return_value=agent))
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+    bg_mgr = MagicMock()
+    bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
+    bg_mgr.running_tasks.get.return_value = None
+
+    with (
+        patch(
+            "xagent.web.api.chat.get_agent_manager",
+            return_value=agent_manager,
+        ),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
+    ):
+        await _handle_chat_message_unserialized(
+            MagicMock(),
+            int(task.id),
+            {
+                "message": "just an ordinary follow-up",
+                "client_message_id": "connector-refresh-running-turn",
+                "user": owner,
+                "files": [],
+            },
+        )
+
+    agent_manager.refresh_connector_runtime_tools.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_live_marker_cancellation_does_not_cancel_registered_handoff(
     db_session,
 ) -> None:
@@ -3743,6 +3874,95 @@ async def test_execute_resume_background_persists_assistant_for_live_turn(
     db_session.refresh(task)
     assert task.status == TaskStatus.COMPLETED
     assert task.output == "Guidance applied"
+
+
+@pytest.mark.asyncio
+async def test_execute_resume_background_pops_ephemeral_secrets_after_completion(
+    db_session,
+) -> None:
+    """execute_resume_background settles through its own _finalize_resumed_task,
+    a completely separate finalizer from task_orchestrator.finish_turn - it had
+    no ephemeral-secrets handling at all, so a turn that paused for a
+    connect_apps interaction and then genuinely completes on resume would
+    leak that turn's secrets forever (no TTL/reaper exists for them)."""
+    owner = _user(db_session, "owner")
+    task = _task(db_session, owner.id, status=TaskStatus.WAITING_FOR_USER)
+    turn_id = "resume-secrets-turn-completes"
+    store_ephemeral_runtime_values(
+        turn_id,
+        {ConnectorRef("mcp", 1): {"secrets": {"authorization": "Bearer resume-token"}}},
+    )
+    assert get_ephemeral_runtime_values(turn_id) is not None
+
+    tool_config = MagicMock()
+    tool_config.get_connector_runtime_turn_id.return_value = turn_id
+    agent = MagicMock(tool_config=tool_config)
+    agent.resume_execution_by_id = AsyncMock(
+        return_value={
+            "status": "completed",
+            "success": True,
+            "output": "done",
+            "agent_result": {},
+        }
+    )
+    ws_manager = MagicMock(broadcast_to_task=AsyncMock())
+
+    with patch("xagent.web.api.websocket.manager", ws_manager):
+        _register_current_resume(int(task.id))
+        await execute_resume_background(
+            task_id=int(task.id),
+            agent_service=agent,
+            task_owner_user_id=int(owner.id),
+        )
+
+    db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    assert get_ephemeral_runtime_values(turn_id) is None
+    assert pop_ephemeral_runtime_values(turn_id) is None
+
+
+@pytest.mark.asyncio
+async def test_execute_resume_background_keeps_ephemeral_secrets_when_resume_pauses_again(
+    db_session,
+) -> None:
+    """A resume that itself pauses again (e.g. a second connect_apps
+    interaction) is the same turn continuing under the same turn_id, not a
+    finished one - popping here would strand that next resume with nothing
+    to look up its own secrets under."""
+    owner = _user(db_session, "owner")
+    task = _task(db_session, owner.id, status=TaskStatus.WAITING_FOR_USER)
+    turn_id = "resume-secrets-turn-repauses"
+    store_ephemeral_runtime_values(
+        turn_id,
+        {ConnectorRef("mcp", 1): {"secrets": {"authorization": "Bearer resume-token"}}},
+    )
+    assert get_ephemeral_runtime_values(turn_id) is not None
+
+    tool_config = MagicMock()
+    tool_config.get_connector_runtime_turn_id.return_value = turn_id
+    agent = MagicMock(tool_config=tool_config)
+    agent.resume_execution_by_id = AsyncMock(
+        return_value={
+            "status": "waiting_for_user",
+            "success": False,
+            "output": "Please connect another app.",
+            "agent_result": {},
+        }
+    )
+    ws_manager = MagicMock(broadcast_to_task=AsyncMock())
+
+    with patch("xagent.web.api.websocket.manager", ws_manager):
+        _register_current_resume(int(task.id))
+        await execute_resume_background(
+            task_id=int(task.id),
+            agent_service=agent,
+            task_owner_user_id=int(owner.id),
+        )
+
+    db_session.refresh(task)
+    assert task.status == TaskStatus.WAITING_FOR_USER
+    assert get_ephemeral_runtime_values(turn_id) is not None
+    assert pop_ephemeral_runtime_values(turn_id) is not None
 
 
 @pytest.mark.asyncio

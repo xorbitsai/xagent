@@ -165,7 +165,16 @@ def _assert_unavailable_runtime_config(
     assert config["config"]["reason"] == diagnostic["code"]
     assert config["config"]["server_id"] == server.id
     assert config["config"]["diagnostic"] == diagnostic
-    assert config["config"]["failure_code"] == "oauth_token_required"
+    if diagnostic["code"] == "authorization_required":
+        assert config["config"]["failure_code"] == "oauth_token_required"
+    else:
+        # insufficient_scope and token_refresh_failed mean a grant already
+        # exists and the failure is transient/narrower than a missing grant -
+        # pausing with a connect_apps card for those would show a false
+        # "Connected" badge and a Continue that loops forever, so
+        # failure_code is omitted entirely rather than set, and
+        # _run_unavailable takes the plain error path instead of pausing.
+        assert "failure_code" not in config["config"]
     assert config["user_id"] == str(server.user_mcpservers[0].user_id)
     assert config["allow_users"] == [str(server.user_mcpservers[0].user_id)]
     assert "runtime_input_schema" not in config

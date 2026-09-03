@@ -16,7 +16,7 @@ import { capitalize } from "@/lib/tool-category-labels";
 import { findMatchingMcpApp } from "@/lib/mcp-lookup";
 import { ApiKeyConnectDialog, CONNECT_TIMEOUT_MS, handleIconLoadError } from "./api-key-connect-dialog";
 
-// The 11 builtin-OAuth providers (see src/xagent/web/builtin_mcp_registry.py's
+// The 13 builtin-OAuth providers (see src/xagent/web/builtin_mcp_registry.py's
 // get_builtin_oauth_provider_rows) - brand names, left untranslated in both
 // locales like every other connector name in the app. Falling back to
 // capitalize() below still runs for any provider missing here, but gets the
@@ -34,6 +34,8 @@ export const PROVIDER_DISPLAY_NAMES: Record<string, string> = {
   github: "GitHub",
   linear: "Linear",
   jira: "Jira",
+  salesforce: "Salesforce",
+  deputy: "Deputy",
 };
 
 // connectingKeys/connectingKeysRef below hold both of these kinds of key in
@@ -83,9 +85,12 @@ type ConnectAppsRow =
  * catalog entry at all is silently dropped - nothing this card could do
  * about it either way.
  */
-function resolveRows(appNames: string[] | undefined, allApps: McpApp[]): ConnectAppsRow[] {
-  const wanted = appNames || [];
-  if (wanted.length === 0) return [];
+export function resolveRows(
+  appEntries: Array<string | { id?: string; name?: string }> | undefined,
+  allApps: McpApp[],
+): { rows: ConnectAppsRow[]; hasUnresolvedApp: boolean } {
+  const wanted = appEntries || [];
+  if (wanted.length === 0) return { rows: [], hasUnresolvedApp: false };
 
   // findMatchingMcpApp (lib/mcp-lookup.ts) matches by name OR id, tolerating
   // a hyphen-for-space variant either way - the same lenient matching
@@ -95,9 +100,31 @@ function resolveRows(appNames: string[] | undefined, allApps: McpApp[]): Connect
   // its connection by app_id (e.g. "facebook-pages") instead of display name.
   const seen = new Set<string>();
   const resolved: McpApp[] = [];
-  for (const name of wanted) {
-    const app = findMatchingMcpApp(allApps, name);
-    if (!app || seen.has(app.id)) continue;
+  let hasUnresolvedApp = false;
+  for (const entry of wanted) {
+    const entryId = typeof entry === "string" ? undefined : entry.id;
+    const entryName = typeof entry === "string" ? entry : entry.name;
+    // An id resolves to exactly one catalog row, unlike a display name - two
+    // visible apps can share a name (custom connector names carry no
+    // uniqueness constraint), so once an id was sent it must stay
+    // authoritative even if it no longer resolves (the app was deleted or
+    // hidden from the catalog since the pause was created) - falling back to
+    // a name match there could silently resolve to a DIFFERENT app that
+    // happens to share the deleted one's old name, and every downstream
+    // action (Connected badge, OAuth/API-key connect, Continue) would then
+    // target that unrelated app instead of leaving the pause unresolved. The
+    // fuzzy name lookup is only for the legacy plain-string shape, which
+    // never carried an id to begin with.
+    const app = entryId
+      ? allApps.find((candidate) => candidate.id === entryId)
+      : entryName
+        ? findMatchingMcpApp(allApps, entryName)
+        : undefined;
+    if (!app) {
+      hasUnresolvedApp = true;
+      continue;
+    }
+    if (seen.has(app.id)) continue;
     seen.add(app.id);
     resolved.push(app);
   }
@@ -124,11 +151,12 @@ function resolveRows(appNames: string[] | undefined, allApps: McpApp[]): Connect
     group.apps.push(app);
   }
 
-  return resolved.map((app): ConnectAppsRow => {
+  const rows = resolved.map((app): ConnectAppsRow => {
     if (app.auth_type === "mcp_oauth") return { kind: "mcp_oauth", app };
     if (isOAuthApp(app)) return { kind: "oauth", app, group: groupsByProvider.get(app.provider)! };
     return { kind: "manual", app };
   });
+  return { rows, hasUnresolvedApp };
 }
 
 function RowIcon({
@@ -180,9 +208,28 @@ function ConnectedBadge({ label }: { label: string }) {
 export function ConnectAppsField({
   interaction,
   onSkip,
+  onContinue,
 }: {
   interaction: Interaction;
-  onSkip: () => void;
+  /** Optional (and omitted) when this card isn't the live, active pause -
+   * see onContinue's own doc comment. Skip sends an ordinary chat message
+   * just like Continue does, with the exact same resume/interrupt side
+   * effects on whatever task state exists when it's received - so a stale
+   * historical card must not offer it either. */
+  onSkip?: () => Promise<void> | void;
+  /** Called once every requested app is connected, in place of onSkip -
+   * distinct so the message it sends can say "connected" rather than
+   * "I'll do this later" (see clarification-form.tsx's
+   * handleContinueConnectApps). Optional: an older/mixed-list caller that
+   * doesn't pass it at all just keeps the allConnectedNote-only footer this
+   * card had before, rather than crashing - but the caller this card
+   * actually has today (clarification-form.tsx's isConnectAppsOnly branch)
+   * DOES always pass this prop type, and instead passes `undefined` as the
+   * *value* while every requested app across the whole pause isn't
+   * connected yet (see allConnectAppsConnected there), or while this card
+   * isn't the live, active pause (see onSkip's own doc comment) - so a
+   * `false`-y value here just as often means "not yet," not "never will." */
+  onContinue?: () => Promise<void> | void;
 }) {
   const { apps, refresh, isLoading, error } = useMcpApps();
   const { token } = useAuth();
@@ -195,6 +242,7 @@ export function ConnectAppsField({
   // app id for an "mcp_oauth" row (no such sharing exists there).
   const [connectingKeys, setConnectingKeys] = useState<Set<string>>(new Set());
   const [skipped, setSkipped] = useState(false);
+  const [continued, setContinued] = useState(false);
   const [keyConnectApp, setKeyConnectApp] = useState<McpApp | null>(null);
   const isMountedRef = useRef(true);
   // Synchronous shadow of connectingKeys, same reason connect-mcp-dialog.tsx
@@ -214,20 +262,27 @@ export function ConnectAppsField({
     };
   }, []);
 
-  const rows = useMemo(() => resolveRows(interaction.apps, apps), [interaction.apps, apps]);
+  // resolveRows silently drops any requested name that doesn't resolve in
+  // the catalog (see its own comment) - a multi-connection template (e.g.
+  // hire-agent.ts's uncapped connections list) with one unresolvable name
+  // must not read as "all connected" just because every row that DID render
+  // happens to be connected, so it reports that alongside the rows from the
+  // same pass instead of a separate scan over interaction.apps.
+  const { rows, hasUnresolvedApp } = useMemo(
+    () => resolveRows(interaction.apps, apps),
+    [interaction.apps, apps],
+  );
   // Recomputed on every render (not memoized against rows, which doesn't
   // change when just an app's is_connected flips) - the footer's "not
   // connected yet" copy plus a Skip button, alongside a card whose every row
   // already shows Connected, would read as an outright contradiction.
-  const allConnected = rows.length > 0 && rows.every((row) => !!row.app.is_connected);
+  const allConnected = !hasUnresolvedApp && rows.length > 0 && rows.every((row) => !!row.app.is_connected);
 
   if (rows.length === 0) {
     // ClarificationForm's Collapsible card (title bar + chevron) is already
     // showing above this by the time useMcpApps() is still fetching or has
     // failed - returning null unconditionally here left it sitting over a
-    // blank void with nothing telling the user why. Once apps has loaded and
-    // still resolves to zero rows, null is correct again: there's genuinely
-    // nothing this card can show.
+    // blank void with nothing telling the user why.
     if (isLoading) {
       return (
         <p className="text-xs text-muted-foreground">
@@ -249,7 +304,52 @@ export function ConnectAppsField({
         </div>
       );
     }
-    return null;
+    // The catalog loaded fine, but none of the requested app names resolved
+    // against it - the backend names apps without filtering by
+    // is_visible_in_connector, while the frontend catalog fetch strong-hides
+    // any app with that flag off (e.g. a hidden-rollout gate), so a real
+    // pause can legitimately name an app this card can never render a row
+    // for. Retry (in case the catalog just hadn't loaded that app yet) plus
+    // Skip, matching the still-genuinely-paused task's own escape hatch -
+    // returning null here left a live pause with no visible action at all.
+    return (
+      <div className="flex items-center gap-3">
+        <p className="flex-1 text-xs text-muted-foreground">
+          {skipped
+            ? t("chatPage.clarification.connectApps.skippedNote")
+            : t("chatPage.clarification.connectApps.noneMatched")}
+        </p>
+        {!skipped && (
+          <>
+            <button
+              type="button"
+              className="flex-shrink-0 rounded-md border border-border px-2 py-1 text-xs font-medium text-foreground hover:bg-muted"
+              onClick={() => void refresh()}
+            >
+              {t("chatPage.clarification.connectApps.retry")}
+            </button>
+            {onSkip && (
+              <button
+                type="button"
+                className="flex-shrink-0 rounded-md px-2 py-1 text-xs font-medium text-muted-foreground hover:bg-muted hover:text-foreground"
+                onClick={async () => {
+                  setSkipped(true);
+                  try {
+                    await onSkip();
+                  } catch {
+                    if (isMountedRef.current) {
+                      setSkipped(false);
+                    }
+                  }
+                }}
+              >
+                {t("chatPage.clarification.connectApps.skip")}
+              </button>
+            )}
+          </>
+        )}
+      </div>
+    );
   }
 
   const withConnectingKey = async (key: string, run: () => Promise<void>) => {
@@ -493,27 +593,70 @@ export function ConnectAppsField({
 
         <div className="flex items-center gap-3 border-t bg-muted/40 px-3 py-2.5">
           <span className="flex-1 text-[11.5px] text-muted-foreground">
-            {allConnected
-              ? t("chatPage.clarification.connectApps.allConnectedNote")
-              : skipped
-                ? t("chatPage.clarification.connectApps.skippedNote")
+            {skipped
+              ? t("chatPage.clarification.connectApps.skippedNote")
+              : allConnected
+                ? t("chatPage.clarification.connectApps.allConnectedNote")
                 : t("chatPage.clarification.connectApps.privacyNote", { appName: branding.appName })}
           </span>
-          {/* Hidden once every row is Connected (whether that was already
-              true on first render or only became true after a later
-              refresh) - a Skip button next to an "I'll do this later" -
-              flavored note would contradict a card with nothing left to do. */}
-          {!skipped && !allConnected && (
-            <button
-              type="button"
-              className="flex-shrink-0 rounded-md px-2 py-1 text-xs font-medium text-muted-foreground hover:bg-muted hover:text-foreground"
-              onClick={() => {
-                setSkipped(true);
-                onSkip();
-              }}
-            >
-              {t("chatPage.clarification.connectApps.skip")}
-            </button>
+          {/* Swaps for a Continue button once every row is Connected (see
+              onContinue's doc comment) - a Skip button next to an "I'll do
+              this later" note would contradict a card with nothing left to
+              do, and without any button at all a card seeded onto a task
+              that's genuinely paused waiting for this connection (not just
+              the Hire-flow seed message, which was never actually waiting)
+              would have no way to tell the task to resume. Gated on !skipped
+              too - Skip already sent its own acknowledgement message, and
+              nothing here disables the per-row Connect buttons, so without
+              this a user who skips and then connects the remaining apps
+              anyway would see Continue reappear and could send a second,
+              contradictory message on top of the one Skip already sent. */}
+          {allConnected ? (
+            !skipped &&
+            onContinue &&
+            !continued && (
+              <button
+                type="button"
+                className="flex-shrink-0 rounded-md bg-primary px-2.5 py-1 text-xs font-medium text-primary-foreground hover:bg-primary/90"
+                onClick={async () => {
+                  setContinued(true);
+                  try {
+                    await onContinue();
+                  } catch {
+                    // A failed send must roll the optimistic "continued"
+                    // state back, or the button disappears while the
+                    // acknowledgement never actually went through, leaving
+                    // the user with no way to retry.
+                    if (isMountedRef.current) {
+                      setContinued(false);
+                    }
+                  }
+                }}
+              >
+                {t("chatPage.clarification.connectApps.continue")}
+              </button>
+            )
+          ) : (
+            !skipped &&
+            onSkip && (
+              <button
+                type="button"
+                className="flex-shrink-0 rounded-md px-2 py-1 text-xs font-medium text-muted-foreground hover:bg-muted hover:text-foreground"
+                onClick={async () => {
+                  setSkipped(true);
+                  try {
+                    await onSkip();
+                  } catch {
+                    // Same rationale as the Continue button's rollback above.
+                    if (isMountedRef.current) {
+                      setSkipped(false);
+                    }
+                  }
+                }}
+              >
+                {t("chatPage.clarification.connectApps.skip")}
+              </button>
+            )
           )}
         </div>
       </div>

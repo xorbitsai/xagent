@@ -532,6 +532,13 @@ async def reply_to_task(
                 None,
                 task_owner_user_id=ctx.task_owner_user_id,
             )
+            # Same nudge as the websocket resume paths (and the A2A
+            # input-required reply): a cached AgentService whose tools were
+            # already built (e.g. paused waiting for the user to connect an
+            # app) would otherwise keep its stale MCP config forever, and a
+            # v1 REST reply is one of the ways a connect_apps pause gets
+            # answered.
+            chat.get_agent_manager().refresh_connector_runtime_tools(task_id)
             posted = await agent_service.post_user_message(
                 str(task_id),
                 execution_message=ctx.text,

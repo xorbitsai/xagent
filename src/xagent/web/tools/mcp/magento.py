@@ -179,6 +179,20 @@ def _resolve_store_host() -> tuple[str, int | None, str]:
     return hostname, port, pinned_ip
 
 
+def _format_origin(hostname: str, port: int | None) -> str:
+    """Build an https origin from a resolved hostname/port.
+
+    `urlsplit(...).hostname` strips the brackets from a bare IPv6 literal
+    (e.g. "[::1]:8443" -> hostname "::1"), so a naive f"https://{hostname}"
+    would collide the address's own colons with the port separator and
+    produce an invalid URL ("https://::1:8443"). Re-bracket it here so both
+    callers below build the same, correct origin for that input instead of
+    each having to remember to do it.
+    """
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    return f"https://{host}" + (f":{port}" if port else "")
+
+
 def _base_url() -> str:
     """Validate MAGENTO_BASE_URL and return the store's bare origin (scheme
     + host[:port]). `_request()` does not call this -- it calls
@@ -187,10 +201,7 @@ def _base_url() -> str:
     validated (see `_resolve_store_host`'s docstring); this function exists
     for its own standalone validation/error-message behavior only."""
     hostname, port, _pinned_ip = _resolve_store_host()
-    origin = f"https://{hostname}"
-    if port:
-        origin += f":{port}"
-    return origin
+    return _format_origin(hostname, port)
 
 
 def _store_path_prefix() -> str:
@@ -442,7 +453,7 @@ def _request(
     # single request gets exactly one DNS lookup, and the connection below
     # can be pinned to the same address that lookup validated.
     hostname, port, pinned_ip = _resolve_store_host()
-    origin = f"https://{hostname}" + (f":{port}" if port else "")
+    origin = _format_origin(hostname, port)
     url = f"{origin}{_store_path_prefix()}{path}"
     try:
         with _pinned_dns(hostname, pinned_ip), _no_ambient_proxy_env():
@@ -570,14 +581,19 @@ def _list_search(
         params.update(extra_params)
     result = _request("GET", path, params=params)
     items, has_more = _paginated_result(result, max_results, current_page)
-    return success_with_capped_dict(
-        result_key,
-        {
-            result_key: [summary_fn(item) for item in items],
-            "has_more": has_more,
-            "next_page": current_page + 1 if has_more else None,
-        },
+    # success_with_capped_dict(field_name, data) always nests `data` as the
+    # single value under `field_name` -- passing a dict that itself
+    # contains a `result_key` entry (e.g. {"products": [...], "has_more":
+    # ...}) would double-nest it as {"products": {"products": [...], ...}}
+    # instead of the flat {"products": [...], "has_more": ...} shape every
+    # caller of this list tool expects. Cap just the summarized list, then
+    # add has_more/next_page as top-level siblings afterward.
+    capped = json.loads(
+        success_with_capped_dict(result_key, [summary_fn(item) for item in items])
     )
+    capped["has_more"] = has_more
+    capped["next_page"] = current_page + 1 if has_more else None
+    return json.dumps(capped, ensure_ascii=False)
 
 
 def _product_summary(product: dict[str, Any]) -> dict[str, Any]:

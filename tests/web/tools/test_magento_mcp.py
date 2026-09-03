@@ -24,20 +24,33 @@ def _fake_getaddrinfo(*ips):
     return _impl
 
 
+_UNSET = object()
+
+
 class MockResponse:
     def __init__(
         self,
-        json_data=None,
+        json_data=_UNSET,
         status_code: int = 200,
         text: str = "",
         url: str = "",
         json_raises: bool = False,
         content: bytes | None = None,
     ):
-        self._json_data = json_data if json_data is not None else {}
+        # `json_data` defaults to a sentinel (not None/False/{}) so a caller
+        # that explicitly passes a falsy JSON value -- None, False, 0, "",
+        # {} -- gets that value actually serialized into .text/.content and
+        # round-tripped through .json() below, rather than being silently
+        # treated the same as "no body was configured for this test".
+        self._json_data = {} if json_data is _UNSET else json_data
         self._json_raises = json_raises
         self.status_code = status_code
-        self.text = text or (json.dumps(self._json_data) if json_data else "")
+        if text:
+            self.text = text
+        elif json_data is _UNSET:
+            self.text = ""
+        else:
+            self.text = json.dumps(self._json_data)
         self.content = content if content is not None else self.text.encode()
         self.url = url
 
@@ -99,6 +112,16 @@ def test_base_url_preserves_custom_port(monkeypatch):
     monkeypatch.setenv("MAGENTO_BASE_URL", "https://store.example.com:8443")
 
     assert magento._base_url() == "https://store.example.com:8443"
+
+
+def test_base_url_brackets_ipv6_literal_host(monkeypatch):
+    # urlsplit(...).hostname strips the brackets from a bare IPv6 literal
+    # ("[::1]:8443" -> "::1"), so rebuilding the origin without re-adding
+    # them would collide the address's own colons with the port separator
+    # ("https://::1:8443", not a valid authority).
+    monkeypatch.setenv("MAGENTO_BASE_URL", "https://[::1]:8443")
+
+    assert magento._base_url() == "https://[::1]:8443"
 
 
 @pytest.mark.parametrize(
@@ -678,6 +701,47 @@ def test_list_products_sends_sku_like_and_status_filters(monkeypatch):
     assert params["searchCriteria[currentPage]"] == 2
 
 
+def test_list_products_returns_flat_shape_with_pagination_metadata(monkeypatch):
+    # _list_search wraps its list under `result_key` via
+    # success_with_capped_dict, which itself already nests `data` under
+    # that same key -- passing a dict that ALSO contains a `result_key`
+    # entry double-nests it (products.products) instead of leaving
+    # has_more/next_page as siblings of the flat products list. Assert the
+    # actual top-level shape, not just the outbound request params (which
+    # every other test in this file checks instead).
+    monkeypatch.setattr(
+        magento.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "items": [{"sku": "abc", "name": "Shirt"}],
+                    "total_count": 100,
+                }
+            )
+        ),
+    )
+
+    result = json.loads(magento.magento_list_products(limit=10, page=1))
+
+    assert result["status"] == "success"
+    assert result["products"] == [
+        {
+            "sku": "abc",
+            "name": "Shirt",
+            "price": None,
+            "status": None,
+            "visibility": None,
+            "type_id": None,
+            "attribute_set_id": None,
+            "created_at": None,
+            "updated_at": None,
+        }
+    ]
+    assert result["has_more"] is True
+    assert result["next_page"] == 2
+
+
 def test_list_products_rejects_invalid_status():
     result = json.loads(magento.magento_list_products(status=9))
 
@@ -840,6 +904,25 @@ def test_list_orders_sends_status_filter_and_sort(monkeypatch):
     assert params["searchCriteria[sortOrders][0][direction]"] == "DESC"
 
 
+def test_list_orders_returns_flat_shape_not_double_nested(monkeypatch):
+    monkeypatch.setattr(
+        magento.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={"items": [{"entity_id": 1}], "total_count": 1}
+            )
+        ),
+    )
+
+    result = json.loads(magento.magento_list_orders())
+
+    assert isinstance(result["orders"], list)
+    assert result["orders"][0]["entity_id"] == 1
+    assert result["has_more"] is False
+    assert "next_page" in result
+
+
 def test_get_order_returns_summary(monkeypatch):
     monkeypatch.setattr(
         magento.requests,
@@ -969,6 +1052,25 @@ def test_list_customers_sends_email_like_filter(monkeypatch):
     params = mock_request.call_args.kwargs["params"]
     assert params["searchCriteria[filter_groups][0][filters][0][value]"] == "%jane%"
     assert mock_request.call_args.kwargs["url"].endswith("/customers/search")
+
+
+def test_list_customers_returns_flat_shape_not_double_nested(monkeypatch):
+    monkeypatch.setattr(
+        magento.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={"items": [{"id": 5}], "total_count": 1}
+            )
+        ),
+    )
+
+    result = json.loads(magento.magento_list_customers())
+
+    assert isinstance(result["customers"], list)
+    assert result["customers"][0]["id"] == 5
+    assert result["has_more"] is False
+    assert "next_page" in result
 
 
 def test_list_customers_escapes_like_wildcards_in_email_like(monkeypatch):

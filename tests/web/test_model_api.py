@@ -10,10 +10,19 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from xagent.core.model.model import ChatModelConfig, EmbeddingModelConfig
 from xagent.web.api import model as model_module
 from xagent.web.api.auth import auth_router
 from xagent.web.api.model import model_router
 from xagent.web.models.database import Base, get_db, get_engine
+from xagent.web.models.model import Model as DBModel
+from xagent.web.models.user import UserDefaultModel, UserModel
+from xagent.web.services.llm_utils import (
+    PLATFORM_MODEL_MANAGER,
+    CoreStorage,
+    PlatformModelIdentityError,
+    PlatformModelStore,
+)
 
 # Create temporary directory for database
 
@@ -220,6 +229,210 @@ def sample_video_model_data():
         "description": "Test Seedance video model",
         "share_with_users": False,
     }
+
+
+def _platform_config(model_id: str, category: str = "llm"):
+    common = {
+        "id": model_id,
+        "model_provider": "openai",
+        "api_key": "platform-key",
+        "base_url": "https://api.openai.com/v1",
+    }
+    if category == "embedding":
+        return EmbeddingModelConfig(
+            **common,
+            model_name="text-embedding-3-small",
+            abilities=["embedding"],
+            dimension=1536,
+        )
+    return ChatModelConfig(**common, model_name="gpt-4", abilities=["chat"])
+
+
+@pytest.mark.parametrize("path", ["/api/models/", "/api/models/register"])
+def test_user_creation_rejects_platform_namespace(
+    test_db, regular_headers, sample_model_data, path
+):
+    payload = {**sample_model_data, "model_id": "platform/forged"}
+
+    response = client.post(path, headers=regular_headers, json=payload)
+
+    assert response.status_code == 403
+    db = next(get_db())
+    try:
+        assert db.query(DBModel).filter_by(model_id="platform/forged").first() is None
+    finally:
+        db.close()
+
+
+def test_trusted_platform_store_persists_provenance_without_user_ownership(test_db):
+    db = next(get_db())
+    try:
+        store = PlatformModelStore(db)
+        created = store.create(_platform_config("platform/toby-embedding", "embedding"))
+
+        assert created.managed_by == PLATFORM_MODEL_MANAGER
+        assert store.get("platform/toby-embedding") is created
+        assert db.query(UserModel).filter_by(model_id=created.id).first() is None
+        assert db.query(UserDefaultModel).filter_by(model_id=created.id).first() is None
+    finally:
+        db.close()
+
+
+def test_trusted_platform_store_does_not_adopt_preclaimed_collision(test_db):
+    db = next(get_db())
+    try:
+        collision = DBModel(
+            model_id="platform/preclaimed",
+            category="llm",
+            model_provider="openai",
+            model_name="tenant-model",
+            api_key="tenant-key",
+            abilities=["chat"],
+            is_active=True,
+        )
+        db.add(collision)
+        db.commit()
+
+        store = PlatformModelStore(db)
+        assert store.get("platform/preclaimed") is None
+        with pytest.raises(PlatformModelIdentityError, match="already claimed"):
+            store.create(_platform_config("platform/preclaimed"))
+
+        db.refresh(collision)
+        assert collision.managed_by is None
+        assert collision.model_name == "tenant-model"
+        assert collision.is_active is True
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    ("initial_category", "requested_category"),
+    [("llm", "embedding"), ("embedding", "llm")],
+)
+def test_platform_category_is_immutable_without_partial_mutation(
+    test_db, admin_user, admin_headers, initial_category, requested_category
+):
+    db = next(get_db())
+    model_id = f"platform/category-{initial_category}"
+    try:
+        created = PlatformModelStore(db).create(
+            _platform_config(model_id, initial_category)
+        )
+        ownership = UserModel(
+            user_id=admin_user["id"],
+            model_id=created.id,
+            is_owner=True,
+            can_edit=True,
+            can_delete=True,
+            is_shared=False,
+        )
+        db.add(ownership)
+        db.add(
+            UserDefaultModel(
+                user_id=admin_user["id"],
+                model_id=created.id,
+                config_type="general" if initial_category == "llm" else "embedding",
+            )
+        )
+        db.commit()
+        ownership_id = ownership.id
+        default_id = db.query(UserDefaultModel).filter_by(model_id=created.id).one().id
+    finally:
+        db.close()
+
+    response = client.put(
+        f"/api/models/by-id/{quote(model_id, safe='')}",
+        headers=admin_headers,
+        json={
+            "category": requested_category,
+            "model_name": "mutated-name",
+            "share_with_users": True,
+        },
+    )
+
+    assert response.status_code == 409
+    db = next(get_db())
+    try:
+        unchanged = db.query(DBModel).filter_by(model_id=model_id).one()
+        assert unchanged.category == initial_category
+        assert unchanged.model_name != "mutated-name"
+        assert db.query(UserModel).filter_by(id=ownership_id).one().is_shared is False
+        assert (
+            db.query(UserDefaultModel).filter_by(id=default_id).one().model_id
+            == unchanged.id
+        )
+    finally:
+        db.close()
+
+
+def test_preclaimed_platform_id_cannot_be_updated_deactivated_or_deleted(
+    test_db, admin_user, admin_headers
+):
+    db = next(get_db())
+    try:
+        collision = DBModel(
+            model_id="platform/tenant-row",
+            category="llm",
+            model_provider="openai",
+            model_name="tenant-model",
+            api_key="tenant-key",
+            abilities=["chat"],
+            is_active=True,
+        )
+        db.add(collision)
+        db.flush()
+        db.add(
+            UserModel(
+                user_id=admin_user["id"],
+                model_id=collision.id,
+                is_owner=True,
+                can_edit=True,
+                can_delete=True,
+                is_shared=False,
+            )
+        )
+        db.commit()
+        with pytest.raises(PlatformModelIdentityError):
+            CoreStorage(db, DBModel).set_model_active(collision.model_id, False)
+    finally:
+        db.close()
+
+    path = f"/api/models/by-id/{quote('platform/tenant-row', safe='')}"
+    assert (
+        client.put(
+            path, headers=admin_headers, json={"model_name": "forged"}
+        ).status_code
+        == 403
+    )
+    assert client.delete(path, headers=admin_headers).status_code == 403
+
+    db = next(get_db())
+    try:
+        unchanged = db.query(DBModel).filter_by(model_id="platform/tenant-row").one()
+        assert unchanged.managed_by is None
+        assert unchanged.model_name == "tenant-model"
+        assert unchanged.is_active is True
+    finally:
+        db.close()
+
+
+def test_ordinary_model_create_update_delete_remains_compatible(
+    test_db, admin_headers, sample_model_data
+):
+    created = client.post("/api/models/", headers=admin_headers, json=sample_model_data)
+    assert created.status_code == 200
+
+    updated = client.put(
+        "/api/models/test-openai-model",
+        headers=admin_headers,
+        json={"model_name": "gpt-4o"},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["model_name"] == "gpt-4o"
+
+    deleted = client.delete("/api/models/test-openai-model", headers=admin_headers)
+    assert deleted.status_code == 200
 
 
 @pytest.mark.asyncio

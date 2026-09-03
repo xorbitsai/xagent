@@ -447,7 +447,10 @@ async def test_auto_decision_sees_memory_context() -> None:
         ]
     )
     context = ExecutionContext(execution_id="auto-context")
-    context.add_user_message("Answer from context")
+    context.add_user_message(
+        "Answer from context\n\nAttached file: /private/runtime/input.txt",
+        metadata={"display_message": "Answer from context"},
+    )
     memory_store = FakeMemoryStore()
 
     result = await AutoPattern().run(
@@ -462,6 +465,10 @@ async def test_auto_decision_sees_memory_context() -> None:
     assert [search["filters"]["category"] for search in memory_store.searches] == [
         "react_memory",
         "general",
+    ]
+    assert [search["query"] for search in memory_store.searches] == [
+        "Answer from context",
+        "Answer from context",
     ]
     decision_messages = llm.calls[0]["messages"]
     system_context = next(

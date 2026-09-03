@@ -36,7 +36,7 @@ from pydantic import BaseModel, Field, create_model
 from ..... import config as _root_config
 from .....sandbox.base import Sandbox
 from ...core.mcp.sessions import Connection, create_session
-from ...core.mcp.tools import load_mcp_tools
+from ...core.mcp.tools import load_mcp_tools, raw_annotations_for
 from .base import AbstractBaseTool, ToolVisibility
 from .connector_runtime import (
     ERROR_DELEGATED_AUTHORIZATION_FAILED,
@@ -85,6 +85,73 @@ _MCP_LOAD_FAILURE_MESSAGES: dict[MCPFailurePhase, str] = {
 def mcp_load_failure_message(phase: MCPFailurePhase) -> str:
     """Return the public-safe message owned by an MCP load failure phase."""
     return _MCP_LOAD_FAILURE_MESSAGES[phase]
+
+
+class MCPWriteHint(Enum):
+    """What a server's tool annotations claim about a tool's side effects.
+
+    Three states rather than a boolean, because "the server told us this is
+    read-only" and "the server told us nothing" are different facts and only
+    the first one is a claim. Collapsing them into ``is_read_only: bool``
+    would make silence indistinguishable from a promise -- and silence is
+    the common case, since annotations are optional and most connectors
+    omit them.
+
+    A consumer deciding whether an action needs a human in front of it
+    should treat everything except :data:`READ_ONLY` as a write. See
+    ``MCPToolAdapter.write_hint`` for why none of this is a trust boundary.
+    """
+
+    READ_ONLY = "read_only"
+    DESTRUCTIVE = "destructive"
+    UNDECLARED = "undeclared"
+
+
+# The annotation keys this classifier reads, spelled as the MCP wire schema
+# spells them (camelCase is the protocol's, not this codebase's).
+_READ_ONLY_HINT = "readOnlyHint"
+_DESTRUCTIVE_HINT = "destructiveHint"
+
+
+def classify_write_hint(raw_annotations: object) -> MCPWriteHint:
+    """Classify a tool's *raw* wire annotations into a write hint.
+
+    Takes the annotation mapping as it arrived on the wire, before the mcp
+    SDK's models see it. That is deliberate and it is the whole reason this
+    function exists: ``ToolAnnotations`` declares ``bool | None`` under
+    non-strict Pydantic validation, so by the time a parsed object is in
+    hand, ``1`` and ``"true"`` have already become an indistinguishable
+    Python ``True``. Classifying after that boundary cannot tell a server
+    that promised ``true`` from one that sent a coercible non-boolean, which
+    would turn "only an exact boolean counts" into a promise this code does
+    not keep.
+
+    Fail-closed in both directions that matter:
+
+    * A declared ``destructiveHint`` outranks a simultaneous ``readOnlyHint``.
+      The schema marks the two independent with no mutual exclusion, so a peer
+      can send both, and the safe reading of a contradiction is the one that
+      keeps a human in front of the action.
+    * Everything else -- absent, ``None``, ``false``, a non-boolean, or an
+      annotations value that is not even a mapping -- is ``UNDECLARED``,
+      which a consumer must treat as a write.
+
+    None of this makes the result trustworthy: annotations come from a server
+    the client does not control, and the spec says outright that a client
+    "should never make tool use decisions based on ToolAnnotations received
+    from untrusted servers". What this buys is that a *malformed* or
+    *contradictory* claim can never read as the permissive one.
+    """
+    if not isinstance(raw_annotations, Mapping):
+        return MCPWriteHint.UNDECLARED
+    # ``is True`` against the raw value, which is the only place it means what
+    # it says. Checked destructive-first so a both-true peer lands on the
+    # safe side.
+    if raw_annotations.get(_DESTRUCTIVE_HINT) is True:
+        return MCPWriteHint.DESTRUCTIVE
+    if raw_annotations.get(_READ_ONLY_HINT) is True:
+        return MCPWriteHint.READ_ONLY
+    return MCPWriteHint.UNDECLARED
 
 
 @dataclass(frozen=True)
@@ -788,6 +855,7 @@ class MCPToolAdapter(AbstractBaseTool):
         source_server: Optional[str] = None,
         concurrency_safe: bool = False,
         concurrent_tools: Optional[List[str]] = None,
+        raw_annotations: Optional[Mapping[str, Any]] = None,
     ):
         """Initialize MCP tool adapter.
 
@@ -806,8 +874,16 @@ class MCPToolAdapter(AbstractBaseTool):
                 after interruption.
             concurrent_tools: Optional allowlist of raw MCP tool names. Empty
                 means every tool from an opted-in server is safe.
+            raw_annotations: The tool's ``annotations`` object exactly as it
+                arrived on the wire, before the mcp SDK's non-strict models
+                coerced it. Required for an honest ``write_hint``: once
+                parsed, ``1`` and ``"true"`` are indistinguishable from a
+                real ``true``. Omitted means no wire evidence reached this
+                adapter, which classifies as ``UNDECLARED`` -- never as a
+                read-only promise.
         """
         self.mcp_tool = mcp_tool
+        self._raw_annotations = raw_annotations
         self.connection = connection
         self._name_prefix = name_prefix or ""
         self._visibility = visibility or ToolVisibility.PRIVATE
@@ -871,6 +947,25 @@ class MCPToolAdapter(AbstractBaseTool):
     def description(self) -> str:
         """Get tool description from MCP tool."""
         return self.mcp_tool.description or f"Execute MCP tool: {self.mcp_tool.name}"
+
+    @property
+    def write_hint(self) -> "MCPWriteHint":
+        """What the server's own annotations claim about this tool's writes.
+
+        Classified from the raw wire annotations captured at load time, not
+        from the parsed ``ToolAnnotations`` object -- see
+        ``classify_write_hint`` for why the distinction is the point rather
+        than a detail. An adapter built without that evidence reports
+        ``UNDECLARED``, which a consumer must treat as a write.
+
+        Not a trust boundary. The spec says annotations are hints and a
+        client "should never make tool use decisions based on
+        ToolAnnotations received from untrusted servers". A server that lies
+        in the permissive direction is upstream of anything this can check;
+        what is guaranteed here is only that malformed or self-contradictory
+        input never reads as the permissive answer.
+        """
+        return classify_write_hint(self._raw_annotations)
 
     @property
     def tags(self) -> List[str]:
@@ -1105,6 +1200,13 @@ class MCPToolAdapter(AbstractBaseTool):
             return all(item == "null" for item in schema_type)
         return False
 
+    # Caps the string this method will attempt to recover as a double-encoded
+    # array/scalar (see below). A real LLM double-encoding mistake is small —
+    # '["date"]', not a multi-KB blob — so anything past this length is out of
+    # scope for the recovery and just takes the raw-wrap fallback instead of
+    # being handed to json.loads at all.
+    _ARRAY_ARG_JSON_RECOVERY_MAX_CHARS = 4096
+
     def _normalize_args_by_schema(self, args: Mapping[str, Any]) -> Dict[str, Any]:
         """Normalize common LLM argument shape mistakes using the MCP input schema."""
         normalized_args = dict(args)
@@ -1123,6 +1225,31 @@ class MCPToolAdapter(AbstractBaseTool):
             if value is None:
                 continue
             if self._schema_is_array_only(field_schema) and not isinstance(value, list):
+                if (
+                    isinstance(value, str)
+                    and len(value) <= self._ARRAY_ARG_JSON_RECOVERY_MAX_CHARS
+                ):
+                    # Tool-calling models sometimes double-encode an
+                    # array-only argument as a JSON string instead of a real
+                    # array — e.g. '["date"]', or even a lone item as
+                    # '"date"'. Recover the intended value before falling
+                    # back to the raw wrap below, which would otherwise
+                    # leak the string's own brackets/quotes into a garbled
+                    # single item. Both ValueError (json.JSONDecodeError,
+                    # and CPython's int-string-conversion digit-limit guard
+                    # for a long run of digits) and RecursionError (a
+                    # pathologically deep bracket string) mean the same
+                    # thing here: not recoverable, fall back below.
+                    try:
+                        parsed_value = json.loads(value)
+                    except (ValueError, RecursionError):
+                        parsed_value = None
+                    if isinstance(parsed_value, list):
+                        normalized_args[field_name] = parsed_value
+                        continue
+                    if isinstance(parsed_value, str):
+                        normalized_args[field_name] = [parsed_value]
+                        continue
                 normalized_args[field_name] = [value]
 
         return normalized_args
@@ -1646,6 +1773,10 @@ def _build_mcp_tool_adapter(
         source_server=normalize_mcp_server_name(server_name),
         concurrency_safe=concurrency_safe,
         concurrent_tools=concurrent_tools,
+        # Read off the tool the loader produced -- both the direct and the
+        # sandboxed loader attach it, so one builder serves both paths and
+        # neither can quietly lose the evidence the other keeps.
+        raw_annotations=raw_annotations_for(mcp_tool),
     )
 
 

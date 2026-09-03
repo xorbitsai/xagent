@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -39,6 +40,8 @@ from xagent.core.agent.pattern.dag.plan_generator import (
     PLAN_GENERATION_REQUIRED_TOOL_MESSAGE,
     PlanLanguageMismatchError,
 )
+from xagent.core.memory.core import MemoryNote as StoredMemoryNote
+from xagent.core.memory.core import MemoryResponse
 from xagent.core.model.chat.types import ChunkType, StreamChunk
 from xagent.core.task_runtime import PREFERRED_INPUT_MODALITIES_METADATA_KEY
 
@@ -240,10 +243,17 @@ class MemoryNote:
 class FakeMemoryStore:
     def __init__(self) -> None:
         self.searches: list[dict[str, Any]] = []
+        self.added: list[Any] = []
 
     def search(self, **kwargs: Any) -> list[MemoryNote]:
         self.searches.append(kwargs)
+        if kwargs.get("query") == "User prefers concise summaries.":
+            return []
         return [MemoryNote()]
+
+    def add(self, note: Any) -> Any:
+        self.added.append(note)
+        return SimpleNamespace(success=True, memory_id=f"mem-{len(self.added)}")
 
 
 class FakeSkillManager:
@@ -483,6 +493,101 @@ async def test_dag_forwards_disabled_interaction_policy_to_each_step(
 
     assert result["success"] is True
     assert observed_policies == [False]
+
+
+@pytest.mark.asyncio
+async def test_dag_waiting_resume_keeps_memory_input_for_later_child() -> None:
+    class EmptyMemoryStore(FakeMemoryStore):
+        def search(self, **kwargs: Any) -> list[MemoryNote]:
+            self.searches.append(kwargs)
+            return []
+
+    typed = "Compare the attached options"
+    augmented = f"{typed}\n\nAttached file: /private/runtime/options.pdf"
+    context = ExecutionContext(execution_id="dag-waiting-memory")
+    context.metadata["task"] = augmented
+    context.add_user_message(augmented, metadata={"display_message": typed})
+    plan = build_plan(
+        PlanStep(id="confirm", task="Ask which option to use"),
+        PlanStep(id="save", task="Save the choice", dependencies=["confirm"]),
+    )
+    pattern = DAGPattern(lambda **_: plan)
+    memory_store = EmptyMemoryStore()
+    first = await pattern.run(
+        context=context,
+        tools=[],
+        llm=SequenceLLM(
+            [
+                {
+                    "tool_calls": [
+                        {
+                            "id": "ask-choice",
+                            "function": {
+                                "name": "send_message",
+                                "arguments": json.dumps(
+                                    {
+                                        "message": "Choose A or B",
+                                        "message_type": "question",
+                                        "expect_response": True,
+                                    }
+                                ),
+                            },
+                        }
+                    ],
+                    "done": False,
+                }
+            ]
+        ),
+        memory_store=memory_store,
+    )
+
+    assert first["status"] == "waiting_for_user"
+    legacy_state = pattern.get_state()
+    legacy_state.pop("memory_input_text")
+    rebuilt = ExecutionContext.from_dict(context.to_dict())
+    rebuilt.add_user_message("B")
+    restored = DAGPattern(lambda **_: plan)
+    restored.load_state(legacy_state)
+
+    resume_llm = SequenceLLM(
+        [
+            {"content": "Choice confirmed.", "done": True},
+            {
+                "content": "Remembering the choice.",
+                "tool_calls": [
+                    {
+                        "id": "store-choice",
+                        "function": {
+                            "name": "store_memory",
+                            "arguments": json.dumps(
+                                {
+                                    "content": "User chose option B.",
+                                    "kind": "user_preference",
+                                }
+                            ),
+                        },
+                    }
+                ],
+                "done": False,
+            },
+            {"content": "Choice saved.", "done": True},
+        ]
+    )
+    result = await restored.run(
+        context=rebuilt,
+        tools=[],
+        llm=resume_llm,
+        memory_store=memory_store,
+    )
+
+    assert result["success"] is True, result
+    assert restored.memory_input_text == typed
+    assert memory_store.added
+    assert memory_store.added[-1].metadata["task"] == typed
+    assert {call["query"] for call in memory_store.searches} == {
+        typed,
+        "User chose option B.",
+    }
 
 
 async def run_invalid_plan(plan: ExecutionPlan) -> dict[str, Any]:
@@ -987,6 +1092,124 @@ async def test_dag_pattern_passes_compact_llm_to_step_react_compaction() -> None
         "compacted dag step context" in message["content"]
         for message in llm.seen_messages[0]
     )
+
+
+@pytest.mark.asyncio
+async def test_dag_compaction_resume_preserves_clean_memory_metadata() -> None:
+    class CrudMemoryStore:
+        def __init__(self) -> None:
+            self.notes = {
+                "existing": StoredMemoryNote(
+                    id="existing",
+                    content="Old preference",
+                    metadata={},
+                )
+            }
+            self.added: list[StoredMemoryNote] = []
+            self.updated: list[StoredMemoryNote] = []
+
+        def search(self, **_: Any) -> list[StoredMemoryNote]:
+            return []
+
+        def add(self, note: StoredMemoryNote) -> MemoryResponse:
+            self.added.append(note)
+            return MemoryResponse(success=True, memory_id="added")
+
+        def get(self, note_id: str) -> MemoryResponse:
+            return MemoryResponse(success=True, content=self.notes[note_id])
+
+        def update(self, note: StoredMemoryNote) -> MemoryResponse:
+            self.updated.append(note)
+            return MemoryResponse(success=True, memory_id=note.id)
+
+    typed = "Prepare the report"
+    augmented = f"{typed}\n\nAttached file: /private/runtime/input.txt"
+    context = ExecutionContext(execution_id="dag-memory-provenance")
+    context.metadata["task"] = augmented
+    context.compact_config.threshold = 1
+    context.add_user_message(augmented, metadata={"display_message": typed})
+    runtime = PatternRuntime(execution_id=context.execution_id)
+    runtime.interrupt_checker = lambda: any(
+        checkpoint["label"] == "dag_after_llm" for checkpoint in runtime.checkpoints
+    )
+    pattern = DAGPattern(
+        lambda **_: build_plan(PlanStep(id="answer", task="Draft the report"))
+    )
+    first_llm = SequenceLLM(
+        [
+            {
+                "content": "Persist memory changes.",
+                "tool_calls": [
+                    {
+                        "id": "store",
+                        "function": {
+                            "name": "store_memory",
+                            "arguments": json.dumps(
+                                {
+                                    "content": "User prefers brief reports.",
+                                    "kind": "user_preference",
+                                }
+                            ),
+                        },
+                    },
+                    {
+                        "id": "update",
+                        "function": {
+                            "name": "update_memory",
+                            "arguments": json.dumps(
+                                {
+                                    "memory_id": "existing",
+                                    "content": "User prefers concise reports.",
+                                }
+                            ),
+                        },
+                    },
+                ],
+                "done": False,
+            }
+        ]
+    )
+    compact_llm = SequenceLLM([{"content": "Compacted DAG child"}])
+    memory_store = CrudMemoryStore()
+
+    interrupted = await pattern.run(
+        context=context,
+        tools=[],
+        llm=first_llm,
+        compact_llm=compact_llm,
+        memory_store=memory_store,
+        runtime=runtime,
+    )
+    checkpoint = runtime.last_checkpoint
+
+    assert interrupted["status"] == "interrupted"
+    assert checkpoint is not None
+    assert checkpoint["pattern_state"]["memory_input_text"] == typed
+    step_state = checkpoint["pattern_state"]["active_step_pattern_states"]["answer"]
+    assert step_state["memory_input_text"] == typed
+
+    restored_context = ExecutionContext.from_dict(checkpoint["context"])
+    restored_context.add_user_message(
+        "Internal resumed step",
+        metadata={"dag_step_id": "answer"},
+    )
+    restored_context.compact_with_llm_response({"content": "Rebuilt root"})
+    restored = DAGPattern(
+        lambda **_: build_plan(PlanStep(id="answer", task="Draft the report"))
+    )
+    restored.load_state(checkpoint["pattern_state"])
+
+    result = await restored.run(
+        context=restored_context,
+        tools=[],
+        llm=SequenceLLM([{"content": "Done.", "done": True}]),
+        compact_llm=SequenceLLM([{"content": "Compacted resumed child"}]),
+        memory_store=memory_store,
+    )
+
+    assert result["success"] is True, result
+    assert memory_store.added[0].metadata["task"] == typed
+    assert memory_store.updated[0].metadata["updated_by_task"] == typed
 
 
 @pytest.mark.asyncio
@@ -4059,12 +4282,33 @@ async def test_dag_pattern_enriches_plan_prompt_with_memory() -> None:
     generator = LLMPlanGenerator()
     pattern = DAGPattern(generator)
     context = ExecutionContext(execution_id="dag-enriched")
-    context.add_user_message("Plan this")
+    context.add_user_message(
+        "Plan this\n\nAttached file: /private/runtime/input.txt",
+        metadata={"display_message": "Plan this"},
+    )
     memory_store = FakeMemoryStore()
     skill_manager = FakeSkillManager()
     llm = SequenceLLM(
         [
             plan_tool_response([{"id": "only", "task": "Only step"}]),
+            {
+                "content": "Remembering a reusable preference.",
+                "tool_calls": [
+                    {
+                        "id": "call_store_memory",
+                        "function": {
+                            "name": "store_memory",
+                            "arguments": json.dumps(
+                                {
+                                    "content": "User prefers concise summaries.",
+                                    "kind": "user_preference",
+                                }
+                            ),
+                        },
+                    }
+                ],
+                "done": False,
+            },
             {"content": "step done", "done": True},
         ]
     )
@@ -4082,7 +4326,15 @@ async def test_dag_pattern_enriches_plan_prompt_with_memory() -> None:
     assert [search["filters"]["category"] for search in memory_store.searches] == [
         "dag_plan_execute_memory",
         "general",
+        "react_memory",
     ]
+    assert [search["query"] for search in memory_store.searches] == [
+        "Plan this",
+        "Plan this",
+        "User prefers concise summaries.",
+    ]
+    assert memory_store.added[0].metadata["task"] == "Plan this"
+    assert "/private/runtime/input.txt" not in memory_store.added[0].metadata["task"]
     prompt_payload = json.loads(llm.call_kwargs[0]["messages"][1]["content"])
     assert (
         "Split this project using the historical DAG pattern."
@@ -5264,6 +5516,9 @@ async def test_restored_dag_step_instruction_drops_stale_language_policy(
     class CapturingReActPattern:
         def __init__(self, **kwargs: Any) -> None:
             del kwargs
+
+        def seed_memory_input(self, memory_text: str) -> None:
+            del memory_text
 
         async def run(self, *, context: Any, **kwargs: Any) -> dict[str, Any]:
             del kwargs

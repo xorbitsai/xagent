@@ -42,6 +42,7 @@ from .enrichment import (
     IMAGE_EDIT_UNAVAILABLE_METADATA_KEY,
     MEMORY_CONTEXT_METADATA_KEY,
     SKILL_CONTEXT_METADATA_KEY,
+    top_level_user_request,
 )
 from .memory_tool import MEMORY_TOOLS_METADATA_KEY
 from .message import LLMCallRecord, Message
@@ -538,35 +539,32 @@ class ExecutionContext:
             "instead of computing from this value."
         )
 
-    def _current_user_request_text(self, *, prefer_display: bool = False) -> str:
+    def current_user_request_text(
+        self,
+        *,
+        prefer_display: bool = False,
+        user_message_limit: int | None = None,
+    ) -> str:
         """Return the current request text.
 
         ``prefer_display`` yields the user-typed message instead of the
         execution prompt, whose appended file-reference block is fixed English
         and would otherwise decide the language of a short foreign request.
+        ``user_message_limit`` restricts selection to a previously checkpointed
+        user-message window so later waiting responses cannot become the task.
         """
-        for message in reversed(self.messages):
-            if message.hidden or message.role != "user":
-                continue
-            if message.metadata.get("response_to_waiting_for_user"):
-                continue
-            # A DAG child context copies the root messages and then appends step
-            # scaffolding; only the root request may anchor the response language.
-            if message.metadata.get("dag_step_id"):
-                continue
-            if prefer_display:
-                display = str(message.metadata.get("display_message") or "").strip()
-                if display:
-                    return display
-            content = str(message.content or "").strip()
-            if content:
-                return content
-        return str(self.metadata.get("task") or "").strip()
+        request = top_level_user_request(
+            self,
+            user_message_limit=user_message_limit,
+        )
+        if prefer_display and request.display_state == "text":
+            return request.language_text
+        return request.execution_text
 
     def _system_context(self) -> str:
         parts = [self._current_time_context(), FILE_REF_MODEL_INSTRUCTIONS]
         dag_step_id = self.metadata.get("dag_step_id")
-        current_task = self._current_user_request_text()
+        current_task = self.current_user_request_text()
         output_language = effective_output_language(self)
         if current_task and not dag_step_id:
             language_directives = output_language_directives(
@@ -648,7 +646,7 @@ class ExecutionContext:
             request_anchor = output_language_directives(
                 output_language,
                 section="dag_step_request_anchor",
-                request=self._current_user_request_text(prefer_display=True),
+                request=self.current_user_request_text(prefer_display=True),
             )
             if request_anchor:
                 parts.append(request_anchor)
@@ -932,6 +930,9 @@ class ExecutionContext:
         include_system_prompt: bool = True,
         metadata: dict[str, Any] | None = None,
     ) -> "ExecutionContext":
+        # Child compaction may discard the copied root message, so snapshot its
+        # request provenance before metadata is cloned.
+        top_level_user_request(self)
         child_metadata = dict(self.metadata)
         if metadata:
             child_metadata.update(metadata)
@@ -1113,6 +1114,7 @@ class ExecutionContext:
                 strategy="none",
             )
 
+        top_level_user_request(self)
         total_tokens = self._get_total_tokens()
         if total_tokens > self.compact_config.threshold:
             result = self._drop_oldest_messages()
@@ -1129,6 +1131,7 @@ class ExecutionContext:
         if not self.compact_config.enabled:
             return None
 
+        top_level_user_request(self)
         total_tokens = self._get_total_tokens()
         if total_tokens <= self.compact_config.threshold:
             return None
@@ -1205,6 +1208,7 @@ class ExecutionContext:
         llm: Any = None,
         original_tokens: int | None = None,
     ) -> CompactResult:
+        top_level_user_request(self)
         original_count = len(self.messages)
         summary = (
             ""

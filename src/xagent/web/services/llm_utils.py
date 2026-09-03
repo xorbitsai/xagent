@@ -32,6 +32,30 @@ from ..models.user import UserDefaultModel, UserModel
 
 logger = logging.getLogger(__name__)
 
+PLATFORM_MODEL_ID_PREFIX = "platform/"
+PLATFORM_MODEL_MANAGER = "platform"
+
+
+class PlatformModelIdentityError(ValueError):
+    """Raised when an ordinary write crosses the platform model boundary."""
+
+
+def is_platform_model_id(model_id: object) -> bool:
+    """Return whether an identifier belongs to the reserved platform namespace."""
+
+    return isinstance(model_id, str) and model_id.strip().startswith(
+        PLATFORM_MODEL_ID_PREFIX
+    )
+
+
+def _ensure_ordinary_model(model: Model) -> None:
+    if is_platform_model_id(model.model_id) or (
+        model.managed_by == PLATFORM_MODEL_MANAGER
+    ):
+        raise PlatformModelIdentityError(
+            "Platform-managed models cannot be mutated through ordinary model storage"
+        )
+
 
 def _create_llm_instance(db_model: Model) -> BaseLLM:
     if db_model.category == "llm":
@@ -169,6 +193,15 @@ class CoreStorage:
     def store(self, model: ModelConfig) -> None:
         """Store model configuration to database."""
 
+        if is_platform_model_id(model.id):
+            raise PlatformModelIdentityError(
+                "Model IDs beginning with 'platform/' are reserved"
+            )
+        self._store(model)
+
+    def _store(self, model: ModelConfig, *, managed_by: str | None = None) -> None:
+        """Persist a model, with provenance available only to trusted wrappers."""
+
         db_data: dict[str, Any] = {
             "model_id": model.id,
             "model_name": model.model_name,
@@ -178,6 +211,7 @@ class CoreStorage:
             "description": model.description,
             "max_retries": model.max_retries,
             "is_active": True,
+            "managed_by": managed_by,
         }
 
         if isinstance(model, ChatModelConfig):
@@ -264,6 +298,7 @@ class CoreStorage:
             self.db.query(self.Model).filter(self.Model.model_id == model_id).first()
         )
         if db_model:
+            _ensure_ordinary_model(db_model)
             self.db.delete(db_model)
             self.db.commit()
 
@@ -402,7 +437,11 @@ class CoreStorage:
             # Strip whitespace from model_id
             model_id = model_id.strip() if isinstance(model_id, str) else model_id
 
-            model_config = self.load(model_id)
+            db_model = self.get_db_model(model_id)
+            if db_model is None:
+                raise ValueError(f"Model not found: {model_id}")
+            _ensure_ordinary_model(db_model)
+            model_config = self._db_model_to_config(db_model)
 
             # Strip whitespace from string fields
             for key, value in kwargs.items():
@@ -478,9 +517,50 @@ class CoreStorage:
         if not db_model:
             return False
 
+        _ensure_ordinary_model(db_model)
+
         db_model.is_active = bool(is_active)  # type: ignore[assignment]
         self.db.commit()
         return True
+
+
+class PlatformModelStore:
+    """Trusted persistence boundary for host-managed platform models."""
+
+    def __init__(self, db: Session, model_class: type[Model] = Model):
+        self.db = db
+        self.Model = model_class
+        self._storage = CoreStorage(db, model_class)
+
+    def create(self, model: ModelConfig) -> Model:
+        """Create a platform model without tenant ownership or default links."""
+
+        if not is_platform_model_id(model.id):
+            raise PlatformModelIdentityError(
+                "Platform-managed model IDs must begin with 'platform/'"
+            )
+        existing = (
+            self.db.query(self.Model).filter(self.Model.model_id == model.id).first()
+        )
+        if existing is not None:
+            raise PlatformModelIdentityError(f"Model ID is already claimed: {model.id}")
+
+        self._storage._store(model, managed_by=PLATFORM_MODEL_MANAGER)
+        created = self.get(model.id)
+        assert created is not None
+        return created
+
+    def get(self, model_id: str) -> Model | None:
+        """Read an exactly matching platform-managed row."""
+
+        return (
+            self.db.query(self.Model)
+            .filter(
+                self.Model.model_id == model_id,
+                self.Model.managed_by == PLATFORM_MODEL_MANAGER,
+            )
+            .first()
+        )
 
 
 class UserAwareModelStorage:

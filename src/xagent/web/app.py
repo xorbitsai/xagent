@@ -110,6 +110,7 @@ from .services.task_lease_recovery import run_task_lease_recovery_loop
 from .services.uploaded_file_recovery import (
     run_uploaded_file_compensation_recovery_loop,
 )
+from .startup_admission import run_host_startup_admissions
 
 # Configure logging when running under gunicorn/uwsgi (no __main__.py)
 setup_logging()  # Uses XAGENT_LOG_LEVEL env var or defaults to INFO
@@ -1231,14 +1232,16 @@ app.include_router(share_router)
 app.include_router(v1_router)
 
 
-# initial database and skill manager
-@app.on_event("startup")
-async def startup_event() -> None:
-    global _migration_task
-    logger.info("Agent runtime configured: %s", get_agent_runtime())
-    validate_interaction_rollout_at_startup()
+async def _initialize_database_and_admit_runtime(app_instance: FastAPI) -> None:
+    """Prepare the database, admit the host, then open runtime work ingress."""
     with _startup_phase("database init"):
         init_db()
+
+    # Host checks may rely on the fully migrated database. Nothing below this
+    # boundary may admit tasks or launch a writer/dispatcher until every check
+    # has passed. An exception deliberately aborts startup unchanged.
+    with _startup_phase("host admission"):
+        await run_host_startup_admissions(app_instance)
 
     # Keep built-in task-runtime providers scoped to the application lifespan.
     # Register even when disabled so task creation receives a precise 403
@@ -1251,11 +1254,20 @@ async def startup_event() -> None:
 
     background_task_manager.start_accepting()
 
-    start_file_storage_startup_sync_task(app)
-    start_trigger_dispatcher_task(app)
-    start_task_lease_recovery_task(app)
-    start_uploaded_file_recovery_task(app)
-    start_orphan_upload_gc_task(app)
+    start_file_storage_startup_sync_task(app_instance)
+    start_trigger_dispatcher_task(app_instance)
+    start_task_lease_recovery_task(app_instance)
+    start_uploaded_file_recovery_task(app_instance)
+    start_orphan_upload_gc_task(app_instance)
+
+
+# initial database and skill manager
+@app.on_event("startup")
+async def startup_event() -> None:
+    global _migration_task
+    logger.info("Agent runtime configured: %s", get_agent_runtime())
+    validate_interaction_rollout_at_startup()
+    await _initialize_database_and_admit_runtime(app)
 
     # Persisted ExecutionScope snapshots (workforce sub-tasks) keep a
     # sub-task scoped across process restarts. With no resolver registered

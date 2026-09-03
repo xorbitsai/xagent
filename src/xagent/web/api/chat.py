@@ -1331,6 +1331,14 @@ class AgentServiceManager:
         self._agent_owner_ids: Dict[int, Optional[int]] = {}
         # Run generation that currently owns each cached runtime.
         self._agent_run_ids: Dict[int, str] = {}
+        # Which *acquisition* of that run owns the runtime. The run id alone
+        # cannot answer this: a resume claims the same run deliberately (so a
+        # waiting checkpoint stays readable), which makes two acquisitions of
+        # one run indistinguishable by id. A previous turn's late cleanup then
+        # matched the resume's runtime and evicted it mid-execution. Bumped on
+        # every acquisition, so a cleanup scheduled by an earlier one no longer
+        # recognizes the runtime and correctly does nothing.
+        self._agent_run_generations: Dict[int, int] = {}
         # Keep only the owner needed to retry a failed workspace cleanup.
         self._agent_cleanup_owner_ids: Dict[int, int] = {}
         self._agent_sandbox_keys: Dict[int, str] = {}
@@ -2210,6 +2218,9 @@ class AgentServiceManager:
             )
             if task_setup_snapshot is not None and task_setup_snapshot.task.run_id:
                 self._agent_run_ids[task_id] = task_setup_snapshot.task.run_id
+            self._agent_run_generations[task_id] = (
+                self._agent_run_generations.get(task_id, 0) + 1
+            )
             return agent
 
     async def _get_agent_for_task_unlocked(
@@ -3281,16 +3292,46 @@ class AgentServiceManager:
                 deferred_task_ids,
             )
 
+    def current_run_generation(self, task_id: int) -> Optional[int]:
+        """Which acquisition of this task's runtime is current, if any.
+
+        A caller that will schedule cleanup for the runtime it just acquired
+        reads this and passes it back as ``expected_run_generation``, so its
+        cleanup cannot evict a runtime a *later* acquisition owns. Needed
+        because a resume deliberately re-claims the same run id, which leaves
+        the id unable to tell two acquisitions apart.
+        """
+        return self._agent_run_generations.get(task_id)
+
     def remove_agent(
         self,
         task_id: int,
         user_id: Optional[int] = None,
         *,
         expected_run_id: Optional[str] = None,
+        expected_run_generation: Optional[int] = None,
     ) -> None:
         """Clean a task runtime only for the run that scheduled cleanup."""
         current_run_id = self._agent_run_ids.get(task_id)
+        current_generation = self._agent_run_generations.get(task_id)
         build_lock = self._agent_build_locks.get(task_id)
+        # Checked before the run-id comparison and independently of it: within
+        # one run, the generation is the only thing that distinguishes the
+        # acquisition that scheduled this cleanup from a later one that now
+        # owns the runtime.
+        if (
+            expected_run_generation is not None
+            and current_generation is not None
+            and current_generation != expected_run_generation
+        ):
+            logger.info(
+                "Skipping stale runtime cleanup for task %s generation %s; "
+                "current generation is %s",
+                task_id,
+                expected_run_generation,
+                current_generation,
+            )
+            return
         if expected_run_id is not None and (
             (current_run_id is not None and current_run_id != expected_run_id)
             or (build_lock is not None and build_lock.locked())
@@ -3337,6 +3378,7 @@ class AgentServiceManager:
             self._agents.pop(task_id, None)
             self._agent_owner_ids.pop(task_id, None)
             self._agent_run_ids.pop(task_id, None)
+            self._agent_run_generations.pop(task_id, None)
             self._agent_sandbox_keys.pop(task_id, None)
             self._agent_sandbox_providers.pop(task_id, None)
             self._agent_scope_fingerprints.pop(task_id, None)

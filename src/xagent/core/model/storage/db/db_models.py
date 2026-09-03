@@ -46,6 +46,7 @@ def create_model_table(Base: Type[Any]) -> Type[Any]:
             JSON, nullable=True
         )  # Model abilities: ["chat", "vision", etc.]
         description = Column(Text, nullable=True)
+        managed_by = Column(String(50), nullable=True)
         max_retries = Column(Integer, nullable=True, default=10)
         created_at = Column(DateTime(timezone=True), server_default=func.now())
         updated_at = Column(DateTime(timezone=True), onupdate=func.now())

@@ -964,16 +964,29 @@ def test_normalize_args_by_schema_falls_back_to_raw_wrap_for_non_list_json(value
     assert normalized["dimensions"] == [value]
 
 
-def test_normalize_args_by_schema_falls_back_to_raw_wrap_on_recursion_error():
+def test_normalize_args_by_schema_falls_back_to_raw_wrap_on_recursion_error(
+    monkeypatch,
+):
     """A pathologically deep bracket string makes json.loads raise
     RecursionError rather than JSONDecodeError. That must be treated the
     same as any other unparsable value (fall back to the raw wrap), not
-    propagate as an unhandled exception."""
+    propagate as an unhandled exception.
+
+    The nesting needed to actually trigger RecursionError (tens of
+    thousands of characters) is itself well past the recovery length cap,
+    so the cap is raised here — same as the digit-limit test below — to
+    reach json.loads at all and genuinely exercise the RecursionError
+    branch, rather than the length guard short-circuiting first.
+    """
+    monkeypatch.setattr(
+        MCPToolAdapter, "_ARRAY_ARG_JSON_RECOVERY_MAX_CHARS", 1_000_000, raising=True
+    )
     adapter = MCPToolAdapter(
         mcp_tool=_google_analytics_run_report_mcp_tool(),
         connection={"transport": "stdio", "command": "python", "args": []},
     )
     deeply_nested = "[" * 100_000 + "]" * 100_000
+    assert len(deeply_nested) <= adapter._ARRAY_ARG_JSON_RECOVERY_MAX_CHARS
 
     normalized = adapter._normalize_args_by_schema(
         {"property_id": "550713710", "dimensions": deeply_nested}

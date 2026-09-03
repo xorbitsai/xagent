@@ -63,7 +63,8 @@ def test_upgrade_inserts_zendesk(tmp_path):
         assert "zendesk" in _app_ids(connection)
         row = connection.execute(
             text(
-                "SELECT transport, provider_name, launch_config FROM public_mcp_apps"
+                "SELECT transport, provider_name, launch_config, "
+                "is_visible_in_connector FROM public_mcp_apps"
                 " WHERE app_id='zendesk'"
             )
         ).first()
@@ -72,6 +73,11 @@ def test_upgrade_inserts_zendesk(tmp_path):
         assert "xagent.web.tools.mcp.zendesk" in str(row[2])
         for env_key in ("ZENDESK_SUBDOMAIN", "ZENDESK_EMAIL", "ZENDESK_API_TOKEN"):
             assert env_key in str(row[2])
+        # Assert the persisted column value, not just dict agreement
+        # (test_seed_row_matches_registry): the table DDL defaults this
+        # column to 1, so a dropped/mistyped key would ship the connector
+        # visible.
+        assert row[3] == 0
 
 
 def test_upgrade_is_idempotent(tmp_path):
@@ -88,7 +94,10 @@ def test_upgrade_is_idempotent(tmp_path):
         assert rows == 1
 
 
-def test_upgrade_warns_and_still_inserts_when_column_missing(tmp_path):
+def test_upgrade_still_inserts_when_non_visibility_column_missing(tmp_path):
+    """A column other than is_visible_in_connector missing (e.g.
+    description) must not block seeding -- only is_visible_in_connector's
+    absence is load-bearing enough to fail loudly."""
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
     with engine.begin() as connection:
@@ -109,6 +118,76 @@ def test_upgrade_warns_and_still_inserts_when_column_missing(tmp_path):
         with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()
         assert "zendesk" in _app_ids(connection)
+
+
+def test_upgrade_raises_if_visibility_column_is_missing(tmp_path):
+    """is_visible_in_connector is load-bearing for the hidden-rollout gate
+    this row ships behind, so its absence must fail loudly rather than let
+    the column-filter silently drop it and fall back to the table's
+    visible-by-default."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE public_mcp_apps (
+                    id INTEGER PRIMARY KEY,
+                    app_id VARCHAR(100) NOT NULL UNIQUE,
+                    name VARCHAR(200) NOT NULL,
+                    description TEXT,
+                    icon VARCHAR(1000),
+                    transport VARCHAR(50) NOT NULL DEFAULT 'oauth',
+                    provider_name VARCHAR(50),
+                    category VARCHAR(100),
+                    oauth_scopes JSON,
+                    launch_config JSON
+                )
+                """
+            )
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            try:
+                migration.upgrade()
+                raised = False
+            except RuntimeError as exc:
+                raised = True
+                assert "is_visible_in_connector" in str(exc)
+        assert raised, "upgrade() must raise when the visibility column is missing"
+        assert "zendesk" not in _app_ids(connection)
+
+
+def test_upgrade_forces_hidden_on_a_preexisting_colliding_row(tmp_path):
+    """N1: a hand-created row with this app_id (visible by the table
+    default) would otherwise survive the collision branch untouched -- and
+    the builtin registry overlays the real launch config onto any row
+    sharing the app_id at read time, silently yielding a visible, working
+    Zendesk connector and defeating the hidden-rollout gate. The collision
+    branch must enforce hidden instead of returning early, without
+    inserting a duplicate or touching the operator's other fields."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection)
+        connection.execute(
+            text(
+                "INSERT INTO public_mcp_apps "
+                "(app_id, name, description, transport, is_visible_in_connector) "
+                "VALUES ('zendesk', 'Operator Zendesk', 'hand-made', "
+                "'stdio', 1)"
+            )
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+        row = connection.execute(
+            text(
+                "SELECT COUNT(*), MIN(is_visible_in_connector), MIN(name) "
+                "FROM public_mcp_apps WHERE app_id='zendesk'"
+            )
+        ).first()
+        assert row[0] == 1  # no duplicate inserted
+        assert row[1] == 0  # forced hidden
+        assert row[2] == "Operator Zendesk"  # other fields left alone
 
 
 def test_seed_row_matches_registry():

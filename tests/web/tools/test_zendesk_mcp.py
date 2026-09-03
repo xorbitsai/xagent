@@ -250,6 +250,19 @@ def test_cursor_page_rejects_non_list_field():
         zendesk._cursor_page({"tickets": "not-a-list"}, "tickets", limit=10)
 
 
+def test_cursor_page_raises_when_more_results_but_no_cursor():
+    # Zendesk's cursor-pagination contract guarantees after_cursor whenever
+    # has_more is true (or the page overflowed limit) -- a response that
+    # violates that must fail loudly rather than hand back a has_more=true
+    # page the caller can never resume past.
+    with pytest.raises(RuntimeError, match="resume cursor"):
+        zendesk._cursor_page(
+            {"tickets": [{"id": 1}, {"id": 2}], "meta": {"has_more": True}},
+            "tickets",
+            limit=1,
+        )
+
+
 def test_offset_page_has_more_when_next_page_present():
     page, has_more = zendesk._offset_page(
         {"results": [{"id": 1}], "next_page": "https://acme.zendesk.com/x"},
@@ -459,6 +472,25 @@ def test_search_clamps_page_to_at_least_one(monkeypatch):
     assert mock_request.call_args.kwargs["params"]["page"] == 1
 
 
+def test_search_returns_empty_past_result_window_without_calling_zendesk(monkeypatch):
+    # Past Zendesk's own documented result-window ceiling, Zendesk itself
+    # would answer with an opaque HTTP error -- a caller mechanically
+    # incrementing `page` must get a clean "no more results" instead.
+    mock_request = Mock()
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+    page = zendesk._MAX_SEARCH_RESULT_WINDOW // 100 + 1
+
+    result = json.loads(zendesk.zendesk_search("type:ticket", limit=100, page=page))
+
+    assert result == {
+        "status": "success",
+        "results": [],
+        "count": None,
+        "has_more": False,
+    }
+    mock_request.assert_not_called()
+
+
 def test_list_tickets_sends_page_size_and_cursor(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(
@@ -472,6 +504,58 @@ def test_list_tickets_sends_page_size_and_cursor(monkeypatch):
     params = mock_request.call_args.kwargs["params"]
     assert params["page[size]"] == 10
     assert params["page[after]"] == "cur1"
+
+
+def test_list_tickets_caps_output_size(monkeypatch):
+    big_tickets = [{"id": i, "subject": "x" * 1000} for i in range(50)]
+    monkeypatch.setattr(
+        zendesk._session,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={"tickets": big_tickets, "meta": {"has_more": False}}
+            )
+        ),
+    )
+    monkeypatch.setattr(zendesk, "get_tool_max_output_length", lambda: 2000)
+
+    raw = zendesk.zendesk_list_tickets(limit=50)
+    result = json.loads(raw)
+
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert 0 < len(result["tickets"]) < len(big_tickets)
+    assert len(raw) <= 2000 + 200  # last halving step can overshoot
+
+
+def test_list_tickets_truncation_retries_same_page_not_zendesks_next_page(monkeypatch):
+    # A truncated page must report ITS OWN input cursor so the caller
+    # retries the same starting point with a smaller limit -- returning
+    # Zendesk's real after_cursor instead would skip every item this call
+    # couldn't fit, silently dropping them for good.
+    big_tickets = [{"id": i, "subject": "x" * 1000} for i in range(50)]
+    monkeypatch.setattr(
+        zendesk._session,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "tickets": big_tickets,
+                    "meta": {
+                        "has_more": True,
+                        "after_cursor": "zendesks_real_next_cursor",
+                    },
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(zendesk, "get_tool_max_output_length", lambda: 2000)
+
+    result = json.loads(zendesk.zendesk_list_tickets(limit=50, after_cursor="cur0"))
+
+    assert result["truncated"] is True
+    assert result["has_more"] is True
+    assert result["after_cursor"] == "cur0"
 
 
 def test_get_ticket_returns_summary(monkeypatch):
@@ -489,6 +573,22 @@ def test_get_ticket_returns_summary(monkeypatch):
 
     assert result["status"] == "success"
     assert result["ticket"]["subject"] == "Help"
+
+
+def test_get_ticket_accepts_agent_ui_url(monkeypatch):
+    # A caller copying a link out of the Zendesk agent UI (rather than a
+    # bare id) must resolve to the same ticket, not error out.
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"ticket": {"id": 123, "subject": "Help"}})
+    )
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    result = json.loads(
+        zendesk.zendesk_get_ticket("https://acme.zendesk.com/agent/tickets/123")
+    )
+
+    assert result["status"] == "success"
+    assert mock_request.call_args.kwargs["url"].endswith("/tickets/123.json")
 
 
 def test_create_ticket_requires_subject_and_comment():
@@ -586,6 +686,17 @@ def test_update_ticket_cleans_tags(monkeypatch):
     assert body["ticket"]["tags"] == ["vip", "priority"]
 
 
+def test_update_ticket_sends_assignee_and_group(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"ticket": {"id": 1}}))
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    result = json.loads(zendesk.zendesk_update_ticket(1, assignee_id=42, group_id=7))
+
+    assert result["status"] == "success"
+    body = mock_request.call_args.kwargs["json"]
+    assert body["ticket"] == {"assignee_id": 42, "group_id": 7}
+
+
 def test_update_ticket_clears_tags_with_explicit_empty_list(monkeypatch):
     mock_request = Mock(return_value=MockResponse(json_data={"ticket": {"id": 1}}))
     monkeypatch.setattr(zendesk._session, "request", mock_request)
@@ -616,7 +727,7 @@ def test_list_ticket_comments_returns_summaries(monkeypatch):
     result = json.loads(zendesk.zendesk_list_ticket_comments(1))
 
     assert result["status"] == "success"
-    assert result["comments"]["comments"][0]["body"] == "Hi"
+    assert result["comments"][0]["body"] == "Hi"
 
 
 def test_reply_to_ticket_sends_public_true(monkeypatch):
@@ -656,6 +767,60 @@ def test_add_comment_rejects_blank_body():
     assert result["status"] == "error"
 
 
+def test_reply_to_ticket_returns_created_comment_from_audit_events(monkeypatch):
+    # PUT /tickets/{id}.json returns {"ticket": ..., "audit": {"events":
+    # [...]}} -- the just-created comment's own id/body/public only appear
+    # in the audit trail, not in the "ticket" object itself.
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={
+                "ticket": {"id": 1, "status": "open"},
+                "audit": {
+                    "events": [
+                        {"type": "Create"},
+                        {
+                            "type": "Comment",
+                            "id": 999,
+                            "body": "Thanks for reaching out",
+                            "public": True,
+                            "author_id": 5,
+                        },
+                    ]
+                },
+            }
+        )
+    )
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    result = json.loads(zendesk.zendesk_reply_to_ticket(1, "Thanks for reaching out"))
+
+    assert result["status"] == "success"
+    assert result["ticket"]["id"] == 1
+    assert result["comment"] == {
+        "id": 999,
+        "author_id": 5,
+        "body": "Thanks for reaching out",
+        "public": True,
+        "created_at": None,
+    }
+
+
+def test_add_internal_note_returns_none_comment_when_audit_missing(monkeypatch):
+    # Not every Zendesk response necessarily carries an audit trail (e.g.
+    # a stubbed/older API version) -- the comment field must degrade to
+    # None rather than raise.
+    monkeypatch.setattr(
+        zendesk._session,
+        "request",
+        Mock(return_value=MockResponse(json_data={"ticket": {"id": 1}})),
+    )
+
+    result = json.loads(zendesk.zendesk_add_internal_note(1, "Escalating to tier 2"))
+
+    assert result["status"] == "success"
+    assert result["comment"] is None
+
+
 def test_list_users_returns_summaries(monkeypatch):
     monkeypatch.setattr(
         zendesk._session,
@@ -673,7 +838,7 @@ def test_list_users_returns_summaries(monkeypatch):
     result = json.loads(zendesk.zendesk_list_users())
 
     assert result["status"] == "success"
-    assert result["users"]["users"][0]["email"] == "jane@example.com"
+    assert result["users"][0]["email"] == "jane@example.com"
 
 
 def test_get_user_returns_summary(monkeypatch):
@@ -689,10 +854,39 @@ def test_get_user_returns_summary(monkeypatch):
     assert result["user"]["name"] == "Jane"
 
 
+def test_get_user_accepts_agent_ui_url(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"user": {"id": 42, "name": "Jane"}})
+    )
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    result = json.loads(
+        zendesk.zendesk_get_user("https://acme.zendesk.com/agent/users/42")
+    )
+
+    assert result["status"] == "success"
+    assert mock_request.call_args.kwargs["url"].endswith("/users/42.json")
+
+
 def test_search_users_requires_non_blank_query():
     result = json.loads(zendesk.zendesk_search_users(""))
 
     assert result["status"] == "error"
+
+
+def test_search_users_returns_empty_past_result_window_without_calling_zendesk(
+    monkeypatch,
+):
+    mock_request = Mock()
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+    page = zendesk._MAX_SEARCH_RESULT_WINDOW // 100 + 1
+
+    result = json.loads(
+        zendesk.zendesk_search_users("jane@example.com", limit=100, page=page)
+    )
+
+    assert result == {"status": "success", "users": [], "has_more": False}
+    mock_request.assert_not_called()
 
 
 def test_search_users_sends_query_and_page_params(monkeypatch):
@@ -731,7 +925,7 @@ def test_list_organizations_returns_summaries(monkeypatch):
     result = json.loads(zendesk.zendesk_list_organizations())
 
     assert result["status"] == "success"
-    assert result["organizations"]["organizations"][0]["name"] == "Acme"
+    assert result["organizations"][0]["name"] == "Acme"
 
 
 def test_get_organization_returns_summary(monkeypatch):
@@ -749,6 +943,22 @@ def test_get_organization_returns_summary(monkeypatch):
 
     assert result["status"] == "success"
     assert result["organization"]["name"] == "Acme"
+
+
+def test_get_organization_accepts_agent_ui_url(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"organization": {"id": 7, "name": "Acme"}})
+    )
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    result = json.loads(
+        zendesk.zendesk_get_organization(
+            "https://acme.zendesk.com/agent/organizations/7"
+        )
+    )
+
+    assert result["status"] == "success"
+    assert mock_request.call_args.kwargs["url"].endswith("/organizations/7.json")
 
 
 def test_session_is_a_requests_session():
@@ -780,10 +990,17 @@ def test_session_is_a_requests_session():
             # tags=[] (an explicit, meaningful empty list) is the one field
             # that satisfies "at least one of status/priority/tags must be
             # provided" without reintroducing a truthy status/priority.
-            {"ticket_id": 1, "status": None, "priority": None, "tags": []},
+            {
+                "ticket_id": "1",
+                "status": None,
+                "priority": None,
+                "tags": [],
+                "assignee_id": None,
+                "group_id": None,
+            },
         ),
         ("zendesk_list_tickets", {"limit": 25, "after_cursor": None}),
-        ("zendesk_list_ticket_comments", {"ticket_id": 1, "after_cursor": None}),
+        ("zendesk_list_ticket_comments", {"ticket_id": "1", "after_cursor": None}),
         ("zendesk_list_users", {"after_cursor": None}),
         ("zendesk_list_organizations", {"after_cursor": None}),
     ],

@@ -282,6 +282,13 @@ def test_redact_sensitive_text_masks_bearer_and_header_keys() -> None:
     assert "my_api_key" not in redacted
 
 
+def test_redact_sensitive_text_masks_basic_auth() -> None:
+    text = "Authorization: Basic am9objpzZWNyZXQtcGFzcw=="
+    redacted = redact_sensitive_text(text)
+
+    assert "am9objpzZWNyZXQtcGFzcw==" not in redacted
+
+
 def test_redact_sensitive_text_masks_assignment_style_secrets() -> None:
     text = "api_key=sk-super-secret timeout=30"
     redacted = redact_sensitive_text(text)

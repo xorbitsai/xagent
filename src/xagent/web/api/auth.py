@@ -237,6 +237,38 @@ def _normalize_deputy_endpoint(raw_endpoint: object) -> Optional[str]:
     return f"{parsed.scheme}://{hostname}{port}"
 
 
+_MYOB_BUSINESS_ID_PATTERN = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
+
+def _normalize_myob_business_id(raw_business_id: object) -> Optional[str]:
+    """Validate the `businessId` MYOB appends to its own authorization
+    redirect as a well-formed GUID.
+
+    This is the *only* place MYOB ever names the business the user
+    consented to -- never the token response (unlike every other
+    per-connection identifier this file normalizes, e.g. Salesforce's/
+    Deputy's), and there is no discovery endpoint to recover it after the
+    fact the way Xero's /connections is: MYOB's own equivalent (GET
+    https://api.myob.com/accountright/) stopped returning company files
+    for API keys created under the post-2025 granular-scope model. So a
+    malformed or missing value here is unrecoverable for this connection,
+    not just a "let a later call fail with a clear error" case the way an
+    unvalidated instance_url elsewhere would be. UserOAuth.instance_url
+    stores this (myob.py reads it via env_mapping's "instance_url" token
+    type, the same mechanism Salesforce/Deputy already use for their own
+    per-connection value), so it's checked with the same strictness here as
+    at connect time, not left to fail opaquely on the first tool call.
+    """
+    if not isinstance(raw_business_id, str):
+        return None
+    business_id = raw_business_id.strip()
+    if not _MYOB_BUSINESS_ID_PATTERN.match(business_id):
+        return None
+    return business_id
+
+
 def _resolve_oauth_secret(
     provider: str, encrypted_value: Optional[str], env_suffix: str
 ) -> str:
@@ -2242,6 +2274,14 @@ def _generic_oauth_login(
         # (read only) followed by an app-scoped connect (read+write) is
         # guaranteed to end up with the broader grant either way.
         params["prompt"] = "consent"
+    if provider.lower() == "myob":
+        # Unlike every other provider's prompt=consent above, this isn't
+        # about re-prompting for a broader grant -- MYOB only appends
+        # businessId (the company file the user picked) to the
+        # authorization redirect at all when the request forces the
+        # consent screen. Without this, the callback's businessId guard
+        # (see _normalize_myob_business_id) would reject every connection.
+        params["prompt"] = "consent"
     meta_config_id = _meta_login_config_id() if provider.lower() == "meta" else ""
     if meta_config_id:
         params["config_id"] = meta_config_id
@@ -2373,11 +2413,21 @@ def generic_oauth_callback(
     # `normalized_provider` precedent, rather than re-lowering/re-comparing
     # the same string five separate times across the function.
     is_deputy = provider.lower() == "deputy"
+    is_myob = provider.lower() == "myob"
     if db is None:
         raise RuntimeError("db session is required")
     code = request.query_params.get("code")
     state = request.query_params.get("state")
     error = request.query_params.get("error")
+    # MYOB appends this to the redirect itself, not the token response --
+    # captured from the raw request here (not deferred to after the token
+    # exchange, the way Deputy's `endpoint`/Salesforce's `instance_url` are
+    # read from token_data below) because it never appears anywhere else.
+    myob_business_id = (
+        _normalize_myob_business_id(request.query_params.get("businessId"))
+        if is_myob
+        else None
+    )
     provider_error_response = (
         HTMLResponse(
             content=f"<h1>Error: {html.escape(str(error))}</h1>", status_code=400
@@ -2630,6 +2680,12 @@ def generic_oauth_callback(
                 )
                 or "longlife_refresh_token"
             )
+        # MYOB's own docs list `scope` as required here too, but the
+        # production-grade pymyob SDK's code-exchange request omits it and
+        # works -- client_id/client_secret/redirect_uri (sent below/above
+        # for every provider already) are what MYOB's endpoint actually
+        # checks. Trusting the working implementation over the stale docs;
+        # revisit if MYOB ever starts rejecting exchanges without it.
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
         if requires_json_accept_header(provider):
             headers["Accept"] = "application/json"
@@ -2827,6 +2883,28 @@ def generic_oauth_callback(
                 status_code=400,
             )
 
+        if is_myob and not myob_business_id:
+            # myob_business_id was already extracted (and validated as a
+            # GUID) from the raw callback request before the token exchange
+            # above -- unlike Deputy/Salesforce, there is no token_data
+            # field to re-derive it from here, so a missing/malformed value
+            # at this point can only mean MYOB's own redirect never carried
+            # one (or carried a value astray of the documented GUID shape).
+            # Same "fail before the delete-then-recreate below" reasoning as
+            # the Salesforce/Deputy guards: this connector's env_mapping
+            # requires it, so letting this through would either come back
+            # unavailable on the next load or destroy a prior *working*
+            # grant while still reporting "Connected Successfully".
+            return HTMLResponse(
+                content=(
+                    "<h1>Error exchanging token</h1>"
+                    f"<p>{html.escape(provider)} did not return a businessId. "
+                    "Make sure the authorization request included "
+                    "prompt=consent.</p>"
+                ),
+                status_code=400,
+            )
+
         provider_user_id = None
         email = None
 
@@ -2951,6 +3029,28 @@ def generic_oauth_callback(
                         f"{html.escape(str(e))}</p>"
                     ),
                     status_code=400,
+                )
+        elif is_myob:
+            # MYOB's userinfo_url is deliberately left empty (see the
+            # registry row's comment) -- unlike Deputy/Linear, there's no
+            # extra round-trip to skip a fixed host for: MYOB's token
+            # response already embeds the identity inline as
+            # `user: {uid, username}`, so this only reads what's already in
+            # hand from the exchange above.
+            raw_user = token_data.get("user")
+            if isinstance(raw_user, dict):
+                raw_provider_user_id = raw_user.get("uid")
+                provider_user_id = (
+                    str(raw_provider_user_id)
+                    if isinstance(raw_provider_user_id, (str, int))
+                    and str(raw_provider_user_id)
+                    else None
+                )
+                raw_username = raw_user.get("username")
+                email = (
+                    raw_username
+                    if isinstance(raw_username, str) and raw_username
+                    else None
                 )
         elif userinfo_url and access_token:
             info_headers = {"Authorization": f"Bearer {access_token}"}
@@ -3107,6 +3207,12 @@ def generic_oauth_callback(
                 # already-guarded, normalized value from above (Deputy
                 # can't reach this branch without it).
                 resolved_instance_url = deputy_instance_url
+            elif is_myob:
+                # MYOB's equivalent is the company file GUID from the
+                # authorization redirect, not anything in token_data --
+                # myob_business_id is the already-guarded value from above
+                # (MYOB can't reach this branch without it).
+                resolved_instance_url = myob_business_id
             setattr(oauth_account, "instance_url", resolved_instance_url)
             if "expires_in" in token_data:
                 setattr(

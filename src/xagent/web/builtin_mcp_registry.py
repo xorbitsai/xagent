@@ -346,6 +346,32 @@ def get_builtin_oauth_provider_rows() -> list[dict[str, Any]]:
                 "read:me",
             ],
         },
+        {
+            "provider_name": "myob",
+            "name": "MYOB",
+            "client_id": os.environ.get("MYOB_CLIENT_ID", ""),
+            "client_secret": os.environ.get("MYOB_CLIENT_SECRET", ""),
+            "auth_url": "https://secure.myob.com/oauth2/account/authorize/",
+            "token_url": "https://secure.myob.com/oauth2/v1/authorize/",
+            "redirect_uri": os.environ.get("MYOB_REDIRECT_URI", ""),
+            # MYOB has no dedicated userinfo endpoint -- the token response
+            # already embeds identity inline as `user: {uid, username}`, so
+            # generic_oauth_callback's `elif userinfo_url and access_token:`
+            # REST-GET branch is skipped entirely (left empty, same as
+            # Deputy/Linear/Salesforce above for their own reasons); identity
+            # instead comes from a dedicated `elif is_myob` branch there that
+            # reads those two fields straight off token_data.
+            "userinfo_url": "",
+            "user_id_path": "",
+            "email_path": "",
+            # Empty, not identity-only like zoom/github above: MYOB has no
+            # separate identity scope to request, and every functional scope
+            # this connector needs is granular (AuthAccount-scoped, e.g.
+            # sme-sales/sme-contacts-customer) and app-specific, so it lives
+            # on the app row's oauth_scopes below instead, merged in at
+            # authorize time by _merge_oauth_scopes.
+            "default_scopes": [],
+        },
     ]
 
 
@@ -1194,6 +1220,68 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                 "command": "python",
                 "args": ["-m", "xagent.web.tools.mcp.chartmogul"],
                 "required_env": ["CHARTMOGUL_API_KEY"],
+            },
+        },
+        {
+            "app_id": "myob",
+            "name": "MYOB",
+            "description": "Connect to MYOB AccountRight to look up contacts, invoices, purchase bills, and general ledger accounts.",
+            "icon": "https://www.google.com/s2/favicons?domain=myob.com&sz=128",
+            "transport": "oauth",
+            "provider_name": "myob",
+            "category": "Operations",
+            # Granular AuthAccount scopes (MYOB retired the old blanket
+            # CompanyFile scope) matching the tool set this connector
+            # exposes -- sme-company-file for myob_get_business_info, the
+            # rest one per resource family (contacts/sales/purchases/
+            # general ledger). Deliberately excludes sme-banking (no
+            # banking tools exposed) and sme-payroll/sme-contacts-employee/
+            # sme-contacts-personal/sme-timebilling (no payroll or
+            # personal-employee-data tools) -- nothing here would justify
+            # requesting access to any of them.
+            "oauth_scopes": [
+                "sme-company-file",
+                "sme-contacts-customer",
+                "sme-contacts-supplier",
+                "sme-sales",
+                "sme-purchases",
+                "sme-general-ledger",
+            ],
+            "is_visible_in_connector": True,
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.myob"],
+                "env_mapping": {
+                    "MYOB_ACCESS_TOKEN": "access_token",
+                    # The company file GUID captured from the authorization
+                    # redirect (see api/auth.py's is_myob handling) -- same
+                    # instance_url mechanism Salesforce/Deputy already use
+                    # for their own per-connection value, just sourced from
+                    # a different place in the OAuth flow.
+                    "MYOB_BUSINESS_ID": "instance_url",
+                },
+                # x-myobapi-key identifies the calling *application*, not the
+                # end user -- every MYOB connection made by this deployment
+                # uses the same client_id, so it's forwarded verbatim from
+                # this process's own env rather than threaded through
+                # env_mapping like the per-user access token above.
+                # Unlike Google Ads' developer-token static_env above,
+                # MYOB_CLIENT_ID is also the same value the OAuth login/
+                # token-exchange flow resolves via _resolve_oauth_secret
+                # (DB-first, env-fallback -- see the provider row above and
+                # admin_mcp.py's provider-edit routes). static_env itself
+                # only ever reads the bare host env var, with no DB
+                # fallback of its own, so an admin who configures MYOB's
+                # client_id purely through the admin UI (never setting this
+                # env var) would see OAuth connect succeed while every
+                # actual myob_*.py tool call then fails on a missing
+                # MYOB_API_KEY -- a real deployment footgun, not just a
+                # theoretical one, but one shared by static_env's design
+                # generally rather than something specific to fix here.
+                # MYOB_CLIENT_ID must be set as an env var for this
+                # connector to work, even if client_id/client_secret are
+                # also configured via the admin UI.
+                "static_env": {"MYOB_API_KEY": "MYOB_CLIENT_ID"},
             },
         },
     ]

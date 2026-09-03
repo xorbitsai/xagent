@@ -649,6 +649,72 @@ def _fetch_deputy_identity(
     return provider_user_id, email
 
 
+_EMPLOYMENT_HERO_API_BASE = "https://api.employmenthero.com/api/v1"
+
+
+def _fetch_employment_hero_identity(
+    access_token: str,
+) -> tuple[Optional[str], Optional[str]]:
+    """Fetch the accessible organisations for this grant from Employment
+    Hero's `GET /organisations` -- the same endpoint employment_hero.py's own
+    employment_hero_list_organisations tool calls, and the closest thing to
+    an identity check a token exposes (Employment Hero has no OIDC-style
+    "me" endpoint, per the registry row's comment). Employment Hero grants
+    are org-scoped rather than user-scoped, so there is no email to return;
+    the sorted, joined set of organisation ids becomes provider_user_id
+    instead -- distinguishing tokens by the organisations they can reach
+    gives UserOAuth's (user_id, provider, provider_user_id) uniqueness
+    constraint a real value to key on. Without this, two concurrent
+    callbacks for the same user (a double-clicked Connect button, or two
+    open tabs) would each insert a row with provider_user_id=None, which
+    SQL's NULL-is-never-equal-to-NULL semantics lets the unique index pass
+    straight through -- the same race Salesforce's token-id fallback and
+    Deputy/Linear's own identity fetches each close for their provider (see
+    the Salesforce branch's comment above).
+
+    A grant with zero accessible organisations returns (None, None) rather
+    than failing the whole connect -- a token scoped to no organisation at
+    all is an edge case no tool in this connector could do anything useful
+    with anyway, so a hard connect-time error would be disproportionate;
+    the duplicate-row race is simply not closed for that one case, the same
+    tradeoff _fetch_deputy_identity accepts when Deputy's employee object is
+    missing every id-like key.
+
+    Raises RuntimeError on a failed/unparsable response, matching
+    _fetch_deputy_identity/_fetch_linear_viewer_identity.
+    """
+    response = requests.get(
+        f"{_EMPLOYMENT_HERO_API_BASE}/organisations",
+        headers={"Authorization": f"Bearer {access_token}"},
+        params={"page_index": 1, "item_per_page": 100},
+        timeout=10.0,
+    )
+    if response.status_code != 200:
+        detail = truncate_error_text(response.text.strip(), limit=500)
+        raise RuntimeError(
+            f"Employment Hero API error (status {response.status_code})"
+            + (f": {detail}" if detail else "")
+        )
+    try:
+        payload = response.json()
+    except ValueError:
+        raise RuntimeError(
+            "Employment Hero API returned a non-JSON response: "
+            f"{truncate_error_text(response.text.strip(), limit=500)}"
+        ) from None
+    data = payload.get("data") if isinstance(payload, dict) else None
+    items = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        raise RuntimeError("Employment Hero API returned an unexpected response body")
+    organisation_ids = sorted(
+        str(item["id"])
+        for item in items
+        if isinstance(item, dict) and item.get("id") not in (None, "")
+    )
+    provider_user_id = ",".join(organisation_ids) if organisation_ids else None
+    return provider_user_id, None
+
+
 def create_access_token(
     data: Dict[str, Any], expires_delta: Optional[timedelta] = None
 ) -> str:
@@ -2955,6 +3021,46 @@ def generic_oauth_callback(
                         "<h1>Error verifying the connected account</h1>"
                         f"<p>Could not reach Deputy to verify the connection: "
                         f"{html.escape(str(e))}</p>"
+                    ),
+                    status_code=400,
+                )
+        elif matches_provider_family(provider, "employment-hero"):
+            # Employment Hero's userinfo_url is deliberately left empty (see
+            # the registry row's comment) -- there's no OIDC-style "me"
+            # endpoint to point the generic `elif userinfo_url and
+            # access_token:` branch below at. Without a dedicated identity
+            # fetch here, provider_user_id would stay permanently NULL for
+            # every Employment Hero grant, the same gap Salesforce's
+            # token-id fallback above exists to close -- except Employment
+            # Hero's token response carries no equivalent "id" field, so
+            # _fetch_employment_hero_identity makes the extra request
+            # instead, mirroring Deputy/Linear's own dedicated fetches.
+            try:
+                provider_user_id, email = _fetch_employment_hero_identity(access_token)
+            except RuntimeError as e:
+                # A deliberate failure raised by _fetch_employment_hero_
+                # identity itself -- Employment Hero's API responded, just
+                # not usably.
+                return HTMLResponse(
+                    content=(
+                        "<h1>Error verifying the connected account</h1>"
+                        f"<p>The provider reported: {html.escape(str(e))}</p>"
+                    ),
+                    status_code=400,
+                )
+            except Exception as e:
+                # A network-level failure (timeout, connection error) --
+                # distinct from the case above: Employment Hero never
+                # actually responded, so attributing this to "the provider
+                # reported" would be misleading.
+                logger.error(
+                    "Employment Hero identity verification failed", exc_info=True
+                )
+                return HTMLResponse(
+                    content=(
+                        "<h1>Error verifying the connected account</h1>"
+                        "<p>Could not reach Employment Hero to verify the "
+                        f"connection: {html.escape(str(e))}</p>"
                     ),
                     status_code=400,
                 )

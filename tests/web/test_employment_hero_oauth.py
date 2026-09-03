@@ -97,11 +97,16 @@ def _callback_request(user, *, code_verifier: str | None = None) -> SimpleNamesp
     return SimpleNamespace(query_params={"code": "eh-code", "state": state})
 
 
-def test_callback_exchanges_code_and_skips_userinfo_lookup(db_session, monkeypatch):
-    """Employment Hero has no identity endpoint this callback's flat userinfo
+def test_callback_exchanges_code_and_backfills_identity_from_organisations(
+    db_session, monkeypatch
+):
+    """Employment Hero has no flat userinfo endpoint this callback's generic
     lookup can use (see the provider row's comment) -- the callback must not
-    attempt a GET at all, and must still persist a connected account with a
-    NULL identity rather than erroring."""
+    attempt that generic GET, but it must still call GET /organisations to
+    derive a provider_user_id (see _fetch_employment_hero_identity's
+    docstring for why a permanently-NULL provider_user_id would otherwise
+    reopen the same duplicate-UserOAuth-row race Salesforce's token-id
+    fallback exists to close)."""
     db, user = db_session
     request = _callback_request(user, code_verifier="verifier-value")
 
@@ -115,7 +120,11 @@ def test_callback_exchanges_code_and_skips_userinfo_lookup(db_session, monkeypat
             }
         )
     )
-    get = Mock()
+    get = Mock(
+        return_value=MockResponse(
+            {"data": {"items": [{"id": "org-2"}, {"id": "org-1"}]}}
+        )
+    )
     monkeypatch.setattr(auth_api.requests, "post", post)
     monkeypatch.setattr(auth_api.requests, "get", get)
 
@@ -124,7 +133,11 @@ def test_callback_exchanges_code_and_skips_userinfo_lookup(db_session, monkeypat
     )
 
     assert response.status_code == 200
-    get.assert_not_called()
+    get.assert_called_once()
+    assert (
+        get.call_args.args[0] == "https://api.employmenthero.com/api/v1/organisations"
+    )
+    assert get.call_args.kwargs["headers"]["Authorization"] == "Bearer eh-token"
 
     data = post.call_args.kwargs["data"]
     assert data["grant_type"] == "authorization_code"
@@ -139,7 +152,7 @@ def test_callback_exchanges_code_and_skips_userinfo_lookup(db_session, monkeypat
     )
     assert oauth_account.access_token == "eh-token"
     assert oauth_account.refresh_token == "eh-refresh"
-    assert oauth_account.provider_user_id is None
+    assert oauth_account.provider_user_id == "org-1,org-2"
     assert oauth_account.email is None
 
     server = db.query(MCPServer).filter(MCPServer.name == "Employment Hero").one()
@@ -153,6 +166,107 @@ def test_callback_exchanges_code_and_skips_userinfo_lookup(db_session, monkeypat
         .one()
     )
     assert user_mcp.is_active is True
+
+
+def test_callback_persists_null_identity_when_no_organisations_accessible(
+    db_session, monkeypatch
+):
+    """A token scoped to zero organisations is an edge case no tool in this
+    connector could do anything useful with -- the connect must still
+    succeed with a NULL provider_user_id rather than erroring."""
+    db, user = db_session
+    request = _callback_request(user, code_verifier="verifier-value")
+
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {"access_token": "eh-token", "token_type": "bearer", "expires_in": 900}
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "get",
+        Mock(return_value=MockResponse({"data": {"items": []}})),
+    )
+
+    response = generic_oauth_callback(
+        "employment-hero", request, db, _employment_hero_provider()
+    )
+
+    assert response.status_code == 200
+    oauth_account = (
+        db.query(UserOAuth)
+        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "employment-hero")
+        .one()
+    )
+    assert oauth_account.provider_user_id is None
+
+
+def test_callback_reports_error_when_organisations_lookup_fails(
+    db_session, monkeypatch
+):
+    db, user = db_session
+    request = _callback_request(user, code_verifier="verifier-value")
+
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {"access_token": "eh-token", "token_type": "bearer", "expires_in": 900}
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "get",
+        Mock(return_value=MockResponse(status_code=401, text="invalid token")),
+    )
+
+    response = generic_oauth_callback(
+        "employment-hero", request, db, _employment_hero_provider()
+    )
+
+    assert response.status_code == 400
+    assert "provider reported" in response.body.decode()
+    assert (
+        db.query(UserOAuth)
+        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "employment-hero")
+        .count()
+        == 0
+    )
+
+
+def test_callback_reports_error_when_organisations_lookup_unreachable(
+    db_session, monkeypatch
+):
+    db, user = db_session
+    request = _callback_request(user, code_verifier="verifier-value")
+
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {"access_token": "eh-token", "token_type": "bearer", "expires_in": 900}
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "get",
+        Mock(side_effect=ConnectionError("timed out")),
+    )
+
+    response = generic_oauth_callback(
+        "employment-hero", request, db, _employment_hero_provider()
+    )
+
+    assert response.status_code == 400
+    assert "Could not reach Employment Hero" in response.body.decode()
 
 
 def test_callback_without_code_verifier_omits_it_from_token_exchange(
@@ -170,7 +284,11 @@ def test_callback_without_code_verifier_omits_it_from_token_exchange(
         )
     )
     monkeypatch.setattr(auth_api.requests, "post", post)
-    monkeypatch.setattr(auth_api.requests, "get", Mock())
+    monkeypatch.setattr(
+        auth_api.requests,
+        "get",
+        Mock(return_value=MockResponse({"data": {"items": []}})),
+    )
 
     response = generic_oauth_callback(
         "employment-hero", request, db, _employment_hero_provider()

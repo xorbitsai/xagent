@@ -659,12 +659,13 @@ async def test_stop_during_the_loading_message_removes_it_and_replies(
         lambda *_args: SimpleNamespace(
             runtime_user=None,
             conversation_history=(),
+            conversation_watermark=None,
             execution_recovery=TaskExecutionRecoverySnapshot(),
         ),
     )
 
     agent_service = SimpleNamespace(
-        set_conversation_history=lambda _messages: None,
+        set_conversation_history=lambda _messages, *, watermark=None: None,
         set_execution_context_messages=lambda _messages: None,
         set_recovered_skill_context=lambda _context: None,
     )
@@ -1422,7 +1423,7 @@ async def test_empty_output_edits_the_loading_message_with_a_placeholder(
 
     agent_service = SimpleNamespace(
         tracer=FakeTracer(),
-        set_conversation_history=lambda _messages: None,
+        set_conversation_history=lambda _messages, *, watermark=None: None,
         set_execution_context_messages=lambda _messages: None,
         set_recovered_skill_context=lambda _context: None,
     )
@@ -1463,6 +1464,7 @@ async def test_empty_output_edits_the_loading_message_with_a_placeholder(
         lambda *_args: SimpleNamespace(
             runtime_user=None,
             conversation_history=(),
+            conversation_watermark=None,
             execution_recovery=TaskExecutionRecoverySnapshot(),
         ),
     )
@@ -1566,7 +1568,7 @@ async def test_successful_telegram_turn_hands_finalize_the_execution_result(
 
     agent_service = SimpleNamespace(
         tracer=FakeTracer(),
-        set_conversation_history=lambda _messages: None,
+        set_conversation_history=lambda _messages, *, watermark=None: None,
         set_execution_context_messages=lambda _messages: None,
         set_recovered_skill_context=lambda _context: None,
     )
@@ -1604,6 +1606,7 @@ async def test_successful_telegram_turn_hands_finalize_the_execution_result(
         lambda *_args: SimpleNamespace(
             runtime_user=None,
             conversation_history=(),
+            conversation_watermark=None,
             execution_recovery=TaskExecutionRecoverySnapshot(),
         ),
     )
@@ -1699,7 +1702,7 @@ async def test_channel_failure_suppresses_stale_error_after_exact_settlement_rej
 
     agent_service = SimpleNamespace(
         tracer=FakeTracer(),
-        set_conversation_history=lambda _messages: None,
+        set_conversation_history=lambda _messages, *, watermark=None: None,
         set_execution_context_messages=lambda _messages: None,
         set_recovered_skill_context=lambda _context: None,
     )
@@ -1735,6 +1738,7 @@ async def test_channel_failure_suppresses_stale_error_after_exact_settlement_rej
         lambda *_args: SimpleNamespace(
             runtime_user=None,
             conversation_history=(),
+            conversation_watermark=None,
             execution_recovery=TaskExecutionRecoverySnapshot(),
         ),
     )

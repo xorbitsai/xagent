@@ -217,12 +217,15 @@ async def restore_telegram_task_context(
     task_id: int,
 ) -> None:
     """Restore prior chat transcript and execution context for a Telegram turn."""
-    from ...services.chat_history_service import load_task_transcript
+    from ...services.chat_history_service import load_task_transcript_window
     from ...services.task_execution_context_service import (
         load_task_execution_recovery_state,
     )
 
-    agent_service.set_conversation_history(load_task_transcript(db, task_id))
+    transcript_window = load_task_transcript_window(db, task_id)
+    agent_service.set_conversation_history(
+        transcript_window.messages, watermark=transcript_window.watermark
+    )
 
     recovery_state: dict[str, Any] = await load_task_execution_recovery_state(
         db, task_id

@@ -1118,11 +1118,15 @@ class ReActPattern(AgentPattern):
             )
             clock_zone_label = clock_zone.key if clock_zone is not None else "UTC"
             missing_information_instruction = (
-                "If a tool needs missing information from the user, call "
+                "If a tool needs missing information from the user, including a "
+                "fact-carrying argument value (one that asserts a real-world "
+                "fact) the user has not provided, call "
                 "ask_user_question; do not ask the question as plain assistant "
-                "text. "
+                "text and do not fill the value in yourself. "
                 if self.user_interaction_enabled
-                else "If missing user information prevents completion, do not ask "
+                else "If missing user information prevents completion, including a "
+                "fact-carrying argument value (one that asserts a real-world fact) "
+                "the user has not provided, do not ask "
                 "the user or attempt an unavailable interaction tool; finish with "
                 "outcome=blocked and explain what is missing. "
             )
@@ -2161,11 +2165,16 @@ class ReActPattern(AgentPattern):
                         "the user responds. Use this only when execution cannot "
                         "continue without missing user-provided information, such "
                         "as a required file, URL, account, target object, permission, "
+                        "a fact-carrying value (one that asserts a real-world fact) "
+                        "for a tool argument that the user has not provided, "
                         "or a choice between mutually exclusive actions with "
                         "different side effects. Do not use it to confirm execution "
                         "strategy, whether to search, whether to use memory, whether "
                         "to apply formatting preferences, or whether to proceed with "
-                        "a sufficiently specified task; decide those yourself."
+                        "a sufficiently specified task; decide those yourself. A task "
+                        "is not sufficiently specified if carrying it out would "
+                        "require inventing a fact-carrying argument value the user "
+                        "has not provided."
                     ),
                     "parameters": {
                         "type": "object",

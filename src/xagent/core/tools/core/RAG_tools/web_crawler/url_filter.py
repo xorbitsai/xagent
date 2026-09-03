@@ -28,6 +28,7 @@ class URLFilter:
         url_patterns: Optional[list[str]] = None,
         exclude_patterns: Optional[list[str]] = None,
         respect_robots_txt: bool = True,
+        user_agent: Optional[str] = None,
     ):
         """Initialize URL filter.
 
@@ -37,6 +38,9 @@ class URLFilter:
             url_patterns: Regex patterns for allowed URLs
             exclude_patterns: Regex patterns for excluded URLs
             respect_robots_txt: Whether to check robots.txt
+            user_agent: UA to send when fetching robots.txt. Must be the one
+                the crawl itself sends: a WAF that 403s an unrecognised UA
+                would otherwise be read as "this site has no rules".
         """
         normalized_base_url = normalize_web_url(base_url)
         self.base_domain = urlparse(normalized_base_url or base_url).netloc.lower()
@@ -44,6 +48,7 @@ class URLFilter:
         self.url_patterns = [re.compile(p) for p in (url_patterns or [])]
         self.exclude_patterns = [re.compile(p) for p in (exclude_patterns or [])]
         self.respect_robots_txt = respect_robots_txt
+        self.user_agent = user_agent
 
         # Initialize robots.txt parser
         self.robots_parser: Optional[RobotFileParser] = None
@@ -59,22 +64,67 @@ class URLFilter:
                 self.robots_parser = None
 
     def _fetch_robots_txt(self) -> None:
-        """Fetch and parse robots.txt."""
+        """Fetch robots.txt and apply the three-way RFC 9309 s2.3 policy: parse
+        it on a 2xx, drop the parser on a 4xx (unavailable means unrestricted),
+        and leave it unread on a 5xx or transport error (undefined means
+        complete disallow)."""
         import httpx
 
         if not self.robots_parser or not self.robots_url:
             return
 
         try:
-            response = httpx.get(self.robots_url, timeout=10)
-            if response.status_code == 200:
+            # follow_redirects is required, not incidental: httpx defaults to
+            # False, so a 3xx would reach the final branch below and deny the
+            # whole site, with the Disallow rules left unread at the redirect
+            # target. Client rather than httpx.get because only Client takes
+            # max_redirects, and timeout is per-request: 20 default hops
+            # stretch the ceiling to ~200s. Five is the floor RFC 9309
+            # s2.3.1.2 asks crawlers to follow.
+            headers = {"User-Agent": self.user_agent} if self.user_agent else None
+            with httpx.Client(
+                timeout=10, follow_redirects=True, max_redirects=5
+            ) as client:
+                response = client.get(self.robots_url, headers=headers)
+            if 200 <= response.status_code < 300:
                 self.robots_parser.parse(response.text.splitlines())
                 logger.info("Loaded robots.txt from %s", self.robots_url)
+            elif 400 <= response.status_code < 500 and response.status_code != 429:
+                # RFC 9309 s2.3.1.3: unavailable means the crawler may access
+                # anything. Dropping the parser is what expresses that - keeping
+                # an unread RobotFileParser makes can_fetch() deny every URL,
+                # which silently reduces a site with no robots.txt to its start
+                # page alone. 5xx and transport errors deliberately fall through
+                # to that deny-all state instead: s2.3.1.4 makes an undefined
+                # robots.txt a complete disallow. s2.3.1.3 judges by meaning
+                # ("the resource is unavailable") and only cites 400-499 as an
+                # example, so 429 is excluded: a server asking us to slow down
+                # has not said it has no rules.
+                self.robots_parser = None
+                logger.info(
+                    "No robots.txt restrictions from %s (HTTP %s)",
+                    self.robots_url,
+                    response.status_code,
+                )
+            else:
+                logger.warning(
+                    "robots.txt undefined at %s (HTTP %s); only the start URL "
+                    "will be fetched, discovered links will be skipped",
+                    self.robots_url,
+                    response.status_code,
+                )
         except Exception as e:
-            logger.warning("Failed to fetch robots.txt: %s", e)
+            # Deliberately broad: narrowing to transport errors would let a bug
+            # in here escape to __init__, which clears the parser and so fails
+            # open on the whole site instead of closed.
+            logger.warning("Could not fetch robots.txt from %s: %s", self.robots_url, e)
 
     def is_allowed(self, url: str, user_agent: str = "*") -> bool:
         """Check if URL is allowed by robots.txt.
+
+        A parser of None is the upstream decision that the site has no rules
+        (see _fetch_robots_txt), not a defensive fallback: returning True there
+        is what makes a site without robots.txt crawlable.
 
         Args:
             url: URL to check

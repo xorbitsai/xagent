@@ -52,6 +52,24 @@ from .skill_tool import (
 )
 
 READ_FILE_CONTEXT_LIMIT = 12_000
+# Set by the web layer into ``ExecutionContext.metadata`` at turn start: the
+# largest persisted transcript row id the context was built from. The agent
+# core never resolves it -- it is opaque here and only has meaning to the
+# caller that issued it -- but carrying it through compaction is what lets a
+# later turn know which stored rows the summary already stands in for.
+TRANSCRIPT_WATERMARK_METADATA_KEY = "transcript_watermark"
+# Written onto ``CompactResult.metadata`` (and from there onto the compact
+# trace event) when an LLM summary replaces the history. The message-dropping
+# backstop never sets them: a dropped-message result stands in for nothing and
+# must not be mistaken for a reusable summary.
+COMPACT_SUMMARY_METADATA_KEY = "summary"
+COMPACT_WATERMARK_METADATA_KEY = "watermark_message_id"
+# The context references compaction chose to carry across the summary. These
+# are a deliberate keep decision, not incidental attachments, so a replay that
+# restores the summary must restore them too or it silently drops images the
+# compaction judged worth the budget.
+COMPACT_CONTEXT_REFS_METADATA_KEY = "summary_context_refs"
+
 COMPACT_SUMMARY_MAX_TOKENS = 8192
 COMPACT_SUMMARY_MIN_TOKENS = 256
 # Budgets to fall back through when the requested one is refused, largest
@@ -1255,8 +1273,23 @@ class ExecutionContext:
                 "dropped_context_ref_count": len(dropped_context_refs),
                 "dropped_tool_result_count": sum(dropped_tool_counts.values()),
                 "dropped_tool_results_by_name": dropped_tool_counts,
+                # The summary body itself, so a later turn can replay it
+                # without re-deriving it. This is the whole point of emitting
+                # it: the in-memory context holding it does not survive the
+                # turn, and the checkpoint that does is pruned within it.
+                COMPACT_SUMMARY_METADATA_KEY: summary_content,
+                COMPACT_CONTEXT_REFS_METADATA_KEY: [
+                    reference.durable_dict() for reference in compacted_context_refs
+                ],
             },
         )
+        watermark = self.metadata.get(TRANSCRIPT_WATERMARK_METADATA_KEY)
+        # Omitted rather than stored as None when the caller issued no
+        # watermark: a reader must be able to tell "this summary covers stored
+        # rows up to N" from "this summary cannot be positioned at all", and a
+        # null would collapse the two into one ambiguous value.
+        if isinstance(watermark, int):
+            result.metadata[COMPACT_WATERMARK_METADATA_KEY] = watermark
         if original_tokens is not None:
             return self._annotate_compact_result(result, original_tokens)
         return result

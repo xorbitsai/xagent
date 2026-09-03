@@ -79,24 +79,45 @@ export function getBackgroundJobFailureMessage(
   return job.error_message || fallbackMessage
 }
 
+// An ingest polls for minutes while the worker runs independently of this loop, so a
+// gap the proxy can close on its own must not fail the job. The budget is wall-clock
+// rather than a poll count because a failing poll takes anywhere from no time at all
+// to the api-wrapper's 15s auth-refresh timeout. It bounds when the streak may end,
+// not when the rejection lands: a single failure that outlasts the window is only
+// seen once it returns.
+const TRANSIENT_POLL_FAILURE_WINDOW_MS = 10_000
+
 export async function waitForBackgroundJob(
   apiUrl: string,
   initialJob: BackgroundJobResponse,
   onUpdate?: (job: BackgroundJobResponse) => void
 ): Promise<BackgroundJobResponse> {
   let job = initialJob
+  let failureWindowExpiresAt: number | null = null
   onUpdate?.(job)
 
   while (!isBackgroundJobTerminal(job)) {
     await new Promise(resolve => window.setTimeout(resolve, 1000))
-    const response = await apiRequest(`${apiUrl}/api/jobs/${job.id}`)
-    if (!response.ok) {
-      throw new Error(`Failed to fetch background job ${job.id}`)
+    let data: unknown
+    try {
+      const response = await apiRequest(`${apiUrl}/api/jobs/${job.id}`)
+      if (!response.ok) {
+        throw new Error(`Failed to fetch background job ${job.id}`)
+      }
+      data = await response.json()
+    } catch (error) {
+      const now = Date.now()
+      if (failureWindowExpiresAt === null) {
+        failureWindowExpiresAt = now + TRANSIENT_POLL_FAILURE_WINDOW_MS
+      } else if (now >= failureWindowExpiresAt) {
+        throw error
+      }
+      continue
     }
-    const data = await response.json()
     if (!isBackgroundJobResponse(data)) {
       throw new Error(`Invalid background job response for ${job.id}`)
     }
+    failureWindowExpiresAt = null
     job = data
     onUpdate?.(job)
   }

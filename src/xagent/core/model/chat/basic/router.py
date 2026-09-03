@@ -22,6 +22,7 @@ Env overrides (all optional; default to the bundled package data):
   XAGENT_XROUTER_MODELS_DIR     model-profile registry dir/file
   XAGENT_XROUTER_ROUTERS_DIR    router configs dir/file
   XAGENT_XROUTER_DB             routing-decision SQLite history path
+  XAGENT_XROUTER_EXCLUDED_MODELS comma-separated candidate model slugs to omit
   XAGENT_ROUTER_FALLBACK_MODEL  slug to use if routing fails
 """
 
@@ -34,6 +35,7 @@ import os
 import threading
 from typing import Any, AsyncIterator, Callable, List, Optional
 
+from .....config import get_xrouter_excluded_models
 from ....context_ref import CONTEXT_REFS_KEY, normalize_context_references
 from ....model import ChatModelConfig
 from ....task_runtime import normalize_input_modalities
@@ -482,12 +484,13 @@ class RouterLLM(BaseLLM):
             route_parameters = dict(inspect.signature(service.route).parameters)
         except (TypeError, ValueError):
             route_parameters = {}
+        supports_keyword_arguments = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in route_parameters.values()
+        )
         supports_modality_preferences = (
             "preferred_input_modalities" in route_parameters
-            or any(
-                parameter.kind is inspect.Parameter.VAR_KEYWORD
-                for parameter in route_parameters.values()
-            )
+            or supports_keyword_arguments
         )
         requested_modalities = tuple(
             dict.fromkeys((*advisory_input_modalities, *preferred_input_modalities))
@@ -511,6 +514,26 @@ class RouterLLM(BaseLLM):
                 "modality preferences (%s); routing without them.",
                 ", ".join(advisory_input_modalities),
             )
+
+        excluded_models = frozenset(get_xrouter_excluded_models())
+        configs = getattr(service, "configs", None) or {}
+        config = configs.get(self._config_name)
+        configured_models = tuple(getattr(config, "models", ()) or ())
+        eligible_models = [
+            model for model in configured_models if model not in excluded_models
+        ]
+        if excluded_models and len(eligible_models) != len(configured_models):
+            if not eligible_models:
+                raise RuntimeError(
+                    f"{self._config_name!r} has no candidates after applying "
+                    "XAGENT_XROUTER_EXCLUDED_MODELS"
+                )
+            if "models" not in route_parameters and not supports_keyword_arguments:
+                raise RuntimeError(
+                    "The installed xrouter-llm RoutingService cannot apply "
+                    "XAGENT_XROUTER_EXCLUDED_MODELS; upgrade xrouter-llm."
+                )
+            route_kwargs["models"] = eligible_models
         result = service.route(prompt, **route_kwargs)
         return list(result.get("selected") or [])
 

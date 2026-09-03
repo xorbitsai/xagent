@@ -7,6 +7,11 @@ import pytest
 
 from xagent.core.agent import ExecutionContext, PatternRuntime
 from xagent.core.agent import runtime as runtime_module
+from xagent.core.agent.context.execution import (
+    COMPACT_SUMMARY_METADATA_KEY,
+    COMPACT_WATERMARK_METADATA_KEY,
+    TRANSCRIPT_WATERMARK_METADATA_KEY,
+)
 from xagent.core.agent.pattern.final_answer_stream import (
     ToolCallStringFieldStreamer,
     _JsonStringFieldReader,
@@ -1707,3 +1712,78 @@ async def test_compaction_does_not_blame_the_model_when_nothing_is_summarizable(
     assert result.metadata["removed_count"] == 4
     assert "llm_summary_unavailable" not in result.metadata
     assert recording_logger.warning_calls == []
+
+
+class _SummarizingLLM:
+    model_name = "compact-test"
+
+    async def chat(self, **_: Any) -> Any:
+        return {"content": "what happened earlier"}
+
+
+def _oversized_context(execution_id: str) -> ExecutionContext:
+    context = ExecutionContext(execution_id=execution_id)
+    context.compact_config.threshold = 32000
+    context.add_user_message("current request")
+    context.add_tool_result(
+        "read_file", {"output": "x" * 200_000}, tool_call_id="call-1"
+    )
+    return context
+
+
+@pytest.mark.asyncio
+async def test_compaction_publishes_the_summary_and_its_watermark() -> None:
+    """The summary has to leave the turn on the compact event.
+
+    The in-memory context holding it is rebuilt from scratch next turn, and
+    the checkpoint that also holds it is pruned within this one, so without
+    this the work is paid for and then discarded every turn.
+    """
+    context = _oversized_context("watermark-publish")
+    context.metadata[TRANSCRIPT_WATERMARK_METADATA_KEY] = 42
+
+    result = await PatternRuntime().compact_context_if_needed(
+        context=context, llm=_SummarizingLLM(), metadata={"phase": "test"}
+    )
+
+    assert result.strategy == "llm_summary"
+    assert result.metadata[COMPACT_WATERMARK_METADATA_KEY] == 42
+    # Byte-identical to the system message this turn actually ran on, so a
+    # replay reproduces the context rather than an approximation of it.
+    assert result.metadata[COMPACT_SUMMARY_METADATA_KEY] == context.messages[0].content
+
+
+@pytest.mark.asyncio
+async def test_compaction_omits_the_watermark_when_the_caller_issued_none() -> None:
+    """A reader must be able to tell "covers rows up to N" from "cannot be
+    positioned at all". Storing None would collapse those into one value."""
+    context = _oversized_context("watermark-absent")
+
+    result = await PatternRuntime().compact_context_if_needed(
+        context=context, llm=_SummarizingLLM(), metadata={"phase": "test"}
+    )
+
+    assert result.strategy == "llm_summary"
+    assert COMPACT_WATERMARK_METADATA_KEY not in result.metadata
+    assert COMPACT_SUMMARY_METADATA_KEY in result.metadata
+
+
+@pytest.mark.asyncio
+async def test_dropping_messages_publishes_no_summary_to_replay() -> None:
+    """The backstop stands in for nothing. Emitting a summary key here would
+    let a later turn skip stored rows on the strength of a compaction that
+    never wrote one."""
+    context = ExecutionContext(execution_id="watermark-backstop")
+    context.compact_config.threshold = 1
+    context.compact_config.max_messages = 2
+    context.metadata[TRANSCRIPT_WATERMARK_METADATA_KEY] = 42
+    for index in range(6):
+        context.add_user_message(f"m{index}")
+
+    result = await PatternRuntime().compact_context_if_needed(
+        context=context, llm=None, metadata={"phase": "test"}
+    )
+
+    assert result.strategy == "truncate"
+    assert COMPACT_SUMMARY_METADATA_KEY not in result.metadata
+    assert COMPACT_WATERMARK_METADATA_KEY not in result.metadata

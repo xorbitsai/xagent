@@ -303,6 +303,155 @@ def test_route_sync_forwards_advisory_modalities_when_supported(monkeypatch) -> 
     assert calls == [("image", "audio")]
 
 
+def test_route_sync_excludes_configured_models(monkeypatch) -> None:
+    calls: list[dict[str, Any]] = []
+
+    class Service:
+        configs = {
+            "auto": SimpleNamespace(
+                models=("z-ai/glm-5.3-flash", "openai/gpt-5.6-luna")
+            )
+        }
+
+        def route(
+            self,
+            prompt: str,
+            *,
+            config_name: str,
+            models: list[str] | None = None,
+        ) -> dict[str, Any]:
+            calls.append(
+                {"prompt": prompt, "config_name": config_name, "models": models}
+            )
+            return {"selected": [models[0]] if models else []}
+
+    monkeypatch.setenv("XAGENT_XROUTER_EXCLUDED_MODELS", "z-ai/glm-5.3-flash")
+    monkeypatch.setattr(
+        "xagent.core.model.chat.basic.router._get_service",
+        lambda: Service(),
+    )
+
+    selected = RouterLLM()._route_sync("inspect")
+
+    assert selected == ["openai/gpt-5.6-luna"]
+    assert calls == [
+        {
+            "prompt": "inspect",
+            "config_name": "auto",
+            "models": ["openai/gpt-5.6-luna"],
+        }
+    ]
+
+
+@pytest.mark.parametrize("excluded_models", ["", "unknown/model"])
+def test_route_sync_leaves_models_unset_without_matching_exclusions(
+    monkeypatch,
+    excluded_models: str,
+) -> None:
+    calls: list[list[str] | None] = []
+
+    class Service:
+        configs = {
+            "auto": SimpleNamespace(
+                models=("z-ai/glm-5.3-flash", "openai/gpt-5.6-luna")
+            )
+        }
+
+        def route(
+            self,
+            prompt: str,
+            *,
+            config_name: str,
+            models: list[str] | None = None,
+        ) -> dict[str, Any]:
+            del prompt, config_name
+            calls.append(models)
+            return {"selected": ["z-ai/glm-5.3-flash"]}
+
+    monkeypatch.setenv("XAGENT_XROUTER_EXCLUDED_MODELS", excluded_models)
+    monkeypatch.setattr(
+        "xagent.core.model.chat.basic.router._get_service",
+        lambda: Service(),
+    )
+
+    selected = RouterLLM()._route_sync("inspect")
+
+    assert selected == ["z-ai/glm-5.3-flash"]
+    assert calls == [None]
+
+
+def test_route_sync_rejects_excluding_every_candidate(monkeypatch) -> None:
+    class Service:
+        configs = {
+            "auto": SimpleNamespace(models=("z-ai/glm-5.3-flash",)),
+        }
+
+        def route(
+            self,
+            prompt: str,
+            *,
+            config_name: str,
+            models: list[str] | None = None,
+        ) -> dict[str, Any]:
+            raise AssertionError("route must not run without an eligible candidate")
+
+    monkeypatch.setenv("XAGENT_XROUTER_EXCLUDED_MODELS", "z-ai/glm-5.3-flash")
+    monkeypatch.setattr(
+        "xagent.core.model.chat.basic.router._get_service",
+        lambda: Service(),
+    )
+
+    with pytest.raises(RuntimeError, match="no candidates"):
+        RouterLLM()._route_sync("inspect")
+
+
+@pytest.mark.asyncio
+async def test_exclusion_failure_uses_explicit_fallback(monkeypatch) -> None:
+    class Service:
+        configs = {
+            "auto": SimpleNamespace(models=("z-ai/glm-5.3-flash",)),
+        }
+
+        def route(
+            self,
+            prompt: str,
+            *,
+            config_name: str,
+            models: list[str] | None = None,
+        ) -> dict[str, Any]:
+            raise AssertionError("route must not run without an eligible candidate")
+
+    monkeypatch.setenv("XAGENT_XROUTER_EXCLUDED_MODELS", "z-ai/glm-5.3-flash")
+    monkeypatch.setenv("XAGENT_ROUTER_FALLBACK_MODEL", "fallback/model")
+    monkeypatch.setattr(
+        "xagent.core.model.chat.basic.router._get_service",
+        lambda: Service(),
+    )
+
+    assert await RouterLLM()._select_model("inspect") == "fallback/model"
+
+
+def test_route_sync_rejects_older_router_api_for_exclusions(monkeypatch) -> None:
+    class Service:
+        configs = {
+            "auto": SimpleNamespace(
+                models=("z-ai/glm-5.3-flash", "openai/gpt-5.6-luna")
+            )
+        }
+
+        def route(self, prompt: str, *, config_name: str) -> dict[str, Any]:
+            return {"selected": ["z-ai/glm-5.3-flash"]}
+
+    monkeypatch.setenv("XAGENT_XROUTER_EXCLUDED_MODELS", "z-ai/glm-5.3-flash")
+    monkeypatch.setattr(
+        "xagent.core.model.chat.basic.router._get_service",
+        lambda: Service(),
+    )
+
+    with pytest.raises(RuntimeError, match="upgrade xrouter-llm"):
+        RouterLLM()._route_sync("inspect")
+
+
 def test_route_sync_rejects_older_router_api_for_modality_requests(
     monkeypatch,
 ) -> None:

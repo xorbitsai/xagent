@@ -28,7 +28,10 @@ from xagent.web.channels.telegram.utils import (
 from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
-from xagent.web.services.chat_history_service import load_task_transcript
+from xagent.web.services.chat_history_service import (
+    TranscriptWindow,
+    load_task_transcript,
+)
 
 
 def test_strip_telegram_image_refs_extracts_file_refs() -> None:
@@ -290,7 +293,7 @@ async def test_restore_telegram_task_context_loads_transcript_and_recovery_state
             self.execution_context_messages = None
             self.recovered_skill_context = None
 
-        def set_conversation_history(self, messages):
+        def set_conversation_history(self, messages, *, watermark=None):
             self.conversation_history = messages
 
         def set_execution_context_messages(self, messages):
@@ -306,8 +309,10 @@ async def test_restore_telegram_task_context_loads_transcript_and_recovery_state
 
     monkeypatch.setattr(
         chat_history_service,
-        "load_task_transcript",
-        lambda received_db, received_task_id: transcript,
+        "load_task_transcript_window",
+        lambda received_db, received_task_id: TranscriptWindow(
+            messages=transcript, watermark=None
+        ),
     )
     monkeypatch.setattr(
         task_execution_context_service,

@@ -2733,7 +2733,8 @@ async def execute_task_background(
                     make_agent_outbound_handler(task_id)
                 )
             agent_service.set_conversation_history(
-                [dict(message) for message in snapshot.conversation_history]
+                [dict(message) for message in snapshot.conversation_history],
+                watermark=snapshot.conversation_watermark,
             )
             recovery_state = await materialize_task_execution_recovery_state(
                 snapshot.execution_recovery

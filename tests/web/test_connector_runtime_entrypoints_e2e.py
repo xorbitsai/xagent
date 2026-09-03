@@ -420,7 +420,9 @@ class _FakeAgentService:
     def set_execution_context_messages(self, _messages: list[Any]) -> None:
         pass
 
-    def set_conversation_history(self, _messages: list[Any]) -> None:
+    def set_conversation_history(
+        self, _messages: list[Any], *, watermark: int | None = None
+    ) -> None:
         pass
 
     def set_recovered_skill_context(self, _skill_context: Any) -> None:

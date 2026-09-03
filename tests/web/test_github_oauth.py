@@ -1190,3 +1190,128 @@ async def test_github_refresh_surfaces_failure_instead_of_raising_on_form_body(
         is False
     )
     assert oauth_account.access_token == "old-token"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_code", ["invalid_client", "unauthorized_client"])
+async def test_github_refresh_treats_bad_provider_credentials_as_transient(
+    db_session, monkeypatch, error_code
+):
+    """invalid_client/unauthorized_client describe the OAuthProvider row's
+    own client_id/client_secret or grant-type authorization -- an
+    admin-fixable config problem, not evidence this user's refresh_token is
+    dead -- so they must not raise _OAuthRefreshPermanentlyInvalid (which
+    would delete every affected user's connection over one admin typo)."""
+    db, user = db_session
+    db.add(
+        OAuthProvider(
+            provider_name="github",
+            name="GitHub",
+            client_id=encrypt_value("github-client-id"),
+            client_secret=encrypt_value("github-client-secret"),
+            auth_url="https://github.com/login/oauth/authorize",
+            token_url="https://github.com/login/oauth/access_token",
+            redirect_uri="https://app.example.com/api/auth/github/callback",
+            userinfo_url="https://api.github.com/user",
+            user_id_path="id",
+            email_path="login",
+            default_scopes=["read:user"],
+        )
+    )
+    oauth_account = UserOAuth(
+        user_id=user.id,
+        provider="github",
+        access_token="old-token",
+        refresh_token="old-refresh",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        provider_user_id="42",
+    )
+    db.add(oauth_account)
+    db.commit()
+
+    class BadCredentialsResponse:
+        status_code = 401
+
+        def json(self):
+            return {"error": error_code}
+
+    class FakeAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, url, **kwargs):
+            return BadCredentialsResponse()
+
+    monkeypatch.setattr(tool_config.httpx, "AsyncClient", FakeAsyncClient)
+
+    assert (
+        await tool_config.refresh_oauth_token_if_needed(db, oauth_account, "github")
+        is False
+    )
+    assert oauth_account.access_token == "old-token"
+
+
+@pytest.mark.asyncio
+async def test_github_refresh_deletes_connection_on_200_bad_refresh_token(
+    db_session, monkeypatch
+):
+    """GitHub's classic OAuth Apps token endpoint reports a dead
+    refresh_token via a 200 response carrying {"error": "bad_refresh_token"}
+    rather than a 4xx -- unlike a generic non-200 failure, this must still
+    be classified as permanent (raising _OAuthRefreshPermanentlyInvalid),
+    or a genuinely dead GitHub connection would be retried forever instead
+    of being cleaned up."""
+    db, user = db_session
+    db.add(
+        OAuthProvider(
+            provider_name="github",
+            name="GitHub",
+            client_id=encrypt_value("github-client-id"),
+            client_secret=encrypt_value("github-client-secret"),
+            auth_url="https://github.com/login/oauth/authorize",
+            token_url="https://github.com/login/oauth/access_token",
+            redirect_uri="https://app.example.com/api/auth/github/callback",
+            userinfo_url="https://api.github.com/user",
+            user_id_path="id",
+            email_path="login",
+            default_scopes=["read:user"],
+        )
+    )
+    oauth_account = UserOAuth(
+        user_id=user.id,
+        provider="github",
+        access_token="old-token",
+        refresh_token="old-refresh",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        provider_user_id="42",
+    )
+    db.add(oauth_account)
+    db.commit()
+
+    class DeadRefreshTokenResponse:
+        status_code = 200
+
+        def json(self):
+            return {
+                "error": "bad_refresh_token",
+                "error_description": "The refresh token is invalid or expired.",
+            }
+
+    class FakeAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, url, **kwargs):
+            return DeadRefreshTokenResponse()
+
+    monkeypatch.setattr(tool_config.httpx, "AsyncClient", FakeAsyncClient)
+
+    with pytest.raises(tool_config._OAuthRefreshPermanentlyInvalid):
+        await tool_config.refresh_oauth_token_if_needed(db, oauth_account, "github")
+    assert oauth_account.access_token == "old-token"

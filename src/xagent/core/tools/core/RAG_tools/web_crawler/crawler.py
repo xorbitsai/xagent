@@ -469,30 +469,6 @@ class WebCrawler:
         self.config = config
         self.progress_callback = progress_callback
 
-        # Initialize components
-        self.url_filter = URLFilter(
-            base_url=config.start_url,
-            same_domain_only=config.same_domain_only,
-            url_patterns=config.url_patterns,
-            exclude_patterns=config.exclude_patterns,
-            respect_robots_txt=config.respect_robots_txt,
-        )
-        self.content_cleaner = ContentCleaner(
-            content_selector=config.content_selector,
-            remove_selectors=config.remove_selectors,
-        )
-        self.link_extractor = LinkExtractor(config.start_url)
-
-        # Crawl state
-        self.visited_urls: Set[str] = set()
-        self.pending_urls: deque = deque()
-        self.crawl_results: List[CrawlResult] = []
-        self.failed_urls: Dict[str, str] = {}
-
-        # Statistics
-        self.total_urls_found = 0
-        self.start_time: Optional[float] = None
-
         # Resolve the TLS-fingerprint sequence to use for fetches.
         # Element type is Optional[str]: None means "use httpx, no impersonation".
         if config.tls_impersonate is None:
@@ -519,6 +495,31 @@ class WebCrawler:
             self._policy_user_agent = (
                 _IMPERSONATE_TO_UA.get(first_fp, "*") if first_fp else "*"
             )
+
+        # Initialize components
+        self.url_filter = URLFilter(
+            base_url=config.start_url,
+            same_domain_only=config.same_domain_only,
+            url_patterns=config.url_patterns,
+            exclude_patterns=config.exclude_patterns,
+            respect_robots_txt=config.respect_robots_txt,
+            user_agent=self._policy_user_agent,
+        )
+        self.content_cleaner = ContentCleaner(
+            content_selector=config.content_selector,
+            remove_selectors=config.remove_selectors,
+        )
+        self.link_extractor = LinkExtractor(config.start_url)
+
+        # Crawl state
+        self.visited_urls: Set[str] = set()
+        self.pending_urls: deque = deque()
+        self.crawl_results: List[CrawlResult] = []
+        self.failed_urls: Dict[str, str] = {}
+
+        # Statistics
+        self.total_urls_found = 0
+        self.start_time: Optional[float] = None
 
     async def crawl(self) -> List[CrawlResult]:
         """Start crawling from the configured start URL.

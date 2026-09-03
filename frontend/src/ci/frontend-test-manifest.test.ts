@@ -23,7 +23,7 @@ const pagesCommand =
 const kbComponentsCommand = "vitest run --config vitest.config.ts src/components/kb"
 const appPagesCommand = "vitest run --config vitest.config.ts src/app"
 const homeBuildContractsCommand =
-  "vitest run --config vitest.config.ts src/lib/models.test.ts src/lib/task-create.test.ts src/i18n/translations.test.ts src/lib/utils.test.ts src/lib/time-utils.test.ts src/lib/team-sharing-sanitizers.test.ts"
+  "vitest run --config vitest.config.ts src/lib/models.test.ts src/lib/task-create.test.ts src/i18n/translations.test.ts src/lib/utils.test.ts src/lib/time-utils.test.ts src/lib/background-jobs.test.ts src/lib/team-sharing-sanitizers.test.ts"
 const ciSummaryCondition =
   "always() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)"
 const frontendSummaryCheckCommand =

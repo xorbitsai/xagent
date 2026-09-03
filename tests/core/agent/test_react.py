@@ -1518,6 +1518,14 @@ def test_react_grounding_rule_present_in_both_answer_paths() -> None:
         assert "illustrative placeholders" in prompt
     assert "use an appropriate tool to verify" in tool_prompt
     assert "use an appropriate tool" not in forced_prompt
+    for prompt in (tool_prompt, lookup_tool_prompt):
+        assert "tool-call arguments that assert facts" in prompt
+        assert "never guess one" in prompt
+        assert (
+            "This does not restrict values you are expected to compose yourself"
+            in prompt
+        )
+    assert "tool-call arguments that assert facts" not in forced_prompt
     assert "## FINAL DELIVERABLE FILE REFERENCES" not in tool_prompt
     assert "exact markdown_link" in tool_prompt
     assert "lookup is unavailable" in tool_prompt
@@ -1527,6 +1535,113 @@ def test_react_grounding_rule_present_in_both_answer_paths() -> None:
     )
     assert forced_prompt.count("## FINAL DELIVERABLE FILE REFERENCES") == 1
     assert "call get_workspace_output_files once before finalizing" not in forced_prompt
+
+
+@pytest.mark.parametrize("user_interaction_enabled", [True, False])
+def test_react_missing_argument_value_instruction_matches_interaction_policy(
+    user_interaction_enabled: bool,
+) -> None:
+    """A missing argument value routes to whichever remedy the run allows.
+
+    The grounding rule tells the model to classify an unsourced fact-carrying
+    argument as missing information; this instruction is what turns that
+    classification into an action, and the two branches must never both be
+    present.
+    """
+    ask_instruction = (
+        "including a fact-carrying argument value (one that asserts a "
+        "real-world fact) the user has not provided, call ask_user_question"
+    )
+    blocked_instruction = (
+        "including a fact-carrying argument value (one that asserts a "
+        "real-world fact) the user has not provided, do not ask the user"
+    )
+    pattern = ReActPattern(user_interaction_enabled=user_interaction_enabled)
+    context = ExecutionContext(system_prompt="You are helpful.")
+    context.add_user_message("update Jane Doe")
+
+    # tool_names is derived per branch only to keep the input shaped like
+    # production, where the interaction control tools are filtered out of the
+    # schema when interaction is disabled. It drives nothing here:
+    # missing_information_instruction never reads tool_names, so every
+    # assertion below is driven solely by user_interaction_enabled.
+    tool_names = ["update_record"]
+    if user_interaction_enabled:
+        tool_names.append("ask_user_question")
+    prompt = pattern._messages_for_llm(context, has_tools=True, tool_names=tool_names)[
+        0
+    ]["content"]
+
+    if user_interaction_enabled:
+        assert ask_instruction in prompt
+        assert blocked_instruction not in prompt
+        assert "do not fill the value in yourself" in prompt
+    else:
+        assert blocked_instruction in prompt
+        assert ask_instruction not in prompt
+        assert "finish with outcome=blocked and explain what is missing" in prompt
+
+
+@pytest.mark.asyncio
+async def test_react_tool_argument_rule_tracks_ask_user_question_availability() -> None:
+    """The prohibition and its remedy must reach the model on the same call.
+
+    The grounding rule tells the model to treat an unsourceable fact-carrying
+    argument as missing information; ask_user_question is the tool that acts on
+    that classification. Telling the model not to invent a value on a turn
+    where it cannot ask for one would leave it with no legal move. Both are
+    gated by ``force_final_answer`` today, so the coupling holds only
+    incidentally; this pins both directions of it against a later change that
+    narrows one gate without the other.
+    """
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "Need calculation.",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    }
+                ],
+                "done": False,
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "final_call",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"The result is 4."}',
+                        },
+                    }
+                ],
+                "done": False,
+            },
+        ]
+    )
+    pattern = ReActPattern(max_iterations=3, finalize_after_tool_result=True)
+    context = ExecutionContext(system_prompt="You are helpful.")
+    context.add_user_message("Calculate 2+2")
+
+    result = await pattern.run(context=context, tools=[FakeTool()], llm=llm)
+
+    assert result["success"] is True
+    coupling = [
+        (
+            "ask_user_question"
+            in [schema["function"]["name"] for schema in call["tools"]],
+            "tool-call arguments that assert facts" in call["messages"][0]["content"],
+        )
+        for call in llm.calls
+    ]
+    # One run covers both cells: the open turn offers ask_user_question and
+    # carries the rule, the forced final turn offers neither.
+    assert coupling == [(True, True), (False, False)]
 
 
 @pytest.mark.asyncio
@@ -4031,6 +4146,13 @@ async def test_react_pattern_reserves_control_tool_names_in_schema() -> None:
     )
     assert "Do not use it to confirm execution strategy" in ask_user_description
     assert "whether to use memory" in ask_user_description
+    assert (
+        "a fact-carrying value (one that asserts a real-world fact) for a tool "
+        "argument that the user has not provided" in ask_user_description
+    )
+    # The qualifier must match the grounding rule's scope: without it the
+    # description would invite pausing for a search query the model composes.
+    assert "require inventing a fact-carrying argument value" in ask_user_description
     system_prompt = llm.calls[0]["messages"][0]["content"]
     assert "Only call tools that are present in the current tool schema" in (
         system_prompt

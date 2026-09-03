@@ -673,7 +673,11 @@ _EMPLOYMENT_HERO_IDENTITY_MAX_PAGES = 50
 # event loop) for its whole duration. The page-count cap alone bounds
 # *requests*, not elapsed time -- a slow/misconfigured token_url host could
 # still occupy a worker for MAX_PAGES * DEFAULT_TIMEOUT_SECONDS in the
-# worst case. This bounds actual wall-clock time spent paginating.
+# worst case. This bounds when a NEW request may be issued, not the
+# function's total runtime: the check runs before each request, so a
+# request already in flight when the deadline is crossed can still run to
+# its own 10s timeout -- worst case is this budget plus one request
+# timeout (~25s here), not a hard 15s ceiling.
 _EMPLOYMENT_HERO_IDENTITY_MAX_SECONDS = 15.0
 # Comfortably under Postgres's ~2704-byte btree index row-size limit that
 # UserOAuth's (user_id, provider, provider_user_id) uniqueness index enforces
@@ -747,11 +751,13 @@ def _fetch_employment_hero_identity(access_token: str) -> Optional[str]:
     not on its own reliable proof there's nothing left. Falls back to that
     same short-page heuristic only if a response is ever missing
     `total_pages` entirely. Capped at _EMPLOYMENT_HERO_IDENTITY_MAX_PAGES
-    pages, and separately at _EMPLOYMENT_HERO_IDENTITY_MAX_SECONDS of
-    wall-clock time (this runs inside a sync callback occupying a FastAPI
-    threadpool worker for its duration, so a slow token_url host could
-    otherwise hold one for page-count-many timeouts) -- either safety bound
-    against a misbehaving/malicious/slow response logs a warning when hit; a
+    pages, and separately at _EMPLOYMENT_HERO_IDENTITY_MAX_SECONDS before a
+    new page request may be issued (this runs inside a sync callback
+    occupying a FastAPI threadpool worker for its duration, so a slow
+    token_url host could otherwise hold one for page-count-many timeouts;
+    see that constant's own comment for why this bounds new requests, not
+    the function's total runtime) -- either safety bound against a
+    misbehaving/malicious/slow response logs a warning when hit; a
     truncated organisation set at that point is still used rather than
     failing the whole connect, matching the zero-organisation tradeoff
     above.

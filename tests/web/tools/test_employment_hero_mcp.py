@@ -218,6 +218,7 @@ def test_list_organisations_requests_expected_path_and_params(monkeypatch):
         == f"{employment_hero.EMPLOYMENT_HERO_BASE_URL}/organisations"
     )
     assert call.kwargs["params"] == {"page_index": 1, "item_per_page": 20}
+    assert call.kwargs["headers"] == {"Authorization": "Bearer access-token"}
 
 
 def test_list_organisations_errors_on_non_dict_data_shape(monkeypatch):
@@ -330,6 +331,40 @@ def test_list_timesheet_entries_includes_date_range_only_when_provided(monkeypat
     call = mock_request.call_args
     assert call.kwargs["params"]["start_date"] == "01/08/2026"
     assert call.kwargs["params"]["end_date"] == "31/08/2026"
+
+
+@pytest.mark.parametrize(
+    "call_tool",
+    [
+        lambda: employment_hero.employment_hero_list_employees("org-1"),
+        lambda: employment_hero.employment_hero_list_teams("org-1"),
+        lambda: employment_hero.employment_hero_list_team_employees("org-1", "team-1"),
+        lambda: employment_hero.employment_hero_list_timesheet_entries(
+            "org-1", "emp-1"
+        ),
+    ],
+    ids=[
+        "list_employees",
+        "list_teams",
+        "list_team_employees",
+        "list_timesheet_entries",
+    ],
+)
+def test_list_tools_error_on_non_dict_data_shape(monkeypatch, call_tool):
+    """The non-dict-data-shape guard (_list_payload) added for
+    employment_hero_list_organisations must actually be wired into every
+    other list tool's own call site too, not just exercised via the shared
+    helper's unit tests -- this end-to-end check would catch a future
+    tool accidentally reverting to a bare _unwrap_data(result) call, or
+    passing the wrong resource/result variable into _list_payload."""
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"data": ["not", "a", "dict"]})
+    )
+    monkeypatch.setattr(employment_hero.requests, "request", mock_request)
+
+    result = json.loads(call_tool())
+
+    assert result["status"] == "error"
 
 
 def test_tool_functions_return_error_envelope_on_failure(monkeypatch):

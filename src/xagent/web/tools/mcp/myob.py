@@ -110,8 +110,8 @@ def _raise_for_status(response: requests.Response) -> None:
     detail = _extract_error_detail(response)
     if detail is None:
         detail = response.text.strip()
-        if len(detail) > MAX_ERROR_RESPONSE_TEXT_CHARS:
-            detail = detail[:MAX_ERROR_RESPONSE_TEXT_CHARS] + "... [truncated]"
+    if detail and len(detail) > MAX_ERROR_RESPONSE_TEXT_CHARS:
+        detail = detail[:MAX_ERROR_RESPONSE_TEXT_CHARS] + "... [truncated]"
     message = f"MYOB API error (status {response.status_code})"
     if detail:
         message = f"{message}: {detail}"

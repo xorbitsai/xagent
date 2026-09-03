@@ -3043,6 +3043,7 @@ def generic_oauth_callback(
                 provider_user_id = (
                     str(raw_provider_user_id)
                     if isinstance(raw_provider_user_id, (str, int))
+                    and not isinstance(raw_provider_user_id, bool)
                     and str(raw_provider_user_id)
                     else None
                 )

@@ -351,3 +351,38 @@ def test_callback_succeeds_when_identity_fields_are_absent(db_session, monkeypat
     )
     assert oauth_account.provider_user_id is None
     assert oauth_account.email is None
+
+
+def test_callback_rejects_boolean_uid_instead_of_stringifying_it(
+    db_session, monkeypatch
+):
+    """`bool` is a subclass of `int` in Python, so `isinstance(uid, (str,
+    int))` alone would let a boolean `uid` through and stringify it to the
+    nonsensical "True"/"False" -- must be treated the same as no usable uid
+    at all (None), not silently accepted."""
+    db, user = db_session
+    mock_post = Mock(
+        return_value=MockResponse(
+            {
+                "access_token": "myob-token",
+                "user": {"uid": True, "username": "alice@acme.example"},
+            }
+        )
+    )
+    monkeypatch.setattr(auth_api.requests, "post", mock_post)
+
+    response = generic_oauth_callback(
+        "myob",
+        _callback_request(db, user, business_id=BUSINESS_ID),
+        db,
+        _myob_provider(),
+    )
+
+    assert response.status_code == 200
+    oauth_account = (
+        db.query(UserOAuth)
+        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "myob")
+        .one()
+    )
+    assert oauth_account.provider_user_id is None
+    assert oauth_account.email == "alice@acme.example"

@@ -141,6 +141,38 @@ def test_request_truncates_long_error_body(monkeypatch):
     assert len(str(excinfo.value)) < len(long_body)
 
 
+def test_request_truncates_long_structured_error_detail(monkeypatch):
+    # Truncation must apply to a successfully-extracted {"Errors": [...]}
+    # detail too, not just the raw-text fallback used when that extraction
+    # fails -- a single AdditionalDetails field (or many stacked errors) can
+    # be just as unbounded as raw response text.
+    long_message = "x" * 5000
+    monkeypatch.setattr(
+        myob.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                status_code=400,
+                json_data={
+                    "Errors": [
+                        {
+                            "Name": "ValidationException",
+                            "Message": long_message,
+                            "AdditionalDetails": "",
+                        }
+                    ]
+                },
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        myob._request("GET", "Contact/Customer/")
+
+    assert "[truncated]" in str(excinfo.value)
+    assert len(str(excinfo.value)) < len(long_message)
+
+
 def test_list_items_unwraps_items_and_count():
     items, total_count = myob._list_items(
         {"Count": 2, "Items": [{"UID": "1"}, {"UID": "2"}]}

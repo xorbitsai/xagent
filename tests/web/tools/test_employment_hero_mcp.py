@@ -219,6 +219,18 @@ def test_list_employees_includes_member_type_only_when_provided(monkeypatch):
     assert call.kwargs["params"]["member_type"] == "contractor"
 
 
+def test_list_employees_rejects_invalid_member_type(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"data": {"items": []}}))
+    monkeypatch.setattr(employment_hero.requests, "request", mock_request)
+
+    result = json.loads(
+        employment_hero.employment_hero_list_employees("org-1", member_type="staff")
+    )
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
 def test_get_employee_url_encodes_path_segments(monkeypatch):
     mock_request = Mock(return_value=MockResponse(json_data={"data": {"id": "emp-1"}}))
     monkeypatch.setattr(employment_hero.requests, "request", mock_request)
@@ -232,6 +244,18 @@ def test_get_employee_url_encodes_path_segments(monkeypatch):
         call.kwargs["url"]
         == f"{employment_hero.EMPLOYMENT_HERO_BASE_URL}/organisations/org%201/employees/emp%2F1"
     )
+
+
+def test_get_employee_errors_on_null_payload(monkeypatch):
+    """A 200 with a null `data` (e.g. a soft-deleted or access-restricted
+    record) must surface as a clear error, not a "success" envelope
+    wrapping employee: null."""
+    mock_request = Mock(return_value=MockResponse(json_data={"data": None}))
+    monkeypatch.setattr(employment_hero.requests, "request", mock_request)
+
+    result = json.loads(employment_hero.employment_hero_get_employee("org-1", "emp-1"))
+
+    assert result["status"] == "error"
 
 
 def test_list_team_employees_requests_nested_path(monkeypatch):

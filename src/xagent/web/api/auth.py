@@ -793,12 +793,18 @@ def _fetch_employment_hero_identity(access_token: str) -> Optional[str]:
         # -- excluded explicitly so a stray boolean in the envelope can't be
         # misread as a page count. A numeric string ("3") is accepted since
         # nothing guarantees this field is always JSON-typed as a number
-        # rather than a string on Employment Hero's side.
+        # rather than a string on Employment Hero's side; an integer-valued
+        # float (3.0) is accepted too, but a genuinely fractional one (3.5)
+        # is not -- that's not a valid page count under any serialization,
+        # so it's treated the same as a missing field rather than silently
+        # truncated into a wrong one.
         total_pages: Optional[int] = None
         if isinstance(total_pages_raw, bool):
             pass
         elif isinstance(total_pages_raw, int):
             total_pages = total_pages_raw
+        elif isinstance(total_pages_raw, float) and total_pages_raw.is_integer():
+            total_pages = int(total_pages_raw)
         elif isinstance(total_pages_raw, str) and total_pages_raw.strip().isdigit():
             total_pages = int(total_pages_raw.strip())
         if total_pages is not None and total_pages > 0:

@@ -28,6 +28,12 @@ MAX_ERROR_RESPONSE_TEXT_CHARS = 1000
 DEFAULT_PAGE_SIZE = 20
 MAX_PAGE_SIZE = 100
 
+# Employment Hero's documented member_type filter values for the employees
+# endpoint (see employment_hero_list_employees) -- validated up front rather
+# than forwarded verbatim, so a typo'd/guessed value (e.g. "staff") gets a
+# clear error instead of an unpredictable API-side response.
+MEMBER_TYPES = ("employee", "contractor")
+
 
 def _error(message: str) -> str:
     return json.dumps({"status": "error", "message": message}, ensure_ascii=False)
@@ -160,6 +166,11 @@ def employment_hero_list_employees(
     page_index: 1-based page number.
     item_per_page: results per page (max 100).
     """
+    if member_type and member_type not in MEMBER_TYPES:
+        return _error(
+            f"Invalid member_type {member_type!r}; expected one of "
+            f"{', '.join(MEMBER_TYPES)}, or empty for both"
+        )
     try:
         safe_org_id = url_path_id(organisation_id, "organisation_id")
         params = _pagination_params(page_index, item_per_page)
@@ -188,7 +199,18 @@ def employment_hero_get_employee(organisation_id: str, employee_id: str) -> str:
         result = _request(
             "GET", f"/organisations/{safe_org_id}/employees/{safe_employee_id}"
         )
-        return success_with_capped_dict("employee", _unwrap_data(result))
+        employee = _unwrap_data(result)
+        if not isinstance(employee, dict):
+            # A 200 with a null/non-object payload (e.g. a soft-deleted or
+            # access-restricted record) is distinct from the 404 a missing
+            # id would raise -- matching deputy_get_resource's convention of
+            # surfacing this as a clear error rather than a "success" envelope
+            # wrapping a null.
+            return _error(
+                f"Employment Hero returned an unexpected response for employee "
+                f"{employee_id}"
+            )
+        return success_with_capped_dict("employee", employee)
     except Exception as e:
         logger.error(f"Error getting Employment Hero employee {employee_id}: {e}")
         return _error(str(e))

@@ -380,6 +380,51 @@ def test_callback_paginates_across_multiple_full_pages_without_total_pages(
     assert get.call_count == 3
 
 
+def test_callback_accepts_integer_valued_float_total_pages(db_session, monkeypatch):
+    """total_pages serialized as a JSON float (3.0, not 3) must still drive
+    pagination -- nothing guarantees Employment Hero always emits this field
+    as a JSON integer rather than a float."""
+    db, user = db_session
+    request = _callback_request(user, code_verifier="verifier-value")
+
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {"access_token": "eh-token", "token_type": "bearer", "expires_in": 900}
+            )
+        ),
+    )
+    responses = [
+        MockResponse(
+            {
+                "data": {
+                    "items": [{"id": f"p1-{i}"} for i in range(5)],
+                    "total_pages": 2.0,
+                }
+            }
+        ),
+        MockResponse(
+            {
+                "data": {
+                    "items": [{"id": f"p2-{i}"} for i in range(5)],
+                    "total_pages": 2.0,
+                }
+            }
+        ),
+    ]
+    get = Mock(side_effect=responses)
+    monkeypatch.setattr(auth_api.requests, "get", get)
+
+    response = generic_oauth_callback(
+        "employment-hero", request, db, _employment_hero_provider()
+    )
+
+    assert response.status_code == 200
+    assert get.call_count == 2
+
+
 def test_callback_hashes_provider_user_id_when_too_long_for_index(
     db_session, monkeypatch
 ):

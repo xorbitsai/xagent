@@ -48,7 +48,12 @@ def _business_id() -> str:
     business_id = os.environ.get("MYOB_BUSINESS_ID")
     if not business_id:
         raise ValueError("MYOB_BUSINESS_ID environment variable is missing")
-    return business_id
+    # Interpolated directly into every request URL below (_base_url) --
+    # validated/percent-encoded the same way every other uid in this file
+    # is, for house consistency, even though this specific value already
+    # passed GUID validation once at connect time
+    # (_normalize_myob_business_id in api/auth.py).
+    return url_path_id(business_id, "MYOB_BUSINESS_ID")
 
 
 def _base_url() -> str:
@@ -241,7 +246,13 @@ def _update_resource(path: str, uid: str, fields: dict[str, Any]) -> dict[str, A
     """
     safe_uid = url_path_id(uid, "uid")
     current = _request("GET", f"{path}{safe_uid}/")
-    if not isinstance(current, dict):
+    # Rejects an empty dict too, not just a non-dict -- _request returns {}
+    # on a 204/empty response, and {} would otherwise pass straight through
+    # to `merged = {**{}, **fields}` below, silently wiping every field
+    # this record has other than the ones the caller named (including
+    # RowVersion, which MYOB needs back on the PUT for optimistic
+    # concurrency).
+    if not current:
         raise RuntimeError(f"MYOB returned no existing record for uid {uid}")
     merged = {**current, **fields}
     response = _raw_request(
@@ -588,13 +599,17 @@ def myob_get_account(uid: str) -> str:
 
 
 @mcp.tool()
-def myob_list_tax_codes(top: int = DEFAULT_PAGE_LIMIT, skip: int = 0) -> str:
+def myob_list_tax_codes(
+    filter: str = "", orderby: str = "", top: int = DEFAULT_PAGE_LIMIT, skip: int = 0
+) -> str:
     """
     List tax codes configured on the business (e.g. GST, FRE, N-T).
+    filter: an optional raw OData $filter expression, e.g. "Type eq 'GST'".
+    orderby: an optional OData $orderby expression, e.g. "Code".
     top/skip: server-side page size (max 100) and offset.
     """
     try:
-        params = _list_params(filter_str="", orderby="", top=top, skip=skip)
+        params = _list_params(filter_str=filter, orderby=orderby, top=top, skip=skip)
         result = _request("GET", "GeneralLedger/TaxCode/", params=params)
         items, total_count = _list_items(result)
         return _success_with_capped_list("tax_codes", items, total_count=total_count)

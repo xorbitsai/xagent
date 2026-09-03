@@ -298,10 +298,32 @@ def test_upgrade_and_downgrade_no_op_without_tables(tmp_path):
 
 
 def test_down_revision_matches_current_head():
-    """Pin down_revision to the confirmed true head as of this branch's
-    last rebase onto upstream/main, so a future migration insertion
-    between them would be caught here rather than only surfacing as a
-    confusing multiple-heads error from `alembic heads`."""
-    migration = _load_migration_module()
+    """down_revision must be a real revision in the on-disk migration
+    graph, and this migration must be its only child.
 
-    assert migration.down_revision == "20260903_model_management"
+    A bare hardcoded-string comparison (this test's original form) only
+    checks two literals a person typed independently -- it can't catch a
+    typo'd revision id, nor a sibling migration that also claims the same
+    parent (which needs a merge migration, not just landing both). Walking
+    the real graph via alembic's own ScriptDirectory catches both.
+    """
+    from alembic.script import ScriptDirectory
+
+    migration = _load_migration_module()
+    migrations_dir = str(Path(__file__).parent.parent.parent / "src/xagent/migrations")
+    script_dir = ScriptDirectory(migrations_dir)
+
+    # Raises CommandError (not None) if down_revision doesn't exist at all.
+    script_dir.get_revision(migration.down_revision)
+
+    siblings = [
+        rev.revision
+        for rev in script_dir.walk_revisions()
+        if rev.down_revision == migration.down_revision
+        and rev.revision != migration.revision
+    ]
+    assert not siblings, (
+        f"down_revision {migration.down_revision!r} has another child "
+        f"migration too: {siblings} -- needs a merge migration, not just "
+        "updating down_revision here"
+    )

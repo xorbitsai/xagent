@@ -256,6 +256,53 @@ def test_get_sales_invoice_caps_output_size(monkeypatch):
     assert result["truncated"] is True
 
 
+def test_create_sales_invoice_caps_output_size(monkeypatch):
+    # returnBody=true means create/update tools echo back the full object
+    # too, so they carry the same open-ended-Lines-array risk as the get
+    # tool above, not just the list/get tools.
+    big_invoice = {
+        "UID": "inv1",
+        "Lines": [{"Description": "x" * 200} for _ in range(50)],
+    }
+    monkeypatch.setattr(
+        myob.requests, "request", Mock(return_value=MockResponse(json_data=big_invoice))
+    )
+    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 500)
+
+    raw = myob.myob_create_sales_invoice({"Customer": {"UID": "c1"}})
+    result = json.loads(raw)
+
+    assert len(raw) <= 500
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+
+
+def test_update_sales_invoice_caps_output_size(monkeypatch):
+    current = {"UID": "inv1"}
+    big_updated = {
+        "UID": "inv1",
+        "Lines": [{"Description": "x" * 200} for _ in range(50)],
+    }
+    monkeypatch.setattr(
+        myob.requests,
+        "request",
+        Mock(
+            side_effect=[
+                MockResponse(json_data=current),
+                MockResponse(json_data=big_updated),
+            ]
+        ),
+    )
+    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 500)
+
+    raw = myob.myob_update_sales_invoice("inv1", {"Status": "Closed"})
+    result = json.loads(raw)
+
+    assert len(raw) <= 500
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+
+
 def test_get_customer_rejects_empty_uid(monkeypatch):
     mock_request = Mock()
     monkeypatch.setattr(myob.requests, "request", mock_request)
@@ -355,6 +402,81 @@ def test_update_customer_rejects_empty_fields(monkeypatch):
 
     assert result["status"] == "error"
     mock_request.assert_not_called()
+
+
+def test_update_resource_rejects_an_empty_get_response(monkeypatch):
+    # {} passes `isinstance(current, dict)` but must still be rejected --
+    # letting it through would merge as `{**{}, **fields}`, silently
+    # wiping every existing field (including RowVersion) on the PUT.
+    mock_request = Mock(return_value=MockResponse(json_data={}))
+    monkeypatch.setattr(myob.requests, "request", mock_request)
+
+    with pytest.raises(RuntimeError, match="no existing record"):
+        myob._update_resource("Contact/Customer/", "c1", {"CompanyName": "New Name"})
+
+    mock_request.assert_called_once()  # the GET only -- no PUT attempted
+
+
+def test_update_supplier_merges_fetched_record_with_changes(monkeypatch):
+    current = {"UID": "s1", "CompanyName": "Old Supplier", "RowVersion": "abc=="}
+    updated = {**current, "CompanyName": "New Supplier"}
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=current),
+            MockResponse(json_data=updated),
+        ]
+    )
+    monkeypatch.setattr(myob.requests, "request", mock_request)
+
+    result = json.loads(
+        myob.myob_update_supplier("s1", {"CompanyName": "New Supplier"})
+    )
+
+    assert result["status"] == "success"
+    assert result["supplier"]["CompanyName"] == "New Supplier"
+    put_call = mock_request.call_args_list[1]
+    assert put_call.kwargs["method"] == "PUT"
+    assert put_call.kwargs["json"] == updated
+
+
+def test_update_sales_invoice_merges_fetched_record_with_changes(monkeypatch):
+    current = {"UID": "inv1", "Status": "Open", "RowVersion": "abc=="}
+    updated = {**current, "Status": "Closed"}
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=current),
+            MockResponse(json_data=updated),
+        ]
+    )
+    monkeypatch.setattr(myob.requests, "request", mock_request)
+
+    result = json.loads(myob.myob_update_sales_invoice("inv1", {"Status": "Closed"}))
+
+    assert result["status"] == "success"
+    assert result["invoice"]["Status"] == "Closed"
+    put_call = mock_request.call_args_list[1]
+    assert put_call.kwargs["method"] == "PUT"
+    assert put_call.kwargs["json"] == updated
+
+
+def test_update_purchase_bill_merges_fetched_record_with_changes(monkeypatch):
+    current = {"UID": "bill1", "Status": "Open", "RowVersion": "abc=="}
+    updated = {**current, "Status": "Closed"}
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=current),
+            MockResponse(json_data=updated),
+        ]
+    )
+    monkeypatch.setattr(myob.requests, "request", mock_request)
+
+    result = json.loads(myob.myob_update_purchase_bill("bill1", {"Status": "Closed"}))
+
+    assert result["status"] == "success"
+    assert result["bill"]["Status"] == "Closed"
+    put_call = mock_request.call_args_list[1]
+    assert put_call.kwargs["method"] == "PUT"
+    assert put_call.kwargs["json"] == updated
 
 
 def test_get_business_info_unwraps_company_file(monkeypatch):

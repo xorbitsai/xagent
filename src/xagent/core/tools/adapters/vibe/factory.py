@@ -968,6 +968,7 @@ class ToolFactory:
         message: object = None,
         failure_code: object = None,
         app_name: object = None,
+        app_id: object = None,
     ) -> Tool:
         """Build the shared server-scoped unavailable MCP tool."""
         from ....agent.result import normalize_tool_failure_code
@@ -985,6 +986,8 @@ class ToolFactory:
             kwargs["message"] = message
         if isinstance(app_name, str):
             kwargs["app_name"] = app_name
+        if isinstance(app_id, str):
+            kwargs["app_id"] = app_id
         return UnavailableMCPTool(**kwargs)
 
     @classmethod
@@ -1061,6 +1064,7 @@ class ToolFactory:
                                 message=inner_config.get("message"),
                                 failure_code=inner_config.get("failure_code"),
                                 app_name=inner_config.get("app_name"),
+                                app_id=inner_config.get("app_id"),
                             )
                         )
                     except Exception as e:

@@ -30,6 +30,7 @@ def _unavailable_tool(
     reason: str | None = None,
     message: str | None = None,
     app_name: str | None = None,
+    app_id: str | None = None,
 ) -> UnavailableMCPTool:
     kwargs: dict[str, Any] = {
         "server_name": server_name,
@@ -43,6 +44,8 @@ def _unavailable_tool(
         kwargs["message"] = message
     if app_name is not None:
         kwargs["app_name"] = app_name
+    if app_id is not None:
+        kwargs["app_id"] = app_id
     return UnavailableMCPTool(
         **kwargs,
     )
@@ -177,6 +180,27 @@ async def test_unavailable_tool_oauth_required_with_app_name_pauses_for_connect_
             }
         ],
     }
+
+
+@pytest.mark.asyncio
+async def test_unavailable_tool_oauth_required_with_app_id_names_apps_by_object(
+    monkeypatch,
+):
+    """When the catalog id resolved (see _build_unavailable_mcp_config's
+    app_id threading), the pause names the app as {id, name} so the frontend
+    can resolve by id first - two visible apps can share a display name but
+    never an id."""
+    monkeypatch.setenv("XAGENT_USER_ID", "7")
+    tool = _unavailable_tool(
+        allow_users=["7"],
+        failure_code="oauth_token_required",
+        app_name="Gmail",
+        app_id="gmail",
+    )
+
+    result = await tool.run_json_async({})
+
+    assert result["interactions"][0]["apps"] == [{"id": "gmail", "name": "Gmail"}]
 
 
 @pytest.mark.asyncio

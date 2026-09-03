@@ -177,6 +177,7 @@ def _add_remote_server(
     headers: dict | None = None,
     runtime_bindings: list[dict] | None = None,
     allow_delegated_authorization: bool = False,
+    visible: bool = True,
 ) -> MCPServer:
     server = MCPServer(
         name=name,
@@ -208,6 +209,7 @@ def _add_remote_server(
             transport="streamable_http",
             provider_name=provider,
             launch_config={},
+            is_visible_in_connector=visible,
         )
     )
     db.commit()
@@ -276,6 +278,7 @@ def _assert_unavailable_mcp_config(
     reason: str,
     oauth_token_required: bool = False,
     app_name: str | None = None,
+    app_id: str | None = None,
 ) -> None:
     assert config["name"] == server.name
     assert config["transport"] == "unavailable"
@@ -289,6 +292,8 @@ def _assert_unavailable_mcp_config(
         assert "failure_code" not in config["config"]
     if app_name is not None:
         assert config["config"]["app_name"] == app_name
+    if app_id is not None:
+        assert config["config"]["app_id"] == app_id
     expected_user_id = str(server.user_mcpservers[0].user_id)
     assert config["user_id"] == expected_user_id
     assert config["allow_users"] == [expected_user_id]
@@ -2160,7 +2165,9 @@ async def test_remote_runtime_connection_none_names_the_app_without_a_resolver_h
         missing_grant,
     )
 
-    configs = await _tool_config(db, user).get_mcp_server_configs()
+    configs = await _tool_config(
+        db, user, connect_apps_interactive=True
+    ).get_mcp_server_configs()
 
     _assert_unavailable_mcp_config(
         configs[0],
@@ -2168,6 +2175,7 @@ async def test_remote_runtime_connection_none_names_the_app_without_a_resolver_h
         reason="authorization_required",
         oauth_token_required=True,
         app_name=remote_server.name,
+        app_id="remote-records",
     )
 
 
@@ -2200,7 +2208,9 @@ async def test_remote_runtime_connection_transient_failure_does_not_pause(
         transient_refresh_failure,
     )
 
-    configs = await _tool_config(db, user).get_mcp_server_configs()
+    configs = await _tool_config(
+        db, user, connect_apps_interactive=True
+    ).get_mcp_server_configs()
 
     _assert_unavailable_mcp_config(
         configs[0],
@@ -2208,7 +2218,95 @@ async def test_remote_runtime_connection_transient_failure_does_not_pause(
         reason="token_refresh_failed",
         oauth_token_required=False,
         app_name=remote_server.name,
+        app_id="remote-records",
     )
+
+
+@pytest.mark.asyncio
+async def test_unavailable_config_omits_app_name_when_not_connect_apps_interactive(
+    db_session,
+    monkeypatch,
+):
+    """connect_apps_interactive defaults to False - a caller that never
+    passes it (every non-web-chat entry point: channel bots, A2A, the v1
+    SDK, public/shared-link runs) must keep the old plain-error behavior
+    instead of naming an app for a pause that surface can't render (see
+    WebToolConfig's connect_apps_interactive docstring)."""
+    db, user = db_session
+    remote_server = _add_remote_server(
+        db,
+        user,
+        auth={"type": "mcp_oauth", "resource": "https://auth.example/resource"},
+    )
+
+    from xagent.web.services.mcp_runtime import MCPRuntimeConnectionBuild
+
+    async def missing_grant(*args, **kwargs):
+        return MCPRuntimeConnectionBuild(
+            connection=None,
+            diagnostic={"code": "authorization_required", "message": "no grant"},
+        )
+
+    monkeypatch.setattr(
+        "xagent.web.services.mcp_runtime.build_mcp_runtime_connection",
+        missing_grant,
+    )
+
+    configs = await _tool_config(db, user).get_mcp_server_configs()
+
+    _assert_unavailable_mcp_config(
+        configs[0],
+        remote_server,
+        reason="authorization_required",
+        oauth_token_required=True,
+    )
+    assert "app_name" not in configs[0]["config"]
+    assert "app_id" not in configs[0]["config"]
+
+
+@pytest.mark.asyncio
+async def test_unavailable_config_omits_app_name_when_app_hidden_from_connector(
+    db_session,
+    monkeypatch,
+):
+    """A hidden app (is_visible_in_connector=False) is deliberately treated
+    the same as unresolvable even on an interactive surface: the frontend's
+    connector catalog fetch excludes it, so naming it in a pause would leave
+    the user staring at a dead-end connect_apps card with no Connect button
+    to act on (see _build_unavailable_mcp_config's own comment)."""
+    db, user = db_session
+    remote_server = _add_remote_server(
+        db,
+        user,
+        auth={"type": "mcp_oauth", "resource": "https://auth.example/resource"},
+        visible=False,
+    )
+
+    from xagent.web.services.mcp_runtime import MCPRuntimeConnectionBuild
+
+    async def missing_grant(*args, **kwargs):
+        return MCPRuntimeConnectionBuild(
+            connection=None,
+            diagnostic={"code": "authorization_required", "message": "no grant"},
+        )
+
+    monkeypatch.setattr(
+        "xagent.web.services.mcp_runtime.build_mcp_runtime_connection",
+        missing_grant,
+    )
+
+    configs = await _tool_config(
+        db, user, connect_apps_interactive=True
+    ).get_mcp_server_configs()
+
+    _assert_unavailable_mcp_config(
+        configs[0],
+        remote_server,
+        reason="authorization_required",
+        oauth_token_required=True,
+    )
+    assert "app_name" not in configs[0]["config"]
+    assert "app_id" not in configs[0]["config"]
 
 
 @pytest.mark.asyncio

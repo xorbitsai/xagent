@@ -461,6 +461,16 @@ class BaseToolConfig(ABC):
         """Get agent ID to exclude from agent tools."""
         return None
 
+    def get_connect_apps_interactive(self) -> bool:
+        """Whether this run's surface can render an interactive
+        `connect_apps` pause for an OAuth-required MCP failure (see
+        WebToolConfig's `connect_apps_interactive` docstring). Threaded into
+        a delegated AgentTool's own tool config so a sub-agent it calls
+        inherits the same answer as its parent, rather than independently
+        defaulting closed. ``False`` for any config that doesn't override
+        it - the safe default for standalone/non-web-chat usage."""
+        return False
+
     @abstractmethod
     def get_db(self) -> Optional[Any]:
         """Get database session. Returns None for standalone usage."""

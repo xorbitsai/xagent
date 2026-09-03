@@ -1094,6 +1094,7 @@ class UnavailableMCPTool(AbstractBaseTool):
         reason: str | None = None,
         message: str = _DEFAULT_UNAVAILABLE_MCP_MESSAGE,
         app_name: str | None = None,
+        app_id: str | None = None,
     ) -> None:
         from ....agent.result import normalize_tool_failure_code
         from .base import ToolCategory
@@ -1111,6 +1112,11 @@ class UnavailableMCPTool(AbstractBaseTool):
         # `_run_unavailable` below) with a `connect_apps` card naming the
         # actual app, instead of only ever surfacing a raw error string.
         self._app_name = app_name
+        # The catalog's stable id for `_app_name`, when resolvable - lets the
+        # `connect_apps` pause below name a specific catalog row instead of
+        # only a display name, which two visible apps can share (see
+        # `_build_unavailable_mcp_config`'s app_id threading).
+        self._app_id = app_id
         self._name = _format_unavailable_mcp_tool_name(server_name, server_id)
         self.source_server = normalize_mcp_server_name(server_name)
         self.category = ToolCategory.MCP
@@ -1176,7 +1182,17 @@ class UnavailableMCPTool(AbstractBaseTool):
                         "type": "connect_apps",
                         "field": "connect_apps",
                         "label": "Connect your apps",
-                        "apps": [self._app_name],
+                        # An object carries the catalog's stable id alongside
+                        # the display name so the frontend can resolve by id
+                        # first - falls back to a bare name string only when
+                        # no id was resolved (e.g. a resolver-failure path
+                        # with no app_info), matching the legacy shape older
+                        # persisted interactions/Hire-seeded cards still use.
+                        "apps": [
+                            {"id": self._app_id, "name": self._app_name}
+                            if self._app_id
+                            else self._app_name
+                        ],
                     }
                 ],
             }

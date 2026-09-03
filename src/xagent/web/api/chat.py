@@ -627,6 +627,7 @@ async def create_default_tools(
     file_operation_access_version: Any = None,
     agent_creator_user_id: Optional[int] = None,
     declared_knowledge_bases: Optional[List[str]] = None,
+    connect_apps_interactive: bool = False,
 ) -> tuple[list[Any], Any]:
     """Create default tools and tool_config for AgentService using ToolFactory.
 
@@ -730,6 +731,7 @@ async def create_default_tools(
         connector_team_id=connector_team_id,
         agent_creator_user_id=agent_creator_user_id,
         declared_knowledge_bases=declared_knowledge_bases,
+        connect_apps_interactive=connect_apps_interactive,
     )
 
     # Store excluded_agent_id in tool_config for agent tool filtering
@@ -791,6 +793,23 @@ def _task_runtime_context(
         source=str(source) if source is not None else None,
         session_factory=get_session_local(),
     )
+
+
+def _connect_apps_interactive_for_task(*, source: Any, channel_id: Any) -> bool:
+    """Whether this task's surface can render an interactive connect_apps pause.
+
+    Only web chat can: it is the only caller that both keeps the run pinned
+    to a live turn awaiting a reply and renders the ``connect_apps`` UI
+    (``ClarificationForm``) that answers it. ``source`` is ``None``/
+    ``"internal"`` for both web chat and IM-channel bot tasks, so
+    ``channel_id`` (non-null only for the latter) is required to tell them
+    apart; A2A (``"a2a"``), the v1 SDK (``"sdk"``), and public/shared-link
+    runs (``"external"``/``"widget"``/``"shared_link"``) are excluded by
+    ``source`` alone.
+    """
+
+    normalized_source = str(source) if source is not None else None
+    return normalized_source in (None, "internal") and channel_id is None
 
 
 def _task_runtime_context_for_tool_build(
@@ -2107,6 +2126,10 @@ class AgentServiceManager:
                 user_id=int(task.user_id),
                 source=getattr(task, "source", None),
             ),
+            connect_apps_interactive=_connect_apps_interactive_for_task(
+                source=getattr(task, "source", None),
+                channel_id=getattr(task, "channel_id", None),
+            ),
             allowed_collections=agent_config["knowledge_bases"]
             if agent_config
             else None,
@@ -2887,6 +2910,22 @@ class AgentServiceManager:
                             if task is not None
                             else getattr(snapshot, "task", None),
                             "source",
+                            None,
+                        ),
+                    ),
+                    connect_apps_interactive=_connect_apps_interactive_for_task(
+                        source=getattr(
+                            task
+                            if task is not None
+                            else getattr(snapshot, "task", None),
+                            "source",
+                            None,
+                        ),
+                        channel_id=getattr(
+                            task
+                            if task is not None
+                            else getattr(snapshot, "task", None),
+                            "channel_id",
                             None,
                         ),
                     ),

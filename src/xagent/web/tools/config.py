@@ -1410,6 +1410,12 @@ class WebToolConfig(BaseToolConfig):
         # positional arguments for anything after agent_call_stack keeps
         # binding the same values it always did.
         voice: Optional[str] = None,
+        # Whether this run's surface can actually render an interactive
+        # `connect_apps` pause (web chat only, today). ``False`` by default
+        # so every non-web-chat entry point (channel bots, A2A, the v1 SDK,
+        # public/shared-link runs) keeps the old plain-error behavior instead
+        # of pausing somewhere with no UI to answer it.
+        connect_apps_interactive: bool = False,
     ):
         # ``tool_selection_spec`` accepts :class:`ToolSelectionSpec` from
         # the tools adapter package; typed as ``Any`` here to avoid an
@@ -1437,6 +1443,7 @@ class WebToolConfig(BaseToolConfig):
         # object can be overwritten by the model, and this value must not
         # be confusable with that one at the resolution point.
         self._declared_knowledge_bases = declared_knowledge_bases
+        self._connect_apps_interactive = connect_apps_interactive
         self._task_runtime_contribution: Any = None
         self._task_runtime_workspace: Any = None
         self._live_db = db
@@ -2275,6 +2282,10 @@ class WebToolConfig(BaseToolConfig):
     def get_voice(self) -> Optional[str]:
         """See BaseToolConfig.get_voice's docstring."""
         return self._voice
+
+    def get_connect_apps_interactive(self) -> bool:
+        """See BaseToolConfig.get_connect_apps_interactive's docstring."""
+        return self._connect_apps_interactive
 
     def _note_unresolved_tool_policy(self, input_name: str, reason: str) -> None:
         """Record that a policy input could not be resolved for this turn.
@@ -3358,12 +3369,31 @@ class WebToolConfig(BaseToolConfig):
         # Lets the runtime pause with a `connect_apps` card naming the actual
         # app (see `UnavailableMCPTool._run_unavailable`) instead of only
         # ever surfacing a raw error - only populated when the caller already
-        # resolved the catalog app, so an unresolvable server keeps the old
-        # error-only behavior.
-        if app_info is not None:
+        # resolved the catalog app AND this run's surface can render the
+        # pause (see `_connect_apps_interactive`'s docstring), so an
+        # unresolvable server, or a non-web-chat entry point, keeps the old
+        # error-only behavior. A hidden app is deliberately treated the same
+        # as unresolvable: /api/mcp/apps (the frontend's connector catalog)
+        # excludes it, so naming it in a pause would leave the user staring
+        # at a dead-end connect_apps card with no Connect button to act on.
+        if (
+            app_info is not None
+            and self._connect_apps_interactive
+            and app_info.get("is_visible_in_connector", True)
+        ):
             app_name = app_info.get("name")
             if isinstance(app_name, str) and app_name:
                 inner_config["app_name"] = app_name
+            # The catalog's stable id, alongside the display name above: two
+            # visible apps can share a name (PublicMCPApp.name has no unique
+            # constraint, unlike app_id), so the frontend resolves the pause
+            # by id first and only falls back to name-matching for the
+            # legacy/plain-string shape. Only meaningful paired with
+            # app_name - a pause naming nothing has no card to attach an id
+            # to.
+            app_id = app_info.get("id")
+            if isinstance(app_id, str) and app_id and "app_name" in inner_config:
+                inner_config["app_id"] = app_id
         serialized_user_id = self._serialize_mcp_user_id()
         return {
             "name": getattr(server, "name", ""),

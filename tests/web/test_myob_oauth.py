@@ -152,7 +152,40 @@ def test_login_sets_prompt_consent_for_myob(db_session):
     """Without prompt=consent, MYOB never appends businessId to the
     authorization redirect at all -- the callback's businessId guard would
     then always trigger, so this must hold for every MYOB login, not just
-    the resource-owner flow."""
+    the resource-owner flow. Uses app_id="myob" (the only reachable path,
+    now that bare app_id-less logins are rejected -- see
+    test_bare_myob_login_is_rejected_once_authenticated_and_configured
+    below), matching how the catalog UI actually connects this app."""
+    db, user = db_session
+    token = _token_for(user)
+
+    provider = SimpleNamespace(
+        client_id=encrypt_value("myob-client-id"),
+        auth_url="https://secure.myob.com/oauth2/account/authorize/",
+        redirect_uri="https://app.example.com/api/auth/myob/callback",
+        default_scopes=[],
+    )
+
+    resp = generic_oauth_login(
+        provider="myob",
+        token=token,
+        app_id="myob",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    url = resp.headers["location"]
+    qs = parse_qs(urlparse(url).query)
+
+    assert qs.get("prompt") == ["consent"], f"myob prompt missing: {url}"
+
+
+def test_bare_myob_login_is_rejected_once_authenticated_and_configured(db_session):
+    """MYOB is in APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT (see mcp_apps.py):
+    its oauth_providers row has no default_scopes at all, so a bare
+    (app_id-less) login would request zero sme-* scopes yet still complete
+    and report success -- this guard must reject it before any state token
+    is minted, the same way it already does for github."""
     db, user = db_session
     token = _token_for(user)
 
@@ -171,10 +204,8 @@ def test_login_sets_prompt_consent_for_myob(db_session):
         db=db,
         db_provider=provider,
     )
-    url = resp.headers["location"]
-    qs = parse_qs(urlparse(url).query)
 
-    assert qs.get("prompt") == ["consent"], f"myob prompt missing: {url}"
+    assert resp.status_code == 404
 
 
 def test_callback_persists_business_id_and_identity(db_session, monkeypatch):
@@ -219,7 +250,11 @@ def test_callback_rejects_missing_business_id_without_touching_prior_grant(
     be rejected before the delete-then-recreate persistence step -- letting
     it through would destroy a prior *working* grant while still reporting
     success, since instance_url is required for the connector to launch at
-    all (launch_config.env_mapping)."""
+    all (launch_config.env_mapping). Rejected before the token exchange even
+    starts (mock_post is never called): myob_business_id is already fully
+    known from the raw callback request, so there's nothing to gain by
+    burning a network round trip and the single-use authorization code on an
+    outcome that's already decided."""
     db, user = db_session
     existing = UserOAuth(
         user_id=user.id,
@@ -246,6 +281,7 @@ def test_callback_rejects_missing_business_id_without_touching_prior_grant(
 
     assert response.status_code == 400
     assert "businessId" in response.body.decode()
+    mock_post.assert_not_called()
     oauth_account = (
         db.query(UserOAuth)
         .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "myob")
@@ -268,6 +304,7 @@ def test_callback_rejects_malformed_business_id(db_session, monkeypatch):
     )
 
     assert response.status_code == 400
+    mock_post.assert_not_called()
     assert (
         db.query(UserOAuth)
         .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "myob")

@@ -36,7 +36,16 @@ from .models.public_mcp import PublicMCPApp
 # (the catalog UI always passes app_id="github", and app_id == provider_name
 # for this connector, so an already-connected grant already satisfies the
 # app-scoped match trivially).
-APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT = frozenset({"facebook", "github"})
+#
+# myob: same structural situation as github, just more extreme -- the myob
+# oauth_providers row's own default_scopes is empty (there's no shared
+# identity scope to request; see the provider row's own comment), and every
+# functional sme-* scope this connector needs lives solely on the app row.
+# Without this entry, a bare GET /api/auth/myob/login would request NO
+# scopes at all, yet the callback would still complete (MYOB's businessId
+# guard has nothing to do with scopes) and activate the app's UserMCPServer
+# against a grant with zero sme-* permissions.
+APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT = frozenset({"facebook", "github", "myob"})
 
 
 def _normalize_oauth_grant_key(value: object) -> str | None:

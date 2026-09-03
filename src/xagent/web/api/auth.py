@@ -2643,6 +2643,29 @@ def generic_oauth_callback(
         missing_config.append(_oauth_env_name(provider, "CLIENT_SECRET"))
     if missing_config:
         return _oauth_provider_config_error(provider, missing_config)
+
+    if is_myob and not myob_business_id:
+        # myob_business_id was already extracted (and validated as a GUID)
+        # from the raw callback request, before this point -- unlike
+        # Deputy/Salesforce's own instance_url-shaped guards (checked further
+        # below, after their own token exchange), there is no token_data
+        # field this could instead be re-derived from post-exchange, so
+        # nothing is gained by waiting: a missing/malformed value here can
+        # only mean MYOB's own redirect never carried one (or carried a
+        # value astray of the documented GUID shape). Checked here, before
+        # the token exchange even starts, so a doomed connection attempt
+        # doesn't burn a network round trip to MYOB or consume the
+        # single-use authorization code for an outcome already decided.
+        return HTMLResponse(
+            content=(
+                "<h1>Error exchanging token</h1>"
+                f"<p>{html.escape(provider)} did not return a businessId. "
+                "Make sure the authorization request included "
+                "prompt=consent.</p>"
+            ),
+            status_code=400,
+        )
+
     token_url = db_provider.token_url
     userinfo_url = db_provider.userinfo_url
 
@@ -2879,28 +2902,6 @@ def generic_oauth_callback(
                 content=(
                     "<h1>Error exchanging token</h1>"
                     f"<p>{html.escape(provider)} did not return an endpoint.</p>"
-                ),
-                status_code=400,
-            )
-
-        if is_myob and not myob_business_id:
-            # myob_business_id was already extracted (and validated as a
-            # GUID) from the raw callback request before the token exchange
-            # above -- unlike Deputy/Salesforce, there is no token_data
-            # field to re-derive it from here, so a missing/malformed value
-            # at this point can only mean MYOB's own redirect never carried
-            # one (or carried a value astray of the documented GUID shape).
-            # Same "fail before the delete-then-recreate below" reasoning as
-            # the Salesforce/Deputy guards: this connector's env_mapping
-            # requires it, so letting this through would either come back
-            # unavailable on the next load or destroy a prior *working*
-            # grant while still reporting "Connected Successfully".
-            return HTMLResponse(
-                content=(
-                    "<h1>Error exchanging token</h1>"
-                    f"<p>{html.escape(provider)} did not return a businessId. "
-                    "Make sure the authorization request included "
-                    "prompt=consent.</p>"
                 ),
                 status_code=400,
             )

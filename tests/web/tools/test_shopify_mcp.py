@@ -502,6 +502,19 @@ def test_extract_connection_no_cursor_when_not_truncated():
     assert after_cursor is None
 
 
+def test_extract_connection_treats_missing_end_cursor_as_no_more_pages():
+    # hasNextPage=true with no endCursor would otherwise tell a caller to
+    # retry with after=None -- the first page again, forever.
+    _items, has_more, after_cursor = shopify._extract_connection(
+        {"products": {"nodes": [{"id": "1"}], "pageInfo": {"hasNextPage": True}}},
+        "products",
+        lambda n: n,
+    )
+
+    assert has_more is False
+    assert after_cursor is None
+
+
 def test_get_shop_returns_shop_info(monkeypatch):
     monkeypatch.setattr(
         shopify.requests,
@@ -539,7 +552,7 @@ def test_list_products_sends_query_limit_and_after(monkeypatch):
     )
 
     assert result["status"] == "success"
-    assert result["products"]["products"][0]["title"] == "Shirt"
+    assert result["products"]["items"][0]["title"] == "Shirt"
     body = mock_post.call_args.kwargs["json"]
     assert body["variables"] == {"first": 10, "query": "status:active", "after": "cur0"}
     assert "$query: String!" in body["query"]
@@ -743,6 +756,51 @@ def test_create_product_fails_closed_when_mutation_field_missing(monkeypatch):
     assert result["status"] == "error"
 
 
+def test_create_product_fails_closed_when_object_null_despite_empty_user_errors(
+    monkeypatch,
+):
+    # userErrors is empty, but the product itself is null (e.g. a
+    # nested field GraphQL couldn't resolve, null-propagating the whole
+    # object) -- this must not be reported as success with an all-null
+    # product.
+    monkeypatch.setattr(
+        shopify.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "data": {"productCreate": {"product": None, "userErrors": []}},
+                    "errors": [{"message": "Access denied for tags field"}],
+                }
+            )
+        ),
+    )
+
+    result = json.loads(shopify.shopify_create_product("Shirt"))
+
+    assert result["status"] == "error"
+    assert "Access denied for tags field" in result["message"]
+
+
+def test_errors_detail_returns_string_as_is():
+    assert shopify._errors_detail("plain string error") == "plain string error"
+
+
+def test_errors_detail_joins_list_of_error_objects():
+    assert (
+        shopify._errors_detail([{"message": "bad"}, {"message": "worse"}])
+        == "bad; worse"
+    )
+
+
+def test_errors_detail_stringifies_unexpected_shape():
+    # Not per the GraphQL spec (errors should be a list), but must not
+    # silently iterate a dict's keys and drop the actual diagnostic text.
+    detail = shopify._errors_detail({"query": ["failed to parse query"]})
+
+    assert "failed to parse query" in detail
+
+
 def test_list_orders_sends_query_and_limit(monkeypatch):
     mock_post = Mock(
         return_value=MockResponse(
@@ -896,7 +954,7 @@ def test_list_customers_returns_summaries(monkeypatch):
 
     result = json.loads(shopify.shopify_list_customers())
 
-    customer = result["customers"]["customers"][0]
+    customer = result["customers"]["items"][0]
     assert customer["first_name"] == "Jane"
     assert customer["email"] == "jane@example.com"
     assert customer["number_of_orders"] == "3"
@@ -940,7 +998,7 @@ def test_list_collections_returns_summaries_with_products_count(monkeypatch):
 
     result = json.loads(shopify.shopify_list_collections())
 
-    collection = result["collections"]["collections"][0]
+    collection = result["collections"]["items"][0]
     assert collection["title"] == "Summer"
     assert collection["products_count"] == 12
 

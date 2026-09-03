@@ -173,8 +173,28 @@ def _mutation_failure_message(
     `success` discriminator."""
     message = _user_errors_message(user_errors)
     if errors:
-        message = f"{message} ({graphql_errors_message(errors)})"
+        message = f"{message} ({_errors_detail(errors)})"
     return message
+
+
+def _errors_detail(errors_field: Any) -> str:
+    """Render a GraphQL response's top-level "errors" value as text.
+
+    Per the GraphQL spec this is always a list of error objects, but
+    Shopify's own auth-failure responses (e.g. a 401 for an invalid access
+    token) put a plain string here instead -- "[API] Invalid API key or
+    access token (...)" -- and a malformed/non-conforming backend could in
+    principle put a bare dict. graphql_errors_message assumes a list and
+    iterates whatever it's given: over a str that walks it one character at
+    a time (producing a mangled "a; p; i" message), and over a dict that
+    walks its keys, silently dropping the actual diagnostic text in its
+    values. Both are handled here before ever reaching that helper.
+    """
+    if isinstance(errors_field, str):
+        return errors_field
+    if isinstance(errors_field, list):
+        return graphql_errors_message(errors_field)
+    return str(errors_field)
 
 
 def _split_tags(tags: str) -> list[str]:
@@ -285,19 +305,7 @@ def _graphql(
         try:
             payload = response.json()
             if isinstance(payload, dict) and payload.get("errors"):
-                errors_field = payload["errors"]
-                # Shopify's own auth-failure responses (e.g. a 401 for an
-                # invalid access token) put a plain string here -- "[API]
-                # Invalid API key or access token (...)" -- not the GraphQL
-                # {"errors": [{"message": ...}]} shape graphql_errors_message
-                # expects. Iterating a str with that helper walks it one
-                # character at a time instead of raising, producing a
-                # mangled "a; p; i" message instead of a clear error.
-                detail = (
-                    errors_field
-                    if isinstance(errors_field, str)
-                    else graphql_errors_message(errors_field)
-                )
+                detail = _errors_detail(payload["errors"])
         except ValueError:
             pass
         if detail is None:
@@ -327,7 +335,7 @@ def _graphql(
         )
     errors = payload.get("errors") or []
     if errors:
-        message = graphql_errors_message(errors)
+        message = _errors_detail(errors)
         if all(value is None for value in data.values()):
             raise RuntimeError(message)
         logger.warning(
@@ -347,8 +355,12 @@ def _extract_connection(
     connection = data.get(field_name) or {}
     nodes = connection.get("nodes") or []
     page_info = connection.get("pageInfo") or {}
-    has_more = bool(page_info.get("hasNextPage"))
-    after_cursor = page_info.get("endCursor") if has_more else None
+    after_cursor = page_info.get("endCursor") if page_info.get("hasNextPage") else None
+    # hasNextPage=true with no endCursor would otherwise tell a caller to
+    # retry with after=None, i.e. the first page again -- an unrecoverable,
+    # silent loop rather than an error. Only report more pages when there is
+    # an actual cursor to advance with.
+    has_more = after_cursor is not None
     # A connection's individual nodes can be null (e.g. a node that failed
     # to resolve due to permissions or a backend error) even when the list
     # itself is present -- summary_fn assumes a dict, so skip null entries
@@ -389,9 +401,15 @@ def _list_connection(
         variables,
     )
     items, has_more, next_cursor = _extract_connection(data, root_field, summary_fn)
+    # success_with_capped_dict wraps its `data` argument under `root_field`
+    # itself (-> {"status": "success", root_field: data, ...}); nesting a
+    # same-named key inside `data` too (e.g. {"products": {"products": [...]}})
+    # would bury has_more/after_cursor a level deeper than every other tool
+    # in this file puts them, so the inner list key is named generically
+    # instead of repeating root_field.
     return success_with_capped_dict(
         root_field,
-        {root_field: items, "has_more": has_more, "after_cursor": next_cursor},
+        {"items": items, "has_more": has_more, "after_cursor": next_cursor},
     )
 
 
@@ -425,9 +443,19 @@ def _run_mutation(
     user_errors = result.get("userErrors") or []
     if user_errors:
         return _error(_mutation_failure_message(user_errors, errors))
-    return _success(
-        **{object_key: summary_fn(result.get(object_key) or {})}, _errors=errors
-    )
+    object_value = result.get(object_key)
+    if not object_value:
+        # userErrors is empty, but the object itself is also null -- e.g. an
+        # access-scope error on one selected field null-propagated up to the
+        # whole object, with the real cause only in the top-level `errors`
+        # this response still carries. Reporting this as success with an
+        # all-null object would hide that entirely.
+        return _error(
+            _errors_detail(errors)
+            if errors
+            else f"Shopify did not return a {object_key} for {mutation_field}"
+        )
+    return _success(**{object_key: summary_fn(object_value)}, _errors=errors)
 
 
 _PRODUCT_FIELDS = (

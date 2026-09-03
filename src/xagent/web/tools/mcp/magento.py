@@ -3,6 +3,7 @@ import json
 import logging
 import re
 import socket
+import threading
 from collections.abc import Callable, Iterator
 from os import environ
 from typing import Any
@@ -41,6 +42,9 @@ MAX_LIMIT = 100
 _PRODUCT_STATUSES = frozenset({1, 2})  # 1 = Enabled, 2 = Disabled
 _PRODUCT_VISIBILITIES = frozenset({1, 2, 3, 4})  # Not Visible/Catalog/Search/Both
 _STORE_CODE_PATTERN = re.compile(r"^[A-Za-z0-9_]+$")
+# Serializes _pinned_dns's global urllib3 monkeypatch -- see that function's
+# docstring for why two overlapping calls could otherwise race.
+_PINNED_DNS_LOCK = threading.Lock()
 
 
 def _success(**payload: Any) -> str:
@@ -267,56 +271,54 @@ def _pinned_dns(hostname: str, pinned_ip: str) -> Iterator[None]:
     call inside fully blocks that thread for the call's duration, so no
     other tool invocation's `_pinned_dns` block can interleave with it. If
     this connector ever moves to an async HTTP client, that property no
-    longer holds and this scoping would need a lock (or a per-Session/
-    per-HTTPConnectionPool patch instead of a global one).
+    longer holds. Rather than leave that invariant unenforced, `_PINNED_DNS_LOCK`
+    below serializes the whole block (not just the patch/restore) so a
+    second overlapping call always waits instead of racing, whether or not
+    that invariant keeps holding in the future.
     """
-    original_create_connection = urllib3_connection.create_connection
+    with _PINNED_DNS_LOCK:
+        original_create_connection = urllib3_connection.create_connection
 
-    def _pinned_create_connection(
-        address: tuple[str, int], *args: Any, **kwargs: Any
-    ) -> Any:
-        host, port = address
-        if host == hostname:
-            address = (pinned_ip, port)
-        return original_create_connection(address, *args, **kwargs)
+        def _pinned_create_connection(
+            address: tuple[str, int], *args: Any, **kwargs: Any
+        ) -> Any:
+            host, port = address
+            if host == hostname:
+                address = (pinned_ip, port)
+            return original_create_connection(address, *args, **kwargs)
 
-    urllib3_connection.create_connection = _pinned_create_connection
-    try:
-        yield
-    finally:
-        urllib3_connection.create_connection = original_create_connection
-
-
-_AMBIENT_PROXY_ENV_VARS = (
-    "http_proxy",
-    "https_proxy",
-    "all_proxy",
-    "HTTP_PROXY",
-    "HTTPS_PROXY",
-    "ALL_PROXY",
-)
+        urllib3_connection.create_connection = _pinned_create_connection
+        try:
+            yield
+        finally:
+            urllib3_connection.create_connection = original_create_connection
 
 
-@contextlib.contextmanager
-def _no_ambient_proxy_env() -> Iterator[None]:
-    """Hide every ambient proxy env var for the duration of this block.
+def _make_request(**kwargs: Any) -> requests.Response:
+    """Issue the actual HTTP call with every ambient/OS-native proxy source
+    disabled, not just the specific env vars `get_trusted_proxy_url()` checks.
 
-    `requests.request()` always runs on a Session with trust_env=True, which
-    calls `get_environ_proxies()` and fills in any scheme not already present
-    in an explicitly-passed `proxies=` dict -- so passing `proxies={}` alone
-    does NOT stop requests from routing through an ambient proxy. This closes
-    that gap for exactly the schemes `get_trusted_proxy_url()` doesn't police
-    (e.g. ALL_PROXY), rather than widening that function's own env-var list,
-    since the goal here is "no proxy unless explicitly trusted," not "trust
-    one more variable."
+    `requests.request()` always runs on a fresh Session with `trust_env=True`,
+    which -- regardless of what `proxies=` is explicitly passed -- still
+    calls `get_environ_proxies()` for any scheme not already present in that
+    dict. That function is `urllib.request.getproxies()`, which itself falls
+    back *past* `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` to the OS's own proxy
+    configuration once none of those env vars are set:
+    `getproxies_macosx_sysconf()` on macOS, `getproxies_registry()` on
+    Windows (confirmed directly against the installed `urllib.request`/
+    `requests` source). A previous fix here scrubbed exactly those env var
+    names, which closed the ALL_PROXY gap but left this OS-native fallback
+    wide open on precisely those two platforms -- the same DNS-rebinding-
+    via-proxy bypass this whole gate exists to close, one layer deeper.
+
+    `trust_env=False` on the Session skips the entire `if self.trust_env:`
+    block in `merge_environment_settings()` -- environment *and* OS-native
+    lookup alike -- so it closes every layer in one place instead of
+    chasing an open-ended list of fallback sources one platform at a time.
     """
-    saved = {name: environ.pop(name, None) for name in _AMBIENT_PROXY_ENV_VARS}
-    try:
-        yield
-    finally:
-        for name, value in saved.items():
-            if value is not None:
-                environ[name] = value
+    with requests.Session() as session:
+        session.trust_env = False
+        return session.request(**kwargs)
 
 
 def _clamp_limit(limit: int) -> int:
@@ -435,17 +437,10 @@ def _request(
     # trusted to enforce its own private-range egress policy
     # (XAGENT_TRUSTED_EGRESS_PROXY=1), rather than silently trusting every
     # ambient proxy setup_proxy_env() promotes from the OS's own settings.
-    # The result is then passed to `requests` explicitly *and* the ambient
-    # proxy env vars are scrubbed for the duration of the call (see
-    # _no_ambient_proxy_env below) so "no proxy" here is an actual
-    # guarantee. Passing proxies= alone is NOT sufficient: requests.request()
-    # runs on a trust_env=True Session by default, which still merges in
-    # whatever get_environ_proxies() finds (e.g. ALL_PROXY, which
-    # get_trusted_proxy_url() never inspects) for any scheme this dict
-    # doesn't already set -- silently reopening the DNS-rebinding window
-    # this whole gate exists to close (verified directly: Session().
-    # merge_environment_settings(url, {}, ...) still fills in an env-derived
-    # proxy even when {} is passed explicitly).
+    # The result is then passed to `_make_request()` (see below), which
+    # issues the call on a trust_env=False Session -- disabling every
+    # ambient/OS-native proxy source, not just the env vars this function
+    # checks -- so "no proxy" here is an actual guarantee for this call.
     proxy_url = get_trusted_proxy_url()
     proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else {}
 
@@ -456,8 +451,8 @@ def _request(
     origin = _format_origin(hostname, port)
     url = f"{origin}{_store_path_prefix()}{path}"
     try:
-        with _pinned_dns(hostname, pinned_ip), _no_ambient_proxy_env():
-            response = requests.request(
+        with _pinned_dns(hostname, pinned_ip):
+            response = _make_request(
                 method=method,
                 url=url,
                 headers=_headers(),
@@ -556,8 +551,21 @@ def _paginated_result(
         raise ValueError(
             f'Expected Magento\'s "items" field to be a list, got {type(items).__name__}'
         )
+    # Missing/non-int total_count raises rather than silently defaulting
+    # has_more to False, matching the rigor items got above: unlike items,
+    # there's no legitimate "absent means empty" reading for total_count --
+    # Magento's SearchResultsInterface always includes it, so a response
+    # missing it (or sending the wrong type) is a heterogeneous/non-compliant
+    # deployment worth surfacing, not a signal indistinguishable from "this
+    # is genuinely the last page" that would silently truncate results for
+    # any caller paginating mechanically.
     total_count = payload.get("total_count")
-    has_more = isinstance(total_count, int) and current_page * page_size < total_count
+    if not isinstance(total_count, int):
+        raise ValueError(
+            'Expected Magento\'s "total_count" field to be an int, got '
+            f"{type(total_count).__name__}"
+        )
+    has_more = current_page * page_size < total_count
     return items, has_more
 
 
@@ -581,15 +589,25 @@ def _list_search(
         params.update(extra_params)
     result = _request("GET", path, params=params)
     items, has_more = _paginated_result(result, max_results, current_page)
-    # success_with_capped_dict(field_name, data) always nests `data` as the
-    # single value under `field_name` -- passing a dict that itself
-    # contains a `result_key` entry (e.g. {"products": [...], "has_more":
-    # ...}) would double-nest it as {"products": {"products": [...], ...}}
-    # instead of the flat {"products": [...], "has_more": ...} shape every
-    # caller of this list tool expects. Cap just the summarized list, then
-    # add has_more/next_page as top-level siblings afterward.
+    # success_with_capped_dict(field_name, data) can only shrink a
+    # collection value *nested inside* a dict -- handed a bare list
+    # directly as `data`, its `not isinstance(data, dict)` guard
+    # short-circuits to returning the payload uncapped no matter how
+    # large (confirmed: a 200-item product list produced a ~73KB response
+    # against a 51.2KB limit, with the body itself claiming
+    # "truncated": false). Wrapping the list one level deeper under
+    # `result_key` -- the same shape mixpanel.py's
+    # success_with_capped_dict("event_names", {"event_names": result})
+    # already relies on -- gives the capping logic a dict to find and
+    # halve the oversized list inside of. The cost is that
+    # result[result_key] itself becomes {result_key: [...]} rather than
+    # a bare list; has_more/next_page are merged in as top-level siblings
+    # afterward so pagination metadata stays reachable there, not nested
+    # inside the (possibly capped) value.
     capped = json.loads(
-        success_with_capped_dict(result_key, [summary_fn(item) for item in items])
+        success_with_capped_dict(
+            result_key, {result_key: [summary_fn(item) for item in items]}
+        )
     )
     capped["has_more"] = has_more
     capped["next_page"] = current_page + 1 if has_more else None
@@ -597,6 +615,13 @@ def _list_search(
 
 
 def _product_summary(product: dict[str, Any]) -> dict[str, Any]:
+    # A malformed 2xx body (JSON null, or an array where an object is
+    # expected) would otherwise raise AttributeError on .get(), surfaced by
+    # each tool's blanket "except Exception" as an opaque "'NoneType' object
+    # has no attribute 'get'" instead of a clear result -- matching
+    # _category_summary's guard below.
+    if not product or not isinstance(product, dict):
+        return {}
     return {
         "sku": product.get("sku"),
         "name": product.get("name"),
@@ -611,6 +636,8 @@ def _product_summary(product: dict[str, Any]) -> dict[str, Any]:
 
 
 def _order_summary(order: dict[str, Any]) -> dict[str, Any]:
+    if not order or not isinstance(order, dict):
+        return {}
     return {
         "entity_id": order.get("entity_id"),
         "increment_id": order.get("increment_id"),
@@ -625,6 +652,8 @@ def _order_summary(order: dict[str, Any]) -> dict[str, Any]:
 
 
 def _customer_summary(customer: dict[str, Any]) -> dict[str, Any]:
+    if not customer or not isinstance(customer, dict):
+        return {}
     return {
         "id": customer.get("id"),
         "email": customer.get("email"),
@@ -851,7 +880,7 @@ def magento_add_order_comment(
     comment: str,
     status: str = "",
     notify_customer: bool = False,
-    visible_to_customer: bool = True,
+    visible_to_customer: bool = False,
 ) -> str:
     """
     Add a status-history comment to an order -- Magento has no separate
@@ -862,7 +891,9 @@ def magento_add_order_comment(
     status: optional order status to set alongside the comment (leave
     empty to keep the order's current status).
     notify_customer: if true, emails the customer this comment/status change.
-    visible_to_customer: if false, this is an internal-only note.
+    visible_to_customer: defaults to false (internal-only note) so an agent
+    adding a note without reasoning about this flag doesn't publish it to
+    the customer's order history by default; pass true to make it visible.
     """
     try:
         _require_non_blank(comment, "comment")
@@ -878,7 +909,12 @@ def magento_add_order_comment(
             f"/orders/{url_path_id(str(order_id), 'order_id')}/comments",
             json_data={"statusHistory": status_history},
         )
-        return _success(added=bool(result))
+        # Magento's addComment always returns a JSON bool -- `result is
+        # False` is the only value that actually means failure. `bool(result)`
+        # would also report failure on a legitimate 204/empty-body response
+        # (_request()'s generic "no content" shortcut returns {}, and
+        # bool({}) is False), misreporting a successful call as failed.
+        return _success(added=result is not False)
     except Exception as e:
         logger.error(f"Error adding comment to Magento order {order_id}: {e}")
         return _error(str(e))

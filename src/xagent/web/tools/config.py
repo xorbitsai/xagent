@@ -1065,8 +1065,18 @@ async def refresh_oauth_token_if_needed(
                             "endpoint; keeping the previously stored value"
                         )
                 if "expires_in" in data:
+                    # int(), not a bare pass-through: MYOB's documented token
+                    # response (both the code-exchange and refresh legs)
+                    # returns this as a JSON *string* (e.g. "1200"), which
+                    # timedelta()'s seconds kwarg rejects outright
+                    # (TypeError) -- MYOB is the first provider whose
+                    # refresh reaches this generic branch with no
+                    # provider-specific handling (unlike Meta's own branch
+                    # a few lines above, or the code-exchange leg in
+                    # api/auth.py's generic_oauth_callback, both of which
+                    # already cast this the same way).
                     oauth_account.expires_at = datetime.now(timezone.utc) + timedelta(
-                        seconds=data["expires_in"]
+                        seconds=int(data["expires_in"])
                     )
                 db.flush([oauth_account])
                 logger.info(

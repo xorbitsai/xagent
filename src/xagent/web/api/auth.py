@@ -2703,12 +2703,30 @@ def generic_oauth_callback(
                 )
                 or "longlife_refresh_token"
             )
-        # MYOB's own docs list `scope` as required here too, but the
-        # production-grade pymyob SDK's code-exchange request omits it and
-        # works -- client_id/client_secret/redirect_uri (sent below/above
-        # for every provider already) are what MYOB's endpoint actually
-        # checks. Trusting the working implementation over the stale docs;
-        # revisit if MYOB ever starts rejecting exchanges without it.
+        if is_myob:
+            # MYOB's own docs list `scope` as a required body param here,
+            # with a worked example -- sent, unlike the Deputy branch above,
+            # from the app row's oauth_scopes rather than
+            # db_provider.default_scopes: MYOB's provider row deliberately
+            # carries no default_scopes of its own (see its registry row's
+            # comment), since every functional sme-* scope this connector
+            # needs is granular and app-specific. target_app_info is the
+            # same lookup already performed above (for the hidden-app
+            # check) when app_id is present; MYOB requires an app-scoped
+            # grant (APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT), so a real
+            # connection always has one -- the `app_id and` guard only
+            # covers a hypothetical stale/crafted state token missing it,
+            # in which case there's nothing to source a scope from anyway.
+            myob_app_scopes = (
+                target_app_info.get("oauth_scopes")
+                if app_id and isinstance(target_app_info, dict)
+                else None
+            )
+            myob_scopes = _merge_oauth_scopes(
+                db_provider.default_scopes or [], myob_app_scopes
+            )
+            if myob_scopes:
+                data["scope"] = _oauth_scope_separator(provider).join(myob_scopes)
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
         if requires_json_accept_header(provider):
             headers["Accept"] = "application/json"

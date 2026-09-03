@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock
 from urllib.parse import parse_qs, urlparse
@@ -17,9 +17,11 @@ from xagent.web.api.auth import (
     generic_oauth_login,
 )
 from xagent.web.models.database import Base
+from xagent.web.models.oauth_provider import OAuthProvider
 from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth
+from xagent.web.tools import config as tool_config
 
 
 class MockResponse:
@@ -216,7 +218,13 @@ def test_callback_persists_business_id_and_identity(db_session, monkeypatch):
                 "access_token": "myob-token",
                 "refresh_token": "myob-refresh",
                 "token_type": "bearer",
-                "expires_in": 3600,
+                # MYOB's documented response returns this as a JSON *string*
+                # (e.g. "1200"), not a number -- pinned here, not just the
+                # more forgiving int the fixture used to carry, so a
+                # regression back to an unguarded int(...)/timedelta(...)
+                # cast would be caught the same way it would against the
+                # real API.
+                "expires_in": "3600",
                 "user": {"uid": "42", "username": "alice@acme.example"},
             }
         )
@@ -231,6 +239,19 @@ def test_callback_persists_business_id_and_identity(db_session, monkeypatch):
     )
 
     assert response.status_code == 200
+    # MYOB's provider row carries no default_scopes of its own -- every
+    # sme-* scope sent on the exchange must come from the app's own
+    # oauth_scopes, matching what MYOB's own docs require on this leg.
+    # get_app_by_id resolves a builtin app_id's oauth_scopes from the
+    # builtin_mcp_registry.py definition, not whatever the db_session
+    # fixture's PublicMCPApp row happens to carry (a builtin app's DB row
+    # is a catalog/display shell; the registry is the source of truth for
+    # its actual scopes) -- so this is the real production scope list,
+    # sorted per _merge_oauth_scopes' app-scope ordering.
+    assert mock_post.call_args.kwargs["data"]["scope"] == (
+        "sme-company-file sme-contacts-customer sme-contacts-supplier "
+        "sme-general-ledger sme-purchases sme-sales"
+    )
     oauth_account = (
         db.query(UserOAuth)
         .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "myob")
@@ -241,6 +262,7 @@ def test_callback_persists_business_id_and_identity(db_session, monkeypatch):
     assert oauth_account.instance_url == BUSINESS_ID
     assert oauth_account.provider_user_id == "42"
     assert oauth_account.email == "alice@acme.example"
+    assert oauth_account.expires_at is not None
 
 
 def test_callback_rejects_missing_business_id_without_touching_prior_grant(
@@ -423,3 +445,67 @@ def test_callback_rejects_boolean_uid_instead_of_stringifying_it(
     )
     assert oauth_account.provider_user_id is None
     assert oauth_account.email == "alice@acme.example"
+
+
+@pytest.mark.asyncio
+async def test_myob_refresh_handles_string_expires_in(db_session, monkeypatch):
+    """MYOB's documented refresh response returns expires_in as a JSON
+    *string* (e.g. "1200"), not a number -- timedelta()'s seconds kwarg
+    raises TypeError on a bare string, and refresh_oauth_token_if_needed's
+    outer except swallows that as a silent False, which is exactly what
+    would otherwise make every MYOB connection stop refreshing ~20 minutes
+    after connect with no visible error."""
+    db, user = db_session
+    db.add(
+        OAuthProvider(
+            provider_name="myob",
+            name="MYOB",
+            client_id=encrypt_value("myob-client-id"),
+            client_secret=encrypt_value("myob-client-secret"),
+            auth_url="https://secure.myob.com/oauth2/account/authorize/",
+            token_url="https://secure.myob.com/oauth2/v1/authorize/",
+            redirect_uri="https://app.example.com/api/auth/myob/callback",
+            userinfo_url="",
+            user_id_path="",
+            email_path="",
+            default_scopes=[],
+        )
+    )
+    oauth_account = UserOAuth(
+        user_id=user.id,
+        provider="myob",
+        access_token="old-token",
+        refresh_token="old-refresh",
+        instance_url=BUSINESS_ID,
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        provider_user_id="42",
+    )
+    db.add(oauth_account)
+    db.commit()
+
+    class FakeAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, url, **kwargs):
+            return MockResponse(
+                {
+                    "access_token": "new-token",
+                    "refresh_token": "new-refresh",
+                    "token_type": "bearer",
+                    "expires_in": "1200",
+                },
+                status_code=200,
+            )
+
+    monkeypatch.setattr(tool_config.httpx, "AsyncClient", FakeAsyncClient)
+
+    assert (
+        await tool_config.refresh_oauth_token_if_needed(db, oauth_account, "myob")
+        is True
+    )
+    assert oauth_account.access_token == "new-token"
+    assert oauth_account.expires_at > datetime.now(timezone.utc) + timedelta(minutes=15)

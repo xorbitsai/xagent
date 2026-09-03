@@ -51,7 +51,13 @@ def db_session(tmp_path):
             transport="oauth",
             provider_name="xero",
             category="Accounting",
-            oauth_scopes=["offline_access", "accounting.contacts"],
+            oauth_scopes=[
+                "offline_access",
+                "accounting.contacts",
+                "accounting.invoices",
+                "accounting.payments.read",
+                "accounting.settings",
+            ],
             # True here regardless of the real catalog row's current value
             # (which ships hidden as a release gate, see
             # builtin_mcp_registry.py's own comment on it): a hidden app's

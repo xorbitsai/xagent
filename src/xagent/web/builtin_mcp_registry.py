@@ -737,17 +737,25 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             # catalog's "All" view/search. "Payments" would be misleading:
             # Xero is bookkeeping/invoicing, not a payments processor.
             "category": "Accounting",
-            # Granular scopes -- Xero deprecated the broad accounting.*
-            # scopes (accounting.transactions/accounting.contacts covering
-            # everything) for apps created on or after 2 March 2026 in
-            # favor of per-resource read/write scopes; any app registered
-            # today only ever gets the granular set. offline_access is
-            # required for a refresh token (a 30-minute access token with
-            # no refresh would otherwise force re-consent every session).
+            # Granular scopes -- Xero deprecated the broad accounting.
+            # transactions scope (bank transactions/credit notes/invoices/
+            # repeating invoices, all under one scope) for apps created on
+            # or after 2 March 2026, replacing it with per-resource scopes;
+            # requesting the old broad scope on a new app fails the
+            # authorize redirect outright with "invalid_scope" (confirmed
+            # live). accounting.contacts and accounting.settings were NOT
+            # part of that split and are unchanged. accounting.invoices
+            # (not just its .read variant) is needed because this connector
+            # both reads and writes invoices; accounting.payments.read
+            # (not the full accounting.payments) because its one payments
+            # tool is read-only. offline_access is required for a refresh
+            # token (a 30-minute access token with no refresh would
+            # otherwise force re-consent every session).
             "oauth_scopes": [
                 "offline_access",
                 "accounting.contacts",
-                "accounting.transactions",
+                "accounting.invoices",
+                "accounting.payments.read",
                 "accounting.settings",
             ],
             # Hidden until manually verified against a live organisation,

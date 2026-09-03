@@ -57,7 +57,8 @@ APP_ID = "xero"
 XERO_SCOPES = [
     "offline_access",
     "accounting.contacts",
-    "accounting.transactions",
+    "accounting.invoices",
+    "accounting.payments.read",
     "accounting.settings",
 ]
 

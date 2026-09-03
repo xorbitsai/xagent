@@ -1257,7 +1257,7 @@ async def test_successful_slack_turn_reuses_channel_runtime(
     agent_service = SimpleNamespace(
         workspace=None,
         tracer=FakeTracer(),
-        set_conversation_history=lambda _messages: None,
+        set_conversation_history=lambda _messages, *, watermark=None: None,
         set_execution_context_messages=lambda _messages: None,
         set_recovered_skill_context=lambda _context: None,
     )
@@ -1298,6 +1298,7 @@ async def test_successful_slack_turn_reuses_channel_runtime(
         lambda *_args: SimpleNamespace(
             runtime_user=None,
             conversation_history=(),
+            conversation_watermark=None,
             execution_recovery=TaskExecutionRecoverySnapshot(),
         ),
     )

@@ -115,6 +115,7 @@ from xagent.config import (
     WEB_CRAWL_TLS_IMPERSONATE,
     WEB_DIR,
     WEB_SEARCH_PROVIDER,
+    XROUTER_EXCLUDED_MODELS,
     ExternalUploadsDirConfigurationError,
     format_file_size,
     get_agent_pattern_for_execution_mode,
@@ -222,6 +223,7 @@ from xagent.config import (
     get_web_crawl_tls_impersonate,
     get_web_dir,
     get_web_search_provider,
+    get_xrouter_excluded_models,
     in_sandbox_tool_runner,
     validate_sandbox_namespace,
 )
@@ -356,6 +358,9 @@ class TestEnvironmentVariableConstants:
             OPENROUTER_OFFICIAL_PROVIDERS_ONLY
             == "XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY"
         )
+
+    def test_xrouter_excluded_models_constant(self):
+        assert XROUTER_EXCLUDED_MODELS == "XAGENT_XROUTER_EXCLUDED_MODELS"
 
     def test_mcp_oauth_allow_private_hosts_constant(self):
         assert MCP_OAUTH_ALLOW_PRIVATE_HOSTS == "XAGENT_MCP_OAUTH_ALLOW_PRIVATE_HOSTS"
@@ -567,6 +572,21 @@ class TestOpenRouterConfig:
     def test_official_providers_only_false_values(self, monkeypatch, value):
         monkeypatch.setenv(OPENROUTER_OFFICIAL_PROVIDERS_ONLY, value)
         assert get_openrouter_official_providers_only() is False
+
+    def test_xrouter_excluded_models_defaults_empty(self, monkeypatch):
+        monkeypatch.delenv(XROUTER_EXCLUDED_MODELS, raising=False)
+        assert get_xrouter_excluded_models() == ()
+
+    def test_xrouter_excluded_models_parses_and_deduplicates(self, monkeypatch):
+        monkeypatch.setenv(
+            XROUTER_EXCLUDED_MODELS,
+            " z-ai/glm-5.3-flash, openai/gpt-5.6-luna, z-ai/glm-5.3-flash,, ",
+        )
+
+        assert get_xrouter_excluded_models() == (
+            "z-ai/glm-5.3-flash",
+            "openai/gpt-5.6-luna",
+        )
 
 
 class TestMCPOAuthConfig:

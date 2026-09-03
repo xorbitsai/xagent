@@ -1,7 +1,7 @@
-"""seed built-in Shopify (key-based) MCP connector
+"""seed built-in Mixpanel (key-based) MCP connector
 
-Revision ID: 20260901_seed_shopify_mcp_app
-Revises: 20260901_seed_chartmogul_mcp_app
+Revision ID: 20260901_seed_mixpanel_mcp_app
+Revises: 20260902_mcp_generations
 Create Date: 2026-09-01 00:00:00.000000
 
 """
@@ -15,8 +15,8 @@ from alembic import op
 logger = logging.getLogger(__name__)
 
 # revision identifiers, used by Alembic.
-revision: str = "20260901_seed_shopify_mcp_app"
-down_revision: Union[str, None] = "20260901_seed_chartmogul_mcp_app"
+revision: str = "20260901_seed_mixpanel_mcp_app"
+down_revision: Union[str, None] = "20260902_mcp_generations"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
@@ -34,22 +34,27 @@ PUBLIC_MCP_APPS_TABLE = sa.table(
     sa.column("launch_config", sa.JSON),
 )
 
-APP_ID = "shopify"
+APP_ID = "mixpanel"
 
 ROW = {
     "app_id": APP_ID,
-    "name": "Shopify",
-    "description": "Connect to a Shopify store with a custom app Admin API access token to search and manage products, look up and update orders, and browse customers and collections.",
-    "icon": "https://www.google.com/s2/favicons?domain=shopify.com&sz=128",
+    "name": "Mixpanel",
+    "description": "Connect to Mixpanel with a Service Account to query events, segmentation, retention, funnels, and user profiles, and export raw event data. Supports US, EU, and India data residency.",
+    "icon": "https://www.google.com/s2/favicons?domain=mixpanel.com&sz=128",
     "transport": "stdio",
     "provider_name": None,
-    "category": "Commerce",
+    "category": "Analytics",
     "oauth_scopes": None,
     "is_visible_in_connector": True,
     "launch_config": {
         "command": "python",
-        "args": ["-m", "xagent.web.tools.mcp.shopify"],
-        "required_env": ["SHOPIFY_STORE_DOMAIN", "SHOPIFY_ACCESS_TOKEN"],
+        "args": ["-m", "xagent.web.tools.mcp.mixpanel"],
+        "required_env": [
+            "MIXPANEL_SERVICE_ACCOUNT_USERNAME",
+            "MIXPANEL_SERVICE_ACCOUNT_SECRET",
+            "MIXPANEL_PROJECT_ID",
+            "MIXPANEL_REGION",
+        ],
     },
 }
 
@@ -88,7 +93,7 @@ def downgrade() -> None:
     inspector = sa.inspect(bind)
     if "public_mcp_apps" not in set(inspector.get_table_names()):
         return
-    # Only the catalog entry is removed. Shopify has no oauth_providers row
+    # Only the catalog entry is removed. Mixpanel has no oauth_providers row
     # (it is key-based). Any MCPServer/UserMCPServer rows created by users who
     # already connected are intentionally left in place -- connect-driven
     # rows are not owned by this migration and are cleaned up through the

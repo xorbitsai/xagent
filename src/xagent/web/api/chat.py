@@ -84,7 +84,7 @@ from ..services.agent_team_scope import (
 from ..services.assistant_history_safety import ASSISTANT_RESPONSE_MESSAGE_TYPE
 from ..services.channel_runtime import ChannelTaskMode
 from ..services.chat_history_service import (
-    load_task_transcript,
+    load_task_transcript_window,
     persist_assistant_message_no_commit,
 )
 from ..services.connector_runtime import (
@@ -1731,11 +1731,14 @@ class AgentServiceManager:
         if agent is None:
             return
 
-        conversation_history = load_task_transcript(db, task_id)
+        transcript_window = load_task_transcript_window(db, task_id)
+        conversation_history = transcript_window.messages
         if not conversation_history:
             return
 
-        agent.set_conversation_history(conversation_history)
+        agent.set_conversation_history(
+            conversation_history, watermark=transcript_window.watermark
+        )
         logger.info(
             f"Loaded {len(conversation_history)} persisted chat messages for task {task_id}"
         )
@@ -3055,7 +3058,8 @@ class AgentServiceManager:
                 if task_exists and snapshot is not None:
                     agent_service = self._agents[task_id]
                     agent_service.set_conversation_history(
-                        [dict(message) for message in snapshot.conversation_history]
+                        [dict(message) for message in snapshot.conversation_history],
+                        watermark=snapshot.conversation_watermark,
                     )
                     recovery_state = await materialize_task_execution_recovery_state(
                         snapshot.execution_recovery
@@ -4048,7 +4052,8 @@ class AgentServiceManager:
                 plan_state,
             )
             agent_service.set_conversation_history(
-                [dict(message) for message in snapshot.conversation_history]
+                [dict(message) for message in snapshot.conversation_history],
+                watermark=snapshot.conversation_watermark,
             )
             recovery_state = await materialize_task_execution_recovery_state(
                 snapshot.execution_recovery

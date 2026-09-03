@@ -101,7 +101,9 @@ class _Agent:
         self.workspace = None
         self.invalidate_tools = MagicMock()
 
-    def set_conversation_history(self, _messages: list[dict[str, Any]]) -> None: ...
+    def set_conversation_history(
+        self, _messages: list[dict[str, Any]], *, watermark: int | None = None
+    ) -> None: ...
 
     def set_execution_context_messages(self, _messages: list[Any]) -> None: ...
 

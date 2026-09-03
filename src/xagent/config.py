@@ -212,6 +212,7 @@ OIDC_LOGIN_TTL_SECONDS = "XAGENT_OIDC_LOGIN_TTL_SECONDS"
 OIDC_EXCHANGE_TTL_SECONDS = "XAGENT_OIDC_EXCHANGE_TTL_SECONDS"
 SESSION_SECRET = "XAGENT_SESSION_SECRET"
 OPENROUTER_OFFICIAL_PROVIDERS_ONLY = "XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY"
+XROUTER_EXCLUDED_MODELS = "XAGENT_XROUTER_EXCLUDED_MODELS"
 MCP_OAUTH_ALLOW_PRIVATE_HOSTS = "XAGENT_MCP_OAUTH_ALLOW_PRIVATE_HOSTS"
 MCP_OAUTH_PROXY_URL = "XAGENT_MCP_OAUTH_PROXY_URL"
 TRUSTED_EGRESS_PROXY = "XAGENT_TRUSTED_EGRESS_PROXY"
@@ -606,6 +607,18 @@ def get_smtp_from_name(default: str) -> str:
 def get_openrouter_official_providers_only() -> bool:
     """Return whether OpenRouter requests should pin official provider endpoints."""
     return _get_bool_env(OPENROUTER_OFFICIAL_PROVIDERS_ONLY, False)
+
+
+def get_xrouter_excluded_models() -> tuple[str, ...]:
+    """Return model slugs excluded from xrouter candidate sets.
+
+    The environment value is a comma-separated list. Empty entries are ignored,
+    and duplicates are removed while preserving the configured order.
+    """
+    value = os.getenv(XROUTER_EXCLUDED_MODELS, "")
+    return tuple(
+        dict.fromkeys(item.strip() for item in value.split(",") if item.strip())
+    )
 
 
 def get_mcp_oauth_allow_private_hosts() -> bool:

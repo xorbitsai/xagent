@@ -144,6 +144,11 @@ class TaskSetupSnapshot:
     agent_config: Optional[dict]
     excluded_agent_id: Optional[int]
     conversation_history: tuple[dict[str, Any], ...] = ()
+    # Largest stored transcript row id ``conversation_history`` covers. Handed
+    # to the agent so a compaction during this turn can record what its summary
+    # absorbed. ``None`` means there was nothing to cover, and a compaction
+    # will emit an unpositionable summary that the next turn ignores.
+    conversation_watermark: Optional[int] = None
     execution_recovery: TaskExecutionRecoverySnapshot = TaskExecutionRecoverySnapshot()
     reconstruction: TaskReconstructionSnapshot = TaskReconstructionSnapshot()
     # Resolved by ``resolve_task_runtime_config_core`` using this same Session.
@@ -357,15 +362,14 @@ def load_task_setup_snapshot_sync(
                 core.agent_config,
             )
 
-        from .chat_history_service import load_task_transcript
+        from .chat_history_service import load_task_transcript_window
 
-        conversation_history = tuple(
-            load_task_transcript(
-                session,
-                task_id,
-                before_message_id=before_message_id,
-            )
+        transcript_window = load_task_transcript_window(
+            session,
+            task_id,
+            before_message_id=before_message_id,
         )
+        conversation_history = tuple(transcript_window.messages)
         execution_recovery = load_task_execution_recovery_snapshot_sync(
             session,
             task_id,
@@ -387,6 +391,7 @@ def load_task_setup_snapshot_sync(
             agent_config=core.agent_config,
             excluded_agent_id=excluded_agent_id,
             conversation_history=conversation_history,
+            conversation_watermark=transcript_window.watermark,
             execution_recovery=execution_recovery,
             reconstruction=reconstruction,
             workforce_runtime=deepcopy(core.workforce),

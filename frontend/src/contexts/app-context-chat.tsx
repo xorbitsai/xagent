@@ -613,7 +613,12 @@ export const normalizeInteractions = (value: unknown): Interaction[] => {
         // would silently empty out every live connect_apps pause's apps list.
         normalized.apps = item.apps.filter(
           (app: unknown): app is string | { id?: string; name?: string } =>
-            typeof app === "string" || (!!app && typeof app === "object")
+            typeof app === "string" ||
+            (!!app &&
+              typeof app === "object" &&
+              !Array.isArray(app) &&
+              (typeof (app as { id?: unknown }).id === "string" ||
+                typeof (app as { name?: unknown }).name === "string"))
         )
       }
 

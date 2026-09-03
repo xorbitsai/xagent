@@ -808,10 +808,18 @@ def _connect_apps_interactive_for_task(*, source: Any, channel_id: Any) -> bool:
     so ``channel_id`` (non-null only for the IM-bot case) is required to
     tell them apart.
 
-    Reuses ``gating_key``'s (interaction_rollout.py) exact classification --
-    ``normalize_interaction_origin(source) == "internal" and channel_id is
-    None`` -- rather than re-deriving it, so the two never silently drift
-    apart on what counts as "web/internal" as the origin vocabulary evolves.
+    Reuses ``normalize_interaction_origin`` (the same source-vocabulary
+    normalizer ``gating_key`` in interaction_rollout.py is built on) instead
+    of re-deriving it, so at least the *vocabulary* can't drift between the
+    two. The compound condition below -- ``origin == "internal" and
+    channel_id is None`` -- is algebraically the same test ``gating_key(...)
+    == "internal"`` runs, but is re-derived here rather than calling
+    ``gating_key`` itself: that function answers a *different* question
+    (which interaction-rollout batch a task belongs to, a concern that is
+    allowed to evolve independently -- see its own module docstring) that
+    only happens to coincide with "is this web chat" today. Coupling this
+    gate to ``gating_key`` would risk the opposite failure -- a rollout-only
+    change silently changing which surfaces get an interactive pause.
     """
 
     origin = normalize_interaction_origin(source if source is None else str(source))

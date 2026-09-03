@@ -30,7 +30,8 @@ from xagent.core.agent.language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
     OUTPUT_LANGUAGE_SOURCE_METADATA_KEY,
     OUTPUT_LANGUAGE_SOURCE_PLAN,
-    response_language_rules,
+    output_language_directives,
+    request_only_language_harness,
 )
 from xagent.core.agent.pattern.base import RequiredToolCallError
 from xagent.core.agent.pattern.dag import dag as dag_module
@@ -454,6 +455,14 @@ def test_dag_waiting_response_preserves_active_step_state() -> None:
         "kind": "dag_waiting_user_response",
         "forwarded_from_root": True,
         "dag_step_id": "confirm",
+        "response_to_waiting_for_user": {
+            "question": "Choose A or B",
+            "message_type": "question",
+        },
+    }
+    assert root_context.messages[-1].metadata["response_to_waiting_for_user"] == {
+        "question": "Choose A or B",
+        "message_type": "question",
     }
 
 
@@ -623,14 +632,20 @@ async def test_dag_pattern_streams_overall_completion_not_step_result() -> None:
     assert has_tool(llm.stream_calls[1], DAG_COMPLETION_TOOL_NAME)
     completion_messages = llm.stream_calls[1]["messages"]
     assert (
-        "same natural language as the output language policy"
+        "The final answer must follow the output language policy"
         in completion_messages[0]["content"]
     )
     completion_payload = json.loads(completion_messages[-1]["content"])
-    assert "output_language_policy" in completion_payload
+    request = "Answer through DAG"
+    assert completion_payload["user_authored_language_request"] == request
+    assert (
+        "`user_authored_language_request` field"
+        in completion_payload["output_language_policy"]
+    )
+    assert request not in completion_payload["output_language_policy"]
     completion_tool = llm.stream_calls[1]["tools"][0]["function"]
     answer_schema = completion_tool["parameters"]["properties"]["answer"]
-    assert "tool results, source documents" in answer_schema["description"]
+    assert "connector metadata" in answer_schema["description"]
     assert [event["type"] for event in outbound.events] == [
         "final_answer_start",
         "final_answer_delta",
@@ -1065,10 +1080,10 @@ async def test_dag_step_appends_current_step_boundary_after_parent_context() -> 
     assert "Overall user goal is background context only" in messages[0]["content"]
     assert "Output language policy" in messages[0]["content"]
     assert (
-        "Current user request, quoted for response language only:"
+        output_language_directives("", section="root_existing_request")
         in messages[0]["content"]
     )
-    assert "Extract highlights and generate two posters." in messages[0]["content"]
+    assert "Extract highlights and generate two posters." not in messages[0]["content"]
     assert "Extract highlights and generate two posters." not in messages[-1]["content"]
     assert "Current step id: extract" in messages[0]["content"]
     assert "Detailed step boundary rules" in messages[0]["content"]
@@ -5185,17 +5200,22 @@ async def test_polluted_plan_language_is_not_a_hard_policy_for_dag_steps(
     assert OUTPUT_LANGUAGE_METADATA_KEY not in context.metadata
     assert sorted(captured) == ["compare", "write"]
     for child in captured.values():
-        system_content = child.get_messages_for_llm()[0]["content"]
+        messages = child.get_messages_for_llm()
+        system_content = messages[0]["content"]
         assert "Output language: Simplified Chinese" not in system_content
         assert "Output language:" not in system_content
-        assert request in system_content
-        assert response_language_rules() in system_content
+        assert request not in system_content
+        assert sum(message["content"].count(request) for message in messages) == 1
+        assert "latest independent user message" in system_content
         step_instruction = [
             message.content
             for message in child.messages
             if message.metadata.get("kind") == "dag_step_instruction"
         ][0]
         assert "Output language: Simplified Chinese" not in step_instruction
+        assert "authoritative request-language guidance" in step_instruction
+        assert request_only_language_harness("") not in step_instruction
+        assert request not in step_instruction
     completion_payload = json.loads(llm.seen_messages[-1][-1]["content"])
     completion_policy = completion_payload["output_language_policy"]
     assert "Output language: Simplified Chinese" not in completion_policy
@@ -5246,13 +5266,21 @@ async def test_restored_dag_step_instruction_drops_stale_language_policy(
     step = PlanStep(id="write", task="Write the summary")
     pattern = DAGPattern(lambda **_: build_plan(step))
     pattern.plan = build_plan(step)
+    request = "Summarize the release notes."
 
     legacy_root = ExecutionContext(execution_id="dag-restored-language-legacy")
     legacy_root.metadata[OUTPUT_LANGUAGE_METADATA_KEY] = "Simplified Chinese"
+    legacy_root.add_user_message(request)
     stale_instruction = pattern._step_instruction(root_context=legacy_root, step=step)
     assert "Output language: Simplified Chinese" in stale_instruction
 
-    child_context = ExecutionContext(execution_id="dag-restored-language:write")
+    child_context = legacy_root.create_child_context(
+        metadata={
+            "dag_step_id": "write",
+            "dag_step_name": step.task,
+            "dag_step_description": step.task,
+        }
+    )
     child_context.add_user_message(
         stale_instruction,
         metadata={"kind": "dag_step_instruction", "dag_step_id": "write"},
@@ -5273,7 +5301,7 @@ async def test_restored_dag_step_instruction_drops_stale_language_policy(
     monkeypatch.setattr(dag_module, "ReActPattern", CapturingReActPattern)
 
     root_context = ExecutionContext(execution_id="dag-restored-language")
-    root_context.add_user_message("Summarize the release notes.")
+    root_context.add_user_message(request)
     await pattern._execute_step_impl(
         step=step,
         root_context=root_context,
@@ -5289,7 +5317,9 @@ async def test_restored_dag_step_instruction_drops_stale_language_policy(
         if message.metadata.get("kind") == "dag_step_instruction"
     )
     assert "Output language: Simplified Chinese" not in instruction
-    assert "Use the same natural language as the current user request" in instruction
+    assert "authoritative request-language guidance" in instruction
+    assert request_only_language_harness("") not in instruction
+    assert request not in instruction
 
 
 _FILE_REFERENCE_BLOCK = (

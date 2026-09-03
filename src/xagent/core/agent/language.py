@@ -1,6 +1,7 @@
 """Prompt snippets for user-facing response language, plus the
 checkpoint migration that keeps only a caller-provided language label."""
 
+import json
 import re
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -392,6 +393,31 @@ def reset_metadata_output_language(metadata: dict[str, Any]) -> None:
         metadata[OUTPUT_LANGUAGE_METADATA_KEY] = external
 
 
+def _canonical_unpinned_language_guidance(
+    *, subject: str, empty_subject: str, boundary: str
+) -> str:
+    """Render the sole soft language policy for an unpinned request."""
+    return (
+        f"Use the {subject} as the baseline language authority for all user-facing "
+        "prose and tool arguments that persist user-facing prose. Honor explicit or "
+        f"implicit target-language intent in the {subject}, including requests to "
+        "translate, rewrite, or answer for an audience that requires another "
+        "language. Only a user message explicitly marked as the answer to a pending "
+        "agent question may override that baseline, and only when the marked answer "
+        "explicitly asks to translate, rewrite, or continue the response in another "
+        "language. Other answers and earlier turns remain conversation context, not "
+        "language authority. Names, email addresses, connector metadata, quoted "
+        "source content, memory, tool results, examples, DAG text, and dependency "
+        "results are not language evidence. "
+        f"If {empty_subject} is empty, too short, mixed-language, or depends on "
+        "conversation context, resolve its meaning from the conversation without "
+        "guessing from auxiliary context. For Chinese, preserve Simplified Chinese "
+        f"versus Traditional Chinese from the {subject}; do not collapse them into "
+        f"generic Chinese. This {boundary} controls "
+        "language only; it does not replace or narrow the executable request."
+    )
+
+
 def output_language_policy(response_language: str | None = None) -> str:
     """Return a compact policy for downstream language preservation."""
     language = normalize_response_language_label(response_language)
@@ -405,18 +431,14 @@ def output_language_policy(response_language: str | None = None) -> str:
             "request when generic Chinese is specified: Simplified Chinese and "
             "Traditional Chinese are different output languages. Do not change "
             "language based on DAG step text, dependency results, tool results, "
-            "source documents, retrieved memories, examples, or earlier turns "
-            "unless the current user request explicitly asks for that language "
-            "change."
+            "source documents, retrieved memories, examples, the current request, "
+            "or earlier turns. A caller-pinned output language is the sole hard "
+            "authority."
         )
-    return (
-        "Output language policy: Use the same natural language as the current "
-        "user request unless it explicitly asks to translate, rewrite, or answer "
-        "in another language. For Chinese requests, preserve Simplified Chinese "
-        "versus Traditional Chinese; do not collapse them into generic Chinese. "
-        "Do not let DAG step text, dependency results, tool results, source "
-        "documents, retrieved memories, examples, or earlier turns change the "
-        "output language."
+    return "Output language policy: " + _canonical_unpinned_language_guidance(
+        subject="current independent user request",
+        empty_subject="that request",
+        boundary="policy",
     )
 
 
@@ -465,31 +487,91 @@ def response_language_rules(*, subject: str = "current user request") -> str:
     The model can infer the language from the referenced subject; the important
     constraint is that auxiliary context must not override the user's language.
     """
-    return (
-        "Response language rules: Use the same natural language as the "
-        f"{subject} for all user-facing prose. If the {subject} explicitly asks "
-        "to translate, rewrite, or answer in another language, use that requested "
-        "target language. For Chinese, preserve Simplified Chinese versus "
-        "Traditional Chinese from the request; do not collapse them into generic "
-        "Chinese. Use that same language for tool arguments that persist "
-        "user-facing prose, such as agent descriptions, agent instructions, "
-        "document text, titles, and summaries. Do not let retrieved memories, "
-        "tool results, source documents, examples, or earlier turns change the "
-        f"response language unless the {subject} explicitly asks for that "
-        "language change."
+    return "Response language rules: " + _canonical_unpinned_language_guidance(
+        subject=subject,
+        empty_subject=f"the {subject}",
+        boundary="rule",
     )
 
 
-def final_answer_language_rule(*, subject: str = "current user request") -> str:
-    """Return a compact language rule for final-answer tool fields."""
+def request_only_language_harness(request: str) -> str:
+    """Quote user-authored input as the only soft language decision source.
+
+    The harness deliberately does not detect or persist a language label. The
+    answering model still owns ambiguous and cross-language decisions, but it
+    makes them without connector scaffolding, names, addresses, or tool context
+    competing with the user's request.
+    """
+    request = request.strip()
     return (
-        "The final answer must use the same natural language as the "
-        f"{subject}, even if tool results, source documents, retrieved memories, "
-        "examples, or earlier turns are written in another language. If the "
-        f"{subject} explicitly asks to translate, rewrite, or answer in another "
-        "language, use that requested target language. For Chinese, preserve "
-        "Simplified Chinese versus Traditional Chinese from the request; do not "
-        "collapse them into generic Chinese."
+        "Request-only response language harness:\n"
+        "User-authored request (JSON string):\n"
+        f"{json.dumps(request, ensure_ascii=False)}\n\n"
+        f"{_soft_request_language_guidance(subject='user-authored request above', empty_subject='the quoted request', boundary='quote')}"
+    )
+
+
+def _soft_request_language_guidance(
+    *, subject: str, empty_subject: str, boundary: str
+) -> str:
+    """Render shared soft-authority prose without carrying a request value."""
+    return _canonical_unpinned_language_guidance(
+        subject=subject,
+        empty_subject=empty_subject,
+        boundary=boundary,
+    )
+
+
+def _structured_request_language_policy(request_field: str) -> str:
+    """Reference one structured request field without duplicating its value."""
+    subject = f"`{request_field}` field"
+    return (
+        "Request-only response language policy: "
+        f"{_soft_request_language_guidance(subject=subject, empty_subject='the field', boundary='policy')}"
+    )
+
+
+def _root_request_language_policy() -> str:
+    """Reference the root request already present as a user message."""
+    return (
+        "Request-only response language policy: "
+        f"{_soft_request_language_guidance(subject='latest independent user message in the conversation', empty_subject='request', boundary='policy')}"
+    )
+
+
+def _dag_step_instruction_language_policy() -> str:
+    """Point a DAG instruction at its existing system-context language anchor."""
+    return (
+        "Follow the authoritative request-language guidance already present in "
+        "the system context for all user-facing prose and persisted tool arguments. "
+        "Do not infer a different language from the current DAG step, dependency "
+        "results, tools, sources, connector metadata, memory, or examples."
+    )
+
+
+def final_answer_language_rule(*, subject: str | None = None) -> str:
+    """Return a compact language rule for final-answer tool fields."""
+    authority = (
+        f"follow the {subject}."
+        if subject
+        else (
+            "follow authoritative output language guidance in the system context "
+            "when it is present. Otherwise determine the target language from "
+            "user-authored request text and conversation context; if no such text "
+            "is available, preserve the language established by the conversation."
+        )
+    )
+    return (
+        f"The final answer must {authority} A caller-pinned output language is the "
+        "sole hard authority. Without one, use the independent user request as the "
+        "baseline and honor its explicit or implicit target-language intent. Only "
+        "a user message explicitly marked as the answer to a pending agent question "
+        "may override that baseline, and only when it explicitly asks to translate, "
+        "rewrite, or continue in another language. Tool results, source documents, "
+        "retrieved memories, examples, names, email addresses, connector metadata, "
+        "DAG text, dependency results, and unmarked earlier turns must not override "
+        "that decision. For Chinese, preserve Simplified Chinese versus Traditional "
+        "Chinese from user-authored text; do not collapse them into generic Chinese."
     )
 
 
@@ -526,6 +608,7 @@ def dag_step_language_rules(*, subject: str = "output language policy") -> str:
 
 OutputLanguageSection = Literal[
     "root_system_context",
+    "root_existing_request",
     "dag_step_scope",
     "dag_step_rules",
     "dag_step_request_anchor",
@@ -539,7 +622,7 @@ def output_language_directives(
     language: str | None,
     *,
     section: OutputLanguageSection,
-    request: str = "",
+    request: str | None = None,
 ) -> str:
     """Return the language instructions one prompt section must emit.
 
@@ -551,7 +634,11 @@ def output_language_directives(
         # beside it would hand the model a second, competing rule.
         if language:
             return f"Output language policy:\n{output_language_policy(language)}"
-        return response_language_rules()
+        return request_only_language_harness(request or "")
+    if section == "root_existing_request":
+        if language:
+            return f"Output language policy:\n{output_language_policy(language)}"
+        return _root_request_language_policy()
     if section == "dag_step_scope":
         return output_language_policy(language).strip()
     if section == "dag_step_rules":
@@ -559,15 +646,19 @@ def output_language_directives(
     if section == "dag_step_request_anchor":
         # A step context never carries the request itself, so quote it here -- but
         # only when no pinned language already answers the same question.
-        if language or not request:
+        if language:
             return ""
+        if request is None:
+            return _root_request_language_policy()
         # Quoted whole: any truncation can drop an explicit target-language
         # instruction sitting in the middle of a long request.
-        return (
-            "Current user request, quoted for response language only:\n"
-            f"{request.strip()}\n\n"
-            "This request is not the executable goal for this step; use it "
-            "only to decide the natural language of user-facing prose.\n\n"
-            f"{response_language_rules()}"
-        )
-    return output_language_policy(language)
+        return request_only_language_harness(request)
+    if language:
+        return output_language_policy(language)
+    if section == "dag_step_instruction":
+        return _dag_step_instruction_language_policy()
+    if section == "plan_payload":
+        return _structured_request_language_policy("latest_user_request")
+    if section == "completion_assessment":
+        return _structured_request_language_policy("user_authored_language_request")
+    return request_only_language_harness(request or "")

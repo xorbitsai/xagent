@@ -14,7 +14,9 @@ from ....task_runtime import (
 )
 from ...context.enrichment import (
     enrich_context_with_memory,
+    language_prompt_message,
     latest_user_text,
+    top_level_user_request,
 )
 from ...frame import ExecutionFrame, ExecutionSnapshot, ExecutionStatus
 from ...grounding import grounding_rule
@@ -1503,20 +1505,28 @@ class DAGPattern(AgentPattern):
         return assessment
 
     def _completion_assessment_messages(self, context: Any) -> list[dict[str, Any]]:
+        language_request = top_level_user_request(context).language_text
+        output_language = effective_output_language(context)
         latest_messages = [
-            {"role": message.role, "content": message.content}
+            language_prompt_message(message)
             for message in getattr(context, "messages", [])
             if getattr(message, "role", None) in {"user", "assistant", "tool"}
         ]
         authoritative_user_requests = [
-            {"role": message.role, "content": message.content}
+            language_prompt_message(message)
             for message in getattr(context, "messages", [])
             if getattr(message, "role", None) == "user"
         ]
         payload = {
             "output_language_policy": output_language_directives(
-                effective_output_language(context),
+                output_language,
                 section="completion_assessment",
+                request=language_request,
+            ),
+            **(
+                {}
+                if output_language
+                else {"user_authored_language_request": language_request}
             ),
             "authoritative_user_requests": authoritative_user_requests,
             "messages": latest_messages,
@@ -1885,11 +1895,30 @@ class DAGPattern(AgentPattern):
 
         child_context = type(root_context).from_dict(active_context)
         self._refresh_restored_step_runtime_metadata(child_context, root_context)
+        state = self.active_step_pattern_states.get(step_id)
+        waiting_request = (
+            state.get("waiting_for_user_request") if isinstance(state, dict) else {}
+        )
+        waiting_request = waiting_request if isinstance(waiting_request, dict) else {}
         for message in root_user_messages[self.planned_user_message_count :]:
+            waiting_marker = {
+                "question": str(waiting_request.get("message") or ""),
+                "message_type": waiting_request.get("message_type", "question"),
+            }
+            metadata = {
+                **getattr(message, "metadata", {}),
+                "response_to_waiting_for_user": waiting_marker,
+            }
+            root_index = next(
+                index
+                for index, root_message in enumerate(root_context.messages)
+                if root_message is message
+            )
+            root_context.messages[root_index] = replace(message, metadata=metadata)
             child_context.add_user_message(
                 message.content,
                 metadata={
-                    **getattr(message, "metadata", {}),
+                    **metadata,
                     "kind": "dag_waiting_user_response",
                     "forwarded_from_root": True,
                     "dag_step_id": step_id,

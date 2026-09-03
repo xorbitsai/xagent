@@ -54,7 +54,11 @@ async def test_optimize_instructions_preserves_draft_language(
     }
     system_prompt = llm.calls[0]["messages"][0]["content"]
     assert "Preserve the draft's natural language" in system_prompt
-    assert "same natural language as the draft instructions" in system_prompt
+    assert (
+        "Use the draft instructions as the baseline language authority" in system_prompt
+    )
+    assert "explicit or implicit target-language intent" in system_prompt
+    assert "unless the draft instructions explicitly asks" not in system_prompt
     assert "Simplified Chinese versus Traditional Chinese" in system_prompt
 
 

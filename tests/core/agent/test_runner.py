@@ -19,6 +19,7 @@ from xagent.core.agent.checkpoint import (
     CheckpointCorruptError,
     CheckpointUnavailableError,
 )
+from xagent.core.agent.context.enrichment import latest_user_text
 from xagent.core.agent.language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
     OUTPUT_LANGUAGE_SOURCE_METADATA_KEY,
@@ -1645,6 +1646,29 @@ async def test_runner_initial_user_message_preserves_display_metadata(
     assert user_event["data"]["turn_id"] == turn_id
 
 
+@pytest.mark.parametrize("display_message", [None, 17], ids=["null", "non-string"])
+def test_runner_normalizes_unsupported_display_values_to_authoritative_empty(
+    tmp_path: Path,
+    display_message: object,
+) -> None:
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[FakePattern({"success": True})]),
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    context = ExecutionContext(
+        execution_id="exec-display-normalization",
+        metadata={"request_context": {"display_message": display_message}},
+    )
+
+    metadata = runner._initial_user_message_metadata(context)
+    context.add_user_message(
+        "Connector context: responder en español.", metadata=metadata
+    )
+
+    assert metadata["display_message"] == ""
+    assert latest_user_text(context, prefer_display=True) == ""
+
+
 @pytest.mark.asyncio
 async def test_runner_attaches_uploaded_image_refs_to_initial_user_message(
     tmp_path: Path,
@@ -1883,6 +1907,19 @@ async def test_inject_user_message_raises_corrupt_on_contextless_checkpoint() ->
         )
 
 
+def _assert_unpinned_restored_request_prompt(context: ExecutionContext) -> None:
+    request = "Summarize the release notes in one paragraph."
+    provider_messages = context.get_messages_for_llm()
+    system_content = provider_messages[0]["content"]
+    assert "Output language: Simplified Chinese" not in system_content
+    assert request not in system_content
+    assert "latest independent user message" in system_content
+    assert sum(message["content"].count(request) for message in provider_messages) == 1
+    assert any(
+        message == {"role": "user", "content": request} for message in provider_messages
+    )
+
+
 @pytest.mark.asyncio
 async def test_resume_drops_legacy_router_output_language(tmp_path: Path) -> None:
     checkpoint_context = ExecutionContext(execution_id="exec-legacy-router-language")
@@ -1920,9 +1957,7 @@ async def test_resume_drops_legacy_router_output_language(tmp_path: Path) -> Non
     restored_child = pattern.state["active_step_contexts"]["step_1"]["metadata"]
     assert OUTPUT_LANGUAGE_METADATA_KEY not in restored_child
     assert OUTPUT_LANGUAGE_SOURCE_METADATA_KEY not in restored_child
-    system_content = result["context"].get_messages_for_llm()[0]["content"]
-    assert "Output language: Simplified Chinese" not in system_content
-    assert "Summarize the release notes in one paragraph." in system_content
+    _assert_unpinned_restored_request_prompt(result["context"])
 
 
 @pytest.mark.asyncio
@@ -1962,9 +1997,7 @@ async def test_resume_drops_legacy_plan_output_language(tmp_path: Path) -> None:
     restored_child = pattern.state["active_step_contexts"]["step_1"]["metadata"]
     assert OUTPUT_LANGUAGE_METADATA_KEY not in restored_child
     assert OUTPUT_LANGUAGE_SOURCE_METADATA_KEY not in restored_child
-    system_content = result["context"].get_messages_for_llm()[0]["content"]
-    assert "Output language: Simplified Chinese" not in system_content
-    assert "Summarize the release notes in one paragraph." in system_content
+    _assert_unpinned_restored_request_prompt(result["context"])
 
 
 @pytest.mark.asyncio

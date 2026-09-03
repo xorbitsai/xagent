@@ -10,7 +10,7 @@ from xagent.core.agent.language import (
     effective_output_language,
     output_language_directives,
     output_language_policy,
-    response_language_rules,
+    request_only_language_harness,
 )
 from xagent.core.agent.pattern.dag.dag import DAGPattern
 from xagent.core.agent.pattern.dag.plan_generator import (
@@ -90,9 +90,12 @@ def test_output_language_directives_render_each_section_verbatim() -> None:
     assert output_language_directives("Japanese", section="root_system_context") == (
         f"Output language policy:\n{output_language_policy('Japanese')}"
     )
+    assert output_language_directives(
+        "", section="root_system_context"
+    ) == request_only_language_harness("")
     assert (
-        output_language_directives("", section="root_system_context")
-        == response_language_rules()
+        "latest independent user message in the conversation"
+        in output_language_directives("", section="root_existing_request")
     )
     assert (
         output_language_directives("Japanese", section="dag_step_scope")
@@ -101,6 +104,12 @@ def test_output_language_directives_render_each_section_verbatim() -> None:
     assert (
         output_language_directives("", section="dag_step_scope")
         == output_language_policy("").strip()
+    )
+    assert "latest independent user message" in output_language_directives(
+        "", section="dag_step_request_anchor", request=None
+    )
+    assert request_only_language_harness("") == output_language_directives(
+        "", section="dag_step_request_anchor", request=""
     )
     assert (
         output_language_directives("Japanese", section="dag_step_rules")
@@ -112,10 +121,31 @@ def test_output_language_directives_render_each_section_verbatim() -> None:
         "plan_payload",
     )
     for section in sections:
-        for label in ("Japanese", ""):
-            assert output_language_directives(
-                label, section=section
-            ) == output_language_policy(label)
+        assert output_language_directives(
+            "Japanese", section=section
+        ) == output_language_policy("Japanese")
+    step_instruction_policy = output_language_directives(
+        "", section="dag_step_instruction"
+    )
+    assert step_instruction_policy == (
+        "Follow the authoritative request-language guidance already present in "
+        "the system context for all user-facing prose and persisted tool arguments. "
+        "Do not infer a different language from the current DAG step, dependency "
+        "results, tools, sources, connector metadata, memory, or examples."
+    )
+    assert request_only_language_harness("") not in step_instruction_policy
+
+    completion_policy = output_language_directives("", section="completion_assessment")
+    plan_policy = output_language_directives("", section="plan_payload")
+    assert (
+        "Use the `user_authored_language_request` field as the baseline language "
+        "authority for all user-facing prose" in completion_policy
+    )
+    assert (
+        "Use the `latest_user_request` field as the baseline language authority "
+        "for all user-facing prose" in plan_policy
+    )
+    assert "the the `" not in completion_policy + plan_policy
 
 
 def test_every_consumer_renders_the_resolved_language() -> None:
@@ -142,8 +172,9 @@ def test_every_consumer_renders_the_resolved_language() -> None:
 
 
 def test_every_consumer_falls_back_when_no_language_is_recorded() -> None:
+    request = "Summarize the repository"
     assert (
-        output_language_directives("", section="root_system_context")
+        output_language_directives("", section="root_existing_request")
         in _root_context()._system_context()
     )
     assert (
@@ -153,8 +184,12 @@ def test_every_consumer_falls_back_when_no_language_is_recorded() -> None:
     assert output_language_directives(
         "", section="dag_step_instruction"
     ) in _step_instruction(None)
-    assert _completion_policy(None) == output_language_policy("")
-    assert _plan_payload_policy(None) == output_language_policy("")
+    assert request_only_language_harness("") not in _step_instruction(None)
+    assert request not in _step_instruction(None)
+    assert "`user_authored_language_request` field" in _completion_policy(None)
+    assert request not in _completion_policy(None)
+    assert "`latest_user_request` field" in _plan_payload_policy(None)
+    assert request not in _plan_payload_policy(None)
 
 
 def test_consumers_normalize_an_aliased_language_label() -> None:

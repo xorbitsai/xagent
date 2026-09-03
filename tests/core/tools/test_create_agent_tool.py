@@ -157,22 +157,23 @@ class TestCreateAgentTool:
     def test_create_agent_tool_schema_anchors_persisted_text_language(self) -> None:
         tool = CreateAgentTool(session_factory=None, user_id=1)
 
-        assert (
-            "same natural language as the current output language policy"
-            in tool.description
+        assert "language required by the current output language policy" in (
+            tool.description
         )
+        assert "unless the user explicitly asks" not in tool.description
         assert "Do not inherit another language from DAG step text" in tool.description
 
         schema = tool.args_type().model_json_schema()
         description_schema = schema["properties"]["description"]["description"]
         instructions_schema = schema["properties"]["instructions"]["description"]
-        assert (
-            "same natural language as the current output language policy"
-            in description_schema
+        assert "language required by the current output language policy" in (
+            description_schema
         )
-        assert (
-            "same natural language as the current output language policy"
-            in instructions_schema
+        assert "language required by the current output language policy" in (
+            instructions_schema
+        )
+        assert "unless the user explicitly asks" not in (
+            description_schema + instructions_schema
         )
 
     @pytest.mark.asyncio

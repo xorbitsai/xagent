@@ -388,15 +388,16 @@ class CreateAgentToolArgs(BaseModel):
             "IMPORTANT: Description of when to use this agent (e.g., 'Use this "
             "agent for data analysis tasks involving CSV files'). This helps users "
             "understand the agent's purpose and when to call it. Write this in the "
-            "same natural language as the current output language policy unless the user "
-            "explicitly asks for another language."
+            "language required by the current output language policy; that policy "
+            "already accounts for valid user-requested language changes."
         )
     )
     instructions: str = Field(
         description=(
             "System instructions/prompt for the agent. Write persisted "
-            "user-facing prose in the same natural language as the current output "
-            "language policy unless the user explicitly asks for another language."
+            "user-facing prose in the language required by the current output "
+            "language policy; that policy already accounts for valid "
+            "user-requested language changes."
         )
     )
     tool_categories: Optional[list[str]] = Field(
@@ -750,7 +751,7 @@ class CreateAgentTool(AbstractBaseTool):
             "The agent will be created in DRAFT status and can be called immediately using the returned tool name.\n\n"
             "Parameters:\n"
             "- name: A short, descriptive name for the agent (e.g., 'researcher', 'data_analyzer')\n"
-            "- description: IMPORTANT - Clear description of when to use this agent (e.g., 'Use this agent for data analysis tasks involving CSV files'). This helps users understand the agent's purpose. Write this in the same natural language as the current output language policy unless the user explicitly asks for another language.\n"
+            "- description: IMPORTANT - Clear description of when to use this agent (e.g., 'Use this agent for data analysis tasks involving CSV files'). This helps users understand the agent's purpose. Write this in the language required by the current output language policy; that policy already accounts for valid user-requested language changes.\n"
             f"- tool_categories (optional): Available categories: {categories_list}\n"
             f"  Example: ['file', 'knowledge', 'basic']\n"
             f"- knowledge_bases (optional): List of knowledge base names or IDs to link to this agent.\n"
@@ -759,7 +760,7 @@ class CreateAgentTool(AbstractBaseTool):
             "file upload, or existing knowledge base choice before calling this tool.\n"
             f"- skills (optional): Available skills: {skills_list}\n"
             f"  Example: ['presentation-generator', 'evidence-based-rag']\n"
-            "- instructions: System prompt/instructions defining the agent's behavior and expertise. Write persisted user-facing prose in the same natural language as the current output language policy unless the user explicitly asks for another language. Do not inherit another language from DAG step text, dependency results, tool results, source documents, retrieved memories, examples, or earlier turns.\n"
+            "- instructions: System prompt/instructions defining the agent's behavior and expertise. Write persisted user-facing prose in the language required by the current output language policy; that policy already accounts for valid user-requested language changes. Do not inherit another language from DAG step text, dependency results, tool results, source documents, retrieved memories, examples, or earlier turns.\n"
             "- execution_mode (optional): 'flash', 'balanced' (default), 'think', or 'auto'\n\n"
             "Returns:\n"
             "- agent_id: Database ID of the created agent\n"

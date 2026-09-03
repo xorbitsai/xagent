@@ -132,10 +132,9 @@ STRIP_LOG_MAX_TOOL_NAME_CHARS = 64
 REACT_RESPONSE_LANGUAGE_DESCRIPTION = (
     "Target natural language for user-facing prose in this ReAct response, "
     "for example English, Simplified Chinese, Traditional Chinese, or Spanish. "
+    "Follow the authoritative output language guidance in the system context. "
     "For Chinese requests, choose Simplified Chinese or Traditional Chinese to "
-    "match the request script; do not use generic Chinese. If the current user "
-    "request explicitly asks to answer in another language, use that requested "
-    "target language."
+    "match the request script; do not use generic Chinese."
 )
 
 

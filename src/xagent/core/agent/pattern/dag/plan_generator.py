@@ -7,7 +7,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from ...context.enrichment import latest_user_text
+from ...context.enrichment import language_prompt_message, top_level_user_request
 from ...language import (
     OUTPUT_LANGUAGE_SOURCE_METADATA_KEY,
     OUTPUT_LANGUAGE_SOURCE_PLAN,
@@ -484,8 +484,13 @@ class LLMPlanGenerator(PlanGenerator):
                                 "persisted tool-argument prose produced by the plan, "
                                 "for example English, Simplified Chinese, Traditional "
                                 "Chinese, or Spanish. Determine it only from "
-                                "latest_user_request and any explicit target-language "
-                                "instruction in that request. For Chinese requests, "
+                                "latest_user_request and its explicit or implicit "
+                                "target-language intent. A message whose "
+                                "user_message_context is "
+                                "pending_agent_question_response may override that "
+                                "baseline only when it explicitly asks to translate, "
+                                "rewrite, or continue in another language. For "
+                                "Chinese requests, "
                                 "choose Simplified Chinese or Traditional Chinese to "
                                 "match the request script; do not use generic Chinese. "
                                 "If output_language_policy names a language, match it."
@@ -561,10 +566,10 @@ class LLMPlanGenerator(PlanGenerator):
         }
 
     def _build_prompt(self, request: PlanGenerationRequest) -> str:
-        latest_request = latest_user_text(request.context, prefer_display=True) or ""
+        latest_request = top_level_user_request(request.context).language_text
         expected_language, language_source = self._language_authority(request.context)
         latest_messages = [
-            {"role": message.role, "content": message.content}
+            language_prompt_message(message)
             for message in request.context.messages
             if getattr(message, "role", None) in {"user", "assistant", "tool"}
         ]
@@ -579,6 +584,7 @@ class LLMPlanGenerator(PlanGenerator):
                 if language_source == OUTPUT_LANGUAGE_SOURCE_PLAN
                 else expected_language,
                 section="plan_payload",
+                request=latest_request,
             ),
             "messages": latest_messages,
             "retrieved_memory_context": request.context.metadata.get(
@@ -687,7 +693,7 @@ class LLMPlanGenerator(PlanGenerator):
         Script comparison cannot tell a biased plan from a request that legitimately
         asks for another language, so it may only nudge once, never reject a plan.
         """
-        request = latest_user_text(context, prefer_display=True) or ""
+        request = top_level_user_request(context).language_text
         for step in plan.steps:
             mismatch = detect_prose_script_mismatch(
                 request, LLMPlanGenerator._step_prose(step)
@@ -698,9 +704,11 @@ class LLMPlanGenerator(PlanGenerator):
                 f"Plan step {step.id!r} is written in predominantly "
                 f"{mismatch.observed_script} script, which does not match the "
                 "script of the latest user request. Re-read latest_user_request "
-                "above and decide the output language from that request alone, "
-                "including any language change it asks for explicitly or "
-                f"implicitly. Call {LLMPlanGenerator.PLAN_TOOL_NAME} again exactly "
+                "above as the baseline, including any explicit or implicit "
+                "target-language intent. A message explicitly marked as a pending "
+                "agent question response may override that baseline only when it "
+                "explicitly asks to translate, rewrite, or continue in another "
+                f"language. Call {LLMPlanGenerator.PLAN_TOOL_NAME} again exactly "
                 "once. If that language is still correct for this request, keep it "
                 "and return the same plan language."
             )

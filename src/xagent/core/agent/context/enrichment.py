@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, cast
+from dataclasses import dataclass
+from typing import Any, Literal, cast
 
 from ...agent.trace import (
     trace_memory_retrieve_end,
@@ -19,6 +20,54 @@ SKILL_CONTEXT_METADATA_KEY = "selected_skill_context"
 # True only when generate_image is registered and edit_image is not; a deployment
 # with no image tools at all leaves it False.
 IMAGE_EDIT_UNAVAILABLE_METADATA_KEY = "image_edit_unavailable"
+
+
+DisplayMessageState = Literal["missing", "empty", "text"]
+TOP_LEVEL_USER_REQUEST_METADATA_KEY = "_xagent_top_level_user_request"
+
+
+@dataclass(frozen=True)
+class TopLevelUserRequest:
+    """One executable request and its presentation-only language boundary."""
+
+    execution_text: str
+    language_text: str
+    display_state: DisplayMessageState
+    has_pending_response: bool = False
+
+
+def _stored_top_level_user_request(context: Any) -> TopLevelUserRequest | None:
+    metadata = getattr(context, "metadata", None)
+    if not isinstance(metadata, dict):
+        return None
+    payload = metadata.get(TOP_LEVEL_USER_REQUEST_METADATA_KEY)
+    if not isinstance(payload, dict):
+        return None
+    execution_text = payload.get("execution_text")
+    language_text = payload.get("language_text")
+    display_state = payload.get("display_state")
+    if (
+        not isinstance(execution_text, str)
+        or not isinstance(language_text, str)
+        or display_state not in {"missing", "empty", "text"}
+    ):
+        return None
+    return TopLevelUserRequest(
+        execution_text=execution_text,
+        language_text=language_text,
+        display_state=display_state,
+    )
+
+
+def _persist_top_level_user_request(context: Any, request: TopLevelUserRequest) -> None:
+    metadata = getattr(context, "metadata", None)
+    if not isinstance(metadata, dict):
+        return
+    metadata[TOP_LEVEL_USER_REQUEST_METADATA_KEY] = {
+        "execution_text": request.execution_text,
+        "language_text": request.language_text,
+        "display_state": request.display_state,
+    }
 
 
 async def enrich_context_with_memory(
@@ -110,23 +159,122 @@ def build_skill_context(skill: dict[str, Any]) -> str:
     return f"## Available Skill: {name}\n\n{content}".strip()
 
 
+def display_message_override(metadata: Any) -> str | None:
+    """Return a supported display-message override, including an empty one.
+
+    Missing keys and non-string values in directly constructed or restored
+    contexts keep the execution-content fallback. The production runner
+    normalizes a present non-string value to an authoritative empty string before
+    this helper. Any present string is authoritative after trimming, so file-only
+    turns do not expose augmented connector or attachment text as language evidence.
+    """
+    if not isinstance(metadata, dict) or "display_message" not in metadata:
+        return None
+    display = metadata["display_message"]
+    if not isinstance(display, str):
+        return None
+    return display.strip()
+
+
+def top_level_user_request(context: Any) -> TopLevelUserRequest:
+    """Return the latest independent request, excluding DAG and wait scaffolding.
+
+    A present display string is authoritative for language even when empty.
+    Answers to pending agent questions remain conversational context, but they do
+    not replace the independent request. Prompt policy may still honor an explicit
+    language-change instruction in such an answer.
+    """
+    has_pending_response = False
+    for message in reversed(getattr(context, "messages", []) or []):
+        if getattr(message, "role", None) != "user" or getattr(
+            message, "hidden", False
+        ):
+            continue
+        metadata = getattr(message, "metadata", None)
+        metadata = metadata if isinstance(metadata, dict) else {}
+        if metadata.get("response_to_waiting_for_user"):
+            has_pending_response = True
+            continue
+        if metadata.get("dag_step_id"):
+            continue
+
+        execution_text = str(getattr(message, "content", "") or "").strip()
+        display_text = display_message_override(metadata)
+        if display_text is None:
+            if not execution_text:
+                continue
+            request = TopLevelUserRequest(
+                execution_text=execution_text,
+                language_text=execution_text,
+                display_state="missing",
+                has_pending_response=has_pending_response,
+            )
+            _persist_top_level_user_request(context, request)
+            return request
+        request = TopLevelUserRequest(
+            execution_text=execution_text,
+            language_text=display_text,
+            display_state="text" if display_text else "empty",
+            has_pending_response=has_pending_response,
+        )
+        _persist_top_level_user_request(context, request)
+        return request
+
+    stored = _stored_top_level_user_request(context)
+    if stored is not None:
+        return TopLevelUserRequest(
+            execution_text=stored.execution_text,
+            language_text=stored.language_text,
+            display_state=stored.display_state,
+            has_pending_response=has_pending_response,
+        )
+
+    task = (
+        context.metadata.get("task")
+        if isinstance(getattr(context, "metadata", None), dict)
+        else None
+    )
+    task_text = str(task or "").strip()
+    request = TopLevelUserRequest(
+        execution_text=task_text,
+        language_text=task_text,
+        display_state="missing",
+        has_pending_response=has_pending_response,
+    )
+    _persist_top_level_user_request(context, request)
+    return request
+
+
+def language_prompt_message(message: Any) -> dict[str, Any]:
+    """Serialize one prompt payload message without duplicating its content."""
+    payload = {
+        "role": getattr(message, "role", None),
+        "content": getattr(message, "content", None),
+    }
+    metadata = getattr(message, "metadata", None)
+    if (
+        payload["role"] == "user"
+        and isinstance(metadata, dict)
+        and metadata.get("response_to_waiting_for_user")
+    ):
+        payload["user_message_context"] = "pending_agent_question_response"
+    return payload
+
+
 def latest_user_text(context: Any, *, prefer_display: bool = False) -> str:
     """Return the latest user turn's text.
 
-    ``prefer_display`` returns what the user actually typed instead of the
-    runtime-augmented execution prompt; language anchors must use it, work
-    anchors must not.
+    ``prefer_display`` returns a present string ``display_message`` (including
+    an intentionally empty one) instead of the runtime-augmented execution
+    prompt. Missing values, plus non-string values in direct/restored contexts,
+    fall back to content. Language anchors must prefer display text; work anchors
+    must not.
     """
     for message in reversed(getattr(context, "messages", []) or []):
         if getattr(message, "role", None) == "user":
             if prefer_display:
-                metadata = getattr(message, "metadata", None)
-                display = (
-                    metadata.get("display_message")
-                    if isinstance(metadata, dict)
-                    else None
-                )
-                if isinstance(display, str) and display.strip():
+                display = display_message_override(getattr(message, "metadata", None))
+                if display is not None:
                     return display
             return str(getattr(message, "content", "") or "")
     task = context.metadata.get("task") if hasattr(context, "metadata") else None

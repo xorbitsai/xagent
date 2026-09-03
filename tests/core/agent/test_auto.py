@@ -25,7 +25,7 @@ from xagent.core.agent.language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
     OUTPUT_LANGUAGE_SOURCE_METADATA_KEY,
     OUTPUT_LANGUAGE_SOURCE_PLAN,
-    response_language_rules,
+    output_language_directives,
 )
 from xagent.core.agent.pattern.auto.auto import DECISION_TOOL_NAME, _AutoChildRuntime
 from xagent.core.model.chat.basic.router import RouterLLM
@@ -857,10 +857,14 @@ async def test_auto_pattern_final_answer_completes_without_child_pattern() -> No
     assert runtime.last_checkpoint is not None
     assert runtime.last_checkpoint["pattern"] == "AutoPattern"
     assert (
-        "same natural language as the current user request"
+        "authoritative output language guidance in the system context"
         in tool_schema["description"]
     )
-    assert "tool results, source documents" in answer_schema["description"]
+    assert "connector metadata" in answer_schema["description"]
+    assert (
+        output_language_directives("", section="root_existing_request")
+        in llm.calls[0]["messages"][0]["content"]
+    )
 
 
 @pytest.mark.asyncio
@@ -2288,12 +2292,18 @@ async def test_stale_memory_language_does_not_reach_child_as_hard_policy() -> No
     assert result["success"] is True
     assert OUTPUT_LANGUAGE_METADATA_KEY not in context.metadata
     assert child.kwargs is not None
-    child_system = child.kwargs["context"].get_messages_for_llm()[0]["content"]
+    child_messages = child.kwargs["context"].get_messages_for_llm()
+    child_system = child_messages[0]["content"]
     assert "请始终使用中文回答。" in child_system
     assert "Output language:" not in child_system
     assert "Output language policy:" not in child_system
-    assert "Summarize the quarterly revenue trend in one paragraph." in child_system
-    assert response_language_rules() in child_system
+    assert "Summarize the quarterly revenue trend in one paragraph." not in child_system
+    assert child_messages[-1]["content"] == (
+        "Summarize the quarterly revenue trend in one paragraph."
+    )
+    assert (
+        output_language_directives("", section="root_existing_request") in child_system
+    )
 
 
 @pytest.mark.asyncio
@@ -2319,18 +2329,20 @@ async def test_direct_final_answer_allows_an_explicit_target_language() -> None:
     assert result["success"] is True
     assert result["output"] == "La capitale de l'Italie est Rome."
     assert OUTPUT_LANGUAGE_METADATA_KEY not in context.metadata
-    target_rule = (
-        "If the current user request explicitly asks to translate, rewrite, or "
-        "answer in another language, use that requested target language."
-    )
+    target_rule = "honor its explicit or implicit target-language intent"
     tool_schema = llm.calls[0]["tools"][0]["function"]
     assert target_rule in tool_schema["description"]
     assert (
         target_rule in tool_schema["parameters"]["properties"]["answer"]["description"]
     )
-    system_content = context.get_messages_for_llm()[0]["content"]
-    assert request in system_content
-    assert target_rule in system_content
+    messages = context.get_messages_for_llm()
+    system_content = messages[0]["content"]
+    assert system_content.count(request) == 0
+    assert sum(message["content"].count(request) for message in messages) == 1
+    assert (
+        output_language_directives("", section="root_existing_request")
+        in system_content
+    )
 
 
 class RoutedDecisionLLM:

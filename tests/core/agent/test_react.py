@@ -23,6 +23,7 @@ from xagent.core.agent import (
     ToolCallRecord,
 )
 from xagent.core.agent.context.execution import CLOCK_TIMEZONE_METADATA_KEY
+from xagent.core.agent.language import output_language_directives
 from xagent.core.agent.pattern.final_answer_stream import ReActFinalAnswerStreamer
 from xagent.core.agent.pattern.react.react import (
     _INTERACTION_TRIM_CHARS,
@@ -4169,8 +4170,12 @@ async def test_react_pattern_reserves_control_tool_names_in_schema() -> None:
         if schema["function"]["name"] == "final_answer"
     )["function"]
     assert (
-        "same natural language as the current user request"
+        "authoritative output language guidance in the system context"
         in final_answer_schema["description"]
+    )
+    assert "connector metadata" in final_answer_schema["description"]
+    assert (
+        output_language_directives("", section="root_existing_request") in system_prompt
     )
     assert (
         "Call this tool alone: never place it in the same response as any "
@@ -4191,7 +4196,7 @@ async def test_react_pattern_reserves_control_tool_names_in_schema() -> None:
     assert "generic Chinese" in response_language_schema["description"]
     answer_schema = final_answer_schema["parameters"]["properties"]["answer"]
     assert "response_language" in answer_schema["description"]
-    assert "tool results, source documents" in answer_schema["description"]
+    assert "connector metadata" in answer_schema["description"]
     assert "## FINAL DELIVERABLE FILE REFERENCES" not in answer_schema["description"]
     assert "exact markdown_link" in answer_schema["description"]
     assert "get_workspace_output_files" not in answer_schema["description"]

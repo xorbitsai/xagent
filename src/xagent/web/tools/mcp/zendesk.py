@@ -109,6 +109,17 @@ def _require_non_blank(value: str, field_name: str) -> str:
     return value
 
 
+def _clean_tags(tags: list[str]) -> list[str]:
+    """Strip whitespace and drop empty entries from a caller-supplied tag
+    list before sending it to Zendesk -- FastMCP's schema only validates
+    that this is a list of strings, not that each one is meaningful, and an
+    LLM caller is exactly the kind of source likely to pass "vip " (trailing
+    space, silently failing to match the canonical "vip" tag already used
+    elsewhere in the account) or an empty string left over from a
+    trailing-comma split done upstream of this tool."""
+    return [t.strip() for t in tags if t.strip()]
+
+
 def _unwrap(result: Any, key: str) -> Any:
     """Pull a Zendesk response's single-object envelope (e.g. {"ticket":
     {...}}) out by its key, falling back to the raw payload if it isn't
@@ -444,7 +455,7 @@ def zendesk_create_ticket(
         if priority:
             ticket["priority"] = priority
         if tags:
-            ticket["tags"] = tags
+            ticket["tags"] = _clean_tags(tags)
         result = _request("POST", "/tickets.json", json_data={"ticket": ticket})
         return _success(ticket=_ticket_summary(_unwrap(result, "ticket")))
     except Exception as e:
@@ -464,19 +475,21 @@ def zendesk_update_ticket(
     explicitly provided (not None) are changed. Use zendesk_reply_to_ticket
     or zendesk_add_internal_note to add a comment instead.
     status: optional, one of "new", "open", "pending", "hold", "solved",
-    "closed".
-    priority: optional, one of "low", "normal", "high", "urgent".
+    "closed" -- an empty string is treated the same as leaving it unset
+    (there is no valid "clear the status" value).
+    priority: optional, one of "low", "normal", "high", "urgent" -- an empty
+    string is treated the same as leaving it unset, for the same reason.
     tags: optional list of tags -- replaces the ticket's existing tags
     entirely (pass an empty list to clear them), it does not add to them.
     """
     try:
         fields: dict[str, Any] = {}
-        if status is not None:
+        if status:
             fields["status"] = status
-        if priority is not None:
+        if priority:
             fields["priority"] = priority
         if tags is not None:
-            fields["tags"] = tags
+            fields["tags"] = _clean_tags(tags)
         if not fields:
             raise ValueError("at least one of status/priority/tags must be provided")
         result = _request(

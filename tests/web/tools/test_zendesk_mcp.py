@@ -525,6 +525,20 @@ def test_create_ticket_sends_expected_body(monkeypatch):
     assert mock_request.call_args.kwargs["method"] == "POST"
 
 
+def test_create_ticket_cleans_tags(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"ticket": {"id": 1, "subject": "Help"}})
+    )
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    zendesk.zendesk_create_ticket(
+        "Help", "Something's broken", tags=["vip ", "", "  priority"]
+    )
+
+    body = mock_request.call_args.kwargs["json"]
+    assert body["ticket"]["tags"] == ["vip", "priority"]
+
+
 def test_update_ticket_requires_at_least_one_field():
     result = json.loads(zendesk.zendesk_update_ticket(1))
 
@@ -543,6 +557,44 @@ def test_update_ticket_sends_only_provided_fields(monkeypatch):
     assert body["ticket"] == {"status": "solved"}
     assert mock_request.call_args.kwargs["url"].endswith("/tickets/1.json")
     assert mock_request.call_args.kwargs["method"] == "PUT"
+
+
+def test_update_ticket_treats_empty_status_and_priority_as_not_provided(monkeypatch):
+    # There is no valid "clear the status/priority" value in Zendesk (unlike
+    # tags, which support an explicit empty list) -- an LLM caller filling
+    # in "" for a field it doesn't want to change must not turn into a
+    # request that fails the whole update.
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"ticket": {"id": 1, "priority": "urgent"}})
+    )
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    result = json.loads(zendesk.zendesk_update_ticket(1, status="", priority="urgent"))
+
+    assert result["status"] == "success"
+    body = mock_request.call_args.kwargs["json"]
+    assert body["ticket"] == {"priority": "urgent"}
+
+
+def test_update_ticket_cleans_tags(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"ticket": {"id": 1}}))
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    zendesk.zendesk_update_ticket(1, tags=["vip ", "", "  priority"])
+
+    body = mock_request.call_args.kwargs["json"]
+    assert body["ticket"]["tags"] == ["vip", "priority"]
+
+
+def test_update_ticket_clears_tags_with_explicit_empty_list(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"ticket": {"id": 1}}))
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    result = json.loads(zendesk.zendesk_update_ticket(1, tags=[]))
+
+    assert result["status"] == "success"
+    body = mock_request.call_args.kwargs["json"]
+    assert body["ticket"] == {"tags": []}
 
 
 def test_list_ticket_comments_returns_summaries(monkeypatch):
@@ -699,7 +751,13 @@ def test_get_organization_returns_summary(monkeypatch):
     assert result["organization"]["name"] == "Acme"
 
 
-def test_session_is_a_requests_session_reused_across_calls():
+def test_session_is_a_requests_session():
+    # Each MCP tool call runs in its own fresh subprocess (see
+    # mcp_adapter._execute_mcp_call), so this session is never actually
+    # reused *across* calls in production -- it only saves a connection
+    # within the retry-on-429 path of a single call. This just confirms
+    # `_request()` has something to call `.request()` on, not cross-call
+    # pooling (which doesn't happen here).
     assert isinstance(zendesk._session, requests.Session)
 
 
@@ -718,7 +776,11 @@ def test_session_is_a_requests_session_reused_across_calls():
         ),
         (
             "zendesk_update_ticket",
-            {"ticket_id": 1, "status": "solved", "priority": None, "tags": None},
+            # status/priority both None exercises their null-acceptance;
+            # tags=[] (an explicit, meaningful empty list) is the one field
+            # that satisfies "at least one of status/priority/tags must be
+            # provided" without reintroducing a truthy status/priority.
+            {"ticket_id": 1, "status": None, "priority": None, "tags": []},
         ),
         ("zendesk_list_tickets", {"limit": 25, "after_cursor": None}),
         ("zendesk_list_ticket_comments", {"ticket_id": 1, "after_cursor": None}),

@@ -16,13 +16,28 @@ from xagent.web.api.chat import _connect_apps_interactive_for_task
         # the connect_apps card.
         (None, 5, False),
         ("internal", 5, False),
-        # A2A, the v1 SDK, and public/shared-link runs are excluded by
-        # source alone.
+        # A2A, the v1 SDK, agent triggers, and public/shared-link runs are
+        # excluded by source alone.
         ("a2a", None, False),
         ("sdk", None, False),
+        ("trigger", None, False),
         ("external", None, False),
         ("widget", None, False),
         ("shared_link", None, False),
+        # "" normalizes the same as None (normalize_interaction_origin's own
+        # documented contract, matching legacy rows predating the origin
+        # vocabulary) - must stay True, not silently diverge from the None
+        # case now that this function delegates to that normalizer.
+        ("", None, True),
+        ("", 5, False),
+        # A near-miss on "internal" (whitespace/case) must NOT normalize to
+        # it - normalize_interaction_origin deliberately does exact
+        # byte-for-byte matching only.
+        (" internal", None, False),
+        ("INTERNAL", None, False),
+        # An unrecognized source string is "unknown", not silently folded
+        # into "internal".
+        ("unknown_garbage", None, False),
     ],
 )
 def test_connect_apps_interactive_for_task(source, channel_id, expected):

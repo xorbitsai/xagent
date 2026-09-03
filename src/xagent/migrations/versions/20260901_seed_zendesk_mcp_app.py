@@ -13,7 +13,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "20260901_seed_zendesk_mcp_app"
-down_revision: Union[str, None] = "20260901_seed_mixpanel_mcp_app"
+down_revision: Union[str, None] = "20260903_model_management"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

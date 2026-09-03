@@ -39,7 +39,7 @@ def test_request_raises_with_structured_message(monkeypatch):
         "request",
         Mock(
             return_value=MockResponse(
-                status_code=401, text='{"message": "invalid or expired token"}'
+                status_code=401, json_data={"message": "invalid or expired token"}
             )
         ),
     )

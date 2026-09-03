@@ -92,8 +92,11 @@ def _request(
         detail = _extract_error_detail(response)
         if detail is None:
             detail = response.text.strip()
-            if len(detail) > MAX_ERROR_RESPONSE_TEXT_CHARS:
-                detail = detail[:MAX_ERROR_RESPONSE_TEXT_CHARS] + "... [truncated]"
+        # Applies to both branches -- a long or numerous structured error
+        # array (_extract_error_detail's case) is just as unbounded as raw
+        # response text, and was previously only capped in the latter.
+        if len(detail) > MAX_ERROR_RESPONSE_TEXT_CHARS:
+            detail = detail[:MAX_ERROR_RESPONSE_TEXT_CHARS] + "... [truncated]"
         raise RuntimeError(
             f"Employment Hero API error (status {response.status_code}): {detail}"
         )

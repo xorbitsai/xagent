@@ -33,11 +33,6 @@ FULL_OAUTH_PROVIDERS_TABLE = sa.table(
     sa.column("default_scopes", sa.JSON),
 )
 
-OAUTH_PROVIDERS_TABLE = sa.table(
-    "oauth_providers",
-    sa.column("provider_name", sa.String),
-)
-
 PUBLIC_MCP_APPS_TABLE = sa.table(
     "public_mcp_apps",
     sa.column("app_id", sa.String),
@@ -112,7 +107,9 @@ def upgrade() -> None:
             column["name"] for column in inspector.get_columns("oauth_providers")
         }
         existing_provider_names = set(
-            bind.execute(sa.select(OAUTH_PROVIDERS_TABLE.c.provider_name)).scalars()
+            bind.execute(
+                sa.select(FULL_OAUTH_PROVIDERS_TABLE.c.provider_name)
+            ).scalars()
         )
         if "employment-hero" not in existing_provider_names:
             bind.execute(

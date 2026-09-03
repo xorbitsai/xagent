@@ -167,6 +167,23 @@ def get_builtin_oauth_provider_rows() -> list[dict[str, Any]]:
             "default_scopes": ["user:read:user"],
         },
         {
+            "provider_name": "xero",
+            "name": "Xero",
+            "client_id": os.environ.get("XERO_CLIENT_ID", ""),
+            "client_secret": os.environ.get("XERO_CLIENT_SECRET", ""),
+            "auth_url": "https://login.xero.com/identity/connect/authorize",
+            "token_url": "https://identity.xero.com/connect/token",
+            "redirect_uri": os.environ.get("XERO_REDIRECT_URI", ""),
+            "userinfo_url": "https://identity.xero.com/connect/userinfo",
+            "user_id_path": "sub",
+            "email_path": "email",
+            # Identity-only (openid/profile/email), matching zoom/google —
+            # the functional accounting.* scopes this connector actually
+            # calls live on the app row's oauth_scopes below and are merged
+            # in at authorize time, so they aren't duplicated here.
+            "default_scopes": ["openid", "profile", "email"],
+        },
+        {
             "provider_name": "github",
             "name": "GitHub",
             "client_id": os.environ.get("GITHUB_CLIENT_ID", ""),
@@ -704,6 +721,47 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                 "command": "python",
                 "args": ["-m", "xagent.web.tools.mcp.zoom"],
                 "env_mapping": {"ZOOM_ACCESS_TOKEN": "access_token"},
+            },
+        },
+        {
+            "app_id": "xero",
+            "name": "Xero",
+            "description": "Connect to Xero to look up organisations, manage contacts and invoices, and browse the chart of accounts and payments.",
+            "icon": "https://www.google.com/s2/favicons?domain=xero.com&sz=128",
+            "transport": "oauth",
+            "provider_name": "xero",
+            # "Accounting" is not one of the connect dialog's fixed sidebar
+            # category filters (connect-mcp-dialog.tsx only has CRM/Support/
+            # Marketing/Payments/Analytics/etc.), so this connector won't
+            # get a dedicated filter button yet -- still findable via the
+            # catalog's "All" view/search. "Payments" would be misleading:
+            # Xero is bookkeeping/invoicing, not a payments processor.
+            "category": "Accounting",
+            # Granular scopes -- Xero deprecated the broad accounting.*
+            # scopes (accounting.transactions/accounting.contacts covering
+            # everything) for apps created on or after 2 March 2026 in
+            # favor of per-resource read/write scopes; any app registered
+            # today only ever gets the granular set. offline_access is
+            # required for a refresh token (a 30-minute access token with
+            # no refresh would otherwise force re-consent every session).
+            "oauth_scopes": [
+                "offline_access",
+                "accounting.contacts",
+                "accounting.transactions",
+                "accounting.settings",
+            ],
+            # Hidden until manually verified against a live organisation,
+            # same precedent as the intercom/zendesk rows: it ships
+            # customer/supplier-facing write tools (create/update contact,
+            # create invoice, change invoice status) not yet verified live,
+            # and Xero's own auth model changed twice in the last 18 months
+            # (see the oauth_scopes comment) so the exact request/response
+            # shapes are worth a live check before general availability.
+            "is_visible_in_connector": False,
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.xero"],
+                "env_mapping": {"XERO_ACCESS_TOKEN": "access_token"},
             },
         },
         {

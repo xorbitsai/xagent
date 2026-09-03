@@ -85,9 +85,12 @@ type ConnectAppsRow =
  * catalog entry at all is silently dropped - nothing this card could do
  * about it either way.
  */
-export function resolveRows(appNames: string[] | undefined, allApps: McpApp[]): ConnectAppsRow[] {
-  const wanted = appNames || [];
-  if (wanted.length === 0) return [];
+export function resolveRows(
+  appEntries: Array<string | { id?: string; name?: string }> | undefined,
+  allApps: McpApp[],
+): { rows: ConnectAppsRow[]; hasUnresolvedApp: boolean } {
+  const wanted = appEntries || [];
+  if (wanted.length === 0) return { rows: [], hasUnresolvedApp: false };
 
   // findMatchingMcpApp (lib/mcp-lookup.ts) matches by name OR id, tolerating
   // a hyphen-for-space variant either way - the same lenient matching
@@ -97,9 +100,31 @@ export function resolveRows(appNames: string[] | undefined, allApps: McpApp[]): 
   // its connection by app_id (e.g. "facebook-pages") instead of display name.
   const seen = new Set<string>();
   const resolved: McpApp[] = [];
-  for (const name of wanted) {
-    const app = findMatchingMcpApp(allApps, name);
-    if (!app || seen.has(app.id)) continue;
+  let hasUnresolvedApp = false;
+  for (const entry of wanted) {
+    const entryId = typeof entry === "string" ? undefined : entry.id;
+    const entryName = typeof entry === "string" ? entry : entry.name;
+    // An id resolves to exactly one catalog row, unlike a display name - two
+    // visible apps can share a name (custom connector names carry no
+    // uniqueness constraint), so once an id was sent it must stay
+    // authoritative even if it no longer resolves (the app was deleted or
+    // hidden from the catalog since the pause was created) - falling back to
+    // a name match there could silently resolve to a DIFFERENT app that
+    // happens to share the deleted one's old name, and every downstream
+    // action (Connected badge, OAuth/API-key connect, Continue) would then
+    // target that unrelated app instead of leaving the pause unresolved. The
+    // fuzzy name lookup is only for the legacy plain-string shape, which
+    // never carried an id to begin with.
+    const app = entryId
+      ? allApps.find((candidate) => candidate.id === entryId)
+      : entryName
+        ? findMatchingMcpApp(allApps, entryName)
+        : undefined;
+    if (!app) {
+      hasUnresolvedApp = true;
+      continue;
+    }
+    if (seen.has(app.id)) continue;
     seen.add(app.id);
     resolved.push(app);
   }
@@ -126,11 +151,12 @@ export function resolveRows(appNames: string[] | undefined, allApps: McpApp[]): 
     group.apps.push(app);
   }
 
-  return resolved.map((app): ConnectAppsRow => {
+  const rows = resolved.map((app): ConnectAppsRow => {
     if (app.auth_type === "mcp_oauth") return { kind: "mcp_oauth", app };
     if (isOAuthApp(app)) return { kind: "oauth", app, group: groupsByProvider.get(app.provider)! };
     return { kind: "manual", app };
   });
+  return { rows, hasUnresolvedApp };
 }
 
 function RowIcon({
@@ -236,12 +262,21 @@ export function ConnectAppsField({
     };
   }, []);
 
-  const rows = useMemo(() => resolveRows(interaction.apps, apps), [interaction.apps, apps]);
+  // resolveRows silently drops any requested name that doesn't resolve in
+  // the catalog (see its own comment) - a multi-connection template (e.g.
+  // hire-agent.ts's uncapped connections list) with one unresolvable name
+  // must not read as "all connected" just because every row that DID render
+  // happens to be connected, so it reports that alongside the rows from the
+  // same pass instead of a separate scan over interaction.apps.
+  const { rows, hasUnresolvedApp } = useMemo(
+    () => resolveRows(interaction.apps, apps),
+    [interaction.apps, apps],
+  );
   // Recomputed on every render (not memoized against rows, which doesn't
   // change when just an app's is_connected flips) - the footer's "not
   // connected yet" copy plus a Skip button, alongside a card whose every row
   // already shows Connected, would read as an outright contradiction.
-  const allConnected = rows.length > 0 && rows.every((row) => !!row.app.is_connected);
+  const allConnected = !hasUnresolvedApp && rows.length > 0 && rows.every((row) => !!row.app.is_connected);
 
   if (rows.length === 0) {
     // ClarificationForm's Collapsible card (title bar + chevron) is already

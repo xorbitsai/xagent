@@ -336,10 +336,15 @@ export interface Interaction {
   default_value?: string | number | boolean | null;
   accept?: string[] | string;
   multiple?: boolean;
-  /** For "connect_apps": connector app display names (matched against
-   * useMcpApps()'s McpApp.name) to group by OAuth provider and render as
-   * connect cards - e.g. ["Gmail", "Google Calendar", "HubSpot"]. */
-  apps?: string[];
+  /** For "connect_apps": connector apps to group by OAuth provider and
+   * render as connect cards. A plain string is a display name only
+   * (matched against useMcpApps()'s McpApp.name) - the legacy shape, still
+   * used by Hire-seeded cards and older persisted interactions. An object
+   * additionally carries the catalog's stable id (McpApp.id), which
+   * resolveRows in connect-apps-field.tsx prefers over name-matching,
+   * since two visible apps can share a display name but never an id -
+   * e.g. [{ id: "gmail", name: "Gmail" }, "HubSpot"]. */
+  apps?: Array<string | { id?: string; name?: string }>;
 }
 import {
   useWebSocket,

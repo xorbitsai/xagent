@@ -13,7 +13,6 @@ import { toast } from "@/components/ui/sonner"
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible"
 import { ChevronDown, ChevronRight, MessageSquare, Upload, File as FileIcon, X, Globe } from "lucide-react"
 import { ConnectAppsField, resolveRows } from "./connect-apps-field"
-import { findMatchingMcpApp } from "@/lib/mcp-lookup"
 import { useMcpApps, type McpApp } from "@/contexts/mcp-apps-context"
 import type { MessageDeliveryDisposition } from "@/hooks/use-websocket"
 import type { TranslationKey } from "@/i18n/translations"
@@ -143,12 +142,21 @@ const LIVE_WIDGET_TYPES = new Set(["connect_apps"])
 // in the isConnectAppsOnly map the SAME React key - React would warn and
 // could reuse/misattribute a DOM node and its local continued/skipped state
 // between two unrelated cards on re-render.
+//
+// An app entry can be a plain display-name string (the legacy shape) or an
+// object carrying the catalog's stable id alongside the name (see
+// Interaction.apps's own doc comment) - stringified here as id-or-name so
+// two different object entries never collapse to the same "[object Object]"
+// text under Array.prototype.join.
+const stringifyAppEntry = (entry: string | { id?: string; name?: string }): string =>
+  typeof entry === "string" ? entry : entry.id ?? entry.name ?? ""
+
 const connectAppsCardKey = (
   requestId: string | undefined,
   interaction: Interaction,
   index: number,
 ): string => {
-  const roundIdentity = requestId ?? `apps:${(interaction.apps ?? []).join(",")}`
+  const roundIdentity = requestId ?? `apps:${(interaction.apps ?? []).map(stringifyAppEntry).join(",")}`
   return `${roundIdentity}-${interaction.field}-${index}`
 }
 
@@ -197,6 +205,7 @@ export function ClarificationForm({
     interactions
       .filter((interaction) => interaction.type === "connect_apps")
       .flatMap((interaction) => interaction.apps ?? [])
+      .map(stringifyAppEntry)
       .join(",")
 
   const { t } = useI18n()
@@ -342,17 +351,19 @@ export function ClarificationForm({
   }
   const allConnectAppsConnected = useMemo(() => {
     if (!isConnectAppsOnly) return false
-    const allAppNames = normalizedInteractions.flatMap((interaction) => interaction.apps ?? [])
-    if (allAppNames.length === 0) return false
-    // resolveRows silently drops any requested name that doesn't resolve
+    const allAppEntries = normalizedInteractions.flatMap((interaction) => interaction.apps ?? [])
+    if (allAppEntries.length === 0) return false
+    // resolveRows silently drops any requested app that doesn't resolve
     // against the catalog at all (e.g. one hidden via
     // is_visible_in_connector=false, which is exactly what a card's own
-    // noneMatched fallback surfaces) - checking only the rows it DID
-    // resolve would let this go true while that app can never actually be
-    // connected from here, firing Continue prematurely.
-    const anyUnresolved = allAppNames.some((name) => !findMatchingMcpApp(mcpApps, name))
-    if (anyUnresolved) return false
-    const rows = resolveRows(allAppNames, mcpApps)
+    // noneMatched fallback surfaces) - checking only the rows it DID resolve
+    // would let this go true while that app can never actually be connected
+    // from here, firing Continue prematurely. hasUnresolvedApp comes from
+    // the same resolution pass (id-first, falling back to name-matching for
+    // the legacy plain-string shape) instead of a separate name-only scan,
+    // so it can't disagree with the rows resolveRows actually produced.
+    const { rows, hasUnresolvedApp } = resolveRows(allAppEntries, mcpApps)
+    if (hasUnresolvedApp) return false
     return rows.length > 0 && rows.every((row) => row.app.is_connected)
   }, [isConnectAppsOnly, normalizedInteractions, mcpApps])
 

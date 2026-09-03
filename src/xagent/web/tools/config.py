@@ -999,13 +999,23 @@ async def refresh_oauth_token_if_needed(
         if requires_json_accept_header(normalized_provider):
             headers["Accept"] = "application/json"
 
+        from ..api.auth import _is_employment_hero_token_url
         from ..oauth_provider_quirks import matches_provider_family
 
-        if matches_provider_family(normalized_provider, "employment-hero"):
+        if matches_provider_family(
+            normalized_provider, "employment-hero"
+        ) and _is_employment_hero_token_url(refresh_token_url):
             # Matches the code-exchange branch in api/auth.py: Employment
             # Hero's partner guide requires grant_type and refresh_token as
             # query parameters on the refresh request too, with only the
-            # credential fields in the form body. Putting a long-lived
+            # credential fields in the form body. Gated on
+            # _is_employment_hero_token_url too, not just the family match
+            # -- same reasoning as the code-exchange branch: an admin-
+            # created "employment-hero"-family row's token_url isn't
+            # guaranteed to actually be Employment Hero's, and this
+            # EH-specific wire quirk would break a genuinely different
+            # token endpoint's refresh instead of using the standard RFC
+            # 6749 body-only shape it likely expects. Putting a long-lived
             # credential (refresh_token) in a query string is a generic
             # secret-exposure anti-pattern (it can end up in proxy/server
             # access logs a form body wouldn't) -- accepted here as a

@@ -2865,7 +2865,9 @@ def generic_oauth_callback(
             data["client_secret"] = client_secret
 
         params: dict[str, Any] | None = None
-        if matches_provider_family(provider, "employment-hero"):
+        if matches_provider_family(
+            provider, "employment-hero"
+        ) and _is_employment_hero_token_url(token_url):
             # Employment Hero's partner guide (developer.employmenthero.com
             # /partner-guides) requires grant_type and redirect_uri as query
             # parameters on the token URL itself, with only the credential/
@@ -2873,7 +2875,15 @@ def generic_oauth_callback(
             # the form body -- unlike every other provider here, which sends
             # the full RFC 6749 shape (all fields in the body). Popped out of
             # `data` rather than duplicated, so they're never sent in both
-            # places.
+            # places. Gated on _is_employment_hero_token_url, not just the
+            # family match, for the same reason the identity-fetch branch
+            # below is: an admin-created "employment-hero"-family row's
+            # token_url isn't guaranteed to actually be Employment Hero's
+            # (see that function's docstring) -- applying this EH-specific
+            # wire quirk to a genuinely different token endpoint would
+            # break its exchange for no benefit, when falling back to the
+            # standard RFC 6749 body-only shape is what that endpoint
+            # actually expects.
             params = {
                 "grant_type": data.pop("grant_type"),
                 "redirect_uri": data.pop("redirect_uri"),

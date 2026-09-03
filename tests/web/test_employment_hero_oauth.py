@@ -786,7 +786,10 @@ def test_callback_skips_identity_fetch_when_token_url_is_not_employment_hero(
     have this callback forward its access token to the real
     api.employmenthero.com. The connect must still succeed, just with no
     identity (the same NULL-provider_user_id path a provider with no
-    userinfo_url and no family match takes)."""
+    userinfo_url and no family match takes). The EH-specific query-param
+    wire rewrite must also be skipped for the same reason -- the foreign
+    token endpoint likely expects the standard RFC 6749 body-only shape,
+    not Employment Hero's own quirk."""
     db, user = db_session
     request = _callback_request(user, code_verifier="verifier-value")
 
@@ -806,6 +809,15 @@ def test_callback_skips_identity_fetch_when_token_url_is_not_employment_hero(
 
     assert response.status_code == 200
     get.assert_not_called()
+    # The query-param rewrite must be skipped for this non-EH token_url --
+    # grant_type/redirect_uri stay in the body, matching every other
+    # provider's standard shape, not Employment Hero's own quirk.
+    assert post.call_args.kwargs["params"] is None
+    assert post.call_args.kwargs["data"]["grant_type"] == "authorization_code"
+    assert (
+        post.call_args.kwargs["data"]["redirect_uri"]
+        == "https://app.example.com/api/auth/employment-hero/callback"
+    )
     oauth_account = (
         db.query(UserOAuth)
         .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "employment-hero")
@@ -915,3 +927,71 @@ async def test_employment_hero_refresh_sends_grant_type_and_refresh_token_as_que
     assert "refresh_token" not in kwargs["data"]
     assert kwargs["data"]["client_id"] == "eh-client-id"
     assert kwargs["data"]["client_secret"] == "eh-client-secret"
+
+
+@pytest.mark.asyncio
+async def test_employment_hero_refresh_skips_query_rewrite_for_non_eh_token_url(
+    db_session, monkeypatch
+):
+    """An "employment-hero"-family provider row's token_url is admin-
+    editable, same as the callback side -- a row whose token_url doesn't
+    actually belong to Employment Hero must not have this refresh apply
+    Employment Hero's query-param wire quirk, since the foreign token
+    endpoint likely expects the standard RFC 6749 body-only shape."""
+    db, user = db_session
+    db.add(
+        OAuthProvider(
+            provider_name="employment-hero",
+            name="Employment Hero",
+            client_id=encrypt_value("eh-client-id"),
+            client_secret=encrypt_value("eh-client-secret"),
+            auth_url="https://oauth.employmenthero.com/oauth2/authorize",
+            token_url="https://attacker.example.com/oauth2/token",
+            redirect_uri="https://app.example.com/api/auth/employment-hero/callback",
+            userinfo_url="",
+            user_id_path="id",
+            email_path="email",
+            default_scopes=[],
+        )
+    )
+    oauth_account = UserOAuth(
+        user_id=user.id,
+        provider="employment-hero",
+        access_token="old-token",
+        refresh_token="old-refresh",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        provider_user_id=None,
+    )
+    db.add(oauth_account)
+    db.commit()
+
+    captured_requests = []
+
+    class FakeAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, url, **kwargs):
+            captured_requests.append((url, kwargs))
+            return MockResponse(
+                {"access_token": "new-token", "token_type": "Bearer"},
+                status_code=200,
+            )
+
+    monkeypatch.setattr(tool_config.httpx, "AsyncClient", FakeAsyncClient)
+
+    assert (
+        await tool_config.refresh_oauth_token_if_needed(
+            db, oauth_account, "employment-hero"
+        )
+        is True
+    )
+
+    url, kwargs = captured_requests[0]
+    assert url == "https://attacker.example.com/oauth2/token"
+    assert "params" not in kwargs
+    assert kwargs["data"]["grant_type"] == "refresh_token"
+    assert kwargs["data"]["refresh_token"] == "old-refresh"

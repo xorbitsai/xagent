@@ -4,6 +4,7 @@ import importlib.util
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from sqlalchemy import create_engine, text
@@ -226,12 +227,34 @@ def test_downgrade_preserves_pre_existing_employment_hero_app(tmp_path):
         assert "employment-hero" in _provider_names(connection)
 
 
-def test_downgrade_preserves_app_row_admin_edited_beyond_structural_fields(tmp_path):
-    """An admin who PATCHed the seeded app row's oauth_scopes without
-    touching app_id/name/transport/provider_name must not have that edit
-    silently discarded by downgrade -- matching only those four structural
-    columns isn't enough to prove this is still "this migration's row"
-    once anything else about it has been customized."""
+# One representative, type-appropriate edit per column in the app row's
+# downgrade guard's compare_columns set (see the migration's downgrade()) --
+# parametrized rather than a single field, so a future edit that accidentally
+# drops one of these columns from compare_columns (this exact class of bug is
+# what that guard exists to prevent) is caught regardless of which column it
+# is, not just whichever one happened to be spot-checked.
+_APP_ROW_COLUMN_EDITS = {
+    "name": "'Custom Name'",
+    "description": "'Custom description'",
+    "icon": "'https://example.com/custom-icon.png'",
+    "transport": "'stdio'",
+    "provider_name": "'custom-provider'",
+    "category": "'Custom'",
+    "oauth_scopes": "'[\"custom_scope\"]'",
+    "is_visible_in_connector": "0",
+    "launch_config": '\'{"command": "custom"}\'',
+}
+
+
+@pytest.mark.parametrize("column", sorted(_APP_ROW_COLUMN_EDITS))
+def test_downgrade_preserves_app_row_admin_edited_beyond_structural_fields(
+    tmp_path, column
+):
+    """An admin who PATCHed any one of the seeded app row's non-app_id
+    columns must not have that edit silently discarded by downgrade --
+    matching only a handful of structural columns isn't enough to prove
+    this is still "this migration's row" once anything else about it has
+    been customized."""
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
     with engine.begin() as connection:
@@ -240,7 +263,7 @@ def test_downgrade_preserves_app_row_admin_edited_beyond_structural_fields(tmp_p
             migration.upgrade()
         connection.execute(
             text(
-                "UPDATE public_mcp_apps SET oauth_scopes = '[\"custom_scope\"]'"
+                f"UPDATE public_mcp_apps SET {column} = {_APP_ROW_COLUMN_EDITS[column]}"
                 " WHERE app_id = 'employment-hero'"
             )
         )
@@ -249,14 +272,27 @@ def test_downgrade_preserves_app_row_admin_edited_beyond_structural_fields(tmp_p
         assert "employment-hero" in _app_ids(connection)
 
 
+# Same idea as _APP_ROW_COLUMN_EDITS, for the provider row's guard.
+_PROVIDER_ROW_COLUMN_EDITS = {
+    "name": "'Custom Name'",
+    "auth_url": "'https://custom.example.com/authorize'",
+    "token_url": "'https://custom.example.com/token'",
+    "userinfo_url": "'https://custom.example.com/userinfo'",
+    "user_id_path": "'custom_id'",
+    "email_path": "'custom_email'",
+    "default_scopes": "'[\"custom_scope\"]'",
+}
+
+
+@pytest.mark.parametrize("column", sorted(_PROVIDER_ROW_COLUMN_EDITS))
 def test_downgrade_preserves_provider_row_admin_edited_beyond_structural_fields(
-    tmp_path,
+    tmp_path, column
 ):
-    """An admin who edited the seeded provider row's default_scopes without
-    touching provider_name/name/auth_url/token_url must not have that edit
-    silently discarded by downgrade -- the app row is removed as usual (it
-    still matches the seeded shape exactly), but the provider row it
-    depends on must survive since its own shape no longer matches."""
+    """An admin who edited any one of the seeded provider row's non-
+    provider_name columns must not have that edit silently discarded by
+    downgrade -- the app row is removed as usual (it still matches the
+    seeded shape exactly), but the provider row it depends on must survive
+    since its own shape no longer matches."""
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
     with engine.begin() as connection:
@@ -265,7 +301,8 @@ def test_downgrade_preserves_provider_row_admin_edited_beyond_structural_fields(
             migration.upgrade()
         connection.execute(
             text(
-                "UPDATE oauth_providers SET default_scopes = '[\"custom_scope\"]'"
+                f"UPDATE oauth_providers SET {column} = "
+                f"{_PROVIDER_ROW_COLUMN_EDITS[column]}"
                 " WHERE provider_name = 'employment-hero'"
             )
         )

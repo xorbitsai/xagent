@@ -1105,6 +1105,13 @@ class MCPToolAdapter(AbstractBaseTool):
             return all(item == "null" for item in schema_type)
         return False
 
+    # Caps the string this method will attempt to recover as a double-encoded
+    # array/scalar (see below). A real LLM double-encoding mistake is small —
+    # '["date"]', not a multi-KB blob — so anything past this length is out of
+    # scope for the recovery and just takes the raw-wrap fallback instead of
+    # being handed to json.loads at all.
+    _ARRAY_ARG_JSON_RECOVERY_MAX_CHARS = 4096
+
     def _normalize_args_by_schema(self, args: Mapping[str, Any]) -> Dict[str, Any]:
         """Normalize common LLM argument shape mistakes using the MCP input schema."""
         normalized_args = dict(args)
@@ -1123,23 +1130,24 @@ class MCPToolAdapter(AbstractBaseTool):
             if value is None:
                 continue
             if self._schema_is_array_only(field_schema) and not isinstance(value, list):
-                if isinstance(value, str):
+                if (
+                    isinstance(value, str)
+                    and len(value) <= self._ARRAY_ARG_JSON_RECOVERY_MAX_CHARS
+                ):
                     # Tool-calling models sometimes double-encode an
                     # array-only argument as a JSON string instead of a real
                     # array — e.g. '["date"]', or even a lone item as
                     # '"date"'. Recover the intended value before falling
                     # back to the raw wrap below, which would otherwise
                     # leak the string's own brackets/quotes into a garbled
-                    # single item.
+                    # single item. Both ValueError (json.JSONDecodeError,
+                    # and CPython's int-string-conversion digit-limit guard
+                    # for a long run of digits) and RecursionError (a
+                    # pathologically deep bracket string) mean the same
+                    # thing here: not recoverable, fall back below.
                     try:
                         parsed_value = json.loads(value)
-                    except json.JSONDecodeError:
-                        parsed_value = None
-                    except RecursionError:
-                        # A pathologically deep/adversarial bracket string
-                        # (e.g. thousands of nested "[") blows the C parser's
-                        # recursion limit instead of raising JSONDecodeError.
-                        # Treat it the same as any other unparsable value.
+                    except (ValueError, RecursionError):
                         parsed_value = None
                     if isinstance(parsed_value, list):
                         normalized_args[field_name] = parsed_value

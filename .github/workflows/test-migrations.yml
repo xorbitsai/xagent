@@ -56,6 +56,11 @@ on:
       - 'tests/web/test_trusted_actor_oauth_postgresql.py'
       - 'tests/shared/postgres_disposable.py'
       - 'tests/web/services/checkpoint_anchor_shared.py'
+      - 'src/xagent/web/api/mcp.py'
+      - 'src/xagent/web/models/mcp.py'
+      - 'src/xagent/web/models/mcp_oauth.py'
+      - 'src/xagent/web/models/public_mcp.py'
+      - 'tests/web/api/test_mcp_app_teardown_postgresql.py'
   pull_request:
     branches: [main]
   # Required by the merge queue: without this the two required contexts below
@@ -148,6 +153,11 @@ jobs:
             tests/web/test_trusted_actor_oauth_postgresql.py
             tests/shared/postgres_disposable.py
             tests/web/services/checkpoint_anchor_shared.py
+            src/xagent/web/api/mcp.py
+            src/xagent/web/models/mcp.py
+            src/xagent/web/models/mcp_oauth.py
+            src/xagent/web/models/public_mcp.py
+            tests/web/api/test_mcp_app_teardown_postgresql.py
           )
 
           case "$EVENT_NAME" in
@@ -358,6 +368,13 @@ jobs:
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
           pytest tests/web/test_trusted_actor_oauth_postgresql.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test app-scoped MCP teardown concurrency (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/web/api/test_mcp_app_teardown_postgresql.py -m postgresql -q
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 

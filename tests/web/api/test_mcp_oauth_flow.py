@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import timedelta
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
@@ -654,6 +655,39 @@ async def test_connect_creates_pkce_state_and_redirects(db_session, monkeypatch)
     assert client.client_secret != "client-secret"
     assert decrypt_value(client.client_secret) == "client-secret"
     assert flow_state.mcp_oauth_client_id == client.id
+
+
+@pytest.mark.asyncio
+async def test_connect_revalidates_active_association_after_discovery(
+    db_session, monkeypatch
+):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+    factory = sessionmaker(bind=db.get_bind(), autoflush=False, autocommit=False)
+
+    async def disconnect_during_discovery(_server, _auth_config):
+        with factory() as teardown_db:
+            teardown_db.query(UserMCPServer).filter(
+                UserMCPServer.user_id == user.id,
+                UserMCPServer.mcpserver_id == server.id,
+            ).delete(synchronize_session=False)
+            teardown_db.commit()
+        return _discovery()
+
+    monkeypatch.setattr(
+        mcp_api, "_discover_mcp_oauth_for_server", disconnect_during_discovery
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await connect_mcp_oauth(
+            server.id,
+            MCPOAuthConnectRequest(redirect_after="/settings/mcp"),
+            user,
+            db,
+        )
+
+    assert exc_info.value.status_code == 409
+    assert db.query(MCPOAuthFlowState).count() == 0
 
 
 @pytest.mark.asyncio
@@ -2267,6 +2301,131 @@ async def test_callback_exchanges_code_and_stores_encrypted_grant(
     assert decrypt_value(grant.access_token) == "plain-access-token"
     assert decrypt_value(grant.refresh_token) == "plain-refresh-token"
     assert db.query(MCPOAuthFlowState).one().consumed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_callback_rejects_old_flow_after_disconnect_and_fast_reconnect(
+    db_session, monkeypatch
+):
+    db, user, _ = db_session
+    server, client, old_flow = _add_callback_client_and_state(
+        db,
+        user,
+        state="old-lifecycle-state",
+        metadata_json={"revocation_endpoint": "https://auth.example.com/revoke"},
+    )
+    factory = sessionmaker(bind=db.get_bind(), autoflush=False, autocommit=False)
+    revocations = []
+
+    async def exchange_after_reconnect(**_kwargs):
+        with factory() as lifecycle_db:
+            lifecycle_db.query(MCPOAuthFlowState).filter_by(id=old_flow.id).delete(
+                synchronize_session=False
+            )
+            lifecycle_db.query(UserMCPServer).filter_by(
+                user_id=user.id, mcpserver_id=server.id
+            ).delete(synchronize_session=False)
+            lifecycle_db.add(
+                UserMCPServer(
+                    user_id=user.id,
+                    mcpserver_id=server.id,
+                    is_owner=False,
+                    is_active=True,
+                )
+            )
+            lifecycle_db.add(
+                MCPOAuthFlowState(
+                    state="new-lifecycle-state",
+                    mcp_server_id=server.id,
+                    user_id=user.id,
+                    mcp_oauth_client_id=client.id,
+                    resource_owner_key="resource-owner-a",
+                    issuer="https://auth.example.com",
+                    resource="https://mcp.example.com/mcp",
+                    scope="records.read",
+                    code_verifier=mcp_api.encrypt_value("new-verifier"),
+                    expires_at=mcp_api._utc_now() + timedelta(minutes=10),
+                )
+            )
+            lifecycle_db.commit()
+        return {
+            "access_token": "issued-access-token",
+            "refresh_token": "issued-refresh-token",
+            "token_type": "Bearer",
+            "scope": "records.read",
+        }
+
+    async def observe_revocation(snapshot):
+        revocations.append(snapshot)
+
+    monkeypatch.setattr(mcp_api, "_exchange_mcp_oauth_code", exchange_after_reconnect)
+    monkeypatch.setattr(
+        mcp_api, "_revoke_mcp_oauth_snapshot_externally", observe_revocation
+    )
+
+    response = await mcp_oauth_callback(
+        _request("/api/mcp/oauth/callback?code=auth-code&state=old-lifecycle-state"),
+        db,
+    )
+
+    assert _redirect_query(response)["mcp_oauth_error"] == ["invalid_state"]
+    assert db.query(MCPOAuthGrant).count() == 0
+    assert db.query(MCPOAuthFlowState).one().state == "new-lifecycle-state"
+    assert len(revocations) == 1
+    assert decrypt_value(revocations[0].access_token) == "issued-access-token"
+    assert decrypt_value(revocations[0].refresh_token) == "issued-refresh-token"
+
+
+@pytest.mark.asyncio
+async def test_callback_persistence_failure_revokes_token_without_logging_detail(
+    db_session, monkeypatch, caplog
+):
+    db, user, _ = db_session
+    _add_callback_client_and_state(
+        db,
+        user,
+        state="persistence-failure-state",
+        metadata_json={"revocation_endpoint": "https://auth.example.com/revoke"},
+    )
+    secret_detail = "issued-access-token raw-upstream-detail"
+    revocations = []
+
+    async def exchange(**_kwargs):
+        return {
+            "access_token": "issued-access-token",
+            "refresh_token": "issued-refresh-token",
+            "token_type": "Bearer",
+            "scope": "records.read",
+        }
+
+    def fail_persistence(*_args, **_kwargs):
+        raise RuntimeError(secret_detail)
+
+    async def observe_revocation(snapshot):
+        revocations.append(snapshot)
+
+    monkeypatch.setattr(mcp_api, "_exchange_mcp_oauth_code", exchange)
+    monkeypatch.setattr(mcp_api, "_upsert_mcp_oauth_grant", fail_persistence)
+    monkeypatch.setattr(
+        mcp_api, "_revoke_mcp_oauth_snapshot_externally", observe_revocation
+    )
+    caplog.set_level(logging.ERROR, logger=mcp_api.__name__)
+
+    response = await mcp_oauth_callback(
+        _request(
+            "/api/mcp/oauth/callback?code=auth-code&state=persistence-failure-state"
+        ),
+        db,
+    )
+
+    assert _redirect_query(response)["mcp_oauth_error"] == ["token_exchange_failed"]
+    assert db.query(MCPOAuthGrant).count() == 0
+    assert len(revocations) == 1
+    assert decrypt_value(revocations[0].access_token) == "issued-access-token"
+    assert decrypt_value(revocations[0].refresh_token) == "issued-refresh-token"
+    assert "MCP OAuth callback failed after state claim" in caplog.text
+    assert secret_detail not in caplog.text
+    assert "raw-upstream-detail" not in caplog.text
 
 
 @pytest.mark.asyncio

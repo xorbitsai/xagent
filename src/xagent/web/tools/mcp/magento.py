@@ -117,15 +117,39 @@ def _resolve_store_host() -> tuple[str, int | None, str]:
         raise ValueError("MAGENTO_BASE_URL must include a hostname")
     try:
         # IDNA-encoded (punycode) up front, matching what urllib3's own URL
-        # parsing (`_normalize_host`) does to the host it actually connects
-        # to -- without this, a non-ASCII hostname would leave `hostname`
-        # (used below for the pinning comparison) as raw Unicode while the
-        # real connection's `self.host` is punycode, so `_pinned_dns`'s
-        # `host == hostname` check would never match and silently skip
-        # pinning for exactly this input.
-        hostname = hostname.encode("idna").decode("ascii")
+        # parsing (`_normalize_host`/`_idna_encode`) does to the host it
+        # actually connects to -- without this, a non-ASCII hostname would
+        # leave `hostname` (used below for the pinning comparison) as raw
+        # Unicode while the real connection's `self.host` is punycode, so
+        # `_pinned_dns`'s `host == hostname` check would never match and
+        # silently skip pinning for exactly this input.
+        #
+        # This must go through the third-party `idna` package the same way
+        # urllib3 does (IDNA2008/UTS46, strict + std3_rules) -- NOT Python's
+        # stdlib `str.encode("idna")` codec, which implements the older
+        # IDNA2003 and disagrees with urllib3 on real hostnames (verified:
+        # "faß.de".encode("idna") -> "fass.de", a different, unrelated
+        # domain, while urllib3's own encoder produces "xn--fa-hia.de").
+        # Using the stdlib codec here wouldn't just skip pinning -- DNS,
+        # the Host header, and TLS SNI would all consistently target the
+        # wrong domain instead. urllib3 itself only reaches for `idna` when
+        # the host isn't already ASCII (see `_idna_encode`), so mirror that
+        # exactly rather than unconditionally re-encoding an ASCII host.
+        if not hostname.isascii():
+            import idna
+
+            hostname = idna.encode(
+                hostname.lower(), strict=True, std3_rules=True
+            ).decode("ascii")
+        else:
+            hostname = hostname.lower()
     except UnicodeError as exc:
         raise ValueError(f"MAGENTO_BASE_URL has an invalid hostname: {exc}") from exc
+    except ImportError as exc:
+        raise ValueError(
+            "MAGENTO_BASE_URL has a non-ASCII hostname but the 'idna' "
+            "package is not installed to encode it"
+        ) from exc
     try:
         port = parsed.port
     except ValueError as exc:
@@ -223,13 +247,17 @@ def _pinned_dns(hostname: str, pinned_ip: str) -> Iterator[None]:
     the installed urllib3's `connection.py` (`HTTPSConnection.connect()`
     sets `server_hostname = self.host` independently of `_new_conn()`).
 
-    Scoped to this one call (patched in, restored in `finally`) rather
-    than a permanent global patch: `urllib3.util.connection.create_connection`
-    is process-global state, and while this connector's process is
-    presently spawned fresh per tool call (see intercom.py's identical
-    single-token-cache reasoning) and so never actually races with itself,
-    scoping the patch to the exact call that needs it means that
-    assumption doesn't have to keep holding for this to stay correct.
+    Scoped to this one call (patched in, restored in `finally`) rather than
+    a permanent global patch: `urllib3.util.connection.create_connection` is
+    process-global state, so two overlapping calls patching/restoring it
+    concurrently could in principle race. That doesn't happen today only
+    because the MCP SDK invokes this synchronous, non-async tool function
+    directly on its single event-loop thread -- the `requests.request()`
+    call inside fully blocks that thread for the call's duration, so no
+    other tool invocation's `_pinned_dns` block can interleave with it. If
+    this connector ever moves to an async HTTP client, that property no
+    longer holds and this scoping would need a lock (or a per-Session/
+    per-HTTPConnectionPool patch instead of a global one).
     """
     original_create_connection = urllib3_connection.create_connection
 
@@ -246,6 +274,38 @@ def _pinned_dns(hostname: str, pinned_ip: str) -> Iterator[None]:
         yield
     finally:
         urllib3_connection.create_connection = original_create_connection
+
+
+_AMBIENT_PROXY_ENV_VARS = (
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+)
+
+
+@contextlib.contextmanager
+def _no_ambient_proxy_env() -> Iterator[None]:
+    """Hide every ambient proxy env var for the duration of this block.
+
+    `requests.request()` always runs on a Session with trust_env=True, which
+    calls `get_environ_proxies()` and fills in any scheme not already present
+    in an explicitly-passed `proxies=` dict -- so passing `proxies={}` alone
+    does NOT stop requests from routing through an ambient proxy. This closes
+    that gap for exactly the schemes `get_trusted_proxy_url()` doesn't police
+    (e.g. ALL_PROXY), rather than widening that function's own env-var list,
+    since the goal here is "no proxy unless explicitly trusted," not "trust
+    one more variable."
+    """
+    saved = {name: environ.pop(name, None) for name in _AMBIENT_PROXY_ENV_VARS}
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            if value is not None:
+                environ[name] = value
 
 
 def _clamp_limit(limit: int) -> int:
@@ -364,10 +424,17 @@ def _request(
     # trusted to enforce its own private-range egress policy
     # (XAGENT_TRUSTED_EGRESS_PROXY=1), rather than silently trusting every
     # ambient proxy setup_proxy_env() promotes from the OS's own settings.
-    # The result is then passed to `requests` explicitly (not left to its
-    # default trust_env=True env-var auto-pickup) so "no proxy" here is an
-    # actual guarantee for this call, not just the absence of one var this
-    # code happened to check.
+    # The result is then passed to `requests` explicitly *and* the ambient
+    # proxy env vars are scrubbed for the duration of the call (see
+    # _no_ambient_proxy_env below) so "no proxy" here is an actual
+    # guarantee. Passing proxies= alone is NOT sufficient: requests.request()
+    # runs on a trust_env=True Session by default, which still merges in
+    # whatever get_environ_proxies() finds (e.g. ALL_PROXY, which
+    # get_trusted_proxy_url() never inspects) for any scheme this dict
+    # doesn't already set -- silently reopening the DNS-rebinding window
+    # this whole gate exists to close (verified directly: Session().
+    # merge_environment_settings(url, {}, ...) still fills in an env-derived
+    # proxy even when {} is passed explicitly).
     proxy_url = get_trusted_proxy_url()
     proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else {}
 
@@ -378,7 +445,7 @@ def _request(
     origin = f"https://{hostname}" + (f":{port}" if port else "")
     url = f"{origin}{_store_path_prefix()}{path}"
     try:
-        with _pinned_dns(hostname, pinned_ip):
+        with _pinned_dns(hostname, pinned_ip), _no_ambient_proxy_env():
             response = requests.request(
                 method=method,
                 url=url,

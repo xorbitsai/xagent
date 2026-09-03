@@ -169,6 +169,22 @@ def test_resolve_store_host_idna_encodes_non_ascii_hostname(monkeypatch):
     assert hostname == "xn--mnchen-3ya.example.com"
 
 
+def test_resolve_store_host_idna_encodes_using_urllib3s_actual_encoder(monkeypatch):
+    # Python's stdlib `str.encode("idna")` codec (IDNA2003) and the
+    # third-party `idna` package urllib3 actually uses (IDNA2008/UTS46)
+    # disagree on some real hostnames -- e.g. this one case-folds "ß"
+    # differently, so the stdlib codec would produce "fass.de" (a
+    # different, unrelated domain) while urllib3 would dial "xn--fa-hia.de"
+    # for the exact same MAGENTO_BASE_URL. _resolve_store_host() must match
+    # what urllib3 will actually connect to, not just produce *some*
+    # ASCII-looking encoding of the host.
+    monkeypatch.setenv("MAGENTO_BASE_URL", "https://faß.de")
+
+    hostname, _port, _pinned_ip = magento._resolve_store_host()
+
+    assert hostname == "xn--fa-hia.de"
+
+
 def test_pinned_dns_redirects_matching_host_to_pinned_ip(monkeypatch):
     calls = []
 
@@ -520,6 +536,34 @@ def test_request_passes_proxy_explicitly_when_trusted(monkeypatch):
     }
 
 
+def test_request_scrubs_ambient_proxy_env_vars_not_covered_by_the_trust_gate(
+    monkeypatch,
+):
+    # get_trusted_proxy_url() only inspects HTTP_PROXY/HTTPS_PROXY, so it
+    # returns None here and this call passes proxies={} explicitly -- but
+    # requests.request() always runs on a trust_env=True Session, which
+    # still fills in ALL_PROXY via get_environ_proxies() for any scheme
+    # that dict doesn't already set. Verified directly against the
+    # installed requests: Session().merge_environment_settings(url, {},
+    # ...) returns a non-empty proxies dict from ALL_PROXY alone even when
+    # {} is passed. _no_ambient_proxy_env() must hide ALL_PROXY (and its
+    # siblings) for the duration of the call so this can't happen, and
+    # restore it afterward.
+    monkeypatch.setenv("ALL_PROXY", "http://evil-proxy.internal:9999")
+    seen = {}
+
+    def _capture(*args, **kwargs):
+        seen["all_proxy_during_call"] = magento.environ.get("ALL_PROXY")
+        return MockResponse(json_data={"ok": True})
+
+    monkeypatch.setattr(magento.requests, "request", Mock(side_effect=_capture))
+
+    magento._request("GET", "/products/abc")
+
+    assert seen["all_proxy_during_call"] is None
+    assert magento.environ.get("ALL_PROXY") == "http://evil-proxy.internal:9999"
+
+
 @pytest.mark.parametrize("status_code", [301, 302, 303, 307, 308])
 def test_request_rejects_redirect_response(monkeypatch, status_code):
     monkeypatch.setattr(
@@ -829,14 +873,23 @@ def test_get_order_percent_encodes_id_in_path(monkeypatch):
     assert mock_request.call_args.kwargs["url"].endswith("/orders/1")
 
 
-def test_get_order_rejects_path_traversal_id():
+def test_get_order_neutralizes_path_traversal_id(monkeypatch):
     # order_id is typed int, so a real MCP call can never reach this value
     # (FastMCP validates the wire argument first) -- this is a
     # defense-in-depth check on the underlying function, matching the
-    # protection magento_get_product's sku already has.
+    # protection magento_get_product's sku already has. url_path_id()
+    # percent-encodes rather than rejects a value merely containing "/",
+    # so this must not hit a real network call to prove anything: mock the
+    # request and assert the traversal segment landed encoded in the path,
+    # never as a raw path separator.
+    mock_request = Mock(return_value=MockResponse(json_data={"entity_id": 1}))
+    monkeypatch.setattr(magento.requests, "request", mock_request)
+
     result = json.loads(magento.magento_get_order("1/../../customers/5"))
 
-    assert result["status"] == "error"
+    assert result["status"] == "success"
+    url = mock_request.call_args.kwargs["url"]
+    assert url.endswith("/orders/1%2F..%2F..%2Fcustomers%2F5")
 
 
 def test_add_order_comment_requires_non_blank_comment():
@@ -867,12 +920,17 @@ def test_add_order_comment_sends_status_history(monkeypatch):
     assert mock_request.call_args.kwargs["url"].endswith("/orders/1/comments")
 
 
-def test_add_order_comment_rejects_path_traversal_id():
+def test_add_order_comment_neutralizes_path_traversal_id(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data=True))
+    monkeypatch.setattr(magento.requests, "request", mock_request)
+
     result = json.loads(
         magento.magento_add_order_comment("1/../../customers/5", "Note")
     )
 
-    assert result["status"] == "error"
+    assert result["status"] == "success"
+    url = mock_request.call_args.kwargs["url"]
+    assert url.endswith("/orders/1%2F..%2F..%2Fcustomers%2F5/comments")
 
 
 def test_add_order_comment_omits_status_when_not_provided(monkeypatch):
@@ -944,10 +1002,15 @@ def test_get_customer_returns_summary(monkeypatch):
     assert result["customer"]["email"] == "jane@example.com"
 
 
-def test_get_customer_rejects_path_traversal_id():
+def test_get_customer_neutralizes_path_traversal_id(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"id": 1}))
+    monkeypatch.setattr(magento.requests, "request", mock_request)
+
     result = json.loads(magento.magento_get_customer("1/../../orders/5"))
 
-    assert result["status"] == "error"
+    assert result["status"] == "success"
+    url = mock_request.call_args.kwargs["url"]
+    assert url.endswith("/customers/1%2F..%2F..%2Forders%2F5")
 
 
 def test_get_category_tree_sends_optional_params(monkeypatch):
@@ -987,10 +1050,15 @@ def test_get_category_returns_summary(monkeypatch):
     assert result["category"]["name"] == "Shirts"
 
 
-def test_get_category_rejects_path_traversal_id():
+def test_get_category_neutralizes_path_traversal_id(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"id": 1, "name": "Root"}))
+    monkeypatch.setattr(magento.requests, "request", mock_request)
+
     result = json.loads(magento.magento_get_category("1/../../orders/5"))
 
-    assert result["status"] == "error"
+    assert result["status"] == "success"
+    url = mock_request.call_args.kwargs["url"]
+    assert url.endswith("/categories/1%2F..%2F..%2Forders%2F5")
 
 
 def test_category_summary_returns_empty_dict_for_none():

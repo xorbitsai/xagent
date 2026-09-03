@@ -10,6 +10,7 @@ from typing import Any
 import requests
 from mcp.server.fastmcp import FastMCP
 
+from ....config import get_tool_max_output_length
 from ....core.utils.security import (
     PrivateNetworkHostError,
     redact_sensitive_text,
@@ -386,20 +387,78 @@ def _list_connection(
         variables,
     )
     items, has_more, next_cursor = _extract_connection(data, root_field, summary_fn)
-    # Deliberately not run through a size-capping helper: after_cursor is
-    # Shopify's endCursor for the *full* page this call fetched (the
-    # selection is nodes + pageInfo, not per-item edges { cursor }), so
-    # trimming `items` down to fit an output-size cap without also rewinding
-    # the cursor would silently drop the untrimmed items -- the next call
-    # resumes past them, and they're never returned by any call. MAX_LIMIT
-    # already bounds the page to at most 100 of these flat summary objects,
-    # matching posthog.py's list tools, which don't cap either.
-    return _success(
-        **{root_field: items},
-        has_more=has_more,
-        after_cursor=next_cursor,
-        _errors=errors,
-    )
+    return _success_paginated(root_field, items, has_more, next_cursor, after, errors)
+
+
+def _success_paginated(
+    field_name: str,
+    items: list[dict[str, Any]],
+    has_more: bool,
+    next_cursor: str | None,
+    input_after: str,
+    errors: list[Any],
+) -> str:
+    """Build a list tool's success response, shrinking `items` if the full
+    page doesn't fit the platform's output-size cap. Mirrors hubspot.py's
+    `_paged_list`, adapted for Shopify's cursor semantics.
+
+    A shrunk page must never keep `next_cursor` (Shopify's own endCursor):
+    that cursor marks the end of the *full* page Shopify returned (the
+    GraphQL selection is `nodes { ... }` + `pageInfo`, not per-item `edges
+    { cursor node }`), so pairing a locally truncated `items` with it would
+    make the next call resume past the untrimmed items -- silently
+    dropping them for good, not just deferring them (the bug this helper
+    replaces). On truncation, `after_cursor` is instead this call's own
+    *input* cursor (or None if it was the first page) -- the server still
+    considers the full untruncated page consumed, so the only way to
+    surface the trimmed entries is retrying that same starting point with
+    a smaller `limit`, not advancing to Shopify's next page.
+    """
+
+    def _build(
+        page: list[dict[str, Any]], more: bool, cursor: str | None, truncated: bool
+    ) -> str:
+        return _success(
+            **{field_name: page},
+            truncated=truncated,
+            has_more=more,
+            after_cursor=cursor,
+            _errors=errors,
+        )
+
+    response = _build(items, has_more, next_cursor, False)
+    max_output_length = get_tool_max_output_length()
+    if len(response) <= max_output_length:
+        return response
+
+    truncated_cursor = input_after or None
+    shrunk = False
+    while len(response) > max_output_length and items:
+        items = items[: len(items) // 2]
+        shrunk = True
+        response = _build(items, True, truncated_cursor, True)
+    if shrunk and not items:
+        # Collapsing all the way to zero means even the single largest
+        # remaining record didn't fit alone -- "retry with a smaller
+        # limit" isn't guaranteed to help here (there's already only one
+        # item at play), so say so plainly instead of implying a fix that
+        # may not exist. Only used if it still fits: an operator can
+        # configure the output cap small enough that even this
+        # already-empty payload plus the message text exceeds it, and
+        # appending it unconditionally would reintroduce the
+        # hard-truncated-into-broken-JSON failure mode this function
+        # exists to prevent.
+        payload = json.loads(response)
+        payload["message"] = (
+            "Every record in this page was individually too large to fit "
+            "the output size limit, so none could be returned. Retrying "
+            "with a smaller `limit` may surface different records if more "
+            "exist, but cannot shrink an individually oversized record."
+        )
+        response_with_message = json.dumps(payload, ensure_ascii=False)
+        if len(response_with_message) <= max_output_length:
+            response = response_with_message
+    return response
 
 
 def _run_mutation(

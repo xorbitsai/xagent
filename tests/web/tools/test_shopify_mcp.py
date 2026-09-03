@@ -665,6 +665,165 @@ def test_list_products_surfaces_partial_success_warnings(monkeypatch):
     assert result["warnings"] == ["a sub-field failed"]
 
 
+def test_list_products_caps_output_size(monkeypatch):
+    big_products = [
+        {"id": f"gid://shopify/Product/{i}", "title": "x" * 1000} for i in range(50)
+    ]
+    monkeypatch.setattr(
+        shopify.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "data": {
+                        "products": {
+                            "nodes": big_products,
+                            "pageInfo": {"hasNextPage": False},
+                        }
+                    }
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(shopify, "get_tool_max_output_length", lambda: 2000)
+
+    raw = shopify.shopify_list_products(limit=100)
+    result = json.loads(raw)
+
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert 0 < len(result["products"]) < len(big_products)
+    assert result["has_more"] is True
+    # first page (no `after` was passed in) -- a truncated page must report
+    # a dead end, not a real (unreachable) cursor.
+    assert result["after_cursor"] is None
+    assert len(raw) <= 2000 + 200  # last halving step can overshoot
+
+
+def test_list_products_truncation_retries_same_page_not_shopifys_next_page(monkeypatch):
+    # A truncated page must report ITS OWN input cursor so the caller
+    # retries the same starting point with a smaller limit -- returning
+    # Shopify's real endCursor instead would skip every item this call
+    # couldn't fit, silently dropping them for good.
+    big_products = [
+        {"id": f"gid://shopify/Product/{i}", "title": "x" * 1000} for i in range(50)
+    ]
+    monkeypatch.setattr(
+        shopify.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "data": {
+                        "products": {
+                            "nodes": big_products,
+                            "pageInfo": {
+                                "hasNextPage": True,
+                                "endCursor": "shopifys_real_next_cursor",
+                            },
+                        }
+                    }
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(shopify, "get_tool_max_output_length", lambda: 2000)
+
+    result = json.loads(shopify.shopify_list_products(limit=100, after="cur0"))
+
+    assert result["truncated"] is True
+    assert result["has_more"] is True
+    assert result["after_cursor"] == "cur0"
+
+
+def test_list_products_truncates_to_empty_when_single_item_still_oversized(monkeypatch):
+    """Regression for an off-by-one in the halving loop: a page that
+    shrinks to exactly one item which is STILL over budget on its own must
+    still truncate down to zero items with truncated=True, not silently
+    return the oversized single item untouched."""
+    huge_product = {"id": "gid://shopify/Product/1", "title": "x" * 5000}
+    monkeypatch.setattr(
+        shopify.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "data": {
+                        "products": {
+                            "nodes": [huge_product],
+                            "pageInfo": {"hasNextPage": False},
+                        }
+                    }
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(shopify, "get_tool_max_output_length", lambda: 200)
+
+    result = json.loads(shopify.shopify_list_products(limit=1))
+
+    assert result["status"] == "success"
+    assert result["products"] == []
+    assert result["truncated"] is True
+    assert result["has_more"] is True
+
+
+def test_list_products_explains_the_dead_end_when_collapsed_to_empty(monkeypatch):
+    huge_product = {"id": "gid://shopify/Product/1", "title": "x" * 5000}
+    monkeypatch.setattr(
+        shopify.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "data": {
+                        "products": {
+                            "nodes": [huge_product],
+                            "pageInfo": {"hasNextPage": False},
+                        }
+                    }
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(shopify, "get_tool_max_output_length", lambda: 400)
+
+    result = json.loads(shopify.shopify_list_products(limit=1))
+
+    assert "message" in result
+    assert "too large" in result["message"]
+
+
+def test_list_products_drops_message_when_it_alone_exceeds_the_limit(monkeypatch):
+    huge_product = {"id": "gid://shopify/Product/1", "title": "x" * 5000}
+    monkeypatch.setattr(
+        shopify.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "data": {
+                        "products": {
+                            "nodes": [huge_product],
+                            "pageInfo": {"hasNextPage": False},
+                        }
+                    }
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(shopify, "get_tool_max_output_length", lambda: 150)
+
+    raw = shopify.shopify_list_products(limit=1)
+    result = json.loads(raw)
+
+    assert len(raw) <= 150
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert result["products"] == []
+    assert "message" not in result
+
+
 def test_get_product_normalizes_id_and_returns_summary(monkeypatch):
     mock_post = Mock(
         return_value=MockResponse(

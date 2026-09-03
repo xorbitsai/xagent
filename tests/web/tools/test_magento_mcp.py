@@ -415,8 +415,11 @@ def test_paginated_result_rejects_missing_total_count():
         magento._paginated_result({"items": []}, page_size=10, current_page=1)
 
 
-@pytest.mark.parametrize("total_count_value", ["30", None, 12.5])
+@pytest.mark.parametrize("total_count_value", ["30", None, 12.5, True, False])
 def test_paginated_result_rejects_non_int_total_count(total_count_value):
+    # isinstance(x, int) alone would accept a bool here too (bool is an
+    # int subclass in Python) -- a non-compliant "total_count": true/false
+    # must still be rejected, not silently evaluated as 1/0.
     with pytest.raises(ValueError, match="total_count"):
         magento._paginated_result(
             {"items": [], "total_count": total_count_value},
@@ -644,6 +647,44 @@ def test_make_request_disables_trust_env(monkeypatch):
     assert response.json() == {"ok": True}
 
 
+def test_make_request_reapplies_ca_bundle_env_var(monkeypatch):
+    # trust_env=False also disables requests' REQUESTS_CA_BUNDLE/
+    # CURL_CA_BUNDLE lookup (gated behind the same `if self.trust_env:` as
+    # the proxy lookup) -- without re-applying it explicitly, a self-hosted
+    # store behind a private/internal CA that relied on this env var would
+    # silently start failing TLS verification after the trust_env fix.
+    monkeypatch.setenv("REQUESTS_CA_BUNDLE", "/etc/ssl/internal-ca.pem")
+    captured = {}
+
+    class FakeSession:
+        def __enter__(self):
+            self.trust_env = True
+            self.verify = True
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        def request(self, **kwargs):
+            captured["verify"] = self.verify
+            return MockResponse(json_data={"ok": True})
+
+    monkeypatch.setattr(magento.requests, "Session", FakeSession)
+
+    magento._make_request(
+        method="GET",
+        url="https://store.example.com/rest/V1/products/abc",
+        headers={},
+        params=None,
+        json=None,
+        timeout=1,
+        proxies={},
+        allow_redirects=False,
+    )
+
+    assert captured["verify"] == "/etc/ssl/internal-ca.pem"
+
+
 def test_request_pins_dns_within_a_lock(monkeypatch):
     # _pinned_dns serializes its global urllib3 monkeypatch through
     # _PINNED_DNS_LOCK so two overlapping calls can never race on it --
@@ -842,6 +883,27 @@ def test_list_products_caps_output_when_the_page_is_oversized(monkeypatch):
     assert result["truncated"] is True
     assert len(result["products"]["products"]) < len(items)
     assert len(raw) <= 2000 + 400  # last halving step can overshoot
+
+
+def test_list_products_survives_an_aggressively_low_output_limit(monkeypatch):
+    # Confirmed bug: under an extremely low XAGENT_TOOL_MAX_OUTPUT_LENGTH,
+    # success_with_capped_dict's phase-2 fallback can drop the wrapper's
+    # sole key entirely once list-halving alone isn't enough, leaving
+    # capped["products"] == {} instead of {"products": []} --
+    # result["products"]["products"] then raised KeyError instead of
+    # returning an empty list.
+    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 30)
+    items = [{"sku": f"SKU-{i}", "name": "x" * 50} for i in range(50)]
+    monkeypatch.setattr(
+        magento,
+        "_make_request",
+        Mock(return_value=MockResponse(json_data={"items": items, "total_count": 50})),
+    )
+
+    result = json.loads(magento.magento_list_products(limit=50, page=1))
+
+    assert result["status"] == "success"
+    assert result["products"]["products"] == []
 
 
 def test_list_products_rejects_invalid_status():
@@ -1202,6 +1264,22 @@ def test_add_order_comment_reports_added_true_on_empty_body_response(monkeypatch
     assert result["added"] is True
 
 
+@pytest.mark.parametrize("value", [None, 0, "", []])
+def test_add_order_comment_surfaces_unexpected_response_shapes(monkeypatch, value):
+    # `result is not False` would treat any of these non-compliant values
+    # (a fork/gateway deviating from Magento's "always a JSON bool"
+    # contract) as success, silently hiding an actual failure -- only an
+    # explicit true/false/{} (the 204/empty-body case) are legitimate.
+    monkeypatch.setattr(
+        magento, "_make_request", Mock(return_value=MockResponse(json_data=value))
+    )
+
+    result = json.loads(magento.magento_add_order_comment(1, "Note"))
+
+    assert result["status"] == "error"
+    assert "unexpected" in result["message"]
+
+
 def test_list_customers_sends_email_like_filter(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(json_data={"items": [], "total_count": 0})
@@ -1324,31 +1402,25 @@ def test_get_category_neutralizes_path_traversal_id(monkeypatch):
     assert url.endswith("/categories/1%2F..%2F..%2Forders%2F5")
 
 
-def test_category_summary_returns_empty_dict_for_none():
-    assert magento._category_summary(None) == {}
+_ALL_SUMMARY_FUNCTIONS = [
+    magento._product_summary,
+    magento._order_summary,
+    magento._customer_summary,
+    magento._category_summary,
+]
 
 
-def test_category_summary_returns_empty_dict_for_non_dict():
-    assert magento._category_summary("not-a-category") == {}
-
-
-@pytest.mark.parametrize(
-    "summary_fn",
-    [magento._product_summary, magento._order_summary, magento._customer_summary],
-)
+@pytest.mark.parametrize("summary_fn", _ALL_SUMMARY_FUNCTIONS)
 def test_summary_functions_return_empty_dict_for_none(summary_fn):
     # A malformed 2xx body (JSON null, or an array where an object is
     # expected) would otherwise raise AttributeError on .get(), surfaced
     # by each tool's blanket "except Exception" as an opaque "'NoneType'
-    # object has no attribute 'get'" -- matching the guard
-    # _category_summary already has.
+    # object has no attribute 'get'" -- all four summary functions share
+    # this guard via _as_record().
     assert summary_fn(None) == {}
 
 
-@pytest.mark.parametrize(
-    "summary_fn",
-    [magento._product_summary, magento._order_summary, magento._customer_summary],
-)
+@pytest.mark.parametrize("summary_fn", _ALL_SUMMARY_FUNCTIONS)
 def test_summary_functions_return_empty_dict_for_non_dict(summary_fn):
     assert summary_fn("not-a-record") == {}
 

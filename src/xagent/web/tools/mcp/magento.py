@@ -267,14 +267,28 @@ def _pinned_dns(hostname: str, pinned_ip: str) -> Iterator[None]:
     process-global state, so two overlapping calls patching/restoring it
     concurrently could in principle race. That doesn't happen today only
     because the MCP SDK invokes this synchronous, non-async tool function
-    directly on its single event-loop thread -- the `requests.request()`
-    call inside fully blocks that thread for the call's duration, so no
-    other tool invocation's `_pinned_dns` block can interleave with it. If
-    this connector ever moves to an async HTTP client, that property no
-    longer holds. Rather than leave that invariant unenforced, `_PINNED_DNS_LOCK`
+    directly on its single event-loop thread -- the `_make_request()` call
+    inside fully blocks that thread for the call's duration, so no other
+    tool invocation's `_pinned_dns` block can interleave with it. If this
+    connector ever moves to an async HTTP client, that property no longer
+    holds. Rather than leave that invariant unenforced, `_PINNED_DNS_LOCK`
     below serializes the whole block (not just the patch/restore) so a
     second overlapping call always waits instead of racing, whether or not
     that invariant keeps holding in the future.
+
+    The lock has to span the full `yield` (the actual network call), not
+    just the patch-in/patch-out lines: `hostname` is the same value for
+    every call in this process (there is exactly one `MAGENTO_BASE_URL`),
+    so a second call's `pinned_ip` can differ from this one's only if DNS
+    re-resolved to a different address between calls. Releasing the lock
+    before the network call would let that second call repatch
+    `create_connection` to *its* `pinned_ip` while this call's connection
+    is still being established, silently redirecting this call's request
+    to the wrong address -- a worse bug than the one the lock exists to
+    prevent. The cost is that this does fully serialize concurrent Magento
+    calls if the single-thread invariant above ever stops holding; that
+    trade (correctness over throughput for a security-sensitive pin) is
+    intentional, not an oversight to "optimize" away.
     """
     with _PINNED_DNS_LOCK:
         original_create_connection = urllib3_connection.create_connection
@@ -295,29 +309,30 @@ def _pinned_dns(hostname: str, pinned_ip: str) -> Iterator[None]:
 
 
 def _make_request(**kwargs: Any) -> requests.Response:
-    """Issue the actual HTTP call with every ambient/OS-native proxy source
-    disabled, not just the specific env vars `get_trusted_proxy_url()` checks.
+    """Issue the actual HTTP call with `trust_env=False`, so `requests`
+    never falls back to an ambient/OS-native proxy source
+    `get_trusted_proxy_url()` doesn't police -- passing `proxies=` alone
+    isn't enough, since a `trust_env=True` Session (`requests.request()`'s
+    default) still calls `urllib.request.getproxies()`, which itself falls
+    back *past* `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` to the OS's own
+    proxy configuration (`getproxies_macosx_sysconf()`/
+    `getproxies_registry()`) once no env var is set -- the same
+    DNS-rebinding-via-proxy bypass this gate exists to close, one layer
+    deeper than an env-var scrub alone reaches.
 
-    `requests.request()` always runs on a fresh Session with `trust_env=True`,
-    which -- regardless of what `proxies=` is explicitly passed -- still
-    calls `get_environ_proxies()` for any scheme not already present in that
-    dict. That function is `urllib.request.getproxies()`, which itself falls
-    back *past* `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` to the OS's own proxy
-    configuration once none of those env vars are set:
-    `getproxies_macosx_sysconf()` on macOS, `getproxies_registry()` on
-    Windows (confirmed directly against the installed `urllib.request`/
-    `requests` source). A previous fix here scrubbed exactly those env var
-    names, which closed the ALL_PROXY gap but left this OS-native fallback
-    wide open on precisely those two platforms -- the same DNS-rebinding-
-    via-proxy bypass this whole gate exists to close, one layer deeper.
-
-    `trust_env=False` on the Session skips the entire `if self.trust_env:`
-    block in `merge_environment_settings()` -- environment *and* OS-native
-    lookup alike -- so it closes every layer in one place instead of
-    chasing an open-ended list of fallback sources one platform at a time.
+    `trust_env=False` also disables `requests`' `REQUESTS_CA_BUNDLE`/
+    `CURL_CA_BUNDLE` lookup and `.netrc` auto-auth (both gated behind the
+    same `if self.trust_env:` check in `requests`' own Session code) --
+    re-apply the CA bundle explicitly below so a self-hosted store behind
+    a private/internal CA doesn't silently start failing TLS verification;
+    `.netrc` is left disabled since this connector always sends its own
+    Bearer header.
     """
     with requests.Session() as session:
         session.trust_env = False
+        ca_bundle = environ.get("REQUESTS_CA_BUNDLE") or environ.get("CURL_CA_BUNDLE")
+        if ca_bundle:
+            session.verify = ca_bundle
         return session.request(**kwargs)
 
 
@@ -560,7 +575,11 @@ def _paginated_result(
     # is genuinely the last page" that would silently truncate results for
     # any caller paginating mechanically.
     total_count = payload.get("total_count")
-    if not isinstance(total_count, int):
+    # isinstance(x, int) alone would accept a bool here too (bool is an int
+    # subclass in Python), letting a non-compliant "total_count": true/false
+    # silently compute has_more against 1/0 instead of raising the clear
+    # error this check exists to produce.
+    if not isinstance(total_count, int) or isinstance(total_count, bool):
         raise ValueError(
             'Expected Magento\'s "total_count" field to be an int, got '
             f"{type(total_count).__name__}"
@@ -609,79 +628,97 @@ def _list_search(
             result_key, {result_key: [summary_fn(item) for item in items]}
         )
     )
+    # Under an aggressively low XAGENT_TOOL_MAX_OUTPUT_LENGTH,
+    # success_with_capped_dict's phase-2 fallback can drop the wrapper's
+    # sole key entirely once phase 1's list-halving alone isn't enough --
+    # confirmed directly: with the list already emptied down to [], the
+    # skeleton can still exceed the limit, so capped[result_key] ends up
+    # {} instead of {result_key: []}. Re-add it rather than let a caller's
+    # capped[result_key][result_key] raise KeyError on an edge this
+    # aggressive-but-supported config can actually reach.
+    capped[result_key].setdefault(result_key, [])
     capped["has_more"] = has_more
     capped["next_page"] = current_page + 1 if has_more else None
     return json.dumps(capped, ensure_ascii=False)
 
 
+def _as_record(value: Any) -> dict[str, Any] | None:
+    """Coerce a raw API value into a dict-shaped record, or None.
+
+    A malformed 2xx body (JSON null, or an array where an object was
+    expected -- top-level, or recursively for a category's own
+    children_data entries) would otherwise raise AttributeError on
+    .get(), surfaced by each tool's blanket "except Exception" as an
+    opaque "'NoneType' object has no attribute 'get'" instead of a clear
+    result. Centralized here since every *_summary function below needs
+    the same guard.
+    """
+    return value if value and isinstance(value, dict) else None
+
+
 def _product_summary(product: dict[str, Any]) -> dict[str, Any]:
-    # A malformed 2xx body (JSON null, or an array where an object is
-    # expected) would otherwise raise AttributeError on .get(), surfaced by
-    # each tool's blanket "except Exception" as an opaque "'NoneType' object
-    # has no attribute 'get'" instead of a clear result -- matching
-    # _category_summary's guard below.
-    if not product or not isinstance(product, dict):
+    record = _as_record(product)
+    if record is None:
         return {}
     return {
-        "sku": product.get("sku"),
-        "name": product.get("name"),
-        "price": product.get("price"),
-        "status": product.get("status"),
-        "visibility": product.get("visibility"),
-        "type_id": product.get("type_id"),
-        "attribute_set_id": product.get("attribute_set_id"),
-        "created_at": product.get("created_at"),
-        "updated_at": product.get("updated_at"),
+        "sku": record.get("sku"),
+        "name": record.get("name"),
+        "price": record.get("price"),
+        "status": record.get("status"),
+        "visibility": record.get("visibility"),
+        "type_id": record.get("type_id"),
+        "attribute_set_id": record.get("attribute_set_id"),
+        "created_at": record.get("created_at"),
+        "updated_at": record.get("updated_at"),
     }
 
 
 def _order_summary(order: dict[str, Any]) -> dict[str, Any]:
-    if not order or not isinstance(order, dict):
+    record = _as_record(order)
+    if record is None:
         return {}
     return {
-        "entity_id": order.get("entity_id"),
-        "increment_id": order.get("increment_id"),
-        "state": order.get("state"),
-        "status": order.get("status"),
-        "customer_email": order.get("customer_email"),
-        "grand_total": order.get("grand_total"),
-        "currency": order.get("order_currency_code"),
-        "created_at": order.get("created_at"),
-        "updated_at": order.get("updated_at"),
+        "entity_id": record.get("entity_id"),
+        "increment_id": record.get("increment_id"),
+        "state": record.get("state"),
+        "status": record.get("status"),
+        "customer_email": record.get("customer_email"),
+        "grand_total": record.get("grand_total"),
+        "currency": record.get("order_currency_code"),
+        "created_at": record.get("created_at"),
+        "updated_at": record.get("updated_at"),
     }
 
 
 def _customer_summary(customer: dict[str, Any]) -> dict[str, Any]:
-    if not customer or not isinstance(customer, dict):
+    record = _as_record(customer)
+    if record is None:
         return {}
     return {
-        "id": customer.get("id"),
-        "email": customer.get("email"),
-        "firstname": customer.get("firstname"),
-        "lastname": customer.get("lastname"),
-        "group_id": customer.get("group_id"),
-        "created_at": customer.get("created_at"),
+        "id": record.get("id"),
+        "email": record.get("email"),
+        "firstname": record.get("firstname"),
+        "lastname": record.get("lastname"),
+        "group_id": record.get("group_id"),
+        "created_at": record.get("created_at"),
     }
 
 
 def _category_summary(category: dict[str, Any]) -> dict[str, Any]:
-    # A malformed/partial response could hand back a null or non-dict
-    # category (top-level, or as one of children_data's own entries, since
-    # this function recurses into those) -- fail to an empty summary for
-    # that one node instead of an AttributeError on .get().
-    if not category or not isinstance(category, dict):
+    record = _as_record(category)
+    if record is None:
         return {}
     return {
-        "id": category.get("id"),
-        "parent_id": category.get("parent_id"),
-        "name": category.get("name"),
-        "is_active": category.get("is_active"),
-        "position": category.get("position"),
-        "level": category.get("level"),
-        "product_count": category.get("product_count"),
+        "id": record.get("id"),
+        "parent_id": record.get("parent_id"),
+        "name": record.get("name"),
+        "is_active": record.get("is_active"),
+        "position": record.get("position"),
+        "level": record.get("level"),
+        "product_count": record.get("product_count"),
         "children_data": [
             _category_summary(child)
-            for child in category.get("children_data") or []
+            for child in record.get("children_data") or []
             if child
         ],
     }
@@ -909,12 +946,22 @@ def magento_add_order_comment(
             f"/orders/{url_path_id(str(order_id), 'order_id')}/comments",
             json_data={"statusHistory": status_history},
         )
-        # Magento's addComment always returns a JSON bool -- `result is
-        # False` is the only value that actually means failure. `bool(result)`
-        # would also report failure on a legitimate 204/empty-body response
-        # (_request()'s generic "no content" shortcut returns {}, and
-        # bool({}) is False), misreporting a successful call as failed.
-        return _success(added=result is not False)
+        # Magento's addComment always returns a JSON bool, or {} for a
+        # legitimate 204/empty-body response (_request()'s generic
+        # "no content" shortcut). `bool(result)` would misreport that
+        # legitimate {} case as a failure (bool({}) is False); conversely
+        # `result is not False` would misreport an unexpected non-bool
+        # value (a non-compliant fork/gateway returning null/0/[]) as a
+        # success instead of the surfaced error either actually deserves.
+        if result is True or result == {}:
+            added = True
+        elif result is False:
+            added = False
+        else:
+            raise RuntimeError(
+                f"Magento returned an unexpected addComment response: {result!r}"
+            )
+        return _success(added=added)
     except Exception as e:
         logger.error(f"Error adding comment to Magento order {order_id}: {e}")
         return _error(str(e))

@@ -66,6 +66,7 @@ from ..models.database import (
 )
 from ..models.model import Model as DBModel
 from ..models.task import AgentType, Task, TaskStatus, TraceEvent
+from ..models.task_interaction import normalize_interaction_origin
 from ..models.user import User
 from ..models.user_channel import UserChannel
 from ..sandbox_keys import (
@@ -801,15 +802,20 @@ def _connect_apps_interactive_for_task(*, source: Any, channel_id: Any) -> bool:
     Only web chat can: it is the only caller that both keeps the run pinned
     to a live turn awaiting a reply and renders the ``connect_apps`` UI
     (``ClarificationForm``) that answers it. ``source`` is ``None``/
-    ``"internal"`` for both web chat and IM-channel bot tasks, so
-    ``channel_id`` (non-null only for the latter) is required to tell them
-    apart; A2A (``"a2a"``), the v1 SDK (``"sdk"``), and public/shared-link
-    runs (``"external"``/``"widget"``/``"shared_link"``) are excluded by
-    ``source`` alone.
+    ``"internal"`` for both web chat and IM-channel bot tasks (see
+    ``Task.source``'s own doc comment for the full vocabulary -- ``"sdk"``,
+    ``"a2a"``, ``"trigger"``, ``"widget"``, ``"shared_link"`` are the rest),
+    so ``channel_id`` (non-null only for the IM-bot case) is required to
+    tell them apart.
+
+    Reuses ``gating_key``'s (interaction_rollout.py) exact classification --
+    ``normalize_interaction_origin(source) == "internal" and channel_id is
+    None`` -- rather than re-deriving it, so the two never silently drift
+    apart on what counts as "web/internal" as the origin vocabulary evolves.
     """
 
-    normalized_source = str(source) if source is not None else None
-    return normalized_source in (None, "internal") and channel_id is None
+    origin = normalize_interaction_origin(source if source is None else str(source))
+    return origin == "internal" and channel_id is None
 
 
 def _task_runtime_context_for_tool_build(
@@ -2110,6 +2116,7 @@ class AgentServiceManager:
             prepare_root=workspace_binding.prepare_root,
         )
 
+        task_source = getattr(task, "source", None)
         return await create_default_tools(
             db,
             request=self.request,
@@ -2124,10 +2131,10 @@ class AgentServiceManager:
             task_runtime_context=_task_runtime_context_for_tool_build(
                 task_id=task_id,
                 user_id=int(task.user_id),
-                source=getattr(task, "source", None),
+                source=task_source,
             ),
             connect_apps_interactive=_connect_apps_interactive_for_task(
-                source=getattr(task, "source", None),
+                source=task_source,
                 channel_id=getattr(task, "channel_id", None),
             ),
             allowed_collections=agent_config["knowledge_bases"]
@@ -2885,6 +2892,14 @@ class AgentServiceManager:
                     include_mcp_tools=actor_marked,
                 )
 
+                # ``task`` is the live ORM row when this path was reached
+                # without a snapshot; otherwise fall back to the snapshot's
+                # own frozen task fields. Bound once here (not inlined at
+                # each ``getattr`` below) so every field read below it can
+                # never diverge onto a different object.
+                task_for_fields = (
+                    task if task is not None else getattr(snapshot, "task", None)
+                )
                 tools = await create_default_tools(
                     db,
                     request=self.request,
@@ -2905,29 +2920,11 @@ class AgentServiceManager:
                     task_runtime_context=_task_runtime_context_for_tool_build(
                         task_id=task_id,
                         user_id=workspace_owner_id,
-                        source=getattr(
-                            task
-                            if task is not None
-                            else getattr(snapshot, "task", None),
-                            "source",
-                            None,
-                        ),
+                        source=getattr(task_for_fields, "source", None),
                     ),
                     connect_apps_interactive=_connect_apps_interactive_for_task(
-                        source=getattr(
-                            task
-                            if task is not None
-                            else getattr(snapshot, "task", None),
-                            "source",
-                            None,
-                        ),
-                        channel_id=getattr(
-                            task
-                            if task is not None
-                            else getattr(snapshot, "task", None),
-                            "channel_id",
-                            None,
-                        ),
+                        source=getattr(task_for_fields, "source", None),
+                        channel_id=getattr(task_for_fields, "channel_id", None),
                     ),
                     allowed_collections=agent_config["knowledge_bases"]
                     if agent_config

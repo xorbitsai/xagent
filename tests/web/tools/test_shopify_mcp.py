@@ -6,6 +6,7 @@ import pytest
 import requests
 
 from xagent.web.tools.mcp import shopify
+from xagent.web.tools.mcp import utils as mcp_utils
 
 
 def _fake_getaddrinfo(*ips):
@@ -231,58 +232,55 @@ def test_split_tags_strips_and_drops_empty_entries():
 
 
 def test_throttle_wait_seconds_true_for_429():
-    assert shopify._throttle_wait_seconds(MockResponse(status_code=429)) is not None
+    assert shopify._throttle_wait_seconds(429, {}) is not None
 
 
 def test_throttle_wait_seconds_true_for_200_with_throttled_message():
-    response = MockResponse(json_data={"errors": [{"message": "Throttled"}]})
+    payload = {"errors": [{"message": "Throttled"}]}
 
-    assert shopify._throttle_wait_seconds(response) is not None
+    assert shopify._throttle_wait_seconds(200, payload) is not None
 
 
 def test_throttle_wait_seconds_true_for_200_with_throttled_extension_code():
-    response = MockResponse(
-        json_data={"errors": [{"message": "x", "extensions": {"code": "THROTTLED"}}]}
-    )
+    payload = {"errors": [{"message": "x", "extensions": {"code": "THROTTLED"}}]}
 
-    assert shopify._throttle_wait_seconds(response) is not None
+    assert shopify._throttle_wait_seconds(200, payload) is not None
 
 
 def test_throttle_wait_seconds_none_for_normal_success():
-    assert (
-        shopify._throttle_wait_seconds(MockResponse(json_data={"data": {"ok": True}}))
-        is None
-    )
+    assert shopify._throttle_wait_seconds(200, {"data": {"ok": True}}) is None
 
 
 def test_throttle_wait_seconds_ignores_non_dict_extensions():
     # A malformed error entry (extensions present but not a dict) must not
     # crash the throttle check.
-    response = MockResponse(
-        json_data={"errors": [{"message": "x", "extensions": ["not", "a", "dict"]}]}
-    )
+    payload = {"errors": [{"message": "x", "extensions": ["not", "a", "dict"]}]}
 
-    assert shopify._throttle_wait_seconds(response) is None
+    assert shopify._throttle_wait_seconds(200, payload) is None
 
 
 def test_throttle_wait_seconds_computes_from_cost_extension():
-    response = MockResponse(
-        status_code=429,
-        json_data={
-            "extensions": {
-                "cost": {
-                    "requestedQueryCost": 200,
-                    "throttleStatus": {"currentlyAvailable": 100, "restoreRate": 50},
-                }
+    payload = {
+        "extensions": {
+            "cost": {
+                "requestedQueryCost": 200,
+                "throttleStatus": {"currentlyAvailable": 100, "restoreRate": 50},
             }
-        },
-    )
+        }
+    }
 
-    assert shopify._throttle_wait_seconds(response) == 2.0
+    assert shopify._throttle_wait_seconds(429, payload) == 2.0
 
 
 def test_throttle_wait_seconds_falls_back_to_one_second_without_cost_data():
-    assert shopify._throttle_wait_seconds(MockResponse(status_code=429)) == 1.0
+    assert shopify._throttle_wait_seconds(429, {}) == 1.0
+
+
+def test_throttle_wait_seconds_none_when_body_is_not_json(monkeypatch):
+    # _graphql now parses the response body once and passes the already-
+    # parsed payload (None on a non-JSON body) in, rather than the response
+    # object -- a non-dict/None payload must not crash the throttle check.
+    assert shopify._throttle_wait_seconds(200, None) is None
 
 
 def test_graphql_sends_query_and_variables_as_json_body(monkeypatch):
@@ -462,6 +460,68 @@ def test_graphql_does_not_retry_a_second_throttle(monkeypatch):
     assert mock_post.call_count == 2
 
 
+def test_graphql_retries_once_on_200_throttled_shape_and_then_succeeds(monkeypatch):
+    # Shopify's cost-based throttling can surface as an HTTP 200 whose body
+    # carries a "Throttled" error, not just an HTTP 429 -- a separate code
+    # path through _graphql (falls through the status-code checks entirely
+    # and is only caught by the throttle-message scan), so it needs its own
+    # end-to-end coverage, not just the 429 shape.
+    responses = [
+        MockResponse(json_data={"errors": [{"message": "Throttled"}]}),
+        MockResponse(json_data={"data": {"ok": True}}),
+    ]
+    mock_post = Mock(side_effect=responses)
+    monkeypatch.setattr(shopify.requests, "post", mock_post)
+    monkeypatch.setattr(shopify.time, "sleep", Mock())
+
+    data, errors = shopify._graphql("query { ok }")
+
+    assert data == {"ok": True}
+    assert mock_post.call_count == 2
+    shopify.time.sleep.assert_called_once()
+
+
+def test_graphql_does_not_retry_when_wait_exceeds_max_retry_seconds(monkeypatch):
+    # A computed wait longer than MAX_RETRY_AFTER_SECONDS must fall straight
+    # through to the normal HTTP-error handling instead of sleeping.
+    response = MockResponse(
+        status_code=429,
+        json_data={
+            "extensions": {
+                "cost": {
+                    "requestedQueryCost": 10_000,
+                    "throttleStatus": {"currentlyAvailable": 0, "restoreRate": 1},
+                }
+            }
+        },
+    )
+    mock_post = Mock(return_value=response)
+    monkeypatch.setattr(shopify.requests, "post", mock_post)
+    sleep_mock = Mock()
+    monkeypatch.setattr(shopify.time, "sleep", sleep_mock)
+
+    with pytest.raises(RuntimeError):
+        shopify._graphql("query { ok }")
+
+    assert mock_post.call_count == 1
+    sleep_mock.assert_not_called()
+
+
+def test_throttle_wait_seconds_falls_back_to_one_second_when_restore_rate_not_positive():
+    # A zero/negative restoreRate must not divide by zero -- fall back to
+    # the flat one-second backoff instead.
+    payload = {
+        "extensions": {
+            "cost": {
+                "requestedQueryCost": 200,
+                "throttleStatus": {"currentlyAvailable": 100, "restoreRate": 0},
+            }
+        }
+    }
+
+    assert shopify._throttle_wait_seconds(429, payload) == 1.0
+
+
 def test_graphql_redacts_connection_error_message(monkeypatch):
     def _raise(*args, **kwargs):
         raise requests.exceptions.ProxyError(
@@ -573,6 +633,21 @@ def test_get_shop_returns_shop_info(monkeypatch):
     assert result["shop"]["name"] == "Acme"
     assert result["shop"]["domain"] == "acme.myshopify.com"
     assert result["shop"]["currency"] == "USD"
+
+
+def test_get_shop_returns_error_when_shop_is_null(monkeypatch):
+    # Every other get-one-record tool (product/order/customer) fails
+    # closed when the requested object comes back null; shop must too,
+    # instead of reporting an all-null object as a success.
+    monkeypatch.setattr(
+        shopify.requests,
+        "post",
+        Mock(return_value=MockResponse(json_data={"data": {"shop": None}})),
+    )
+
+    result = json.loads(shopify.shopify_get_shop())
+
+    assert result["status"] == "error"
 
 
 def test_list_products_sends_query_limit_and_after(monkeypatch):
@@ -861,6 +936,40 @@ def test_get_product_returns_error_when_not_found(monkeypatch):
     assert result["status"] == "error"
 
 
+def test_get_product_caps_output_size(monkeypatch):
+    # A single get response can be just as oversized as a list page (e.g.
+    # an unusually large `tags` list) -- must shrink via _success_capped
+    # instead of returning an uncapped payload the platform's own output
+    # filter would then hard-truncate into broken JSON.
+    monkeypatch.setattr(
+        shopify.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "data": {
+                        "product": {
+                            "id": "gid://shopify/Product/1",
+                            "title": "Shirt",
+                            "tags": [f"tag-{i}" * 20 for i in range(200)],
+                        }
+                    }
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(shopify, "get_tool_max_output_length", lambda: 500)
+    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 500)
+
+    raw = shopify.shopify_get_product("1")
+    result = json.loads(raw)
+
+    assert len(raw) <= 500 + 200  # last halving step can overshoot
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert len(result["product"]["tags"]) < 200
+
+
 def test_create_product_requires_title():
     result = json.loads(shopify.shopify_create_product(""))
 
@@ -1075,6 +1184,31 @@ def test_create_product_fails_closed_when_object_null_despite_empty_user_errors(
     assert "Access denied for tags field" in result["message"]
 
 
+def test_create_product_fails_closed_when_object_null_with_no_top_level_errors(
+    monkeypatch,
+):
+    # Same null-object-despite-empty-userErrors shape as above, but with no
+    # top-level `errors` at all -- the generic fallback message branch,
+    # distinct from the `_errors_detail(errors)` branch the sibling test
+    # above exercises.
+    monkeypatch.setattr(
+        shopify.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "data": {"productCreate": {"product": None, "userErrors": []}}
+                }
+            )
+        ),
+    )
+
+    result = json.loads(shopify.shopify_create_product("Shirt"))
+
+    assert result["status"] == "error"
+    assert "productCreate" in result["message"]
+
+
 def test_errors_detail_returns_string_as_is():
     assert shopify._errors_detail("plain string error") == "plain string error"
 
@@ -1092,6 +1226,48 @@ def test_errors_detail_stringifies_unexpected_shape():
     detail = shopify._errors_detail({"query": ["failed to parse query"]})
 
     assert "failed to parse query" in detail
+
+
+def test_errors_detail_truncates_long_text():
+    detail = shopify._errors_detail("x" * 5000)
+
+    assert len(detail) < 5000
+    assert detail.endswith("[truncated]")
+
+
+def test_errors_detail_redacts_sensitive_text():
+    detail = shopify._errors_detail(
+        [{"message": "upstream call failed: https://user:sp-secret@example.com/x"}]
+    )
+
+    assert "sp-secret" not in detail
+
+
+def test_success_routes_warnings_through_errors_detail(monkeypatch):
+    # _success's `warnings` field must go through the same str/list/dict
+    # normalization + truncation/redaction as every other consumer of a
+    # GraphQL response's top-level `errors` value -- calling
+    # graphql_errors_message directly (as _success used to) mangles a
+    # plain-string errors value character by character.
+    monkeypatch.setattr(
+        shopify.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "data": {
+                        "product": {"id": "gid://shopify/Product/1", "title": "Shirt"}
+                    },
+                    "errors": "[API] partial failure",
+                }
+            )
+        ),
+    )
+
+    result = json.loads(shopify.shopify_get_product("1"))
+
+    assert result["status"] == "success"
+    assert result["warnings"] == ["[API] partial failure"]
 
 
 def test_list_orders_sends_query_and_limit(monkeypatch):
@@ -1139,6 +1315,18 @@ def test_get_order_returns_summary(monkeypatch):
     assert result["order"]["name"] == "#1001"
     assert result["order"]["total_price"] == "10.00"
     assert result["order"]["currency"] == "USD"
+
+
+def test_get_order_returns_error_when_not_found(monkeypatch):
+    monkeypatch.setattr(
+        shopify.requests,
+        "post",
+        Mock(return_value=MockResponse(json_data={"data": {"order": None}})),
+    )
+
+    result = json.loads(shopify.shopify_get_order("999"))
+
+    assert result["status"] == "error"
 
 
 def test_update_order_requires_tags_or_note():
@@ -1322,6 +1510,48 @@ def test_list_collections_returns_summaries_with_products_count(monkeypatch):
     collection = result["collections"][0]
     assert collection["title"] == "Summer"
     assert collection["products_count"] == 12
+
+
+def test_list_collections_forwards_after_cursor_and_clamps_limit(monkeypatch):
+    # Collections is the only list tool with no `query` parameter -- confirm
+    # the shared _list_connection/_success_paginated machinery still builds
+    # a well-formed request (limit clamped, `after` forwarded, no `query`
+    # variable/argument) when query is always "".
+    mock_post = Mock(
+        return_value=MockResponse(
+            json_data={
+                "data": {
+                    "collections": {"nodes": [], "pageInfo": {"hasNextPage": False}}
+                }
+            }
+        )
+    )
+    monkeypatch.setattr(shopify.requests, "post", mock_post)
+
+    shopify.shopify_list_collections(limit=10_000, after="cur0")
+
+    body = mock_post.call_args.kwargs["json"]
+    assert body["variables"] == {"first": shopify.MAX_LIMIT, "after": "cur0"}
+    assert "$query" not in body["query"]
+
+
+def test_list_collections_forwards_query(monkeypatch):
+    mock_post = Mock(
+        return_value=MockResponse(
+            json_data={
+                "data": {
+                    "collections": {"nodes": [], "pageInfo": {"hasNextPage": False}}
+                }
+            }
+        )
+    )
+    monkeypatch.setattr(shopify.requests, "post", mock_post)
+
+    shopify.shopify_list_collections(query="title:*sale*")
+
+    body = mock_post.call_args.kwargs["json"]
+    assert body["variables"]["query"] == "title:*sale*"
+    assert "$query: String!" in body["query"]
 
 
 def test_shopify_app_registry_requires_store_domain_and_token():

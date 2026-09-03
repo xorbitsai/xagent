@@ -17,7 +17,7 @@ from ....core.utils.security import (
     reject_private_network_host,
 )
 from ...utils.graphql_errors import graphql_errors_message, truncate_error_text
-from .utils import clamp_limit, setup_proxy_env
+from .utils import clamp_limit, setup_proxy_env, success_with_capped_dict
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("shopify-mcp")
@@ -59,8 +59,12 @@ def _success(*, _errors: list[Any] | None = None, **payload: Any) -> str:
     if _errors:
         # A genuine partial GraphQL success (one sub-field failed, others
         # resolved) -- surface it in the result instead of only the server
-        # log, matching linear.py's identical warnings contract.
-        body["warnings"] = [graphql_errors_message(_errors)]
+        # log, matching linear.py's identical warnings contract. Routed
+        # through _errors_detail (not graphql_errors_message directly) for
+        # the same reason every other consumer of a GraphQL response's
+        # top-level "errors" value in this module is: Shopify doesn't
+        # always send a list there.
+        body["warnings"] = [_errors_detail(_errors)]
     return json.dumps(body, ensure_ascii=False)
 
 
@@ -175,19 +179,31 @@ def _errors_detail(errors_field: Any) -> str:
     a time (producing a mangled "a; p; i" message), and over a dict that
     walks its keys, silently dropping the actual diagnostic text in its
     values. Both are handled here before ever reaching that helper.
+
+    The result is truncated and redacted here, once, rather than leaving
+    every call site responsible for remembering to do both -- this is the
+    single choke point every top-level "errors" value passes through
+    before becoming user- or log-facing text (a raised RuntimeError, a
+    logged warning, or a tool's "warnings"/error message), so a caller
+    that forgot either step would otherwise let an unbounded or
+    credential-bearing error body straight through, same class of issue
+    already fixed for the raw-response-body fallback text elsewhere in
+    this module.
     """
     if isinstance(errors_field, str):
-        return errors_field
-    if isinstance(errors_field, list):
-        return graphql_errors_message(errors_field)
-    return str(errors_field)
+        text = errors_field
+    elif isinstance(errors_field, list):
+        text = graphql_errors_message(errors_field)
+    else:
+        text = str(errors_field)
+    return redact_sensitive_text(truncate_error_text(text))
 
 
 def _split_tags(tags: str) -> list[str]:
     return [t.strip() for t in tags.split(",") if t.strip()]
 
 
-def _throttle_wait_seconds(response: requests.Response) -> float | None:
+def _throttle_wait_seconds(status_code: int, payload: Any) -> float | None:
     """Return how long to wait before retrying, or None if this response
     doesn't signal throttling.
 
@@ -195,19 +211,12 @@ def _throttle_wait_seconds(response: requests.Response) -> float | None:
     429 or an HTTP 200 whose body carries a "Throttled" error (the request
     cost more "leaky bucket" points than were available) -- checked
     defensively for both shapes since Shopify's own docs and real-world
-    responses aren't fully consistent on which one to expect. The response
-    body is parsed at most once (shared between the throttle check and the
-    wait-time calculation) rather than twice.
+    responses aren't fully consistent on which one to expect. `payload` is
+    the response body already parsed once by the caller (or None if it
+    wasn't valid JSON) -- shared with `_graphql`'s own data-extraction
+    parse rather than decoding the same body a second time.
     """
-    # Parsed regardless of status code -- a 429 can carry the same
-    # errors/extensions.cost body a 200 throttle response does, and this
-    # value feeds the wait-time calculation below either way.
-    try:
-        payload = response.json()
-    except ValueError:
-        payload = None
-
-    throttled = response.status_code == 429
+    throttled = status_code == 429
     if not throttled and isinstance(payload, dict):
         for entry in payload.get("errors") or []:
             if not isinstance(entry, dict):
@@ -272,8 +281,17 @@ def _graphql(
                 timeout=DEFAULT_TIMEOUT_SECONDS,
                 allow_redirects=False,
             )
+            # Parsed once per attempt and carried past the loop for reuse by
+            # the status-code branches below -- every prior version of this
+            # function parsed the same (non-retried) response body a second
+            # time in the success/error branch, doubling the JSON-decode
+            # cost of every call on the common, non-throttled path.
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = None
             if attempt == 0:
-                wait_seconds = _throttle_wait_seconds(response)
+                wait_seconds = _throttle_wait_seconds(response.status_code, payload)
                 if wait_seconds is not None and wait_seconds <= MAX_RETRY_AFTER_SECONDS:
                     time.sleep(wait_seconds)
                     continue
@@ -288,12 +306,8 @@ def _graphql(
         )
     if response.status_code >= 400:
         detail: str | None = None
-        try:
-            payload = response.json()
-            if isinstance(payload, dict) and payload.get("errors"):
-                detail = _errors_detail(payload["errors"])
-        except ValueError:
-            pass
+        if isinstance(payload, dict) and payload.get("errors"):
+            detail = _errors_detail(payload["errors"])
         if detail is None:
             detail = truncate_error_text(response.text.strip())
         raise RuntimeError(
@@ -301,9 +315,7 @@ def _graphql(
             f"{redact_sensitive_text(detail)}"
         )
 
-    try:
-        payload = response.json()
-    except ValueError:
+    if payload is None:
         detail = truncate_error_text(response.text.strip())
         raise RuntimeError(
             f"Shopify API returned a non-JSON response: {detail}"
@@ -511,7 +523,43 @@ def _run_mutation(
             if errors
             else f"Shopify did not return a {object_key} for {mutation_field}"
         )
-    return _success(**{object_key: summary_fn(object_value)}, _errors=errors)
+    return _success_capped(object_key, summary_fn(object_value), errors)
+
+
+def _success_capped(field_name: str, value: dict[str, Any], errors: list[Any]) -> str:
+    """Build a single-object success response, shrinking `value` if it
+    doesn't fit the platform's output-size cap.
+
+    Every list tool below goes through `_success_paginated`'s size-capping
+    on the way out, but a single get/create/update result can be just as
+    unbounded -- e.g. `_product_summary`'s `tags` (Shopify allows up to 250)
+    or `_order_summary`'s `note` (up to ~5000 chars) -- and was previously
+    returned via a bare `_success()` call with no cap at all, so an
+    oversized single object hit the same hard-truncated-into-broken-JSON
+    failure mode the pagination helper exists to prevent. Reuses
+    `success_with_capped_dict` (utils.py) for the actual shrinking rather
+    than reimplementing its halving logic locally -- unlike the pagination
+    case, there's no cursor to invalidate here, so the generic dict-capping
+    helper's usual contract applies unmodified.
+    """
+    response = _success(**{field_name: value}, _errors=errors)
+    max_output_length = get_tool_max_output_length()
+    if len(response) <= max_output_length:
+        return response
+
+    capped = success_with_capped_dict(field_name, value)
+    if not errors:
+        return capped
+    # success_with_capped_dict's payload shape has no room for the
+    # `_errors`-derived "warnings" key `_success` above would have added --
+    # re-add it only if the now-shrunk response still fits, since appending
+    # it unconditionally could push an already-fitted response back over
+    # the cap (the same reasoning `_success_paginated`'s dead-end message
+    # follows).
+    payload = json.loads(capped)
+    payload["warnings"] = [_errors_detail(errors)]
+    with_warnings = json.dumps(payload, ensure_ascii=False)
+    return with_warnings if len(with_warnings) <= max_output_length else capped
 
 
 def _shop_summary(shop: dict[str, Any]) -> dict[str, Any]:
@@ -608,7 +656,10 @@ def shopify_get_shop() -> str:
         data, errors = _graphql(
             "query { shop { name myshopifyDomain email currencyCode ianaTimezone } }"
         )
-        return _success(shop=_shop_summary(data.get("shop") or {}), _errors=errors)
+        shop = data.get("shop")
+        if not shop:
+            return _error("Shopify did not return shop info")
+        return _success_capped("shop", _shop_summary(shop), errors)
     except Exception as e:
         logger.error(f"Error fetching Shopify shop info: {e}", exc_info=True)
         return _error(str(e))
@@ -646,7 +697,7 @@ def shopify_get_product(product_id: str) -> str:
         product = data.get("product")
         if not product:
             return _error(f"Product '{product_id}' not found")
-        return _success(product=_product_summary(product), _errors=errors)
+        return _success_capped("product", _product_summary(product), errors)
     except Exception as e:
         logger.error(f"Error fetching Shopify product {product_id}: {e}", exc_info=True)
         return _error(str(e))
@@ -786,7 +837,7 @@ def shopify_get_order(order_id: str) -> str:
         order = data.get("order")
         if not order:
             return _error(f"Order '{order_id}' not found")
-        return _success(order=_order_summary(order), _errors=errors)
+        return _success_capped("order", _order_summary(order), errors)
     except Exception as e:
         logger.error(f"Error fetching Shopify order {order_id}: {e}", exc_info=True)
         return _error(str(e))
@@ -858,7 +909,7 @@ def shopify_get_customer(customer_id: str) -> str:
         customer = data.get("customer")
         if not customer:
             return _error(f"Customer '{customer_id}' not found")
-        return _success(customer=_customer_summary(customer), _errors=errors)
+        return _success_capped("customer", _customer_summary(customer), errors)
     except Exception as e:
         logger.error(
             f"Error fetching Shopify customer {customer_id}: {e}", exc_info=True
@@ -867,17 +918,19 @@ def shopify_get_customer(customer_id: str) -> str:
 
 
 @mcp.tool()
-def shopify_list_collections(limit: int = 25, after: str = "") -> str:
+def shopify_list_collections(query: str = "", limit: int = 25, after: str = "") -> str:
     """
     List collections (product groupings) -- id, title, handle, and how many
     products each contains.
+    query: optional Shopify search-syntax filter, e.g. "title:*sale*".
+    Leave empty to list all collections.
     limit: max collections to return (default 25, hard cap 100).
     after: pass the previous call's own after_cursor to fetch the next
     page; omit for the first page.
     """
     try:
         return _list_connection(
-            "collections", _COLLECTION_FIELDS, limit, "", after, _collection_summary
+            "collections", _COLLECTION_FIELDS, limit, query, after, _collection_summary
         )
     except Exception as e:
         logger.error(f"Error listing Shopify collections: {e}", exc_info=True)

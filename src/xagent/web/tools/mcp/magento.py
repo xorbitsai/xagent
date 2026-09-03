@@ -247,6 +247,10 @@ def _validate_choice(
     return None
 
 
+_NAMED_PLACEHOLDER_PATTERN = re.compile(r"%(\w+)")
+_POSITIONAL_PLACEHOLDER_PATTERN = re.compile(r"%(\d+)")
+
+
 def _extract_error_detail(response: requests.Response) -> str | None:
     """Pull the human-readable message out of a Magento error body.
 
@@ -254,15 +258,17 @@ def _extract_error_detail(response: requests.Response) -> str | None:
     where the message is a template with %-prefixed placeholders --
     %resources/%fieldName-style named ones (parameters is a dict) or
     positional %1/%2 ones (parameters is a list), depending on which
-    exception raised it. Substituted here so the LLM sees the actual values
-    instead of a raw template. Both the named and positional forms
-    substitute longest-placeholder-first (by key length, or by descending
-    index for the positional form) rather than in whatever order the
-    parameters happened to arrive in -- otherwise substituting a shorter
-    placeholder first (e.g. "%1" or "%field") can also match inside a
-    longer one that hasn't been substituted yet ("%10", "%fieldName"),
-    corrupting it. Returns None so the caller falls back to the raw
-    response text when the body isn't in this shape at all.
+    exception raised it. Substituted here (via a single `re.sub` pass per
+    form, not a sequence of `str.replace` calls) so the LLM sees the actual
+    values instead of a raw template. A single regex pass -- rather than
+    substituting one placeholder at a time -- also means a shorter
+    placeholder can never accidentally match as a prefix of a longer one
+    that hasn't been substituted yet ("%field" clobbering part of
+    "%fieldName", or "%1" clobbering part of "%10"): each `%` is always
+    paired with the *longest* contiguous run of word/digit characters
+    following it in one match, so "%fieldName" is one token, never "%field"
+    + "Name". Returns None so the caller falls back to the raw response
+    text when the body isn't in this shape at all.
     """
     try:
         payload = response.json()
@@ -275,11 +281,21 @@ def _extract_error_detail(response: requests.Response) -> str | None:
         return None
     parameters = payload.get("parameters")
     if isinstance(parameters, dict):
-        for key, value in sorted(parameters.items(), key=lambda item: -len(item[0])):
-            message = message.replace(f"%{key}", str(value))
+        message = _NAMED_PLACEHOLDER_PATTERN.sub(
+            lambda m: str(parameters[m.group(1)])
+            if m.group(1) in parameters
+            else m.group(0),
+            message,
+        )
     elif isinstance(parameters, list):
-        for index, value in reversed(list(enumerate(parameters, start=1))):
-            message = message.replace(f"%{index}", str(value))
+
+        def _substitute_positional(match: re.Match[str]) -> str:
+            index = int(match.group(1))
+            if 1 <= index <= len(parameters):
+                return str(parameters[index - 1])
+            return match.group(0)
+
+        message = _POSITIONAL_PLACEHOLDER_PATTERN.sub(_substitute_positional, message)
     return message
 
 

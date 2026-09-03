@@ -22,6 +22,7 @@ from xagent.web.services.task_setup_snapshot import (
     TaskSetupSnapshot,
     _TaskFields,
 )
+from xagent.web.user_isolated_memory import current_user_id
 
 
 def _build_reconstruction_snapshot(
@@ -832,6 +833,55 @@ class TestAgentServiceManagerReconstruction:
         _, agent_kwargs = mock_agent_service_class.call_args
         assert agent_kwargs["tools"] == ["tool"]
         assert agent_kwargs["tool_config"] == "tool_config"
+
+    @pytest.mark.asyncio
+    async def test_reconstruction_resolves_memory_as_authoritative_owner(
+        self,
+        agent_manager,
+        mock_user,
+        sample_task,
+        sample_trace_events,
+        sample_dag_execution,
+    ):
+        runtime_llm = MagicMock(model_name="task-qwen")
+        snapshot = _build_reconstruction_snapshot(
+            sample_task,
+            mock_user,
+            trace_events=sample_trace_events,
+            dag_execution=sample_dag_execution,
+            task_llm=runtime_llm,
+        )
+        seen_users = []
+
+        async def resolve_memory(**_kwargs):
+            seen_users.append(current_user_id.get())
+            return MagicMock(
+                memory=MagicMock(),
+                memory_enabled=True,
+                memory_available=True,
+                memory_availability_reason=None,
+            )
+
+        with (
+            patch(
+                "xagent.web.api.chat.create_default_tools",
+                new=AsyncMock(return_value=([], {})),
+            ),
+            patch(
+                "xagent.web.api.chat.resolve_agent_service_memory_policy_async",
+                new=resolve_memory,
+            ),
+            patch("xagent.web.sandbox_manager.get_sandbox_manager", return_value=None),
+            patch("xagent.web.api.chat.AgentService") as agent_service,
+        ):
+            agent_service.return_value.reconstruct_from_history = AsyncMock()
+            await agent_manager._reconstruct_agent_from_history(
+                int(sample_task.id),
+                None,
+                task_setup_snapshot=snapshot,
+            )
+
+        assert seen_users == [int(sample_task.user_id)]
 
     @pytest.mark.asyncio
     async def test_reconstruct_agent_from_history_uses_shared_runtime_config(

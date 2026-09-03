@@ -101,8 +101,12 @@ class DashScopeEmbedding(BaseEmbedding):
                 "model": self.model,
                 "input": {"texts": batch_texts},
                 "output_type": "dense",
-                "parameters": {"dimension": dimension or self.dimension},
+                "parameters": {},
             }
+
+            final_dimension = dimension or self.dimension
+            if final_dimension is not None:
+                payload["parameters"]["dimension"] = final_dimension
 
             # Add instruction if provided
             final_instruct = instruct or self.instruct
@@ -134,7 +138,7 @@ class DashScopeEmbedding(BaseEmbedding):
 
     def get_dimension(self) -> Optional[int]:
         """Get the embedding dimension."""
-        return self.dimension
+        return self.dimension or 1024
 
     @property
     def abilities(self) -> List[str]:

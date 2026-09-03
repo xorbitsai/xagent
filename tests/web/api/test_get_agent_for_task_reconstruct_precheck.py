@@ -41,6 +41,7 @@ from xagent.core.tools.adapters.vibe.config import (
     RequiredMCPUnavailableError,
 )
 from xagent.web.api.chat import AgentServiceManager
+from xagent.web.dynamic_memory_store import MemoryBackendUnavailableError
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.task import DAGExecution, Task, TaskStatus, TraceEvent
 from xagent.web.models.user import User
@@ -51,6 +52,7 @@ from xagent.web.services.task_setup_snapshot import (
     TaskSetupSnapshot,
     _TaskFields,
 )
+from xagent.web.user_isolated_memory import current_user_id
 
 
 def _make_user() -> User:
@@ -148,6 +150,45 @@ def _build_snapshot(
 
 class _Fake:
     """Sentinel used to select trace- or DAG-backed snapshot history."""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner_id", [1, 2])
+async def test_reconstruction_resolves_required_memory_as_owner(owner_id) -> None:
+    manager = AgentServiceManager()
+    user = _make_user()
+    user.id = owner_id
+    task = _make_task(TaskStatus.RUNNING)
+    task.user_id = owner_id
+    snapshot = _build_snapshot(task, user, trace_event=_Fake())
+
+    async def required_memory(*_args, **_kwargs):
+        assert current_user_id.get() == owner_id
+        raise MemoryBackendUnavailableError("required_memory_backend_unavailable")
+
+    with (
+        patch.object(
+            manager, "_build_tools_for_task", new=AsyncMock(return_value=([], {}))
+        ),
+        patch("xagent.web.api.chat.create_task_tracer", return_value=MagicMock()),
+        patch("xagent.web.api.chat._build_workforce_system_prompt", return_value=None),
+        patch("xagent.web.api.agents.enhance_system_prompt_with_kb", return_value=None),
+        patch("xagent.web.api.agents.apply_user_voice", return_value=None),
+        patch("xagent.web.api.agents.voice_from_runtime_user", return_value=None),
+        patch(
+            "xagent.web.api.chat.resolve_agent_service_memory_policy_async",
+            side_effect=required_memory,
+        ),
+        patch("xagent.web.api.chat.AgentService") as agent_service,
+    ):
+        with pytest.raises(MemoryBackendUnavailableError):
+            await manager._reconstruct_agent_from_history(
+                task_id=42,
+                db=None,
+                task_setup_snapshot=snapshot,
+            )
+
+    agent_service.assert_not_called()
 
 
 def _build_db(
@@ -339,6 +380,32 @@ async def test_running_with_prior_trace_event_runs_reconstruct() -> None:
         mcp_runtime_authorization_policy=None,
     )
     snapshot_loader.assert_called_once_with(42, None)
+
+
+@pytest.mark.asyncio
+async def test_reconstruction_required_memory_failure_does_not_fallback() -> None:
+    manager = AgentServiceManager()
+    user = _make_user()
+    task = _make_task(TaskStatus.RUNNING, agent_id=7)
+    snapshot = _build_snapshot(task, user, trace_event=_Fake())
+    reconstruct = AsyncMock(
+        side_effect=MemoryBackendUnavailableError("required_memory_backend_unavailable")
+    )
+
+    with (
+        patch.object(manager, "_reconstruct_agent_from_history", reconstruct),
+        patch(
+            "xagent.web.api.chat.load_task_setup_snapshot_sync", return_value=snapshot
+        ),
+    ):
+        with pytest.raises(MemoryBackendUnavailableError):
+            await manager.get_agent_for_task(
+                task_id=42,
+                db=_build_db(task, user=user),
+                user=user,
+            )
+
+    reconstruct.assert_awaited_once()
 
 
 @pytest.mark.asyncio

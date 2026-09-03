@@ -335,10 +335,12 @@ def _task_error_payload(
 def create_terminal_task_error_event(
     task_id: int,
     message: str,
+    *,
+    error_code: str | None = None,
 ) -> dict[str, Any]:
     """Shape an error event after the exact lease owner commits FAILED."""
 
-    return {
+    payload = {
         "type": "task_error",
         "message": message,
         "task_id": task_id,
@@ -349,6 +351,9 @@ def create_terminal_task_error_event(
         "error": message,
         "timestamp": datetime.now(timezone.utc).timestamp(),
     }
+    if error_code is not None:
+        payload["error_code"] = error_code
+    return payload
 
 
 def _client_message_id(value: Any) -> str | None:

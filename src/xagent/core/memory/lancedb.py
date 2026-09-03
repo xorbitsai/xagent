@@ -16,7 +16,11 @@ from ..model.embedding import BaseEmbedding, DashScopeEmbedding
 from ..model.embedding.adapter import create_embedding_adapter
 from ..model.model import EmbeddingModelConfig
 from ..tools.core.RAG_tools.LanceDB.schema_manager import _safe_close_table
-from .base import MemoryStore
+from .base import (
+    MEMORY_BACKEND_UNAVAILABLE_REASON,
+    MemoryBackendUnavailableError,
+    MemoryStore,
+)
 from .core import MemoryNote, MemoryResponse
 from .schema_migration import (
     MemoryMismatchKind,
@@ -35,6 +39,8 @@ from .scope_columns import (
 
 logger = logging.getLogger(__name__)
 
+_VECTOR_SPACE_METADATA_KEY = b"xagent.memory.vector_space"
+
 
 class LanceDBMemoryStore(MemoryStore):
     """LanceDB-based memory store implementation with vector search capabilities."""
@@ -47,6 +53,8 @@ class LanceDBMemoryStore(MemoryStore):
         collection_name: str = "memories",
         embedding_model: Optional[Union[BaseEmbedding, EmbeddingModelConfig]] = None,
         similarity_threshold: float = 1.0,
+        vector_space_identity: Optional[dict[str, Any]] = None,
+        allow_schema_migration: bool = True,
         **embedding_kwargs: Any,
     ):
         """
@@ -60,6 +68,8 @@ class LanceDBMemoryStore(MemoryStore):
             **embedding_kwargs: Additional arguments for embedding model
         """
         self._collection_name = collection_name
+        self._vector_space_identity = vector_space_identity
+        self._allow_schema_migration = allow_schema_migration
 
         # Handle different types of embedding_model input
         if embedding_model is None:
@@ -87,9 +97,48 @@ class LanceDBMemoryStore(MemoryStore):
                 f"Unsupported embedding model type: {type(embedding_model)}"
             )
         self._similarity_threshold = similarity_threshold
-        self._vector_store = LanceDBVectorStore(db_dir, collection_name)
         self._conn_manager = LanceDBConnectionManager()
+        self._vector_store = LanceDBVectorStore(
+            db_dir,
+            collection_name,
+            connection_manager=self._conn_manager,
+            initial_data=self._initial_table_data(),
+        )
         self._ensure_table_schema()
+
+    def _configured_embedding_dimension(self) -> Optional[int]:
+        if self._vector_space_identity is not None:
+            dimension = self._vector_space_identity.get("dimension")
+            return int(dimension) if dimension else None
+        if not self._embedding_model:
+            return None
+        try:
+            dimension = self._embedding_model.get_dimension()
+        except Exception:
+            return None
+        return int(dimension) if dimension else None
+
+    def _initial_table_data(self) -> Any:
+        base: dict[str, Any] = {
+            "id": ["sample"],
+            "text": ["sample"],
+            "metadata": ["{}"],
+            USER_ID_COLUMN: pa.array([0], pa.int64()),
+            SCOPE_DIMS_COLUMN: pa.array([["sample"]], pa.list_(pa.string())),
+        }
+        dimension = self._configured_embedding_dimension()
+        if dimension is not None:
+            base["vector"] = pa.array(
+                [[0.0] * dimension], pa.list_(pa.float32(), dimension)
+            )
+        data = pa.table(base)
+        if self._vector_space_identity is not None:
+            metadata = dict(data.schema.metadata or {})
+            metadata[_VECTOR_SPACE_METADATA_KEY] = json.dumps(
+                self._vector_space_identity, sort_keys=True, separators=(",", ":")
+            ).encode()
+            data = data.replace_schema_metadata(metadata)
+        return data
 
     def _ensure_table_schema(self) -> None:
         """Ensure the table has the correct schema for memory storage.
@@ -103,6 +152,11 @@ class LanceDBMemoryStore(MemoryStore):
         a table is both missing a base column and vector-mismatched.
         """
         conn = self._vector_store.get_raw_connection()
+
+        if not self._allow_schema_migration:
+            # Request-time manager stores use read-only admission. Existing
+            # shared tables are never scanned, rebuilt, or re-embedded here.
+            return
 
         # Determine whether the table already exists and read its columns.
         table = None
@@ -176,9 +230,90 @@ class LanceDBMemoryStore(MemoryStore):
         # Remove sample data
         table.delete("id = 'sample'")
 
+    def _table_schema(self) -> Any:
+        table = self._vector_store.get_raw_connection().open_table(
+            self._collection_name
+        )
+        try:
+            return table.schema
+        finally:
+            _safe_close_table(table)
+
+    @staticmethod
+    def _vector_dimension(schema: Any) -> Optional[int]:
+        if "vector" not in schema.names:
+            return None
+        vector_type = schema.field("vector").type
+        return (
+            int(vector_type.list_size)
+            if pa.types.is_fixed_size_list(vector_type)
+            else None
+        )
+
+    def _stored_vector_space_identity(self, schema: Any) -> Optional[dict[str, Any]]:
+        encoded = (schema.metadata or {}).get(_VECTOR_SPACE_METADATA_KEY)
+        if encoded is None:
+            return None
+        try:
+            value = json.loads(encoded.decode())
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
+            return None
+        return value if isinstance(value, dict) else None
+
+    def _has_compatible_vector_space(self) -> bool:
+        try:
+            schema = self._table_schema()
+        except Exception:
+            return False
+        dimension = self._configured_embedding_dimension()
+        if dimension is None or self._vector_dimension(schema) != dimension:
+            return False
+        if self._vector_space_identity is None:
+            # Preserve direct/legacy callers that predate persisted identity.
+            return self._embedding_model is not None
+        return self._stored_vector_space_identity(schema) == self._vector_space_identity
+
+    def ensure_persistence(self) -> None:
+        """Verify the persistent table is readable without mutating it."""
+
+        try:
+            schema = self._table_schema()
+            if not {
+                "id",
+                "text",
+                "metadata",
+                USER_ID_COLUMN,
+                SCOPE_DIMS_COLUMN,
+            } <= set(schema.names):
+                raise RuntimeError("memory table requires an offline schema migration")
+        except Exception as exc:
+            raise MemoryBackendUnavailableError(
+                MEMORY_BACKEND_UNAVAILABLE_REASON
+            ) from exc
+
+    def ensure_required_vector_search(self) -> None:
+        """Read-only strict admission; it performs no embedding call."""
+
+        self.ensure_persistence()
+        if (
+            self._embedding_model is None
+            or self._vector_space_identity is None
+            or not self._has_compatible_vector_space()
+        ):
+            raise MemoryBackendUnavailableError(MEMORY_BACKEND_UNAVAILABLE_REASON)
+
     def _get_embedding(self, text: str) -> Optional[list[float]]:
         """Get embedding for text using the configured embedding model."""
         if not self._embedding_model or not text.strip():
+            return None
+        if (
+            self._vector_space_identity is not None
+            and not self._has_compatible_vector_space()
+        ):
+            logger.warning(
+                "Configured embedding identity does not match the persisted "
+                "vector space; using text-only fallback"
+            )
             return None
 
         try:
@@ -197,12 +332,27 @@ class LanceDBMemoryStore(MemoryStore):
             logger.error(f"Failed to generate embedding for text '{text[:50]}...': {e}")
             return None
 
+    def _get_required_embedding(self, text: str) -> list[float]:
+        self.ensure_required_vector_search()
+        embedding = self._get_embedding(text)
+        expected_dimension = self._configured_embedding_dimension()
+        if (
+            embedding is None
+            or expected_dimension is None
+            or len(embedding) != expected_dimension
+        ):
+            raise MemoryBackendUnavailableError(MEMORY_BACKEND_UNAVAILABLE_REASON)
+        return [float(value) for value in embedding]
+
     def _current_embedding_dim(self) -> Optional[int]:
         """Return the vector dimension the store currently produces, or None.
 
         None means no embedding model is available and the store operates in
         vector-less (text-search) mode.
         """
+        configured = self._configured_embedding_dimension()
+        if configured is not None:
+            return configured
         if not self._embedding_model:
             return None
         try:
@@ -411,13 +561,19 @@ class LanceDBMemoryStore(MemoryStore):
             record = {k: v for k, v in record.items() if k != "vector"}
         table.add([record])
 
-    def _memory_note_to_dict(self, note: MemoryNote) -> dict[str, Any]:
+    def _memory_note_to_dict(
+        self, note: MemoryNote, *, require_vector: bool = False
+    ) -> dict[str, Any]:
         """Convert MemoryNote to dictionary for storage."""
         # Get embedding for the content
         content_text = (
             note.content.decode() if isinstance(note.content, bytes) else note.content
         )
-        embedding = self._get_embedding(content_text)
+        embedding = (
+            self._get_required_embedding(content_text)
+            if require_vector
+            else self._get_embedding(content_text)
+        )
 
         # Prepare metadata
         metadata = {
@@ -480,13 +636,21 @@ class LanceDBMemoryStore(MemoryStore):
 
     def add(self, note: MemoryNote) -> MemoryResponse:
         """Add a memory note to the store."""
+        return self._add(note, require_vector=False)
+
+    def add_required_vector(self, note: MemoryNote) -> MemoryResponse:
+        """Add only after a compatible embedding has been produced."""
+
+        return self._add(note, require_vector=True)
+
+    def _add(self, note: MemoryNote, *, require_vector: bool) -> MemoryResponse:
         try:
             # Generate ID if not provided
             if not note.id:
                 note.id = str(uuid4())
 
             # Convert to storage format
-            data = self._memory_note_to_dict(note)
+            data = self._memory_note_to_dict(note, require_vector=require_vector)
 
             # Add to vector store - use a consistent approach
             conn = self._vector_store.get_raw_connection()
@@ -513,6 +677,8 @@ class LanceDBMemoryStore(MemoryStore):
                 try:
                     table.add([record])
                 except Exception as add_error:
+                    if require_vector or not self._allow_schema_migration:
+                        raise add_error
                     logger.warning(
                         f"add() failed on possible schema mismatch: {add_error}; "
                         "attempting safe in-place migration"
@@ -541,8 +707,14 @@ class LanceDBMemoryStore(MemoryStore):
 
             return MemoryResponse(success=True, memory_id=data["id"])
 
+        except MemoryBackendUnavailableError:
+            raise
         except Exception as e:
             logger.error(f"Failed to add memory note {note.id}: {e}")
+            if require_vector:
+                raise MemoryBackendUnavailableError(
+                    MEMORY_BACKEND_UNAVAILABLE_REASON
+                ) from e
             return MemoryResponse(
                 success=False,
                 error=f"Failed to add memory: {str(e)}",
@@ -612,6 +784,42 @@ class LanceDBMemoryStore(MemoryStore):
                 error=f"Failed to update memory: {str(e)}",
                 memory_id=note.id,
             )
+
+    def update_required_vector(self, note: MemoryNote) -> MemoryResponse:
+        """Atomically replace a row after obtaining a valid embedding."""
+
+        get_response = self.get(note.id)
+        if not get_response.success:
+            if get_response.error != "Memory not found":
+                raise MemoryBackendUnavailableError(MEMORY_BACKEND_UNAVAILABLE_REASON)
+            return MemoryResponse(
+                success=False, error="Memory not found", memory_id=note.id
+            )
+
+        try:
+            data = self._memory_note_to_dict(note, require_vector=True)
+            record = {
+                "id": data["id"],
+                "text": data["text"],
+                "metadata": data["metadata"],
+                "vector": data["vector"],
+                USER_ID_COLUMN: data[USER_ID_COLUMN],
+                SCOPE_DIMS_COLUMN: data[SCOPE_DIMS_COLUMN],
+            }
+            table = self._vector_store.get_raw_connection().open_table(
+                self._collection_name
+            )
+            try:
+                (table.merge_insert("id").when_matched_update_all().execute([record]))
+            finally:
+                _safe_close_table(table)
+            return MemoryResponse(success=True, memory_id=note.id)
+        except MemoryBackendUnavailableError:
+            raise
+        except Exception as exc:
+            raise MemoryBackendUnavailableError(
+                MEMORY_BACKEND_UNAVAILABLE_REASON
+            ) from exc
 
     def delete(self, note_id: str) -> MemoryResponse:
         """Delete a memory note by its ID."""
@@ -878,6 +1086,60 @@ class LanceDBMemoryStore(MemoryStore):
         except Exception as e:
             logger.error(f"Failed to search memories with query '{query[:50]}...': {e}")
             return []
+        finally:
+            _safe_close_table(table)
+
+    def search_required_vector(
+        self,
+        query: str,
+        k: int = 5,
+        filters: Optional[dict[str, Any]] = None,
+        similarity_threshold: Optional[float] = None,
+    ) -> list[MemoryNote]:
+        """Search through the compatible vector column without text fallback."""
+
+        table = None
+        try:
+            query_embedding = self._get_required_embedding(query)
+            table = self._vector_store.get_raw_connection().open_table(
+                self._collection_name
+            )
+            if "vector" not in table.schema.names:
+                raise RuntimeError("memory table has no vector column")
+            where_sql, residual_filters = build_scope_where(filters)
+            residual_other_filters = self._flat_other_filters(residual_filters)
+            vector_query = table.search(query_embedding, vector_column_name="vector")
+            if where_sql:
+                vector_query = vector_query.where(where_sql, prefilter=True)
+            rows = vector_query.limit(k).to_pandas()
+            threshold = (
+                similarity_threshold
+                if similarity_threshold is not None
+                else self._similarity_threshold
+            )
+            results: list[MemoryNote] = []
+            for _, row in rows.iterrows():
+                if row.get("_distance", float("inf")) > threshold:
+                    continue
+                note = self._dict_to_memory_note(
+                    {
+                        "id": row.get("id", ""),
+                        "text": row.get("text", ""),
+                        "metadata": row.get("metadata", "{}"),
+                    }
+                )
+                if residual_filters and not self._matches_filters(
+                    note, residual_filters, residual_other_filters
+                ):
+                    continue
+                results.append(note)
+            return results
+        except MemoryBackendUnavailableError:
+            raise
+        except Exception as exc:
+            raise MemoryBackendUnavailableError(
+                MEMORY_BACKEND_UNAVAILABLE_REASON
+            ) from exc
         finally:
             _safe_close_table(table)
 

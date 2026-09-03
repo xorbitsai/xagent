@@ -83,6 +83,21 @@ class TestDashScopeEmbedding(BaseEmbeddingTest):
                 call_args[1]["json"]["parameters"]["instruct"] == "Override instruction"
             )
 
+    def test_omitted_dimension_uses_service_default(self):
+        from unittest.mock import Mock, patch
+
+        with patch("requests.Session.post") as mock_post:
+            response = Mock()
+            response.raise_for_status.return_value = None
+            response.json.return_value = self.get_mock_response([[0.1] * 1024])
+            mock_post.return_value = response
+
+            client = DashScopeEmbedding(api_key="test_key")
+            client.encode("Hello")
+
+        assert "dimension" not in mock_post.call_args.kwargs["json"]["parameters"]
+        assert client.get_dimension() == 1024
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

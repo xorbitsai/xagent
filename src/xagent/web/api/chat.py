@@ -28,7 +28,7 @@ from ...core.execution_scope import (
     resolve_execution_scope_off_turn,
     scope_fingerprint,
 )
-from ...core.memory.base import MemoryStore
+from ...core.memory.base import MemoryBackendUnavailableError, MemoryStore
 from ...core.memory.in_memory import InMemoryMemoryStore
 from ...core.model.chat.basic.base import BaseLLM
 from ...core.model.chat.basic.deepseek import DeepSeekLLM
@@ -354,12 +354,26 @@ def resolve_agent_service_memory_policy(
     use_in_memory = (is_preview and not enabled) or (
         override is not None and not override.available
     )
-    memory = InMemoryMemoryStore() if use_in_memory else get_memory_store()
+    memory: MemoryStore
+    if use_in_memory:
+        memory = InMemoryMemoryStore()
+    else:
+        requirements = {
+            "require_persistence": bool(
+                override is not None and override.require_persistence
+            ),
+            "require_vector_search": bool(
+                override is not None and override.require_vector_search
+            ),
+        }
+        memory = get_memory_store(**requirements)
+    available = True if override is None else override.available
+    availability_reason = None if override is None else override.reason
     return AgentServiceMemoryPolicy(
         memory=memory,
         memory_enabled=enabled,
-        memory_available=True if override is None else override.available,
-        memory_availability_reason=None if override is None else override.reason,
+        memory_available=available,
+        memory_availability_reason=availability_reason,
     )
 
 
@@ -2614,6 +2628,7 @@ class AgentServiceManager:
                             return self._agents[task_id]
                     except (
                         HTTPException,
+                        MemoryBackendUnavailableError,
                         TaskOwnerMismatchError,
                         _AgentRuntimeSessionBoundaryError,
                     ):
@@ -4010,10 +4025,11 @@ class AgentServiceManager:
                 if agent_config
                 else None
             )
-            memory_policy = await resolve_agent_service_memory_policy_async(
-                task=task,
-                agent_config=agent_config,
-            )
+            with UserContext(user_id):
+                memory_policy = await resolve_agent_service_memory_policy_async(
+                    task=task,
+                    agent_config=agent_config,
+                )
             allowed_external_dirs = _build_allowed_external_dirs(
                 user_id,
                 scope=scope,

@@ -1,10 +1,13 @@
+from xagent.core.memory.base import MemoryBackendUnavailableError
 from xagent.core.tools.adapters.vibe.config import RequiredMCPUnavailableError
 from xagent.web.services.client_error_messages import (
     CLIENT_SAFE_GUIDANCE_IN_PROGRESS,
+    CLIENT_SAFE_MEMORY_BACKEND_UNAVAILABLE,
     CLIENT_SAFE_TASK_FAILURE,
     CLIENT_SAFE_VALIDATION_ERROR,
     ClientErrorCode,
     client_error_message,
+    memory_backend_unavailable_client_message,
     required_mcp_unavailable_client_message,
 )
 
@@ -71,6 +74,9 @@ def test_client_error_codes_have_fixed_safe_fallbacks() -> None:
         "authentication_required": "Authentication is required to send this message.",
         "task_access_denied": "You do not have access to this task.",
         "invalid_message": "The message format is invalid.",
+        "memory_backend_unavailable": (
+            "Required memory is temporarily unavailable. Please try again later."
+        ),
     }
 
 
@@ -88,5 +94,25 @@ def test_required_mcp_adapter_rejects_incidental_exceptions() -> None:
             error,
             fallback=CLIENT_SAFE_TASK_FAILURE,
         )
+        == CLIENT_SAFE_TASK_FAILURE
+    )
+
+
+def test_memory_backend_error_uses_stable_sanitized_message() -> None:
+    error = MemoryBackendUnavailableError("provider token=secret")
+
+    assert (
+        memory_backend_unavailable_client_message(error)
+        == CLIENT_SAFE_MEMORY_BACKEND_UNAVAILABLE
+    )
+    assert (
+        client_error_message(ClientErrorCode.MEMORY_BACKEND_UNAVAILABLE)
+        == CLIENT_SAFE_MEMORY_BACKEND_UNAVAILABLE
+    )
+
+
+def test_memory_backend_adapter_rejects_incidental_exception() -> None:
+    assert (
+        memory_backend_unavailable_client_message(RuntimeError("secret"))
         == CLIENT_SAFE_TASK_FAILURE
     )

@@ -11,6 +11,12 @@ from .scope_columns import (
     scope_dim_element,
 )
 
+MEMORY_BACKEND_UNAVAILABLE_REASON = "required_memory_backend_unavailable"
+
+
+class MemoryBackendUnavailableError(RuntimeError):
+    """A caller-required memory backend capability is unavailable."""
+
 
 def comparable_timestamp(value: Any) -> Any:
     """Normalize a datetime for cross-comparison in date-range filters.
@@ -39,6 +45,37 @@ class MemoryStore(ABC):
     Any concrete implementation (e.g., in-memory store, ChromaDB, Redis, etc.)
     should implement all the following methods to manage MemoryNote objects.
     """
+
+    def ensure_persistence(self) -> None:
+        """Verify durable storage without changing backend state."""
+
+        raise MemoryBackendUnavailableError(MEMORY_BACKEND_UNAVAILABLE_REASON)
+
+    def ensure_required_vector_search(self) -> None:
+        """Verify strict vector operations without network calls or mutation."""
+
+        raise MemoryBackendUnavailableError(MEMORY_BACKEND_UNAVAILABLE_REASON)
+
+    def add_required_vector(self, note: "MemoryNote") -> "MemoryResponse":
+        """Add a note only when a valid vector can be persisted."""
+
+        raise MemoryBackendUnavailableError(MEMORY_BACKEND_UNAVAILABLE_REASON)
+
+    def update_required_vector(self, note: "MemoryNote") -> "MemoryResponse":
+        """Atomically replace a note only after producing a valid vector."""
+
+        raise MemoryBackendUnavailableError(MEMORY_BACKEND_UNAVAILABLE_REASON)
+
+    def search_required_vector(
+        self,
+        query: str,
+        k: int = 5,
+        filters: Optional[dict[str, Any]] = None,
+        similarity_threshold: Optional[float] = None,
+    ) -> list["MemoryNote"]:
+        """Search only through a compatible vector index."""
+
+        raise MemoryBackendUnavailableError(MEMORY_BACKEND_UNAVAILABLE_REASON)
 
     @abstractmethod
     def add(self, note: "MemoryNote") -> "MemoryResponse":

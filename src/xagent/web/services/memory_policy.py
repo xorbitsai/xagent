@@ -29,6 +29,8 @@ class MemoryPolicyDecision:
     enabled: bool
     available: bool
     reason: str | None = None
+    require_persistence: bool = False
+    require_vector_search: bool = False
 
 
 MemoryPolicyResolver = Callable[[MemoryPolicyRequest], MemoryPolicyDecision]
@@ -74,8 +76,17 @@ def _validate_decision(decision: object) -> None:
         raise TypeError("memory policy resolver returned an invalid decision type")
     if type(decision.enabled) is not bool or type(decision.available) is not bool:
         raise TypeError("memory policy decision flags must be bool")
+    if (
+        type(decision.require_persistence) is not bool
+        or type(decision.require_vector_search) is not bool
+    ):
+        raise TypeError("memory backend requirement flags must be bool")
     if decision.enabled and not decision.available:
         raise ValueError("unavailable memory cannot be enabled")
+    if (decision.require_persistence or decision.require_vector_search) and not (
+        decision.enabled and decision.available
+    ):
+        raise ValueError("memory backend requirements need enabled, available memory")
     if decision.reason is not None and (
         not isinstance(decision.reason, str) or not decision.reason.strip()
     ):

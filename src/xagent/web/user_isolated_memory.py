@@ -9,7 +9,11 @@ from xagent.core.execution_scope import (
     memory_dimension_metadata,
     metadata_carries_scope_dimensions,
 )
-from xagent.core.memory.base import MemoryStore
+from xagent.core.memory.base import (
+    MEMORY_BACKEND_UNAVAILABLE_REASON,
+    MemoryBackendUnavailableError,
+    MemoryStore,
+)
 from xagent.core.memory.core import MemoryNote, MemoryResponse
 from xagent.core.memory.scope_columns import SCOPE_EXCLUSIVE_FILTER_KEY
 from xagent.core.user_context import current_user_id
@@ -42,7 +46,9 @@ class UserIsolatedMemoryStore(MemoryStore):
     remains the only access-control key.
     """
 
-    def __init__(self, base_store: MemoryStore) -> None:
+    def __init__(
+        self, base_store: MemoryStore, *, require_vector_search: bool = False
+    ) -> None:
         """
         Initialize with a base memory store for actual storage.
 
@@ -50,6 +56,7 @@ class UserIsolatedMemoryStore(MemoryStore):
             base_store: The underlying memory store for storage operations
         """
         self._base_store = base_store
+        self._require_vector_search = require_vector_search
 
     def _get_current_user_id(self) -> Optional[int]:
         """Get the current user ID from context."""
@@ -163,7 +170,22 @@ class UserIsolatedMemoryStore(MemoryStore):
         # filter on them (no-op when unscoped or dimension-less).
         note.metadata.update(memory_dimension_metadata(get_execution_scope()))
 
+        if self._require_vector_search:
+            return self._base_store.add_required_vector(note)
         return self._base_store.add(note)
+
+    def ensure_persistence(self) -> None:
+        self._base_store.ensure_persistence()
+
+    def ensure_required_vector_search(self) -> None:
+        self._base_store.ensure_required_vector_search()
+
+    def add_required_vector(self, note: MemoryNote) -> MemoryResponse:
+        user_id = self._get_current_user_id()
+        if user_id is not None:
+            note.metadata["user_id"] = user_id
+        note.metadata.update(memory_dimension_metadata(get_execution_scope()))
+        return self._base_store.add_required_vector(note)
 
     def get(self, note_id: str) -> MemoryResponse:
         """
@@ -206,13 +228,40 @@ class UserIsolatedMemoryStore(MemoryStore):
         if note.id and (user_id is not None or self._scope_gates_by_id_access()):
             existing_response = self.get(note.id)
             if not existing_response.success:
+                if self._require_vector_search and existing_response.error not in {
+                    "Memory not found",
+                    "Memory note not found or access denied",
+                }:
+                    raise MemoryBackendUnavailableError(
+                        MEMORY_BACKEND_UNAVAILABLE_REASON
+                    )
                 return existing_response
 
         # Add user ID to metadata if not present
         if user_id is not None and "user_id" not in note.metadata:
             note.metadata["user_id"] = user_id
 
+        if self._require_vector_search:
+            return self._base_store.update_required_vector(note)
         return self._base_store.update(note)
+
+    def update_required_vector(self, note: MemoryNote) -> MemoryResponse:
+        user_id = self._get_current_user_id()
+        if note.id and (user_id is not None or self._scope_gates_by_id_access()):
+            existing_response = self.get(note.id)
+            if not existing_response.success:
+                if existing_response.error not in {
+                    "Memory not found",
+                    "Memory note not found or access denied",
+                }:
+                    raise MemoryBackendUnavailableError(
+                        MEMORY_BACKEND_UNAVAILABLE_REASON
+                    )
+                return existing_response
+        if user_id is not None and "user_id" not in note.metadata:
+            note.metadata["user_id"] = user_id
+        note.metadata.update(memory_dimension_metadata(get_execution_scope()))
+        return self._base_store.update_required_vector(note)
 
     def delete(self, note_id: str) -> MemoryResponse:
         """
@@ -283,10 +332,29 @@ class UserIsolatedMemoryStore(MemoryStore):
         # the store (prefilter on the vector path), not post-filtered here.
         filtered_filters = self._add_user_filter(filters)
 
-        return self._base_store.search(
+        search = (
+            self._base_store.search_required_vector
+            if self._require_vector_search
+            else self._base_store.search
+        )
+        return search(
             query=query,
             k=k,
             filters=filtered_filters,
+            similarity_threshold=similarity_threshold,
+        )
+
+    def search_required_vector(
+        self,
+        query: str,
+        k: int = 5,
+        filters: Optional[dict[str, Any]] = None,
+        similarity_threshold: Optional[float] = None,
+    ) -> List[MemoryNote]:
+        return self._base_store.search_required_vector(
+            query=query,
+            k=k,
+            filters=self._add_user_filter(filters),
             similarity_threshold=similarity_threshold,
         )
 

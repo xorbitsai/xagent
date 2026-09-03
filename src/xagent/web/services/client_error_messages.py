@@ -2,6 +2,7 @@
 
 from enum import StrEnum
 
+from ...core.memory.base import MemoryBackendUnavailableError
 from ...core.tools.adapters.vibe.config import RequiredMCPUnavailableError
 
 CLIENT_SAFE_VALIDATION_ERROR = "The message could not be processed. Please try again."
@@ -9,6 +10,9 @@ CLIENT_SAFE_VALIDATION_ERROR = "The message could not be processed. Please try a
 # Task audiences did not necessarily initiate the failing operation, so a
 # task-level failure uses neutral wording instead of the validation fallback.
 CLIENT_SAFE_TASK_FAILURE = "Task execution failed."
+CLIENT_SAFE_MEMORY_BACKEND_UNAVAILABLE = (
+    "Required memory is temporarily unavailable. Please try again later."
+)
 CLIENT_SAFE_GUIDANCE_IN_PROGRESS = (
     "A previous guidance message is still being applied. Please wait for it to finish."
 )
@@ -36,6 +40,7 @@ class ClientErrorCode(StrEnum):
     AUTHENTICATION_REQUIRED = "authentication_required"
     TASK_ACCESS_DENIED = "task_access_denied"
     INVALID_MESSAGE = "invalid_message"
+    MEMORY_BACKEND_UNAVAILABLE = "memory_backend_unavailable"
 
 
 def client_error_message(code: ClientErrorCode) -> str:
@@ -91,6 +96,9 @@ def client_error_message(code: ClientErrorCode) -> str:
         ),
         ClientErrorCode.TASK_ACCESS_DENIED: "You do not have access to this task.",
         ClientErrorCode.INVALID_MESSAGE: "The message format is invalid.",
+        ClientErrorCode.MEMORY_BACKEND_UNAVAILABLE: (
+            CLIENT_SAFE_MEMORY_BACKEND_UNAVAILABLE
+        ),
     }[code]
 
 
@@ -111,3 +119,11 @@ def required_mcp_unavailable_client_message(
     if message.strip():
         return message
     return fallback
+
+
+def memory_backend_unavailable_client_message(error: BaseException) -> str:
+    """Return only the fixed message for the typed capability failure."""
+
+    if not isinstance(error, MemoryBackendUnavailableError):
+        return CLIENT_SAFE_TASK_FAILURE
+    return CLIENT_SAFE_MEMORY_BACKEND_UNAVAILABLE

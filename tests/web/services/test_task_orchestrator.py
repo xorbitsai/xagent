@@ -38,6 +38,7 @@ from tests.web.pool_contention_shared import (
     wait_for_ticks,
 )
 from xagent.core.agent.checkpoint import CHECKPOINT_TYPE
+from xagent.core.memory.base import MemoryBackendUnavailableError
 from xagent.core.tools.adapters.vibe.config import RequiredMCPUnavailableError
 from xagent.core.tools.adapters.vibe.connector_runtime import ConnectorRef
 from xagent.web.models import database as database_module
@@ -3086,6 +3087,68 @@ async def test_schedule_bg_preserves_public_safe_required_mcp_failure(
     event = broadcast.await_args.args[0]
     assert event["message"] == public_message
     assert event["error"] == public_message
+
+
+@pytest.mark.asyncio
+async def test_schedule_bg_sanitizes_memory_backend_failure(db_session) -> None:
+    from xagent.web.api.websocket import background_task_manager
+    from xagent.web.api.websocket import manager as ws_manager
+
+    user = _create_user(db_session)
+    task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
+    task.runner_id = "test-runner"
+    task.run_id = "run-a"
+    db_session.commit()
+    lease = TaskLease(task_id=int(task.id), runner_id="test-runner", run_id="run-a")
+
+    with (
+        patch(
+            "xagent.web.services.task_orchestrator.acquire_task_lease_isolated",
+            return_value=lease,
+        ),
+        patch(
+            "xagent.web.services.task_orchestrator.run_task_lease_heartbeat",
+            new=AsyncMock(),
+        ),
+        patch(
+            "xagent.web.services.task_orchestrator.load_task_setup_snapshot_sync",
+            side_effect=MemoryBackendUnavailableError("provider token=secret"),
+        ),
+        patch.object(background_task_manager, "register_task"),
+        patch.object(ws_manager, "broadcast_to_task", new=AsyncMock()) as broadcast,
+        patch(
+            "xagent.web.services.task_orchestrator._get_agent_manager",
+            return_value=MagicMock(),
+        ),
+    ):
+        await _schedule_bg(
+            task_id=int(task.id),
+            task_owner_user_id=int(user.id),
+            task_source=task.source,
+            payload=TaskTurnPayload("hello"),
+            force_fresh=False,
+            context=None,
+        )
+
+    db_session.expire_all()
+    persisted = db_session.get(Task, int(task.id))
+    assert persisted is not None
+    assert persisted.error_message == "setup/run error: MemoryBackendUnavailableError"
+    assert "secret" not in persisted.error_message
+    assistant = (
+        db_session.query(TaskChatMessage)
+        .filter(
+            TaskChatMessage.task_id == task.id,
+            TaskChatMessage.role == "assistant",
+        )
+        .one()
+    )
+    safe_message = "Required memory is temporarily unavailable. Please try again later."
+    assert assistant.content == safe_message
+    event = broadcast.await_args.args[0]
+    assert event["message"] == safe_message
+    assert event["error_code"] == "memory_backend_unavailable"
+    assert "secret" not in repr(event)
 
 
 @pytest.mark.asyncio

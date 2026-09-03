@@ -58,6 +58,7 @@ from sqlalchemy.orm import Session
 
 from ...core.agent.context.execution import CLOCK_TIMEZONE_METADATA_KEY
 from ...core.execution_scope import resolve_execution_scope
+from ...core.memory.base import MemoryBackendUnavailableError
 from ...core.tools.adapters.vibe.config import RequiredMCPUnavailableError
 from ..models.task import Task, TaskStatus
 from .assistant_history_safety import (
@@ -73,6 +74,8 @@ from .chat_history_service import (
 )
 from .client_error_messages import (
     CLIENT_SAFE_TASK_FAILURE,
+    ClientErrorCode,
+    memory_backend_unavailable_client_message,
     required_mcp_unavailable_client_message,
 )
 from .db_runtime import (
@@ -1793,6 +1796,7 @@ def _schedule_bg(
         client_history_error_message: str | None = None
         client_history_message_type = TASK_FAILURE_MESSAGE_TYPE
         broadcast_error_message: str | None = None
+        broadcast_error_code: str | None = None
         defer_settlement_to_ttl_recovery = False
         skip_delivery_reconciliation = False
         # Positive evidence for finalize's delivery target: once
@@ -1943,10 +1947,24 @@ def _schedule_bg(
                         exc_info=True,
                     )
                 else:
+                    is_memory_backend_error = isinstance(
+                        setup_or_run_err, MemoryBackendUnavailableError
+                    )
                     is_public_safe_mcp_error = isinstance(
                         setup_or_run_err, RequiredMCPUnavailableError
                     )
-                    if is_public_safe_mcp_error:
+                    if is_memory_backend_error:
+                        settlement_error = (
+                            "setup/run error: MemoryBackendUnavailableError"
+                        )
+                        client_history_message_type = CLIENT_SAFE_FAILURE_MESSAGE_TYPE
+                        broadcast_error_message = (
+                            memory_backend_unavailable_client_message(setup_or_run_err)
+                        )
+                        broadcast_error_code = (
+                            ClientErrorCode.MEMORY_BACKEND_UNAVAILABLE.value
+                        )
+                    elif is_public_safe_mcp_error:
                         # This exception's string contract is deliberately
                         # public-safe. Preserve it exactly in the durable task
                         # and TriggerRun projections; adding the exception type
@@ -2033,6 +2051,7 @@ def _schedule_bg(
                                     create_terminal_task_error_event(
                                         task_id,
                                         broadcast_error_message,
+                                        error_code=broadcast_error_code,
                                     ),
                                     task_id,
                                 )

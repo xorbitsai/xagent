@@ -1124,12 +1124,22 @@ class MCPToolAdapter(AbstractBaseTool):
                 continue
             if self._schema_is_array_only(field_schema) and not isinstance(value, list):
                 if isinstance(value, str):
+                    # Tool-calling models sometimes double-encode an
+                    # array-only argument as a JSON string instead of a real
+                    # array — e.g. '["date"]', or even a lone item as
+                    # '"date"'. Recover the intended value before falling
+                    # back to the raw wrap below, which would otherwise
+                    # leak the string's own brackets/quotes into a garbled
+                    # single item.
                     try:
                         parsed_value = json.loads(value)
-                    except (ValueError, TypeError):
+                    except json.JSONDecodeError:
                         parsed_value = None
                     if isinstance(parsed_value, list):
                         normalized_args[field_name] = parsed_value
+                        continue
+                    if isinstance(parsed_value, str):
+                        normalized_args[field_name] = [parsed_value]
                         continue
                 normalized_args[field_name] = [value]
 

@@ -82,13 +82,17 @@ def _validate_guid(value: str, field_name: str) -> str:
 
 
 def _reject_quote(value: str, field_name: str) -> str:
-    """Reject a value containing '"' before it's interpolated into a Xero
-    `where=` string literal -- none of the values this is applied to
+    """Reject a value containing '"' or '\\' before it's interpolated into a
+    Xero `where=` string literal -- none of the values this is applied to
     (a status keyword, an account type keyword) should ever legitimately
     contain one, so rejecting outright is simpler and safer than attempting
-    to escape Xero's filter-expression quoting rules."""
-    if '"' in value:
-        raise ValueError(f"{field_name} must not contain a '\"' character")
+    to escape Xero's filter-expression quoting rules. '\\' is rejected too
+    since Xero's where-clause strings support backslash-escaping a quote --
+    without this, a trailing backslash could consume the literal's own
+    closing quote from the template rather than the caller's value.
+    """
+    if '"' in value or "\\" in value:
+        raise ValueError(f"{field_name} must not contain a '\"' or '\\' character")
     return value
 
 
@@ -112,14 +116,19 @@ def _extract_error_detail(response: requests.Response) -> str | None:
     if not isinstance(message, str):
         message = None
     validation_messages = []
-    for element in payload.get("Elements") or []:
-        if not isinstance(element, dict):
-            continue
-        for validation_error in element.get("ValidationErrors") or []:
-            if isinstance(validation_error, dict):
-                detail = validation_error.get("Message")
-                if isinstance(detail, str) and detail:
-                    validation_messages.append(detail)
+    elements = payload.get("Elements")
+    if isinstance(elements, list):
+        for element in elements:
+            if not isinstance(element, dict):
+                continue
+            validation_errors = element.get("ValidationErrors")
+            if not isinstance(validation_errors, list):
+                continue
+            for validation_error in validation_errors:
+                if isinstance(validation_error, dict):
+                    detail = validation_error.get("Message")
+                    if isinstance(detail, str) and detail:
+                        validation_messages.append(detail)
     if validation_messages:
         joined = "; ".join(validation_messages)
         return f"{message}: {joined}" if message else joined
@@ -185,8 +194,12 @@ def _accounting_request(
     )
 
 
-def _list_items(result: Any, key: str) -> list[Any]:
-    return result.get(key) or [] if isinstance(result, dict) else []
+def _list_items(result: Any, key: str) -> list[dict[str, Any]]:
+    if isinstance(result, dict):
+        items = result.get(key)
+        if isinstance(items, list):
+            return [item for item in items if isinstance(item, dict)]
+    return []
 
 
 def _first_item(result: Any, key: str, not_found_message: str) -> dict[str, Any]:
@@ -216,7 +229,9 @@ def _contact_summary(contact: dict[str, Any]) -> dict[str, Any]:
 
 
 def _invoice_summary(invoice: dict[str, Any]) -> dict[str, Any]:
-    contact = invoice.get("Contact") or {}
+    contact = invoice.get("Contact")
+    if not isinstance(contact, dict):
+        contact = {}
     return {
         "invoice_id": invoice.get("InvoiceID"),
         "invoice_number": invoice.get("InvoiceNumber"),
@@ -248,8 +263,12 @@ def _account_summary(account: dict[str, Any]) -> dict[str, Any]:
 
 
 def _payment_summary(payment: dict[str, Any]) -> dict[str, Any]:
-    invoice = payment.get("Invoice") or {}
-    account = payment.get("Account") or {}
+    invoice = payment.get("Invoice")
+    if not isinstance(invoice, dict):
+        invoice = {}
+    account = payment.get("Account")
+    if not isinstance(account, dict):
+        account = {}
     return {
         "payment_id": payment.get("PaymentID"),
         "amount": payment.get("Amount"),
@@ -350,7 +369,9 @@ def xero_list_contacts(tenant_id: str, search_term: str = "", page: int = 1) -> 
             params["searchTerm"] = search_term
         result = _accounting_request("GET", tenant_id, "/Contacts", params=params)
         contacts = _list_items(result, "Contacts")
-        pagination = result.get("pagination") or {} if isinstance(result, dict) else {}
+        pagination = result.get("pagination") if isinstance(result, dict) else None
+        if not isinstance(pagination, dict):
+            pagination = {}
         return success_with_capped_dict(
             "contacts",
             {
@@ -501,7 +522,8 @@ def xero_get_invoice(tenant_id: str, invoice_id: str) -> str:
         result = _accounting_request("GET", tenant_id, f"/Invoices/{encoded_id}")
         invoice = _first_item(result, "Invoices", f"Invoice '{invoice_id}' not found")
         summary = _invoice_summary(invoice)
-        summary["line_items"] = invoice.get("LineItems") or []
+        line_items = invoice.get("LineItems")
+        summary["line_items"] = line_items if isinstance(line_items, list) else []
         return success_with_capped_dict("invoice", summary)
     except Exception as e:
         logger.error(f"Error fetching Xero invoice {invoice_id}: {e}")

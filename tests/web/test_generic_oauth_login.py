@@ -947,6 +947,20 @@ def test_resolve_oauth_secret_uses_env_without_decrypting_empty_values(
     )
 
 
+def test_resolve_oauth_secret_normalizes_hyphenated_provider_env_name(monkeypatch):
+    """A hyphenated provider_name (e.g. "employment-hero", or an admin-
+    created "-sandbox" variant of any family) must map to the same
+    underscored env var name every deployment already documents -- env vars
+    can't contain "-" at all, so an unnormalized lookup (EMPLOYMENT-HERO_...)
+    would never match anything a real deployment could set, permanently
+    breaking this fallback for every hyphenated provider."""
+    monkeypatch.setenv("EMPLOYMENT_HERO_CLIENT_SECRET", "env-secret")
+
+    assert (
+        _resolve_oauth_secret("employment-hero", None, "CLIENT_SECRET") == "env-secret"
+    )
+
+
 def test_login_fails_locally_when_client_id_is_missing(db_session, monkeypatch):
     db, user = db_session
     token = _token_for(user)

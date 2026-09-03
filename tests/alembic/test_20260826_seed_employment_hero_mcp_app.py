@@ -201,6 +201,80 @@ def test_downgrade_preserves_admin_created_employment_hero_provider(tmp_path):
         assert "employment-hero" in _provider_names(connection)
 
 
+def test_downgrade_preserves_pre_existing_employment_hero_app(tmp_path):
+    """A pre-existing "employment-hero" app row (different shape than the
+    seeded one) must survive downgrade -- upgrade()'s own `app_id not in
+    existing_app_ids` check skipped inserting over it, so it was never
+    "this migration's row" to remove. Deleting it unconditionally would
+    also make the remaining-employment-hero-apps count wrongly read as
+    zero, letting the oauth_providers row underneath it be deleted too."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_tables(connection)
+        connection.execute(
+            text(
+                "INSERT INTO public_mcp_apps (app_id, name, transport, provider_name)"
+                " VALUES ('employment-hero', 'Custom Employment Hero App', 'oauth',"
+                " 'employment-hero')"
+            )
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+            migration.downgrade()
+        assert "employment-hero" in _app_ids(connection)
+        assert "employment-hero" in _provider_names(connection)
+
+
+def test_downgrade_preserves_app_row_admin_edited_beyond_structural_fields(tmp_path):
+    """An admin who PATCHed the seeded app row's oauth_scopes without
+    touching app_id/name/transport/provider_name must not have that edit
+    silently discarded by downgrade -- matching only those four structural
+    columns isn't enough to prove this is still "this migration's row"
+    once anything else about it has been customized."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_tables(connection)
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+        connection.execute(
+            text(
+                "UPDATE public_mcp_apps SET oauth_scopes = '[\"custom_scope\"]'"
+                " WHERE app_id = 'employment-hero'"
+            )
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.downgrade()
+        assert "employment-hero" in _app_ids(connection)
+
+
+def test_downgrade_preserves_provider_row_admin_edited_beyond_structural_fields(
+    tmp_path,
+):
+    """An admin who edited the seeded provider row's default_scopes without
+    touching provider_name/name/auth_url/token_url must not have that edit
+    silently discarded by downgrade -- the app row is removed as usual (it
+    still matches the seeded shape exactly), but the provider row it
+    depends on must survive since its own shape no longer matches."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_tables(connection)
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+        connection.execute(
+            text(
+                "UPDATE oauth_providers SET default_scopes = '[\"custom_scope\"]'"
+                " WHERE provider_name = 'employment-hero'"
+            )
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.downgrade()
+        assert "employment-hero" not in _app_ids(connection)
+        assert "employment-hero" in _provider_names(connection)
+
+
 def test_upgrade_and_downgrade_no_op_without_tables(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()

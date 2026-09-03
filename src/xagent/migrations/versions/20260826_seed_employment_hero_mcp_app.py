@@ -131,20 +131,67 @@ def upgrade() -> None:
             )
 
 
+def _row_matches_seeded_shape(
+    row: sa.engine.Row, seeded: dict[str, object], compare_columns: set[str]
+) -> bool:
+    """Compare a fetched row against the seeded row dict in Python.
+
+    Deliberately not pushed into the SQL WHERE clause: PostgreSQL's plain
+    ``json`` column type (what oauth_scopes/launch_config/default_scopes
+    actually are -- see the models, no ``.with_variant(JSONB(), ...)``
+    escape hatch here) has no ``=`` operator at all, so
+    ``.where(json_column == python_value)`` compiles fine but raises
+    ``UndefinedFunction: operator does not exist: json = json`` at
+    execute time on Postgres. Comparing in Python after a plain SELECT
+    sidesteps that entirely and works identically on every backend.
+    """
+    return all(row._mapping[column] == seeded[column] for column in compare_columns)
+
+
 def downgrade() -> None:
     bind = op.get_bind()
     inspector = sa.inspect(bind)
     existing_tables = set(inspector.get_table_names())
 
     if "public_mcp_apps" in existing_tables:
-        # Only the catalog entry is removed. Any user OAuth connections created
-        # against this app are not owned by this migration and are cleaned up
-        # through the normal disconnect path.
-        bind.execute(
-            sa.delete(PUBLIC_MCP_APPS_TABLE).where(
+        # Only delete the catalog entry when it still matches the FULL
+        # static shape this migration seeded -- an unconditional
+        # delete-by-app_id would remove a pre-existing operator row that
+        # happened to already occupy app_id "employment-hero" before this
+        # migration ever ran (upgrade()'s own `if APP_ID not in
+        # existing_app_ids` check would have skipped inserting over it, so
+        # upgrade and downgrade must agree on what "this migration's row"
+        # means). Every one of this row's columns is compared, not just a
+        # structural few, since description/is_visible_in_connector are
+        # freely PATCHable today and a raw DB edit (or this app_id later
+        # being dropped from the built-in registry while the row persists)
+        # could diverge any of them. In Python, see
+        # _row_matches_seeded_shape's docstring for why not in SQL.
+        app_row = bind.execute(
+            sa.select(PUBLIC_MCP_APPS_TABLE).where(
                 PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID
             )
-        )
+        ).first()
+        if app_row is not None and _row_matches_seeded_shape(
+            app_row,
+            _employment_hero_app_row(),
+            {
+                "name",
+                "description",
+                "icon",
+                "transport",
+                "provider_name",
+                "category",
+                "oauth_scopes",
+                "is_visible_in_connector",
+                "launch_config",
+            },
+        ):
+            bind.execute(
+                sa.delete(PUBLIC_MCP_APPS_TABLE).where(
+                    PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID
+                )
+            )
 
     if "oauth_providers" not in existing_tables:
         return
@@ -158,17 +205,35 @@ def downgrade() -> None:
         if remaining_employment_hero_apps:
             return
 
-    # Only delete the provider row when it still matches the static shape this
-    # migration seeded, so an admin-created "employment-hero" provider (via
-    # POST /admin/mcp/providers) is preserved. client_id/client_secret are
-    # env-dependent and intentionally not part of the guard. name/auth_url/
-    # token_url are NOT NULL core columns present since the table's creation,
-    # so they can be matched unconditionally.
-    seeded_provider = _employment_hero_provider_row()
-    bind.execute(
-        sa.delete(FULL_OAUTH_PROVIDERS_TABLE)
-        .where(FULL_OAUTH_PROVIDERS_TABLE.c.provider_name == "employment-hero")
-        .where(FULL_OAUTH_PROVIDERS_TABLE.c.name == seeded_provider["name"])
-        .where(FULL_OAUTH_PROVIDERS_TABLE.c.auth_url == seeded_provider["auth_url"])
-        .where(FULL_OAUTH_PROVIDERS_TABLE.c.token_url == seeded_provider["token_url"])
-    )
+    # Only delete the provider row when it still matches the FULL static
+    # shape this migration seeded, so an admin-created or admin-edited
+    # "employment-hero" provider (via POST/PUT /admin/mcp/providers) is
+    # preserved. client_id/client_secret/redirect_uri are env-dependent and
+    # intentionally excluded from the guard; every other column is static
+    # and matched, not just name/auth_url/token_url -- an admin who edited
+    # userinfo_url/user_id_path/email_path/default_scopes without touching
+    # those few fields would otherwise still match and get silently
+    # deleted.
+    provider_row = bind.execute(
+        sa.select(FULL_OAUTH_PROVIDERS_TABLE).where(
+            FULL_OAUTH_PROVIDERS_TABLE.c.provider_name == "employment-hero"
+        )
+    ).first()
+    if provider_row is not None and _row_matches_seeded_shape(
+        provider_row,
+        _employment_hero_provider_row(),
+        {
+            "name",
+            "auth_url",
+            "token_url",
+            "userinfo_url",
+            "user_id_path",
+            "email_path",
+            "default_scopes",
+        },
+    ):
+        bind.execute(
+            sa.delete(FULL_OAUTH_PROVIDERS_TABLE).where(
+                FULL_OAUTH_PROVIDERS_TABLE.c.provider_name == "employment-hero"
+            )
+        )

@@ -999,6 +999,18 @@ async def refresh_oauth_token_if_needed(
         if requires_json_accept_header(normalized_provider):
             headers["Accept"] = "application/json"
 
+        from ..oauth_provider_quirks import matches_provider_family
+
+        if matches_provider_family(normalized_provider, "employment-hero"):
+            # Matches the code-exchange branch in api/auth.py: Employment
+            # Hero's partner guide requires grant_type and refresh_token as
+            # query parameters on the refresh request too, with only the
+            # credential fields in the form body.
+            post_kwargs["params"] = {
+                "grant_type": data.pop("grant_type"),
+                "refresh_token": data.pop("refresh_token"),
+            }
+
         # Matches the code-exchange branch in api/auth.py: Atlassian's token
         # endpoint requires a JSON body on refresh too, not form-urlencoded.
         body_kwarg: dict[str, Any] = {"data": data}
@@ -3869,6 +3881,13 @@ class WebToolConfig(BaseToolConfig):
                         resource_owner_key=None,
                     )
                     .filter(UserOAuth.provider.in_(providers_to_check))
+                    # Deterministic tie-break for the rare case of more than
+                    # one row for this (user, provider) set (e.g. a provider
+                    # whose identity backfill can't always derive a non-NULL
+                    # provider_user_id, like Employment Hero with zero
+                    # accessible organisations) -- most-recently-created wins,
+                    # rather than an arbitrary, backend-dependent row order.
+                    .order_by(UserOAuth.id.desc())
                     .first()
                 )
                 logger.info(
@@ -3885,6 +3904,9 @@ class WebToolConfig(BaseToolConfig):
                         resource_owner_key=None,
                     )
                     .filter(UserOAuth.provider == provider_name)
+                    # See the app_id-scoped branch above for why this is
+                    # ordered rather than left to an arbitrary row order.
+                    .order_by(UserOAuth.id.desc())
                     .first()
                 )
                 logger.info(

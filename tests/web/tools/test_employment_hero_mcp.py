@@ -34,12 +34,18 @@ def test_headers_include_bearer_token():
 
 
 def test_request_raises_with_structured_message(monkeypatch):
+    # `text` deliberately does NOT contain the expected message: MockResponse's
+    # raw-text fallback would otherwise happen to satisfy this test's assertion
+    # even if _extract_error_detail's JSON parsing were broken (returning
+    # None), since the raw-text fallback path is exercised regardless.
     monkeypatch.setattr(
         employment_hero.requests,
         "request",
         Mock(
             return_value=MockResponse(
-                status_code=401, json_data={"message": "invalid or expired token"}
+                status_code=401,
+                json_data={"message": "invalid or expired token"},
+                text="raw fallback body",
             )
         ),
     )
@@ -50,6 +56,8 @@ def test_request_raises_with_structured_message(monkeypatch):
 
 
 def test_request_raises_with_errors_list_of_dicts(monkeypatch):
+    # See test_request_raises_with_structured_message for why `text` must not
+    # itself contain the expected message.
     monkeypatch.setattr(
         employment_hero.requests,
         "request",
@@ -57,6 +65,7 @@ def test_request_raises_with_errors_list_of_dicts(monkeypatch):
             return_value=MockResponse(
                 status_code=422,
                 json_data={"errors": [{"message": "date is required"}]},
+                text="raw fallback body",
             )
         ),
     )
@@ -71,7 +80,9 @@ def test_request_raises_with_errors_list_of_strings(monkeypatch):
         "request",
         Mock(
             return_value=MockResponse(
-                status_code=422, json_data={"errors": ["date is required"]}
+                status_code=422,
+                json_data={"errors": ["date is required"]},
+                text="raw fallback body",
             )
         ),
     )
@@ -88,6 +99,7 @@ def test_request_raises_with_errors_dict_of_field_to_list(monkeypatch):
             return_value=MockResponse(
                 status_code=422,
                 json_data={"errors": {"date": ["is required"]}},
+                text="raw fallback body",
             )
         ),
     )

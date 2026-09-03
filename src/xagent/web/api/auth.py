@@ -160,7 +160,13 @@ def _run_post_commit_oauth_side_effects(
 
 
 def _oauth_env_name(provider: str, suffix: str) -> str:
-    return f"{provider.upper()}_{suffix}"
+    # "-" -> "_" before uppercasing: a hyphenated provider_name (e.g.
+    # "employment-hero", or an admin-created "-sandbox" variant of any
+    # family) would otherwise produce an env var name no deployment could
+    # ever set (env vars can't contain "-"), silently breaking this
+    # fallback for every hyphenated provider. Every non-hyphenated provider
+    # name is unaffected by this replacement.
+    return f"{provider.upper().replace('-', '_')}_{suffix}"
 
 
 def _is_salesforce_provider(provider: str) -> bool:
@@ -650,6 +656,40 @@ def _fetch_deputy_identity(
 
 
 _EMPLOYMENT_HERO_API_BASE = "https://api.employmenthero.com/api/v1"
+_EMPLOYMENT_HERO_HOST_SUFFIX = "employmenthero.com"
+# Safety bound on _fetch_employment_hero_identity's pagination loop -- a
+# misbehaving/malicious response that never returns a short page must not
+# hang this callback in an unbounded fetch; 50 pages at 100 items each
+# (5000 organisations) is far beyond any real grant's scope.
+_EMPLOYMENT_HERO_IDENTITY_MAX_PAGES = 50
+
+
+def _is_employment_hero_token_url(token_url: str) -> bool:
+    """True if `token_url`'s host is employmenthero.com or a subdomain of it.
+
+    Guards the call to _fetch_employment_hero_identity below: matches_
+    provider_family(provider, "employment-hero") trusts provider_name alone
+    (by design -- an admin-created "employment-hero-sandbox" row is exactly
+    the documented workaround this predicate exists for), but nothing else
+    ties that row's `token_url` to the real Employment Hero. Without this
+    check, an admin who points an "employment-hero"-family row's token_url
+    at an unrelated issuer would have this callback take the access token
+    that issuer returns and forward it, as a Bearer credential, to the real
+    api.employmenthero.com -- this check keeps the identity fetch (and the
+    provider_user_id it derives) scoped to grants that actually came from
+    Employment Hero's own token endpoint, falling through to the same
+    NULL-identity path a non-family provider with no userinfo_url takes
+    otherwise.
+    """
+    from urllib.parse import urlparse
+
+    try:
+        hostname = (urlparse(token_url).hostname or "").rstrip(".")
+    except ValueError:
+        return False
+    return hostname == _EMPLOYMENT_HERO_HOST_SUFFIX or hostname.endswith(
+        f".{_EMPLOYMENT_HERO_HOST_SUFFIX}"
+    )
 
 
 def _fetch_employment_hero_identity(
@@ -680,38 +720,52 @@ def _fetch_employment_hero_identity(
     tradeoff _fetch_deputy_identity accepts when Deputy's employee object is
     missing every id-like key.
 
+    Paginates through every page rather than trusting a single 100-item
+    page: a grant with more than 100 accessible organisations would
+    otherwise have its provider_user_id derived from only the first 100,
+    silently excluding the rest from the uniqueness key. Capped at
+    _EMPLOYMENT_HERO_IDENTITY_MAX_PAGES pages as a safety bound against a
+    misbehaving/malicious response that never shrinks below a full page.
+
     Raises RuntimeError on a failed/unparsable response, matching
     _fetch_deputy_identity/_fetch_linear_viewer_identity.
     """
-    response = requests.get(
-        f"{_EMPLOYMENT_HERO_API_BASE}/organisations",
-        headers={"Authorization": f"Bearer {access_token}"},
-        params={"page_index": 1, "item_per_page": 100},
-        timeout=10.0,
-    )
-    if response.status_code != 200:
-        detail = truncate_error_text(response.text.strip(), limit=500)
-        raise RuntimeError(
-            f"Employment Hero API error (status {response.status_code})"
-            + (f": {detail}" if detail else "")
+    item_per_page = 100
+    organisation_ids: set[str] = set()
+    for page_index in range(1, _EMPLOYMENT_HERO_IDENTITY_MAX_PAGES + 1):
+        response = requests.get(
+            f"{_EMPLOYMENT_HERO_API_BASE}/organisations",
+            headers={"Authorization": f"Bearer {access_token}"},
+            params={"page_index": page_index, "item_per_page": item_per_page},
+            timeout=10.0,
         )
-    try:
-        payload = response.json()
-    except ValueError:
-        raise RuntimeError(
-            "Employment Hero API returned a non-JSON response: "
-            f"{truncate_error_text(response.text.strip(), limit=500)}"
-        ) from None
-    data = payload.get("data") if isinstance(payload, dict) else None
-    items = data.get("items") if isinstance(data, dict) else None
-    if not isinstance(items, list):
-        raise RuntimeError("Employment Hero API returned an unexpected response body")
-    organisation_ids = sorted(
-        str(item["id"])
-        for item in items
-        if isinstance(item, dict) and item.get("id") not in (None, "")
-    )
-    provider_user_id = ",".join(organisation_ids) if organisation_ids else None
+        if response.status_code != 200:
+            detail = truncate_error_text(response.text.strip(), limit=500)
+            raise RuntimeError(
+                f"Employment Hero API error (status {response.status_code})"
+                + (f": {detail}" if detail else "")
+            )
+        try:
+            payload = response.json()
+        except ValueError:
+            raise RuntimeError(
+                "Employment Hero API returned a non-JSON response: "
+                f"{truncate_error_text(response.text.strip(), limit=500)}"
+            ) from None
+        data = payload.get("data") if isinstance(payload, dict) else None
+        items = data.get("items") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            raise RuntimeError(
+                "Employment Hero API returned an unexpected response body"
+            )
+        organisation_ids.update(
+            str(item["id"])
+            for item in items
+            if isinstance(item, dict) and item.get("id") not in (None, "")
+        )
+        if len(items) < item_per_page:
+            break
+    provider_user_id = ",".join(sorted(organisation_ids)) if organisation_ids else None
     return provider_user_id, None
 
 
@@ -2714,6 +2768,21 @@ def generic_oauth_callback(
             data["client_id"] = client_id
             data["client_secret"] = client_secret
 
+        params: dict[str, Any] | None = None
+        if matches_provider_family(provider, "employment-hero"):
+            # Employment Hero's partner guide (developer.employmenthero.com
+            # /partner-guides) requires grant_type and redirect_uri as query
+            # parameters on the token URL itself, with only the credential/
+            # code fields (client_id, client_secret, code, code_verifier) in
+            # the form body -- unlike every other provider here, which sends
+            # the full RFC 6749 shape (all fields in the body). Popped out of
+            # `data` rather than duplicated, so they're never sent in both
+            # places.
+            params = {
+                "grant_type": data.pop("grant_type"),
+                "redirect_uri": data.pop("redirect_uri"),
+            }
+
         # Atlassian's token endpoint requires a JSON body -- unlike every
         # other provider here, it does not accept form-urlencoded and
         # answers a form-encoded POST with a 400.
@@ -2728,7 +2797,12 @@ def generic_oauth_callback(
             post_kwargs = {"json": data}
 
         token_response = requests.post(
-            token_url, headers=headers, timeout=10.0, auth=auth, **post_kwargs
+            token_url,
+            headers=headers,
+            timeout=10.0,
+            auth=auth,
+            params=params,
+            **post_kwargs,
         )
         try:
             token_data = token_response.json()
@@ -3024,7 +3098,9 @@ def generic_oauth_callback(
                     ),
                     status_code=400,
                 )
-        elif matches_provider_family(provider, "employment-hero"):
+        elif matches_provider_family(
+            provider, "employment-hero"
+        ) and _is_employment_hero_token_url(token_url):
             # Employment Hero's userinfo_url is deliberately left empty (see
             # the registry row's comment) -- there's no OIDC-style "me"
             # endpoint to point the generic `elif userinfo_url and
@@ -3034,7 +3110,10 @@ def generic_oauth_callback(
             # token-id fallback above exists to close -- except Employment
             # Hero's token response carries no equivalent "id" field, so
             # _fetch_employment_hero_identity makes the extra request
-            # instead, mirroring Deputy/Linear's own dedicated fetches.
+            # instead, mirroring Deputy/Linear's own dedicated fetches. The
+            # _is_employment_hero_token_url guard keeps this scoped to rows
+            # whose token_url is actually Employment Hero's own -- see that
+            # function's docstring.
             try:
                 provider_user_id, email = _fetch_employment_hero_identity(access_token)
             except RuntimeError as e:

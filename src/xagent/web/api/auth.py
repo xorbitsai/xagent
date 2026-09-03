@@ -2634,9 +2634,13 @@ def generic_oauth_callback(
         if requires_json_accept_header(provider):
             headers["Accept"] = "application/json"
         auth: tuple[str, str] | None = None
-        if provider.lower() == "zoom":
-            # Zoom's token endpoint requires HTTP Basic Auth for client
-            # credentials (client_id:client_secret, base64).
+        if provider.lower() in ("zoom", "xero"):
+            # Zoom's and Xero's token endpoints both require HTTP Basic Auth
+            # for client credentials (client_id:client_secret, base64) --
+            # confirmed for Xero directly against its official SDK
+            # (XeroAPI/xero-node's tokenRequest()), which authenticates the
+            # same authorization_code/refresh_token exchange this way rather
+            # than posting client_id/client_secret in the body.
             auth = (client_id, client_secret)
         else:
             data["client_id"] = client_id

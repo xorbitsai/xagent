@@ -930,12 +930,16 @@ async def refresh_oauth_token_if_needed(
         }
         post_kwargs: dict[str, Any] = {}
         # Matches the code-exchange branch in api/auth.py: an admin-created
-        # provider named "Zoom" would otherwise connect fine but silently
-        # fail every refresh an hour later.
-        if normalized_provider == "zoom":
-            # Zoom's token endpoint requires HTTP Basic Auth for client
-            # credentials (client_id:client_secret, base64) on every refresh,
-            # same as the initial code exchange.
+        # provider named "Zoom" or "Xero" would otherwise connect fine but
+        # silently fail every refresh (Xero's access token lives only 30
+        # minutes, so this would surface fast).
+        if normalized_provider in ("zoom", "xero"):
+            # Zoom's and Xero's token endpoints both require HTTP Basic Auth
+            # for client credentials (client_id:client_secret, base64) on
+            # every refresh, same as the initial code exchange -- confirmed
+            # for Xero directly against its official SDK (XeroAPI/xero-node's
+            # tokenRequest(), shared by both the code-exchange and
+            # refresh_token grants).
             post_kwargs["auth"] = httpx.BasicAuth(client_id, client_secret)
         else:
             data["client_id"] = client_id

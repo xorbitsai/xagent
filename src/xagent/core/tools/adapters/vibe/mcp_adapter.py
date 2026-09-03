@@ -1135,6 +1135,12 @@ class MCPToolAdapter(AbstractBaseTool):
                         parsed_value = json.loads(value)
                     except json.JSONDecodeError:
                         parsed_value = None
+                    except RecursionError:
+                        # A pathologically deep/adversarial bracket string
+                        # (e.g. thousands of nested "[") blows the C parser's
+                        # recursion limit instead of raising JSONDecodeError.
+                        # Treat it the same as any other unparsable value.
+                        parsed_value = None
                     if isinstance(parsed_value, list):
                         normalized_args[field_name] = parsed_value
                         continue

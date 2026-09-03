@@ -964,6 +964,24 @@ def test_normalize_args_by_schema_falls_back_to_raw_wrap_for_non_list_json(value
     assert normalized["dimensions"] == [value]
 
 
+def test_normalize_args_by_schema_falls_back_to_raw_wrap_on_recursion_error():
+    """A pathologically deep bracket string makes json.loads raise
+    RecursionError rather than JSONDecodeError. That must be treated the
+    same as any other unparsable value (fall back to the raw wrap), not
+    propagate as an unhandled exception."""
+    adapter = MCPToolAdapter(
+        mcp_tool=_google_analytics_run_report_mcp_tool(),
+        connection={"transport": "stdio", "command": "python", "args": []},
+    )
+    deeply_nested = "[" * 100_000 + "]" * 100_000
+
+    normalized = adapter._normalize_args_by_schema(
+        {"property_id": "550713710", "dimensions": deeply_nested}
+    )
+
+    assert normalized["dimensions"] == [deeply_nested]
+
+
 def test_normalize_args_by_schema_keeps_scalar_for_union_scalar_or_array_field():
     mcp_tool = SimpleNamespace(
         name="multi_shape_tool",

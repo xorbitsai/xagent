@@ -1,7 +1,7 @@
 """seed built-in Zendesk (key-based) MCP connector
 
 Revision ID: 20260901_seed_zendesk_mcp_app
-Revises: 20260901_seed_mixpanel_mcp_app
+Revises: 20260903_model_management
 Create Date: 2026-09-01 00:00:00.000000
 
 """

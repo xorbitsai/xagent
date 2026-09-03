@@ -518,11 +518,13 @@ def test_search_returns_empty_past_result_window_without_calling_zendesk(monkeyp
 
     result = json.loads(zendesk.zendesk_search("type:ticket", limit=100, page=page))
 
+    # Nested the same way as the normal success path (results is a dict,
+    # not a list) -- this tool must return one consistent shape regardless
+    # of how far it paged.
     assert result == {
         "status": "success",
-        "results": [],
-        "count": None,
-        "has_more": False,
+        "results": {"results": [], "count": None, "has_more": False},
+        "truncated": False,
     }
     mock_request.assert_not_called()
 
@@ -561,6 +563,11 @@ def test_list_tickets_caps_output_size(monkeypatch):
     assert result["status"] == "success"
     assert result["truncated"] is True
     assert 0 < len(result["tickets"]) < len(big_tickets)
+    # Zendesk's own meta said this was the last page (has_more: False), but
+    # truncation dropped tickets this call never returned -- has_more must
+    # reflect that regardless of what Zendesk's meta said, or a caller that
+    # trusts has_more alone will stop paging and silently lose them.
+    assert result["has_more"] is True
     assert len(raw) <= 2000 + 200  # last halving step can overshoot
 
 
@@ -921,7 +928,11 @@ def test_search_users_returns_empty_past_result_window_without_calling_zendesk(
         zendesk.zendesk_search_users("jane@example.com", limit=100, page=page)
     )
 
-    assert result == {"status": "success", "users": [], "has_more": False}
+    assert result == {
+        "status": "success",
+        "users": {"users": [], "has_more": False},
+        "truncated": False,
+    }
     mock_request.assert_not_called()
 
 

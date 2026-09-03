@@ -284,7 +284,8 @@ def _cursor_page(
     meta = payload.get("meta") or {}
     has_more = bool(meta.get("has_more")) or len(items) > limit
     after_cursor = meta.get("after_cursor")
-    if has_more and page and not after_cursor:
+    cursor_expected = has_more and bool(page)
+    if cursor_expected and not after_cursor:
         # Zendesk's own cursor-pagination contract guarantees an
         # after_cursor whenever has_more is true. A response that violates
         # that (e.g. more rows than the page[size] this call requested, but
@@ -297,7 +298,7 @@ def _cursor_page(
             "return a resume cursor -- this violates its own documented "
             "cursor-pagination contract"
         )
-    return page, has_more, after_cursor if (has_more and page) else None
+    return page, has_more, after_cursor if cursor_expected else None
 
 
 def _offset_page(
@@ -332,7 +333,11 @@ def _list_cursor_paginated(
     def _build(page: list[dict[str, Any]], cursor: str | None, truncated: bool) -> str:
         return _success(
             **{list_key: page},
-            has_more=has_more,
+            # A truncated page must report has_more=True even if Zendesk's
+            # own meta said this was the last page: the items dropped by
+            # truncation are still unread, so a caller that trusts has_more
+            # alone (a natural reading of that field) must not stop here.
+            has_more=has_more or truncated,
             after_cursor=cursor,
             truncated=truncated,
         )
@@ -351,7 +356,7 @@ def _list_cursor_paginated(
     # -- Zendesk still considers the full untruncated page consumed, so
     # the only way to recover the trimmed items is retrying that same
     # starting point with a smaller `limit`, mirroring hubspot.py's
-    # _paged_list / shopify.py's _success_paginated.
+    # _paged_list.
     fallback_cursor = after_cursor or None
     while len(response) > max_output_length and summaries:
         summaries = summaries[: len(summaries) // 2]
@@ -478,7 +483,12 @@ def zendesk_search(query: str, limit: int = 25, page: int = 1) -> str:
             # itself would answer with an opaque HTTP error here, so return
             # a clean, predictable "no more results" instead of forwarding
             # a caller mechanically incrementing `page` into that error.
-            return _success(results=[], count=None, has_more=False)
+            # Nested the same way as the success_with_capped_dict call
+            # below -- a flat shape here would make this tool return two
+            # different response shapes depending on how far it paged.
+            return success_with_capped_dict(
+                "results", {"results": [], "count": None, "has_more": False}
+            )
         result = _request(
             "GET",
             "/search.json",
@@ -733,8 +743,10 @@ def zendesk_search_users(query: str, limit: int = 25, page: int = 1) -> str:
         page = max(1, page)
         if (page - 1) * max_results >= _MAX_SEARCH_RESULT_WINDOW:
             # Past Zendesk's own documented result-window ceiling -- see
-            # zendesk_search's identical guard for why.
-            return _success(users=[], has_more=False)
+            # zendesk_search's identical guard for why. Nested the same way
+            # as the success_with_capped_dict call below, for the same
+            # reason zendesk_search's guard is.
+            return success_with_capped_dict("users", {"users": [], "has_more": False})
         result = _request(
             "GET",
             "/users/search.json",

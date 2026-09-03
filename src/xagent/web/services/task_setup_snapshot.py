@@ -70,6 +70,14 @@ class _TaskFields:
     run_id: str | None = None
     state_version: int = 0
     control_state: str | None = None
+    # Non-None for a task driven by an IM bot (Feishu/Slack/Telegram) -
+    # together with ``source``, this is what decides whether an OAuth-
+    # required tool failure may pause with an interactive connect_apps card
+    # (see WebToolConfig's connect_apps_interactive) instead of the plain
+    # error every non-web/SDK surface still gets: a bot channel can only
+    # project the pause to text, and a hidden/widget/shared_link task has no
+    # McpAppsProvider to render the card's OAuth actions at all.
+    channel_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -316,6 +324,9 @@ def load_task_setup_snapshot_sync(
             user_id=int(task_row.user_id),
             status=task_row.status,
             source=str(task_row.source) if task_row.source is not None else None,
+            channel_id=(
+                int(task_row.channel_id) if task_row.channel_id is not None else None
+            ),
             agent_id=int(task_row.agent_id) if task_row.agent_id is not None else None,
             agent_config=(
                 dict(task_row.agent_config)

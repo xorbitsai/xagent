@@ -144,6 +144,94 @@ def test_base_url_raises_when_dns_resolution_fails(monkeypatch):
         magento._base_url()
 
 
+def test_resolve_store_host_returns_hostname_port_and_first_valid_ip(monkeypatch):
+    monkeypatch.setattr(
+        magento.socket, "getaddrinfo", _fake_getaddrinfo("1.1.1.1", "2.2.2.2")
+    )
+
+    hostname, port, pinned_ip = magento._resolve_store_host()
+
+    assert hostname == "store.example.com"
+    assert port is None
+    assert pinned_ip == "1.1.1.1"
+
+
+def test_pinned_dns_redirects_matching_host_to_pinned_ip(monkeypatch):
+    calls = []
+
+    def _fake_create_connection(address, *args, **kwargs):
+        calls.append(address)
+        return "sentinel-socket"
+
+    monkeypatch.setattr(
+        magento.urllib3_connection, "create_connection", _fake_create_connection
+    )
+
+    with magento._pinned_dns("store.example.com", "9.9.9.9"):
+        result = magento.urllib3_connection.create_connection(
+            ("store.example.com", 443)
+        )
+
+    assert result == "sentinel-socket"
+    assert calls == [("9.9.9.9", 443)]
+
+
+def test_pinned_dns_leaves_other_hosts_untouched(monkeypatch):
+    calls = []
+
+    def _fake_create_connection(address, *args, **kwargs):
+        calls.append(address)
+        return "sentinel-socket"
+
+    monkeypatch.setattr(
+        magento.urllib3_connection, "create_connection", _fake_create_connection
+    )
+
+    with magento._pinned_dns("store.example.com", "9.9.9.9"):
+        magento.urllib3_connection.create_connection(("other-host.example.com", 443))
+
+    assert calls == [("other-host.example.com", 443)]
+
+
+def test_pinned_dns_restores_original_function_on_exit(monkeypatch):
+    original = magento.urllib3_connection.create_connection
+
+    with magento._pinned_dns("store.example.com", "9.9.9.9"):
+        assert magento.urllib3_connection.create_connection is not original
+
+    assert magento.urllib3_connection.create_connection is original
+
+
+def test_pinned_dns_restores_original_function_on_exception(monkeypatch):
+    original = magento.urllib3_connection.create_connection
+
+    with pytest.raises(RuntimeError):
+        with magento._pinned_dns("store.example.com", "9.9.9.9"):
+            raise RuntimeError("boom")
+
+    assert magento.urllib3_connection.create_connection is original
+
+
+def test_request_pins_connection_to_validated_ip(monkeypatch):
+    # End-to-end: _request() must pin the same IP _resolve_store_host()
+    # validated, not let requests/urllib3 re-resolve independently.
+    connect_calls = []
+
+    def _fake_create_connection(address, *args, **kwargs):
+        connect_calls.append(address)
+        raise OSError("no real network in tests")
+
+    monkeypatch.setattr(
+        magento.urllib3_connection, "create_connection", _fake_create_connection
+    )
+
+    with pytest.raises(RuntimeError):
+        magento._request("GET", "/products/abc")
+
+    assert connect_calls
+    assert all(addr[0] == "1.1.1.1" for addr in connect_calls)
+
+
 def test_api_base_url_defaults_to_v1(monkeypatch):
     assert magento._api_base_url() == "https://store.example.com/rest/V1"
 
@@ -719,6 +807,42 @@ def test_get_category_returns_summary(monkeypatch):
 
     assert result["status"] == "success"
     assert result["category"]["name"] == "Shirts"
+
+
+def test_category_summary_returns_empty_dict_for_none():
+    assert magento._category_summary(None) == {}
+
+
+def test_category_summary_returns_empty_dict_for_non_dict():
+    assert magento._category_summary("not-a-category") == {}
+
+
+def test_category_summary_filters_out_falsy_children():
+    # None and {} entries in children_data are dropped outright (skipped
+    # before recursing), not turned into an empty-dict placeholder.
+    summary = magento._category_summary(
+        {
+            "id": 1,
+            "name": "Root",
+            "children_data": [None, {"id": 2, "name": "Child"}, {}],
+        }
+    )
+
+    assert summary["name"] == "Root"
+    assert [child.get("name") for child in summary["children_data"]] == ["Child"]
+
+
+def test_get_category_handles_null_category_response(monkeypatch):
+    monkeypatch.setattr(
+        magento.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data=None)),
+    )
+
+    result = json.loads(magento.magento_get_category(3))
+
+    assert result["status"] == "success"
+    assert result["category"] == {}
 
 
 def test_magento_app_registry_requires_base_url_and_token():

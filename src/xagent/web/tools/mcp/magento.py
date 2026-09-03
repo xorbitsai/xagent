@@ -1,13 +1,15 @@
+import contextlib
 import json
 import logging
 import re
 import socket
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from os import environ
 from typing import Any
 from urllib.parse import urlsplit
 
 import requests
+import urllib3.util.connection as urllib3_connection
 from mcp.server.fastmcp import FastMCP
 
 from ....core.utils.security import (
@@ -72,8 +74,8 @@ def _headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
 
-def _base_url() -> str:
-    """Validate and return the store's bare origin (scheme + host[:port]).
+def _resolve_store_host() -> tuple[str, int | None, str]:
+    """Validate MAGENTO_BASE_URL and resolve it to a single non-private IP.
 
     Unlike Shopify/Zendesk (always a "*.myshopify.com"/"*.zendesk.com"
     subdomain), Magento/Adobe Commerce is commonly self-hosted at an
@@ -84,6 +86,15 @@ def _base_url() -> str:
     connector will ever send its Bearer token there -- the primary SSRF
     defense here, not just defense-in-depth, since (again unlike PostHog)
     there is no small fixed-hostname allowlist to lean on first.
+
+    Returns (hostname, port, pinned_ip). `_request()` pins its actual TCP
+    connection to `pinned_ip` (see `_pinned_dns` below) instead of letting
+    `requests`/urllib3 re-resolve the hostname independently right before
+    connecting: without that, the address validated here and the address
+    actually connected to a moment later could differ -- a DNS-rebinding
+    TOCTOU where an attacker-controlled, low-TTL DNS record answers with a
+    public IP for this check and a private one (e.g. 127.0.0.1 or a cloud
+    metadata endpoint) for the real connection, defeating this whole check.
     """
     raw = environ.get("MAGENTO_BASE_URL", "").strip()
     if not raw:
@@ -112,20 +123,41 @@ def _base_url() -> str:
         resolved = socket.getaddrinfo(
             hostname, port or 443, socket.AF_UNSPEC, socket.SOCK_STREAM
         )
-        for *_, sockaddr in resolved:
-            reject_private_network_host(str(sockaddr[0]))
-    except PrivateNetworkHostError as exc:
-        raise ValueError(f"MAGENTO_BASE_URL is not allowed: {exc}") from exc
     except OSError as exc:
         raise ValueError(f"MAGENTO_BASE_URL could not be resolved: {exc}") from exc
 
+    pinned_ip: str | None = None
+    try:
+        for *_, sockaddr in resolved:
+            ip = str(sockaddr[0])
+            reject_private_network_host(ip)
+            if pinned_ip is None:
+                pinned_ip = ip
+    except PrivateNetworkHostError as exc:
+        raise ValueError(f"MAGENTO_BASE_URL is not allowed: {exc}") from exc
+    if pinned_ip is None:
+        raise ValueError(
+            "MAGENTO_BASE_URL could not be resolved: no addresses returned"
+        )
+
+    return hostname, port, pinned_ip
+
+
+def _base_url() -> str:
+    """Validate MAGENTO_BASE_URL and return the store's bare origin (scheme
+    + host[:port]). `_request()` does not call this -- it calls
+    `_resolve_store_host()` directly so a single logical request resolves
+    DNS exactly once and can pin its connection to the address it
+    validated (see `_resolve_store_host`'s docstring); this function exists
+    for its own standalone validation/error-message behavior only."""
+    hostname, port, _pinned_ip = _resolve_store_host()
     origin = f"https://{hostname}"
     if port:
         origin += f":{port}"
     return origin
 
 
-def _api_base_url() -> str:
+def _store_path_prefix() -> str:
     """MAGENTO_STORE_CODE scopes every call to one store view (a Magento
     installation with multiple storefronts/languages can have several) --
     left unset, /rest/V1/ resolves to the default store view, which is the
@@ -133,7 +165,7 @@ def _api_base_url() -> str:
     and requires no extra setup from those users."""
     store_code = environ.get("MAGENTO_STORE_CODE", "").strip()
     if not store_code:
-        return f"{_base_url()}/rest/V1"
+        return "/rest/V1"
     # Magento store codes are themselves restricted to this shape (letters,
     # digits, underscores); enforcing it here means a misconfigured env var
     # (e.g. one containing "/" or "?") fails with a clear error instead of
@@ -144,7 +176,54 @@ def _api_base_url() -> str:
             "MAGENTO_STORE_CODE must contain only letters, digits, and "
             f"underscores, got {store_code!r}"
         )
-    return f"{_base_url()}/rest/{store_code}/V1"
+    return f"/rest/{store_code}/V1"
+
+
+def _api_base_url() -> str:
+    return f"{_base_url()}{_store_path_prefix()}"
+
+
+@contextlib.contextmanager
+def _pinned_dns(hostname: str, pinned_ip: str) -> Iterator[None]:
+    """Force any connection to `hostname` made inside this block to dial
+    `pinned_ip` directly, without a second DNS lookup -- closes the
+    TOCTOU/DNS-rebinding window between `_resolve_store_host()`'s
+    validation and the connection `requests` would otherwise make on its
+    own (urllib3's `HTTPConnection._new_conn()` calls
+    `urllib3.util.connection.create_connection()`, which does its own
+    independent `socket.getaddrinfo()`).
+
+    This only repoints the TCP connect address: the Host header and TLS
+    SNI/certificate-hostname verification are untouched, since urllib3
+    reads those from `self.host` (still `hostname`, because the request
+    URL itself is never rewritten to the IP) completely separately from
+    the address `create_connection()` dials -- confirmed directly against
+    the installed urllib3's `connection.py` (`HTTPSConnection.connect()`
+    sets `server_hostname = self.host` independently of `_new_conn()`).
+
+    Scoped to this one call (patched in, restored in `finally`) rather
+    than a permanent global patch: `urllib3.util.connection.create_connection`
+    is process-global state, and while this connector's process is
+    presently spawned fresh per tool call (see intercom.py's identical
+    single-token-cache reasoning) and so never actually races with itself,
+    scoping the patch to the exact call that needs it means that
+    assumption doesn't have to keep holding for this to stay correct.
+    """
+    original_create_connection = urllib3_connection.create_connection
+
+    def _pinned_create_connection(
+        address: tuple[str, int], *args: Any, **kwargs: Any
+    ) -> Any:
+        host, port = address
+        if host == hostname:
+            address = (pinned_ip, port)
+        return original_create_connection(address, *args, **kwargs)
+
+    urllib3_connection.create_connection = _pinned_create_connection
+    try:
+        yield
+    finally:
+        urllib3_connection.create_connection = original_create_connection
 
 
 def _clamp_limit(limit: int) -> int:
@@ -211,22 +290,28 @@ def _request(
     params: dict[str, Any] | None = None,
     json_data: dict[str, Any] | None = None,
 ) -> Any:
-    url = f"{_api_base_url()}{path}"
+    # Resolved once here (not via _api_base_url()/_base_url()) so this
+    # single request gets exactly one DNS lookup, and the connection below
+    # can be pinned to the same address that lookup validated.
+    hostname, port, pinned_ip = _resolve_store_host()
+    origin = f"https://{hostname}" + (f":{port}" if port else "")
+    url = f"{origin}{_store_path_prefix()}{path}"
     try:
-        response = requests.request(
-            method=method,
-            url=url,
-            headers=_headers(),
-            params=params,
-            json=json_data,
-            timeout=DEFAULT_TIMEOUT_SECONDS,
-            # A redirect response is never followed with the Bearer header
-            # still attached: a self-hosted store redirecting an API call
-            # (e.g. an http->https or www-canonicalization rule misapplied
-            # to /rest/) is either a misconfiguration or a host trying to
-            # relay the credential elsewhere.
-            allow_redirects=False,
-        )
+        with _pinned_dns(hostname, pinned_ip):
+            response = requests.request(
+                method=method,
+                url=url,
+                headers=_headers(),
+                params=params,
+                json=json_data,
+                timeout=DEFAULT_TIMEOUT_SECONDS,
+                # A redirect response is never followed with the Bearer header
+                # still attached: a self-hosted store redirecting an API call
+                # (e.g. an http->https or www-canonicalization rule misapplied
+                # to /rest/) is either a misconfiguration or a host trying to
+                # relay the credential elsewhere.
+                allow_redirects=False,
+            )
     except requests.RequestException as exc:
         # A connection/timeout/proxy failure's message can itself embed
         # sensitive data -- e.g. a ProxyError echoing the ambient
@@ -379,6 +464,12 @@ def _customer_summary(customer: dict[str, Any]) -> dict[str, Any]:
 
 
 def _category_summary(category: dict[str, Any]) -> dict[str, Any]:
+    # A malformed/partial response could hand back a null or non-dict
+    # category (top-level, or as one of children_data's own entries, since
+    # this function recurses into those) -- fail to an empty summary for
+    # that one node instead of an AttributeError on .get().
+    if not category or not isinstance(category, dict):
+        return {}
     return {
         "id": category.get("id"),
         "parent_id": category.get("parent_id"),
@@ -388,7 +479,9 @@ def _category_summary(category: dict[str, Any]) -> dict[str, Any]:
         "level": category.get("level"),
         "product_count": category.get("product_count"),
         "children_data": [
-            _category_summary(child) for child in category.get("children_data") or []
+            _category_summary(child)
+            for child in category.get("children_data") or []
+            if child
         ],
     }
 

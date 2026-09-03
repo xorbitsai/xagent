@@ -335,6 +335,26 @@ def _oauth_scope_separator(provider: str) -> str:
     return " "
 
 
+def _oauth_scope_str(
+    default_scopes: list[str] | None, app_scopes: list[str] | None, provider: str
+) -> str:
+    """Merge provider default scopes with an app row's oauth_scopes and join
+    them into one scope string, using the same two shared primitives
+    (_merge_oauth_scopes, _oauth_scope_separator) every scope computation in
+    this file already goes through.
+
+    Used by MYOB's token-exchange leg in generic_oauth_callback, which has
+    no default_scopes of its own and sources everything from the app row.
+    _generic_oauth_login's own authorize-redirect leg computes the merged
+    list inline instead of through this helper, since it needs that
+    intermediate list again afterward (to exclude required scopes from
+    optional_scope) -- not a second reimplementation of this logic, just a
+    second caller of the same two primitives this wraps.
+    """
+    scopes = _merge_oauth_scopes(default_scopes or [], app_scopes)
+    return _oauth_scope_separator(provider).join(scopes)
+
+
 def _meta_login_config_id() -> str:
     return os.environ.get("META_CONFIG_ID", "")
 
@@ -2722,11 +2742,11 @@ def generic_oauth_callback(
                 if app_id and isinstance(target_app_info, dict)
                 else None
             )
-            myob_scopes = _merge_oauth_scopes(
-                db_provider.default_scopes or [], myob_app_scopes
+            myob_scope_str = _oauth_scope_str(
+                db_provider.default_scopes, myob_app_scopes, provider
             )
-            if myob_scopes:
-                data["scope"] = _oauth_scope_separator(provider).join(myob_scopes)
+            if myob_scope_str:
+                data["scope"] = myob_scope_str
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
         if requires_json_accept_header(provider):
             headers["Accept"] = "application/json"
@@ -3059,13 +3079,13 @@ def generic_oauth_callback(
             raw_user = token_data.get("user")
             if isinstance(raw_user, dict):
                 raw_provider_user_id = raw_user.get("uid")
-                provider_user_id = (
+                uid_str = (
                     str(raw_provider_user_id)
                     if isinstance(raw_provider_user_id, (str, int))
                     and not isinstance(raw_provider_user_id, bool)
-                    and str(raw_provider_user_id)
-                    else None
+                    else ""
                 )
+                provider_user_id = uid_str or None
                 raw_username = raw_user.get("username")
                 email = (
                     raw_username

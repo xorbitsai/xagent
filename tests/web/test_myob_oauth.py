@@ -180,6 +180,16 @@ def test_login_sets_prompt_consent_for_myob(db_session):
     qs = parse_qs(urlparse(url).query)
 
     assert qs.get("prompt") == ["consent"], f"myob prompt missing: {url}"
+    # Closes the gap a review round flagged: the authorize-redirect leg and
+    # the token-exchange leg (test_callback_persists_business_id_and_identity
+    # below) both compute this scope string via the same shared
+    # _oauth_scope_str helper now -- this pins the authorize side so a
+    # future change to either leg alone would show up as a mismatch between
+    # the two tests, not silently diverge unnoticed.
+    assert qs.get("scope") == [
+        "sme-company-file sme-contacts-customer sme-contacts-supplier "
+        "sme-general-ledger sme-purchases sme-sales"
+    ]
 
 
 def test_bare_myob_login_is_rejected_once_authenticated_and_configured(db_session):

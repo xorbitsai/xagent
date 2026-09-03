@@ -104,7 +104,18 @@ def _extract_error_detail(response: requests.Response) -> str | None:
             continue
         name = entry.get("Name") or ""
         message = entry.get("Message") or ""
-        details = entry.get("AdditionalDetails") or ""
+        # AdditionalDetails is usually a plain string, but at least one
+        # documented MYOB error shape carries it as a list of per-field
+        # messages -- joined into readable text here rather than left to
+        # fall through to the generic str(part) below, which would embed a
+        # raw Python list repr (e.g. "['TaxCode is required']") in the
+        # message surfaced to the LLM.
+        raw_details = entry.get("AdditionalDetails")
+        details = (
+            ", ".join(str(item) for item in raw_details if item)
+            if isinstance(raw_details, list)
+            else raw_details or ""
+        )
         parts.append(" ".join(str(part) for part in (name, message, details) if part))
     return "; ".join(part for part in parts if part) or None
 

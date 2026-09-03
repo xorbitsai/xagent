@@ -113,6 +113,40 @@ def test_request_raises_with_joined_errors_array(monkeypatch):
     assert "CompanyName is required" in str(excinfo.value)
 
 
+def test_request_joins_list_shaped_additional_details(monkeypatch):
+    # At least one documented MYOB error shape carries AdditionalDetails as
+    # a list of per-field messages, not a plain string -- must be joined
+    # into readable text, not fall through to a raw Python list repr like
+    # "['TaxCode is required', 'Customer is required']".
+    monkeypatch.setattr(
+        myob.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                status_code=400,
+                json_data={
+                    "Errors": [
+                        {
+                            "Name": "ValidationException",
+                            "Message": "Required fields are missing",
+                            "AdditionalDetails": [
+                                "TaxCode is required",
+                                "Customer is required",
+                            ],
+                        }
+                    ]
+                },
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        myob._request("GET", "Contact/Customer/")
+
+    assert "TaxCode is required, Customer is required" in str(excinfo.value)
+    assert "[" not in str(excinfo.value)
+
+
 def test_request_falls_back_to_raw_text_for_unstructured_error(monkeypatch):
     monkeypatch.setattr(
         myob.requests,

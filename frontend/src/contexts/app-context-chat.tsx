@@ -1162,6 +1162,19 @@ const normalizeDagExecutionPayload = (raw: Record<string, unknown>): DAGExecutio
   } as DAGExecution
 }
 
+/**
+ * The structured disposition a terminal `agent_error` frame carries for one
+ * durable command (#1500). `resendSafe` is asserted by the backend only when
+ * the failed handoff proved the command never reached the downstream
+ * operation; everything else — including frames from backends that predate
+ * the field — reads as "may be committed or still in flight".
+ */
+export interface TerminalCommandOutcome {
+  outcome: "failed"
+  resendSafe: boolean
+  messageCode: string | null
+}
+
 export interface AppState {
   messages: Message[]
   currentTask: Task | null
@@ -1207,6 +1220,19 @@ export interface AppState {
   // Current context-window usage from the latest LLM call, for the usage gauge.
   contextUsage: { tokens: number; threshold: number } | null
   sessionConversation: SessionConversationState
+  // Terminal dispositions keyed by the durable command id (the sender's own
+  // client message id), so a submitter can decide whether its accepted reply
+  // is safe to resend. Command ids are unique, which is what makes exact-id
+  // correlation immune to stale or cross-run outcomes (#1500).
+  commandOutcomes: Record<string, TerminalCommandOutcome>
+  // The reply command each clarification round is still accountable for,
+  // keyed by request id. Context state, not component state: the same round
+  // can render in more than one ClarificationForm instance (virtual waiting
+  // message vs. persisted timeline message), and the retry gate must survive
+  // the submitting instance being replaced (#1500). Rounds without a
+  // request id are deliberately not tracked - with no round identity a
+  // recorded reply could gate a different question.
+  clarificationSubmissions: Record<string, { commandId: string }>
 }
 
 type AppAction =
@@ -1219,6 +1245,9 @@ type AppAction =
   | { type: "SET_CURRENT_TASK"; payload: Task | null }
   | { type: "SET_TASK_RUNTIME_EXTENSIONS"; payload: { taskId: number; extensions: TaskRuntimeExtensions } }
   | { type: "UPDATE_TASK_STATUS"; payload: { status: Task["status"]; waitingQuestion?: string; waitingInteractions?: Interaction[]; waitingRequestId?: string; runId?: string | null; stateVersion?: number; controlState?: TaskControlState; updatedAt?: string } }
+  | { type: "RECORD_COMMAND_OUTCOME"; payload: { commandId: string; outcome: TerminalCommandOutcome } }
+  | { type: "RECORD_CLARIFICATION_SUBMISSION"; payload: { requestId: string; commandId: string } }
+  | { type: "CLEAR_CLARIFICATION_SUBMISSION"; payload: { requestId: string } }
   | { type: "TRIGGER_TASK_UPDATE" }
   | { type: "SET_DAG_EXECUTION"; payload: DAGExecution | null }
   | { type: "RESET_DAG_STATE" }
@@ -1291,6 +1320,8 @@ const createInitialState = (): AppState => ({
   isHistoryLoading: false,
   contextUsage: null,
   sessionConversation: { ...initialSessionConversationState },
+  commandOutcomes: {},
+  clarificationSubmissions: {},
 })
 
 function projectAppState(state: AppState, action: AppAction): AppState {
@@ -1307,6 +1338,30 @@ function projectAppState(state: AppState, action: AppAction): AppState {
       }
     case "SET_HISTORY_LOADING":
       return { ...state, isHistoryLoading: action.payload }
+    case "RECORD_COMMAND_OUTCOME":
+      return {
+        ...state,
+        commandOutcomes: {
+          ...state.commandOutcomes,
+          [action.payload.commandId]: action.payload.outcome,
+        },
+      }
+    case "RECORD_CLARIFICATION_SUBMISSION":
+      return {
+        ...state,
+        clarificationSubmissions: {
+          ...state.clarificationSubmissions,
+          [action.payload.requestId]: { commandId: action.payload.commandId },
+        },
+      }
+    case "CLEAR_CLARIFICATION_SUBMISSION": {
+      if (!(action.payload.requestId in state.clarificationSubmissions)) {
+        return state
+      }
+      const remaining = { ...state.clarificationSubmissions }
+      delete remaining[action.payload.requestId]
+      return { ...state, clarificationSubmissions: remaining }
+    }
 
     case "SYNC_PROCESSING_STATUS":
       if (shouldStopProcessingForTaskStatus(state.currentTask?.status)) {
@@ -5780,6 +5835,30 @@ export function AppProvider({
         const agentErrorTaskStatus = staleControlErrorFrame
           ? null
           : getWebSocketTaskStatus(message)
+
+        // A terminal frame for a durable command carries a structured
+        // disposition (#1500). Record it keyed by command id so the
+        // submitter of that exact command can make its retry decision;
+        // `resend_safe` is trusted only as a literal true, so frames from
+        // backends that predate the field stay in the unsafe reading.
+        const agentErrorData = asMessageRecord(message.data)
+        const terminalCommandId = agentErrorData.command_id
+        if (typeof terminalCommandId === "string" && terminalCommandId
+          && agentErrorData.outcome === "failed") {
+          dispatch({
+            type: "RECORD_COMMAND_OUTCOME",
+            payload: {
+              commandId: terminalCommandId,
+              outcome: {
+                outcome: "failed",
+                resendSafe: agentErrorData.resend_safe === true,
+                messageCode: typeof agentErrorData.message_code === "string"
+                  ? agentErrorData.message_code
+                  : null,
+              },
+            },
+          })
+        }
 
         if (agentErrorTaskStatus) {
           dispatch({

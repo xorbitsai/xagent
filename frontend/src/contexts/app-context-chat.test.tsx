@@ -214,6 +214,7 @@ function StateProbe() {
       <div data-testid="history-loading">{String(state.isHistoryLoading)}</div>
       <div data-testid="preview-open">{String(state.filePreview.isOpen)}</div>
       <div data-testid="processing">{String(state.isProcessing)}</div>
+      <div data-testid="command-outcomes">{JSON.stringify(state.commandOutcomes)}</div>
     </>
   )
 }
@@ -6806,5 +6807,239 @@ describe("clarification round identity (#1500)", () => {
       )
     })
     expect(screen.getByTestId("task-status").textContent).toBe("waiting_for_user")
+  })
+})
+
+function ClarificationSubmissionProbe() {
+  const { state, dispatch } = useApp()
+  return (
+    <>
+      <div data-testid="clarification-submissions">
+        {JSON.stringify(state.clarificationSubmissions)}
+      </div>
+      <button
+        data-testid="record-submission"
+        onClick={() =>
+          dispatch({
+            type: "RECORD_CLARIFICATION_SUBMISSION",
+            payload: { requestId: "req-1", commandId: "cmd-1" },
+          })
+        }
+      />
+      <button
+        data-testid="clear-submission"
+        onClick={() =>
+          dispatch({
+            type: "CLEAR_CLARIFICATION_SUBMISSION",
+            payload: { requestId: "req-1" },
+          })
+        }
+      />
+    </>
+  )
+}
+
+describe("terminal command outcomes (#1500)", () => {
+  beforeEach(() => {
+    webSocketOptions.current = null
+    webSocketOptions.all = []
+    sessionControls = null
+    wsHarness.isConnected = true
+    apiRequestMock.mockReset()
+    routerPushMock.mockReset()
+    sendRawMessageMock.mockReset()
+    sendRawMessageMock.mockReturnValue("sent")
+    sendChatMessageMock.mockReset()
+    sendChatMessageMock.mockResolvedValue({
+      client_message_id: "turn-optimistic",
+      turn_id: "turn-optimistic",
+    })
+    localStorage.clear()
+    ;(window as typeof window & { clearDuplicateMessageCache?: () => void })
+      .clearDuplicateMessageCache?.()
+  })
+
+  afterEach(() => {
+    cleanup()
+    localStorage.clear()
+  })
+
+  // A terminal agent_error for a durable command carries a structured
+  // disposition. The context records it keyed by command id so the
+  // clarification form that submitted that exact command can decide
+  // whether a resend is safe - task state alone must not decide that.
+  it("records a structured terminal outcome keyed by command id", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.({
+        type: "agent_error",
+        timestamp: "2026-05-27T05:00:04Z",
+        data: {
+          type: "agent_error",
+          message: "This message was not applied to the task.",
+          command_id: "client-msg-1",
+          command_kind: "message",
+          outcome: "failed",
+          resend_safe: true,
+          message_code: "task_command_deferred",
+        },
+      })
+    })
+
+    await waitFor(() => {
+      expect(
+        JSON.parse(screen.getByTestId("command-outcomes").textContent || "{}")
+      ).toEqual({
+        "client-msg-1": {
+          outcome: "failed",
+          resendSafe: true,
+          messageCode: "task_command_deferred",
+        },
+      })
+    })
+  })
+
+  it("keeps legacy frames without a structured outcome in the unsafe reading", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.({
+        type: "agent_error",
+        timestamp: "2026-05-27T05:00:04Z",
+        data: {
+          type: "agent_error",
+          message: "Task command message failed: something",
+          command_id: "client-msg-legacy",
+          command_kind: "message",
+        },
+      })
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "Task command message failed"
+      )
+    })
+    // No structured outcome field, no recorded disposition: consumers keep
+    // treating the command as possibly committed or in flight.
+    expect(
+      JSON.parse(screen.getByTestId("command-outcomes").textContent || "{}")
+    ).toEqual({})
+  })
+
+  it("records the outcome while a same-version waiting_for_user reassertion is retained", async () => {
+    // The full post-ack sequence at the context level: the task waits, the
+    // reply's terminal agent_error reasserts waiting_for_user for the same
+    // run and version, and the structured outcome lands beside the retained
+    // task state - the form layer decides the retry from both.
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.({
+        type: "task_waiting_for_user",
+        timestamp: "2026-05-27T05:00:01Z",
+        task_id: 1,
+        task: { id: 1, status: "waiting_for_user" },
+        message: "Which region should I use?",
+        request_id: "req-1",
+        interactions: [
+          { type: "text", request_id: "req-1", prompt: "Which region should I use?" },
+        ],
+      } as TestWebSocketMessage)
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("waiting_for_user")
+    })
+
+    act(() => {
+      onMessage?.({
+        type: "agent_error",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        run_id: "run-1",
+        state_version: 3,
+        data: {
+          type: "agent_error",
+          message: "We could not confirm whether this message was applied to the task.",
+          command_id: "client-msg-2",
+          command_kind: "message",
+          outcome: "failed",
+          resend_safe: false,
+          message_code: "task_command_deferred",
+          task: { id: 1, status: "waiting_for_user" },
+        },
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      expect(
+        JSON.parse(screen.getByTestId("command-outcomes").textContent || "{}")
+      ).toEqual({
+        "client-msg-2": {
+          outcome: "failed",
+          resendSafe: false,
+          messageCode: "task_command_deferred",
+        },
+      })
+    })
+    // The reasserted waiting state is retained, exactly as before.
+    expect(screen.getByTestId("task-status").textContent).toBe("waiting_for_user")
+    expect(screen.getByTestId("waiting-interactions").textContent).not.toBe("[]")
+  })
+
+  it("records and consumes the round's accountable submission", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <ClarificationSubmissionProbe />
+      </AppProvider>
+    )
+
+    act(() => {
+      screen.getByTestId("record-submission").click()
+    })
+    await waitFor(() => {
+      expect(
+        JSON.parse(
+          screen.getByTestId("clarification-submissions").textContent || "{}"
+        )
+      ).toEqual({ "req-1": { commandId: "cmd-1" } })
+    })
+
+    act(() => {
+      screen.getByTestId("clear-submission").click()
+    })
+    await waitFor(() => {
+      expect(
+        JSON.parse(
+          screen.getByTestId("clarification-submissions").textContent || "{}"
+        )
+      ).toEqual({})
+    })
   })
 })

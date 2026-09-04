@@ -17,6 +17,10 @@ const appContextMock = vi.hoisted(() => ({
   filesDisabled: false,
   providerAvailable: true,
   sendMessage: vi.fn(),
+  state: {
+    commandOutcomes: {} as Record<string, unknown>,
+    clarificationSubmissions: {} as Record<string, unknown>,
+  },
 }))
 const toastErrorMock = vi.hoisted(() => vi.fn())
 const mcpAppsMock = vi.hoisted(() => ({
@@ -897,5 +901,255 @@ describe("ClarificationForm blank option filtering", () => {
 
     expect(screen.getByText("Import")).toBeInTheDocument()
     expect(blankOptionSpans(container)).toHaveLength(0)
+  })
+})
+
+describe("ClarificationForm terminal command outcomes", () => {
+  // Issue #1500: after a reply is durably accepted, its command can still
+  // reach a terminal disposition before a turn is established. Whether the
+  // form may invite a resend is decided by the structured outcome the
+  // backend broadcasts for that exact command, never by task state alone.
+  // The accountable submission lives in context keyed by request id, so the
+  // gate survives the submitting component instance being replaced.
+  beforeEach(() => {
+    appContextMock.dispatch.mockReset()
+    appContextMock.filesDisabled = false
+    appContextMock.providerAvailable = true
+    appContextMock.sendMessage.mockReset()
+    appContextMock.sendMessage.mockResolvedValue(undefined)
+    appContextMock.state = { commandOutcomes: {}, clarificationSubmissions: {} }
+    toastErrorMock.mockReset()
+  })
+
+  afterEach(() => {
+    appContextMock.state = { commandOutcomes: {}, clarificationSubmissions: {} }
+    cleanup()
+  })
+
+  const form = (active: boolean, requestId = "inputreq_r1") => (
+    <ClarificationForm
+      interactions={[{ type: "text_input" as const, field: "city", label: "City" }]}
+      requestId={requestId}
+      active={active}
+    />
+  )
+
+  const submitButton = () =>
+    screen.queryByRole("button", { name: "chatPage.clarification.submit" })
+
+  // Drives one accepted submission and mirrors the RECORD dispatch into the
+  // mock context state, the way the real reducer would.
+  const submitAccepted = async (requestId = "inputreq_r1") => {
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "Beijing" } })
+    fireEvent.click(
+      screen.getByRole("button", { name: "chatPage.clarification.submit" }),
+    )
+    await waitFor(() => expect(appContextMock.sendMessage).toHaveBeenCalledTimes(1))
+    // Accepted submissions collapse the form.
+    await waitFor(() => expect(screen.queryByRole("textbox")).toBeNull())
+    const record = appContextMock.dispatch.mock.calls
+      .map(([action]) => action)
+      .find((action) => action?.type === "RECORD_CLARIFICATION_SUBMISSION")
+    expect(record).toEqual({
+      type: "RECORD_CLARIFICATION_SUBMISSION",
+      payload: { requestId, commandId: expect.any(String) },
+    })
+    // The recorded command id is the client message id the delivery used.
+    const config = appContextMock.sendMessage.mock.calls[0][1] as {
+      clientMessageId?: string
+    }
+    expect(record.payload.commandId).toBe(config.clientMessageId)
+    appContextMock.state = {
+      ...appContextMock.state,
+      clarificationSubmissions: {
+        [requestId]: { commandId: record.payload.commandId },
+      },
+    }
+    return record.payload.commandId as string
+  }
+
+  const withOutcome = (commandId: string, resendSafe: boolean) => {
+    appContextMock.state = {
+      ...appContextMock.state,
+      commandOutcomes: {
+        [commandId]: {
+          outcome: "failed",
+          resendSafe,
+          messageCode: "task_command_deferred",
+        },
+      },
+    }
+  }
+
+  it("reactivates the form and preserves the draft when the outcome proves retry safe", async () => {
+    const { rerender } = render(form(true))
+    const commandId = await submitAccepted()
+
+    rerender(form(false))
+    withOutcome(commandId, true)
+    rerender(form(true))
+
+    await waitFor(() => expect(submitButton()).toBeEnabled())
+    expect(screen.getByRole("textbox")).toHaveValue("Beijing")
+    expect(
+      screen.getByText("chatPage.clarification.replyNotApplied"),
+    ).toBeInTheDocument()
+    // The record is consumed so the resend is armed exactly once.
+    expect(appContextMock.dispatch).toHaveBeenCalledWith({
+      type: "CLEAR_CLARIFICATION_SUBMISSION",
+      payload: { requestId: "inputreq_r1" },
+    })
+  })
+
+  it("keeps the form locked and surfaces the ambiguity when the outcome is not proven safe", async () => {
+    const { rerender } = render(form(true))
+    const commandId = await submitAccepted()
+
+    rerender(form(false))
+    withOutcome(commandId, false)
+    rerender(form(true))
+
+    // The notice is visible, the draft is intact, and nothing invites a
+    // duplicate submission of the accepted reply.
+    const alert = await screen.findByRole("alert")
+    expect(alert).toHaveTextContent("chatPage.clarification.replyOutcomeUnknown")
+    expect(screen.getByRole("textbox")).toHaveValue("Beijing")
+    expect(submitButton()).toBeDisabled()
+  })
+
+  it("does not reactivate while the accepted reply has no terminal outcome yet", async () => {
+    const { rerender } = render(form(true))
+    await submitAccepted()
+
+    rerender(form(false))
+    rerender(form(true))
+
+    // No outcome means the command may still be in flight: the form stays
+    // collapsed instead of inviting a duplicate.
+    expect(screen.queryByRole("textbox")).toBeNull()
+    expect(submitButton()).toBeNull()
+  })
+
+  it("is not reopened by a late terminal event after a turn is established", async () => {
+    const { rerender } = render(form(true))
+    const commandId = await submitAccepted()
+
+    rerender(form(false))
+    // The turn was established, the task is running, and only then does a
+    // stale resend-safe terminal frame arrive: with the task not waiting,
+    // nothing may reopen the submitted form.
+    withOutcome(commandId, true)
+    rerender(form(false))
+
+    expect(screen.queryByRole("textbox")).toBeNull()
+    expect(submitButton()).toBeNull()
+  })
+
+  it("gates a fresh component instance for a round another instance submitted", async () => {
+    // The virtual waiting message and the persisted timeline message render
+    // the same round in different component instances; replacing the
+    // submitting instance must not drop the gate.
+    render(form(true))
+    const commandId = await submitAccepted()
+    cleanup()
+
+    withOutcome(commandId, false)
+    render(form(true))
+
+    const alert = await screen.findByRole("alert")
+    expect(alert).toHaveTextContent("chatPage.clarification.replyOutcomeUnknown")
+    expect(submitButton()).toBeDisabled()
+  })
+
+  it("records the submission when the delivery outcome is unknown", async () => {
+    appContextMock.sendMessage.mockRejectedValue(Object.assign(
+      new Error("ack timed out"),
+      { disposition: "outcome_unknown", userFacing: true },
+    ))
+    render(form(true))
+
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "Beijing" } })
+    fireEvent.click(
+      screen.getByRole("button", { name: "chatPage.clarification.submit" }),
+    )
+
+    // The reply may still have been durably accepted, so its eventual
+    // terminal outcome must gate this round like an acknowledged one.
+    await waitFor(() => {
+      expect(appContextMock.dispatch).toHaveBeenCalledWith({
+        type: "RECORD_CLARIFICATION_SUBMISSION",
+        payload: {
+          requestId: "inputreq_r1",
+          commandId: expect.any(String),
+        },
+      })
+    })
+    // The existing advisory behavior is unchanged until an outcome arrives.
+    expect(submitButton()).toBeEnabled()
+  })
+
+  it("still reactivates a form that never submitted, ignoring unrelated outcomes", async () => {
+    appContextMock.state = {
+      clarificationSubmissions: {},
+      commandOutcomes: {
+        "someone-elses-command": {
+          outcome: "failed",
+          resendSafe: false,
+          messageCode: "task_command_failed",
+        },
+      },
+    }
+    const { rerender } = render(form(false))
+    rerender(form(true))
+
+    await waitFor(() => expect(submitButton()).toBeEnabled())
+    expect(screen.queryByRole("alert")).toBeNull()
+  })
+
+  it("resets the gate for a new clarification round", async () => {
+    const { rerender } = render(form(true))
+    const commandId = await submitAccepted()
+
+    rerender(form(false))
+    withOutcome(commandId, false)
+    rerender(form(true))
+    await screen.findByRole("alert")
+
+    rerender(form(true, "inputreq_r2"))
+
+    await waitFor(() => expect(submitButton()).toBeEnabled())
+    expect(screen.getByRole("textbox")).toHaveValue("")
+    expect(screen.queryByRole("alert")).toBeNull()
+  })
+
+  it("does not record a submission for a round without a request id", async () => {
+    render(
+      <ClarificationForm
+        interactions={[{ type: "text_input" as const, field: "city", label: "City" }]}
+        active
+      />,
+    )
+
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "Beijing" } })
+    fireEvent.click(
+      screen.getByRole("button", { name: "chatPage.clarification.submit" }),
+    )
+
+    await waitFor(() => expect(appContextMock.sendMessage).toHaveBeenCalledTimes(1))
+    // With no round identity to bind to, gating is skipped entirely rather
+    // than risking a recorded reply gating a different question.
+    expect(appContextMock.dispatch).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: "RECORD_CLARIFICATION_SUBMISSION" }),
+    )
+  })
+
+  it("uses outcome notice keys that resolve in both locale trees", () => {
+    for (const key of [
+      "chatPage.clarification.replyNotApplied",
+      "chatPage.clarification.replyOutcomeUnknown",
+    ] as const) {
+      expect(resolveTranslation("en", key)).not.toBe(key)
+      expect(resolveTranslation("zh", key)).not.toBe(key)
+    }
   })
 })

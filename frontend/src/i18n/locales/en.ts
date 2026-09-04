@@ -363,6 +363,8 @@ const en = {
       sendError: "Failed to send response",
       sendNotSent: "Your answers were kept — you can submit again.",
       sendOutcomeUnknown: "Your response may already have been submitted. Reload the conversation before submitting again.",
+      replyNotApplied: "Your reply was not applied to the task. You can submit it again.",
+      replyOutcomeUnknown: "We couldn't confirm whether your reply was applied. Review the conversation before submitting it again.",
       selectOption: "Select an option",
       selectOptions: "Select options",
       acceptedFormats: "Accepted formats",

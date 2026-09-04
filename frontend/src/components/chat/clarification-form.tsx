@@ -1,5 +1,6 @@
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
-import { Interaction } from "@/contexts/app-context-chat"
+import { Interaction, TerminalCommandOutcome } from "@/contexts/app-context-chat"
+import { generateClientMessageId } from "@/lib/utils"
 import { Input } from "@/components/ui/input"
 import { Button } from "@/components/ui/button"
 import { Textarea } from "@/components/ui/textarea"
@@ -133,11 +134,15 @@ export function ClarificationForm({
 }: ClarificationFormProps) {
   // If onSend is provided, use it (e.g., from builder chat), otherwise use useApp
   let sendMessage: any, dispatch: any, contextFilesDisabled: boolean | undefined;
+  let commandOutcomes: Record<string, TerminalCommandOutcome> | undefined;
+  let clarificationSubmissions: Record<string, { commandId: string }> | undefined;
   try {
     const appCtx = useApp();
     sendMessage = appCtx.sendMessage;
     dispatch = appCtx.dispatch;
     contextFilesDisabled = appCtx.filesDisabled;
+    commandOutcomes = appCtx.state?.commandOutcomes;
+    clarificationSubmissions = appCtx.state?.clarificationSubmissions;
   } catch {
     // We might not be in the app context (e.g., agent builder chat)
   }
@@ -184,6 +189,11 @@ export function ClarificationForm({
       errorCode: ClientErrorCode | null
     } | null
   >(null)
+  // Which outcome notice the form owes the user. Raw category only; the
+  // sentence is resolved at render so a locale switch reaches it.
+  const [outcomeNotice, setOutcomeNotice] = useState<
+    "notApplied" | "unconfirmed" | null
+  >(null)
 
   useLayoutEffect(() => {
     latestRequestIdRef.current = requestId
@@ -194,18 +204,60 @@ export function ClarificationForm({
     setIsSubmitted(!active && !isConnectAppsOnly)
     setIsOpen(active || isConnectAppsOnly)
     setSendFailure(null)
+    // A new round is a new question: the previous round's outcome notice no
+    // longer belongs on top of it.
+    setOutcomeNotice(null)
   }, [active, isConnectAppsOnly, requestId])
 
+  // The reply command this round is still accountable for, and its terminal
+  // disposition, both read from context so the gate survives this component
+  // instance being replaced (virtual waiting message vs. persisted timeline
+  // message render the same round). Derived per render: the effect below
+  // must re-run when either changes, and must NOT re-run when an unrelated
+  // command's outcome lands - that rerun used to wipe a visible failure
+  // alert.
+  const outstandingSubmission = requestId
+    ? clarificationSubmissions?.[requestId]
+    : undefined
+  const outstandingOutcome = outstandingSubmission
+    ? commandOutcomes?.[outstandingSubmission.commandId]
+    : undefined
+
   useEffect(() => {
-    if (active) {
-      // A new clarification round reuses this component instance on the live
-      // turn render path, so a stale round-1 failure alert would sit on top
-      // of round 2's question.
-      setIsSubmitted(false)
-      setIsOpen(true)
-      setSendFailure(null)
+    if (!active) return
+    // Task state alone answers whether the task accepts input; it does not
+    // prove that repeating this round's accepted reply is safe (#1500).
+    // While a submission is outstanding, reactivation requires a terminal
+    // outcome for that exact command that proves non-application.
+    if (outstandingSubmission) {
+      if (!outstandingOutcome || outstandingOutcome.resendSafe !== true) {
+        // Committed, still in flight, or unknown: surface the ambiguity
+        // (when a terminal outcome exists) without inviting a duplicate.
+        // The chat input remains available for a deliberate fresh message.
+        if (outstandingOutcome) {
+          setOutcomeNotice("unconfirmed")
+          setIsSubmitted(true)
+          setIsOpen(true)
+        }
+        return
+      }
+      // Proven not applied: consume the record so the resend is armed once,
+      // then reactivate below with the draft intact.
+      dispatch?.({
+        type: "CLEAR_CLARIFICATION_SUBMISSION",
+        payload: { requestId },
+      })
+      setOutcomeNotice("notApplied")
     }
-  }, [active])
+    // A new clarification round reuses this component instance on the live
+    // turn render path, so a stale round-1 failure alert would sit on top
+    // of round 2's question. The outcome notice is deliberately not cleared
+    // here: it explains why the form re-opened, and it falls away on the
+    // next submit or the next round.
+    setIsSubmitted(false)
+    setIsOpen(true)
+    setSendFailure(null)
+  }, [active, outstandingSubmission, outstandingOutcome, requestId, dispatch])
 
   const normalizedInteractions = useMemo(() => {
     const seenFields = new Set<string>()
@@ -377,9 +429,26 @@ export function ClarificationForm({
       }
     })
 
+    // Minted here, not in sendMessage, so this round knows the id the
+    // durable command will carry and can correlate its terminal outcome
+    // (#1500). The builder onSend path has no durable command behind it and
+    // takes no part in outcome gating; neither does a round without a
+    // request id - the gate would have no round identity to bind to, and a
+    // recorded reply could end up gating a different question.
+    const clientMessageId = generateClientMessageId()
+    const recordSubmission = () => {
+      if (onSend || !dispatch) return
+      if (typeof submittedRequestId !== "string" || !submittedRequestId) return
+      dispatch({
+        type: "RECORD_CLARIFICATION_SUBMISSION",
+        payload: { requestId: submittedRequestId, commandId: clientMessageId },
+      })
+    }
+
     try {
       setIsSubmitting(true)
       setSendFailure(null)
+      setOutcomeNotice(null)
       // If textMessage is empty but we have files, send a generic message?
       const outboundFiles = filesDisabled ? [] : files
       const finalMessage = textMessage || (outboundFiles.length > 0 ? t("chatPage.clarification.uploadedFiles") : t("chatPage.clarification.confirmed"))
@@ -387,7 +456,12 @@ export function ClarificationForm({
       if (onSend) {
         await onSend(finalMessage, outboundFiles, metadata);
       } else if (sendMessage) {
-        await sendMessage(finalMessage, { force: true, metadata }, outboundFiles)
+        await sendMessage(
+          finalMessage,
+          { force: true, metadata, clientMessageId },
+          outboundFiles,
+        )
+        recordSubmission()
       }
 
       if (latestRequestIdRef.current !== submittedRequestId) return
@@ -397,6 +471,12 @@ export function ClarificationForm({
         dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "running" } })
       }
     } catch (error) {
+      if (readSendDisposition(error) === "outcome_unknown") {
+        // An ack timeout: the reply may still have been durably accepted,
+        // so its eventual terminal outcome must gate this round exactly as
+        // an acknowledged submission's would.
+        recordSubmission()
+      }
       if (latestRequestIdRef.current !== submittedRequestId) return
       console.error("Failed to send clarification response", error)
       // The rejection reason ("a previous guidance message is still being
@@ -713,6 +793,16 @@ export function ClarificationForm({
               ))}
             </div>
 
+            {outcomeNotice === "unconfirmed" && (
+              <div role="alert" className="rounded-md border border-destructive/40 bg-destructive/5 p-3 text-sm text-destructive">
+                {t("chatPage.clarification.replyOutcomeUnknown")}
+              </div>
+            )}
+            {outcomeNotice === "notApplied" && (
+              <div role="status" className="rounded-md border bg-muted/50 p-3 text-sm text-muted-foreground">
+                {t("chatPage.clarification.replyNotApplied")}
+              </div>
+            )}
             {sendFailure && (
               <div role="alert" className="rounded-md border border-destructive/40 bg-destructive/5 p-3 text-sm text-destructive">
                 <div>{sendFailureMessage}</div>

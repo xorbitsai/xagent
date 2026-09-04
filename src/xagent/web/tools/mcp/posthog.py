@@ -201,17 +201,29 @@ def _make_request(**kwargs: Any) -> requests.Response:
     configuration (`getproxies_macosx_sysconf()`/`getproxies_registry()`)
     once no env var is set -- the same DNS-rebinding-via-proxy bypass this
     gate exists to close, one layer deeper than an env-var scrub alone
-    reaches. Mirrors magento.py's identical `_make_request`.
+    reaches.
 
     `trust_env=False` also disables `requests`' `REQUESTS_CA_BUNDLE`/
     `CURL_CA_BUNDLE` lookup and `.netrc` auto-auth (both gated behind the
-    same `if self.trust_env:` check in `requests`' own Session code); no
-    re-application is needed here, unlike magento.py's self-hosted target,
-    since PostHog Cloud's two hosts always terminate TLS with a publicly
-    trusted CA and this connector always sends its own Bearer header.
+    same `if self.trust_env:` check in `requests`' own Session code) --
+    re-applying the CA bundle explicitly below matters even though PostHog
+    Cloud's own two hosts always terminate TLS with a publicly trusted CA:
+    the only case `proxies` is ever non-empty here is an operator opting in
+    via `XAGENT_TRUSTED_EGRESS_PROXY=1`, the textbook case for a corporate
+    egress proxy doing TLS interception with an internally-issued CA. Without
+    this, that proxy path would fail closed with an opaque `SSLError` for
+    every operator who actually needs it, rather than the intercepting
+    proxy's CA being honored the way it would under `requests`' own default
+    `trust_env=True`. `.netrc` is left disabled since this connector always
+    sends its own Bearer header.
     """
     with requests.Session() as session:
         session.trust_env = False
+        ca_bundle = os.environ.get("REQUESTS_CA_BUNDLE") or os.environ.get(
+            "CURL_CA_BUNDLE"
+        )
+        if ca_bundle:
+            session.verify = ca_bundle
         return session.request(**kwargs)
 
 
@@ -226,15 +238,15 @@ def _request(
     # the real connection, not this process -- silently bypassing
     # _base_url()'s own private-network validation of POSTHOG_HOST, which
     # only checks the addresses this process itself resolves. Mirrors
-    # web_content.py's fetch_web_content and magento.py's _request:
-    # get_trusted_proxy_url() raises unless the proxy is explicitly marked
-    # trusted to enforce its own private-range egress policy
-    # (XAGENT_TRUSTED_EGRESS_PROXY=1), rather than silently trusting every
-    # ambient proxy setup_proxy_env() promotes from the OS's own settings.
-    # The result is then passed to `_make_request()` (see above), which
-    # issues the call on a trust_env=False Session -- disabling every
-    # ambient/OS-native proxy source, not just the env vars this function
-    # checks -- so "no proxy" here is an actual guarantee for this call.
+    # web_content.py's fetch_web_content: get_trusted_proxy_url() raises
+    # unless the proxy is explicitly marked trusted to enforce its own
+    # private-range egress policy (XAGENT_TRUSTED_EGRESS_PROXY=1), rather
+    # than silently trusting every ambient proxy setup_proxy_env() promotes
+    # from the OS's own settings. The result is then passed to
+    # `_make_request()` (see above), which issues the call on a
+    # trust_env=False Session -- disabling every ambient/OS-native proxy
+    # source, not just the env vars this function checks -- so "no proxy"
+    # here is an actual guarantee for this call.
     proxy_url = get_trusted_proxy_url()
     proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else {}
 
@@ -268,11 +280,11 @@ def _request(
             break
     except requests.RequestException as exc:
         # A connection/timeout/proxy failure's message can itself embed
-        # sensitive data -- e.g. a ProxyError echoing the ambient
-        # HTTPS_PROXY URL, which may carry embedded user:pass@ credentials
-        # (setup_proxy_env() exports whatever the OS has configured) -- so
-        # this gets the same redaction the HTTPError response-body path
-        # below already has, not just that one case.
+        # sensitive data -- e.g. a ProxyError connecting through a proxy
+        # that passed the trust check above can still echo that proxy's
+        # URL, which may carry embedded user:pass@ credentials -- so this
+        # gets the same redaction the HTTPError response-body path below
+        # already has, not just that one case.
         raise RuntimeError(redact_sensitive_text(str(exc))) from exc
 
     if 300 <= response.status_code < 400:

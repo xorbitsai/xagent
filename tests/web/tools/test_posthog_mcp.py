@@ -396,7 +396,16 @@ def test_make_request_disables_trust_env(monkeypatch):
     # set. trust_env=False skips that entire environment-and-OS-native
     # lookup in one place, so assert _make_request actually sets it before
     # issuing the real request.
+    #
+    # The full kwargs dict is captured (not just trust_env), and the
+    # context manager's __exit__ is asserted too: a body that silently
+    # dropped proxies=/allow_redirects=False before calling
+    # session.request(), or that never actually used the Session as a
+    # context manager, would strip the exact security guards this module
+    # adds while every other test here (which mocks _make_request itself
+    # away) would still pass.
     captured = {}
+    exited = {}
 
     class FakeSession:
         def __enter__(self):
@@ -404,10 +413,12 @@ def test_make_request_disables_trust_env(monkeypatch):
             return self
 
         def __exit__(self, *exc_info):
+            exited["called"] = True
             return False
 
         def request(self, **kwargs):
             captured["trust_env"] = self.trust_env
+            captured["kwargs"] = kwargs
             return MockResponse(json_data={"ok": True})
 
     monkeypatch.setattr(posthog.requests, "Session", FakeSession)
@@ -419,12 +430,56 @@ def test_make_request_disables_trust_env(monkeypatch):
         params=None,
         json=None,
         timeout=1,
-        proxies={},
+        proxies={"https": "http://proxy.internal:8080"},
         allow_redirects=False,
     )
 
     assert captured["trust_env"] is False
+    assert captured["kwargs"]["proxies"] == {"https": "http://proxy.internal:8080"}
+    assert captured["kwargs"]["allow_redirects"] is False
     assert response.json() == {"ok": True}
+    assert exited["called"] is True
+
+
+def test_make_request_reapplies_ca_bundle_env_var(monkeypatch):
+    # trust_env=False also disables requests' REQUESTS_CA_BUNDLE/
+    # CURL_CA_BUNDLE lookup (gated behind the same `if self.trust_env:` as
+    # the proxy lookup). The only case proxies is ever non-empty here is an
+    # operator opting into XAGENT_TRUSTED_EGRESS_PROXY=1 -- a corporate
+    # egress proxy doing TLS interception with an internally-issued CA is
+    # the textbook reason to do that -- so without re-applying this env var
+    # explicitly, that proxy path would fail closed with an opaque
+    # SSLError for exactly the operator who needs it.
+    monkeypatch.setenv("REQUESTS_CA_BUNDLE", "/etc/ssl/internal-ca.pem")
+    captured = {}
+
+    class FakeSession:
+        def __enter__(self):
+            self.trust_env = True
+            self.verify = True
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        def request(self, **kwargs):
+            captured["verify"] = self.verify
+            return MockResponse(json_data={"ok": True})
+
+    monkeypatch.setattr(posthog.requests, "Session", FakeSession)
+
+    posthog._make_request(
+        method="GET",
+        url="https://us.posthog.com/api/users/@me/",
+        headers={},
+        params=None,
+        json=None,
+        timeout=1,
+        proxies={},
+        allow_redirects=False,
+    )
+
+    assert captured["verify"] == "/etc/ssl/internal-ca.pem"
 
 
 @pytest.mark.parametrize("status_code", [301, 302, 303, 307, 308])

@@ -1,7 +1,7 @@
 """seed built-in Zendesk (key-based) MCP connector
 
 Revision ID: 20260901_seed_zendesk_mcp_app
-Revises: 20260903_model_management
+Revises: 20260826_seed_employment_hero_mcp_app
 Create Date: 2026-09-01 00:00:00.000000
 
 """
@@ -13,7 +13,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "20260901_seed_zendesk_mcp_app"
-down_revision: Union[str, None] = "20260903_model_management"
+down_revision: Union[str, None] = "20260826_seed_employment_hero_mcp_app"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

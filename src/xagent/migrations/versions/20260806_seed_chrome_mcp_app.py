@@ -161,6 +161,6 @@ def downgrade() -> None:
     for guard_column in ("name", "description", "transport"):
         if guard_column in columns:
             query = query.where(
-                getattr(PUBLIC_MCP_APPS_TABLE.c, guard_column) == ROW[guard_column]
+                PUBLIC_MCP_APPS_TABLE.c[guard_column] == ROW[guard_column]
             )
     bind.execute(query)

@@ -5,6 +5,7 @@ import pytest
 import requests
 
 from xagent.web.tools.mcp import mixpanel
+from xagent.web.tools.mcp import utils as mcp_utils
 
 
 class MockResponse:
@@ -778,6 +779,49 @@ def test_list_annotations_uses_app_api_path_and_camelcase_dates(monkeypatch):
     assert params["fromDate"] == "2026-01-01"
     assert params["toDate"] == "2026-01-31"
     assert "project_id" not in params
+
+
+@pytest.mark.parametrize(
+    "call, key, json_data",
+    [
+        (
+            lambda: mixpanel.mixpanel_list_event_names(),
+            "event_names",
+            [f"Event-{i}" for i in range(200)],
+        ),
+        (
+            lambda: mixpanel.mixpanel_list_funnels(),
+            "funnels",
+            [{"funnel_id": i, "name": "x" * 50} for i in range(200)],
+        ),
+        (
+            lambda: mixpanel.mixpanel_list_annotations("2026-01-01", "2026-01-31"),
+            "annotations",
+            {"results": [{"id": i, "description": "x" * 50} for i in range(200)]},
+        ),
+    ],
+    ids=["event_names", "funnels", "annotations"],
+)
+def test_list_tools_survive_an_aggressively_low_output_limit(
+    monkeypatch, call, key, json_data
+):
+    # Confirmed bug (mirrors the same fix in magento.py): under an
+    # extremely low XAGENT_TOOL_MAX_OUTPUT_LENGTH,
+    # success_with_capped_dict's phase-2 fallback can drop the wrapper's
+    # sole key entirely once list-halving alone isn't enough, leaving
+    # capped[key] == {} instead of {key: []} -- result[key][key] then
+    # raised KeyError instead of returning an empty list.
+    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 30)
+    monkeypatch.setattr(
+        mixpanel.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data=json_data)),
+    )
+
+    result = json.loads(call())
+
+    assert result["status"] == "success"
+    assert result[key][key] == []
 
 
 def test_create_annotation_sends_json_body_to_app_api(monkeypatch):

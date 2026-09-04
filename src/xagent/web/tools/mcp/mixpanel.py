@@ -61,6 +61,28 @@ def _error(message: str) -> str:
     return json.dumps({"status": "error", "message": message}, ensure_ascii=False)
 
 
+def _success_with_capped_list(key: str, items: Any) -> str:
+    """Wrap a bare list under ``key`` so success_with_capped_dict has a dict
+    to shrink, then guarantee the nested key survives capping.
+
+    success_with_capped_dict(field_name, data) can only shrink a
+    list/dict-valued key nested *inside* a dict -- handed a bare list
+    directly, its own `not isinstance(data, dict)` guard returns it
+    uncapped regardless of size, so callers here wrap it one level deeper
+    as {key: items} first. But under an aggressively low
+    XAGENT_TOOL_MAX_OUTPUT_LENGTH, its phase-2 fallback (dropping whole
+    top-level keys once list-halving alone isn't enough) can drop that
+    wrapper's sole key entirely -- even after phase 1 has already emptied
+    the list to [] -- leaving capped[key] == {} instead of {key: []}. A
+    caller doing result[key][key] would then raise KeyError instead of
+    getting an empty list, on a supported (if aggressive) config. Re-add
+    the key rather than let that edge surface as a crash.
+    """
+    capped = json.loads(success_with_capped_dict(key, {key: items}))
+    capped[key].setdefault(key, [])
+    return json.dumps(capped, ensure_ascii=False)
+
+
 def _auth() -> tuple[str, str]:
     # Stripped like MIXPANEL_REGION below: a value that's only whitespace
     # (e.g. a trailing newline from copy-pasting the credential into a
@@ -301,7 +323,7 @@ def mixpanel_list_event_names(event_type: str = "general", limit: int = 50) -> s
             "/api/query/events/names",
             params={"type": event_type, "limit": max_results},
         )
-        return success_with_capped_dict("event_names", {"event_names": result})
+        return _success_with_capped_list("event_names", result)
     except Exception as e:
         logger.error(f"Error listing Mixpanel event names: {e}")
         return _error(str(e))
@@ -455,7 +477,7 @@ def mixpanel_list_funnels() -> str:
     """
     try:
         result = _request("GET", _region_hosts()["query"], "/api/query/funnels/list")
-        return success_with_capped_dict("funnels", {"funnels": result})
+        return _success_with_capped_list("funnels", result)
     except Exception as e:
         logger.error(f"Error listing Mixpanel funnels: {e}")
         return _error(str(e))
@@ -551,7 +573,7 @@ def mixpanel_list_annotations(from_date: str, to_date: str) -> str:
         annotations = (
             (result.get("results") or []) if isinstance(result, dict) else result
         )
-        return success_with_capped_dict("annotations", {"annotations": annotations})
+        return _success_with_capped_list("annotations", annotations)
     except Exception as e:
         logger.error(f"Error listing Mixpanel annotations: {e}")
         return _error(str(e))

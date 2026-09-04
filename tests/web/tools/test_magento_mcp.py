@@ -852,6 +852,28 @@ def test_request_truncates_unstructured_error_body(monkeypatch):
     assert len(str(excinfo.value)) < len(long_body)
 
 
+def test_request_truncates_structured_error_body(monkeypatch):
+    # truncate_error_text previously only ran on the raw-text fallback path;
+    # a valid JSON error body (the common Magento shape) flowed through
+    # _extract_error_detail uncapped.
+    long_message = "x" * 5000
+    monkeypatch.setattr(
+        magento,
+        "_make_request",
+        Mock(
+            return_value=MockResponse(
+                status_code=500, json_data={"message": long_message}
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        magento._request("GET", "/products/abc")
+
+    assert "[truncated]" in str(excinfo.value)
+    assert len(str(excinfo.value)) < len(long_message)
+
+
 def test_list_products_sends_sku_like_and_status_filters(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(json_data={"items": [], "total_count": 0})
@@ -1191,6 +1213,18 @@ def test_create_product_rejects_negative_price(monkeypatch):
     monkeypatch.setattr(magento, "_make_request", mock_request)
 
     result = json.loads(magento.magento_create_product("sku1", "Shirt", -1))
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
+def test_create_product_rejects_negative_attribute_set_id(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(magento, "_make_request", mock_request)
+
+    result = json.loads(
+        magento.magento_create_product("sku1", "Shirt", 19.99, attribute_set_id=-1)
+    )
 
     assert result["status"] == "error"
     mock_request.assert_not_called()
@@ -1643,6 +1677,31 @@ def test_get_category_returns_summary(monkeypatch):
 
     assert result["status"] == "success"
     assert result["category"]["name"] == "Shirts"
+
+
+def test_get_category_caps_output_when_children_data_is_oversized(monkeypatch):
+    # Unlike magento_get_category_tree, this used plain _success (no
+    # success_with_capped_dict) -- its own docstring says children_data
+    # "does not reliably populate" here, not that it's guaranteed absent, so
+    # a Magento variant that does return it produced an uncapped response.
+    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 2000)
+    children = [{"id": i, "name": "x" * 100, "children_data": []} for i in range(100)]
+    monkeypatch.setattr(
+        magento,
+        "_make_request",
+        Mock(
+            return_value=MockResponse(
+                json_data={"id": 3, "name": "Shirts", "children_data": children}
+            )
+        ),
+    )
+
+    raw = magento.magento_get_category(3)
+    result = json.loads(raw)
+
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert len(result["category"]["children_data"]) < len(children)
 
 
 def test_get_category_neutralizes_path_traversal_id(monkeypatch):

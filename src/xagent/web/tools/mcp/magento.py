@@ -538,7 +538,8 @@ def _request(
         message = str(exc)
         detail = _extract_error_detail(response)
         if detail is None:
-            detail = truncate_error_text(response.text.strip())
+            detail = response.text.strip()
+        detail = truncate_error_text(detail)
         if detail:
             message = f"{message} - {redact_sensitive_text(detail)}"
         if response.status_code == 401:
@@ -902,6 +903,8 @@ def magento_create_product(
         name = _require_non_blank(name, "name")
         if err := _validate_non_negative(price, "price"):
             return _error(err)
+        if err := _validate_non_negative(attribute_set_id, "attribute_set_id"):
+            return _error(err)
         if err := _validate_choice(status, _PRODUCT_STATUSES, "status"):
             return _error(err)
         if err := _validate_choice(visibility, _PRODUCT_VISIBILITIES, "visibility"):
@@ -1148,7 +1151,7 @@ def magento_get_category(category_id: int) -> str:
         result = _request(
             "GET", f"/categories/{url_path_id(str(category_id), 'category_id')}"
         )
-        return _success(category=_category_summary(result))
+        return success_with_capped_dict("category", _category_summary(result))
     except Exception as e:
         logger.error(f"Error fetching Magento category {category_id}: {e}")
         return _error(str(e))

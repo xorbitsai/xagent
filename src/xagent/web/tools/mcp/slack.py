@@ -449,6 +449,9 @@ def slack_join_channel(channel: str) -> str:
     member list, which is visible to everyone in it, so it should never
     happen silently just because another Slack tool call failed with
     "not_in_channel".
+
+    Joining a channel does not put it in scope for reading: read only what
+    the user named or selected (see slack_get_channel_history's scope rule).
     channel: a channel id, or a channel name (with or without "#").
     This only works for a public channel: Slack does not let a bot join a
     private channel or DM on its own (conversations.join fails with
@@ -516,7 +519,11 @@ def slack_list_channels(
 ) -> str:
     """
     List public channels in the connected Slack workspace (id, name, is_archived).
-    Use this to resolve a channel name to an id before posting.
+    Use this to resolve a channel name to an id before posting, or to build
+    the option list for an ask_user_question when the user has not named a
+    channel. The list is discovery, not permission: do not read every
+    returned channel's history — read only channels the user named or
+    selected (see slack_get_channel_history's scope rule).
     name_contains: optional case-insensitive substring filter on the channel
     name — pass it when looking for a specific channel in a large workspace
     instead of listing everything.
@@ -653,6 +660,16 @@ def slack_get_channel_history(
     calling slack_join_channel to add the bot (only works for a public
     channel), or ask a member to `/invite` the bot for a private channel or
     DM.
+    Scope rule: read only the conversations the user asked for — ones they
+    named in this request, a set they explicitly asked for (e.g. "all public
+    channels"), or ones they selected in a previous ask_user_question answer.
+    A listing from slack_list_channels / slack_list_direct_messages is
+    discovery, not permission to read everything in it. If the request names
+    no conversation and no set, do not read the listed ones one by one: offer
+    the candidates in a single ask_user_question and read only the selected
+    ones — a conversation the user did not select stays out of scope even if
+    the bot can already read it. If asking is not possible in this run, read
+    nothing beyond what the request names and say what was left unread.
     """
     try:
         channel_id = _resolve_channel_id(channel)
@@ -698,7 +715,8 @@ def slack_get_thread_replies(
     Fetch a page of replies in a message thread (the parent message is
     included as the first result). Defaults to the 100 most recent replies
     per call — pass cursor to page through a longer thread.
-    channel: a channel/DM id or name the thread lives in.
+    channel: a channel/DM id or name the thread lives in; it must be in scope
+    (see slack_get_channel_history's scope rule).
     thread_ts: the parent message's "ts".
     cursor: pass the next_cursor from a previous call's response to fetch
     the next page of replies.
@@ -784,6 +802,9 @@ def slack_list_direct_messages(limit: int = 200) -> str:
     conversation name (group DM).
     Use the returned id with slack_get_channel_history, slack_search_messages,
     or slack_post_message to work with a specific DM.
+    The list is discovery, not permission: do not read every returned DM's
+    history — read only DMs the user named or selected (see
+    slack_get_channel_history's scope rule).
     """
     conversations: list[dict[str, Any]] = []
     max_conversations = max(1, min(int(limit), MAX_CHANNELS))
@@ -893,7 +914,9 @@ def slack_search_messages(
     most recent messages — it is not a Slack workspace-wide search, which
     needs a user-token search:read scope this bot-token connector does not
     request. To search multiple conversations, call this once per channel/DM
-    (see slack_list_channels / slack_list_direct_messages).
+    (see slack_list_channels / slack_list_direct_messages) — but only for
+    conversations in scope (see slack_get_channel_history's scope rule),
+    never as a sweep over everything a listing returned.
     """
     needle = query.strip().lower()
     if not needle:

@@ -1124,7 +1124,11 @@ class ReActPattern(AgentPattern):
                 "fact-carrying argument value (one that asserts a real-world "
                 "fact) the user has not provided, call "
                 "ask_user_question; do not ask the question as plain assistant "
-                "text and do not fill the value in yourself. "
+                "text and do not fill the value in yourself. When the user answers "
+                "an ask_user_question by selecting a subset of the offered options, "
+                "that selection is the complete scope for the follow-up work: do not "
+                "include unselected options, even ones that are already accessible "
+                "or that fit the original request. "
                 if self.user_interaction_enabled
                 else "If missing user information prevents completion, including a "
                 "fact-carrying argument value (one that asserts a real-world fact) "

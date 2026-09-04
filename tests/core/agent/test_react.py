@@ -1572,14 +1572,25 @@ def test_react_missing_argument_value_instruction_matches_interaction_policy(
         0
     ]["content"]
 
+    # The subset-selection rule describes how to read an ask_user_question
+    # answer, so it travels with the branch where that tool exists; a run that
+    # cannot ask must not be told how to interpret an answer it can't receive.
+    subset_instruction = (
+        "selecting a subset of the offered options, that selection is the "
+        "complete scope for the follow-up work"
+    )
+
     if user_interaction_enabled:
         assert ask_instruction in prompt
         assert blocked_instruction not in prompt
         assert "do not fill the value in yourself" in prompt
+        assert subset_instruction in prompt
+        assert "even ones that are already accessible" in prompt
     else:
         assert blocked_instruction in prompt
         assert ask_instruction not in prompt
         assert "finish with outcome=blocked and explain what is missing" in prompt
+        assert subset_instruction not in prompt
 
 
 @pytest.mark.asyncio

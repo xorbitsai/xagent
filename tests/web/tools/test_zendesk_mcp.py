@@ -764,6 +764,18 @@ def test_create_ticket_sends_expected_body(monkeypatch):
     assert mock_request.call_args.kwargs["method"] == "POST"
 
 
+def test_create_ticket_treats_whitespace_only_priority_as_not_provided(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"ticket": {"id": 1, "subject": "Help"}})
+    )
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    zendesk.zendesk_create_ticket("Help", "Something's broken", priority="   ")
+
+    body = mock_request.call_args.kwargs["json"]
+    assert "priority" not in body["ticket"]
+
+
 def test_create_ticket_sends_requester_name_with_email(monkeypatch):
     # F11: Zendesk requires a name for a requester_email that doesn't
     # already match an existing user; name-only requesters aren't
@@ -880,6 +892,23 @@ def test_update_ticket_treats_empty_status_and_priority_as_not_provided(monkeypa
     monkeypatch.setattr(zendesk._session, "request", mock_request)
 
     result = json.loads(zendesk.zendesk_update_ticket(1, status="", priority="urgent"))
+
+    assert result["status"] == "success"
+    body = mock_request.call_args.kwargs["json"]
+    assert body["ticket"] == {"priority": "urgent"}
+
+
+def test_update_ticket_treats_whitespace_only_status_as_not_provided(monkeypatch):
+    # Same as the blank-string case above, but whitespace-only -- truthy in
+    # Python, so a bare `if status:` check alone would forward it.
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"ticket": {"id": 1, "priority": "urgent"}})
+    )
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    result = json.loads(
+        zendesk.zendesk_update_ticket(1, status="   ", priority="urgent")
+    )
 
     assert result["status"] == "success"
     body = mock_request.call_args.kwargs["json"]

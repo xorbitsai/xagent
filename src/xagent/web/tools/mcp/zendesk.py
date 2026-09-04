@@ -170,6 +170,14 @@ def _require_comment_body(value: str | None, field_name: str) -> str:
     return value
 
 
+def _blank_to_none(value: str | None) -> str | None:
+    """Normalize a blank (empty or whitespace-only) optional string to
+    None, so callers can treat "not provided" and "provided as blank" the
+    same way -- e.g. status/priority have no valid "clear the field" value
+    in Zendesk, so a blank one must be dropped rather than sent verbatim."""
+    return (value or "").strip() or None
+
+
 def _clean_tags(tags: list[str]) -> list[str]:
     """Strip whitespace and drop empty entries from a caller-supplied tag
     list before sending it to Zendesk -- FastMCP's schema only validates
@@ -749,8 +757,8 @@ def zendesk_create_ticket(
         # Zendesk verbatim -- a whitespace-only requester_name would
         # otherwise silently defeat the "name is required for a new
         # requester" rule this parameter exists to satisfy.
-        requester_email = (requester_email or "").strip() or None
-        requester_name = (requester_name or "").strip() or None
+        requester_email = _blank_to_none(requester_email)
+        requester_name = _blank_to_none(requester_name)
         if requester_email:
             requester: dict[str, Any] = {"email": requester_email}
             if requester_name:
@@ -758,6 +766,7 @@ def zendesk_create_ticket(
             ticket["requester"] = requester
         elif requester_name:
             raise ValueError("requester_name requires requester_email")
+        priority = _blank_to_none(priority)
         if priority:
             ticket["priority"] = priority
         tags_value = _resolve_tags(tags)
@@ -787,9 +796,9 @@ def zendesk_update_ticket(
     ticket_id: a bare numeric id, or a full ticket URL copied from the
     Zendesk agent UI.
     status: optional, one of "new", "open", "pending", "hold", "solved",
-    "closed" -- an empty string is treated the same as leaving it unset
-    (there is no valid "clear the status" value).
-    priority: optional, one of "low", "normal", "high", "urgent" -- an empty
+    "closed" -- a blank (empty or whitespace-only) string is treated the
+    same as leaving it unset (there is no valid "clear the status" value).
+    priority: optional, one of "low", "normal", "high", "urgent" -- a blank
     string is treated the same as leaving it unset, for the same reason.
     tags: optional list of tags -- replaces the ticket's existing tags
     entirely (pass an empty list to clear them), it does not add to them.
@@ -801,8 +810,10 @@ def zendesk_update_ticket(
     """
     try:
         fields: dict[str, Any] = {}
+        status = _blank_to_none(status)
         if status:
             fields["status"] = status
+        priority = _blank_to_none(priority)
         if priority:
             fields["priority"] = priority
         tags_value = _resolve_tags(tags)

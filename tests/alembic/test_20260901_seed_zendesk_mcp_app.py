@@ -213,13 +213,20 @@ def test_downgrade_removes_zendesk(tmp_path):
         assert "zendesk" not in _app_ids(connection)
 
 
-def test_downgrade_removes_zendesk_when_guard_columns_are_missing(tmp_path):
-    """The name/description/transport guard added for Mi3 must degrade the
-    same way upgrade() already does when a column it references isn't
-    present on the real schema -- referencing a column absent from the
-    real table raises "no such column" (a regression this migration's own
-    non-visibility-column-missing test exercises for upgrade() but not,
-    until now, for downgrade())."""
+def test_downgrade_is_a_noop_when_a_guard_column_is_missing(tmp_path):
+    """The downgrade() guard matches on name/description/transport to avoid
+    destroying an adopted operator row -- but a reduced-schema table
+    missing one of those columns (e.g. mid-migration-chain, same
+    precondition upgrade() already tolerates via its column-filter) must
+    not make the DELETE reference a nonexistent column and raise.
+
+    It must also not fall back to deleting on whichever guard columns
+    remain: fewer guards is a weaker match, which reopens the exact
+    coincidental-match risk the three-column guard exists to rule out (see
+    test_downgrade_preserves_an_adopted_row_on_a_reduced_schema below).
+    No-op and leave a hidden orphan row behind instead, same tradeoff as
+    the admin-edited-description case, mirroring the chrome seed
+    migration's identical guard."""
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
     with engine.begin() as connection:
@@ -239,8 +246,58 @@ def test_downgrade_removes_zendesk_when_guard_columns_are_missing(tmp_path):
         )
         with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()
-            migration.downgrade()  # must not raise "no such column"
-        assert "zendesk" not in _app_ids(connection)
+            migration.downgrade()  # must not raise: no `description` column
+        # No-op, not a delete: the migration's own row is left behind as a
+        # hidden orphan rather than risk a weaker, coincidence-prone match.
+        assert "zendesk" in _app_ids(connection)
+
+
+def test_downgrade_preserves_an_adopted_row_on_a_reduced_schema(tmp_path):
+    """On a reduced schema missing a guard column, a weaker fix would drop
+    that column's predicate and delete on whatever guards remained -- e.g.
+    with `description` absent, matching on just name+transport. A
+    hand-made operator row is plausibly named 'Zendesk' with transport
+    'stdio' (the natural values for this connector), so that weaker match
+    could delete an adopted operator row, not just the migration's own
+    row. Pin that such a row survives both upgrade()'s adoption and
+    downgrade()'s no-op."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE public_mcp_apps (
+                    id INTEGER PRIMARY KEY,
+                    app_id VARCHAR(100) NOT NULL UNIQUE,
+                    name VARCHAR(200) NOT NULL,
+                    transport VARCHAR(50) NOT NULL DEFAULT 'oauth',
+                    is_visible_in_connector BOOLEAN NOT NULL DEFAULT 1,
+                    launch_config JSON
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO public_mcp_apps "
+                "(app_id, name, transport, is_visible_in_connector) "
+                "VALUES ('zendesk', 'Zendesk', 'stdio', 1)"
+            )
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+            migration.downgrade()
+        row = connection.execute(
+            text(
+                "SELECT is_visible_in_connector FROM public_mcp_apps "
+                "WHERE app_id='zendesk'"
+            )
+        ).first()
+        # Adopted (forced hidden) by upgrade(), then left in place by
+        # downgrade()'s no-op -- destroyed would mean row is None.
+        assert row is not None
+        assert row[0] == 0
 
 
 def test_downgrade_preserves_an_adopted_preexisting_row(tmp_path):

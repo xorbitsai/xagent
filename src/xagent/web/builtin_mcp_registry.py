@@ -1128,9 +1128,10 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "oauth_scopes": None,
             # Hidden until manually verified against a live account, same
             # precedent as the intercom row above: it ships customer-facing
-            # *write* tools (reply/internal note/create/update) discoverable
-            # by every user the moment it's visible, and that verification
-            # hasn't happened yet. Flip to True via a follow-up once done --
+            # *write* tools (reply/internal note/create/update/delete)
+            # discoverable by every user the moment it's visible, and that
+            # verification hasn't happened yet. Flip to True via a
+            # follow-up once done --
             # no redeploy needed (is_visible_in_connector is not
             # builtin-protected).
             "is_visible_in_connector": False,

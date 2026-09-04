@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import socket
 from dataclasses import dataclass
@@ -147,19 +148,33 @@ class SafeOAuthAsyncHTTPTransport(httpx.AsyncBaseTransport):
             # stale/misconfigured value was previously harmless. Surface it
             # as a structured OAuth error instead of letting the raw
             # FileNotFoundError/ssl.SSLError (a subclass of OSError) escape
-            # as an unhandled 500.
-            raise MCPOAuthDiscoveryError(
-                "invalid_configuration",
-                "Server TLS trust store is misconfigured (SSL_CERT_FILE/SSL_CERT_DIR).",
-            ) from exc
+            # as an unhandled 500. Only blame the env vars when one is
+            # actually set -- create_ssl_context() can also raise OSError
+            # from the certifi-backed default path when neither is set (a
+            # broken/partial certifi install), which is an environment
+            # problem, not an admin misconfiguration of these two vars.
+            configured_vars = [
+                name
+                for name in ("SSL_CERT_FILE", "SSL_CERT_DIR")
+                if os.environ.get(name)
+            ]
+            detail = (
+                f"Server TLS trust store is misconfigured ({'/'.join(configured_vars)})."
+                if configured_vars
+                else "Server TLS trust store could not be initialized."
+            )
+            raise MCPOAuthDiscoveryError("invalid_configuration", detail) from exc
         # An https:// proxy also needs the isolated context on its own CONNECT
         # TLS leg -- passing proxy_url as a bare string leaves that leg's
         # ssl_context as None, which httpx/httpcore then defaults to the
         # certifi-only trust store, bypassing a private CA configured via
-        # SSL_CERT_FILE/SSL_CERT_DIR for the proxy hop itself.
-        proxy = (
-            httpx.Proxy(url=proxy_url, ssl_context=ssl_context) if proxy_url else None
-        )
+        # SSL_CERT_FILE/SSL_CERT_DIR for the proxy hop itself. httpcore
+        # rejects a non-None proxy_ssl_context outright for a plain http://
+        # proxy (there's no TLS leg to configure there), so only attach it
+        # for an https:// proxy.
+        proxy: httpx.Proxy | str | None = proxy_url
+        if proxy_url and urlsplit(proxy_url).scheme == "https":
+            proxy = httpx.Proxy(url=proxy_url, ssl_context=ssl_context)
         self._transport = httpx.AsyncHTTPTransport(
             limits=httpx.Limits(max_keepalive_connections=0),
             trust_env=False,

@@ -1,30 +1,41 @@
 from __future__ import annotations
 
+import datetime
 import ssl
-import textwrap
 from typing import Any
+
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import NameOID
 
 from xagent.core.utils import security
 
-# A short-lived, self-signed CA cert generated purely for this test -- it is
-# never used to verify a real connection, only to prove build_ca_bundle_ssl_context()
-# actually loads whatever SSL_CERT_FILE points at into the resulting context's
-# trust store.
-_TEST_CA_PEM = textwrap.dedent(
-    """\
-    -----BEGIN CERTIFICATE-----
-    MIIBfjCCASOgAwIBAgIUJy8vvflj4iZFGcIOHxvXEKK4WHwwCgYIKoZIzj0EAwIw
-    FDESMBAGA1UEAwwJdGVzdC1yb290MB4XDTI2MDkwNDA1MzgxM1oXDTM2MDkwMTA1
-    MzgxM1owFDESMBAGA1UEAwwJdGVzdC1yb290MFkwEwYHKoZIzj0CAQYIKoZIzj0D
-    AQcDQgAEJBvNMaVhLnQvDmVv+q13d1usFhEVDxM2GATOxbR7L3iQVGn6SpbLlQq+
-    7S9t7XjlKhC/vDTaeYCFOW7DF44vLKNTMFEwHQYDVR0OBBYEFFJ8SEgt8Im88lSw
-    TBsWnRdX6aFVMB8GA1UdIwQYMBaAFFJ8SEgt8Im88lSwTBsWnRdX6aFVMA8GA1Ud
-    EwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDSQAwRgIhAI9qxcfjyWlf0/umk3rcz684
-    QXTQwsywHV9QosmFrxXzAiEA4z1QKZ7W2DUnDWCGlK20Oam6O6USv4nI4S1kQES6
-    3mI=
-    -----END CERTIFICATE-----
+
+def _generate_test_ca_pem() -> bytes:
+    """Build a throwaway self-signed CA cert, purely to prove
+    build_ca_bundle_ssl_context() actually loads whatever SSL_CERT_FILE
+    points at into the resulting context's trust store -- generated at test
+    time (matching this repo's convention, e.g.
+    tests/web/api/test_gmail_oidc_real_signature.py) rather than checked in
+    as an opaque static blob.
     """
-)
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "test-root")])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=1))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+    return cert.public_bytes(serialization.Encoding.PEM)
 
 
 class TestBuildCaBundleSslContext:
@@ -69,7 +80,7 @@ class TestBuildCaBundleSslContext:
         # was called (a mocked-kwargs test would still pass if the underlying
         # cert never made it into the context).
         cert_file = tmp_path / "test-ca.pem"
-        cert_file.write_text(_TEST_CA_PEM)
+        cert_file.write_bytes(_generate_test_ca_pem())
         monkeypatch.setenv("SSL_CERT_FILE", str(cert_file))
         monkeypatch.delenv("SSL_CERT_DIR", raising=False)
 

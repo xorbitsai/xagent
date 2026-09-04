@@ -1392,6 +1392,59 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                 "static_env": {"MYOB_API_KEY": "MYOB_CLIENT_ID"},
             },
         },
+        {
+            "app_id": "magento",
+            "name": "Magento",
+            "description": 'Connect to a self-hosted Magento/Adobe Commerce store with an Integration access token to search and manage products, look up orders and add order comments, and browse customers and categories. On Magento 2.4.4+, enable Stores > Configuration > Services > OAuth > Consumer Settings > "Allow OAuth Access Tokens to be used as standalone Bearer tokens" first.',
+            "icon": "https://www.google.com/s2/favicons?domain=magento.com&sz=128",
+            "transport": "stdio",
+            "provider_name": None,
+            # "Commerce" is not one of the connect dialog's fixed sidebar
+            # category filters (connect-mcp-dialog.tsx only has CRM/Support/
+            # Marketing/Payments/Analytics/etc.), so this connector won't
+            # get a dedicated filter button yet -- still findable via the
+            # catalog's "All" view/search. "Payments" (Stripe's category)
+            # would be actively misleading: Magento is store/inventory/
+            # order management, not a payments processor.
+            "category": "Commerce",
+            "oauth_scopes": None,
+            "is_visible_in_connector": True,
+            # Key-based (non-oauth), like posthog/stripe: a Magento
+            # "Integration" (Admin -> System -> Extensions -> Integrations
+            # -> Add New Integration) issues a store-scoped access token
+            # self-serve, with no Magento Marketplace review -- OAuth on
+            # Magento is only a review-gated path for a *public* extension
+            # distributed to many merchants, not for a store granting
+            # itself access. MAGENTO_BASE_URL is the store's own full
+            # origin (Magento is commonly self-hosted at an arbitrary
+            # domain, unlike Shopify/Zendesk's fixed "*.myshopify.com"/
+            # "*.zendesk.com" suffix) -- validated in magento.py as a bare
+            # https origin, then resolved and pinned against private/
+            # internal IP ranges before every request, since here (unlike
+            # those two) there is no small fixed-hostname allowlist to lean
+            # on first. That pinning only holds when no HTTP(S) proxy is in
+            # play (a proxy does its own DNS resolution this process can't
+            # see -- magento.py's _request() calls the same
+            # get_trusted_proxy_url() gate web_content.py uses, raising
+            # unless the proxy is explicitly marked trusted via
+            # XAGENT_TRUSTED_EGRESS_PROXY=1); upfront private-IP rejection
+            # at validation time is the unconditional baseline either way.
+            # MAGENTO_STORE_CODE is in required_env (there is no
+            # optional_env concept in the connect flow) even though
+            # magento.py itself defaults to the default store view when
+            # it's empty -- same precedent as the mixpanel row's
+            # MIXPANEL_REGION above, so a multi-storefront install isn't
+            # stuck unable to select a non-default store view.
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.magento"],
+                "required_env": [
+                    "MAGENTO_BASE_URL",
+                    "MAGENTO_ACCESS_TOKEN",
+                    "MAGENTO_STORE_CODE",
+                ],
+            },
+        },
     ]
 
 

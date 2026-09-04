@@ -1,6 +1,7 @@
 import contextlib
 import json
 import logging
+import math
 import re
 import socket
 import threading
@@ -386,12 +387,17 @@ def _validate_choice(
 
 
 def _validate_non_negative(value: float, field_name: str) -> str | None:
-    """Return an error message if value is negative, else None -- shared
-    by create/update product's price check for the same reason
-    _validate_choice is shared: so the wording can't drift between call
-    sites that repeat it."""
-    if value < 0:
-        return f"{field_name} must not be negative"
+    """Return an error message if value is negative or non-finite, else
+    None -- shared by create/update product's price check for the same
+    reason _validate_choice is shared: so the wording can't drift between
+    call sites that repeat it."""
+    # bool is an int subclass in Python, so `False < 0`/`True < 0` are both
+    # False -- the same gap _validate_choice/_paginated_result's
+    # total_count check were hardened against. NaN/inf also silently pass
+    # `value < 0` (both False) and would otherwise serialize into the
+    # request body as non-standard-JSON tokens Magento can't parse.
+    if isinstance(value, bool) or not math.isfinite(value) or value < 0:
+        return f"{field_name} must be a non-negative finite number"
     return None
 
 

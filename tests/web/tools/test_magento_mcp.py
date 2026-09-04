@@ -1196,6 +1196,15 @@ def test_create_product_rejects_negative_price(monkeypatch):
     mock_request.assert_not_called()
 
 
+@pytest.mark.parametrize("value", [True, False, float("nan"), float("inf")])
+def test_validate_non_negative_rejects_bool_and_non_finite(value):
+    # bool is an int subclass in Python (False/True < 0 are both False),
+    # and NaN/inf also silently pass `value < 0` -- the same gap
+    # _validate_choice/_paginated_result's total_count check were
+    # hardened against, missed when this helper was first extracted.
+    assert magento._validate_non_negative(value, "price")
+
+
 def test_update_product_requires_at_least_one_field(monkeypatch):
     mock_request = Mock()
     monkeypatch.setattr(magento, "_make_request", mock_request)

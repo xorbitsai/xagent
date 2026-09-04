@@ -135,11 +135,22 @@ class MCPOAuthRuntimeAuth:
     refreshed: bool = False
 
 
+def _ca_bundle_error_detail(configured_ca_vars: list[str]) -> str:
+    if configured_ca_vars:
+        return (
+            f"Server TLS trust store is misconfigured ({'/'.join(configured_ca_vars)})."
+        )
+    return "Server TLS trust store could not be initialized."
+
+
 class SafeOAuthAsyncHTTPTransport(httpx.AsyncBaseTransport):
     """HTTP transport that resolves and pins OAuth hosts before connecting."""
 
     def __init__(self) -> None:
         proxy_url = get_mcp_oauth_proxy_url()
+        configured_ca_vars = [
+            name for name in ("SSL_CERT_FILE", "SSL_CERT_DIR") if os.environ.get(name)
+        ]
         try:
             ssl_context = build_ca_bundle_ssl_context()
         except OSError as exc:
@@ -153,17 +164,22 @@ class SafeOAuthAsyncHTTPTransport(httpx.AsyncBaseTransport):
             # from the certifi-backed default path when neither is set (a
             # broken/partial certifi install), which is an environment
             # problem, not an admin misconfiguration of these two vars.
-            configured_vars = [
-                name
-                for name in ("SSL_CERT_FILE", "SSL_CERT_DIR")
-                if os.environ.get(name)
-            ]
-            detail = (
-                f"Server TLS trust store is misconfigured ({'/'.join(configured_vars)})."
-                if configured_vars
-                else "Server TLS trust store could not be initialized."
+            raise MCPOAuthDiscoveryError(
+                "invalid_configuration", _ca_bundle_error_detail(configured_ca_vars)
+            ) from exc
+        if configured_ca_vars and not ssl_context.get_ca_certs():
+            # ssl.create_default_context(capath=...) silently loads zero
+            # certs -- no OSError -- when SSL_CERT_DIR names a directory
+            # that doesn't exist or contains no certs (unlike SSL_CERT_FILE,
+            # which does raise for a missing/empty file). Left unguarded,
+            # this transport would build successfully with an empty trust
+            # store, and every TLS request through it would fail later with
+            # a generic httpx.ConnectError instead of this structured error.
+            raise MCPOAuthDiscoveryError(
+                "invalid_configuration",
+                _ca_bundle_error_detail(configured_ca_vars)
+                + " No CA certificates were loaded.",
             )
-            raise MCPOAuthDiscoveryError("invalid_configuration", detail) from exc
         # An https:// proxy also needs the isolated context on its own CONNECT
         # TLS leg -- passing proxy_url as a bare string leaves that leg's
         # ssl_context as None, which httpx/httpcore then defaults to the

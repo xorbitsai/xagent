@@ -299,6 +299,12 @@ def test_safe_oauth_transport_disables_proxy_http2_and_keepalive(monkeypatch):
 
     monkeypatch.setattr(mcp_oauth_service.httpx, "AsyncHTTPTransport", CaptureTransport)
     monkeypatch.delenv("XAGENT_MCP_OAUTH_PROXY_URL", raising=False)
+    # This constructs the real build_ca_bundle_ssl_context() (only
+    # AsyncHTTPTransport is mocked); an ambient SSL_CERT_FILE/SSL_CERT_DIR
+    # left over from the environment could otherwise make this fail on a
+    # value unrelated to what's under test here.
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
 
     SafeOAuthAsyncHTTPTransport()
 
@@ -328,6 +334,8 @@ def test_safe_oauth_transport_uses_explicit_proxy_configuration(monkeypatch):
 
     monkeypatch.setattr(mcp_oauth_service.httpx, "AsyncHTTPTransport", CaptureTransport)
     monkeypatch.setenv("XAGENT_MCP_OAUTH_PROXY_URL", "http://proxy.example.com:8080")
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
 
     SafeOAuthAsyncHTTPTransport()
 
@@ -351,6 +359,8 @@ def test_safe_oauth_transport_attaches_ca_bundle_to_https_proxy_leg(monkeypatch)
 
     monkeypatch.setattr(mcp_oauth_service.httpx, "AsyncHTTPTransport", CaptureTransport)
     monkeypatch.setenv("XAGENT_MCP_OAUTH_PROXY_URL", "https://proxy.example.com:8443")
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
 
     SafeOAuthAsyncHTTPTransport()
 
@@ -380,10 +390,14 @@ def test_safe_oauth_transport_constructs_against_real_httpx_transport(
         monkeypatch.delenv("XAGENT_MCP_OAUTH_PROXY_URL", raising=False)
     else:
         monkeypatch.setenv("XAGENT_MCP_OAUTH_PROXY_URL", proxy_url)
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
 
     transport = SafeOAuthAsyncHTTPTransport()
 
-    assert transport is not None
+    # Prove a real, non-mocked connection pool was actually built (not just
+    # that construction didn't raise, which pytest would already catch).
+    assert isinstance(transport._transport, httpx.AsyncHTTPTransport)
 
 
 def test_safe_oauth_transport_reports_bad_ca_bundle_as_discovery_error(monkeypatch):
@@ -430,6 +444,28 @@ def test_safe_oauth_transport_does_not_blame_env_vars_that_are_unset(monkeypatch
     assert exc.value.code == "invalid_configuration"
     assert "SSL_CERT_FILE" not in exc.value.message
     assert "SSL_CERT_DIR" not in exc.value.message
+
+
+def test_safe_oauth_transport_rejects_ssl_cert_dir_that_loads_no_certs(
+    monkeypatch, tmp_path
+):
+    # ssl.create_default_context(capath=...) does NOT raise for a directory
+    # that doesn't exist or contains no certs (unlike SSL_CERT_FILE, which
+    # does raise for a missing/empty file) -- it silently returns a context
+    # with zero trusted CAs. Left unguarded, this transport would build
+    # "successfully" with an effectively empty trust store, and every TLS
+    # request through it would fail later with a generic httpx.ConnectError
+    # instead of this structured, actionable error.
+    empty_dir = tmp_path / "empty-ca-dir"
+    empty_dir.mkdir()
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    monkeypatch.setenv("SSL_CERT_DIR", str(empty_dir))
+
+    with pytest.raises(MCPOAuthDiscoveryError) as exc:
+        SafeOAuthAsyncHTTPTransport()
+
+    assert exc.value.code == "invalid_configuration"
+    assert "SSL_CERT_DIR" in exc.value.message
 
 
 @pytest.mark.asyncio

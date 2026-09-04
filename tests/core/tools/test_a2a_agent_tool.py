@@ -406,6 +406,11 @@ def test_pinned_a2a_transport_disables_http2_and_pins_ca_bundle(monkeypatch) -> 
             return None
 
     monkeypatch.setattr(a2a_agent_tool.httpx, "AsyncHTTPTransport", CaptureTransport)
+    # This constructs the real build_ca_bundle_ssl_context() (only
+    # AsyncHTTPTransport is mocked); clear both env vars so an ambient
+    # SSL_CERT_FILE/SSL_CERT_DIR can't make this fail nondeterministically.
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
 
     _PinnedA2ATransport(allow_private_networks=False)
 

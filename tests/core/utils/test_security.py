@@ -50,7 +50,14 @@ class TestBuildCaBundleSslContext:
     then honors regardless of the transport's own trust_env setting.
     """
 
-    def test_returns_a_concrete_ssl_context(self) -> None:
+    def test_returns_a_concrete_ssl_context(self, monkeypatch) -> None:
+        # Clear both env vars so this doesn't nondeterministically fail on
+        # an ambient SSL_CERT_FILE/SSL_CERT_DIR left over in the process
+        # environment (this test only cares about the return type, not
+        # about a specific CA bundle).
+        monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+        monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+
         context = security.build_ca_bundle_ssl_context()
 
         assert isinstance(context, ssl.SSLContext)

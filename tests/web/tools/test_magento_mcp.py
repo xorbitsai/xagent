@@ -912,6 +912,24 @@ def test_list_products_rejects_invalid_status():
     assert result["status"] == "error"
 
 
+@pytest.mark.parametrize("value", [True, False])
+def test_validate_choice_rejects_bool(value):
+    # bool is an int subclass in Python, so `True in {1, 2}` compares equal
+    # to 1 and would silently pass -- the same gap _paginated_result's
+    # total_count check was hardened against.
+    assert magento._validate_choice(value, magento._PRODUCT_STATUSES, "status")
+
+
+def test_list_products_rejects_bool_status(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(magento, "_make_request", mock_request)
+
+    result = json.loads(magento.magento_list_products(status=True))
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
 def test_list_products_escapes_like_wildcards_in_sku_like(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(json_data={"items": [], "total_count": 0})
@@ -1437,6 +1455,22 @@ def test_category_summary_filters_out_falsy_children():
     )
 
     assert summary["name"] == "Root"
+    assert [child.get("name") for child in summary["children_data"]] == ["Child"]
+
+
+def test_category_summary_filters_out_truthy_non_dict_children():
+    # A truthy-but-malformed child (a stray string/int from a non-compliant
+    # proxy, not just None/{}) must be dropped too, not turned into a
+    # phantom empty-dict category -- `if child` alone wouldn't catch this
+    # since a non-empty string is truthy.
+    summary = magento._category_summary(
+        {
+            "id": 1,
+            "name": "Root",
+            "children_data": ["not-a-category", {"id": 2, "name": "Child"}, 42],
+        }
+    )
+
     assert [child.get("name") for child in summary["children_data"]] == ["Child"]
 
 

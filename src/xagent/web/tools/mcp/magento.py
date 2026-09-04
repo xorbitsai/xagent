@@ -364,7 +364,10 @@ def _validate_choice(
     """Return an error message if value isn't in allowed, else None -- shared
     by every status/visibility check below so the wording and comparison
     can't drift between the list/create/update tools that all repeat it."""
-    if value not in allowed:
+    # bool is an int subclass in Python, so `True in {1, 2}` compares equal
+    # to 1 and would silently pass this check -- reject it explicitly, the
+    # same gap _paginated_result's total_count check was hardened against.
+    if isinstance(value, bool) or value not in allowed:
         return f"{field_name} must be one of {sorted(allowed)}, got {value!r}"
     return None
 
@@ -716,10 +719,17 @@ def _category_summary(category: dict[str, Any]) -> dict[str, Any]:
         "position": record.get("position"),
         "level": record.get("level"),
         "product_count": record.get("product_count"),
+        # Filtering on the *summary* (not the raw child with `if child`)
+        # means a truthy-but-malformed child -- a stray string/int from a
+        # non-compliant proxy, not just None/{} -- gets dropped too:
+        # _category_summary(child) is {} for anything _as_record()
+        # rejects, and only ever {} for that case (a genuine record always
+        # returns all 8 keys), so filtering on it can't also drop a real,
+        # sparsely-populated category.
         "children_data": [
-            _category_summary(child)
+            summary
             for child in record.get("children_data") or []
-            if child
+            if (summary := _category_summary(child))
         ],
     }
 

@@ -213,6 +213,36 @@ def test_downgrade_removes_zendesk(tmp_path):
         assert "zendesk" not in _app_ids(connection)
 
 
+def test_downgrade_removes_zendesk_when_guard_columns_are_missing(tmp_path):
+    """The name/description/transport guard added for Mi3 must degrade the
+    same way upgrade() already does when a column it references isn't
+    present on the real schema -- referencing a column absent from the
+    real table raises "no such column" (a regression this migration's own
+    non-visibility-column-missing test exercises for upgrade() but not,
+    until now, for downgrade())."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE public_mcp_apps (
+                    id INTEGER PRIMARY KEY,
+                    app_id VARCHAR(100) NOT NULL UNIQUE,
+                    name VARCHAR(200) NOT NULL,
+                    transport VARCHAR(50) NOT NULL DEFAULT 'oauth',
+                    is_visible_in_connector BOOLEAN NOT NULL DEFAULT 1,
+                    launch_config JSON
+                )
+                """
+            )
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+            migration.downgrade()  # must not raise "no such column"
+        assert "zendesk" not in _app_ids(connection)
+
+
 def test_downgrade_preserves_an_adopted_preexisting_row(tmp_path):
     """Mi3: the collision branch in upgrade() adopts a hand-created row
     (e.g. an operator who created one before this migration deployed) by

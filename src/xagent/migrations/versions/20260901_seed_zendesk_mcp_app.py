@@ -116,11 +116,25 @@ def downgrade() -> None:
     # (mirrors the chrome seed migration's identical guard) distinguishes a
     # genuinely migration-created row from an adopted one without needing a
     # new tracking column -- a row that doesn't match is left in place,
-    # restored rather than destroyed.
-    bind.execute(
-        sa.delete(PUBLIC_MCP_APPS_TABLE)
-        .where(PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID)
-        .where(PUBLIC_MCP_APPS_TABLE.c.name == ROW["name"])
-        .where(PUBLIC_MCP_APPS_TABLE.c.description == ROW["description"])
-        .where(PUBLIC_MCP_APPS_TABLE.c.transport == ROW["transport"])
+    # restored rather than destroyed. Known edge, in the safe direction:
+    # description (unlike name/transport) is admin-editable even on
+    # builtin rows, so a migration-created row whose description an admin
+    # later changed is skipped too -- downgrade then leaves a hidden
+    # orphan row behind rather than risking deleting operator-owned data.
+    #
+    # Only guard on columns that actually exist: upgrade() already
+    # tolerates a table missing name/description/transport (it filters ROW
+    # down to whatever columns are present before inserting), so a WHERE
+    # clause referencing a column absent from the real schema would raise
+    # "no such column" here instead of degrading the same way upgrade()
+    # does.
+    columns = {c["name"] for c in inspector.get_columns("public_mcp_apps")}
+    query = sa.delete(PUBLIC_MCP_APPS_TABLE).where(
+        PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID
     )
+    for guard_column in ("name", "description", "transport"):
+        if guard_column in columns:
+            query = query.where(
+                getattr(PUBLIC_MCP_APPS_TABLE.c, guard_column) == ROW[guard_column]
+            )
+    bind.execute(query)

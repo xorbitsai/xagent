@@ -156,20 +156,25 @@ def _clean_tags(tags: list[str]) -> list[str]:
     return [t.strip() for t in tags if t.strip()]
 
 
-def _resolve_tags(tags: list[str]) -> list[str]:
-    """Clean a non-empty tag list, but reject one that cleans down to
-    nothing rather than silently treating it as "clear all tags".
+def _resolve_tags(tags: list[str] | None) -> list[str] | None:
+    """Resolve a caller-supplied tags param into the value to send in the
+    request body, or None if the field should be omitted entirely (tags
+    not provided).
 
-    Zendesk's tag update is a full replace, and an explicitly empty input
-    list ([]) is this connector's documented "clear all tags" signal
-    (handled by the caller before this is reached). A *non-empty* list
-    that _clean_tags reduces to [] -- e.g. ["  ", ""], exactly the kind of
-    LLM sloppiness _clean_tags exists to absorb -- is a different case:
-    the caller had *something* in mind, just not usable values, and
-    letting that collapse into the same wire request as an intentional
-    clear would destructively wipe an existing tag set on a ticket the
-    caller never asked to untag, with no undo available in this
+    Distinguishes three states: None (omit), an explicit empty list []
+    (this connector's documented "clear all tags" signal), and a
+    non-empty list (cleaned via _clean_tags, but rejected if cleaning
+    reduces it to nothing). A *non-empty* input that _clean_tags reduces
+    to [] -- e.g. ["  ", ""], exactly the kind of LLM sloppiness
+    _clean_tags exists to absorb -- must not collapse into the same wire
+    request as an explicit clear: Zendesk's tag update is a full replace,
+    so doing so would destructively wipe an existing tag set on a ticket
+    the caller never asked to untag, with no undo available in this
     connector."""
+    if tags is None:
+        return None
+    if not tags:
+        return []
     cleaned = _clean_tags(tags)
     if not cleaned:
         raise ValueError(
@@ -668,10 +673,9 @@ def zendesk_create_ticket(
             ticket["requester"] = {"email": requester_email}
         if priority:
             ticket["priority"] = priority
-        if tags:
-            ticket["tags"] = _resolve_tags(tags)
-        elif tags is not None:
-            ticket["tags"] = []
+        tags_value = _resolve_tags(tags)
+        if tags_value is not None:
+            ticket["tags"] = tags_value
         result = _request("POST", "/tickets.json", json_data={"ticket": ticket})
         return _success(ticket=_ticket_summary(_unwrap(result, "ticket")))
     except Exception as e:
@@ -714,10 +718,9 @@ def zendesk_update_ticket(
             fields["status"] = status
         if priority:
             fields["priority"] = priority
-        if tags:
-            fields["tags"] = _resolve_tags(tags)
-        elif tags is not None:
-            fields["tags"] = []
+        tags_value = _resolve_tags(tags)
+        if tags_value is not None:
+            fields["tags"] = tags_value
         if assignee_id is not None:
             fields["assignee_id"] = assignee_id
         if group_id is not None:

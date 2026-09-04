@@ -999,6 +999,37 @@ async def refresh_oauth_token_if_needed(
         if requires_json_accept_header(normalized_provider):
             headers["Accept"] = "application/json"
 
+        from ..api.auth import _is_employment_hero_token_url
+        from ..oauth_provider_quirks import matches_provider_family
+
+        if matches_provider_family(
+            normalized_provider, "employment-hero"
+        ) and _is_employment_hero_token_url(refresh_token_url):
+            # Matches the code-exchange branch in api/auth.py: Employment
+            # Hero's partner guide requires grant_type and refresh_token as
+            # query parameters on the refresh request too, with only the
+            # credential fields in the form body. Gated on
+            # _is_employment_hero_token_url too, not just the family match
+            # -- same reasoning as the code-exchange branch: an admin-
+            # created "employment-hero"-family row's token_url isn't
+            # guaranteed to actually be Employment Hero's, and this
+            # EH-specific wire quirk would break a genuinely different
+            # token endpoint's refresh instead of using the standard RFC
+            # 6749 body-only shape it likely expects. Putting a long-lived
+            # credential (refresh_token) in a query string is a generic
+            # secret-exposure anti-pattern (it can end up in proxy/server
+            # access logs a form body wouldn't) -- accepted here as a
+            # residual risk forced by Employment Hero's documented contract,
+            # not a choice this codebase would otherwise make. No httpx/
+            # httpcore request-logging middleware exists in this codebase
+            # today (those loggers are pinned to WARNING) and the
+            # configured HTTPS proxy only sees a CONNECT tunnel, never this
+            # URL's query string -- reassess this note if either changes.
+            post_kwargs["params"] = {
+                "grant_type": data.pop("grant_type"),
+                "refresh_token": data.pop("refresh_token"),
+            }
+
         # Matches the code-exchange branch in api/auth.py: Atlassian's token
         # endpoint requires a JSON body on refresh too, not form-urlencoded.
         body_kwarg: dict[str, Any] = {"data": data}
@@ -3774,7 +3805,14 @@ class WebToolConfig(BaseToolConfig):
                 )
             else:
                 actor_query = actor_query.with_for_update()
-            oauth_account = actor_query.first()
+            # See the ordinary-flow branches in _resolve_legacy_oauth_access_
+            # token for why this is ordered rather than left arbitrary: the
+            # lock above prevents a *new* duplicate from forming during this
+            # resolution, but doesn't retroactively fix a namespace that
+            # already has more than one row from before locking existed (or
+            # from a provider whose identity backfill can't always derive a
+            # non-NULL provider_user_id).
+            oauth_account = actor_query.order_by(UserOAuth.id.desc()).first()
             logger.info(
                 "OAUTH CONFIG: Checked actor app credential for user %s. Found: %s",
                 user_id,
@@ -3869,6 +3907,13 @@ class WebToolConfig(BaseToolConfig):
                         resource_owner_key=None,
                     )
                     .filter(UserOAuth.provider.in_(providers_to_check))
+                    # Deterministic tie-break for the rare case of more than
+                    # one row for this (user, provider) set (e.g. a provider
+                    # whose identity backfill can't always derive a non-NULL
+                    # provider_user_id, like Employment Hero with zero
+                    # accessible organisations) -- most-recently-created wins,
+                    # rather than an arbitrary, backend-dependent row order.
+                    .order_by(UserOAuth.id.desc())
                     .first()
                 )
                 logger.info(
@@ -3885,6 +3930,9 @@ class WebToolConfig(BaseToolConfig):
                         resource_owner_key=None,
                     )
                     .filter(UserOAuth.provider == provider_name)
+                    # See the app_id-scoped branch above for why this is
+                    # ordered rather than left to an arbitrary row order.
+                    .order_by(UserOAuth.id.desc())
                     .first()
                 )
                 logger.info(

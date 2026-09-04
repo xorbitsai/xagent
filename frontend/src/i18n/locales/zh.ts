@@ -22,6 +22,11 @@ const zh = {
     uploadTooLarge: "文件过大，请减小上传大小后重试。",
     uploadProxyError: "上传请求未到达应用，请检查服务器的上传大小限制。",
     uploadFailed: "上传失败，请重试。",
+    missingRuntimeContext: "这个连接器需要额外的运行时输入才能运行。",
+    runtimeSecretUnavailable: "这个连接器需要的运行时凭据当前不可用。",
+    scheduledSecretUnavailable: "定时运行需要的运行时凭据当前不可用。",
+    invalidRuntimeContext: "这个连接器的运行时输入无效，任务无法运行。",
+    connectorRuntimeUnavailable: "这个连接器依赖的服务当前不可用，请稍后重试。",
   },
   common: {
     optional: "(可选)",

@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest"
 
+import en from "@/i18n/locales/en"
 import {
+  CLIENT_ERROR_CODES,
   clientErrorFallback,
   clientErrorTranslationKey,
   readClientErrorCode,
@@ -30,6 +32,11 @@ describe("client error wire contract", () => {
     ["upload_too_large", "clientErrors.uploadTooLarge", "File is too large. Please reduce the upload size and try again."],
     ["upload_proxy_error", "clientErrors.uploadProxyError", "Upload failed before reaching the application. Please check the server upload limit."],
     ["upload_failed", "clientErrors.uploadFailed", "Upload failed. Please try again."],
+    ["missing_runtime_context", "clientErrors.missingRuntimeContext", "This connector needs additional runtime input before it can run."],
+    ["runtime_secret_unavailable", "clientErrors.runtimeSecretUnavailable", "This connector needs a runtime credential that is not available."],
+    ["scheduled_secret_unavailable", "clientErrors.scheduledSecretUnavailable", "A scheduled run needs a runtime credential that is not available."],
+    ["invalid_runtime_context", "clientErrors.invalidRuntimeContext", "This connector's runtime input is not valid, so the task could not run."],
+    ["connector_runtime_unavailable", "clientErrors.connectorRuntimeUnavailable", "A service this connector needs is unavailable. Please try again later."],
   ] as const)("maps %s to a typed translation key", (code, key, fallback) => {
     expect(readClientErrorCode(code)).toBe(code)
     expect(clientErrorTranslationKey(code)).toBe(key)
@@ -39,5 +46,16 @@ describe("client error wire contract", () => {
   it("rejects unknown and non-string codes", () => {
     expect(readClientErrorCode("provider_secret")).toBeNull()
     expect(readClientErrorCode({ error_code: "upload_failed" })).toBeNull()
+  })
+
+  it("keeps the fallback strings identical to the English locale", () => {
+    for (const code of CLIENT_ERROR_CODES) {
+      const translationKey = clientErrorTranslationKey(code)
+      const localeKey = translationKey.replace(
+        /^clientErrors\./,
+        "",
+      ) as keyof typeof en.clientErrors
+      expect(clientErrorFallback(code)).toBe(en.clientErrors[localeKey])
+    }
   })
 })

@@ -59,6 +59,7 @@ from sqlalchemy.orm import Session
 from ...core.agent.context.execution import CLOCK_TIMEZONE_METADATA_KEY
 from ...core.execution_scope import resolve_execution_scope
 from ...core.tools.adapters.vibe.config import RequiredMCPUnavailableError
+from ...core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
 from ..models.task import Task, TaskStatus
 from .assistant_history_safety import (
     CLIENT_SAFE_FAILURE_MESSAGE_TYPE,
@@ -73,6 +74,8 @@ from .chat_history_service import (
 )
 from .client_error_messages import (
     CLIENT_SAFE_TASK_FAILURE,
+    connector_runtime_client_code,
+    connector_runtime_client_message,
     required_mcp_unavailable_client_message,
 )
 from .db_runtime import (
@@ -1793,6 +1796,7 @@ def _schedule_bg(
         client_history_error_message: str | None = None
         client_history_message_type = TASK_FAILURE_MESSAGE_TYPE
         broadcast_error_message: str | None = None
+        broadcast_error_code: str | None = None
         defer_settlement_to_ttl_recovery = False
         skip_delivery_reconciliation = False
         # Positive evidence for finalize's delivery target: once
@@ -1961,6 +1965,39 @@ def _schedule_bg(
                                 fallback=CLIENT_SAFE_TASK_FAILURE,
                             )
                         )
+                    elif isinstance(setup_or_run_err, ConnectorRuntimeError):
+                        # This exception's message is a curated public-safe
+                        # sentence -- it says a runtime input is missing, not
+                        # which one -- so the client gets it instead of the
+                        # opaque fallback, and ``code`` rides along on the
+                        # frame so the client can pick its own wording.
+                        # Nothing else from the exception reaches the frame:
+                        # the reason and the connector identity go to the
+                        # operator log below.
+                        settlement_error = str(setup_or_run_err)
+                        client_history_message_type = CLIENT_SAFE_FAILURE_MESSAGE_TYPE
+                        broadcast_error_message = connector_runtime_client_message(
+                            setup_or_run_err
+                        )
+                        broadcast_error_code = connector_runtime_client_code(
+                            setup_or_run_err
+                        )
+                        # Operators read the raw details: the connector
+                        # identity is useful here and does not leave the
+                        # server. ``details`` is a plain public attribute
+                        # anything can reassign, so verify the shape before
+                        # reading it.
+                        raw_details = setup_or_run_err.details
+                        if not isinstance(raw_details, dict):
+                            raw_details = {}
+                        logger.error(
+                            "task_id=%s component=connector-runtime code=%s "
+                            "reason=%s connector=%s",
+                            task_id,
+                            setup_or_run_err.code,
+                            raw_details.get("reason"),
+                            raw_details.get("connector_ref"),
+                        )
                     else:
                         settlement_error = (
                             "setup/run error: "
@@ -2033,6 +2070,7 @@ def _schedule_bg(
                                     create_terminal_task_error_event(
                                         task_id,
                                         broadcast_error_message,
+                                        code=broadcast_error_code,
                                     ),
                                     task_id,
                                 )

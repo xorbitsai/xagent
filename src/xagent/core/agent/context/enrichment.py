@@ -35,6 +35,42 @@ class TopLevelUserRequest:
     has_pending_response: bool = False
 
 
+@dataclass(frozen=True)
+class PendingUserResponse:
+    """Allowlisted context for one answer to a pending agent message."""
+
+    answer: str
+    question: str
+    message_type: str
+
+
+def pending_user_response(message: Any) -> PendingUserResponse | None:
+    """Extract only language-relevant fields from a marked user message."""
+    if getattr(message, "role", None) != "user":
+        return None
+    metadata = getattr(message, "metadata", None)
+    marker = (
+        metadata.get("response_to_waiting_for_user")
+        if isinstance(metadata, dict)
+        else None
+    )
+    if not isinstance(marker, dict):
+        return None
+    question = marker.get("question")
+    if not isinstance(question, str) or not question.strip():
+        return None
+    raw_message_type = marker.get("message_type", "question")
+    message_type = (
+        raw_message_type.strip()
+        if isinstance(raw_message_type, str) and raw_message_type.strip()
+        else "question"
+    )
+    answer = getattr(message, "content", "")
+    if not isinstance(answer, str):
+        return None
+    return PendingUserResponse(answer, question, message_type)
+
+
 def _stored_top_level_user_request(context: Any) -> TopLevelUserRequest | None:
     metadata = getattr(context, "metadata", None)
     if not isinstance(metadata, dict):

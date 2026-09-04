@@ -80,7 +80,10 @@ vi.mock("@/contexts/auth-context", () => ({
 }))
 
 vi.mock("@/contexts/i18n-context", () => ({
-  useI18n: () => ({ t: (key: string) => key }),
+  useI18n: () => ({
+    t: (key: string, vars?: Record<string, string | number>) =>
+      vars ? `${key}:${JSON.stringify(vars)}` : key,
+  }),
 }))
 
 vi.mock("@/hooks/use-websocket", () => ({
@@ -142,12 +145,14 @@ vi.mock("sonner", () => ({
 import {
   AppProvider,
   extractTaskControlEnvelope,
+  projectErrorFrameForDisplay,
   type AppProviderTransportConfig,
   useApp,
 } from "./app-context-chat"
 import { ChatStartScreen } from "@/components/chat/ChatStartScreen"
 import { MarkdownRenderer } from "@/components/ui/markdown-renderer"
 import { TASK_ERROR_EVENT, type TaskErrorEventDetail } from "@/lib/task-error-events"
+import type { Translate } from "@/contexts/i18n-context"
 
 type TaskControlMessage = Parameters<typeof extractTaskControlEnvelope>[0]
 
@@ -5622,5 +5627,1022 @@ describe("AppProvider websocket message routing", () => {
     const defaultLink = screen.getByRole("link", { name: "Docs" })
     expect(defaultLink).not.toHaveAttribute("target")
     expect(defaultLink).not.toHaveAttribute("rel")
+  })
+})
+
+describe("terminal error frames", () => {
+  // Same reset as the routing suite above: the websocket harness ref and the
+  // duplicate-message cache both outlive a single render, so without this the
+  // second test in this block would keep talking to the first one's provider.
+  beforeEach(() => {
+    webSocketOptions.current = null
+    webSocketOptions.all = []
+    sessionControls = null
+    wsHarness.isConnected = true
+    apiRequestMock.mockReset()
+    routerPushMock.mockReset()
+    sendRawMessageMock.mockReset()
+    sendRawMessageMock.mockReturnValue("sent")
+    sendChatMessageMock.mockReset()
+    sendChatMessageMock.mockResolvedValue({
+      client_message_id: "turn-optimistic",
+      turn_id: "turn-optimistic",
+    })
+    localStorage.clear()
+    ;(window as typeof window & { clearDuplicateMessageCache?: () => void })
+      .clearDuplicateMessageCache?.()
+  })
+
+  afterEach(() => {
+    cleanup()
+    localStorage.clear()
+  })
+
+  // The conversation panel renders only user / isResult / system-notice
+  // messages. Without the flag the bubble is filtered out and the UI falls
+  // back to a generic "unknown error" placeholder until the page reloads.
+  it("flags the terminal task_error bubble as the turn's result", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.({
+        type: "task_error",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        task: { id: 1, status: "failed" },
+        message: "Task execution failed.",
+        error: "Task execution failed.",
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "Task execution failed."
+      )
+    })
+
+    const messages = JSON.parse(
+      screen.getByTestId("messages").textContent || "[]"
+    )
+    const bubble = messages.find((m: { content: string }) =>
+      m.content.includes("Task execution failed.")
+    )
+    expect(bubble?.isResult).toBe(true)
+  })
+
+  // Rejections arrive on the root "error" type while the task keeps running:
+  // websocket.py refuses a chat message (:5521-5554) and a pause command
+  // (:8491, :8502) that way. Flagging one as this turn's result makes the
+  // conversation panel treat the turn as answered -- it renders only user /
+  // isResult / system-notice messages, so a flagged rejection ends the live
+  // progress indicator of a turn that is still running.
+  it("does not treat a rejection on a running task as the turn's result", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.({
+        type: "error",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        task: { id: 1, status: "running" },
+        message: "Task is currently busy; please wait for the previous turn to finish.",
+        error_code: "task_busy",
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "clientErrors.taskBusy"
+      )
+    })
+
+    const messages = JSON.parse(screen.getByTestId("messages").textContent || "[]")
+    const bubble = messages.find((m: { content: string }) =>
+      m.content.includes("clientErrors.taskBusy")
+    )
+    expect(bubble).toBeDefined()
+    expect(bubble?.isResult).not.toBe(true)
+    // The turn is untouched: still running, still processing.
+    expect(screen.getByTestId("task-status").textContent).toBe("running")
+    expect(screen.getByTestId("processing").textContent).toBe("true")
+  })
+
+  // The waiting half. A refused resume arrives on the root "error" type
+  // carrying the task's real current status (built from TaskControlSnapshot
+  // in websocket.py's _handle_resume_task_unserialized, near where
+  // resume_control_state is assembled -- that function is long, so look for
+  // the assignment rather than a fixed offset). The question the user still
+  // has to answer lives on the panel's virtual bubble, which a flagged
+  // rejection would remove.
+  // The fixture below combines fields from two producers: `task` comes from
+  // the resume-refusal branch, websocket.py's
+  // _handle_resume_task_unserialized; `error_code` comes from the
+  // pause-refusal branch, websocket.py's handle_pause_task, near its
+  // ClientErrorCode.MESSAGE_PROCESSING_FAILED fallback. Neither path emits
+  // both fields together today; each field is genuinely emitted by its own
+  // path.
+  // Carrying `task` drives the reducer's preservation branch (it is what
+  // makes `UPDATE_TASK_STATUS` dispatch at all) -- without it the assertions
+  // below would pass vacuously instead of exercising that branch.
+  it("does not treat a rejection on a waiting task as the turn's result", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    // Put the task where a resume can be refused: waiting on a question that
+    // carries an interaction the user has to fill in.
+    act(() => {
+      onMessage?.({
+        type: "task_waiting_for_user",
+        timestamp: "2026-05-27T05:00:01Z",
+        task_id: 1,
+        task: { id: 1, status: "waiting_for_user" },
+        message: "Which region should I use?",
+        request_id: "req-1",
+        interactions: [
+          { type: "text", request_id: "req-1", prompt: "Which region should I use?" },
+        ],
+      } as TestWebSocketMessage)
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("waiting_for_user")
+    })
+    expect(screen.getByTestId("waiting-interactions").textContent).not.toBe("[]")
+
+    act(() => {
+      onMessage?.({
+        type: "error",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        task: { id: 1, status: "waiting_for_user" },
+        message: "Task pause is still being applied; please retry shortly.",
+        error_code: "task_pause_in_progress",
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "clientErrors.taskPauseInProgress"
+      )
+    })
+
+    const messages = JSON.parse(screen.getByTestId("messages").textContent || "[]")
+    const bubble = messages.find((m: { content: string }) =>
+      m.content.includes("clientErrors.taskPauseInProgress")
+    )
+    expect(bubble).toBeDefined()
+    expect(bubble?.isResult).not.toBe(true)
+    // The question the user still owes an answer to is untouched.
+    expect(screen.getByTestId("task-status").textContent).toBe("waiting_for_user")
+    expect(screen.getByTestId("waiting-interactions").textContent).not.toBe("[]")
+  })
+
+  // The frame's code alone decides the wording -- nothing the raise site
+  // attached beyond the code reaches the client, so a missing-value code
+  // gets its own table entry regardless of what it would have named.
+  it("resolves wording from the code alone", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.({
+        type: "task_error",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        task: { id: 1, status: "failed" },
+        message: "Connector secrets are unavailable.",
+        error: "Connector secrets are unavailable.",
+        code: "runtime_secret_unavailable",
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "clientErrors.runtimeSecretUnavailable"
+      )
+    })
+
+    const messages = JSON.parse(screen.getByTestId("messages").textContent || "[]")
+    const bubble = messages.find((m: { content: string }) =>
+      m.content.includes("clientErrors.runtimeSecretUnavailable")
+    )
+    // Same toBe as the test below, on a different code: an interpolation
+    // regression has to be caught on both.
+    expect(bubble?.content).toBe("clientErrors.runtimeSecretUnavailable")
+  })
+
+  // What the server now sends for a missing declared context key: the code
+  // survives, and nothing else about the failure -- the key name included --
+  // ever reaches this frame at all. The bubble therefore says a value is
+  // missing without saying which -- the key name is owner configuration and
+  // this frame reaches anonymous widget and share-link visitors. Asserted
+  // with toBe, under a variable-aware i18n mock: had the wording
+  // interpolated anything, the content would read "<key>:{...}" and this
+  // assertion would fail.
+  it("names no declared key when a runtime value is missing", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.({
+        type: "task_error",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        task: { id: 1, status: "failed" },
+        message: "Required connector runtime context is missing.",
+        error: "Required connector runtime context is missing.",
+        code: "missing_runtime_context",
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "clientErrors.missingRuntimeContext"
+      )
+    })
+
+    const messages = JSON.parse(screen.getByTestId("messages").textContent || "[]")
+    const bubble = messages.find((m: { content: string }) =>
+      m.content.includes("clientErrors.missingRuntimeContext")
+    )
+    // No prefix: this wording replaces the server sentence rather than
+    // decorating it. Exactly the key, with nothing appended: no variable was
+    // interpolated, so no key name can be in the rendered text.
+    expect(bubble?.content).toBe("clientErrors.missingRuntimeContext")
+    expect(bubble?.isResult).toBe(true)
+  })
+
+  // The frame's code decides the wording -- this code reports a server-side
+  // component being down, and it has its own table entry rather than the
+  // generic prefix.
+  it("uses the code's own wording when a server-side component is down", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.({
+        type: "task_error",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        task: { id: 1, status: "failed" },
+        message: "Connector runtime is unavailable.",
+        error: "Connector runtime is unavailable.",
+        code: "connector_runtime_unavailable",
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "clientErrors.connectorRuntimeUnavailable"
+      )
+    })
+
+    // The server sentence is no longer relayed: this code has its own table
+    // entry now, on every transport, so the logged-in audience no longer sees
+    // a different wording than the one an untrusted transport gets.
+    expect(screen.getByTestId("messages").textContent).not.toContain(
+      "Connector runtime is unavailable."
+    )
+  })
+
+  // The dedup identity is the frame's own (run_id, state_version), not its
+  // code. These two turns fail under the same code -- the same runtime
+  // secret, both times unavailable -- and each settlement bumps
+  // state_version at least once (the retry takes the lease FAILED ->
+  // RUNNING, then settles RUNNING -> FAILED), so the second turn's version
+  // is strictly greater. Two distinct versions mean two distinct
+  // identities, and the bubble is the turn's result.
+  it("keeps both bubbles when one code fails twice at different state versions", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    const frameAtVersion = (timestamp: string, stateVersion: number) => ({
+      type: "task_error",
+      timestamp,
+      task_id: 1,
+      task: { id: 1, status: "failed" },
+      // Identical on both frames, and that is the production shape:
+      // _message_for_code returns one string per code.
+      message: "Required runtime secret is unavailable.",
+      error: "Required runtime secret is unavailable.",
+      code: "runtime_secret_unavailable",
+      run_id: "run-1",
+      state_version: stateVersion,
+    }) as TestWebSocketMessage
+
+    act(() => {
+      onMessage?.(frameAtVersion("2026-05-27T05:00:02Z", 12))
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "clientErrors.runtimeSecretUnavailable"
+      )
+    })
+
+    act(() => {
+      onMessage?.(frameAtVersion("2026-05-27T05:00:03Z", 14))
+    })
+
+    await waitFor(() => {
+      const messages = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]"
+      )
+      const bubbles = messages.filter(
+        (m: { content: string }) =>
+          m.content === "clientErrors.runtimeSecretUnavailable"
+      )
+      expect(bubbles).toHaveLength(2)
+    })
+  })
+
+  // The other half of the same contract: a genuine redelivery of one
+  // settlement (same run_id, same state_version) is still collapsed, so the
+  // identity did not simply disable deduplication.
+  it("still collapses a redelivery of one settlement", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    const frame = {
+      type: "task_error",
+      timestamp: "2026-05-27T05:00:02Z",
+      task_id: 1,
+      task: { id: 1, status: "failed" },
+      message: "Required runtime secret is unavailable.",
+      error: "Required runtime secret is unavailable.",
+      code: "runtime_secret_unavailable",
+      run_id: "run-1",
+      state_version: 12,
+    } as TestWebSocketMessage
+
+    act(() => {
+      onMessage?.(frame)
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "clientErrors.runtimeSecretUnavailable"
+      )
+    })
+
+    act(() => {
+      onMessage?.({ ...frame, timestamp: "2026-05-27T05:00:03Z" })
+    })
+
+    await waitFor(() => {
+      const messages = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]"
+      )
+      const bubbles = messages.filter(
+        (m: { content: string }) =>
+          m.content === "clientErrors.runtimeSecretUnavailable"
+      )
+      expect(bubbles).toHaveLength(1)
+    })
+  })
+
+  // Two failed turns under the same code, distinguished only by their
+  // state_version. Keying on the failure's class -- the code or the
+  // rendered sentence -- cannot tell these apart; keying on the frame's own
+  // state tuple can.
+  it("keeps both bubbles when one failure repeats on the next turn", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    const frameAtVersion = (stateVersion: number, timestamp: string) => ({
+      type: "task_error",
+      timestamp,
+      task_id: 1,
+      task: { id: 1, status: "failed" },
+      message: "Required runtime secret is unavailable.",
+      error: "Required runtime secret is unavailable.",
+      code: "runtime_secret_unavailable",
+      run_id: "run-1",
+      state_version: stateVersion,
+    }) as TestWebSocketMessage
+
+    act(() => {
+      onMessage?.(frameAtVersion(12, "2026-05-27T05:00:02Z"))
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "clientErrors.runtimeSecretUnavailable"
+      )
+    })
+
+    act(() => {
+      onMessage?.(frameAtVersion(14, "2026-05-27T05:00:03Z"))
+    })
+
+    await waitFor(() => {
+      const messages = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]"
+      )
+      const bubbles = messages.filter(
+        (m: { content: string }) =>
+          m.content === "clientErrors.runtimeSecretUnavailable"
+      )
+      expect(bubbles).toHaveLength(2)
+    })
+  })
+
+  // Two failed turns that carry no code at all -- the rendered sentence is
+  // identical on both -- distinguished only by their state_version. Before
+  // this change the dedup key was the rendered sentence alone, so the
+  // second of these vanished and that bubble
+  // is the turn's result.
+  it("keeps both bubbles for two generic failures on consecutive turns", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    const frameAtVersion = (stateVersion: number, timestamp: string) => ({
+      type: "task_error",
+      timestamp,
+      task_id: 1,
+      task: { id: 1, status: "failed" },
+      message: "Task execution failed.",
+      error: "Task execution failed.",
+      run_id: "run-1",
+      state_version: stateVersion,
+    }) as TestWebSocketMessage
+
+    act(() => {
+      onMessage?.(frameAtVersion(12, "2026-05-27T05:00:02Z"))
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "Task execution failed."
+      )
+    })
+
+    act(() => {
+      onMessage?.(frameAtVersion(14, "2026-05-27T05:00:03Z"))
+    })
+
+    await waitFor(() => {
+      const messages = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]"
+      )
+      const bubbles = messages.filter(
+        (m: { content: string }) =>
+          typeof m.content === "string" && m.content.includes("Task execution failed.")
+      )
+      expect(bubbles).toHaveLength(2)
+    })
+  })
+
+  // The widest form of the same case: a generic failure on an untrusted
+  // transport reads the same fixed "Unknown error" constant regardless of
+  // what precedes it, so a version-blind identity would collapse it into
+  // whatever coded failure happened to precede it within the window. The
+  // frame's own state tuple tells these two turns apart even though their
+  // rendered sentence -- and, on this transport, their entire dedup text --
+  // is identical.
+  it("keeps a generic failure that follows a coded one on an untrusted transport", async () => {
+    render(
+      <AppProvider token="public-token" transport={{ legacyErrorProse: "untrusted" }}>
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.({
+        type: "task_error",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        task: { id: 1, status: "failed" },
+        message: "Required connector runtime context is missing.",
+        error: "Required connector runtime context is missing.",
+        code: "missing_runtime_context",
+        run_id: "run-1",
+        state_version: 12,
+      } as TestWebSocketMessage)
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "clientErrors.missingRuntimeContext"
+      )
+    })
+
+    act(() => {
+      onMessage?.({
+        type: "task_error",
+        timestamp: "2026-05-27T05:00:03Z",
+        task_id: 1,
+        task: { id: 1, status: "failed" },
+        message: "Task execution failed.",
+        error: "Task execution failed.",
+        run_id: "run-1",
+        state_version: 14,
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      const messages = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]"
+      )
+      expect(messages).toHaveLength(2)
+      const codedBubbles = messages.filter(
+        (m: { content: string }) =>
+          m.content === "clientErrors.missingRuntimeContext"
+      )
+      const genericBubbles = messages.filter(
+        (m: { content: string }) =>
+          typeof m.content === "string" && m.content.includes("Unknown error")
+      )
+      expect(codedBubbles).toHaveLength(1)
+      expect(genericBubbles).toHaveLength(1)
+    })
+  })
+
+  // The witness at the integration level: two non-terminal rejections each
+  // carry a version ("error" is in VERSIONED_TASK_EVENT_TYPES too), but the
+  // terminal-only identity must not leak into this channel -- if it did, two
+  // different versions would make these look like two distinct rejections
+  // instead of one repeated one.
+  it("still collapses two identical non-terminal rejections", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    const rejectionAtVersion = (stateVersion: number, timestamp: string) => ({
+      type: "error",
+      timestamp,
+      task_id: 1,
+      task: { id: 1, status: "running" },
+      message: "Task is currently busy; please wait for the previous turn to finish.",
+      error_code: "task_busy",
+      run_id: "run-1",
+      state_version: stateVersion,
+    }) as TestWebSocketMessage
+
+    act(() => {
+      onMessage?.(rejectionAtVersion(12, "2026-05-27T05:00:02Z"))
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "clientErrors.taskBusy"
+      )
+    })
+
+    act(() => {
+      onMessage?.(rejectionAtVersion(14, "2026-05-27T05:00:03Z"))
+    })
+
+    await waitFor(() => {
+      const messages = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]"
+      )
+      const bubbles = messages.filter(
+        (m: { content: string }) =>
+          typeof m.content === "string" && m.content.includes("clientErrors.taskBusy")
+      )
+      expect(bubbles).toHaveLength(1)
+    })
+  })
+
+  // connector_runtime_unavailable has its own table entry, so it survives a
+  // transport that marks legacy prose untrusted the same way the three
+  // previously-curated codes always did. Before this, only those three had
+  // client-side wording; every other code, this one included, fell through
+  // to "Unknown error" for an anonymous widget or share-link visitor.
+  it("localizes a connector-runtime code for an untrusted transport", async () => {
+    render(
+      <AppProvider token="public-token" transport={{ legacyErrorProse: "untrusted" }}>
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.({
+        type: "task_error",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        task: { id: 1, status: "failed" },
+        message: "Connector runtime is unavailable.",
+        error: "Connector runtime is unavailable.",
+        code: "connector_runtime_unavailable",
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "clientErrors.connectorRuntimeUnavailable"
+      )
+    })
+
+    expect(screen.getByTestId("messages").textContent).not.toContain(
+      "Unknown error"
+    )
+  })
+
+  // The boundary the client wording table draws: a code the table does not
+  // list keeps the generic prefixed wording, even though it is a member of
+  // the same connector-runtime family. connector_not_found is real -- it is
+  // one of the ten V1ErrorCode connector-runtime members -- but its only
+  // raise site is in the payload-validation stage before a task row exists,
+  // so it never reaches a terminal frame in production; this pins what the
+  // table does when a code outside its five members shows up anyway, not a
+  // claim that this specific code will arrive on this path.
+  it("falls back to generic wording for a code the table does not list", async () => {
+    render(
+      <AppProvider token="public-token" transport={{ legacyErrorProse: "untrusted" }}>
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.({
+        type: "task_error",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        task: { id: 1, status: "failed" },
+        message: "Connector could not be found.",
+        error: "Connector could not be found.",
+        code: "connector_not_found",
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "agent.logs.event.messages.errorPrefix Unknown error"
+      )
+    })
+  })
+
+  // getTaskErrorProjection reads `data?.code` before `root.code` -- this
+  // pins the nested half of that fallback, which no existing fixture
+  // exercises (they all carry code on the root).
+  it("reads code nested under data", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.({
+        type: "task_error",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        data: {
+          code: "missing_runtime_context",
+        },
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "clientErrors.missingRuntimeContext"
+      )
+    })
+  })
+
+  // A cancellation carries no code (external_task_cancel.py:404 passes only
+  // a message), so isTerminal alone -- not a code -- has to make this frame
+  // the turn's result and route it through ADD_MESSAGE's isResult branch,
+  // the one place trace events accumulated on state.traceEvents move onto
+  // the settling message and state.traceEvents is cleared.
+  it("drains accumulated trace events onto the cancellation bubble", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+        <SessionControlsProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      getSessionControls().dispatch({
+        type: "ADD_TRACE_EVENT",
+        payload: {
+          event_id: "trace-1",
+          event_type: "agent_progress",
+          timestamp: "2026-05-27T05:00:01Z",
+          data: { message: "Reading the connector config" },
+        },
+      })
+      getSessionControls().dispatch({
+        type: "ADD_TRACE_EVENT",
+        payload: {
+          event_id: "trace-2",
+          event_type: "agent_progress",
+          timestamp: "2026-05-27T05:00:01.500Z",
+          data: { message: "Calling the tool" },
+        },
+      })
+    })
+    expect(getSessionControls().state.traceEvents).toHaveLength(2)
+
+    act(() => {
+      onMessage?.({
+        type: "task_error",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        task: { id: 1, status: "failed" },
+        message: "This response was interrupted.",
+        error: "This response was interrupted.",
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "This response was interrupted."
+      )
+    })
+
+    expect(getSessionControls().state.traceEvents).toEqual([])
+    const bubble = getSessionControls().state.messages.find(
+      (message) =>
+        typeof message.content === "string" &&
+        message.content.includes("This response was interrupted.")
+    )
+    expect(bubble?.traceEvents?.map((event) => event.event_id)).toEqual([
+      "trace-1",
+      "trace-2",
+    ])
+  })
+})
+
+describe("error frame display projection", () => {
+  const translate = ((key: string) => key) as unknown as Translate
+
+  it.each([
+    {
+      name: "a terminal frame with a missing-value code on a trusted transport",
+      frame: {
+        type: "task_error",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        task: { id: 1, status: "failed" },
+        message: "Required connector runtime context is missing.",
+        error: "Required connector runtime context is missing.",
+        code: "missing_runtime_context",
+      } as unknown as TaskControlMessage,
+      trustLegacyErrorProse: true,
+      expected: {
+        isTerminal: true,
+        taskStatus: "failed",
+        stopsProcessing: true,
+        dedupText: "Required connector runtime context is missing.",
+        // No run_id/state_version on this fixture, same as production for a
+        // frame the version gate would drop once any versioned event has
+        // been seen; the second case below is the witness for that fallback.
+        occurrenceIdentity: undefined,
+        bubbleContent: "clientErrors.missingRuntimeContext",
+        isResult: true,
+      },
+    },
+    {
+      name: "a terminal frame with no code on a trusted transport",
+      frame: {
+        type: "task_error",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        task: { id: 1, status: "failed" },
+        message: "Task execution failed.",
+        error: "Task execution failed.",
+      } as unknown as TaskControlMessage,
+      trustLegacyErrorProse: true,
+      expected: {
+        isTerminal: true,
+        taskStatus: "failed",
+        stopsProcessing: true,
+        dedupText: "Task execution failed.",
+        // This is the witness for withholding the identity when the frame
+        // has no state version.
+        occurrenceIdentity: undefined,
+        bubbleContent: "agent.logs.event.messages.errorPrefix Task execution failed.",
+        isResult: true,
+      },
+    },
+    {
+      // A resume that settles the task before the caller can hand it a code:
+      // websocket.py's resume-settlement broadcast (:3038) carries error_code
+      // on the root, the same field the non-terminal rejection channel
+      // uses -- not the code field create_terminal_task_error_event writes.
+      // getWebSocketErrorCode reads it regardless of which channel it came
+      // from, so dedupText picks up the coded wording; the bubble still gets
+      // the generic prefix, because that only drops for a frame carrying a
+      // `code` field, which this one does not.
+      name: "a resume-settlement frame with a root error_code on a trusted transport",
+      frame: {
+        type: "task_error",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        task: { id: 1, status: "failed" },
+        message: "Task execution failed.",
+        error: "Task execution failed.",
+        error_code: "task_execution_failed",
+      } as unknown as TaskControlMessage,
+      trustLegacyErrorProse: true,
+      expected: {
+        isTerminal: true,
+        taskStatus: "failed",
+        stopsProcessing: true,
+        dedupText: "clientErrors.taskExecutionFailed",
+        occurrenceIdentity: undefined,
+        bubbleContent: "agent.logs.event.messages.errorPrefix clientErrors.taskExecutionFailed",
+        isResult: true,
+      },
+    },
+    {
+      name: "a terminal frame with a missing-value code on an untrusted transport",
+      frame: {
+        type: "task_error",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        task: { id: 1, status: "failed" },
+        message: "Required connector runtime context is missing.",
+        error: "Required connector runtime context is missing.",
+        code: "missing_runtime_context",
+      } as unknown as TaskControlMessage,
+      trustLegacyErrorProse: false,
+      expected: {
+        isTerminal: true,
+        taskStatus: "failed",
+        stopsProcessing: true,
+        dedupText: "Unknown error",
+        occurrenceIdentity: undefined,
+        bubbleContent: "clientErrors.missingRuntimeContext",
+        isResult: true,
+      },
+    },
+    {
+      name: "a terminal frame with a state version on a trusted transport",
+      frame: {
+        type: "task_error",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        task: { id: 1, status: "failed" },
+        message: "Required runtime secret is unavailable.",
+        error: "Required runtime secret is unavailable.",
+        code: "runtime_secret_unavailable",
+        run_id: "run-1",
+        state_version: 12,
+      } as unknown as TaskControlMessage,
+      trustLegacyErrorProse: true,
+      expected: {
+        isTerminal: true,
+        taskStatus: "failed",
+        stopsProcessing: true,
+        dedupText: "Required runtime secret is unavailable.",
+        occurrenceIdentity: "run-1:12",
+        bubbleContent: "clientErrors.runtimeSecretUnavailable",
+        isResult: true,
+      },
+    },
+    {
+      name: "a terminal frame with a state version and no code on a trusted transport",
+      frame: {
+        type: "task_error",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        task: { id: 1, status: "failed" },
+        message: "Task execution failed.",
+        error: "Task execution failed.",
+        run_id: "run-1",
+        state_version: 12,
+      } as unknown as TaskControlMessage,
+      trustLegacyErrorProse: true,
+      expected: {
+        isTerminal: true,
+        taskStatus: "failed",
+        stopsProcessing: true,
+        dedupText: "Task execution failed.",
+        occurrenceIdentity: "run-1:12",
+        bubbleContent: "agent.logs.event.messages.errorPrefix Task execution failed.",
+        isResult: true,
+      },
+    },
+    {
+      name: "a non-terminal frame with a code and a state version on a trusted transport",
+      frame: {
+        type: "error",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        task: { id: 1, status: "running" },
+        message: "Task is currently busy; please wait for the previous turn to finish.",
+        error: "Task is currently busy; please wait for the previous turn to finish.",
+        code: "connector_runtime_unavailable",
+        state_version: 12,
+      } as unknown as TaskControlMessage,
+      trustLegacyErrorProse: true,
+      expected: {
+        isTerminal: false,
+        taskStatus: "running",
+        stopsProcessing: false,
+        dedupText: "Task is currently busy; please wait for the previous turn to finish.",
+        // This is the witness for keeping the terminal-only identity out of
+        // the rejection channel.
+        occurrenceIdentity: undefined,
+        bubbleContent: "agent.logs.event.messages.errorPrefix Task is currently busy; please wait for the previous turn to finish.",
+        isResult: false,
+      },
+    },
+  ])("derives $name", ({ frame, trustLegacyErrorProse, expected }) => {
+    // The envelope is parsed here rather than hand-built, matching the one
+    // call site in production (app-context-chat.tsx, before the switch): a
+    // hand-built envelope would be non-production-shaped input, and this is
+    // also what makes the no-version cell above (see its comment) actually
+    // exercise stateVersion being undefined rather than a value we chose.
+    const controlEnvelope = extractTaskControlEnvelope(frame)
+    expect(
+      projectErrorFrameForDisplay(frame, { trustLegacyErrorProse, translate, controlEnvelope }),
+    ).toEqual(expected)
   })
 })

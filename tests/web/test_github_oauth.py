@@ -156,6 +156,13 @@ def test_github_callback_requests_json_and_sends_secret_in_body(
     assert post.call_args.kwargs["auth"] is None
     assert post.call_args.kwargs["data"]["client_id"] == "github-client-id"
     assert post.call_args.kwargs["data"]["client_secret"] == "github-client-secret"
+    # Pins that the Employment Hero-specific query-param rewrite
+    # (grant_type/redirect_uri moved out of the body into `params`) stays
+    # scoped to that family and never leaks onto an unrelated provider's
+    # token exchange, e.g. if matches_provider_family's matching were ever
+    # accidentally widened.
+    assert post.call_args.kwargs["params"] is None
+    assert "grant_type" in post.call_args.kwargs["data"]
 
     oauth_account = (
         db.query(UserOAuth)

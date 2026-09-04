@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import secrets
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Dict, List, Literal, Optional, cast
 
@@ -52,7 +53,12 @@ from ..models.database import (
 from ..models.system_setting import SystemSetting
 from ..models.user import User
 from ..models.user_oauth import UserOAuth
-from ..oauth_provider_quirks import requires_json_accept_header
+from ..oauth_provider_quirks import (
+    host_matches_suffix,
+    matches_provider_family,
+    requires_json_accept_header,
+    requires_pkce,
+)
 from ..services import gmail_provisioning
 from ..services.auth_email import send_password_reset_email
 from ..services.db_runtime import await_task_settlement, propagate_deferred_cancellation
@@ -156,7 +162,17 @@ def _run_post_commit_oauth_side_effects(
 
 
 def _oauth_env_name(provider: str, suffix: str) -> str:
-    return f"{provider.upper()}_{suffix}"
+    # "-" -> "_" before uppercasing: a hyphenated provider_name (e.g.
+    # "employment-hero", or an admin-created "-sandbox" variant of any
+    # family) would otherwise produce an env var name no deployment could
+    # ever set (env vars can't contain "-"), silently breaking this
+    # fallback for every hyphenated provider. Every non-hyphenated provider
+    # name is unaffected by this replacement. Note this makes two distinct
+    # provider names that differ only in "-" vs "_" (e.g. a hypothetical
+    # "foo-bar" and "foo_bar") resolve to the same env var name -- no such
+    # pair exists among current providers, so this is a dormant, not
+    # currently reachable, collision.
+    return f"{provider.upper().replace('-', '_')}_{suffix}"
 
 
 def _is_salesforce_provider(provider: str) -> bool:
@@ -166,21 +182,19 @@ def _is_salesforce_provider(provider: str) -> bool:
     workaround is an admin hand-creating a second provider row (e.g.
     "salesforce-sandbox") pointing at test.salesforce.com, since the
     provider-row model has no per-user sandbox toggle. Every Salesforce-only
-    code path -- PKCE, the instance_url presence guard, and the
+    code path below -- the instance_url presence guard and the
     provider_user_id identity backfill -- must use this same predicate; an
-    exact match on any one of them would silently grant that row the
-    capability while skipping its safeguard.
+    exact match on either would silently grant that row the capability while
+    skipping its safeguard.
 
-    Anchored to a "-" separator, not a bare prefix: `oauth_providers.name` is
-    admin-settable via POST/PUT /admin/mcp/providers, so a bare
-    `.startswith("salesforce")` would also match an unrelated custom
-    provider an admin happened to name e.g. "salesforcelite" -- routing it
-    through PKCE and the instance_url-required guard it has no reason to
-    satisfy. Requiring "salesforce" or "salesforce-<anything>" keeps the
-    sandbox row matched without widening the blast radius that far.
+    PKCE is gated separately, by requires_pkce() (oauth_provider_quirks.py):
+    that predicate also covers Employment Hero, so it is no longer
+    Salesforce-only and must not be conflated with this one. Both share the
+    same underlying family-match algorithm (matches_provider_family below),
+    just applied to a different provider set -- see that function's
+    docstring for the "-"-anchored-prefix reasoning this predicate relies on.
     """
-    lowered = provider.lower()
-    return lowered == "salesforce" or lowered.startswith("salesforce-")
+    return matches_provider_family(provider, "salesforce")
 
 
 _DEPUTY_HOST_SUFFIX = "deputy.com"
@@ -230,8 +244,8 @@ def _normalize_deputy_endpoint(raw_endpoint: object) -> Optional[str]:
     except ValueError:
         return None
     hostname = (parsed.hostname or "").rstrip(".")
-    if parsed.scheme != "https" or not (
-        hostname == _DEPUTY_HOST_SUFFIX or hostname.endswith(f".{_DEPUTY_HOST_SUFFIX}")
+    if parsed.scheme != "https" or not host_matches_suffix(
+        hostname, _DEPUTY_HOST_SUFFIX
     ):
         return None
     return f"{parsed.scheme}://{hostname}{port}"
@@ -645,6 +659,210 @@ def _fetch_deputy_identity(
             email = candidate
             break
     return provider_user_id, email
+
+
+_EMPLOYMENT_HERO_API_BASE = "https://api.employmenthero.com/api/v1"
+_EMPLOYMENT_HERO_HOST_SUFFIX = "employmenthero.com"
+# Safety bound on _fetch_employment_hero_identity's pagination loop -- a
+# misbehaving/malicious response that never returns a short page must not
+# hang this callback in an unbounded fetch; 50 pages at 100 items each
+# (5000 organisations) is far beyond any real grant's scope.
+_EMPLOYMENT_HERO_IDENTITY_MAX_PAGES = 50
+# Wall-clock companion to the page-count cap above: generic_oauth_callback
+# runs as a sync def, so it occupies a FastAPI threadpool worker (not the
+# event loop) for its whole duration. The page-count cap alone bounds
+# *requests*, not elapsed time -- a slow/misconfigured token_url host could
+# still occupy a worker for MAX_PAGES * DEFAULT_TIMEOUT_SECONDS in the
+# worst case. This bounds when a NEW request may be issued, not the
+# function's total runtime: the check runs before each request, so a
+# request already in flight when the deadline is crossed can still run to
+# its own 10s timeout -- worst case is this budget plus one request
+# timeout (~25s here), not a hard 15s ceiling.
+_EMPLOYMENT_HERO_IDENTITY_MAX_SECONDS = 15.0
+# Comfortably under Postgres's ~2704-byte btree index row-size limit that
+# UserOAuth's (user_id, provider, provider_user_id) uniqueness index enforces
+# -- see _fetch_employment_hero_identity's docstring.
+_PROVIDER_USER_ID_SAFE_LENGTH = 500
+
+
+def _is_employment_hero_token_url(token_url: str) -> bool:
+    """True if `token_url`'s host is employmenthero.com or a subdomain of it.
+
+    Guards the call to _fetch_employment_hero_identity below: matches_
+    provider_family(provider, "employment-hero") trusts provider_name alone
+    (by design -- an admin-created "employment-hero-sandbox" row is exactly
+    the documented workaround this predicate exists for), but nothing else
+    ties that row's `token_url` to the real Employment Hero. Without this
+    check, an admin who points an "employment-hero"-family row's token_url
+    at an unrelated issuer would have this callback take the access token
+    that issuer returns and forward it, as a Bearer credential, to the real
+    api.employmenthero.com -- this check keeps the identity fetch (and the
+    provider_user_id it derives) scoped to grants that actually came from
+    Employment Hero's own token endpoint, falling through to the same
+    NULL-identity path a non-family provider with no userinfo_url takes
+    otherwise.
+    """
+    from urllib.parse import urlparse
+
+    try:
+        hostname = (urlparse(token_url).hostname or "").rstrip(".")
+    except ValueError:
+        return False
+    return host_matches_suffix(hostname, _EMPLOYMENT_HERO_HOST_SUFFIX)
+
+
+def _fetch_employment_hero_identity(access_token: str) -> Optional[str]:
+    """Fetch the accessible organisations for this grant from Employment
+    Hero's `GET /organisations` -- the same endpoint employment_hero.py's own
+    employment_hero_list_organisations tool calls, and the closest thing to
+    an identity check a token exposes (Employment Hero has no OIDC-style
+    "me" endpoint, per the registry row's comment). Employment Hero grants
+    are org-scoped rather than user-scoped, so there is no email to return;
+    the sorted, JSON-encoded set of organisation ids becomes provider_user_id
+    instead -- distinguishing tokens by the organisations they can reach
+    gives UserOAuth's (user_id, provider, provider_user_id) uniqueness
+    constraint a real value to key on. Without this, two concurrent
+    callbacks for the same user (a double-clicked Connect button, or two
+    open tabs) would each insert a row with provider_user_id=None, which
+    SQL's NULL-is-never-equal-to-NULL semantics lets the unique index pass
+    straight through -- the same race Salesforce's token-id fallback and
+    Deputy/Linear's own identity fetches each close for their provider (see
+    the Salesforce branch's comment above).
+
+    A grant with zero accessible organisations returns None rather than
+    failing the whole connect -- a token scoped to no organisation at
+    all is an edge case no tool in this connector could do anything useful
+    with anyway, so a hard connect-time error would be disproportionate;
+    the duplicate-row race is simply not closed for that one case, the same
+    tradeoff _fetch_deputy_identity accepts when Deputy's employee object is
+    missing every id-like key.
+
+    Paginates through every page rather than trusting a single 100-item
+    page: a grant with more than 100 accessible organisations would
+    otherwise have its provider_user_id derived from only the first 100,
+    silently excluding the rest from the uniqueness key. Termination is
+    driven by the response envelope's own `total_pages` (confirmed present
+    in Employment Hero's actual response shape -- see
+    test_list_organisations_requests_expected_path_and_params's fixture),
+    not by comparing the returned page size against the 100 this function
+    itself requested: this API's documented max page size is a ceiling on
+    what a caller may ask for, not a guarantee the server always returns
+    that many when more results exist, so a page shorter than requested is
+    not on its own reliable proof there's nothing left. Falls back to that
+    same short-page heuristic only if a response is ever missing
+    `total_pages` entirely. Capped at _EMPLOYMENT_HERO_IDENTITY_MAX_PAGES
+    pages, and separately at _EMPLOYMENT_HERO_IDENTITY_MAX_SECONDS before a
+    new page request may be issued (this runs inside a sync callback
+    occupying a FastAPI threadpool worker for its duration, so a slow
+    token_url host could otherwise hold one for page-count-many timeouts;
+    see that constant's own comment for why this bounds new requests, not
+    the function's total runtime) -- either safety bound against a
+    misbehaving/malicious/slow response logs a warning when hit; a
+    truncated organisation set at that point is still used rather than
+    failing the whole connect, matching the zero-organisation tradeoff
+    above.
+
+    The resulting id set is hashed rather than stored as a raw joined
+    string once it's long enough to risk exceeding Postgres's ~2704-byte
+    btree index row-size limit (UUID-shaped organisation ids at real scale
+    -- a partner/bookkeeper account with 70+ accessible organisations --
+    can exceed it): a hash is still a stable, deterministic value per exact
+    organisation set, which is all the uniqueness key actually needs.
+
+    Raises RuntimeError on a failed/unparsable response, matching
+    _fetch_deputy_identity/_fetch_linear_viewer_identity.
+    """
+    item_per_page = 100
+    organisation_ids: set[str] = set()
+    deadline = time.monotonic() + _EMPLOYMENT_HERO_IDENTITY_MAX_SECONDS
+    for page_index in range(1, _EMPLOYMENT_HERO_IDENTITY_MAX_PAGES + 1):
+        if time.monotonic() > deadline:
+            # This is a `break`, not a `for...else` fall-through -- logged
+            # here rather than relying on the loop's own cap-exhaustion
+            # warning below, since exceeding the time budget can happen
+            # well before exhausting the page-count one.
+            logger.warning(
+                "Employment Hero organisation lookup exceeded its %.0fs "
+                "time budget after %d page(s); provider_user_id may be "
+                "derived from an incomplete organisation set.",
+                _EMPLOYMENT_HERO_IDENTITY_MAX_SECONDS,
+                page_index - 1,
+            )
+            break
+        response = requests.get(
+            f"{_EMPLOYMENT_HERO_API_BASE}/organisations",
+            headers={"Authorization": f"Bearer {access_token}"},
+            params={"page_index": page_index, "item_per_page": item_per_page},
+            timeout=10.0,
+        )
+        if response.status_code != 200:
+            detail = truncate_error_text(response.text.strip(), limit=500)
+            raise RuntimeError(
+                f"Employment Hero API error (status {response.status_code})"
+                + (f": {detail}" if detail else "")
+            )
+        try:
+            payload = response.json()
+        except ValueError:
+            raise RuntimeError(
+                "Employment Hero API returned a non-JSON response: "
+                f"{truncate_error_text(response.text.strip(), limit=500)}"
+            ) from None
+        data = payload.get("data") if isinstance(payload, dict) else None
+        items = data.get("items") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            raise RuntimeError(
+                "Employment Hero API returned an unexpected response body"
+            )
+        organisation_ids.update(
+            str(item["id"])
+            for item in items
+            if isinstance(item, dict) and item.get("id") not in (None, "")
+        )
+        total_pages_raw = data.get("total_pages") if isinstance(data, dict) else None
+        # bool is an int subclass in Python (isinstance(True, int) is True)
+        # -- excluded explicitly so a stray boolean in the envelope can't be
+        # misread as a page count. A numeric string ("3") is accepted since
+        # nothing guarantees this field is always JSON-typed as a number
+        # rather than a string on Employment Hero's side; an integer-valued
+        # float (3.0) is accepted too, but a genuinely fractional one (3.5)
+        # is not -- that's not a valid page count under any serialization,
+        # so it's treated the same as a missing field rather than silently
+        # truncated into a wrong one.
+        total_pages: Optional[int] = None
+        if isinstance(total_pages_raw, bool):
+            pass
+        elif isinstance(total_pages_raw, int):
+            total_pages = total_pages_raw
+        elif isinstance(total_pages_raw, float) and total_pages_raw.is_integer():
+            total_pages = int(total_pages_raw)
+        elif isinstance(total_pages_raw, str) and total_pages_raw.strip().isdigit():
+            total_pages = int(total_pages_raw.strip())
+        if total_pages is not None and total_pages > 0:
+            if page_index >= total_pages:
+                break
+        elif len(items) < item_per_page:
+            break
+    else:
+        logger.warning(
+            "Employment Hero organisation lookup hit the %s-page safety cap; "
+            "provider_user_id may be derived from an incomplete organisation "
+            "set.",
+            _EMPLOYMENT_HERO_IDENTITY_MAX_PAGES,
+        )
+    # JSON-encoded, not comma-joined: a raw ",".join would let two distinct
+    # id sets collide onto the same string whenever an id itself happens to
+    # contain a literal "," (not expected for Employment Hero's UUID/numeric
+    # ids today, but not a contract this code can rely on) -- e.g.
+    # {"a,b", "c"} and {"a", "b,c"} both join to "a,b,c". JSON's own string
+    # quoting/escaping makes that collision impossible regardless of what
+    # characters an id contains.
+    provider_user_id = (
+        json.dumps(sorted(organisation_ids)) if organisation_ids else None
+    )
+    if provider_user_id and len(provider_user_id) > _PROVIDER_USER_ID_SAFE_LENGTH:
+        provider_user_id = hashlib.sha256(provider_user_id.encode()).hexdigest()
+    return provider_user_id
 
 
 def create_access_token(
@@ -2091,19 +2309,20 @@ def _generic_oauth_login(
     # Newer Salesforce orgs enforce PKCE on this authorization-code grant at
     # the org level, with no per-app way to disable it (Setup > External
     # Client Apps > Security > "Require Proof Key for Code Exchange" is
-    # locked once an org has it on). The verifier rides inside this signed,
-    # short-lived state token rather than a new DB row, to avoid a schema
-    # change for one provider -- but `state` itself goes out as a URL query
-    # param on the redirect to Salesforce and back, so it lands in browser
-    # history/Referer headers/proxy logs. HS256 signing alone doesn't hide
-    # the payload (it's base64, not encrypted), so the verifier is encrypted
-    # here before being embedded, and decrypted back out in the callback
-    # below. The token exchange still requires the server-held client_secret
-    # regardless, so this is defense-in-depth on top of that, not the only
-    # thing standing between an interceptor and a token.
-    code_verifier = (
-        secrets.token_urlsafe(64) if _is_salesforce_provider(provider) else None
-    )
+    # locked once an org has it on); Employment Hero mandates it for every
+    # app from 2026-09-14. requires_pkce() (oauth_provider_quirks.py) is the
+    # shared predicate for this provider family, not just _is_salesforce_
+    # provider, since it's no longer Salesforce-only. The verifier rides
+    # inside this signed, short-lived state token rather than a new DB row,
+    # to avoid a schema change for this -- but `state` itself goes out as a
+    # URL query param on the redirect to the provider and back, so it lands
+    # in browser history/Referer headers/proxy logs. HS256 signing alone
+    # doesn't hide the payload (it's base64, not encrypted), so the verifier
+    # is encrypted here before being embedded, and decrypted back out in the
+    # callback below. The token exchange still requires the server-held
+    # client_secret regardless, so this is defense-in-depth on top of that,
+    # not the only thing standing between an interceptor and a token.
+    code_verifier = secrets.token_urlsafe(64) if requires_pkce(provider) else None
     if code_verifier:
         from ...core.utils.encryption import encrypt_value
 
@@ -2113,19 +2332,22 @@ def _generic_oauth_login(
             # get_cipher() raises this when ENCRYPTION_KEY is unset outside
             # development -- every other provider's login route never calls
             # encrypt_value at all, so this misconfiguration is otherwise
-            # invisible until the first Salesforce connect attempt. Not
-            # routed through _oauth_provider_config_error: that helper's
-            # "Missing X for provider Y" phrasing is written for a
-            # provider-prefixed env var (e.g. SALESFORCE_CLIENT_ID) and
-            # would misleadingly suggest a SALESFORCE_ENCRYPTION_KEY-style
-            # variable exists, when ENCRYPTION_KEY is a single global
-            # setting unrelated to any one provider.
+            # invisible until the first PKCE-gated connect attempt (now
+            # Salesforce or Employment Hero, per requires_pkce() -- the
+            # provider name is interpolated below rather than hardcoded, so
+            # this stays accurate as that set grows). Not routed through
+            # _oauth_provider_config_error: that helper's "Missing X for
+            # provider Y" phrasing is written for a provider-prefixed env var
+            # (e.g. SALESFORCE_CLIENT_ID) and would misleadingly suggest a
+            # SALESFORCE_ENCRYPTION_KEY-style variable exists, when
+            # ENCRYPTION_KEY is a single global setting unrelated to any one
+            # provider.
             return HTMLResponse(
                 content=(
                     "<h1>Error: Server misconfigured</h1>"
                     "<p>The ENCRYPTION_KEY environment variable is not set. "
-                    "This is required to connect Salesforce; set it and "
-                    "restart the backend.</p>"
+                    f"This is required to connect {html.escape(provider)}; set "
+                    "it and restart the backend.</p>"
                 ),
                 status_code=500,
             )
@@ -2642,6 +2864,31 @@ def generic_oauth_callback(
             data["client_id"] = client_id
             data["client_secret"] = client_secret
 
+        params: dict[str, Any] | None = None
+        if matches_provider_family(
+            provider, "employment-hero"
+        ) and _is_employment_hero_token_url(token_url):
+            # Employment Hero's partner guide (developer.employmenthero.com
+            # /partner-guides) requires grant_type and redirect_uri as query
+            # parameters on the token URL itself, with only the credential/
+            # code fields (client_id, client_secret, code, code_verifier) in
+            # the form body -- unlike every other provider here, which sends
+            # the full RFC 6749 shape (all fields in the body). Popped out of
+            # `data` rather than duplicated, so they're never sent in both
+            # places. Gated on _is_employment_hero_token_url, not just the
+            # family match, for the same reason the identity-fetch branch
+            # below is: an admin-created "employment-hero"-family row's
+            # token_url isn't guaranteed to actually be Employment Hero's
+            # (see that function's docstring) -- applying this EH-specific
+            # wire quirk to a genuinely different token endpoint would
+            # break its exchange for no benefit, when falling back to the
+            # standard RFC 6749 body-only shape is what that endpoint
+            # actually expects.
+            params = {
+                "grant_type": data.pop("grant_type"),
+                "redirect_uri": data.pop("redirect_uri"),
+            }
+
         # Atlassian's token endpoint requires a JSON body -- unlike every
         # other provider here, it does not accept form-urlencoded and
         # answers a form-encoded POST with a 400.
@@ -2656,7 +2903,12 @@ def generic_oauth_callback(
             post_kwargs = {"json": data}
 
         token_response = requests.post(
-            token_url, headers=headers, timeout=10.0, auth=auth, **post_kwargs
+            token_url,
+            headers=headers,
+            timeout=10.0,
+            auth=auth,
+            params=params,
+            **post_kwargs,
         )
         try:
             token_data = token_response.json()
@@ -2949,6 +3201,54 @@ def generic_oauth_callback(
                         "<h1>Error verifying the connected account</h1>"
                         f"<p>Could not reach Deputy to verify the connection: "
                         f"{html.escape(str(e))}</p>"
+                    ),
+                    status_code=400,
+                )
+        elif matches_provider_family(
+            provider, "employment-hero"
+        ) and _is_employment_hero_token_url(token_url):
+            # Employment Hero's userinfo_url is deliberately left empty (see
+            # the registry row's comment) -- there's no OIDC-style "me"
+            # endpoint to point the generic `elif userinfo_url and
+            # access_token:` branch below at. Without a dedicated identity
+            # fetch here, provider_user_id would stay permanently NULL for
+            # every Employment Hero grant, the same gap Salesforce's
+            # token-id fallback above exists to close -- except Employment
+            # Hero's token response carries no equivalent "id" field, so
+            # _fetch_employment_hero_identity makes the extra request
+            # instead, mirroring Deputy/Linear's own dedicated fetches. The
+            # _is_employment_hero_token_url guard keeps this scoped to rows
+            # whose token_url is actually Employment Hero's own -- see that
+            # function's docstring.
+            try:
+                # No email slot -- Employment Hero grants are org-scoped,
+                # not user-scoped (see the function's docstring); `email`
+                # stays at its outer-scope None default.
+                provider_user_id = _fetch_employment_hero_identity(access_token)
+            except RuntimeError as e:
+                # A deliberate failure raised by _fetch_employment_hero_
+                # identity itself -- Employment Hero's API responded, just
+                # not usably.
+                return HTMLResponse(
+                    content=(
+                        "<h1>Error verifying the connected account</h1>"
+                        f"<p>The provider reported: {html.escape(str(e))}</p>"
+                    ),
+                    status_code=400,
+                )
+            except Exception as e:
+                # A network-level failure (timeout, connection error) --
+                # distinct from the case above: Employment Hero never
+                # actually responded, so attributing this to "the provider
+                # reported" would be misleading.
+                logger.error(
+                    "Employment Hero identity verification failed", exc_info=True
+                )
+                return HTMLResponse(
+                    content=(
+                        "<h1>Error verifying the connected account</h1>"
+                        "<p>Could not reach Employment Hero to verify the "
+                        f"connection: {html.escape(str(e))}</p>"
                     ),
                     status_code=400,
                 )

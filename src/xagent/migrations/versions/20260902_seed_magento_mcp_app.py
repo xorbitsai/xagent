@@ -39,7 +39,7 @@ APP_ID = "magento"
 ROW = {
     "app_id": APP_ID,
     "name": "Magento",
-    "description": "Connect to a self-hosted Magento/Adobe Commerce store with an Integration access token to search and manage products, look up orders and add order comments, and browse customers and categories.",
+    "description": 'Connect to a self-hosted Magento/Adobe Commerce store with an Integration access token to search and manage products, look up orders and add order comments, and browse customers and categories. On Magento 2.4.4+, enable Stores > Configuration > Services > OAuth > Consumer Settings > "Allow OAuth Access Tokens to be used as standalone Bearer tokens" first.',
     "icon": "https://www.google.com/s2/favicons?domain=magento.com&sz=128",
     "transport": "stdio",
     "provider_name": None,

@@ -1,5 +1,6 @@
 import json
 import socket
+import sys
 from unittest.mock import Mock
 
 import pytest
@@ -92,6 +93,12 @@ def test_headers_include_bearer_token_and_json_content_type():
     }
 
 
+def test_headers_strips_padded_access_token(monkeypatch):
+    monkeypatch.setenv("MAGENTO_ACCESS_TOKEN", "  test-token  ")
+
+    assert magento._headers()["Authorization"] == "Bearer test-token"
+
+
 def test_base_url_requires_env(monkeypatch):
     monkeypatch.delenv("MAGENTO_BASE_URL")
 
@@ -132,6 +139,8 @@ def test_base_url_brackets_ipv6_literal_host(monkeypatch):
         ("user:pass@store.example.com", "credentials"),
         ("store.example.com/rest", "path"),
         ("store.example.com?x=1", "path"),
+        ("store.example.com#frag", "path"),
+        ("https://store.example.com:not-a-port", "port"),
         ("https://", "hostname"),
     ],
 )
@@ -139,6 +148,13 @@ def test_base_url_rejects_invalid_url(monkeypatch, value, match):
     monkeypatch.setenv("MAGENTO_BASE_URL", value)
 
     with pytest.raises(ValueError, match=match):
+        magento._base_url()
+
+
+def test_base_url_raises_when_no_addresses_are_returned(monkeypatch):
+    monkeypatch.setattr(magento.socket, "getaddrinfo", lambda *a, **k: [])
+
+    with pytest.raises(ValueError, match="could not be resolved"):
         magento._base_url()
 
 
@@ -207,6 +223,25 @@ def test_resolve_store_host_idna_encodes_using_urllib3s_actual_encoder(monkeypat
     hostname, _port, _pinned_ip = magento._resolve_store_host()
 
     assert hostname == "xn--fa-hia.de"
+
+
+def test_resolve_store_host_raises_clear_error_for_invalid_idna_hostname(monkeypatch):
+    # idna.IDNAError (a UnicodeError subclass) for a non-ASCII hostname
+    # that's also invalid under IDNA's own rules (an underscore, not
+    # allowed under std3_rules) -- must surface as a clear ValueError,
+    # not propagate the raw IDNAError.
+    monkeypatch.setenv("MAGENTO_BASE_URL", "https://café_.example.com")
+
+    with pytest.raises(ValueError, match="invalid hostname"):
+        magento._resolve_store_host()
+
+
+def test_resolve_store_host_raises_clear_error_when_idna_package_missing(monkeypatch):
+    monkeypatch.setenv("MAGENTO_BASE_URL", "https://münchen.example.com")
+    monkeypatch.setitem(sys.modules, "idna", None)
+
+    with pytest.raises(ValueError, match="'idna' package is not installed"):
+        magento._resolve_store_host()
 
 
 def test_pinned_dns_redirects_matching_host_to_pinned_ip(monkeypatch):
@@ -772,6 +807,21 @@ def test_request_raises_with_structured_error_detail(monkeypatch):
         magento._request("GET", "/products/missing")
 
 
+def test_request_hints_at_the_bearer_token_setting_on_401(monkeypatch):
+    # The single most common cause of a 401 from an otherwise-correctly-
+    # configured integration: Magento 2.4.4+ disabled standalone-Bearer
+    # usage by default. That's currently only documented in a docstring
+    # nobody reading a runtime error sees -- surface it in the error too.
+    monkeypatch.setattr(
+        magento,
+        "_make_request",
+        Mock(return_value=MockResponse(status_code=401, text="Unauthorized")),
+    )
+
+    with pytest.raises(RuntimeError, match="standalone Bearer tokens"):
+        magento._request("GET", "/products/abc")
+
+
 def test_request_raises_clear_error_for_non_json_2xx_body(monkeypatch):
     monkeypatch.setattr(
         magento,
@@ -930,10 +980,40 @@ def test_list_products_drops_malformed_items_instead_of_phantom_records(monkeypa
     assert result["products"]["products"][0]["sku"] == "abc"
 
 
-def test_list_products_rejects_invalid_status():
+def test_list_products_logs_a_warning_when_dropping_malformed_items(
+    monkeypatch, caplog
+):
+    # Dropping a malformed item silently would look identical to "this
+    # page just happens to be short" -- a warning is the only signal a
+    # non-compliant response occurred, since there's no cursor to retry
+    # with once it's dropped.
+    monkeypatch.setattr(
+        magento,
+        "_make_request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "items": [{"sku": "abc", "name": "Shirt"}, "not-a-product"],
+                    "total_count": 2,
+                }
+            )
+        ),
+    )
+
+    with caplog.at_level("WARNING", logger="magento-mcp"):
+        magento.magento_list_products(limit=10, page=1)
+
+    assert any("Dropped 1 malformed" in record.message for record in caplog.records)
+
+
+def test_list_products_rejects_invalid_status(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(magento, "_make_request", mock_request)
+
     result = json.loads(magento.magento_list_products(status=9))
 
     assert result["status"] == "error"
+    mock_request.assert_not_called()
 
 
 @pytest.mark.parametrize("value", [True, False])
@@ -1003,10 +1083,14 @@ def test_get_product_returns_summary(monkeypatch):
     assert result["product"]["name"] == "Shirt"
 
 
-def test_get_product_requires_non_blank_sku():
+def test_get_product_requires_non_blank_sku(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(magento, "_make_request", mock_request)
+
     result = json.loads(magento.magento_get_product("  "))
 
     assert result["status"] == "error"
+    mock_request.assert_not_called()
 
 
 def test_get_product_percent_encodes_sku_containing_slash(monkeypatch):
@@ -1028,20 +1112,28 @@ def test_get_product_rejects_dot_dot_sku():
     assert result["status"] == "error"
 
 
-def test_create_product_rejects_invalid_status():
+def test_create_product_rejects_invalid_status(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(magento, "_make_request", mock_request)
+
     result = json.loads(
         magento.magento_create_product("sku1", "Shirt", 19.99, status=9)
     )
 
     assert result["status"] == "error"
+    mock_request.assert_not_called()
 
 
-def test_create_product_rejects_invalid_visibility():
+def test_create_product_rejects_invalid_visibility(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(magento, "_make_request", mock_request)
+
     result = json.loads(
         magento.magento_create_product("sku1", "Shirt", 19.99, visibility=9)
     )
 
     assert result["status"] == "error"
+    mock_request.assert_not_called()
 
 
 def test_create_product_rejects_whitespace_padded_sku(monkeypatch):
@@ -1081,10 +1173,37 @@ def test_create_product_sends_expected_body(monkeypatch):
     assert mock_request.call_args.kwargs["url"].endswith("/products")
 
 
-def test_update_product_requires_at_least_one_field():
+def test_create_product_strips_padded_name(monkeypatch):
+    # Unlike sku (an identifier, rejected if padded via require_clean_identifier),
+    # name is a free-text display field -- incidental padding should be
+    # stripped rather than silently stored, matching _require_non_blank's
+    # contract.
+    mock_request = Mock(return_value=MockResponse(json_data={"sku": "sku1"}))
+    monkeypatch.setattr(magento, "_make_request", mock_request)
+
+    magento.magento_create_product("sku1", "  Shirt  ", 19.99)
+
+    assert mock_request.call_args.kwargs["json"]["product"]["name"] == "Shirt"
+
+
+def test_create_product_rejects_negative_price(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(magento, "_make_request", mock_request)
+
+    result = json.loads(magento.magento_create_product("sku1", "Shirt", -1))
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
+def test_update_product_requires_at_least_one_field(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(magento, "_make_request", mock_request)
+
     result = json.loads(magento.magento_update_product("sku1"))
 
     assert result["status"] == "error"
+    mock_request.assert_not_called()
 
 
 def test_update_product_sends_only_provided_fields(monkeypatch):
@@ -1099,6 +1218,35 @@ def test_update_product_sends_only_provided_fields(monkeypatch):
     assert body == {"sku": "sku1", "price": 29.99}
     assert mock_request.call_args.kwargs["url"].endswith("/products/sku1")
     assert mock_request.call_args.kwargs["method"] == "PUT"
+
+
+def test_update_product_strips_padded_name(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"sku": "sku1"}))
+    monkeypatch.setattr(magento, "_make_request", mock_request)
+
+    magento.magento_update_product("sku1", name="  Shirt  ")
+
+    assert mock_request.call_args.kwargs["json"]["product"]["name"] == "Shirt"
+
+
+def test_update_product_rejects_blank_name(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(magento, "_make_request", mock_request)
+
+    result = json.loads(magento.magento_update_product("sku1", name="   "))
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
+def test_update_product_rejects_negative_price(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(magento, "_make_request", mock_request)
+
+    result = json.loads(magento.magento_update_product("sku1", price=-1))
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
 
 
 def test_update_product_percent_encodes_sku_in_path(monkeypatch):
@@ -1125,6 +1273,43 @@ def test_list_orders_sends_status_filter_and_sort(monkeypatch):
     assert params["searchCriteria[filter_groups][0][filters][0][value]"] == "processing"
     assert params["searchCriteria[sortOrders][0][field]"] == "created_at"
     assert params["searchCriteria[sortOrders][0][direction]"] == "DESC"
+
+
+def test_list_orders_sends_increment_id_filter(monkeypatch):
+    # The only way to look up an order by the customer-facing number
+    # (e.g. "000000123") -- magento_get_order requires the internal
+    # entity id instead.
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"items": [], "total_count": 0})
+    )
+    monkeypatch.setattr(magento, "_make_request", mock_request)
+
+    magento.magento_list_orders(increment_id="000000123")
+
+    params = mock_request.call_args.kwargs["params"]
+    assert (
+        params["searchCriteria[filter_groups][0][filters][0][field]"] == "increment_id"
+    )
+    assert params["searchCriteria[filter_groups][0][filters][0][value]"] == "000000123"
+
+
+def test_list_orders_sends_status_and_increment_id_filters_as_separate_groups(
+    monkeypatch,
+):
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"items": [], "total_count": 0})
+    )
+    monkeypatch.setattr(magento, "_make_request", mock_request)
+
+    magento.magento_list_orders(status="processing", increment_id="000000123")
+
+    params = mock_request.call_args.kwargs["params"]
+    # Separate filter_groups entries (ANDed), not a second filter in group 0
+    # (which Magento would OR together instead).
+    assert params["searchCriteria[filter_groups][0][filters][0][field]"] == "status"
+    assert (
+        params["searchCriteria[filter_groups][1][filters][0][field]"] == "increment_id"
+    )
 
 
 def test_list_orders_returns_pagination_metadata_at_top_level(monkeypatch):
@@ -1170,7 +1355,11 @@ def test_get_order_returns_summary(monkeypatch):
     assert result["order"]["currency"] == "USD"
 
 
-def test_get_order_percent_encodes_id_in_path(monkeypatch):
+def test_get_order_builds_the_expected_path(monkeypatch):
+    # Renamed from "..._percent_encodes_id_in_path": a plain "1" has
+    # nothing to encode, so this only covers the happy-path URL shape --
+    # actual percent-encoding is exercised by
+    # test_get_order_neutralizes_path_traversal_id below.
     mock_request = Mock(return_value=MockResponse(json_data={"entity_id": 1}))
     monkeypatch.setattr(magento, "_make_request", mock_request)
 
@@ -1216,10 +1405,24 @@ def test_get_order_neutralizes_path_traversal_id(monkeypatch):
     assert url.endswith("/orders/1%2F..%2F..%2Fcustomers%2F5")
 
 
-def test_add_order_comment_requires_non_blank_comment():
+def test_add_order_comment_requires_non_blank_comment(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(magento, "_make_request", mock_request)
+
     result = json.loads(magento.magento_add_order_comment(1, "   "))
 
     assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
+def test_add_order_comment_strips_padded_comment(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data=True))
+    monkeypatch.setattr(magento, "_make_request", mock_request)
+
+    magento.magento_add_order_comment(1, "  Shipped today  ")
+
+    body = mock_request.call_args.kwargs["json"]["statusHistory"]
+    assert body["comment"] == "Shipped today"
 
 
 def test_add_order_comment_sends_status_history(monkeypatch):
@@ -1509,6 +1712,37 @@ def test_category_summary_rejects_non_list_children_data(children_data_value):
         magento._category_summary(
             {"id": 1, "name": "Root", "children_data": children_data_value}
         )
+
+
+def _make_nested_category(depth: int) -> dict:
+    node: dict = {"id": depth, "name": f"Level {depth}", "children_data": []}
+    for level in range(depth - 1, -1, -1):
+        node = {"id": level, "name": f"Level {level}", "children_data": [node]}
+    return node
+
+
+def test_category_summary_accepts_a_deeply_nested_but_bounded_tree():
+    # Comfortably below the safety cap -- a real, if unusually deep,
+    # category tree must not be rejected.
+    tree = _make_nested_category(depth=10)
+
+    summary = magento._category_summary(tree)
+
+    # Walk down to confirm the whole chain summarized correctly.
+    node = summary
+    for level in range(10):
+        assert node["name"] == f"Level {level}"
+        node = node["children_data"][0]
+
+
+def test_category_summary_rejects_a_pathologically_deep_tree():
+    # A pathological or cyclic children_data would otherwise only ever be
+    # stopped by an incidental RecursionError -- assert the explicit,
+    # documented cap raises a clear error instead.
+    tree = _make_nested_category(depth=magento._MAX_CATEGORY_SUMMARY_DEPTH + 5)
+
+    with pytest.raises(ValueError, match="maximum supported depth"):
+        magento._category_summary(tree)
 
 
 def test_get_category_handles_null_category_response(monkeypatch):

@@ -38,6 +38,11 @@ mcp = FastMCP("magento-mcp")
 
 DEFAULT_TIMEOUT_SECONDS = 30
 MAX_LIMIT = 100
+# Comfortably deeper than any real Magento catalog's category hierarchy
+# (a handful of levels in practice) -- just enough to turn a pathological
+# or cyclic children_data into a clear error instead of an incidental
+# RecursionError.
+_MAX_CATEGORY_SUMMARY_DEPTH = 50
 
 _PRODUCT_STATUSES = frozenset({1, 2})  # 1 = Enabled, 2 = Disabled
 _PRODUCT_VISIBILITIES = frozenset({1, 2, 3, 4})  # Not Visible/Catalog/Search/Both
@@ -73,7 +78,7 @@ def _headers() -> dict[str, str]:
     auth scheme this module doesn't implement; a 401 from an otherwise
     correctly-configured integration is the signal to check this setting.
     """
-    token = environ.get("MAGENTO_ACCESS_TOKEN")
+    token = environ.get("MAGENTO_ACCESS_TOKEN", "").strip()
     if not token:
         raise ValueError("MAGENTO_ACCESS_TOKEN environment variable is missing")
     return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
@@ -341,9 +346,16 @@ def _clamp_limit(limit: int) -> int:
 
 
 def _require_non_blank(value: str, field_name: str) -> str:
+    """Reject an empty/all-whitespace value, and strip incidental
+    leading/trailing whitespace from what's kept. Unlike
+    require_clean_identifier's reject-don't-fix handling of an id (where
+    padding is itself a bug signal worth surfacing, since it changes what
+    the id matches), these are free-text display fields -- a product
+    name, an order comment -- where silently storing accidental padding
+    is the more likely-to-surprise outcome, not stripping it."""
     if not value or not value.strip():
         raise ValueError(f"{field_name} must not be blank")
-    return value
+    return value.strip()
 
 
 def _escape_like(value: str) -> str:
@@ -444,6 +456,12 @@ def _request(
     params: dict[str, Any] | None = None,
     json_data: dict[str, Any] | None = None,
 ) -> Any:
+    # Validated before anything that costs a network round-trip: a request
+    # that's going to fail anyway on a missing/malformed token or store
+    # code shouldn't first pay for a DNS lookup to find that out.
+    headers = _headers()
+    store_path_prefix = _store_path_prefix()
+
     # An ambient HTTP(S) proxy makes the *proxy* perform DNS resolution and
     # the actual outbound TCP connection, not this process -- urllib3's
     # connection pool dials the proxy's own address in that case, never the
@@ -467,13 +485,13 @@ def _request(
     # can be pinned to the same address that lookup validated.
     hostname, port, pinned_ip = _resolve_store_host()
     origin = _format_origin(hostname, port)
-    url = f"{origin}{_store_path_prefix()}{path}"
+    url = f"{origin}{store_path_prefix}{path}"
     try:
         with _pinned_dns(hostname, pinned_ip):
             response = _make_request(
                 method=method,
                 url=url,
-                headers=_headers(),
+                headers=headers,
                 params=params,
                 json=json_data,
                 timeout=DEFAULT_TIMEOUT_SECONDS,
@@ -506,6 +524,18 @@ def _request(
             detail = truncate_error_text(response.text.strip())
         if detail:
             message = f"{message} - {redact_sensitive_text(detail)}"
+        if response.status_code == 401:
+            # The single most common cause of an otherwise-correctly-
+            # configured integration returning 401: Magento 2.4.4+ disabled
+            # standalone-Bearer usage of an Integration's token by default
+            # (see _headers()'s docstring) -- surface the fix here too,
+            # not just in a docstring nobody reading a 401 sees.
+            message += (
+                " (On Magento 2.4.4+, this can mean 'Allow OAuth Access "
+                "Tokens to be used as standalone Bearer tokens' is "
+                "disabled -- see Stores > Configuration > Services > "
+                "OAuth > Consumer Settings.)"
+            )
         raise RuntimeError(message) from exc
 
     if response.status_code == 204 or not response.content:
@@ -632,12 +662,18 @@ def _list_search(
     # non-compliant proxy is dropped outright instead of appearing as a
     # phantom all-None record indistinguishable from a real one -- the
     # same reasoning applied to _category_summary's children_data.
-    capped = json.loads(
-        success_with_capped_dict(
+    summaries = [summary for item in items if (summary := summary_fn(item))]
+    if len(summaries) < len(items):
+        # Silently returning fewer items than total_count implied would
+        # look identical to "this page just happens to be short" -- log
+        # so a malformed response is at least visible somewhere, even
+        # though the caller has no cursor to retry with once it's dropped.
+        logger.warning(
+            "Dropped %d malformed %s item(s) from a Magento response",
+            len(items) - len(summaries),
             result_key,
-            {result_key: [summary for item in items if (summary := summary_fn(item))]},
         )
-    )
+    capped = json.loads(success_with_capped_dict(result_key, {result_key: summaries}))
     # Under an aggressively low XAGENT_TOOL_MAX_OUTPUT_LENGTH,
     # success_with_capped_dict's phase-2 fallback can drop the wrapper's
     # sole key entirely once phase 1's list-halving alone isn't enough --
@@ -714,10 +750,21 @@ def _customer_summary(customer: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _category_summary(category: dict[str, Any]) -> dict[str, Any]:
+def _category_summary(category: dict[str, Any], _depth: int = 0) -> dict[str, Any]:
     record = _as_record(category)
     if record is None:
         return {}
+    if _depth >= _MAX_CATEGORY_SUMMARY_DEPTH:
+        # A pathological or cyclic children_data (a non-compliant proxy,
+        # or a genuinely malformed tree) would otherwise only ever be
+        # stopped by RecursionError -- an implementation detail the tool's
+        # blanket "except Exception" happens to catch today, not an
+        # intentional guarantee this function's own "unlimited depth"
+        # claim should rely on.
+        raise ValueError(
+            f"Magento category tree exceeds the maximum supported depth "
+            f"({_MAX_CATEGORY_SUMMARY_DEPTH})"
+        )
     # Type-checked the same way _paginated_result treats "items": a
     # genuinely absent/None children_data legitimately means "no
     # children", but a truthy non-list value (a string, a dict from a
@@ -750,7 +797,9 @@ def _category_summary(category: dict[str, Any]) -> dict[str, Any]:
         # returns all 8 keys), so filtering on it can't also drop a real,
         # sparsely-populated category.
         "children_data": [
-            summary for child in children_data if (summary := _category_summary(child))
+            summary
+            for child in children_data
+            if (summary := _category_summary(child, _depth + 1))
         ],
     }
 
@@ -833,7 +882,9 @@ def magento_create_product(
         # creating a product a later get/update of the same string would
         # then reject as invalid.
         require_clean_identifier(sku, "sku")
-        _require_non_blank(name, "name")
+        name = _require_non_blank(name, "name")
+        if price < 0:
+            return _error("price must not be negative")
         if err := _validate_choice(status, _PRODUCT_STATUSES, "status"):
             return _error(err)
         if err := _validate_choice(visibility, _PRODUCT_VISIBILITIES, "visibility"):
@@ -874,10 +925,11 @@ def magento_update_product(
         product_input: dict[str, Any] = {"sku": sku}
         fields_provided = False
         if name is not None:
-            _require_non_blank(name, "name")
-            product_input["name"] = name
+            product_input["name"] = _require_non_blank(name, "name")
             fields_provided = True
         if price is not None:
+            if price < 0:
+                return _error("price must not be negative")
             product_input["price"] = price
             fields_provided = True
         if status is not None:
@@ -903,12 +955,18 @@ def magento_update_product(
 
 
 @mcp.tool()
-def magento_list_orders(status: str = "", limit: int = 25, page: int = 1) -> str:
+def magento_list_orders(
+    status: str = "", increment_id: str = "", limit: int = 25, page: int = 1
+) -> str:
     """
     Search/list orders, most recent first.
     status: optional order status to filter by, e.g. "processing",
     "complete", "pending", "canceled" (a store's exact status values are
     configurable, so these are the common defaults, not a fixed enum).
+    increment_id: optional exact customer-facing order number to look up,
+    e.g. "000000123" -- the only way to find an order by the number a
+    customer/support agent actually sees, since magento_get_order requires
+    the internal entity id instead.
     limit: max orders to return (default 25, hard cap 100).
     page: 1-based page number; pass the previous page + 1 to continue.
     """
@@ -916,6 +974,8 @@ def magento_list_orders(status: str = "", limit: int = 25, page: int = 1) -> str
         filters: list[tuple[str, str, str]] = []
         if status:
             filters.append(("status", "eq", status))
+        if increment_id:
+            filters.append(("increment_id", "eq", increment_id))
         extra_params = {
             "searchCriteria[sortOrders][0][field]": "created_at",
             "searchCriteria[sortOrders][0][direction]": "DESC",
@@ -932,7 +992,8 @@ def magento_list_orders(status: str = "", limit: int = 25, page: int = 1) -> str
 def magento_get_order(order_id: int) -> str:
     """
     Get a Magento order by its numeric entity id (from magento_list_orders;
-    not the customer-facing increment_id like "000000123").
+    not the customer-facing increment_id like "000000123" -- to look up an
+    order by that number instead, use magento_list_orders(increment_id=...)).
     """
     try:
         result = _request("GET", f"/orders/{url_path_id(str(order_id), 'order_id')}")
@@ -964,7 +1025,7 @@ def magento_add_order_comment(
     the customer's order history by default; pass true to make it visible.
     """
     try:
-        _require_non_blank(comment, "comment")
+        comment = _require_non_blank(comment, "comment")
         status_history: dict[str, Any] = {
             "comment": comment,
             "is_customer_notified": notify_customer,

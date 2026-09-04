@@ -63,8 +63,8 @@ def test_upgrade_inserts_magento(tmp_path):
         assert "magento" in _app_ids(connection)
         row = connection.execute(
             text(
-                "SELECT transport, provider_name, launch_config FROM public_mcp_apps"
-                " WHERE app_id='magento'"
+                "SELECT transport, provider_name, launch_config, category, "
+                "description, icon FROM public_mcp_apps WHERE app_id='magento'"
             )
         ).first()
         assert row[0] == "stdio"
@@ -76,6 +76,9 @@ def test_upgrade_inserts_magento(tmp_path):
             "MAGENTO_STORE_CODE",
         ):
             assert env_key in str(row[2])
+        assert row[3] == "Commerce"
+        assert "Magento/Adobe Commerce" in row[4]
+        assert row[5].startswith("https://")
 
 
 def test_upgrade_is_idempotent(tmp_path):
@@ -135,6 +138,33 @@ def test_downgrade_removes_magento(tmp_path):
         with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()
             migration.downgrade()
+        assert "magento" not in _app_ids(connection)
+
+
+def test_downgrade_leaves_other_catalog_rows_untouched(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection)
+        connection.execute(
+            text(
+                "INSERT INTO public_mcp_apps (app_id, name, transport) "
+                "VALUES ('other_app', 'Other', 'oauth')"
+            )
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+            migration.downgrade()
+        assert _app_ids(connection) == {"other_app"}
+
+
+def test_downgrade_is_a_no_op_when_the_row_is_already_absent(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection)
+        with patch.object(migration, "op", _operations(connection)):
+            migration.downgrade()  # never upgraded -- must not raise
         assert "magento" not in _app_ids(connection)
 
 

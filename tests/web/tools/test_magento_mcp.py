@@ -1239,6 +1239,36 @@ def test_validate_non_negative_rejects_bool_and_non_finite(value):
     assert magento._validate_non_negative(value, "price")
 
 
+@pytest.mark.parametrize("value", [True, False, float("nan"), float("inf")])
+def test_create_product_rejects_bool_and_non_finite_price(monkeypatch, value):
+    # test_validate_non_negative_rejects_bool_and_non_finite only proves the
+    # shared helper rejects these -- this proves magento_create_product
+    # actually calls it for `price` (a future edit could swap in a bare
+    # `< 0` check at this call site and no test would catch it).
+    mock_request = Mock()
+    monkeypatch.setattr(magento, "_make_request", mock_request)
+
+    result = json.loads(magento.magento_create_product("sku1", "Shirt", value))
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
+@pytest.mark.parametrize("value", [True, False, float("nan"), float("inf")])
+def test_create_product_rejects_bool_and_non_finite_attribute_set_id(
+    monkeypatch, value
+):
+    mock_request = Mock()
+    monkeypatch.setattr(magento, "_make_request", mock_request)
+
+    result = json.loads(
+        magento.magento_create_product("sku1", "Shirt", 19.99, attribute_set_id=value)
+    )
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
 def test_update_product_requires_at_least_one_field(monkeypatch):
     mock_request = Mock()
     monkeypatch.setattr(magento, "_make_request", mock_request)
@@ -1287,6 +1317,42 @@ def test_update_product_rejects_negative_price(monkeypatch):
     monkeypatch.setattr(magento, "_make_request", mock_request)
 
     result = json.loads(magento.magento_update_product("sku1", price=-1))
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
+@pytest.mark.parametrize("value", [True, False, float("nan"), float("inf")])
+def test_update_product_rejects_bool_and_non_finite_price(monkeypatch, value):
+    mock_request = Mock()
+    monkeypatch.setattr(magento, "_make_request", mock_request)
+
+    result = json.loads(magento.magento_update_product("sku1", price=value))
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
+def test_update_product_rejects_invalid_status(monkeypatch):
+    # magento_create_product's equivalent status/visibility rejection is
+    # tested (test_create_product_rejects_invalid_status/_visibility) but
+    # update's own _validate_choice calls (a separate call site) had no
+    # test of their own -- a regression here would only show up as Magento
+    # itself rejecting a bad PUT request, not as a failing test.
+    mock_request = Mock()
+    monkeypatch.setattr(magento, "_make_request", mock_request)
+
+    result = json.loads(magento.magento_update_product("sku1", status=9))
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
+def test_update_product_rejects_invalid_visibility(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(magento, "_make_request", mock_request)
+
+    result = json.loads(magento.magento_update_product("sku1", visibility=9))
 
     assert result["status"] == "error"
     mock_request.assert_not_called()
@@ -1660,6 +1726,33 @@ def test_get_category_tree_sends_optional_params(monkeypatch):
     assert result["category"]["name"] == "Root"
     assert result["category"]["children_data"][0]["name"] == "Shirts"
     assert mock_request.call_args.kwargs["params"] == {"rootCategoryId": 2, "depth": 2}
+
+
+def test_get_category_tree_caps_output_when_the_tree_is_oversized(monkeypatch):
+    # get_category_tree is the unbounded-depth/width endpoint (no size
+    # limit on root_category_id/depth), so it's at least as exposed to an
+    # oversized response as magento_get_category -- mirrors
+    # test_get_category_caps_output_when_children_data_is_oversized to
+    # prove the capping call is wired up here too, not just tested on its
+    # sibling.
+    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 2000)
+    children = [{"id": i, "name": "x" * 100, "children_data": []} for i in range(100)]
+    monkeypatch.setattr(
+        magento,
+        "_make_request",
+        Mock(
+            return_value=MockResponse(
+                json_data={"id": 2, "name": "Root", "children_data": children}
+            )
+        ),
+    )
+
+    raw = magento.magento_get_category_tree()
+    result = json.loads(raw)
+
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert len(result["category"]["children_data"]) < len(children)
 
 
 def test_get_category_returns_summary(monkeypatch):

@@ -251,6 +251,38 @@ def _normalize_deputy_endpoint(raw_endpoint: object) -> Optional[str]:
     return f"{parsed.scheme}://{hostname}{port}"
 
 
+_MYOB_BUSINESS_ID_PATTERN = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
+
+def _normalize_myob_business_id(raw_business_id: object) -> Optional[str]:
+    """Validate the `businessId` MYOB appends to its own authorization
+    redirect as a well-formed GUID.
+
+    This is the *only* place MYOB ever names the business the user
+    consented to -- never the token response (unlike every other
+    per-connection identifier this file normalizes, e.g. Salesforce's/
+    Deputy's), and there is no discovery endpoint to recover it after the
+    fact the way Xero's /connections is: MYOB's own equivalent (GET
+    https://api.myob.com/accountright/) stopped returning company files
+    for API keys created under the post-2025 granular-scope model. So a
+    malformed or missing value here is unrecoverable for this connection,
+    not just a "let a later call fail with a clear error" case the way an
+    unvalidated instance_url elsewhere would be. UserOAuth.instance_url
+    stores this (myob.py reads it via env_mapping's "instance_url" token
+    type, the same mechanism Salesforce/Deputy already use for their own
+    per-connection value), so it's checked with the same strictness here as
+    at connect time, not left to fail opaquely on the first tool call.
+    """
+    if not isinstance(raw_business_id, str):
+        return None
+    business_id = raw_business_id.strip()
+    if not _MYOB_BUSINESS_ID_PATTERN.match(business_id):
+        return None
+    return business_id
+
+
 def _resolve_oauth_secret(
     provider: str, encrypted_value: Optional[str], env_suffix: str
 ) -> str:
@@ -315,6 +347,36 @@ def _oauth_scope_separator(provider: str) -> str:
     if provider.lower() in ("meta", "linear"):
         return ","
     return " "
+
+
+def _merged_oauth_scopes(
+    default_scopes: list[str] | None, app_scopes: list[str] | None, provider: str
+) -> tuple[list[str], str]:
+    """Merge provider default scopes with an app row's oauth_scopes, and
+    join them into one scope string -- the shared place for this specific
+    "merge default+app scopes, dedupe, join" pattern, used by
+    _generic_oauth_login's authorize-redirect leg and MYOB's token-exchange
+    leg in generic_oauth_callback.
+
+    Returns (merged_list, joined_string): the list is needed by the
+    authorize-redirect leg (to exclude required scopes from optional_scope
+    below), the string by MYOB's leg, which has no default_scopes of its
+    own and sources everything from the app row. A single-caller wrapper
+    around the string alone was tried first and correctly called out as
+    pointless indirection when the other leg still inlined the same
+    computation separately -- this version is what actually makes it one
+    shared computation for those two, instead of a same-shaped copy.
+
+    NOT the only scope-string mechanism in this file: Deputy's own
+    code-exchange leg (see its `if is_deputy:` block above) builds its
+    scope string by hand instead, for reasons specific to it -- it needs a
+    literal fallback ("longlife_refresh_token") this function has no
+    concept of, and doesn't dedupe, both deliberate per that block's own
+    comment. Left as-is rather than folded in here.
+    """
+    scopes = _merge_oauth_scopes(default_scopes or [], app_scopes)
+    scope_str = _oauth_scope_separator(provider).join(scopes)
+    return scopes, scope_str
 
 
 def _meta_login_config_id() -> str:
@@ -2402,8 +2464,9 @@ def _generic_oauth_login(
                 app_scopes = app_info["oauth_scopes"]
             app_optional_scopes = app_info.get("optional_oauth_scopes") or []
 
-    scopes = _merge_oauth_scopes(db_provider.default_scopes or [], app_scopes)
-    scope_str = _oauth_scope_separator(provider).join(scopes)
+    scopes, scope_str = _merged_oauth_scopes(
+        db_provider.default_scopes, app_scopes, provider
+    )
     # Sent via the authorize request's own optional_scope parameter (see
     # get_builtin_execution_fields_and_optional_scopes) rather than merged
     # into `scopes` above: a scope tier-gated on the connected account's
@@ -2463,6 +2526,14 @@ def _generic_oauth_login(
         # sidesteps needing to know that default: a bare provider connect
         # (read only) followed by an app-scoped connect (read+write) is
         # guaranteed to end up with the broader grant either way.
+        params["prompt"] = "consent"
+    if provider.lower() == "myob":
+        # Unlike every other provider's prompt=consent above, this isn't
+        # about re-prompting for a broader grant -- MYOB only appends
+        # businessId (the company file the user picked) to the
+        # authorization redirect at all when the request forces the
+        # consent screen. Without this, the callback's businessId guard
+        # (see _normalize_myob_business_id) would reject every connection.
         params["prompt"] = "consent"
     meta_config_id = _meta_login_config_id() if provider.lower() == "meta" else ""
     if meta_config_id:
@@ -2595,11 +2666,21 @@ def generic_oauth_callback(
     # `normalized_provider` precedent, rather than re-lowering/re-comparing
     # the same string five separate times across the function.
     is_deputy = provider.lower() == "deputy"
+    is_myob = provider.lower() == "myob"
     if db is None:
         raise RuntimeError("db session is required")
     code = request.query_params.get("code")
     state = request.query_params.get("state")
     error = request.query_params.get("error")
+    # MYOB appends this to the redirect itself, not the token response --
+    # captured from the raw request here (not deferred to after the token
+    # exchange, the way Deputy's `endpoint`/Salesforce's `instance_url` are
+    # read from token_data below) because it never appears anywhere else.
+    myob_business_id = (
+        _normalize_myob_business_id(request.query_params.get("businessId"))
+        if is_myob
+        else None
+    )
     provider_error_response = (
         HTMLResponse(
             content=f"<h1>Error: {html.escape(str(error))}</h1>", status_code=400
@@ -2815,6 +2896,29 @@ def generic_oauth_callback(
         missing_config.append(_oauth_env_name(provider, "CLIENT_SECRET"))
     if missing_config:
         return _oauth_provider_config_error(provider, missing_config)
+
+    if is_myob and not myob_business_id:
+        # myob_business_id was already extracted (and validated as a GUID)
+        # from the raw callback request, before this point -- unlike
+        # Deputy/Salesforce's own instance_url-shaped guards (checked further
+        # below, after their own token exchange), there is no token_data
+        # field this could instead be re-derived from post-exchange, so
+        # nothing is gained by waiting: a missing/malformed value here can
+        # only mean MYOB's own redirect never carried one (or carried a
+        # value astray of the documented GUID shape). Checked here, before
+        # the token exchange even starts, so a doomed connection attempt
+        # doesn't burn a network round trip to MYOB or consume the
+        # single-use authorization code for an outcome already decided.
+        return HTMLResponse(
+            content=(
+                "<h1>Error exchanging token</h1>"
+                f"<p>{html.escape(provider)} did not return a businessId. "
+                "Make sure the authorization request included "
+                "prompt=consent.</p>"
+            ),
+            status_code=400,
+        )
+
     token_url = db_provider.token_url
     userinfo_url = db_provider.userinfo_url
 
@@ -2852,6 +2956,30 @@ def generic_oauth_callback(
                 )
                 or "longlife_refresh_token"
             )
+        if is_myob:
+            # MYOB's own docs list `scope` as a required body param here,
+            # with a worked example -- sent, unlike the Deputy branch above,
+            # from the app row's oauth_scopes rather than
+            # db_provider.default_scopes: MYOB's provider row deliberately
+            # carries no default_scopes of its own (see its registry row's
+            # comment), since every functional sme-* scope this connector
+            # needs is granular and app-specific. target_app_info is the
+            # same lookup already performed above (for the hidden-app
+            # check) when app_id is present; MYOB requires an app-scoped
+            # grant (APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT), so a real
+            # connection always has one -- the `app_id and` guard only
+            # covers a hypothetical stale/crafted state token missing it,
+            # in which case there's nothing to source a scope from anyway.
+            myob_app_scopes = (
+                target_app_info.get("oauth_scopes")
+                if app_id and isinstance(target_app_info, dict)
+                else None
+            )
+            _, myob_scope_str = _merged_oauth_scopes(
+                db_provider.default_scopes, myob_app_scopes, provider
+            )
+            if myob_scope_str:
+                data["scope"] = myob_scope_str
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
         if requires_json_accept_header(provider):
             headers["Accept"] = "application/json"
@@ -3204,6 +3332,71 @@ def generic_oauth_callback(
                     ),
                     status_code=400,
                 )
+        elif is_myob:
+            # MYOB's userinfo_url is deliberately left empty (see the
+            # registry row's comment) -- unlike Deputy/Linear, there's no
+            # extra round-trip to skip a fixed host for: MYOB's token
+            # response already embeds the identity inline as
+            # `user: {uid, username}`, so this only reads what's already in
+            # hand from the exchange above.
+            raw_user = token_data.get("user")
+            if isinstance(raw_user, dict):
+                raw_provider_user_id = raw_user.get("uid")
+                uid_str = (
+                    str(raw_provider_user_id)
+                    if isinstance(raw_provider_user_id, (str, int))
+                    and not isinstance(raw_provider_user_id, bool)
+                    else ""
+                )
+                provider_user_id = uid_str or None
+                if provider_user_id is None:
+                    if raw_provider_user_id:
+                        # Same "truthy but wrong type" convention as the
+                        # Salesforce branch above.
+                        logger.warning(
+                            "MYOB token response's user.uid was not a usable "
+                            "string/int (got %s); falling back to NULL "
+                            "provider_user_id for this grant",
+                            type(raw_provider_user_id).__name__,
+                        )
+                    else:
+                        # A missing/empty "uid" inside an otherwise-present
+                        # user object -- unlike Salesforce's own "id", which
+                        # real responses can legitimately omit, MYOB's
+                        # user.uid is documented as always present, so this
+                        # is genuinely malformed, not an expected variation.
+                        # Distinct from (and NOT covered by) the outer
+                        # "no usable user object" warning below, which only
+                        # fires when `user` itself isn't a dict at all --
+                        # a dict missing just "uid" never reaches that
+                        # branch.
+                        logger.warning(
+                            "MYOB token response's user object had no usable "
+                            "uid (got %s); connecting with no identity for "
+                            "this grant",
+                            type(raw_provider_user_id).__name__,
+                        )
+                raw_username = raw_user.get("username")
+                email = (
+                    raw_username
+                    if isinstance(raw_username, str) and raw_username
+                    else None
+                )
+            else:
+                # Every real MYOB token response embeds `user: {uid,
+                # username}` inline -- unlike Salesforce's optional "id",
+                # this is documented as always present, so a missing or
+                # malformed `user` object here means something is actually
+                # wrong with the response, not an expected per-provider
+                # variation. provider_user_id/email were already
+                # initialized to None above; this just makes the anomaly
+                # visible server-side instead of silently connecting with
+                # no identity.
+                logger.warning(
+                    "MYOB token response had no usable user object (got %s); "
+                    "connecting with no identity for this grant",
+                    type(raw_user).__name__,
+                )
         elif matches_provider_family(
             provider, "employment-hero"
         ) and _is_employment_hero_token_url(token_url):
@@ -3407,6 +3600,12 @@ def generic_oauth_callback(
                 # already-guarded, normalized value from above (Deputy
                 # can't reach this branch without it).
                 resolved_instance_url = deputy_instance_url
+            elif is_myob:
+                # MYOB's equivalent is the company file GUID from the
+                # authorization redirect, not anything in token_data --
+                # myob_business_id is the already-guarded value from above
+                # (MYOB can't reach this branch without it).
+                resolved_instance_url = myob_business_id
             setattr(oauth_account, "instance_url", resolved_instance_url)
             if "expires_in" in token_data:
                 setattr(

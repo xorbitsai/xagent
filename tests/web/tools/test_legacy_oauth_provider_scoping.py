@@ -69,6 +69,19 @@ def test_requires_app_scoped_oauth_grant_github_addition_leaves_meta_unaffected(
     assert requires_app_scoped_oauth_grant("meta") is False
 
 
+def test_requires_app_scoped_oauth_grant_covers_myob():
+    """MYOB's oauth_providers row seeds an empty default_scopes (there is no
+    shared identity scope; every functional sme-* scope lives solely on the
+    app row) -- an even more extreme version of github's situation, since a
+    bare grant here would request zero scopes, not just an under-scoped
+    identity-only set. Pin membership the same way as github's own
+    regression test above, and confirm it didn't flip anything unrelated."""
+    assert requires_app_scoped_oauth_grant("myob") is True
+    assert requires_app_scoped_oauth_grant("MyOB") is True
+    assert requires_app_scoped_oauth_grant("instagram") is False
+    assert requires_app_scoped_oauth_grant("meta") is False
+
+
 def test_restrict_to_app_scoped_oauth_grant_dedupes_and_preserves_order():
     assert restrict_to_app_scoped_oauth_grant(
         "instagram", ["meta", "meta", "instagram", None, ""]

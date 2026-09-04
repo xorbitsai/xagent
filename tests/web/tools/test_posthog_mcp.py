@@ -54,6 +54,30 @@ class MockResponse:
             )
 
 
+class FakeSession:
+    """Stand-in for requests.Session, used by the _make_request tests below
+    to observe the state of a real Session instance at call time -- shared
+    rather than redefined per test so a future change to what those tests
+    need to capture only has to be made once."""
+
+    def __init__(self):
+        self.trust_env = True
+        self.verify = True
+        self.exited = False
+        self.captured_kwargs: dict | None = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.exited = True
+        return False
+
+    def request(self, **kwargs):
+        self.captured_kwargs = kwargs
+        return MockResponse(json_data={"ok": True})
+
+
 @pytest.fixture(autouse=True)
 def _credentials(monkeypatch):
     monkeypatch.setenv("POSTHOG_API_KEY", "phx_test_key")
@@ -314,8 +338,8 @@ def test_create_annotation_rejects_empty_project_id():
 
 def test_create_annotation_raises_on_http_error(monkeypatch):
     monkeypatch.setattr(
-        posthog.requests,
-        "request",
+        posthog,
+        "_make_request",
         Mock(
             return_value=MockResponse(
                 status_code=403, json_data={"detail": "Permission denied."}
@@ -331,7 +355,7 @@ def test_create_annotation_raises_on_http_error(monkeypatch):
 
 def test_request_uses_configured_host_and_headers(monkeypatch):
     mock_request = Mock(return_value=MockResponse(json_data={"ok": True}))
-    monkeypatch.setattr(posthog.requests, "request", mock_request)
+    monkeypatch.setattr(posthog, "_make_request", mock_request)
 
     result = posthog._request("GET", "/api/users/@me/")
 
@@ -346,11 +370,143 @@ def test_request_uses_configured_host_and_headers(monkeypatch):
     assert mock_request.call_args.kwargs["allow_redirects"] is False
 
 
+def test_request_passes_empty_proxies_when_none_configured(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"ok": True}))
+    monkeypatch.setattr(posthog, "_make_request", mock_request)
+
+    posthog._request("GET", "/api/users/@me/")
+
+    assert mock_request.call_args.kwargs["proxies"] == {}
+
+
+def test_request_raises_when_proxy_is_configured_but_not_trusted(monkeypatch):
+    # An ambient proxy makes the *proxy* resolve DNS for the real
+    # connection, silently bypassing _base_url()'s own private-network
+    # validation of POSTHOG_HOST -- this must fail loudly instead of
+    # quietly connecting through an unvetted proxy.
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.internal:8080")
+    monkeypatch.delenv("XAGENT_TRUSTED_EGRESS_PROXY", raising=False)
+    mock_request = Mock()
+    monkeypatch.setattr(posthog, "_make_request", mock_request)
+
+    with pytest.raises(ValueError, match="not marked as trusted"):
+        posthog._request("GET", "/api/users/@me/")
+
+    mock_request.assert_not_called()
+
+
+def test_request_redacts_proxy_trust_error_message(monkeypatch):
+    # get_trusted_proxy_url()'s own message text never echoes the proxy URL
+    # today, but this call sits outside _request()'s try/except block, so
+    # nothing here was routing it through the same redact_sensitive_text()
+    # every other error path in this function already gets -- if that
+    # message ever grew to include the proxy URL (which can carry embedded
+    # user:pass@ credentials, exactly the concern already handled for a
+    # ProxyError below), it must not leak unredacted just because this one
+    # exception type raises before the try block.
+    monkeypatch.setattr(
+        posthog,
+        "get_trusted_proxy_url",
+        Mock(
+            side_effect=posthog.PrivateNetworkHostError(
+                "proxy https://user:sp-secret-proxy-pass@proxy.internal:8080/ "
+                "is not marked as trusted"
+            )
+        ),
+    )
+
+    with pytest.raises(posthog.PrivateNetworkHostError) as excinfo:
+        posthog._request("GET", "/api/users/@me/")
+
+    assert "sp-secret-proxy-pass" not in str(excinfo.value)
+
+
+def test_request_passes_proxy_explicitly_when_trusted(monkeypatch):
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.internal:8080")
+    monkeypatch.setenv("XAGENT_TRUSTED_EGRESS_PROXY", "1")
+    mock_request = Mock(return_value=MockResponse(json_data={"ok": True}))
+    monkeypatch.setattr(posthog, "_make_request", mock_request)
+
+    result = posthog._request("GET", "/api/users/@me/")
+
+    assert result == {"ok": True}
+    assert mock_request.call_args.kwargs["proxies"] == {
+        "http": "http://proxy.internal:8080",
+        "https": "http://proxy.internal:8080",
+    }
+
+
+def test_make_request_disables_trust_env(monkeypatch):
+    # requests.request() always runs on a fresh trust_env=True Session,
+    # which -- regardless of what proxies= is passed -- still falls back to
+    # get_environ_proxies() -> urllib.request.getproxies(), which itself
+    # falls back *past* HTTP_PROXY/HTTPS_PROXY/ALL_PROXY to the OS's own
+    # proxy configuration (getproxies_macosx_sysconf() on macOS,
+    # getproxies_registry() on Windows) once none of those env vars are
+    # set. trust_env=False skips that entire environment-and-OS-native
+    # lookup in one place, so assert _make_request actually sets it before
+    # issuing the real request.
+    #
+    # The full kwargs dict is captured (not just trust_env), and the
+    # context manager's __exit__ is asserted too: a body that silently
+    # dropped proxies=/allow_redirects=False before calling
+    # session.request(), or that never actually used the Session as a
+    # context manager, would strip the exact security guards this module
+    # adds while every other test here (which mocks _make_request itself
+    # away) would still pass.
+    session = FakeSession()
+    monkeypatch.setattr(posthog.requests, "Session", lambda: session)
+
+    response = posthog._make_request(
+        method="GET",
+        url="https://us.posthog.com/api/users/@me/",
+        headers={},
+        params=None,
+        json=None,
+        timeout=1,
+        proxies={"https": "http://proxy.internal:8080"},
+        allow_redirects=False,
+    )
+
+    assert session.trust_env is False
+    assert session.captured_kwargs["proxies"] == {"https": "http://proxy.internal:8080"}
+    assert session.captured_kwargs["allow_redirects"] is False
+    assert response.json() == {"ok": True}
+    assert session.exited is True
+
+
+def test_make_request_reapplies_ca_bundle_env_var(monkeypatch):
+    # trust_env=False also disables requests' REQUESTS_CA_BUNDLE/
+    # CURL_CA_BUNDLE lookup (gated behind the same `if self.trust_env:` as
+    # the proxy lookup). The only case proxies is ever non-empty here is an
+    # operator opting into XAGENT_TRUSTED_EGRESS_PROXY=1 -- a corporate
+    # egress proxy doing TLS interception with an internally-issued CA is
+    # the textbook reason to do that -- so without re-applying this env var
+    # explicitly, that proxy path would fail closed with an opaque
+    # SSLError for exactly the operator who needs it.
+    monkeypatch.setenv("REQUESTS_CA_BUNDLE", "/etc/ssl/internal-ca.pem")
+    session = FakeSession()
+    monkeypatch.setattr(posthog.requests, "Session", lambda: session)
+
+    posthog._make_request(
+        method="GET",
+        url="https://us.posthog.com/api/users/@me/",
+        headers={},
+        params=None,
+        json=None,
+        timeout=1,
+        proxies={},
+        allow_redirects=False,
+    )
+
+    assert session.verify == "/etc/ssl/internal-ca.pem"
+
+
 @pytest.mark.parametrize("status_code", [301, 302, 303, 307, 308])
 def test_request_rejects_redirect_response(monkeypatch, status_code):
     monkeypatch.setattr(
-        posthog.requests,
-        "request",
+        posthog,
+        "_make_request",
         Mock(
             return_value=MockResponse(
                 status_code=status_code, url="https://us.posthog.com/api/users/@me/"
@@ -364,7 +520,7 @@ def test_request_rejects_redirect_response(monkeypatch, status_code):
 
 def test_request_passes_configured_timeout(monkeypatch):
     mock_request = Mock(return_value=MockResponse(json_data={"ok": True}))
-    monkeypatch.setattr(posthog.requests, "request", mock_request)
+    monkeypatch.setattr(posthog, "_make_request", mock_request)
 
     posthog._request("GET", "/api/users/@me/")
 
@@ -373,8 +529,8 @@ def test_request_passes_configured_timeout(monkeypatch):
 
 def test_request_returns_empty_dict_for_204(monkeypatch):
     monkeypatch.setattr(
-        posthog.requests,
-        "request",
+        posthog,
+        "_make_request",
         Mock(return_value=MockResponse(status_code=204, text="")),
     )
 
@@ -387,7 +543,7 @@ def test_request_retries_once_on_429_with_retry_after(monkeypatch):
         MockResponse(json_data={"ok": True}),
     ]
     mock_request = Mock(side_effect=responses)
-    monkeypatch.setattr(posthog.requests, "request", mock_request)
+    monkeypatch.setattr(posthog, "_make_request", mock_request)
     monkeypatch.setattr(posthog.time, "sleep", Mock())
 
     result = posthog._request("GET", "/api/users/@me/")
@@ -400,7 +556,7 @@ def test_request_retries_once_on_429_with_retry_after(monkeypatch):
 def test_request_does_not_retry_a_second_429(monkeypatch):
     response = MockResponse(status_code=429, url="x", headers={"Retry-After": "1"})
     mock_request = Mock(return_value=response)
-    monkeypatch.setattr(posthog.requests, "request", mock_request)
+    monkeypatch.setattr(posthog, "_make_request", mock_request)
     monkeypatch.setattr(posthog.time, "sleep", Mock())
 
     with pytest.raises(RuntimeError):
@@ -410,16 +566,15 @@ def test_request_does_not_retry_a_second_429(monkeypatch):
 
 
 def test_request_redacts_connection_error_message(monkeypatch):
-    # setup_proxy_env() exports whatever ambient HTTPS_PROXY the OS has
-    # configured, which requests honors; a ProxyError connecting through
-    # it can echo the full proxy URL, credentials included.
+    # A ProxyError connecting through a trusted proxy can echo the full
+    # proxy URL, credentials included.
     def _raise(*args, **kwargs):
         raise requests.exceptions.ProxyError(
             "Unable to connect to proxy: "
             "https://user:sp-secret-proxy-pass@proxy.internal:8080/"
         )
 
-    monkeypatch.setattr(posthog.requests, "request", _raise)
+    monkeypatch.setattr(posthog, "_make_request", _raise)
 
     with pytest.raises(RuntimeError) as excinfo:
         posthog._request("GET", "/api/users/@me/")
@@ -429,8 +584,8 @@ def test_request_redacts_connection_error_message(monkeypatch):
 
 def test_request_raises_with_structured_error_detail(monkeypatch):
     monkeypatch.setattr(
-        posthog.requests,
-        "request",
+        posthog,
+        "_make_request",
         Mock(
             return_value=MockResponse(
                 status_code=401,
@@ -449,8 +604,8 @@ def test_request_raises_with_structured_error_detail(monkeypatch):
 
 def test_request_redacts_bearer_token_in_error_detail(monkeypatch):
     monkeypatch.setattr(
-        posthog.requests,
-        "request",
+        posthog,
+        "_make_request",
         Mock(
             return_value=MockResponse(
                 status_code=502,
@@ -473,8 +628,8 @@ def test_request_redacts_bearer_token_in_error_detail(monkeypatch):
 
 def test_request_raises_clear_error_for_non_json_2xx_body(monkeypatch):
     monkeypatch.setattr(
-        posthog.requests,
-        "request",
+        posthog,
+        "_make_request",
         Mock(
             return_value=MockResponse(
                 status_code=200, text="<html>not json</html>", json_raises=True
@@ -495,8 +650,8 @@ def test_extract_error_detail_returns_none_for_non_json_body():
 def test_request_truncates_unstructured_error_body(monkeypatch):
     long_body = "x" * 5000
     monkeypatch.setattr(
-        posthog.requests,
-        "request",
+        posthog,
+        "_make_request",
         Mock(return_value=MockResponse(status_code=500, text=long_body)),
     )
 
@@ -509,8 +664,8 @@ def test_request_truncates_unstructured_error_body(monkeypatch):
 
 def test_get_current_user_returns_profile(monkeypatch):
     monkeypatch.setattr(
-        posthog.requests,
-        "request",
+        posthog,
+        "_make_request",
         Mock(
             return_value=MockResponse(
                 json_data={
@@ -531,8 +686,8 @@ def test_get_current_user_returns_profile(monkeypatch):
 
 def test_get_current_user_returns_error_payload_on_failure(monkeypatch):
     monkeypatch.setattr(
-        posthog.requests,
-        "request",
+        posthog,
+        "_make_request",
         Mock(
             return_value=MockResponse(
                 status_code=401,
@@ -549,8 +704,8 @@ def test_get_current_user_returns_error_payload_on_failure(monkeypatch):
 
 def test_list_organizations_returns_results_and_truncated_flag(monkeypatch):
     monkeypatch.setattr(
-        posthog.requests,
-        "request",
+        posthog,
+        "_make_request",
         Mock(
             return_value=MockResponse(
                 json_data={
@@ -571,8 +726,8 @@ def test_list_organizations_returns_results_and_truncated_flag(monkeypatch):
 
 def test_list_organizations_not_truncated_when_no_next_page(monkeypatch):
     monkeypatch.setattr(
-        posthog.requests,
-        "request",
+        posthog,
+        "_make_request",
         Mock(
             return_value=MockResponse(
                 json_data={"results": [{"id": "org1", "name": "Acme"}], "next": None}
@@ -596,7 +751,7 @@ def test_list_organizations_passes_offset_and_returns_next_offset(monkeypatch):
             }
         )
     )
-    monkeypatch.setattr(posthog.requests, "request", mock_request)
+    monkeypatch.setattr(posthog, "_make_request", mock_request)
 
     result = json.loads(posthog.posthog_list_organizations(offset=50))
 
@@ -606,7 +761,7 @@ def test_list_organizations_passes_offset_and_returns_next_offset(monkeypatch):
 
 def test_list_organizations_clamps_negative_offset(monkeypatch):
     mock_request = Mock(return_value=MockResponse(json_data={"results": []}))
-    monkeypatch.setattr(posthog.requests, "request", mock_request)
+    monkeypatch.setattr(posthog, "_make_request", mock_request)
 
     posthog.posthog_list_organizations(offset=-5)
 
@@ -619,7 +774,7 @@ def test_list_projects_uses_organization_id_in_path(monkeypatch):
             json_data={"results": [{"id": 1, "name": "Default Project"}]}
         )
     )
-    monkeypatch.setattr(posthog.requests, "request", mock_request)
+    monkeypatch.setattr(posthog, "_make_request", mock_request)
 
     result = json.loads(posthog.posthog_list_projects(organization_id="org1"))
 
@@ -632,7 +787,7 @@ def test_list_projects_uses_organization_id_in_path(monkeypatch):
 
 def test_list_projects_defaults_organization_id_to_current(monkeypatch):
     mock_request = Mock(return_value=MockResponse(json_data={"results": []}))
-    monkeypatch.setattr(posthog.requests, "request", mock_request)
+    monkeypatch.setattr(posthog, "_make_request", mock_request)
 
     posthog.posthog_list_projects()
 
@@ -643,7 +798,7 @@ def test_list_projects_defaults_organization_id_to_current(monkeypatch):
 
 def test_list_projects_encodes_hostile_organization_id(monkeypatch):
     mock_request = Mock(return_value=MockResponse(json_data={"results": []}))
-    monkeypatch.setattr(posthog.requests, "request", mock_request)
+    monkeypatch.setattr(posthog, "_make_request", mock_request)
 
     posthog.posthog_list_projects(organization_id="1/../2")
 
@@ -662,7 +817,7 @@ def test_query_sends_hogql_query_body(monkeypatch):
             }
         )
     )
-    monkeypatch.setattr(posthog.requests, "request", mock_request)
+    monkeypatch.setattr(posthog, "_make_request", mock_request)
 
     result = json.loads(
         posthog.posthog_query("select event, count() from events", name="my query")
@@ -684,7 +839,7 @@ def test_query_sends_hogql_query_body(monkeypatch):
 
 def test_query_omits_name_when_not_provided(monkeypatch):
     mock_request = Mock(return_value=MockResponse(json_data={"results": []}))
-    monkeypatch.setattr(posthog.requests, "request", mock_request)
+    monkeypatch.setattr(posthog, "_make_request", mock_request)
 
     posthog.posthog_query("select 1")
 
@@ -697,7 +852,7 @@ def test_query_clamps_results_to_limit_and_reports_truncated(monkeypatch):
             json_data={"results": [[1], [2], [3]], "columns": ["n"]}
         )
     )
-    monkeypatch.setattr(posthog.requests, "request", mock_request)
+    monkeypatch.setattr(posthog, "_make_request", mock_request)
 
     result = json.loads(posthog.posthog_query("select n from numbers", limit=2))
 
@@ -709,7 +864,7 @@ def test_query_not_truncated_when_results_within_limit(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(json_data={"results": [[1]], "columns": ["n"]})
     )
-    monkeypatch.setattr(posthog.requests, "request", mock_request)
+    monkeypatch.setattr(posthog, "_make_request", mock_request)
 
     result = json.loads(posthog.posthog_query("select 1", limit=50))
 
@@ -721,8 +876,8 @@ def test_query_reports_clear_error_for_malformed_results_shape(monkeypatch):
     # rather than a silent bad slice (e.g. slicing a dict, or slicing a
     # string into a garbled row) or an opaque AttributeError/TypeError.
     monkeypatch.setattr(
-        posthog.requests,
-        "request",
+        posthog,
+        "_make_request",
         Mock(return_value=MockResponse(json_data={"results": {"not": "a-list"}})),
     )
 
@@ -738,7 +893,7 @@ def test_list_persons_includes_search_param(monkeypatch):
             json_data={"results": [{"id": 1, "distinct_ids": ["abc"]}]}
         )
     )
-    monkeypatch.setattr(posthog.requests, "request", mock_request)
+    monkeypatch.setattr(posthog, "_make_request", mock_request)
 
     result = json.loads(posthog.posthog_list_persons(search="ada@example.com"))
 
@@ -750,7 +905,7 @@ def test_get_person_returns_person(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(json_data={"id": 1, "distinct_ids": ["abc"]})
     )
-    monkeypatch.setattr(posthog.requests, "request", mock_request)
+    monkeypatch.setattr(posthog, "_make_request", mock_request)
 
     result = json.loads(posthog.posthog_get_person("1"))
 
@@ -763,7 +918,7 @@ def test_get_person_returns_person(monkeypatch):
 
 def test_get_person_encodes_hostile_person_id(monkeypatch):
     mock_request = Mock(return_value=MockResponse(json_data={"id": 1}))
-    monkeypatch.setattr(posthog.requests, "request", mock_request)
+    monkeypatch.setattr(posthog, "_make_request", mock_request)
 
     posthog.posthog_get_person("1/../2", project_id="proj1")
 
@@ -776,7 +931,7 @@ def test_list_insights_requests_basic_shape(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(json_data={"results": [{"id": 1, "name": "Signups"}]})
     )
-    monkeypatch.setattr(posthog.requests, "request", mock_request)
+    monkeypatch.setattr(posthog, "_make_request", mock_request)
 
     result = json.loads(posthog.posthog_list_insights())
 
@@ -786,8 +941,8 @@ def test_list_insights_requests_basic_shape(monkeypatch):
 
 def test_get_insight_returns_insight(monkeypatch):
     monkeypatch.setattr(
-        posthog.requests,
-        "request",
+        posthog,
+        "_make_request",
         Mock(return_value=MockResponse(json_data={"id": 1, "name": "Signups"})),
     )
 
@@ -799,8 +954,8 @@ def test_get_insight_returns_insight(monkeypatch):
 
 def test_list_feature_flags_returns_results(monkeypatch):
     monkeypatch.setattr(
-        posthog.requests,
-        "request",
+        posthog,
+        "_make_request",
         Mock(
             return_value=MockResponse(
                 json_data={"results": [{"id": 1, "key": "new-onboarding"}]}
@@ -816,8 +971,8 @@ def test_list_feature_flags_returns_results(monkeypatch):
 
 def test_list_dashboards_returns_results(monkeypatch):
     monkeypatch.setattr(
-        posthog.requests,
-        "request",
+        posthog,
+        "_make_request",
         Mock(
             return_value=MockResponse(
                 json_data={"results": [{"id": 1, "name": "KPIs"}]}
@@ -833,8 +988,8 @@ def test_list_dashboards_returns_results(monkeypatch):
 
 def test_list_annotations_returns_results(monkeypatch):
     monkeypatch.setattr(
-        posthog.requests,
-        "request",
+        posthog,
+        "_make_request",
         Mock(
             return_value=MockResponse(
                 json_data={"results": [{"id": 1, "content": "Deployed v2"}]}
@@ -852,7 +1007,7 @@ def test_create_annotation_sends_content_and_scope(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(json_data={"id": 1, "content": "Deployed v2"})
     )
-    monkeypatch.setattr(posthog.requests, "request", mock_request)
+    monkeypatch.setattr(posthog, "_make_request", mock_request)
 
     result = json.loads(posthog.posthog_create_annotation("Deployed v2", "proj1"))
 
@@ -868,7 +1023,7 @@ def test_create_annotation_sends_content_and_scope(monkeypatch):
 
 def test_create_annotation_includes_date_marker_when_provided(monkeypatch):
     mock_request = Mock(return_value=MockResponse(json_data={"id": 1}))
-    monkeypatch.setattr(posthog.requests, "request", mock_request)
+    monkeypatch.setattr(posthog, "_make_request", mock_request)
 
     posthog.posthog_create_annotation(
         "Deployed v2", "proj1", date_marker="2026-08-18T00:00:00Z"

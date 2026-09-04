@@ -1,4 +1,4 @@
-"""PostgreSQL release gate for concurrent trusted actor OAuth callbacks."""
+"""PostgreSQL release gates for concurrent OAuth callback cleanup."""
 
 from __future__ import annotations
 
@@ -11,12 +11,15 @@ from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 
 import pytest
+from sqlalchemy import text
 from sqlalchemy.orm import sessionmaker
 
 from tests.shared.postgres_disposable import disposable_database_factory
 from xagent.core.utils.encryption import encrypt_value
 from xagent.web import mcp_apps
 from xagent.web.api import auth as auth_api
+from xagent.web.api import mcp as mcp_api
+from xagent.web.models import MCPOAuthClient, MCPOAuthFlowState, MCPOAuthGrant
 from xagent.web.models.actor_oauth_flow import ActorOAuthFlowState
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer, UserMCPServer
@@ -768,3 +771,271 @@ async def test_concurrent_postgresql_actor_refresh_uses_one_rotating_token(
         assert persisted is not None
         assert persisted.access_token == "winner-token"
         assert persisted.refresh_token == "winner-refresh-token"
+
+
+def test_mcp_callback_and_delete_do_not_deadlock(
+    postgresql_engine, monkeypatch
+) -> None:
+    tables = [
+        User.__table__,
+        MCPServer.__table__,
+        UserMCPServer.__table__,
+        MCPOAuthClient.__table__,
+        MCPOAuthFlowState.__table__,
+        MCPOAuthGrant.__table__,
+    ]
+    Base.metadata.create_all(postgresql_engine, tables=tables)
+    factory = sessionmaker(bind=postgresql_engine, autoflush=False, autocommit=False)
+    state = "callback-delete-deadlock"
+    with factory() as db:
+        user = User(username="mcp-workspace-account", password_hash="hash")
+        server = MCPServer(
+            name="remote-notes",
+            managed="external",
+            transport="streamable_http",
+            url="https://mcp.example.com/mcp",
+            auth={"type": "mcp_oauth"},
+        )
+        db.add_all([user, server])
+        db.flush()
+        client = MCPOAuthClient(
+            mcp_server_id=server.id,
+            issuer="https://auth.example.com",
+            authorization_endpoint="https://auth.example.com/authorize",
+            token_endpoint="https://auth.example.com/token",
+            client_id="client-id",
+            token_endpoint_auth_method="none",
+            redirect_uri="https://xagent.example/api/mcp/oauth/callback",
+        )
+        db.add(client)
+        db.flush()
+        association = UserMCPServer(
+            user_id=user.id,
+            mcpserver_id=server.id,
+            is_owner=True,
+            is_active=True,
+        )
+        db.add(association)
+        db.flush()
+        db.add(
+            MCPOAuthFlowState(
+                state=state,
+                mcp_server_id=server.id,
+                user_id=user.id,
+                association_lifecycle_generation=association.lifecycle_generation,
+                mcp_oauth_client_id=client.id,
+                resource_owner_key=f"xagent:user:{user.id}",
+                issuer=client.issuer,
+                resource="https://mcp.example.com/mcp",
+                scope="records.read",
+                code_verifier=encrypt_value("verifier"),
+                redirect_after="/settings/mcp",
+                expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+            )
+        )
+        db.commit()
+        user_id = int(user.id)
+        server_id = int(server.id)
+
+    request = SimpleNamespace(
+        query_params={"state": state, "code": "provider-code"},
+        cookies={
+            mcp_api.MCP_OAUTH_STATE_COOKIE: mcp_api._mcp_oauth_state_cookie_value(state)
+        },
+    )
+    callback_has_flow_lock = threading.Event()
+    delete_has_association_lock = threading.Event()
+    release_callback = threading.Event()
+    real_upsert = mcp_api._upsert_mcp_oauth_grant
+    real_actor_state = mcp_api._has_actor_owned_mcp_oauth_state
+
+    async def exchange_code(**_kwargs):
+        return {
+            "access_token": "mcp-token",
+            "token_type": "Bearer",
+            "scope": "records.read",
+        }
+
+    def pause_after_flow_lock(*args, **kwargs):
+        callback_has_flow_lock.set()
+        assert release_callback.wait(timeout=10)
+        return real_upsert(*args, **kwargs)
+
+    def observe_delete_lock(*args, **kwargs):
+        delete_has_association_lock.set()
+        return real_actor_state(*args, **kwargs)
+
+    monkeypatch.setattr(mcp_api, "_exchange_mcp_oauth_code", exchange_code)
+    monkeypatch.setattr(mcp_api, "_upsert_mcp_oauth_grant", pause_after_flow_lock)
+    monkeypatch.setattr(
+        mcp_api,
+        "_has_actor_owned_mcp_oauth_state",
+        observe_delete_lock,
+    )
+
+    def callback():
+        with factory() as db:
+            return asyncio.run(mcp_api.mcp_oauth_callback(request, db))
+
+    def delete():
+        with factory() as db:
+            user = db.get(User, user_id)
+            assert user is not None
+            return asyncio.run(mcp_api.delete_mcp_server(server_id, user, db))
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        callback_future = executor.submit(callback)
+        assert callback_has_flow_lock.wait(timeout=10)
+        delete_future = executor.submit(delete)
+        assert not delete_has_association_lock.wait(timeout=0.2)
+        release_callback.set()
+        callback_response = callback_future.result(timeout=10)
+        assert delete_has_association_lock.wait(timeout=10)
+        assert delete_future.result(timeout=10) is None
+
+    callback_query = parse_qs(urlparse(callback_response.headers["location"]).query)
+    assert callback_query["mcp_oauth_success"] == ["1"]
+    with factory() as db:
+        assert db.query(MCPOAuthFlowState).count() == 0
+        assert db.query(MCPOAuthGrant).count() == 0
+        assert db.query(UserMCPServer).count() == 0
+
+
+def test_connect_sweep_skips_flow_locked_by_delete(
+    postgresql_engine, monkeypatch
+) -> None:
+    tables = [
+        User.__table__,
+        MCPServer.__table__,
+        UserMCPServer.__table__,
+        MCPOAuthClient.__table__,
+        MCPOAuthFlowState.__table__,
+    ]
+    Base.metadata.create_all(postgresql_engine, tables=tables)
+    factory = sessionmaker(bind=postgresql_engine, autoflush=False, autocommit=False)
+
+    with factory() as db:
+        connect_user = User(username="connect-user", password_hash="hash")
+        delete_user = User(username="delete-user", password_hash="hash")
+        connect_server = MCPServer(
+            name="connect-target",
+            managed="external",
+            transport="streamable_http",
+            url="https://connect.example.com/mcp",
+            auth={
+                "type": "mcp_oauth",
+                "resource": "https://connect.example.com/mcp",
+                "issuer": "https://auth.example.com",
+                "scope": "records.read",
+                "client_id": "client-id",
+                "redirect_uri": "https://xagent.example/api/mcp/oauth/callback",
+                "token_endpoint_auth_method": "none",
+            },
+        )
+        delete_server = MCPServer(
+            name="delete-target",
+            managed="external",
+            transport="streamable_http",
+            url="https://delete.example.com/mcp",
+            auth={"type": "mcp_oauth"},
+        )
+        db.add_all([connect_user, delete_user, connect_server, delete_server])
+        db.flush()
+
+        connect_client = MCPOAuthClient(
+            mcp_server_id=connect_server.id,
+            issuer="https://auth.example.com",
+            authorization_endpoint="https://auth.example.com/authorize",
+            token_endpoint="https://auth.example.com/token",
+            client_id="client-id",
+            token_endpoint_auth_method="none",
+            redirect_uri="https://xagent.example/api/mcp/oauth/callback",
+        )
+        delete_client = MCPOAuthClient(
+            mcp_server_id=delete_server.id,
+            issuer="https://auth.example.com",
+            authorization_endpoint="https://auth.example.com/authorize",
+            token_endpoint="https://auth.example.com/token",
+            client_id="client-id",
+            token_endpoint_auth_method="none",
+            redirect_uri="https://xagent.example/api/mcp/oauth/callback",
+        )
+        db.add_all([connect_client, delete_client])
+        db.flush()
+        db.add_all(
+            [
+                UserMCPServer(
+                    user_id=connect_user.id,
+                    mcpserver_id=connect_server.id,
+                    is_owner=True,
+                    is_active=True,
+                ),
+                UserMCPServer(
+                    user_id=delete_user.id,
+                    mcpserver_id=delete_server.id,
+                    is_owner=True,
+                    is_active=True,
+                ),
+                MCPOAuthFlowState(
+                    state="delete-locked-stale-flow",
+                    mcp_server_id=delete_server.id,
+                    user_id=delete_user.id,
+                    mcp_oauth_client_id=delete_client.id,
+                    resource_owner_key=f"xagent:user:{delete_user.id}",
+                    issuer="https://auth.example.com",
+                    resource="https://delete.example.com/mcp",
+                    scope="records.read",
+                    code_verifier=encrypt_value("verifier"),
+                    expires_at=(
+                        datetime.now(timezone.utc)
+                        - mcp_api.MCP_OAUTH_FLOW_STATE_RETENTION
+                        - timedelta(hours=1)
+                    ),
+                ),
+            ]
+        )
+        db.commit()
+        connect_user_id = int(connect_user.id)
+        connect_server_id = int(connect_server.id)
+
+    async def discover(*_args, **_kwargs):
+        return SimpleNamespace(
+            resource="https://connect.example.com/mcp",
+            scopes=("records.read",),
+            authorization_server=SimpleNamespace(
+                issuer="https://auth.example.com",
+                authorization_endpoint="https://auth.example.com/authorize",
+                token_endpoint="https://auth.example.com/token",
+                raw={"issuer": "https://auth.example.com"},
+            ),
+        )
+
+    monkeypatch.setattr(mcp_api, "discover_mcp_oauth_metadata", discover)
+
+    with factory() as delete_db, factory() as connect_db:
+        deleted = (
+            delete_db.query(MCPOAuthFlowState)
+            .filter(MCPOAuthFlowState.state == "delete-locked-stale-flow")
+            .delete(synchronize_session=False)
+        )
+        assert deleted == 1
+
+        connect_db.execute(text("SET LOCAL lock_timeout = '1s'"))
+        connect_user = connect_db.get(User, connect_user_id)
+        assert connect_user is not None
+        response = asyncio.run(
+            mcp_api.connect_mcp_oauth(
+                connect_server_id,
+                mcp_api.MCPOAuthConnectRequest(redirect_after="/settings/mcp"),
+                connect_user,
+                connect_db,
+                accept=None,
+            )
+        )
+        assert response.status_code == 303
+        delete_db.rollback()
+
+    with factory() as db:
+        states = {row.state for row in db.query(MCPOAuthFlowState).all()}
+        assert "delete-locked-stale-flow" in states
+        assert len(states) == 2

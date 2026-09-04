@@ -4,6 +4,7 @@ Tests for Vision Tool
 
 import base64
 import os
+import ssl
 import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
@@ -770,7 +771,14 @@ class TestVisionToolUnderstandMedia:
         assert svg_source in content[1]["text"]
         assert "#7B0099" in content[1]["text"]
         assert all(item["type"] != "image_url" for item in content[1:])
-        async_client.assert_called_once_with(proxy="http://proxy.example:8080")
+        async_client.assert_called_once()
+        client_kwargs = async_client.call_args.kwargs
+        assert client_kwargs["proxy"] == "http://proxy.example:8080"
+        # trust_env=False keeps this call from falling back to the OS's own
+        # proxy configuration once no HTTP(S)_PROXY env var is set -- the
+        # explicit proxy= above must still be honored regardless.
+        assert client_kwargs["trust_env"] is False
+        assert isinstance(client_kwargs["verify"], ssl.SSLContext)
         validate_url.assert_awaited_once_with(
             "https://cdn.example.com/official-logo.svg"
         )

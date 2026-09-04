@@ -147,6 +147,23 @@ def downgrade() -> None:
     # then leaves a hidden orphan row behind rather than risking deleting
     # operator-owned data. Same tradeoff the zoom seed migration makes for
     # its provider-row guard.
+    #
+    # A reduced-schema table missing name/description/transport (e.g.
+    # mid-migration-chain, before the column-adding migration has run) would
+    # otherwise make sa.delete() reference a nonexistent column and raise.
+    # Guard against that by no-op'ing instead -- NOT by dropping the missing
+    # column's predicate and deleting on whatever guards remain. Fewer guard
+    # columns means a weaker match, and the whole point of matching on all
+    # three is that a hand-made row coincidentally matching every one of them
+    # isn't realistic; matching on just one or two (e.g. a hand-made row
+    # that happens to share this migration's name and transport) is exactly
+    # the kind of coincidence this guard exists to rule out. Same tradeoff as
+    # the admin-edited-description case above: leave a hidden orphan row
+    # rather than risk deleting operator-owned data.
+    columns = {c["name"] for c in inspector.get_columns("public_mcp_apps")}
+    if not {"name", "description", "transport"}.issubset(columns):
+        return
+
     bind.execute(
         sa.delete(PUBLIC_MCP_APPS_TABLE)
         .where(PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID)

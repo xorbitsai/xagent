@@ -59,9 +59,13 @@ class UserOAuth(Base):  # type: ignore[no-any-unimported]
         String, nullable=True
     )  # The user's ID in the provider system
     email = Column(String, nullable=True)
-    # Salesforce (and no other provider here) returns a per-org API host in
-    # the token response instead of using a fixed API domain -- every
-    # subsequent API call must go through this URL, not a hardcoded one.
+    # A per-connection value some providers need beyond a fixed API domain,
+    # reused for different shapes by whichever provider populates it:
+    # Salesforce's per-org API host (a real URL), Deputy's per-install API
+    # host (a bare hostname, no scheme), MYOB's company-file businessId (a
+    # bare GUID, not a URL at all despite the column name) -- see each
+    # provider's own handling in api/auth.py for how it's populated and
+    # tools/mcp/<provider>.py for how it's used at call time.
     instance_url = Column(String, nullable=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())

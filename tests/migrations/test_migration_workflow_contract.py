@@ -13,6 +13,11 @@ GENERATION_MODEL_PATHS = (
     "src/xagent/web/models/mcp.py",
     "src/xagent/web/models/public_mcp.py",
 )
+OAUTH_LIFECYCLE_PATHS = (
+    "src/xagent/web/models/mcp_oauth.py",
+    "src/xagent/web/api/mcp.py",
+    "tests/web/api/test_mcp_oauth_lifecycle_postgresql.py",
+)
 
 
 def _workflow_text() -> str:
@@ -56,4 +61,26 @@ def test_generation_model_changes_run_real_postgresql_migration_step(
     assert (
         "pytest tests/migrations/test_20260902_add_mcp_lifecycle_generations.py "
         "-m postgresql -q"
+    ) in regression["run"]
+
+
+@pytest.mark.parametrize("source_path", OAUTH_LIFECYCLE_PATHS)
+def test_oauth_lifecycle_changes_run_real_postgresql_fence_tests(
+    source_path: str,
+) -> None:
+    text = _workflow_text()
+    assert source_path in _push_paths(text)
+    assert source_path in _detector_paths(text)
+
+    workflow = yaml.safe_load(text)
+    job = workflow["jobs"]["test-postgresql-migrations"]
+    regression = next(
+        step
+        for step in job["steps"]
+        if step["name"] == "Test MCP OAuth lifecycle fencing (Postgres-only)"
+    )
+    output = "needs.detect-migration-changes.outputs.should-test"
+    assert regression["if"] == f"{output} == 'true'"
+    assert (
+        "pytest tests/web/api/test_mcp_oauth_lifecycle_postgresql.py -m postgresql -q"
     ) in regression["run"]

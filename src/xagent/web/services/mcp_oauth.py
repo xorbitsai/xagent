@@ -18,6 +18,7 @@ from sqlalchemy.orm import sessionmaker
 from ...config import get_mcp_oauth_allow_private_hosts, get_mcp_oauth_proxy_url
 from ...core.utils.security import (
     PrivateNetworkHostError,
+    build_isolated_ssl_context,
     reject_private_network_host,
 )
 
@@ -143,6 +144,7 @@ class SafeOAuthAsyncHTTPTransport(httpx.AsyncBaseTransport):
             trust_env=False,
             http2=False,
             proxy=proxy_url,
+            verify=build_isolated_ssl_context(),
         )
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:

@@ -1,4 +1,5 @@
 import gzip
+import ssl
 from pathlib import Path
 
 import httpx
@@ -305,6 +306,7 @@ def test_safe_oauth_transport_disables_proxy_http2_and_keepalive(monkeypatch):
     assert captured["proxy"] is None
     assert captured["http2"] is False
     assert captured["limits"].max_keepalive_connections == 0
+    assert isinstance(captured["verify"], ssl.SSLContext)
 
 
 def test_safe_oauth_transport_uses_explicit_proxy_configuration(monkeypatch):
@@ -327,6 +329,7 @@ def test_safe_oauth_transport_uses_explicit_proxy_configuration(monkeypatch):
 
     assert captured["trust_env"] is False
     assert captured["proxy"] == "http://proxy.example.com:8080"
+    assert isinstance(captured["verify"], ssl.SSLContext)
 
 
 @pytest.mark.asyncio

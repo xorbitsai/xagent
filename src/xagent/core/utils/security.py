@@ -4,6 +4,7 @@ import asyncio
 import ipaddress
 import re
 import socket
+import ssl
 from dataclasses import dataclass
 from typing import Mapping
 from urllib.parse import (
@@ -79,6 +80,22 @@ def reject_private_network_host(hostname: str) -> None:
         or not address.is_global
     ):
         raise PrivateNetworkHostError("Host must not resolve to a private network.")
+
+
+def build_isolated_ssl_context() -> ssl.SSLContext:
+    """Return a CA-bundle-aware SSL context for use with ``trust_env=False``.
+
+    ``httpx.create_ssl_context()`` only honors ``SSL_CERT_FILE``/
+    ``SSL_CERT_DIR`` when ``trust_env`` is true, since both env var lookups
+    are gated behind that same flag. Callers that pin a transport's
+    ``trust_env=False`` (to stop httpx from also falling back to the OS's
+    own proxy configuration -- see ``_PinnedA2ATransport`` and
+    ``SafeOAuthAsyncHTTPTransport``) must build this context explicitly and
+    pass it as ``verify=``, or TLS verification silently stops honoring a
+    private/internal CA bundle configured via those env vars.
+    """
+
+    return httpx.create_ssl_context(trust_env=True)
 
 
 async def validate_public_http_url(url: str) -> list[str]:

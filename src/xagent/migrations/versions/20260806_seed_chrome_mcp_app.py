@@ -147,10 +147,20 @@ def downgrade() -> None:
     # then leaves a hidden orphan row behind rather than risking deleting
     # operator-owned data. Same tradeoff the zoom seed migration makes for
     # its provider-row guard.
-    bind.execute(
-        sa.delete(PUBLIC_MCP_APPS_TABLE)
-        .where(PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID)
-        .where(PUBLIC_MCP_APPS_TABLE.c.name == ROW["name"])
-        .where(PUBLIC_MCP_APPS_TABLE.c.description == ROW["description"])
-        .where(PUBLIC_MCP_APPS_TABLE.c.transport == ROW["transport"])
+    #
+    # Only guard on a name/description/transport column that actually exists
+    # in this schema -- same column-filter upgrade() already applies to ROW
+    # before inserting. A reduced-schema table missing one of these (e.g.
+    # mid-migration-chain, before the column-adding migration has run) would
+    # otherwise make sa.delete() reference a nonexistent column and raise,
+    # instead of degrading to "no-op" like the rest of this function.
+    columns = {c["name"] for c in inspector.get_columns("public_mcp_apps")}
+    query = sa.delete(PUBLIC_MCP_APPS_TABLE).where(
+        PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID
     )
+    for guard_column in ("name", "description", "transport"):
+        if guard_column in columns:
+            query = query.where(
+                getattr(PUBLIC_MCP_APPS_TABLE.c, guard_column) == ROW[guard_column]
+            )
+    bind.execute(query)

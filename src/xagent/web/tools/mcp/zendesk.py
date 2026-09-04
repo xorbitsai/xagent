@@ -52,12 +52,16 @@ MAX_RETRY_AFTER_SECONDS = 30
 # two hardcoded-enum hostnames.
 _SUBDOMAIN_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 
-# Zendesk's own documented ceiling on how deep a search result window can be
+# Zendesk's own documented ceilings on how deep a result window can be
 # paginated (page * per_page must stay under this) -- past it Zendesk itself
-# returns an opaque HTTP error rather than a clean "no more results".
-# Checked client-side so a caller mechanically incrementing `page` gets a
-# predictable empty page instead of that error.
+# returns an opaque HTTP error rather than a clean "no more results". Checked
+# client-side so a caller mechanically incrementing `page` gets a predictable
+# empty page instead of that error. The two search endpoints have different
+# documented ceilings -- the unified /search.json is capped at 1,000 results,
+# while /users/search.json goes to 10,000 -- so they are NOT interchangeable
+# despite both being "search" endpoints.
 _MAX_SEARCH_RESULT_WINDOW = 1000
+_MAX_USER_SEARCH_RESULT_WINDOW = 10000
 
 # Accepts a ticket/user/organization id pasted as a Zendesk agent UI URL
 # (e.g. "https://acme.zendesk.com/agent/tickets/123") in addition to a bare
@@ -143,6 +147,27 @@ def _require_non_blank(value: str | None, field_name: str) -> str:
     if not value or not value.strip():
         raise ValueError(f"{field_name} must not be blank")
     return value.strip()
+
+
+# Zendesk silently truncates a comment body past 64KiB with no error
+# reported -- a write that "succeeds" but stores less than what was sent.
+# Rejecting locally, before the request, turns that into a clear local
+# error instead of a silent content mismatch discovered later.
+_MAX_COMMENT_BODY_BYTES = 65536
+
+
+def _require_comment_body(value: str | None, field_name: str) -> str:
+    value = _require_non_blank(value, field_name)
+    byte_length = len(value.encode("utf-8"))
+    if byte_length > _MAX_COMMENT_BODY_BYTES:
+        raise ValueError(
+            f"{field_name} is {byte_length} bytes, over Zendesk's "
+            f"{_MAX_COMMENT_BODY_BYTES}-byte comment body limit -- Zendesk "
+            "truncates rather than rejecting an oversized body, silently "
+            "storing less than what was sent, so this is rejected locally "
+            "instead"
+        )
+    return value
 
 
 def _clean_tags(tags: list[str]) -> list[str]:
@@ -353,15 +378,18 @@ def _offset_page(
     return page, has_more
 
 
-def _past_search_window(page: int, max_results: int) -> bool:
+def _past_search_window(page: int, max_results: int, ceiling: int) -> bool:
     """True once the requested page's *end* offset crosses Zendesk's
-    documented ~1000-result search-window ceiling, past which Zendesk
-    itself returns an opaque HTTP error rather than a clean empty page.
-    Checked against the window's end (page * max_results), not its start,
-    so a `limit` that doesn't evenly divide the ceiling still catches a
-    page that straddles it instead of letting it through to error out
-    remotely (e.g. limit=30, page=34 spans results 991-1020)."""
-    return page * max_results > _MAX_SEARCH_RESULT_WINDOW
+    documented search-window ceiling for the endpoint being called (1,000
+    for /search.json, 10,000 for /users/search.json -- see
+    _MAX_SEARCH_RESULT_WINDOW / _MAX_USER_SEARCH_RESULT_WINDOW), past which
+    Zendesk itself returns an opaque HTTP error rather than a clean empty
+    page. Checked against the window's end (page * max_results), not its
+    start, so a `limit` that doesn't evenly divide the ceiling still
+    catches a page that straddles it instead of letting it through to
+    error out remotely (e.g. limit=30, page=34 spans results 991-1020 of a
+    1,000-result window)."""
+    return page * max_results > ceiling
 
 
 def _list_offset_paginated(
@@ -427,7 +455,16 @@ def _list_cursor_paginated(
     ticket comments, users, organizations) -- only the path, response key,
     and per-item summarizer differ between them."""
     max_results = _clamp_limit(limit)
-    params: dict[str, Any] = {"page[size]": max_results}
+    params: dict[str, Any] = {
+        "page[size]": max_results,
+        # Some cursor-paginated endpoints (users, organizations) omit
+        # meta.has_more entirely unless this is explicitly requested,
+        # which _cursor_page then reads as "no more pages" and silently
+        # drops the next cursor along with every item past this one.
+        # Passing it on every endpoint (not just the ones known to need
+        # it) is a harmless no-op where it's already the default.
+        "include_boundary_indicators": "true",
+    }
     if after_cursor:
         params["page[after]"] = after_cursor
     result = _request("GET", path, params=params)
@@ -476,6 +513,7 @@ def _ticket_summary(ticket: dict[str, Any]) -> dict[str, Any]:
         "priority": ticket.get("priority"),
         "requester_id": ticket.get("requester_id"),
         "assignee_id": ticket.get("assignee_id"),
+        "group_id": ticket.get("group_id"),
         "tags": ticket.get("tags"),
         "created_at": ticket.get("created_at"),
         "updated_at": ticket.get("updated_at"),
@@ -551,18 +589,46 @@ def _find_comment_event(result: Any) -> dict[str, Any] | None:
     return None
 
 
-def _add_comment(ticket_id: str, body: str, public: bool) -> dict[str, Any]:
-    body = _require_non_blank(body, "body")
+def _add_comment(ticket_id: str, body: str, public: bool) -> str:
+    """Post a comment and return the already-capped success envelope (not
+    a dict for the caller to wrap) -- a comment body can be up to 64KiB
+    (Zendesk's own limit, enforced by _require_comment_body above), well
+    past a configured output cap, and this is the only mutation response
+    in this file that echoes caller-supplied free text back verbatim, so
+    it needs its own truncation handling rather than relying on the list
+    tools' page-shrinking (there's no list here to shrink)."""
+    body = _require_comment_body(body, "body")
     result = _request(
         "PUT",
         f"/tickets/{_resolve_path_id(ticket_id, _TICKET_URL_ID_PATTERN, 'ticket_id')}.json",
         json_data={"ticket": {"comment": {"body": body, "public": public}}},
     )
     ticket = _unwrap(result, "ticket")
-    return {
-        "ticket": _ticket_summary(ticket) if isinstance(ticket, dict) else ticket,
-        "comment": _find_comment_event(result),
-    }
+    ticket_summary = _ticket_summary(ticket) if isinstance(ticket, dict) else ticket
+    comment = _find_comment_event(result)
+
+    def _build(comment_value: dict[str, Any] | None) -> str:
+        return _success(ticket=ticket_summary, comment=comment_value)
+
+    response = _build(comment)
+    max_output_length = get_tool_max_output_length()
+    if len(response) <= max_output_length or not isinstance(comment, dict):
+        return response
+
+    comment_body = comment.get("body")
+    if not isinstance(comment_body, str) or not comment_body:
+        return response
+
+    # Truncate the echoed body rather than dropping the comment entirely:
+    # id/public/created_at still confirm what was posted and -- crucially
+    # -- whether it went out publicly, even once the body preview is cut.
+    truncated_comment = dict(comment)
+    while len(response) > max_output_length and comment_body:
+        comment_body = comment_body[: len(comment_body) // 2]
+        truncated_comment["body"] = comment_body
+        truncated_comment["body_truncated"] = True
+        response = _build(truncated_comment)
+    return response
 
 
 @mcp.tool()
@@ -585,7 +651,7 @@ def zendesk_search(query: str, limit: int = 25, page: int = 1) -> str:
         query = _require_non_blank(query, "query")
         max_results = _clamp_limit(limit)
         page = max(1, page)
-        if _past_search_window(page, max_results):
+        if _past_search_window(page, max_results, _MAX_SEARCH_RESULT_WINDOW):
             # Past Zendesk's own documented result-window ceiling: Zendesk
             # itself would answer with an opaque HTTP error here, so return
             # a clean, predictable "no more results" instead of forwarding
@@ -616,9 +682,11 @@ def zendesk_search(query: str, limit: int = 25, page: int = 1) -> str:
 @mcp.tool()
 def zendesk_list_tickets(limit: int = 25, after_cursor: str | None = None) -> str:
     """
-    List all tickets in Zendesk's default order. For a filtered view (by
-    status, priority, assignee, etc.) use zendesk_search instead, e.g.
-    query="type:ticket status:open".
+    List tickets in Zendesk's default order. Does not include archived
+    tickets -- Zendesk excludes them from this endpoint regardless of age;
+    there is no tool in this connector for browsing archived tickets. For
+    a filtered view (by status, priority, assignee, etc.) use
+    zendesk_search instead, e.g. query="type:ticket status:open".
     limit: max tickets to return (default 25, hard cap 100).
     after_cursor: pass the previous call's own after_cursor to fetch the
     next page; omit for the first page.
@@ -652,25 +720,37 @@ def zendesk_create_ticket(
     subject: str,
     comment: str,
     requester_email: str | None = None,
+    requester_name: str | None = None,
     priority: str | None = None,
     tags: list[str] | None = None,
 ) -> str:
     """
     Create a new Zendesk ticket.
     subject: the ticket's subject line.
-    comment: the ticket's initial (public) comment/description.
+    comment: the ticket's initial (public) comment/description. Max 64KiB
+    (Zendesk's own limit) -- rejected locally rather than silently
+    truncated.
     requester_email: optional email of the end user this ticket is on
     behalf of; defaults to the connected agent if omitted.
+    requester_name: the requester's display name. Ignored by Zendesk if
+    requester_email already matches an existing user, but REQUIRED if it
+    doesn't -- Zendesk rejects an unrecognized requester_email with no
+    requester_name. Must not be passed without requester_email.
     priority: optional, one of "low", "normal", "high", "urgent".
     tags: optional list of tags -- a non-empty list with only blank/
     whitespace entries is rejected rather than silently sent as no tags.
     """
     try:
         subject = _require_non_blank(subject, "subject")
-        comment = _require_non_blank(comment, "comment")
+        comment = _require_comment_body(comment, "comment")
         ticket: dict[str, Any] = {"subject": subject, "comment": {"body": comment}}
         if requester_email:
-            ticket["requester"] = {"email": requester_email}
+            requester: dict[str, Any] = {"email": requester_email}
+            if requester_name:
+                requester["name"] = requester_name
+            ticket["requester"] = requester
+        elif requester_name:
+            raise ValueError("requester_name requires requester_email")
         if priority:
             ticket["priority"] = priority
         tags_value = _resolve_tags(tags)
@@ -742,6 +822,27 @@ def zendesk_update_ticket(
 
 
 @mcp.tool()
+def zendesk_delete_ticket(ticket_id: str) -> str:
+    """
+    Delete a Zendesk ticket. This is a soft delete: Zendesk moves the
+    ticket to its "Deleted tickets" area rather than destroying it
+    immediately, and it can still be restored there (outside this
+    connector) for a limited time.
+    ticket_id: a bare numeric id, or a full ticket URL copied from the
+    Zendesk agent UI.
+    """
+    try:
+        _request(
+            "DELETE",
+            f"/tickets/{_resolve_path_id(ticket_id, _TICKET_URL_ID_PATTERN, 'ticket_id')}.json",
+        )
+        return _success(ticket_id=ticket_id)
+    except Exception as e:
+        logger.error(f"Error deleting Zendesk ticket {ticket_id}: {e}")
+        return _error(str(e))
+
+
+@mcp.tool()
 def zendesk_list_ticket_comments(
     ticket_id: str, limit: int = 25, after_cursor: str | None = None
 ) -> str:
@@ -774,9 +875,11 @@ def zendesk_reply_to_ticket(ticket_id: str, body: str) -> str:
     exactly what was posted.
     ticket_id: a bare numeric id, or a full ticket URL copied from the
     Zendesk agent UI.
+    body: max 64KiB (Zendesk's own limit) -- rejected locally rather than
+    silently truncated.
     """
     try:
-        return _success(**_add_comment(ticket_id, body, public=True))
+        return _add_comment(ticket_id, body, public=True)
     except Exception as e:
         logger.error(f"Error replying to Zendesk ticket {ticket_id}: {e}")
         return _error(str(e))
@@ -791,9 +894,11 @@ def zendesk_add_internal_note(ticket_id: str, body: str) -> str:
     the caller can confirm the note did not go out publicly.
     ticket_id: a bare numeric id, or a full ticket URL copied from the
     Zendesk agent UI.
+    body: max 64KiB (Zendesk's own limit) -- rejected locally rather than
+    silently truncated.
     """
     try:
-        return _success(**_add_comment(ticket_id, body, public=False))
+        return _add_comment(ticket_id, body, public=False)
     except Exception as e:
         logger.error(f"Error adding internal note to Zendesk ticket {ticket_id}: {e}")
         return _error(str(e))
@@ -848,10 +953,12 @@ def zendesk_search_users(query: str, limit: int = 25, page: int = 1) -> str:
         query = _require_non_blank(query, "query")
         max_results = _clamp_limit(limit)
         page = max(1, page)
-        if _past_search_window(page, max_results):
-            # Past Zendesk's own documented result-window ceiling -- see
-            # zendesk_search's identical guard for why (including the
-            # config-validation and response-shape rationale).
+        if _past_search_window(page, max_results, _MAX_USER_SEARCH_RESULT_WINDOW):
+            # Past Zendesk's own documented result-window ceiling for THIS
+            # endpoint -- 10,000, not the unified /search.json's 1,000 (see
+            # _MAX_USER_SEARCH_RESULT_WINDOW). See zendesk_search's
+            # identical guard for the config-validation/response-shape
+            # rationale.
             _ensure_configured()
             return _success(users=[], has_more=False, truncated=False)
         return _list_offset_paginated(

@@ -1086,8 +1086,10 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             # the account's subdomain label (e.g. "acme"), validated in
             # zendesk.py to be a single DNS label before it's interpolated
             # into the hardcoded "*.zendesk.com" host -- no arbitrary host
-            # is ever accepted, so unlike posthog.py's POSTHOG_HOST there is
-            # no SSRF surface to additionally guard here.
+            # is ever accepted. The resolved address is additionally
+            # validated in zendesk.py's _base_url(), the same
+            # resolve-and-reject DNS-rebinding guard posthog.py's
+            # _base_url() applies to its own hardcoded hostnames.
             "launch_config": {
                 "command": "python",
                 "args": ["-m", "xagent.web.tools.mcp.zendesk"],

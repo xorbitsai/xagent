@@ -299,6 +299,18 @@ def test_cursor_page_raises_when_more_results_but_no_cursor():
         )
 
 
+def test_cursor_page_raises_when_more_results_but_empty_page_and_no_cursor():
+    # An empty page with has_more=true (e.g. a concurrent deletion emptied
+    # out the window Zendesk reported as non-empty) is exactly the case
+    # with the least to fall back on -- it must raise too, not slip through
+    # as a silent has_more=true/after_cursor=null dead end just because the
+    # page itself happens to be empty.
+    with pytest.raises(RuntimeError, match="resume cursor"):
+        zendesk._cursor_page(
+            {"tickets": [], "meta": {"has_more": True}}, "tickets", limit=10
+        )
+
+
 def test_offset_page_has_more_when_next_page_present():
     page, has_more = zendesk._offset_page(
         {"results": [{"id": 1}], "next_page": "https://acme.zendesk.com/x"},
@@ -486,7 +498,7 @@ def test_search_sends_per_page_and_page_params(monkeypatch):
     )
 
     assert result["status"] == "success"
-    results = result["results"]["results"]
+    results = result["results"]
     assert results[0]["result_type"] == "ticket"
     assert results[0]["subject"] == "Help"
     assert results[1]["result_type"] == "user"
@@ -517,10 +529,14 @@ def test_search_forces_has_more_when_output_truncated(monkeypatch):
     )
     monkeypatch.setattr(zendesk, "get_tool_max_output_length", lambda: 2000)
 
-    result = json.loads(zendesk.zendesk_search("type:ticket", limit=50))
+    raw = zendesk.zendesk_search("type:ticket", limit=50)
+    result = json.loads(raw)
 
+    assert result["status"] == "success"
     assert result["truncated"] is True
-    assert result["results"]["has_more"] is True
+    assert 0 < len(result["results"]) < len(big_results)
+    assert result["has_more"] is True
+    assert len(raw) <= 2000 + 200  # last halving step can overshoot
 
 
 def test_search_clamps_page_to_at_least_one(monkeypatch):
@@ -534,6 +550,16 @@ def test_search_clamps_page_to_at_least_one(monkeypatch):
     assert mock_request.call_args.kwargs["params"]["page"] == 1
 
 
+def test_past_search_window_checks_the_windows_end_not_its_start():
+    # limit=30, page=34: (page-1)*limit=990 is under the 1000 ceiling, but
+    # the requested range is results 991-1020, which straddles past it --
+    # the check must catch the window's *end*, not just where it starts,
+    # or a non-divisor limit slips a straddling page through to an opaque
+    # Zendesk HTTP error instead of this connector's own clean handling.
+    assert zendesk._past_search_window(page=34, max_results=30) is True
+    assert zendesk._past_search_window(page=33, max_results=30) is False
+
+
 def test_search_returns_empty_past_result_window_without_calling_zendesk(monkeypatch):
     # Past Zendesk's own documented result-window ceiling, Zendesk itself
     # would answer with an opaque HTTP error -- a caller mechanically
@@ -544,12 +570,13 @@ def test_search_returns_empty_past_result_window_without_calling_zendesk(monkeyp
 
     result = json.loads(zendesk.zendesk_search("type:ticket", limit=100, page=page))
 
-    # Nested the same way as the normal success path (results is a dict,
-    # not a list) -- this tool must return one consistent shape regardless
-    # of how far it paged.
+    # Same flat shape as the normal success path -- this tool must return
+    # one consistent shape regardless of how far it paged.
     assert result == {
         "status": "success",
-        "results": {"results": [], "count": None, "has_more": False},
+        "results": [],
+        "count": None,
+        "has_more": False,
         "truncated": False,
     }
     mock_request.assert_not_called()
@@ -791,6 +818,33 @@ def test_update_ticket_clears_tags_with_explicit_empty_list(monkeypatch):
     assert body["ticket"] == {"tags": []}
 
 
+def test_update_ticket_rejects_all_blank_tags_instead_of_clearing(monkeypatch):
+    # tags=["  ", ""] is a non-empty list that cleans down to nothing --
+    # unlike an explicit tags=[], this must not be silently treated as
+    # "clear all tags" (Zendesk's tag update is a full replace, so that
+    # would destructively wipe an existing tag set the caller never asked
+    # to clear, with no undo available in this connector).
+    mock_request = Mock()
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    result = json.loads(zendesk.zendesk_update_ticket(1, tags=["  ", ""]))
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
+def test_create_ticket_rejects_all_blank_tags_instead_of_clearing(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    result = json.loads(
+        zendesk.zendesk_create_ticket("Help", "Something's broken", tags=["  ", ""])
+    )
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
 def test_list_ticket_comments_returns_summaries(monkeypatch):
     monkeypatch.setattr(
         zendesk._session,
@@ -970,7 +1024,8 @@ def test_search_users_returns_empty_past_result_window_without_calling_zendesk(
 
     assert result == {
         "status": "success",
-        "users": {"users": [], "has_more": False},
+        "users": [],
+        "has_more": False,
         "truncated": False,
     }
     mock_request.assert_not_called()
@@ -1022,10 +1077,14 @@ def test_search_users_forces_has_more_when_output_truncated(monkeypatch):
     )
     monkeypatch.setattr(zendesk, "get_tool_max_output_length", lambda: 2000)
 
-    result = json.loads(zendesk.zendesk_search_users("jane@example.com", limit=50))
+    raw = zendesk.zendesk_search_users("jane@example.com", limit=50)
+    result = json.loads(raw)
 
+    assert result["status"] == "success"
     assert result["truncated"] is True
-    assert result["users"]["has_more"] is True
+    assert 0 < len(result["users"]) < len(big_users)
+    assert result["has_more"] is True
+    assert len(raw) <= 2000 + 200  # last halving step can overshoot
 
 
 def test_list_organizations_returns_summaries(monkeypatch):

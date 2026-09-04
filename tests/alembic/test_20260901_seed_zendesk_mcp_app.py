@@ -213,6 +213,43 @@ def test_downgrade_removes_zendesk(tmp_path):
         assert "zendesk" not in _app_ids(connection)
 
 
+def test_downgrade_preserves_an_adopted_preexisting_row(tmp_path):
+    """Mi3: the collision branch in upgrade() adopts a hand-created row
+    (e.g. an operator who created one before this migration deployed) by
+    flipping only is_visible_in_connector -- it does not overwrite
+    name/description/transport. An unconditional DELETE-by-app_id on
+    downgrade would then destroy the operator's own row, not "remove the
+    entry this migration owns." Pin that upgrade (adopt) -> downgrade
+    (restore, not destroy) sequence, mirroring the chrome seed migration's
+    identical guard."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection)
+        connection.execute(
+            text(
+                "INSERT INTO public_mcp_apps "
+                "(app_id, name, description, transport, is_visible_in_connector) "
+                "VALUES ('zendesk', 'Operator Zendesk', 'hand-made', "
+                "'stdio', 1)"
+            )
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+            migration.downgrade()
+        row = connection.execute(
+            text(
+                "SELECT name, is_visible_in_connector FROM public_mcp_apps "
+                "WHERE app_id='zendesk'"
+            )
+        ).first()
+        # Adopted and forced hidden by upgrade(), then left in place by
+        # downgrade() -- destroyed would mean row is None.
+        assert row is not None
+        assert row[0] == "Operator Zendesk"
+        assert row[1] == 0
+
+
 def test_upgrade_and_downgrade_no_op_without_table(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()

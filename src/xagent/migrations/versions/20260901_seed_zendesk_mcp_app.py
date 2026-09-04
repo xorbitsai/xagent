@@ -106,6 +106,21 @@ def downgrade() -> None:
     # already connected are intentionally left in place -- connect-driven
     # rows are not owned by this migration and are cleaned up through the
     # normal disconnect path.
+    #
+    # An unconditional DELETE-by-app_id is NOT safe here: upgrade()'s
+    # collision branch adopts a pre-existing hand-created row by flipping
+    # only is_visible_in_connector -- name/description/transport are left
+    # exactly as the operator set them. Deleting unconditionally on
+    # downgrade would destroy that operator's own row, not "remove the
+    # entry this migration owns." Matching on name/description/transport
+    # (mirrors the chrome seed migration's identical guard) distinguishes a
+    # genuinely migration-created row from an adopted one without needing a
+    # new tracking column -- a row that doesn't match is left in place,
+    # restored rather than destroyed.
     bind.execute(
-        sa.delete(PUBLIC_MCP_APPS_TABLE).where(PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID)
+        sa.delete(PUBLIC_MCP_APPS_TABLE)
+        .where(PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID)
+        .where(PUBLIC_MCP_APPS_TABLE.c.name == ROW["name"])
+        .where(PUBLIC_MCP_APPS_TABLE.c.description == ROW["description"])
+        .where(PUBLIC_MCP_APPS_TABLE.c.transport == ROW["transport"])
     )

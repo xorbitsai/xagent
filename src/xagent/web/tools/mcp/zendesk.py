@@ -21,7 +21,6 @@ from .utils import (
     clamp_limit,
     resolve_id_from_url,
     setup_proxy_env,
-    success_with_capped_dict,
     url_path_id,
 )
 
@@ -155,6 +154,29 @@ def _clean_tags(tags: list[str]) -> list[str]:
     elsewhere in the account) or an empty string left over from a
     trailing-comma split done upstream of this tool."""
     return [t.strip() for t in tags if t.strip()]
+
+
+def _resolve_tags(tags: list[str]) -> list[str]:
+    """Clean a non-empty tag list, but reject one that cleans down to
+    nothing rather than silently treating it as "clear all tags".
+
+    Zendesk's tag update is a full replace, and an explicitly empty input
+    list ([]) is this connector's documented "clear all tags" signal
+    (handled by the caller before this is reached). A *non-empty* list
+    that _clean_tags reduces to [] -- e.g. ["  ", ""], exactly the kind of
+    LLM sloppiness _clean_tags exists to absorb -- is a different case:
+    the caller had *something* in mind, just not usable values, and
+    letting that collapse into the same wire request as an intentional
+    clear would destructively wipe an existing tag set on a ticket the
+    caller never asked to untag, with no undo available in this
+    connector."""
+    cleaned = _clean_tags(tags)
+    if not cleaned:
+        raise ValueError(
+            "tags contained no usable values (all entries were blank) -- "
+            "pass an empty list [] to explicitly clear tags instead"
+        )
+    return cleaned
 
 
 def _unwrap(result: Any, key: str) -> Any:
@@ -293,7 +315,12 @@ def _cursor_page(
     meta = payload.get("meta") or {}
     has_more = bool(meta.get("has_more")) or len(items) > limit
     after_cursor = meta.get("after_cursor")
-    cursor_expected = has_more and bool(page)
+    # Deliberately not "and bool(page)": an empty page with has_more=true
+    # (e.g. Zendesk reporting more results over a window that just emptied
+    # out from concurrent deletions) is exactly the case with the least to
+    # fall back on -- it must raise too, not slip through as a silent
+    # has_more=true/after_cursor=null dead end.
+    cursor_expected = has_more
     if cursor_expected and not after_cursor:
         # Zendesk's own cursor-pagination contract guarantees an
         # after_cursor whenever has_more is true. A response that violates
@@ -321,20 +348,67 @@ def _offset_page(
     return page, has_more
 
 
-def _force_has_more_when_truncated(response: str, field_name: str) -> str:
-    """success_with_capped_dict sets `truncated` but leaves the nested
-    `has_more` it was given untouched -- a truncated page must report
-    has_more=True regardless of what Zendesk's own response said, or a
-    caller that trusts has_more alone will stop paging and silently lose
-    the trimmed items. Mirrors _list_cursor_paginated's identical guard,
-    applied here after the fact since zendesk_search/zendesk_search_users
-    build their payload through the generic success_with_capped_dict
-    rather than a truncation-aware loop of their own."""
-    payload = json.loads(response)
-    nested = payload.get(field_name)
-    if payload.get("truncated") and isinstance(nested, dict):
-        nested["has_more"] = True
-    return json.dumps(payload, ensure_ascii=False)
+def _past_search_window(page: int, max_results: int) -> bool:
+    """True once the requested page's *end* offset crosses Zendesk's
+    documented ~1000-result search-window ceiling, past which Zendesk
+    itself returns an opaque HTTP error rather than a clean empty page.
+    Checked against the window's end (page * max_results), not its start,
+    so a `limit` that doesn't evenly divide the ceiling still catches a
+    page that straddles it instead of letting it through to error out
+    remotely (e.g. limit=30, page=34 spans results 991-1020)."""
+    return page * max_results > _MAX_SEARCH_RESULT_WINDOW
+
+
+def _list_offset_paginated(
+    path: str,
+    list_key: str,
+    summary_fn: Callable[[dict[str, Any]], dict[str, Any]],
+    params: dict[str, Any],
+    limit: int,
+    extra_fields_fn: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+) -> str:
+    """Shared body for the offset-paginated search tools (zendesk_search,
+    zendesk_search_users) -- symmetric to _list_cursor_paginated below, so
+    both pagination families in this file build their own truncation-aware
+    flat envelope and cap it themselves, rather than routing through the
+    generic success_with_capped_dict and patching has_more onto an
+    already-capped payload afterward. That patch-after-the-fact approach
+    can itself push the payload back over the cap -- either by flipping
+    "false" to the longer "true", or worse, by re-adding a "has_more" key
+    that success_with_capped_dict's own phase-2 key-dropping had already
+    discarded to fit -- defeating the exact invariant the capping
+    subsystem exists to enforce.
+
+    extra_fields_fn, if given, is called once with the raw Zendesk response
+    to compute constant fields (e.g. zendesk_search's "count") that ride
+    alongside the paginated list rather than being paginated themselves.
+    """
+    result = _request("GET", path, params=params)
+    items, has_more = _offset_page(result, list_key, limit)
+    summaries = [summary_fn(item) for item in items]
+    extra_fields = extra_fields_fn(result) if extra_fields_fn else {}
+
+    def _build(page: list[dict[str, Any]], truncated: bool) -> str:
+        return _success(
+            **{list_key: page},
+            **extra_fields,
+            # See _list_cursor_paginated's identical comment: a truncated
+            # page must report has_more=True regardless of what Zendesk's
+            # own response said, since the caller can't yet see the items
+            # this call dropped for size.
+            has_more=has_more or truncated,
+            truncated=truncated,
+        )
+
+    response = _build(summaries, False)
+    max_output_length = get_tool_max_output_length()
+    if len(response) <= max_output_length:
+        return response
+
+    while len(response) > max_output_length and summaries:
+        summaries = summaries[: len(summaries) // 2]
+        response = _build(summaries, True)
+    return response
 
 
 def _list_cursor_paginated(
@@ -506,7 +580,7 @@ def zendesk_search(query: str, limit: int = 25, page: int = 1) -> str:
         query = _require_non_blank(query, "query")
         max_results = _clamp_limit(limit)
         page = max(1, page)
-        if (page - 1) * max_results >= _MAX_SEARCH_RESULT_WINDOW:
+        if _past_search_window(page, max_results):
             # Past Zendesk's own documented result-window ceiling: Zendesk
             # itself would answer with an opaque HTTP error here, so return
             # a clean, predictable "no more results" instead of forwarding
@@ -516,28 +590,14 @@ def zendesk_search(query: str, limit: int = 25, page: int = 1) -> str:
             # subdomain/credential would otherwise be masked as "no
             # results" instead of surfacing as the usual config error.
             _ensure_configured()
-            # Nested the same way as the success_with_capped_dict call
-            # below -- a flat shape here would make this tool return two
-            # different response shapes depending on how far it paged.
-            return success_with_capped_dict(
-                "results", {"results": [], "count": None, "has_more": False}
-            )
-        result = _request(
-            "GET",
+            return _success(results=[], count=None, has_more=False, truncated=False)
+        return _list_offset_paginated(
             "/search.json",
-            params={"query": query, "per_page": max_results, "page": page},
-        )
-        results, has_more = _offset_page(result, "results", max_results)
-        return _force_has_more_when_truncated(
-            success_with_capped_dict(
-                "results",
-                {
-                    "results": [_search_result_summary(r) for r in results],
-                    "count": result.get("count"),
-                    "has_more": has_more,
-                },
-            ),
             "results",
+            _search_result_summary,
+            {"query": query, "per_page": max_results, "page": page},
+            max_results,
+            extra_fields_fn=lambda result: {"count": result.get("count")},
         )
     except Exception as e:
         # The query can carry end-user PII (the tool's own docstring
@@ -597,7 +657,8 @@ def zendesk_create_ticket(
     requester_email: optional email of the end user this ticket is on
     behalf of; defaults to the connected agent if omitted.
     priority: optional, one of "low", "normal", "high", "urgent".
-    tags: optional list of tags.
+    tags: optional list of tags -- a non-empty list with only blank/
+    whitespace entries is rejected rather than silently sent as no tags.
     """
     try:
         subject = _require_non_blank(subject, "subject")
@@ -607,8 +668,10 @@ def zendesk_create_ticket(
             ticket["requester"] = {"email": requester_email}
         if priority:
             ticket["priority"] = priority
-        if tags is not None:
-            ticket["tags"] = _clean_tags(tags)
+        if tags:
+            ticket["tags"] = _resolve_tags(tags)
+        elif tags is not None:
+            ticket["tags"] = []
         result = _request("POST", "/tickets.json", json_data={"ticket": ticket})
         return _success(ticket=_ticket_summary(_unwrap(result, "ticket")))
     except Exception as e:
@@ -639,6 +702,8 @@ def zendesk_update_ticket(
     string is treated the same as leaving it unset, for the same reason.
     tags: optional list of tags -- replaces the ticket's existing tags
     entirely (pass an empty list to clear them), it does not add to them.
+    A non-empty list with only blank/whitespace entries is rejected rather
+    than silently treated the same as an explicit clear.
     assignee_id: optional user id (from zendesk_get_user/zendesk_list_users)
     to reassign the ticket to.
     group_id: optional group id to route the ticket to.
@@ -649,8 +714,10 @@ def zendesk_update_ticket(
             fields["status"] = status
         if priority:
             fields["priority"] = priority
-        if tags is not None:
-            fields["tags"] = _clean_tags(tags)
+        if tags:
+            fields["tags"] = _resolve_tags(tags)
+        elif tags is not None:
+            fields["tags"] = []
         if assignee_id is not None:
             fields["assignee_id"] = assignee_id
         if group_id is not None:
@@ -778,24 +845,18 @@ def zendesk_search_users(query: str, limit: int = 25, page: int = 1) -> str:
         query = _require_non_blank(query, "query")
         max_results = _clamp_limit(limit)
         page = max(1, page)
-        if (page - 1) * max_results >= _MAX_SEARCH_RESULT_WINDOW:
+        if _past_search_window(page, max_results):
             # Past Zendesk's own documented result-window ceiling -- see
             # zendesk_search's identical guard for why (including the
             # config-validation and response-shape rationale).
             _ensure_configured()
-            return success_with_capped_dict("users", {"users": [], "has_more": False})
-        result = _request(
-            "GET",
+            return _success(users=[], has_more=False, truncated=False)
+        return _list_offset_paginated(
             "/users/search.json",
-            params={"query": query, "per_page": max_results, "page": page},
-        )
-        users, has_more = _offset_page(result, "users", max_results)
-        return _force_has_more_when_truncated(
-            success_with_capped_dict(
-                "users",
-                {"users": [_user_summary(u) for u in users], "has_more": has_more},
-            ),
             "users",
+            _user_summary,
+            {"query": query, "per_page": max_results, "page": page},
+            max_results,
         )
     except Exception as e:
         # The query can carry end-user PII (name/email/external_id) --

@@ -1,7 +1,7 @@
 """seed built-in Magento (key-based) MCP connector
 
 Revision ID: 20260902_seed_magento_mcp_app
-Revises: 20260902_oauth_flow_generation
+Revises: 7f41eae18a46
 Create Date: 2026-09-02 00:00:00.000000
 
 """
@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 # revision identifiers, used by Alembic.
 revision: str = "20260902_seed_magento_mcp_app"
-down_revision: Union[str, None] = "20260902_oauth_flow_generation"
+down_revision: Union[str, None] = "7f41eae18a46"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

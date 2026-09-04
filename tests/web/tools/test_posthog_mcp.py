@@ -54,6 +54,30 @@ class MockResponse:
             )
 
 
+class FakeSession:
+    """Stand-in for requests.Session, used by the _make_request tests below
+    to observe the state of a real Session instance at call time -- shared
+    rather than redefined per test so a future change to what those tests
+    need to capture only has to be made once."""
+
+    def __init__(self):
+        self.trust_env = True
+        self.verify = True
+        self.exited = False
+        self.captured_kwargs: dict | None = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.exited = True
+        return False
+
+    def request(self, **kwargs):
+        self.captured_kwargs = kwargs
+        return MockResponse(json_data={"ok": True})
+
+
 @pytest.fixture(autouse=True)
 def _credentials(monkeypatch):
     monkeypatch.setenv("POSTHOG_API_KEY", "phx_test_key")
@@ -371,6 +395,32 @@ def test_request_raises_when_proxy_is_configured_but_not_trusted(monkeypatch):
     mock_request.assert_not_called()
 
 
+def test_request_redacts_proxy_trust_error_message(monkeypatch):
+    # get_trusted_proxy_url()'s own message text never echoes the proxy URL
+    # today, but this call sits outside _request()'s try/except block, so
+    # nothing here was routing it through the same redact_sensitive_text()
+    # every other error path in this function already gets -- if that
+    # message ever grew to include the proxy URL (which can carry embedded
+    # user:pass@ credentials, exactly the concern already handled for a
+    # ProxyError below), it must not leak unredacted just because this one
+    # exception type raises before the try block.
+    monkeypatch.setattr(
+        posthog,
+        "get_trusted_proxy_url",
+        Mock(
+            side_effect=posthog.PrivateNetworkHostError(
+                "proxy https://user:sp-secret-proxy-pass@proxy.internal:8080/ "
+                "is not marked as trusted"
+            )
+        ),
+    )
+
+    with pytest.raises(posthog.PrivateNetworkHostError) as excinfo:
+        posthog._request("GET", "/api/users/@me/")
+
+    assert "sp-secret-proxy-pass" not in str(excinfo.value)
+
+
 def test_request_passes_proxy_explicitly_when_trusted(monkeypatch):
     monkeypatch.setenv("HTTPS_PROXY", "http://proxy.internal:8080")
     monkeypatch.setenv("XAGENT_TRUSTED_EGRESS_PROXY", "1")
@@ -404,24 +454,8 @@ def test_make_request_disables_trust_env(monkeypatch):
     # context manager, would strip the exact security guards this module
     # adds while every other test here (which mocks _make_request itself
     # away) would still pass.
-    captured = {}
-    exited = {}
-
-    class FakeSession:
-        def __enter__(self):
-            self.trust_env = True
-            return self
-
-        def __exit__(self, *exc_info):
-            exited["called"] = True
-            return False
-
-        def request(self, **kwargs):
-            captured["trust_env"] = self.trust_env
-            captured["kwargs"] = kwargs
-            return MockResponse(json_data={"ok": True})
-
-    monkeypatch.setattr(posthog.requests, "Session", FakeSession)
+    session = FakeSession()
+    monkeypatch.setattr(posthog.requests, "Session", lambda: session)
 
     response = posthog._make_request(
         method="GET",
@@ -434,11 +468,11 @@ def test_make_request_disables_trust_env(monkeypatch):
         allow_redirects=False,
     )
 
-    assert captured["trust_env"] is False
-    assert captured["kwargs"]["proxies"] == {"https": "http://proxy.internal:8080"}
-    assert captured["kwargs"]["allow_redirects"] is False
+    assert session.trust_env is False
+    assert session.captured_kwargs["proxies"] == {"https": "http://proxy.internal:8080"}
+    assert session.captured_kwargs["allow_redirects"] is False
     assert response.json() == {"ok": True}
-    assert exited["called"] is True
+    assert session.exited is True
 
 
 def test_make_request_reapplies_ca_bundle_env_var(monkeypatch):
@@ -451,22 +485,8 @@ def test_make_request_reapplies_ca_bundle_env_var(monkeypatch):
     # explicitly, that proxy path would fail closed with an opaque
     # SSLError for exactly the operator who needs it.
     monkeypatch.setenv("REQUESTS_CA_BUNDLE", "/etc/ssl/internal-ca.pem")
-    captured = {}
-
-    class FakeSession:
-        def __enter__(self):
-            self.trust_env = True
-            self.verify = True
-            return self
-
-        def __exit__(self, *exc_info):
-            return False
-
-        def request(self, **kwargs):
-            captured["verify"] = self.verify
-            return MockResponse(json_data={"ok": True})
-
-    monkeypatch.setattr(posthog.requests, "Session", FakeSession)
+    session = FakeSession()
+    monkeypatch.setattr(posthog.requests, "Session", lambda: session)
 
     posthog._make_request(
         method="GET",
@@ -479,7 +499,7 @@ def test_make_request_reapplies_ca_bundle_env_var(monkeypatch):
         allow_redirects=False,
     )
 
-    assert captured["verify"] == "/etc/ssl/internal-ca.pem"
+    assert session.verify == "/etc/ssl/internal-ca.pem"
 
 
 @pytest.mark.parametrize("status_code", [301, 302, 303, 307, 308])

@@ -246,8 +246,14 @@ def _request(
     # `_make_request()` (see above), which issues the call on a
     # trust_env=False Session -- disabling every ambient/OS-native proxy
     # source, not just the env vars this function checks -- so "no proxy"
-    # here is an actual guarantee for this call.
-    proxy_url = get_trusted_proxy_url()
+    # here is an actual guarantee for this call. Redacted the same as every
+    # other error path below: today's message text never echoes the proxy
+    # URL itself, but this keeps that an invariant of this function rather
+    # than of get_trusted_proxy_url()'s current wording.
+    try:
+        proxy_url = get_trusted_proxy_url()
+    except PrivateNetworkHostError as exc:
+        raise type(exc)(redact_sensitive_text(str(exc))) from exc
     proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else {}
 
     url = f"{_base_url()}{path}"

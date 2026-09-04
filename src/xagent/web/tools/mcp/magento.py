@@ -626,9 +626,16 @@ def _list_search(
     # a bare list; has_more/next_page are merged in as top-level siblings
     # afterward so pagination metadata stays reachable there, not nested
     # inside the (possibly capped) value.
+    # Filtering on the *summary* (summary_fn returns {} for anything
+    # _as_record() rejects, and only ever {} for that case) rather than
+    # keeping one entry per raw item means a malformed item from a
+    # non-compliant proxy is dropped outright instead of appearing as a
+    # phantom all-None record indistinguishable from a real one -- the
+    # same reasoning applied to _category_summary's children_data.
     capped = json.loads(
         success_with_capped_dict(
-            result_key, {result_key: [summary_fn(item) for item in items]}
+            result_key,
+            {result_key: [summary for item in items if (summary := summary_fn(item))]},
         )
     )
     # Under an aggressively low XAGENT_TOOL_MAX_OUTPUT_LENGTH,
@@ -711,6 +718,22 @@ def _category_summary(category: dict[str, Any]) -> dict[str, Any]:
     record = _as_record(category)
     if record is None:
         return {}
+    # Type-checked the same way _paginated_result treats "items": a
+    # genuinely absent/None children_data legitimately means "no
+    # children", but a truthy non-list value (a string, a dict from a
+    # non-compliant proxy re-encoding a sparse PHP array as a JSON object)
+    # must not be silently iterated -- that would walk characters/keys
+    # instead of category records, each failing _as_record() and getting
+    # dropped below with no error, silently reporting "no children" for a
+    # category that actually has some.
+    children_data = record.get("children_data")
+    if children_data is None:
+        children_data = []
+    elif not isinstance(children_data, list):
+        raise ValueError(
+            'Expected Magento\'s "children_data" field to be a list, got '
+            f"{type(children_data).__name__}"
+        )
     return {
         "id": record.get("id"),
         "parent_id": record.get("parent_id"),
@@ -727,9 +750,7 @@ def _category_summary(category: dict[str, Any]) -> dict[str, Any]:
         # returns all 8 keys), so filtering on it can't also drop a real,
         # sparsely-populated category.
         "children_data": [
-            summary
-            for child in record.get("children_data") or []
-            if (summary := _category_summary(child))
+            summary for child in children_data if (summary := _category_summary(child))
         ],
     }
 

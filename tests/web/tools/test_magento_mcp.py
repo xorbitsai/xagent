@@ -906,6 +906,30 @@ def test_list_products_survives_an_aggressively_low_output_limit(monkeypatch):
     assert result["products"]["products"] == []
 
 
+def test_list_products_drops_malformed_items_instead_of_phantom_records(monkeypatch):
+    # A malformed item (not a dict) would otherwise summarize to {} via
+    # _as_record() and appear as a phantom all-None record indistinguishable
+    # from a real product -- it must be dropped instead, matching
+    # _category_summary's treatment of a malformed child.
+    monkeypatch.setattr(
+        magento,
+        "_make_request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "items": [{"sku": "abc", "name": "Shirt"}, "not-a-product", None],
+                    "total_count": 3,
+                }
+            )
+        ),
+    )
+
+    result = json.loads(magento.magento_list_products(limit=10, page=1))
+
+    assert len(result["products"]["products"]) == 1
+    assert result["products"]["products"][0]["sku"] == "abc"
+
+
 def test_list_products_rejects_invalid_status():
     result = json.loads(magento.magento_list_products(status=9))
 
@@ -1472,6 +1496,19 @@ def test_category_summary_filters_out_truthy_non_dict_children():
     )
 
     assert [child.get("name") for child in summary["children_data"]] == ["Child"]
+
+
+@pytest.mark.parametrize("children_data_value", ["not-a-list", {"0": {"id": 2}}, 42])
+def test_category_summary_rejects_non_list_children_data(children_data_value):
+    # A truthy non-list children_data (e.g. a non-compliant proxy
+    # re-encoding a sparse PHP array as a JSON object) must not be
+    # silently iterated -- that would walk characters/dict keys instead
+    # of category records, each dropped with no error, silently reporting
+    # "no children" for a category that actually has some.
+    with pytest.raises(ValueError, match="children_data"):
+        magento._category_summary(
+            {"id": 1, "name": "Root", "children_data": children_data_value}
+        )
 
 
 def test_get_category_handles_null_category_response(monkeypatch):

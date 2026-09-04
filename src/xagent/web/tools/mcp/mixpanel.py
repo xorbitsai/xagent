@@ -9,6 +9,7 @@ from typing import Any
 import requests
 from mcp.server.fastmcp import FastMCP
 
+from ....config import get_tool_max_output_length
 from ....core.utils.security import redact_sensitive_text
 from ...utils.graphql_errors import truncate_error_text
 from .utils import clamp_limit, setup_proxy_env, success_with_capped_dict, url_path_id
@@ -63,7 +64,8 @@ def _error(message: str) -> str:
 
 def _success_with_capped_list(key: str, items: Any) -> str:
     """Wrap a bare list under ``key`` so success_with_capped_dict has a dict
-    to shrink, then guarantee the nested key survives capping.
+    to shrink, then restore the nested key -- but only when doing so still
+    fits the platform's output limit.
 
     success_with_capped_dict(field_name, data) can only shrink a
     list/dict-valued key nested *inside* a dict -- handed a bare list
@@ -75,12 +77,44 @@ def _success_with_capped_list(key: str, items: Any) -> str:
     wrapper's sole key entirely -- even after phase 1 has already emptied
     the list to [] -- leaving capped[key] == {} instead of {key: []}. A
     caller doing result[key][key] would then raise KeyError instead of
-    getting an empty list, on a supported (if aggressive) config. Re-add
-    the key rather than let that edge surface as a crash.
+    getting an empty list.
+
+    Naively re-adding the key unconditionally (an earlier version of this
+    function did that) traded that crash for a worse, silent one:
+    success_with_capped_dict already picked its output specifically to
+    satisfy `len(response) <= max_output_length`, and splicing the key
+    back in after that decision grows the string past the limit again --
+    confirmed directly (e.g. a 59-char capped "funnels": {} envelope grows
+    to 76 once "funnels": [] is spliced back in, for a limit of 59). This
+    tool's return value is a single string nested at
+    result["content"][0]["text"] in the MCP adapter's response, which the
+    separate OutputFilteredToolWrapper output filter then re-checks
+    against this same XAGENT_TOOL_MAX_OUTPUT_LENGTH and hard-truncates
+    with a raw character slice (OutputValueFilter._filter_string) with no
+    JSON awareness -- turning an over-budget but valid JSON string into
+    truncated, unparsable garbage, which is worse than the KeyError this
+    function exists to prevent. Re-checking the length here before
+    deciding whether to restore the key keeps the output-length contract
+    the hard constraint: the key is restored whenever there's room for it
+    (true for any realistic limit -- this only bites a limit configured
+    at just barely more than the bare empty-envelope's own size), and
+    falls back to success_with_capped_dict's own (already
+    limit-respecting) output otherwise, rather than ever emitting
+    something longer than it decided was safe.
     """
-    capped = json.loads(success_with_capped_dict(key, {key: items}))
-    capped[key].setdefault(key, [])
-    return json.dumps(capped, ensure_ascii=False)
+    max_output_length = get_tool_max_output_length()
+    capped_response = success_with_capped_dict(key, {key: items})
+    capped = json.loads(capped_response)
+    restored = dict(capped[key])
+    restored.setdefault(key, [])
+    if restored == capped[key]:
+        return capped_response
+    candidate = dict(capped)
+    candidate[key] = restored
+    candidate_response = json.dumps(candidate, ensure_ascii=False)
+    if len(candidate_response) <= max_output_length:
+        return candidate_response
+    return capped_response
 
 
 def _auth() -> tuple[str, str]:

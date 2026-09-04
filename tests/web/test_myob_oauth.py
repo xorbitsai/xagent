@@ -56,6 +56,11 @@ class MockResponse:
         ),
         ("not-a-guid", None),
         ("11111111-2222-3333-4444-55555555555", None),  # one hex digit short
+        # A valid GUID prefix followed by a path-traversal-style suffix
+        # must still be rejected outright by the trailing $ anchor itself
+        # -- not merely relying on url_path_id's own rejection downstream
+        # in myob.py, which is a separate, later line of defense.
+        ("11111111-2222-3333-4444-555555555555/../evil", None),
         ("", None),
         ("   ", None),
         (None, None),
@@ -183,7 +188,7 @@ def test_login_sets_prompt_consent_for_myob(db_session):
     # Closes the gap a review round flagged: the authorize-redirect leg and
     # the token-exchange leg (test_callback_persists_business_id_and_identity
     # below) both compute this scope string via the same shared
-    # _oauth_scope_str helper now -- this pins the authorize side so a
+    # _merged_oauth_scopes helper now -- this pins the authorize side so a
     # future change to either leg alone would show up as a mismatch between
     # the two tests, not silently diverge unnoticed.
     assert qs.get("scope") == [
@@ -272,7 +277,17 @@ def test_callback_persists_business_id_and_identity(db_session, monkeypatch):
     assert oauth_account.instance_url == BUSINESS_ID
     assert oauth_account.provider_user_id == "42"
     assert oauth_account.email == "alice@acme.example"
-    assert oauth_account.expires_at is not None
+    # Pins the actual 3600s duration from the mocked response, not just
+    # "some timestamp got set" -- a timedelta(seconds=...) ->
+    # timedelta(minutes=...) unit regression would still pass a bare
+    # is-not-None check.
+    # SQLite doesn't round-trip tzinfo, so oauth_account.expires_at comes
+    # back naive regardless of what was stored -- compare against a
+    # matching naive value rather than assuming either side's awareness.
+    expected_expiry = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(
+        seconds=3600
+    )
+    assert abs((oauth_account.expires_at - expected_expiry).total_seconds()) < 30
 
 
 def test_callback_rejects_missing_business_id_without_touching_prior_grant(
@@ -396,21 +411,27 @@ def test_callback_rejects_non_2xx_status_for_myob(db_session, monkeypatch):
     )
 
 
-def test_callback_succeeds_when_identity_fields_are_absent(db_session, monkeypatch):
+def test_callback_succeeds_when_identity_fields_are_absent(
+    db_session, monkeypatch, caplog
+):
     """A deliberately lenient design, matching every other identity branch
     in this file: a token response with no recognizable `user` shape must
     still succeed the connect, leaving provider_user_id/email as None
-    rather than failing the whole connect."""
+    rather than failing the whole connect -- but unlike Salesforce's own
+    optional "id" field, MYOB's docs say `user` is always present, so this
+    case is anomalous enough to warn about server-side, not silently
+    expected."""
     db, user = db_session
     mock_post = Mock(return_value=MockResponse({"access_token": "myob-token"}))
     monkeypatch.setattr(auth_api.requests, "post", mock_post)
 
-    response = generic_oauth_callback(
-        "myob",
-        _callback_request(db, user, business_id=BUSINESS_ID),
-        db,
-        _myob_provider(),
-    )
+    with caplog.at_level("WARNING"):
+        response = generic_oauth_callback(
+            "myob",
+            _callback_request(db, user, business_id=BUSINESS_ID),
+            db,
+            _myob_provider(),
+        )
 
     assert response.status_code == 200
     oauth_account = (
@@ -420,6 +441,41 @@ def test_callback_succeeds_when_identity_fields_are_absent(db_session, monkeypat
     )
     assert oauth_account.provider_user_id is None
     assert oauth_account.email is None
+    assert any("no usable user object" in record.message for record in caplog.records)
+
+
+def test_callback_warns_on_unusable_uid_type(db_session, monkeypatch, caplog):
+    """A present-but-wrong-typed uid (e.g. a nested object) must still warn
+    server-side, matching the same "truthy but wrong type" convention the
+    Salesforce identity branch above it already uses."""
+    db, user = db_session
+    mock_post = Mock(
+        return_value=MockResponse(
+            {
+                "access_token": "myob-token",
+                "user": {"uid": {"nested": "object"}, "username": "alice@acme.example"},
+            }
+        )
+    )
+    monkeypatch.setattr(auth_api.requests, "post", mock_post)
+
+    with caplog.at_level("WARNING"):
+        response = generic_oauth_callback(
+            "myob",
+            _callback_request(db, user, business_id=BUSINESS_ID),
+            db,
+            _myob_provider(),
+        )
+
+    assert response.status_code == 200
+    oauth_account = (
+        db.query(UserOAuth)
+        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "myob")
+        .one()
+    )
+    assert oauth_account.provider_user_id is None
+    assert oauth_account.email == "alice@acme.example"
+    assert any("not a usable string/int" in record.message for record in caplog.records)
 
 
 def test_callback_rejects_boolean_uid_instead_of_stringifying_it(

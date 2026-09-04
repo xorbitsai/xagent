@@ -1289,7 +1289,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
         {
             "app_id": "myob",
             "name": "MYOB",
-            "description": "Connect to MYOB AccountRight to look up contacts, invoices, purchase bills, and general ledger accounts.",
+            "description": "Connect to MYOB AccountRight to look up and manage contacts, sales invoices, and purchase bills, and browse general ledger accounts and tax codes.",
             "icon": "https://www.google.com/s2/favicons?domain=myob.com&sz=128",
             "transport": "oauth",
             "provider_name": "myob",

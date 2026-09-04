@@ -378,6 +378,61 @@ def test_create_customer_rejects_empty_fields(monkeypatch):
     mock_request.assert_not_called()
 
 
+def test_create_customer_returns_error_payload_on_non_2xx(monkeypatch):
+    # Every prior create/update error-path test in this file goes through
+    # a GET (e.g. _update_resource's guards) -- this pins the write-request
+    # error path itself: a real MYOB validation failure on POST/PUT must
+    # surface as the tool's {"status": "error"} contract, not an unhandled
+    # exception.
+    mock_request = Mock(
+        return_value=MockResponse(
+            status_code=400,
+            json_data={
+                "Errors": [
+                    {
+                        "Name": "ValidationException",
+                        "Message": "CompanyName is required",
+                        "AdditionalDetails": "",
+                    }
+                ]
+            },
+        )
+    )
+    monkeypatch.setattr(myob.requests, "request", mock_request)
+
+    result = json.loads(myob.myob_create_customer({"IsIndividual": False}))
+
+    assert result["status"] == "error"
+    assert "CompanyName is required" in result["message"]
+
+
+def test_update_customer_returns_error_payload_on_non_2xx_put(monkeypatch):
+    current = {"UID": "c1", "CompanyName": "Old Name", "RowVersion": "abc=="}
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=current),  # the GET succeeds
+            MockResponse(
+                status_code=409,
+                json_data={
+                    "Errors": [
+                        {
+                            "Name": "ConcurrencyException",
+                            "Message": "RowVersion mismatch",
+                            "AdditionalDetails": "",
+                        }
+                    ]
+                },
+            ),
+        ]
+    )
+    monkeypatch.setattr(myob.requests, "request", mock_request)
+
+    result = json.loads(myob.myob_update_customer("c1", {"CompanyName": "New Name"}))
+
+    assert result["status"] == "error"
+    assert "RowVersion mismatch" in result["message"]
+
+
 def test_create_customer_falls_back_to_location_header_when_body_is_empty(
     monkeypatch,
 ):
@@ -462,6 +517,99 @@ def test_update_resource_rejects_a_non_dict_get_response(monkeypatch):
         myob._update_resource("Contact/Customer/", "c1", {"CompanyName": "New Name"})
 
     mock_request.assert_called_once()  # the GET only -- no PUT attempted
+
+
+def test_list_suppliers_sends_filter_orderby_and_paging(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"Count": 1, "Items": [{"UID": "s1"}]})
+    )
+    monkeypatch.setattr(myob.requests, "request", mock_request)
+
+    result = json.loads(
+        myob.myob_list_suppliers(
+            filter="IsActive eq true", orderby="CompanyName", top=10, skip=5
+        )
+    )
+
+    assert result["status"] == "success"
+    assert result["suppliers"] == [{"UID": "s1"}]
+    assert mock_request.call_args.kwargs["params"] == {
+        "$top": 10,
+        "$skip": 5,
+        "$filter": "IsActive eq true",
+        "$orderby": "CompanyName",
+    }
+    assert mock_request.call_args.kwargs["url"].endswith("Contact/Supplier/")
+
+
+def test_get_supplier_percent_encodes_uid(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"UID": "s1"}))
+    monkeypatch.setattr(myob.requests, "request", mock_request)
+
+    result = json.loads(myob.myob_get_supplier("s1/../evil"))
+
+    assert result["status"] == "success"
+    url = mock_request.call_args.kwargs["url"]
+    assert url.endswith("Contact/Supplier/s1%2F..%2Fevil/")
+
+
+def test_create_supplier_sends_return_body_and_json(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"UID": "s1", "CompanyName": "Acme"})
+    )
+    monkeypatch.setattr(myob.requests, "request", mock_request)
+
+    result = json.loads(
+        myob.myob_create_supplier({"CompanyName": "Acme", "IsIndividual": False})
+    )
+
+    assert result["status"] == "success"
+    assert result["supplier"]["UID"] == "s1"
+    assert mock_request.call_args.kwargs["json"] == {
+        "CompanyName": "Acme",
+        "IsIndividual": False,
+    }
+    assert mock_request.call_args.kwargs["params"] == {"returnBody": "true"}
+    assert mock_request.call_args.kwargs["method"] == "POST"
+    assert mock_request.call_args.kwargs["url"].endswith("Contact/Supplier/")
+
+
+def test_get_purchase_bill_percent_encodes_uid(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"UID": "bill1"}))
+    monkeypatch.setattr(myob.requests, "request", mock_request)
+
+    result = json.loads(myob.myob_get_purchase_bill("bill1/../evil"))
+
+    assert result["status"] == "success"
+    url = mock_request.call_args.kwargs["url"]
+    assert url.endswith("Purchase/Bill/Item/bill1%2F..%2Fevil/")
+
+
+def test_create_purchase_bill_sends_return_body_and_json(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"UID": "bill1", "Status": "Open"})
+    )
+    monkeypatch.setattr(myob.requests, "request", mock_request)
+
+    result = json.loads(myob.myob_create_purchase_bill({"Supplier": {"UID": "s1"}}))
+
+    assert result["status"] == "success"
+    assert result["bill"]["UID"] == "bill1"
+    assert mock_request.call_args.kwargs["json"] == {"Supplier": {"UID": "s1"}}
+    assert mock_request.call_args.kwargs["params"] == {"returnBody": "true"}
+    assert mock_request.call_args.kwargs["method"] == "POST"
+    assert mock_request.call_args.kwargs["url"].endswith("Purchase/Bill/Item/")
+
+
+def test_get_account_percent_encodes_uid(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"UID": "acc1"}))
+    monkeypatch.setattr(myob.requests, "request", mock_request)
+
+    result = json.loads(myob.myob_get_account("acc1/../evil"))
+
+    assert result["status"] == "success"
+    url = mock_request.call_args.kwargs["url"]
+    assert url.endswith("GeneralLedger/Account/acc1%2F..%2Fevil/")
 
 
 def test_update_supplier_merges_fetched_record_with_changes(monkeypatch):
@@ -586,12 +734,48 @@ def test_capped_list_halves_items_to_fit_output_limit(monkeypatch):
         "customers",
         [{"UID": str(i), "Name": "x" * 50} for i in range(20)],
         total_count=20,
+        skip=0,
     )
     result = json.loads(raw)
 
     assert len(raw) <= 200
     assert result["truncated"] is True
     assert len(result["customers"]) < 20
+
+
+def test_capped_list_next_skip_reflects_items_actually_returned(monkeypatch):
+    # A halving pass that drops items must not let a caller's next fetch
+    # jump straight to skip+top (which would silently skip the dropped
+    # items) -- next_skip must reflect only what actually made it into
+    # *this* response, the same convention salesforce.py's own capped-page
+    # helper uses.
+    monkeypatch.setattr(myob, "get_tool_max_output_length", lambda: 200)
+
+    raw = myob._success_with_capped_list(
+        "customers",
+        [{"UID": str(i), "Name": "x" * 50} for i in range(20)],
+        total_count=50,
+        skip=10,
+    )
+    result = json.loads(raw)
+
+    returned = len(result["customers"])
+    assert returned < 20
+    assert result["has_more"] is True
+    assert result["next_skip"] == 10 + returned
+
+
+def test_capped_list_has_more_false_and_no_next_skip_on_last_page(monkeypatch):
+    raw = myob._success_with_capped_list(
+        "customers",
+        [{"UID": "1"}, {"UID": "2"}],
+        total_count=12,
+        skip=10,
+    )
+    result = json.loads(raw)
+
+    assert result["has_more"] is False
+    assert "next_skip" not in result
 
 
 def test_myob_app_registry_scopes_exclude_unused_families():

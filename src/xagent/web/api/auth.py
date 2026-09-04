@@ -349,24 +349,27 @@ def _oauth_scope_separator(provider: str) -> str:
     return " "
 
 
-def _oauth_scope_str(
+def _merged_oauth_scopes(
     default_scopes: list[str] | None, app_scopes: list[str] | None, provider: str
-) -> str:
-    """Merge provider default scopes with an app row's oauth_scopes and join
-    them into one scope string, using the same two shared primitives
-    (_merge_oauth_scopes, _oauth_scope_separator) every scope computation in
-    this file already goes through.
+) -> tuple[list[str], str]:
+    """Merge provider default scopes with an app row's oauth_scopes, and
+    join them into one scope string -- the ONE place both computations
+    happen, for every caller that needs either or both.
 
-    Used by MYOB's token-exchange leg in generic_oauth_callback, which has
-    no default_scopes of its own and sources everything from the app row.
-    _generic_oauth_login's own authorize-redirect leg computes the merged
-    list inline instead of through this helper, since it needs that
-    intermediate list again afterward (to exclude required scopes from
-    optional_scope) -- not a second reimplementation of this logic, just a
-    second caller of the same two primitives this wraps.
+    Returns (merged_list, joined_string): the list is needed by
+    _generic_oauth_login's authorize-redirect leg (to exclude required
+    scopes from optional_scope below), the string by any leg that just
+    needs a request param (MYOB's token-exchange leg in
+    generic_oauth_callback, which has no default_scopes of its own and
+    sources everything from the app row). A single-caller wrapper around
+    the string alone was tried first and correctly called out as pointless
+    indirection when the other leg still inlined the same computation
+    separately -- this version is what actually makes it one shared
+    computation instead of a same-shaped copy.
     """
     scopes = _merge_oauth_scopes(default_scopes or [], app_scopes)
-    return _oauth_scope_separator(provider).join(scopes)
+    scope_str = _oauth_scope_separator(provider).join(scopes)
+    return scopes, scope_str
 
 
 def _meta_login_config_id() -> str:
@@ -2454,8 +2457,9 @@ def _generic_oauth_login(
                 app_scopes = app_info["oauth_scopes"]
             app_optional_scopes = app_info.get("optional_oauth_scopes") or []
 
-    scopes = _merge_oauth_scopes(db_provider.default_scopes or [], app_scopes)
-    scope_str = _oauth_scope_separator(provider).join(scopes)
+    scopes, scope_str = _merged_oauth_scopes(
+        db_provider.default_scopes, app_scopes, provider
+    )
     # Sent via the authorize request's own optional_scope parameter (see
     # get_builtin_execution_fields_and_optional_scopes) rather than merged
     # into `scopes` above: a scope tier-gated on the connected account's
@@ -2964,7 +2968,7 @@ def generic_oauth_callback(
                 if app_id and isinstance(target_app_info, dict)
                 else None
             )
-            myob_scope_str = _oauth_scope_str(
+            _, myob_scope_str = _merged_oauth_scopes(
                 db_provider.default_scopes, myob_app_scopes, provider
             )
             if myob_scope_str:
@@ -3338,11 +3342,40 @@ def generic_oauth_callback(
                     else ""
                 )
                 provider_user_id = uid_str or None
+                if raw_provider_user_id and provider_user_id is None:
+                    # Same "truthy but wrong type" convention as the
+                    # Salesforce branch above -- a missing "uid" would be a
+                    # genuinely malformed MYOB response (unlike Salesforce's
+                    # own "id", which real responses can legitimately omit),
+                    # but that case is covered by the outer warning below;
+                    # this one is specifically for a present-but-unusable
+                    # value.
+                    logger.warning(
+                        "MYOB token response's user.uid was not a usable "
+                        "string/int (got %s); falling back to NULL "
+                        "provider_user_id for this grant",
+                        type(raw_provider_user_id).__name__,
+                    )
                 raw_username = raw_user.get("username")
                 email = (
                     raw_username
                     if isinstance(raw_username, str) and raw_username
                     else None
+                )
+            else:
+                # Every real MYOB token response embeds `user: {uid,
+                # username}` inline -- unlike Salesforce's optional "id",
+                # this is documented as always present, so a missing or
+                # malformed `user` object here means something is actually
+                # wrong with the response, not an expected per-provider
+                # variation. provider_user_id/email were already
+                # initialized to None above; this just makes the anomaly
+                # visible server-side instead of silently connecting with
+                # no identity.
+                logger.warning(
+                    "MYOB token response had no usable user object (got %s); "
+                    "connecting with no identity for this grant",
+                    type(raw_user).__name__,
                 )
         elif matches_provider_family(
             provider, "employment-hero"

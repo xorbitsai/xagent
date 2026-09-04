@@ -88,7 +88,7 @@ def _myob_app_row() -> dict[str, object]:
     return {
         "app_id": APP_ID,
         "name": "MYOB",
-        "description": "Connect to MYOB AccountRight to look up contacts, invoices, purchase bills, and general ledger accounts.",
+        "description": "Connect to MYOB AccountRight to look up and manage contacts, sales invoices, and purchase bills, and browse general ledger accounts and tax codes.",
         "icon": "https://www.google.com/s2/favicons?domain=myob.com&sz=128",
         "transport": "oauth",
         "provider_name": "myob",

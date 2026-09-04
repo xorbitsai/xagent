@@ -184,21 +184,38 @@ def _list_items(result: Any) -> tuple[list[Any], int | None]:
 
 
 def _success_with_capped_list(
-    list_field: str, items: list[Any], *, total_count: int | None, **extra: Any
+    list_field: str,
+    items: list[Any],
+    *,
+    total_count: int | None,
+    skip: int,
+    **extra: Any,
 ) -> str:
     """Build a success payload, halving ``items`` until the response fits
     the platform's output limit.
 
-    Matches salesforce.py's _success_with_capped_list: MYOB's own $top/
-    $skip already lets a caller retry for a narrower page, so items dropped
-    here purely for output size are recoverable via a smaller ``top``, not
-    unrecoverable the way a SOQL query's client-side cap is.
+    ``next_skip``/``has_more`` reflect how many items actually made it into
+    this response (post-halving), the same convention salesforce.py's own
+    offset-based capped-page helper uses -- a caller resuming from
+    ``next_skip`` picks up exactly where this response left off, including
+    any items a halving pass dropped, rather than jumping straight to
+    ``skip + top`` and silently skipping over them the way returning a bare
+    ``truncated: true`` with no cursor would.
     """
 
     def _build(items: list[Any], truncated: bool) -> str:
-        payload: dict[str, Any] = {list_field: items, "truncated": truncated, **extra}
+        next_skip = skip + len(items)
+        has_more = total_count is not None and next_skip < total_count
+        payload: dict[str, Any] = {
+            list_field: items,
+            "truncated": truncated,
+            "has_more": has_more,
+            **extra,
+        }
         if total_count is not None:
             payload["total_count"] = total_count
+        if has_more:
+            payload["next_skip"] = next_skip
         return _success(**payload)
 
     max_output_length = get_tool_max_output_length()
@@ -254,6 +271,14 @@ def _update_resource(path: str, uid: str, fields: dict[str, Any]) -> dict[str, A
     RowVersion themselves, this fetches the current body first and merges
     the caller's changes on top of it, so a caller only has to name what's
     actually changing.
+
+    This is still a GET-then-PUT with no retry: a concurrent edit landing
+    between the two (another tool call, or a change made directly in MYOB)
+    is a classic lost-update race -- MYOB's own RowVersion check makes the
+    PUT fail cleanly with a 409 rather than silently overwriting, but this
+    function doesn't re-fetch and retry on that, it just surfaces the
+    error. Not unique to this connector (other connectors in this codebase
+    PUT the same way), so left as a known tradeoff rather than solved here.
     """
     safe_uid = url_path_id(uid, "uid")
     current = _request("GET", f"{path}{safe_uid}/")
@@ -309,7 +334,9 @@ def myob_list_customers(
         params = _list_params(filter_str=filter, orderby=orderby, top=top, skip=skip)
         result = _request("GET", "Contact/Customer/", params=params)
         items, total_count = _list_items(result)
-        return _success_with_capped_list("customers", items, total_count=total_count)
+        return _success_with_capped_list(
+            "customers", items, total_count=total_count, skip=params["$skip"]
+        )
     except Exception as e:
         logger.error(f"Error listing MYOB customers: {e}")
         return _error(str(e))
@@ -379,7 +406,9 @@ def myob_list_suppliers(
         params = _list_params(filter_str=filter, orderby=orderby, top=top, skip=skip)
         result = _request("GET", "Contact/Supplier/", params=params)
         items, total_count = _list_items(result)
-        return _success_with_capped_list("suppliers", items, total_count=total_count)
+        return _success_with_capped_list(
+            "suppliers", items, total_count=total_count, skip=params["$skip"]
+        )
     except Exception as e:
         logger.error(f"Error listing MYOB suppliers: {e}")
         return _error(str(e))
@@ -450,7 +479,9 @@ def myob_list_sales_invoices(
         params = _list_params(filter_str=filter, orderby=orderby, top=top, skip=skip)
         result = _request("GET", "Sale/Invoice/Item/", params=params)
         items, total_count = _list_items(result)
-        return _success_with_capped_list("invoices", items, total_count=total_count)
+        return _success_with_capped_list(
+            "invoices", items, total_count=total_count, skip=params["$skip"]
+        )
     except Exception as e:
         logger.error(f"Error listing MYOB sales invoices: {e}")
         return _error(str(e))
@@ -523,7 +554,9 @@ def myob_list_purchase_bills(
         params = _list_params(filter_str=filter, orderby=orderby, top=top, skip=skip)
         result = _request("GET", "Purchase/Bill/Item/", params=params)
         items, total_count = _list_items(result)
-        return _success_with_capped_list("bills", items, total_count=total_count)
+        return _success_with_capped_list(
+            "bills", items, total_count=total_count, skip=params["$skip"]
+        )
     except Exception as e:
         logger.error(f"Error listing MYOB purchase bills: {e}")
         return _error(str(e))
@@ -594,7 +627,9 @@ def myob_list_accounts(
         params = _list_params(filter_str=filter, orderby=orderby, top=top, skip=skip)
         result = _request("GET", "GeneralLedger/Account/", params=params)
         items, total_count = _list_items(result)
-        return _success_with_capped_list("accounts", items, total_count=total_count)
+        return _success_with_capped_list(
+            "accounts", items, total_count=total_count, skip=params["$skip"]
+        )
     except Exception as e:
         logger.error(f"Error listing MYOB accounts: {e}")
         return _error(str(e))
@@ -626,7 +661,9 @@ def myob_list_tax_codes(
         params = _list_params(filter_str=filter, orderby=orderby, top=top, skip=skip)
         result = _request("GET", "GeneralLedger/TaxCode/", params=params)
         items, total_count = _list_items(result)
-        return _success_with_capped_list("tax_codes", items, total_count=total_count)
+        return _success_with_capped_list(
+            "tax_codes", items, total_count=total_count, skip=params["$skip"]
+        )
     except Exception as e:
         logger.error(f"Error listing MYOB tax codes: {e}")
         return _error(str(e))

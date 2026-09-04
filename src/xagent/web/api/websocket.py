@@ -100,6 +100,12 @@ from ..services.chat_history_service import (
     inspect_user_message_delivery,
     mark_user_message_delivery_sync,
 )
+from ..services.websocket_writer import (
+    activate_websocket_writer,
+    fanout_websocket_text,
+    retire_websocket_writer,
+    send_websocket_text,
+)
 from ..services.client_error_messages import (
     CLIENT_SAFE_GUIDANCE_IN_PROGRESS,
     CLIENT_SAFE_TASK_FAILURE,
@@ -4679,7 +4685,7 @@ class SharedWebSocketTracer(TraceHandler):
             if self.is_preview:
                 stream_event["is_preview"] = True
 
-            await self.ws.send_text(json.dumps(stream_event))
+            await send_websocket_text(self.ws, json.dumps(stream_event))
 
         except (RuntimeError, ConnectionError) as e:
             error_msg = str(e)
@@ -5113,6 +5119,7 @@ class ConnectionManager:
 
     def register_connection(self, websocket: WebSocket, task_id: int) -> None:
         """Register an already-accepted websocket for task broadcasts."""
+        activate_websocket_writer(websocket)
         current_task_id = self._connection_task_ids.get(websocket)
         if current_task_id is not None and current_task_id != task_id:
             self._remove_from_task(websocket, current_task_id)
@@ -5132,6 +5139,12 @@ class ConnectionManager:
                 pass
 
     def disconnect(self, websocket: WebSocket) -> None:
+        self.unregister_connection(websocket)
+        retire_websocket_writer(websocket)
+
+    def unregister_connection(self, websocket: WebSocket) -> None:
+        """Detach task routing while keeping the accepted socket usable."""
+
         task_id = self._connection_task_ids.pop(websocket, None)
         if task_id is not None:
             self._remove_from_task(websocket, task_id)
@@ -5144,6 +5157,7 @@ class ConnectionManager:
             if self._connection_task_ids.get(connection) == task_id:
                 del self._connection_task_ids[connection]
             _command_origins.discard_socket(connection)
+            retire_websocket_writer(connection)
         return connections
 
     def connections_for_task(self, task_id: int) -> List[WebSocket]:
@@ -5164,37 +5178,45 @@ class ConnectionManager:
 
     async def send_personal_message(self, message: dict, websocket: WebSocket) -> None:
         versioned_message = await _with_current_task_control_state(message)
-        await websocket.send_text(json.dumps(versioned_message))
+        await send_websocket_text(websocket, json.dumps(versioned_message))
 
     async def broadcast_to_task(self, message: dict, task_id: int) -> None:
-        if self.connections_for_task(task_id):
-            versioned_message = await _with_current_task_control_state(
-                message,
-                fallback_task_id=task_id,
-            )
-            for connection in self.connections_for_task(task_id):
-                if not self.is_connection_registered(connection, task_id):
-                    continue
-                try:
-                    await connection.send_text(json.dumps(versioned_message))
-                except (
+        connections = self.connections_for_task(task_id)
+        if not connections:
+            return
+        versioned_message = await _with_current_task_control_state(
+            message,
+            fallback_task_id=task_id,
+        )
+        failures = await fanout_websocket_text(
+            connections,
+            json.dumps(versioned_message),
+            is_active=lambda connection: self.is_connection_registered(
+                connection,
+                task_id,
+            ),
+        )
+        unexpected: Exception | None = None
+        for connection, error in failures:
+            if isinstance(
+                error,
+                (
                     BrokenResourceError,
                     ClosedResourceError,
                     ConnectionError,
                     WebSocketDisconnect,
                     RuntimeError,
-                ) as e:
-                    # Network connection error, remove disconnected connection
-                    logger.warning(f"Connection error for task {task_id}: {e}")
-                    self.disconnect(connection)
-                except Exception as e:
-                    # Other errors should not be silently handled, log and re-raise
-                    logger.error(
-                        f"Unexpected error broadcasting to task {task_id}: {e}"
-                    )
-                    # Remove disconnected connection but preserve error propagation
-                    self.disconnect(connection)
-                    raise
+                ),
+            ):
+                logger.warning(f"Connection error for task {task_id}: {error}")
+            else:
+                logger.error(
+                    f"Unexpected error broadcasting to task {task_id}: {error}"
+                )
+                unexpected = unexpected or error
+            self.disconnect(connection)
+        if unexpected is not None:
+            raise unexpected
 
 
 # Global connection manager
@@ -10014,6 +10036,7 @@ async def websocket_builder_chat_endpoint(
         return
 
     await websocket.accept()
+    activate_websocket_writer(websocket)
     logger.info(f"Builder chat WebSocket connection established for user {user.id}")
     active_chat_task: asyncio.Task[None] | None = None
 
@@ -10040,9 +10063,12 @@ async def websocket_builder_chat_endpoint(
     except Exception as e:
         logger.error(f"Unexpected error in builder chat WebSocket: {e}")
     finally:
-        if active_chat_task is not None:
-            await cancel_and_drain_async_task(active_chat_task)
-        websocket.state.chat_task = None
+        retire_websocket_writer(websocket)
+        try:
+            if active_chat_task is not None:
+                await cancel_and_drain_async_task(active_chat_task)
+        finally:
+            websocket.state.chat_task = None
 
 
 async def handle_builder_chat(
@@ -10184,7 +10210,8 @@ clarification questions as plain assistant text.
 
         async def send_builder_outbound_message(payload: Dict[str, Any]) -> None:
             """Bridge agent agent-to-user messages to the builder chat socket."""
-            await websocket.send_text(
+            await send_websocket_text(
+                websocket,
                 json.dumps(
                     create_stream_event(
                         _agent_outbound_event_type(payload),
@@ -10203,17 +10230,18 @@ clarification questions as plain assistant text.
                         },
                         event_id=payload.get("event_id"),
                     )
-                )
+                ),
             )
 
         llm = runtime_inputs.llm
         compact_llm = runtime_inputs.compact_llm
 
         if not llm:
-            await websocket.send_text(
+            await send_websocket_text(
+                websocket,
                 json.dumps(
                     {"type": "error", "message": "No LLM configured for builder chat"}
-                )
+                ),
             )
             return
 
@@ -10432,7 +10460,8 @@ clarification questions as plain assistant text.
                         "chat_response"
                     )
 
-                await websocket.send_text(
+                await send_websocket_text(
+                    websocket,
                     json.dumps(
                         {
                             "type": "task_completed",
@@ -10441,15 +10470,16 @@ clarification questions as plain assistant text.
                             "success": result.get("success", True),
                             "timestamp": datetime.now(timezone.utc).timestamp(),
                         }
-                    )
+                    ),
                 )
             except Exception as e:
                 logger.warning(f"Failed to send task_completed: {e}")
 
     except Exception as e:
         logger.error("Error handling builder chat: %s", e, exc_info=True)
-        await websocket.send_text(
-            json.dumps({"type": "error", "message": client_safe_error_message(e)})
+        await send_websocket_text(
+            websocket,
+            json.dumps({"type": "error", "message": client_safe_error_message(e)}),
         )
 
 
@@ -10469,6 +10499,7 @@ async def websocket_build_preview_endpoint(
         return
 
     await websocket.accept()
+    activate_websocket_writer(websocket)
     logger.info(f"Build preview WebSocket connection established for user {user.id}")
 
     try:
@@ -10491,13 +10522,14 @@ async def websocket_build_preview_endpoint(
                         {"type": "pause_task", "user": user},
                     )
                 else:
-                    await websocket.send_text(
+                    await send_websocket_text(
+                        websocket,
                         json.dumps(
                             {
                                 "type": "error",
                                 "message": "No active agent to pause",
                             }
-                        )
+                        ),
                     )
             elif message_type == "resume":
                 task_id = getattr(websocket.state, "preview_task_id", None)
@@ -10508,28 +10540,31 @@ async def websocket_build_preview_endpoint(
                         {"type": "resume_task", "user": user},
                     )
                 else:
-                    await websocket.send_text(
+                    await send_websocket_text(
+                        websocket,
                         json.dumps(
                             {
                                 "type": "error",
                                 "message": "No active agent to resume",
                             }
-                        )
+                        ),
                     )
             elif message_type == "clear_context":
-                manager.disconnect(websocket)
+                manager.unregister_connection(websocket)
                 websocket.state.preview_task_id = None
-                await websocket.send_text(
+                await send_websocket_text(
+                    websocket,
                     json.dumps(
                         {
                             "type": "context_cleared",
                             "timestamp": datetime.now(timezone.utc).timestamp(),
                         }
-                    )
+                    ),
                 )
                 logger.info(f"Cleared build preview context for user {user.id}")
             else:
-                await websocket.send_text(
+                await send_websocket_text(
+                    websocket,
                     json.dumps(
                         {
                             "type": "error",
@@ -10537,7 +10572,7 @@ async def websocket_build_preview_endpoint(
                             # "Unknown message type" site above.
                             "message": "Unknown message type",
                         }
-                    )
+                    ),
                 )
 
     except WebSocketDisconnect:
@@ -10562,13 +10597,14 @@ async def handle_build_preview_execution(
     user_message = message_data.get("message", "")
     files_data = message_data.get("files", [])
     if not user_message and not files_data:
-        await websocket.send_text(
+        await send_websocket_text(
+            websocket,
             json.dumps(
                 {
                     "type": "error",
                     "message": "Message or files are required for preview",
                 }
-            )
+            ),
         )
         return
 

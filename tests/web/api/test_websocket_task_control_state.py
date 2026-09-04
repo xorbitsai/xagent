@@ -517,7 +517,9 @@ async def test_broadcast_rechecks_membership_after_message_enrichment(
 
 
 @pytest.mark.asyncio
-async def test_broadcast_skips_connection_moved_during_fanout() -> None:
+async def test_broadcast_uses_membership_snapshot_without_cross_socket_blocking() -> (
+    None
+):
     task_id = 42
     moved_task_id = 99
     blocking_websocket = _BlockingSendWebSocket()
@@ -534,7 +536,10 @@ async def test_broadcast_skips_connection_moved_during_fanout() -> None:
     blocking_websocket.release_send.set()
     await broadcast
 
-    assert moved_websocket.messages == []
+    # The socket was authorized when fan-out began. Per-connection sends now
+    # progress independently, so moving another socket cannot retroactively
+    # cancel a frame that was already scheduled for this connection.
+    assert moved_websocket.messages == [json.dumps({"type": "diagnostic"})]
     assert connection_manager.active_connections == {
         task_id: [blocking_websocket],
         moved_task_id: [moved_websocket],

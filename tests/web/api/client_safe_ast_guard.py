@@ -67,8 +67,17 @@ def _message_expression(node: ast.Call, index: int | None) -> ast.expr | None:
     return None
 
 
-# ``send_text`` takes a serialized payload, so the dict sits one call deeper.
-ERROR_PAYLOAD_SINKS = {"send_personal_message", "broadcast_to_task", "send_text"}
+# Text sinks take a serialized payload, so the dict sits one call deeper.
+SERIALIZED_ERROR_PAYLOAD_SINKS = {
+    "fanout_websocket_text",
+    "send_text",
+    "send_websocket_text",
+}
+ERROR_PAYLOAD_SINKS = {
+    "send_personal_message",
+    "broadcast_to_task",
+    *SERIALIZED_ERROR_PAYLOAD_SINKS,
+}
 
 # Both render in the client's conversation, so both are the same disclosure
 # surface. ``agent_error`` was missing until review found a producer using it.
@@ -304,8 +313,12 @@ def _error_payload_messages(
     sink_name = _called_name(node, parents)
     if sink_name not in ERROR_PAYLOAD_SINKS:
         return []
-    payload_keyword = "data" if sink_name == "send_text" else "message"
-    payload = _call_argument(node, 0, payload_keyword)
+    serialized_sink = sink_name in SERIALIZED_ERROR_PAYLOAD_SINKS
+    payload_keyword = "data" if serialized_sink else "message"
+    payload_position = (
+        1 if sink_name in {"fanout_websocket_text", "send_websocket_text"} else 0
+    )
+    payload = _call_argument(node, payload_position, payload_keyword)
     if payload is None:
         return []
     argument = _unwrap_serializer(payload, parents)
@@ -324,7 +337,7 @@ def _error_payload_messages(
             return []
     if not isinstance(argument, (ast.Call, ast.Dict, ast.Name, ast.Await)):
         return []
-    if sink_name == "send_text" and isinstance(argument, (ast.Name, ast.Await)):
+    if serialized_sink and isinstance(argument, (ast.Name, ast.Await)):
         # ``ConnectionManager`` serializes payloads already vetted at its
         # public send/broadcast boundary. Keep direct dict/json payloads
         # visible without treating that forwarding layer as a second

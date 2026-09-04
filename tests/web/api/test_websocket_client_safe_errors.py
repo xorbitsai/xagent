@@ -1966,6 +1966,22 @@ async def audit_failure(audit, error):
     assert not _guard_offenders(source)
 
 
+@pytest.mark.parametrize(
+    "sink",
+    ["send_websocket_text", "fanout_websocket_text"],
+)
+def test_guard_checks_ordered_websocket_writer_payloads(sink: str) -> None:
+    source = f"""
+async def leak(websocket, error):
+    await {sink}(
+        websocket,
+        json.dumps({{"type": "error", "message": str(error)}}),
+    )
+"""
+
+    assert _guard_offenders(source)
+
+
 # The concurrent-delete race (TaskCommandTaskMissing between lookup and
 # enqueue) is pinned in tests/web/services/test_task_command_transport.py:
 # recovery-allowed returns None, and the strict path converts to

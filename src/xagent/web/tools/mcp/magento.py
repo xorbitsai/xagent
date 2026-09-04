@@ -353,9 +353,10 @@ def _require_non_blank(value: str, field_name: str) -> str:
     the id matches), these are free-text display fields -- a product
     name, an order comment -- where silently storing accidental padding
     is the more likely-to-surprise outcome, not stripping it."""
-    if not value or not value.strip():
+    stripped = value.strip() if value else value
+    if not stripped:
         raise ValueError(f"{field_name} must not be blank")
-    return value.strip()
+    return stripped
 
 
 def _escape_like(value: str) -> str:
@@ -381,6 +382,16 @@ def _validate_choice(
     # same gap _paginated_result's total_count check was hardened against.
     if isinstance(value, bool) or value not in allowed:
         return f"{field_name} must be one of {sorted(allowed)}, got {value!r}"
+    return None
+
+
+def _validate_non_negative(value: float, field_name: str) -> str | None:
+    """Return an error message if value is negative, else None -- shared
+    by create/update product's price check for the same reason
+    _validate_choice is shared: so the wording can't drift between call
+    sites that repeat it."""
+    if value < 0:
+        return f"{field_name} must not be negative"
     return None
 
 
@@ -883,8 +894,8 @@ def magento_create_product(
         # then reject as invalid.
         require_clean_identifier(sku, "sku")
         name = _require_non_blank(name, "name")
-        if price < 0:
-            return _error("price must not be negative")
+        if err := _validate_non_negative(price, "price"):
+            return _error(err)
         if err := _validate_choice(status, _PRODUCT_STATUSES, "status"):
             return _error(err)
         if err := _validate_choice(visibility, _PRODUCT_VISIBILITIES, "visibility"):
@@ -928,8 +939,8 @@ def magento_update_product(
             product_input["name"] = _require_non_blank(name, "name")
             fields_provided = True
         if price is not None:
-            if price < 0:
-                return _error("price must not be negative")
+            if err := _validate_non_negative(price, "price"):
+                return _error(err)
             product_input["price"] = price
             fields_provided = True
         if status is not None:

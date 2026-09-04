@@ -41,15 +41,12 @@ pytestmark = pytest.mark.usefixtures("_test_db")
 # one test instead of hanging the suite, so it is sized for the worst CI
 # machine rather than for the expected one.
 #
-# It has to be generous because the code these handshakes straddle is
-# deliberately expensive. Runtime-key delivery hashes with bcrypt at
-# ``BCRYPT_COST`` 12 -- ~100ms per draw on idle commodity hardware, up to
-# ``PREFIX_COLLISION_RETRIES`` draws -- and then commits. CI runs this suite
-# as ``pytest -n 4`` on a 4-vCPU runner that is simultaneously driving a
-# Docker daemon, so the 2s budget these waits used to carry (~9x headroom on
-# an idle workstation) was routinely missed there. Oversubscribing an
-# 18-core machine ~8x reproduces the exact CI failures: ``assert False`` on a
-# handshake wait, ``TimeoutError`` on a settlement wait.
+# It has to be generous because CI runs this suite as ``pytest -n 4`` on a
+# 4-vCPU runner that is simultaneously driving a Docker daemon and contended
+# database transactions. The 2s budget these waits used to carry was routinely
+# missed there. Oversubscribing an 18-core machine ~8x reproduces the exact CI
+# failures: ``assert False`` on a handshake wait, ``TimeoutError`` on a
+# settlement wait.
 _HANDSHAKE_TIMEOUT = 30.0
 
 # Deliberately short, and deliberately not the constant above: this probe
@@ -106,7 +103,7 @@ async def _cancel_after_runtime_key_commit(
 async def test_create_and_rotate_hash_without_holding_pool_connection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """bcrypt is worker-owned and runs before either write transaction opens."""
+    """Key hashing is worker-owned and precedes either write transaction."""
 
     from xagent.core.utils import api_key
 
@@ -115,23 +112,23 @@ async def test_create_and_rotate_hash_without_holding_pool_connection(
     event_loop_thread = threading.get_ident()
     hash_observations: list[tuple[int, int]] = []
     sql_threads: list[int] = []
-    original_hashpw = api_key.bcrypt.hashpw
+    original_hash_api_key = api_key.hash_api_key
 
     @event.listens_for(engine, "before_cursor_execute")
     def record_sql_thread(*_args) -> None:  # type: ignore[no-untyped-def]
         sql_threads.append(threading.get_ident())
 
-    def recording_hashpw(*args, **kwargs):  # type: ignore[no-untyped-def]
+    def recording_hash_api_key(*args, **kwargs):  # type: ignore[no-untyped-def]
         hash_observations.append((threading.get_ident(), engine.pool.checkedout()))
-        return original_hashpw(*args, **kwargs)
+        return original_hash_api_key(*args, **kwargs)
 
-    monkeypatch.setattr(api_key.bcrypt, "hashpw", recording_hashpw)
+    monkeypatch.setattr(api_key, "hash_api_key", recording_hash_api_key)
     runtime = AgentManagementRuntime()
 
     created = await runtime.create_agent(
         user_id=user_id,
         is_admin=is_admin,
-        spec=_create_spec("bcrypt boundary"),
+        spec=_create_spec("hash boundary"),
     )
     rotated = await runtime.rotate_agent_runtime_key(
         user_id=user_id,

@@ -43,7 +43,9 @@ class AgentApiKey(Base):  # type: ignore
     label = Column(String(100), nullable=True)
     # Public-safe lookup handle (6-char in practice; column sized to 12 for headroom).
     key_prefix = Column(String(12), nullable=False, unique=True, index=True)
-    # bcrypt(full_key, cost=12). Never store the plaintext secret.
+    # Versioned SHA-256 digest for current keys; legacy bcrypt hashes remain
+    # readable and are upgraded after one successful authentication. Never
+    # store the plaintext secret.
     key_hash = Column(String(128), nullable=False)
     # Temporarily disables auth without revoking (audit-preserving pause/resume).
     paused_at = Column(DateTime(timezone=True), nullable=True)

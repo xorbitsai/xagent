@@ -139,9 +139,11 @@ def _create_task(full_key: str, agent_id: int, content: str = "hello") -> int:
 
 
 def _principal_for(full_key: str) -> ApiKeyPrincipal:
-    """Resolve a real principal through the production auth path (bcrypt
-    included) rather than hand-rolling a snapshot -- keeps tests honest
-    about what ``get_principal_from_api_key`` actually returns."""
+    """Resolve a real principal through the production authentication path.
+
+    Avoid hand-rolling a snapshot so tests stay honest about what
+    ``get_principal_from_api_key`` actually returns.
+    """
     creds = HTTPAuthorizationCredentials(scheme="Bearer", credentials=full_key)
     return _resolve_principal_from_credentials(creds)
 

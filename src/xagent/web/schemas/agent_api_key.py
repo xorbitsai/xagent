@@ -95,7 +95,7 @@ class APIKeyGenerateResponse(BaseModel):
     The ``full_key`` is plaintext and returned exactly once per
     rotation. Clients (the web UI) must show it to the agent owner
     immediately and warn that it will not be retrievable later. The
-    server only persists ``bcrypt(full_key)`` in ``agent_api_keys.key_hash``;
+    server only persists a one-way verifier in ``agent_api_keys.key_hash``;
     the plaintext leaves this response and is never written to disk
     server-side.
     """

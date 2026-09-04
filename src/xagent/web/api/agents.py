@@ -1464,7 +1464,7 @@ async def generate_agent_api_key(
     endpoint revokes it and inserts a new active row in a single
     transaction. The new ``full_key`` is returned exactly once in the
     response; the plaintext secret is never persisted server-side, only
-    its bcrypt hash.
+    its one-way verifier.
 
     Args:
         agent_id: Path parameter; the target agent's primary key.
@@ -1495,7 +1495,7 @@ async def generate_agent_api_key(
           the multi-key endpoints; two racing legacy rotations both succeed
           sequentially, and the later rotation leaves its key active.
         - Logs include the ``key_prefix`` only -- never the ``full_key``,
-          the secret half, or the bcrypt hash.
+          the secret half, or the stored verifier.
     """
     try:
         # Ownership gate. Raises 404 on miss; never reveals "exists but

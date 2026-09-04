@@ -1190,8 +1190,8 @@ class AgentManagementRuntime:
     ) -> _RuntimeKeyDeliveryOutcome[AgentCreateSnapshot]:
         attempts = PREFIX_COLLISION_RETRIES if spec.generate_runtime_key else 1
         for attempt in range(attempts):
-            # Candidate generation includes bcrypt. It deliberately precedes
-            # Session creation so CPU work never pins a pool checkout.
+            # Generate key material and its verifier before Session creation
+            # so this work never pins a pool checkout.
             candidate = (
                 generate_api_key(None, kind=ApiKeyKind.AGENT)
                 if spec.generate_runtime_key

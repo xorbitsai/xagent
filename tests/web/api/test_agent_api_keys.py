@@ -18,6 +18,7 @@ import pytest
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from xagent.core.utils.api_key import SHA256_HASH_PREFIX
 from xagent.web.models.agent import Agent, AgentOrigin
 from xagent.web.models.agent_api_key import AgentApiKey
 
@@ -98,9 +99,9 @@ class TestPostGenerateApiKey:
             assert len(rows) == 1
             assert rows[0].key_prefix == body["key_prefix"]
             assert rows[0].revoked_at is None
-            # Hash is bcrypt, NOT the plaintext full_key
+            # The versioned digest, never the plaintext key, is persisted.
             assert rows[0].key_hash != full_key
-            assert rows[0].key_hash.startswith("$2b$12$")
+            assert rows[0].key_hash.startswith(SHA256_HASH_PREFIX)
         finally:
             db.close()
 

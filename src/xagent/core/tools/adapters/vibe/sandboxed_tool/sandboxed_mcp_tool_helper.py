@@ -15,6 +15,10 @@ from mcp.types import Tool as MCPTool
 
 from ......sandbox.base import Sandbox
 from ....core.mcp.sessions import Connection
+from ....core.mcp.tools import (
+    SANDBOX_RAW_ANNOTATIONS_KEY,
+    attach_raw_annotations,
+)
 from ..base import AbstractBaseTool
 from .sandbox_config import SandboxConfig, set_instance_sandbox_config
 from .sandboxed_tool_wrapper import (
@@ -151,7 +155,25 @@ async def list_tools_in_sandbox(
             )
             raise RuntimeError(f"Failed to parse MCP list_tools output: {e}") from e
 
-        return [MCPTool.model_validate(item) for item in tool_data]
+        # The private annotations key the in-sandbox runner attached is
+        # stripped before validation (``Tool`` would otherwise reject it or
+        # carry it as extra) and re-attached afterwards, so a sandboxed tool
+        # classifies from the same wire evidence a directly loaded one does.
+        tools: list[MCPTool] = []
+        for item in tool_data:
+            raw = None
+            if isinstance(item, dict):
+                payload = {
+                    k: v for k, v in item.items() if k != SANDBOX_RAW_ANNOTATIONS_KEY
+                }
+                candidate = item.get(SANDBOX_RAW_ANNOTATIONS_KEY)
+                raw = candidate if isinstance(candidate, dict) else None
+            else:
+                payload = item
+            tool = MCPTool.model_validate(payload)
+            attach_raw_annotations(tool, raw)
+            tools.append(tool)
+        return tools
     finally:
         try:
             await target_sandbox.exec("rm", "-f", result_file)

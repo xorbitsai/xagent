@@ -85,6 +85,34 @@ class ToolMetadata(BaseModel):
     # metadata is constructed).
     read_only: bool = False
     concurrency_safe: bool = False
+    # What a *remote* MCP server's own annotations claimed about this tool's
+    # writes, or None for any tool that is not an MCP tool. Deliberately not
+    # folded into ``read_only`` above: that field is a local guarantee the
+    # scheduler acts on (it implies ``concurrency_safe``), while this one is
+    # an untrusted third-party hint that must never widen what the scheduler
+    # is allowed to do. Kept as the declaration's three states rather than a
+    # boolean so "the server said read-only" stays distinguishable from "the
+    # server said nothing" -- see ``MCPWriteHint``. A consumer gating an
+    # action must treat everything except an explicit read-only claim as a
+    # write, and must not treat even that claim as a security fact.
+    mcp_write_hint: Optional[str] = None
+
+
+def _write_hint_value(tool: Any) -> Optional[str]:
+    """Read a tool's MCP write hint as a plain string, if it has one.
+
+    ``getattr`` rather than an isinstance check against the MCP adapter:
+    this module is the common tool contract and must not import a concrete
+    adapter, and a wrapper that delegates the attribute has to work exactly
+    like the adapter itself. A tool without the attribute reports ``None``,
+    meaning "not an MCP declaration" -- distinct from an MCP tool whose
+    server declared nothing, which reports ``"undeclared"``.
+    """
+    hint = getattr(tool, "write_hint", None)
+    if hint is None:
+        return None
+    value = getattr(hint, "value", None)
+    return value if isinstance(value, str) else None
 
 
 @runtime_checkable
@@ -138,6 +166,12 @@ class AbstractBaseTool(ABC, Tool):
                 getattr(self, "concurrency_safe", False)
                 or getattr(self, "read_only", False)
             ),
+            # Populated from whatever the concrete tool exposes, so an MCP
+            # adapter's declaration reaches the common contract without every
+            # other tool having to know the field exists. Stored as the
+            # enum's value (a plain string) to keep this module free of a
+            # dependency on the MCP adapter.
+            mcp_write_hint=_write_hint_value(self),
         )
 
     @abstractmethod

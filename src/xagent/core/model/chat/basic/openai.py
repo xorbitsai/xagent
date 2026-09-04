@@ -186,6 +186,19 @@ def _degrade_rejected_params(
         completion_params.pop("response_format")
         degraded.append("response_format")
 
+    # Some OpenAI-compatible chat-completions endpoints enable reasoning by
+    # default, but reject that default when function tools are present. Their
+    # error explicitly asks clients to opt out, even when the original request
+    # did not contain ``reasoning_effort``.
+    if (
+        "tools" in completion_params
+        and rejected_param == "reasoning_effort"
+        and "set reasoning_effort to 'none'" in lowered
+        and completion_params.get("reasoning_effort") != "none"
+    ):
+        completion_params["reasoning_effort"] = "none"
+        degraded.append("reasoning_effort")
+
     return degraded
 
 

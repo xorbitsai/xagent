@@ -574,6 +574,10 @@ async def test_deputy_refresh_posts_to_stored_instance_url_with_scope_and_redire
     # function) -- locks in that Deputy takes neither of those branches.
     assert "json" not in kwargs
     assert kwargs["headers"] == {}
+    # Pins that Employment Hero's query-param refresh rewrite (grant_type/
+    # refresh_token moved out of the body into `params`) stays scoped to
+    # that family and never leaks onto an unrelated provider's refresh.
+    assert "params" not in kwargs
 
 
 @pytest.mark.asyncio

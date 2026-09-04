@@ -3,7 +3,17 @@ from __future__ import annotations
 import hashlib
 from typing import Any
 
-from sqlalchemy import JSON, Column, DateTime, ForeignKey, Integer, String, Text, event
+from sqlalchemy import (
+    JSON,
+    Column,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    Uuid,
+    event,
+)
 from sqlalchemy.orm import relationship
 from sqlalchemy.schema import Index, UniqueConstraint
 from sqlalchemy.sql import func
@@ -224,6 +234,11 @@ class MCPOAuthFlowState(Base):  # type: ignore
     user_id = Column(
         Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
+    # Snapshot of the exact UserMCPServer lifecycle that created this flow.
+    # NULL is reserved for flows created before the lifecycle fence migration;
+    # callbacks for those rows fail closed because their association identity
+    # cannot be proven after a delete-and-recreate race.
+    association_lifecycle_generation = Column(Uuid, nullable=True)
     mcp_oauth_client_id = Column(
         Integer,
         ForeignKey("mcp_oauth_clients.id", ondelete="CASCADE"),

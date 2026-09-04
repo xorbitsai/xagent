@@ -1,8 +1,25 @@
-"""Fixed client-visible fallbacks for incidental server failures."""
+"""Client-visible projections of server-side failures.
+
+Holds the fixed fallback strings used when a failure has nothing safe to
+say, the per-exception adapters that pass a curated message through, and
+the projector that lifts a connector-runtime failure's code onto a
+task_error frame.
+"""
 
 from enum import StrEnum
 
 from ...core.tools.adapters.vibe.config import RequiredMCPUnavailableError
+from ...core.tools.adapters.vibe.connector_runtime import (
+    ERROR_CONNECTOR_NOT_FOUND,
+    ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
+    ERROR_INVALID_RUNTIME_CONTEXT,
+    ERROR_MISSING_RUNTIME_CONTEXT,
+    ERROR_RUNTIME_CONTEXT_IMMUTABLE,
+    ERROR_RUNTIME_SECRET_NOT_ALLOWED,
+    ERROR_RUNTIME_SECRET_UNAVAILABLE,
+    ERROR_SCHEDULED_SECRET_UNAVAILABLE,
+    ConnectorRuntimeError,
+)
 
 CLIENT_SAFE_VALIDATION_ERROR = "The message could not be processed. Please try again."
 
@@ -111,3 +128,66 @@ def required_mcp_unavailable_client_message(
     if message.strip():
         return message
     return fallback
+
+
+def connector_runtime_client_message(error: BaseException) -> str:
+    """Adapt the curated connector-runtime failure without a generic escape.
+
+    The runtime check keeps this boundary fail-closed even if a future caller
+    passes an incidental exception despite the function's specific name.
+    """
+
+    if not isinstance(error, ConnectorRuntimeError):
+        return CLIENT_SAFE_TASK_FAILURE
+    message = error.safe_message
+    if isinstance(message, str) and message.strip():
+        return message
+    return CLIENT_SAFE_TASK_FAILURE
+
+
+def connector_runtime_client_code(error: BaseException) -> str | None:
+    """Project a connector-runtime failure onto its wire-safe error code.
+
+    Returns ``None`` for anything else, so a caller cannot widen the surface
+    by passing an incidental exception. Membership in the client-visible
+    closed set is checked by the frame builder, not here: this function
+    only decides whether the exception is one we project at all.
+
+    This is not the only client-visible projection of this exception.
+    ``_raise_v1_connector_runtime_error`` (``web/api/v1/tasks.py``) projects
+    it for the SDK surface and ships ``to_public_error()["details"]``
+    whole, ``connector_ref`` included. The two differ because their
+    audiences do: that one answers an API key held by a caller already
+    authorized for the task, while this one feeds ``broadcast_to_task``,
+    which reaches every connection under the task id including anonymous
+    widget and share-link visitors. Keep them as two projectors with one
+    audience each.
+    """
+
+    if not isinstance(error, ConnectorRuntimeError):
+        return None
+    code = error.code
+    return code if isinstance(code, str) else None
+
+
+# The connector-runtime codes a terminal task_error frame may carry. Every
+# member is raised as a ``ConnectorRuntimeError`` somewhere in this
+# repository today, and none of them states who owns the task or how an
+# authorization check resolved -- the two questions a value has to answer
+# "no" to before it may reach anonymous widget and share-link visitors.
+# ``mcp_oauth_authorization_failed`` and ``delegated_authorization_failed``
+# are deliberately absent: nothing here raises them as this exception, and
+# each one is the outcome of an authorization check. Add a code here in the
+# same change that adds the raise site, never ahead of it.
+CONNECTOR_RUNTIME_CLIENT_ERROR_CODES = frozenset(
+    {
+        ERROR_CONNECTOR_NOT_FOUND,
+        ERROR_INVALID_RUNTIME_CONTEXT,
+        ERROR_MISSING_RUNTIME_CONTEXT,
+        ERROR_RUNTIME_CONTEXT_IMMUTABLE,
+        ERROR_RUNTIME_SECRET_NOT_ALLOWED,
+        ERROR_RUNTIME_SECRET_UNAVAILABLE,
+        ERROR_SCHEDULED_SECRET_UNAVAILABLE,
+        ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
+    }
+)

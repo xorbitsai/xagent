@@ -1,11 +1,13 @@
 """Per-provider quirks in how OAuth token endpoints respond to a token
-request. Some of these are shared between the initial code exchange
-(api/auth.py) and token refresh (tools/config.py) so a quirk fixed in one
-lifecycle path can't silently regress in the other (requires_json_accept_
-header is); others (meta_invalid_token_error_code) are refresh-specific --
-see each function's own docstring, and the call sites' own comments, for
-which lifecycle path(s) it applies to and the underlying provider behavior
-it works around.
+request, plus the provider-family-matching predicates (matches_provider_
+family, requires_pkce) those quirks -- and callers elsewhere in this
+codebase -- are built on. Some of the response-shape quirks are shared
+between the initial code exchange (api/auth.py) and token refresh
+(tools/config.py) so a quirk fixed in one lifecycle path can't silently
+regress in the other (requires_json_accept_header is); others (meta_
+invalid_token_error_code) are refresh-specific -- see each function's own
+docstring, and the call sites' own comments, for which lifecycle path(s) it
+applies to and the underlying provider behavior it works around.
 """
 
 from typing import Mapping
@@ -52,3 +54,67 @@ def meta_invalid_token_error_code(error: object) -> str | None:
     ):
         return "invalid_grant"
     return None
+
+
+def matches_provider_family(provider: str, base_name: str) -> bool:
+    """Match `provider` to a family rooted at `base_name`: exact equality, or
+    a "-"-anchored prefix (`base_name` + "-"), case-insensitively.
+
+    Anchored to a "-" separator, not a bare prefix: `oauth_providers.name` is
+    admin-settable via POST/PUT /admin/mcp/providers, so a bare
+    `.startswith(base_name)` would also match an unrelated custom provider an
+    admin happened to name e.g. "salesforcelite" -- silently pulling it into
+    a family (and whatever safeguard/quirk that family requires) it has no
+    reason to be part of. The "-" anchor is what an admin-created variant row
+    (e.g. "salesforce-sandbox", "employment-hero-sandbox") is expected to use,
+    per example.env's documented workaround for providers with no per-user
+    environment toggle.
+
+    Shared by every family-matching predicate and call site in this codebase
+    (auth.py's _is_salesforce_provider and its Employment Hero query-param
+    wire-format branch, requires_pkce below, tools/config.py's refresh-leg
+    counterpart of that same wire-format branch) so the matching algorithm
+    itself has exactly one implementation -- a caller composing a new
+    family check should use this rather than re-deriving the same
+    equality/prefix logic.
+    """
+    lowered = provider.lower()
+    lowered_base_name = base_name.lower()
+    return lowered == lowered_base_name or lowered.startswith(f"{lowered_base_name}-")
+
+
+def host_matches_suffix(hostname: str, suffix: str) -> bool:
+    """True if `hostname` is exactly `suffix` or a subdomain of it.
+
+    Callers are expected to pass an already-lowercased `hostname` (e.g.
+    from `urlparse(...).hostname`, which itself already lowercases) and a
+    lowercase `suffix` literal. Shared so this "exact match or dot-anchored
+    subdomain" comparison -- used to validate that a URL genuinely belongs
+    to a given provider's real domain before trusting it (see auth.py's
+    _normalize_deputy_endpoint and _is_employment_hero_token_url) -- has
+    exactly one implementation, the same reasoning matches_provider_family
+    above gives for its own "-"-anchored family matching.
+    """
+    return hostname == suffix or hostname.endswith(f".{suffix}")
+
+
+# Providers whose authorization-code grant requires PKCE (a code_challenge on
+# the authorize redirect, a code_verifier on the token exchange), with no
+# per-app way to disable it. Every PKCE-only code path must use this same
+# predicate, or a variant row would silently skip the safeguard its family
+# requires.
+_PKCE_PROVIDER_PREFIXES = (
+    "salesforce",
+    # Employment Hero rolled out a PKCE mandate for this grant effective
+    # 2026-09-14, with no per-app opt-out. See
+    # https://developer.employmenthero.com/partner-guides for the notice.
+    "employment-hero",
+)
+
+
+def requires_pkce(provider: str) -> bool:
+    """True if `provider` is in a family listed in _PKCE_PROVIDER_PREFIXES
+    above (see that constant's own comment for which families and why)."""
+    return any(
+        matches_provider_family(provider, prefix) for prefix in _PKCE_PROVIDER_PREFIXES
+    )

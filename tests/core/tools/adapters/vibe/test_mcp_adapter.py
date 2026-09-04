@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
-from mcp.types import CallToolResult, TextContent
+from mcp.types import CallToolResult, ListToolsResult, TextContent
 from pydantic import BaseModel, ConfigDict, create_model
 from pydantic.alias_generators import to_camel
 
@@ -23,15 +23,19 @@ from xagent.core.tools.adapters.vibe.mcp_adapter import (
     MCPFailurePhase,
     MCPServerLoadFailure,
     MCPToolAdapter,
+    MCPWriteHint,
     _build_mcp_tool_adapter,
     _compact_json,
     _exception_indicates_http_401,
     _mcp_return_value_as_string,
+    classify_write_hint,
     load_mcp_tools_as_agent_tools,
 )
 from xagent.core.tools.adapters.vibe.tool_naming_limits import (
     MAX_AGENT_TOOL_NAME_LENGTH,
 )
+from xagent.core.tools.core.mcp import tools as mcp_tools_module
+from xagent.core.tools.core.mcp.tools import _tools_with_raw_annotations
 
 
 def _http_status_error(
@@ -3097,3 +3101,161 @@ def test_description_length_boundary(length, truncated):
         assert description == "a" * (_FIELD_TEXT_MAX_CHARS - 1) + "…"
     else:
         assert description == raw
+
+
+def _listing(*annotations: object) -> dict[str, Any]:
+    """A ``tools/list`` payload whose tools carry the given raw annotations."""
+    tools = []
+    for index, raw in enumerate(annotations):
+        tool: dict[str, Any] = {
+            "name": f"tool{index}",
+            "description": "d",
+            "inputSchema": {"type": "object"},
+        }
+        if raw is not None:
+            tool["annotations"] = raw
+        tools.append(tool)
+    return {"tools": tools}
+
+
+def _hints_from_wire(*annotations: object) -> list[MCPWriteHint]:
+    """Classify annotations the way a real listing would deliver them.
+
+    Goes through ``_tools_with_raw_annotations`` -- the same helper both
+    loaders use -- rather than assigning an already-parsed object. That is
+    the whole point of these tests: ``ToolAnnotations`` validates
+    non-strictly, so assigning ``"true"`` to a parsed model yields ``True``
+    and a test built that way cannot see the difference it claims to check.
+    """
+    tools = _tools_with_raw_annotations(_listing(*annotations))
+    return [
+        _build_mcp_tool_adapter("srv", SimpleNamespace(), tool).write_hint
+        for tool in tools
+    ]
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        # Exact wire booleans: the only declarations that count.
+        ({"readOnlyHint": True}, MCPWriteHint.READ_ONLY),
+        ({"destructiveHint": True}, MCPWriteHint.DESTRUCTIVE),
+        ({"readOnlyHint": False, "destructiveHint": True}, MCPWriteHint.DESTRUCTIVE),
+        # A contradiction resolves to the safe side, not the permissive one.
+        ({"readOnlyHint": True, "destructiveHint": True}, MCPWriteHint.DESTRUCTIVE),
+        # Coercible non-booleans. The SDK turns each of these into a Python
+        # bool; none of them is a promise, so none may read as one.
+        ({"readOnlyHint": "true"}, MCPWriteHint.UNDECLARED),
+        ({"readOnlyHint": 1}, MCPWriteHint.UNDECLARED),
+        ({"readOnlyHint": "false"}, MCPWriteHint.UNDECLARED),
+        ({"readOnlyHint": 0}, MCPWriteHint.UNDECLARED),
+        ({"destructiveHint": "true"}, MCPWriteHint.UNDECLARED),
+        ({"destructiveHint": 1}, MCPWriteHint.UNDECLARED),
+        # Declared false, and nothing declared at all.
+        ({"readOnlyHint": False}, MCPWriteHint.UNDECLARED),
+        ({"readOnlyHint": None, "destructiveHint": None}, MCPWriteHint.UNDECLARED),
+        ({"title": "Echo"}, MCPWriteHint.UNDECLARED),
+        ({}, MCPWriteHint.UNDECLARED),
+        (None, MCPWriteHint.UNDECLARED),
+    ],
+)
+def test_write_hint_classifies_wire_annotations(raw, expected):
+    """Only an exact wire boolean is a declaration, destructive first."""
+    assert _hints_from_wire(raw) == [expected]
+
+
+def test_coercible_hint_is_indistinguishable_after_the_sdk_parses_it():
+    """Why these tests must go through the wire, stated as an assertion.
+
+    If this ever fails because the SDK started validating strictly, the
+    sidecar this module carries could be simplified away -- but until then,
+    a test that assigns to a parsed model is testing nothing.
+    """
+    tools = _tools_with_raw_annotations(
+        _listing({"readOnlyHint": True}, {"readOnlyHint": "true"})
+    )
+    declared, coerced = tools
+
+    # The SDK cannot tell them apart...
+    assert declared.annotations.readOnlyHint is True
+    assert coerced.annotations.readOnlyHint is True
+    # ...but the classification does.
+    assert _build_mcp_tool_adapter("srv", SimpleNamespace(), declared).write_hint is (
+        MCPWriteHint.READ_ONLY
+    )
+    assert _build_mcp_tool_adapter("srv", SimpleNamespace(), coerced).write_hint is (
+        MCPWriteHint.UNDECLARED
+    )
+
+
+def test_write_hint_is_undeclared_without_loader_evidence():
+    """A tool built outside a capturing loader claims nothing."""
+    tool = _mcp_tool()
+
+    adapter = _build_mcp_tool_adapter("srv", SimpleNamespace(), tool)
+
+    assert adapter.write_hint is MCPWriteHint.UNDECLARED
+    assert adapter.metadata.mcp_write_hint == MCPWriteHint.UNDECLARED.value
+
+
+@pytest.mark.parametrize("malformed", ["readOnly", 1, [], "true"])
+def test_non_mapping_annotations_are_undeclared(malformed):
+    """An ``annotations`` value that is not even an object claims nothing."""
+    assert classify_write_hint(malformed) is MCPWriteHint.UNDECLARED
+
+
+def test_annotations_reach_the_common_metadata_contract():
+    """A gate reads this off ``metadata``, not off a concrete adapter type."""
+    tools = _tools_with_raw_annotations(
+        _listing({"readOnlyHint": True}, {"destructiveHint": True}, None)
+    )
+    read_only, destructive, undeclared = (
+        _build_mcp_tool_adapter("srv", SimpleNamespace(), tool) for tool in tools
+    )
+
+    assert read_only.metadata.mcp_write_hint == "read_only"
+    assert destructive.metadata.mcp_write_hint == "destructive"
+    assert undeclared.metadata.mcp_write_hint == "undeclared"
+    # The scheduler's own read-only flag is a different, local guarantee and
+    # must not be moved by an untrusted remote claim.
+    assert read_only.metadata.read_only is False
+
+
+def test_misaligned_listing_yields_no_declarations(monkeypatch):
+    """Positional alignment is verified, not assumed.
+
+    The raw entries are zipped onto the parsed tools by position. If a parse
+    ever yields a different count than the payload listed, shifting
+    annotations onto a neighbouring tool would attribute one server's
+    read-only claim to a different tool -- so every tool loses its evidence
+    instead, which classifies as undeclared.
+
+    Reached by making the parse disagree with the payload, because a payload
+    that is merely malformed cannot get here: the SDK rejects a page
+    containing an invalid tool outright, which is pre-existing whole-list
+    loader behavior.
+    """
+    payload = _listing({"readOnlyHint": True}, {"readOnlyHint": True})
+    parsed = ListToolsResult.model_validate(payload)
+    truncated = ListToolsResult(tools=parsed.tools[:1])
+    monkeypatch.setattr(
+        mcp_tools_module.ListToolsResult,
+        "model_validate",
+        classmethod(lambda cls, data: truncated),
+    )
+
+    tools = mcp_tools_module._tools_with_raw_annotations(payload)
+
+    assert len(tools) == 1
+    assert (
+        _build_mcp_tool_adapter("srv", SimpleNamespace(), tools[0]).write_hint
+        is MCPWriteHint.UNDECLARED
+    )
+
+
+def test_only_read_only_is_a_safe_reading():
+    """The enum's contract: everything except READ_ONLY means "treat as write"."""
+    assert {h for h in MCPWriteHint if h is not MCPWriteHint.READ_ONLY} == {
+        MCPWriteHint.DESTRUCTIVE,
+        MCPWriteHint.UNDECLARED,
+    }

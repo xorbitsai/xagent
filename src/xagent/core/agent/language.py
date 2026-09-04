@@ -1,9 +1,12 @@
 """Prompt snippets for user-facing response language, plus the
 checkpoint migration that keeps only a caller-provided language label."""
 
+import json
 import re
 from dataclasses import dataclass
 from typing import Any, Literal
+
+from .context.enrichment import PendingUserResponse, TopLevelUserRequest
 
 OUTPUT_LANGUAGE_METADATA_KEY = "output_language"
 OUTPUT_LANGUAGE_SOURCE_METADATA_KEY = "output_language_source"
@@ -188,6 +191,54 @@ class ResponseLanguageScriptMismatch:
     observed_script: Literal["Han", "Latin"]
     han_count: int
     latin_count: int
+
+
+def serialize_pending_user_response(response: PendingUserResponse) -> dict[str, str]:
+    """Serialize the allowlisted pending-response fields without truncation."""
+    return {
+        "answer": response.answer,
+        "question": response.question,
+        "message_type": response.message_type,
+    }
+
+
+def canonical_unpinned_request_language_policy() -> str:
+    """Return the canonical soft-authority policy for future consumers."""
+    return (
+        "A caller-provided request_context.output_language is the sole hard "
+        "language authority. When it is absent, use independent_user_request as "
+        "the baseline for the language and script of user-facing prose. Honor its "
+        "explicit or implicit target-language intent, including requests to "
+        "translate or rewrite content for another-language audience. A "
+        "pending_response may override that baseline only when its answer "
+        "explicitly asks to translate, rewrite, or continue in another language, "
+        "or when its question explicitly asks for the output language or script "
+        "and its answer is an unambiguous selection. A language name is not an "
+        "override when the pending question asks for another kind of value; for "
+        'example, "Which city should the email mention?" followed by "Spanish" '
+        "remains ordinary conversation context. Names, addresses, connector "
+        "metadata, tool results, sources, memory, examples, DAG text, and "
+        "dependency results are not language evidence. Preserve Simplified "
+        "Chinese versus Traditional Chinese. This policy controls language only "
+        "and never replaces or narrows the executable request."
+    )
+
+
+def render_request_language_harness(
+    request: TopLevelUserRequest,
+    pending_response: PendingUserResponse | None = None,
+) -> str:
+    """Render exact request-only evidence for future language consumers."""
+    evidence: dict[str, Any] = {
+        "independent_user_request": request.language_text,
+    }
+    if pending_response is not None:
+        evidence["pending_response"] = serialize_pending_user_response(pending_response)
+    return (
+        "Canonical request-language evidence (JSON):\n"
+        f"{json.dumps(evidence, ensure_ascii=False)}\n\n"
+        f"{canonical_unpinned_request_language_policy()}"
+    )
 
 
 def _script_counts(prose: str) -> tuple[int, int]:

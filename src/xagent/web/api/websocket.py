@@ -104,6 +104,7 @@ from ..services.client_error_messages import (
     CLIENT_SAFE_GUIDANCE_IN_PROGRESS,
     CLIENT_SAFE_TASK_FAILURE,
     CLIENT_SAFE_VALIDATION_ERROR,
+    CONNECTOR_RUNTIME_CLIENT_ERROR_CODES,
     ClientErrorCode,
     client_error_message,
 )
@@ -335,10 +336,49 @@ def _task_error_payload(
 def create_terminal_task_error_event(
     task_id: int,
     message: str,
+    *,
+    code: str | None = None,
 ) -> dict[str, Any]:
-    """Shape an error event after the exact lease owner commits FAILED."""
+    """Shape an error event after the exact lease owner commits FAILED.
 
-    return {
+    ``code`` is written only when it survives validation, so a caller that
+    passes none still gets the same six-key frame, and a caller that passes
+    something unusable gets that same frame rather than an exception. This
+    runs on the reporting path of an already-failed task, and the one call
+    site that passes this argument evaluates it inside the ``except
+    Exception`` that only logs a failed broadcast -- so raising here would
+    cost the terminal frame outright and leave the user on the silent
+    failure this path exists to remove. A bad optional argument costs that
+    argument and nothing else. The rejection is logged with its stack.
+
+    ``code`` must be a member of ``CONNECTOR_RUNTIME_CLIENT_ERROR_CODES``.
+    """
+
+    # Python annotations are not enforced at run time, so the mypy gate on the
+    # signature above is not the whole door: a caller that routes through Any
+    # (a dict from JSON, a **kwargs splat) type-checks clean and would reach
+    # this function with a value of the wrong shape. Name the contract here
+    # instead.
+    #
+    # ConnectorRuntimeError types its code as a bare str and stores it
+    # unvalidated, so "only the eight module constants reach here" is a fact
+    # about today's raise sites, not a property the code holds. The type
+    # check comes first for the same reason: annotations are not enforced,
+    # and an unhashable value would raise inside the membership test on a
+    # path whose whole point is that it never raises.
+    if code is not None and (
+        not isinstance(code, str) or code not in CONNECTOR_RUNTIME_CLIENT_ERROR_CODES
+    ):
+        logger.error(
+            "task_id=%s component=terminal-error-frame dropped=code "
+            "value=%r; the frame is still sent without it",
+            task_id,
+            code,
+            stack_info=True,
+        )
+        code = None
+
+    event: dict[str, Any] = {
         "type": "task_error",
         "message": message,
         "task_id": task_id,
@@ -349,6 +389,9 @@ def create_terminal_task_error_event(
         "error": message,
         "timestamp": datetime.now(timezone.utc).timestamp(),
     }
+    if code is not None:
+        event["code"] = code
+    return event
 
 
 def _client_message_id(value: Any) -> str | None:

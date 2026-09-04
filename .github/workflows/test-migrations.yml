@@ -17,6 +17,9 @@ on:
       - 'src/xagent/web/models/generation.py'
       - 'src/xagent/web/models/mcp.py'
       - 'src/xagent/web/models/public_mcp.py'
+      - 'src/xagent/web/models/mcp_oauth.py'
+      - 'src/xagent/web/api/mcp.py'
+      - 'tests/web/api/test_mcp_oauth_lifecycle_postgresql.py'
       - 'src/xagent/web/services/gmail_provisioning.py'
       - 'tests/web/services/test_gmail_provisioning.py'
       - 'src/xagent/web/services/agent_management.py'
@@ -56,6 +59,13 @@ on:
       - 'tests/web/test_trusted_actor_oauth_postgresql.py'
       - 'tests/shared/postgres_disposable.py'
       - 'tests/web/services/checkpoint_anchor_shared.py'
+      - 'tests/web/api/test_custom_api_edit_lock_postgresql.py'
+      - 'src/xagent/web/api/custom_api.py'
+      - 'src/xagent/web/services/connector_team_scope.py'
+      - 'src/xagent/web/models/custom_api.py'
+      - 'tests/web/api/test_mcp_server_edit_lock_postgresql.py'
+      - 'src/xagent/web/api/mcp.py'
+      - 'src/xagent/core/tools/core/mcp/model.py'
   pull_request:
     branches: [main]
   # Required by the merge queue: without this the two required contexts below
@@ -109,6 +119,9 @@ jobs:
             src/xagent/web/models/generation.py
             src/xagent/web/models/mcp.py
             src/xagent/web/models/public_mcp.py
+            src/xagent/web/models/mcp_oauth.py
+            src/xagent/web/api/mcp.py
+            tests/web/api/test_mcp_oauth_lifecycle_postgresql.py
             src/xagent/web/services/gmail_provisioning.py
             tests/web/services/test_gmail_provisioning.py
             src/xagent/web/services/agent_management.py
@@ -148,6 +161,13 @@ jobs:
             tests/web/test_trusted_actor_oauth_postgresql.py
             tests/shared/postgres_disposable.py
             tests/web/services/checkpoint_anchor_shared.py
+            tests/web/api/test_custom_api_edit_lock_postgresql.py
+            src/xagent/web/api/custom_api.py
+            src/xagent/web/services/connector_team_scope.py
+            src/xagent/web/models/custom_api.py
+            tests/web/api/test_mcp_server_edit_lock_postgresql.py
+            src/xagent/web/api/mcp.py
+            src/xagent/core/tools/core/mcp/model.py
           )
 
           case "$EVENT_NAME" in
@@ -354,6 +374,13 @@ jobs:
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 
+      - name: Test MCP OAuth lifecycle fencing (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/web/api/test_mcp_oauth_lifecycle_postgresql.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
       - name: Test trusted actor OAuth concurrency (Postgres-only)
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
@@ -490,6 +517,20 @@ jobs:
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
           pytest tests/web/services/test_supersede_savepoint_postgresql.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test Custom API edit row lock (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/web/api/test_custom_api_edit_lock_postgresql.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test MCP server edit row lock (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/web/api/test_mcp_server_edit_lock_postgresql.py -m postgresql -q
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 

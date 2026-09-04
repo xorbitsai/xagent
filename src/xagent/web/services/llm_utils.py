@@ -3,6 +3,7 @@
 import logging
 import os
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Callable, List, Optional, Tuple, Union
 
 from sqlalchemy.orm import Session
@@ -38,6 +39,13 @@ PLATFORM_MODEL_MANAGER = "platform"
 
 class PlatformModelIdentityError(ValueError):
     """Raised when an ordinary write crosses the platform model boundary."""
+
+
+class ModelWriteMode(Enum):
+    """Control whether a model write owns or joins the current transaction."""
+
+    COMMIT = "commit"
+    STAGE = "stage"
 
 
 def is_platform_model_id(model_id: object) -> bool:
@@ -199,8 +207,18 @@ class CoreStorage:
             )
         self._store(model)
 
-    def _store(self, model: ModelConfig, *, managed_by: str | None = None) -> None:
+    def _store(
+        self,
+        model: ModelConfig,
+        *,
+        managed_by: str | None = None,
+        is_active: bool = True,
+        write_mode: ModelWriteMode = ModelWriteMode.COMMIT,
+    ) -> Model:
         """Persist a model, with provenance available only to trusted wrappers."""
+
+        if not isinstance(write_mode, ModelWriteMode):
+            raise TypeError("write_mode must be a ModelWriteMode")
 
         db_data: dict[str, Any] = {
             "model_id": model.id,
@@ -210,7 +228,7 @@ class CoreStorage:
             "abilities": model.abilities,
             "description": model.description,
             "max_retries": model.max_retries,
-            "is_active": True,
+            "is_active": is_active,
             "managed_by": managed_by,
         }
 
@@ -290,7 +308,13 @@ class CoreStorage:
 
         db_model = self.Model(**db_data)
         self.db.add(db_model)
-        self.db.commit()
+        if write_mode is ModelWriteMode.STAGE:
+            # Staged callers need the database ID for links/defaults while
+            # retaining ownership of the surrounding transaction.
+            self.db.flush()
+        else:
+            self.db.commit()
+        return db_model
 
     def delete(self, model_id: str) -> None:
         """Delete model by model_id."""
@@ -532,8 +556,18 @@ class PlatformModelStore:
         self.Model = model_class
         self._storage = CoreStorage(db, model_class)
 
-    def create(self, model: ModelConfig) -> Model:
-        """Create a platform model without tenant ownership or default links."""
+    def create(
+        self,
+        model: ModelConfig,
+        *,
+        is_active: bool = True,
+        write_mode: ModelWriteMode = ModelWriteMode.COMMIT,
+    ) -> Model:
+        """Create a platform model without tenant ownership or default links.
+
+        ``STAGE`` flushes the INSERT so the returned row has a stable database
+        ID, but leaves final commit or rollback ownership with the caller.
+        """
 
         if not is_platform_model_id(model.id):
             raise PlatformModelIdentityError(
@@ -545,10 +579,12 @@ class PlatformModelStore:
         if existing is not None:
             raise PlatformModelIdentityError(f"Model ID is already claimed: {model.id}")
 
-        self._storage._store(model, managed_by=PLATFORM_MODEL_MANAGER)
-        created = self.get(model.id)
-        assert created is not None
-        return created
+        return self._storage._store(
+            model,
+            managed_by=PLATFORM_MODEL_MANAGER,
+            is_active=is_active,
+            write_mode=write_mode,
+        )
 
     def get(self, model_id: str) -> Model | None:
         """Read an exactly matching platform-managed row."""

@@ -15,7 +15,11 @@ from xagent.core.tools.adapters.vibe.sandboxed_tool.runner_utils import (
     ensure_user_bin_in_path,
 )
 from xagent.core.tools.core.mcp.sessions import Connection
-from xagent.core.tools.core.mcp.tools import load_mcp_tools
+from xagent.core.tools.core.mcp.tools import (
+    SANDBOX_RAW_ANNOTATIONS_KEY,
+    load_mcp_tools,
+    raw_annotations_for,
+)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -33,9 +37,26 @@ def _load_connection(connection_b64: str) -> Connection:
 
 
 async def _list_tools(connection: Connection) -> list[dict[str, Any]]:
-    """List and serialize MCP tools for JSON output."""
+    """List and serialize MCP tools for JSON output.
+
+    ``model_dump`` alone would lose the wire types of the ``annotations``
+    values: the SDK's models declare them ``bool | None`` under non-strict
+    validation, so a server that sent ``1`` or ``"true"`` is already
+    indistinguishable from one that sent ``true`` by the time a tool is
+    dumped here. The captured mapping is re-attached under a private key so
+    the host side can classify the declaration honestly -- without it, every
+    sandboxed connector would look like it made whatever claim the coercion
+    produced.
+    """
     tools = await load_mcp_tools(None, connection=connection)
-    return [cast(dict[str, Any], tool.model_dump(mode="json")) for tool in tools]
+    serialized: list[dict[str, Any]] = []
+    for tool in tools:
+        item = cast(dict[str, Any], tool.model_dump(mode="json"))
+        raw = raw_annotations_for(tool)
+        if raw is not None:
+            item[SANDBOX_RAW_ANNOTATIONS_KEY] = raw
+        serialized.append(item)
+    return serialized
 
 
 def main() -> None:

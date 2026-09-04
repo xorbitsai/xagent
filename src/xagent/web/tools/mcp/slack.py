@@ -660,16 +660,20 @@ def slack_get_channel_history(
     calling slack_join_channel to add the bot (only works for a public
     channel), or ask a member to `/invite` the bot for a private channel or
     DM.
-    Scope rule: read only the conversations the user asked for — ones they
-    named in this request, a set they explicitly asked for (e.g. "all public
-    channels"), or ones they selected in a previous ask_user_question answer.
-    A listing from slack_list_channels / slack_list_direct_messages is
-    discovery, not permission to read everything in it. If the request names
-    no conversation and no set, do not read the listed ones one by one: offer
-    the candidates in a single ask_user_question and read only the selected
-    ones — a conversation the user did not select stays out of scope even if
-    the bot can already read it. If asking is not possible in this run, read
-    nothing beyond what the request names and say what was left unread.
+    Scope rule: read only conversations the user asked for — named in this
+    request, described unambiguously as a set by its membership (e.g. "every
+    channel whose name starts with support-"), or selected in a previous
+    ask_user_question answer. A vague reference like "my channels" or "my
+    Slack" is not a set — treat it as naming nothing. A listing from
+    slack_list_channels / slack_list_direct_messages is discovery, not
+    permission to read everything in it. If the request names no
+    conversation and no such set, do not read the listed ones one by one:
+    offer the candidates in a single ask_user_question and read only the
+    selected ones. A conversation the user did not select stays out of
+    scope — do not read it, and do not report on it in your answer even if
+    an earlier call already fetched it. If asking is not possible in this
+    run, read nothing beyond what the request names and say what was left
+    unread.
     """
     try:
         channel_id = _resolve_channel_id(channel)

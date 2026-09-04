@@ -838,8 +838,15 @@ async def test_read_tools_expose_channel_scope_rule_via_mcp_list_tools():
     # conversation-reading tools point at it by name rather than repeating it.
     canonical = tools["slack_get_channel_history"]
     assert "selected in a previous ask_user_question" in canonical
-    assert "even if the bot can already read" in canonical
+    assert "do not report on it in your answer" in canonical
     assert "If asking is not possible in this run" in canonical
+    # The ask-first path: a broad, unnamed request must become a single
+    # question, not a one-by-one sweep of every listed conversation.
+    assert "offer the candidates in a single ask_user_question" in canonical
+    # "my channels" is exactly the incident-trigger phrasing (task 251938:
+    # "check my slack channels") — it must not qualify as an explicit set
+    # that lets the model skip asking.
+    assert '"my channels" or "my Slack" is not a set' in canonical
     for name in (
         "slack_search_messages",
         "slack_get_thread_replies",

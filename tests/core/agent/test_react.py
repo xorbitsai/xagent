@@ -1537,6 +1537,30 @@ def test_react_grounding_rule_present_in_both_answer_paths() -> None:
     assert "call get_workspace_output_files once before finalizing" not in forced_prompt
 
 
+def test_react_forced_final_answer_respects_prior_clarification_scope() -> None:
+    """A selected subset must stay the scope at the moment the model writes
+    the user-visible answer, not just while it can still call tools.
+
+    Without this, a sweep that already ran before the user narrowed the
+    request (list every conversation, then ask which to review) leaves data
+    about the unselected ones sitting in tool results — and nothing stopped
+    the forced final-answer turn from reporting on it anyway (PR #2099
+    review, F4)."""
+    pattern = ReActPattern()
+    context = ExecutionContext(system_prompt="You are helpful.")
+    context.add_user_message("check my channels for action items")
+
+    forced_prompt = pattern._messages_for_llm(
+        context, has_tools=True, force_final_answer=True, tool_names=["final_answer"]
+    )[0]["content"]
+
+    assert "narrowed the request to a selected" in forced_prompt
+    assert (
+        "leave out anything outside it even if an earlier tool call already "
+        "returned data about it" in forced_prompt
+    )
+
+
 @pytest.mark.parametrize("user_interaction_enabled", [True, False])
 def test_react_missing_argument_value_instruction_matches_interaction_policy(
     user_interaction_enabled: bool,
@@ -1575,9 +1599,12 @@ def test_react_missing_argument_value_instruction_matches_interaction_policy(
     # The subset-selection rule describes how to read an ask_user_question
     # answer, so it travels with the branch where that tool exists; a run that
     # cannot ask must not be told how to interpret an answer it can't receive.
+    # It's scoped to questions about which items/resources to act on (not
+    # every ask_user_question, e.g. a format pick) — see PR #2099 review.
     subset_instruction = (
-        "selecting a subset of the offered options, that selection is the "
-        "complete scope for the follow-up work"
+        "that asked which items or resources to act on by selecting a "
+        "subset of the offered options, that selection is the complete "
+        "scope for that work"
     )
 
     if user_interaction_enabled:
@@ -1586,6 +1613,7 @@ def test_react_missing_argument_value_instruction_matches_interaction_policy(
         assert "do not fill the value in yourself" in prompt
         assert subset_instruction in prompt
         assert "even ones that are already accessible" in prompt
+        assert "or that fit the original request" in prompt
     else:
         assert blocked_instruction in prompt
         assert ask_instruction not in prompt

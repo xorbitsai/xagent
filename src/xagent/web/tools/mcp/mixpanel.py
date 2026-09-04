@@ -63,55 +63,35 @@ def _error(message: str) -> str:
 
 
 def _success_with_capped_list(key: str, items: Any) -> str:
-    """Wrap a bare list under ``key`` so success_with_capped_dict has a dict
-    to shrink, then restore the nested key -- but only when doing so still
-    fits the platform's output limit.
+    """Wrap a bare list under ``key`` for success_with_capped_dict, then
+    restore the nested key if its phase-2 fallback dropped it -- but only
+    when the restored size still fits XAGENT_TOOL_MAX_OUTPUT_LENGTH.
 
-    success_with_capped_dict(field_name, data) can only shrink a
-    list/dict-valued key nested *inside* a dict -- handed a bare list
-    directly, its own `not isinstance(data, dict)` guard returns it
-    uncapped regardless of size, so callers here wrap it one level deeper
-    as {key: items} first. But under an aggressively low
-    XAGENT_TOOL_MAX_OUTPUT_LENGTH, its phase-2 fallback (dropping whole
-    top-level keys once list-halving alone isn't enough) can drop that
-    wrapper's sole key entirely -- even after phase 1 has already emptied
-    the list to [] -- leaving capped[key] == {} instead of {key: []}. A
-    caller doing result[key][key] would then raise KeyError instead of
-    getting an empty list.
-
-    Naively re-adding the key unconditionally (an earlier version of this
-    function did that) traded that crash for a worse, silent one:
-    success_with_capped_dict already picked its output specifically to
-    satisfy `len(response) <= max_output_length`, and splicing the key
-    back in after that decision grows the string past the limit again --
-    confirmed directly (e.g. a 59-char capped "funnels": {} envelope grows
-    to 76 once "funnels": [] is spliced back in, for a limit of 59). This
-    tool's return value is a single string nested at
+    success_with_capped_dict can drop the wrapper's sole key entirely once
+    list-halving alone can't fit an aggressively low limit, leaving
+    capped[key] == {} instead of {key: []} -- a caller doing
+    result[key][key] then raises KeyError. Restoring the key
+    unconditionally isn't safe: this string ends up at
     result["content"][0]["text"] in the MCP adapter's response, which the
-    separate OutputFilteredToolWrapper output filter then re-checks
-    against this same XAGENT_TOOL_MAX_OUTPUT_LENGTH and hard-truncates
-    with a raw character slice (OutputValueFilter._filter_string) with no
-    JSON awareness -- turning an over-budget but valid JSON string into
-    truncated, unparsable garbage, which is worse than the KeyError this
-    function exists to prevent. Re-checking the length here before
-    deciding whether to restore the key keeps the output-length contract
-    the hard constraint: the key is restored whenever there's room for it
-    (true for any realistic limit -- this only bites a limit configured
-    at just barely more than the bare empty-envelope's own size), and
-    falls back to success_with_capped_dict's own (already
-    limit-respecting) output otherwise, rather than ever emitting
-    something longer than it decided was safe.
+    separate OutputFilteredToolWrapper re-checks against this same limit
+    and hard-truncates by raw character count with no JSON awareness --
+    turning a valid but now-over-budget string into truncated, unparsable
+    garbage, worse than the KeyError. The required {key: [...]} shape has
+    a fixed minimum byte size; below it, no representation is both
+    correctly shaped and within budget, so the limit wins and
+    result[key][key] can still KeyError in that narrow window -- a
+    pre-existing gap in success_with_capped_dict itself (shared by every
+    other caller), not one this local wrapper can close without touching
+    that shared function.
     """
     max_output_length = get_tool_max_output_length()
     capped_response = success_with_capped_dict(key, {key: items})
     capped = json.loads(capped_response)
-    restored = dict(capped[key])
-    restored.setdefault(key, [])
-    if restored == capped[key]:
+    if key in capped[key]:
         return capped_response
-    candidate = dict(capped)
-    candidate[key] = restored
-    candidate_response = json.dumps(candidate, ensure_ascii=False)
+    candidate_response = json.dumps(
+        {**capped, key: {**capped[key], key: []}}, ensure_ascii=False
+    )
     if len(candidate_response) <= max_output_length:
         return candidate_response
     return capped_response

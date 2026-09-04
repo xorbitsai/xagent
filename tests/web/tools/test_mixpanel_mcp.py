@@ -816,16 +816,12 @@ def _patch_max_output_length(monkeypatch, limit: int) -> None:
 def test_list_tools_survive_an_aggressively_low_output_limit(
     monkeypatch, call, key, json_data
 ):
-    # Confirmed bug (mirrors the same fix in magento.py): under an
-    # aggressively low XAGENT_TOOL_MAX_OUTPUT_LENGTH,
-    # success_with_capped_dict's phase-2 fallback can drop the wrapper's
-    # sole key entirely once list-halving alone isn't enough, leaving
-    # capped[key] == {} instead of {key: []} -- result[key][key] then
-    # raised KeyError instead of returning an empty list. 120 chars is
-    # comfortably above the floor for restoring the key on all three
-    # tools (verified below) while still forcing the list itself to
-    # empty -- a realistic "aggressively low but sane" config, unlike an
-    # unrepresentable few-dozen-char limit.
+    # 120 chars is comfortably above the fixed minimum size of the
+    # {key: [...]} shape for all three tools (76/68/76 -- see the boundary
+    # test below), so the nested key survives while the list itself still
+    # gets forced to empty: a realistic "aggressively low but sane" config
+    # that a real deployment could plausibly configure, unlike the
+    # unrepresentable few-dozen-char limits in the boundary test.
     _patch_max_output_length(monkeypatch, 120)
     monkeypatch.setattr(
         mixpanel.requests,
@@ -849,22 +845,12 @@ def test_list_tools_survive_an_aggressively_low_output_limit(
 def test_list_tools_never_exceed_the_output_limit_at_the_unsatisfiable_boundary(
     monkeypatch, call, key, json_data, boundary_limit
 ):
-    # An earlier version of the fix above restored the nested key
-    # unconditionally, without rechecking size -- but success_with_capped_dict
-    # already picked its output specifically to fit
-    # XAGENT_TOOL_MAX_OUTPUT_LENGTH, and splicing the key back in after that
-    # decision can grow the string past the limit again (confirmed: a 59-char
-    # capped '{"event_names": {}}' envelope grows to 76 once "event_names": []
-    # is spliced back in). This tool's return value is the MCP adapter's
-    # result["content"][0]["text"], which the separate
-    # OutputFilteredToolWrapper re-checks against this same limit and
-    # hard-truncates with a raw character slice with no JSON awareness --
-    # turning a valid but over-budget JSON string into truncated,
-    # unparsable garbage. `boundary_limit` is exactly large enough to fit
-    # the empty-envelope shape ({key: {}}) but not the restored one
-    # ({key: {key: []}}), so the nested key legitimately cannot be
-    # guaranteed here -- the length budget must win instead, since there is
-    # no representation that satisfies both.
+    # boundary_limit is exactly large enough to fit the empty-envelope
+    # shape ({key: {}}) but not the restored one ({key: {key: []}}), so
+    # the length budget must win over the shape: no representation
+    # satisfies both, and the output must stay valid, parseable JSON
+    # rather than get truncated mid-string by the downstream output
+    # filter (see _success_with_capped_list's docstring).
     _patch_max_output_length(monkeypatch, boundary_limit)
     monkeypatch.setattr(
         mixpanel.requests,
@@ -877,6 +863,37 @@ def test_list_tools_never_exceed_the_output_limit_at_the_unsatisfiable_boundary(
 
     assert result["status"] == "success"
     assert len(raw) <= boundary_limit
+
+
+@pytest.mark.parametrize(
+    "call, key, json_data, window_limit",
+    [(*case, limit) for case, limit in zip(_LIST_TOOL_CASES, [65, 60, 65])],
+    ids=["event_names", "funnels", "annotations"],
+)
+def test_list_tools_still_raise_keyerror_in_the_unsatisfiable_window(
+    monkeypatch, call, key, json_data, window_limit
+):
+    # window_limit sits strictly between the two fixed floors: too small
+    # for {key: {key: []}} but large enough for {key: {}} to fit. No
+    # representation of the required shape fits there, and this PR
+    # deliberately keeps the length budget as the hard constraint (see
+    # test_list_tools_never_exceed_the_output_limit_at_the_unsatisfiable_boundary),
+    # so result[key][key] still raises here -- a pre-existing gap in the
+    # shared success_with_capped_dict, not something a Mixpanel-local
+    # wrapper can close. Pinned explicitly so this stays a documented,
+    # known limitation rather than a silent gap in test coverage.
+    _patch_max_output_length(monkeypatch, window_limit)
+    monkeypatch.setattr(
+        mixpanel.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data=json_data)),
+    )
+
+    result = json.loads(call())
+
+    assert result["status"] == "success"
+    with pytest.raises(KeyError):
+        result[key][key]
 
 
 def test_create_annotation_sends_json_body_to_app_api(monkeypatch):

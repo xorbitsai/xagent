@@ -18,7 +18,7 @@ from sqlalchemy.orm import sessionmaker
 from ...config import get_mcp_oauth_allow_private_hosts, get_mcp_oauth_proxy_url
 from ...core.utils.security import (
     PrivateNetworkHostError,
-    build_isolated_ssl_context,
+    build_ca_bundle_ssl_context,
     reject_private_network_host,
 )
 
@@ -139,12 +139,33 @@ class SafeOAuthAsyncHTTPTransport(httpx.AsyncBaseTransport):
 
     def __init__(self) -> None:
         proxy_url = get_mcp_oauth_proxy_url()
+        try:
+            ssl_context = build_ca_bundle_ssl_context()
+        except OSError as exc:
+            # SSL_CERT_FILE/SSL_CERT_DIR were never read on this path before
+            # this transport verified against an explicit context, so a
+            # stale/misconfigured value was previously harmless. Surface it
+            # as a structured OAuth error instead of letting the raw
+            # FileNotFoundError/ssl.SSLError (a subclass of OSError) escape
+            # as an unhandled 500.
+            raise MCPOAuthDiscoveryError(
+                "invalid_configuration",
+                "Server TLS trust store is misconfigured (SSL_CERT_FILE/SSL_CERT_DIR).",
+            ) from exc
+        # An https:// proxy also needs the isolated context on its own CONNECT
+        # TLS leg -- passing proxy_url as a bare string leaves that leg's
+        # ssl_context as None, which httpx/httpcore then defaults to the
+        # certifi-only trust store, bypassing a private CA configured via
+        # SSL_CERT_FILE/SSL_CERT_DIR for the proxy hop itself.
+        proxy = (
+            httpx.Proxy(url=proxy_url, ssl_context=ssl_context) if proxy_url else None
+        )
         self._transport = httpx.AsyncHTTPTransport(
             limits=httpx.Limits(max_keepalive_connections=0),
             trust_env=False,
             http2=False,
-            proxy=proxy_url,
-            verify=build_isolated_ssl_context(),
+            proxy=proxy,
+            verify=ssl_context,
         )
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:

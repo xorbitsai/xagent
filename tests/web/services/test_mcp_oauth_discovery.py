@@ -328,8 +328,33 @@ def test_safe_oauth_transport_uses_explicit_proxy_configuration(monkeypatch):
     SafeOAuthAsyncHTTPTransport()
 
     assert captured["trust_env"] is False
-    assert captured["proxy"] == "http://proxy.example.com:8080"
+    assert isinstance(captured["proxy"], httpx.Proxy)
+    assert captured["proxy"].url == httpx.URL("http://proxy.example.com:8080")
+    # The proxy's own CONNECT/TLS leg must trust the same isolated CA bundle
+    # as the tunneled target origin, not fall back to httpcore's
+    # certifi-only default (see build_ca_bundle_ssl_context()'s docstring).
+    assert captured["proxy"].ssl_context is captured["verify"]
     assert isinstance(captured["verify"], ssl.SSLContext)
+
+
+def test_safe_oauth_transport_reports_bad_ca_bundle_as_discovery_error(monkeypatch):
+    # SSL_CERT_FILE/SSL_CERT_DIR were never read on this path before this
+    # transport started verifying against an explicit context, so a stale
+    # misconfigured value used to be harmless. A FileNotFoundError (an
+    # OSError subclass, same as ssl.SSLError) from building that context
+    # must surface as a structured MCPOAuthDiscoveryError, not propagate as
+    # a raw OSError past every caller's `except MCPOAuthDiscoveryError`.
+    def _broken_ssl_context():
+        raise FileNotFoundError("no such CA bundle")
+
+    monkeypatch.setattr(
+        mcp_oauth_service, "build_ca_bundle_ssl_context", _broken_ssl_context
+    )
+
+    with pytest.raises(MCPOAuthDiscoveryError) as exc:
+        SafeOAuthAsyncHTTPTransport()
+
+    assert exc.value.code == "invalid_configuration"
 
 
 @pytest.mark.asyncio

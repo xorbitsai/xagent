@@ -82,17 +82,23 @@ def reject_private_network_host(hostname: str) -> None:
         raise PrivateNetworkHostError("Host must not resolve to a private network.")
 
 
-def build_isolated_ssl_context() -> ssl.SSLContext:
-    """Return a CA-bundle-aware SSL context for use with ``trust_env=False``.
+def build_ca_bundle_ssl_context() -> ssl.SSLContext:
+    """Return an SSL context that still honors ``SSL_CERT_FILE``/``SSL_CERT_DIR``
+    on a transport pinned to ``trust_env=False``.
 
-    ``httpx.create_ssl_context()`` only honors ``SSL_CERT_FILE``/
+    ``httpx.create_ssl_context()`` only reads ``SSL_CERT_FILE``/
     ``SSL_CERT_DIR`` when ``trust_env`` is true, since both env var lookups
-    are gated behind that same flag. Callers that pin a transport's
-    ``trust_env=False`` (to stop httpx from also falling back to the OS's
-    own proxy configuration -- see ``_PinnedA2ATransport`` and
-    ``SafeOAuthAsyncHTTPTransport``) must build this context explicitly and
-    pass it as ``verify=``, or TLS verification silently stops honoring a
-    private/internal CA bundle configured via those env vars.
+    are gated behind that same flag. ``_PinnedA2ATransport`` and
+    ``SafeOAuthAsyncHTTPTransport`` set ``trust_env=False`` on their inner
+    ``httpx.AsyncHTTPTransport`` -- not to affect proxy handling (transport-
+    level ``trust_env`` has no effect there; proxy-env fallback is gated at
+    the ``httpx.AsyncClient`` level via ``allow_env_proxies = trust_env and
+    transport is None``, which is already ``False`` once an explicit
+    ``transport=`` is passed) but because it also feeds
+    ``create_ssl_context()`` internally, and ``verify=True`` there would
+    otherwise silently skip a private/internal CA bundle configured via
+    those env vars. Build that context explicitly here, with
+    ``trust_env=True``, and pass it as ``verify=`` instead.
     """
 
     return httpx.create_ssl_context(trust_env=True)

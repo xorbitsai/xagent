@@ -14,7 +14,7 @@ from uuid import uuid4
 import httpx
 from pydantic import BaseModel, Field
 
-from ....utils.security import build_isolated_ssl_context, reject_private_network_host
+from ....utils.security import build_ca_bundle_ssl_context, reject_private_network_host
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
 from .config import BaseToolConfig
 from .factory import register_tool
@@ -511,7 +511,7 @@ class _PinnedA2ATransport(httpx.AsyncBaseTransport):
     def __init__(self, *, allow_private_networks: bool):
         self._allow_private_networks = allow_private_networks
         self._transport = httpx.AsyncHTTPTransport(
-            trust_env=False, http2=False, verify=build_isolated_ssl_context()
+            trust_env=False, http2=False, verify=build_ca_bundle_ssl_context()
         )
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:

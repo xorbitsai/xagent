@@ -174,12 +174,19 @@ def _list_items(result: Any) -> tuple[list[Any], int | None]:
     tolerates a bare JSON array in case a given endpoint (or a future MYOB
     API revision) returns one directly, rather than crashing on
     ``.get("Items")`` against a list.
+
+    total_count is None for the bare-array shape, not len(result): that
+    length is only the current page, not MYOB's true across-all-pages
+    total the way ``Count`` is -- returning it as total_count would make
+    _success_with_capped_list's has_more/next_skip pagination silently
+    report "no more results" the moment this fallback fires, even when
+    more genuinely exist server-side.
     """
     if isinstance(result, dict):
         items = result.get("Items")
         return (items if isinstance(items, list) else [], result.get("Count"))
     if isinstance(result, list):
-        return result, len(result)
+        return result, None
     return [], None
 
 

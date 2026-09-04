@@ -353,19 +353,26 @@ def _merged_oauth_scopes(
     default_scopes: list[str] | None, app_scopes: list[str] | None, provider: str
 ) -> tuple[list[str], str]:
     """Merge provider default scopes with an app row's oauth_scopes, and
-    join them into one scope string -- the ONE place both computations
-    happen, for every caller that needs either or both.
+    join them into one scope string -- the shared place for this specific
+    "merge default+app scopes, dedupe, join" pattern, used by
+    _generic_oauth_login's authorize-redirect leg and MYOB's token-exchange
+    leg in generic_oauth_callback.
 
-    Returns (merged_list, joined_string): the list is needed by
-    _generic_oauth_login's authorize-redirect leg (to exclude required
-    scopes from optional_scope below), the string by any leg that just
-    needs a request param (MYOB's token-exchange leg in
-    generic_oauth_callback, which has no default_scopes of its own and
-    sources everything from the app row). A single-caller wrapper around
-    the string alone was tried first and correctly called out as pointless
-    indirection when the other leg still inlined the same computation
-    separately -- this version is what actually makes it one shared
-    computation instead of a same-shaped copy.
+    Returns (merged_list, joined_string): the list is needed by the
+    authorize-redirect leg (to exclude required scopes from optional_scope
+    below), the string by MYOB's leg, which has no default_scopes of its
+    own and sources everything from the app row. A single-caller wrapper
+    around the string alone was tried first and correctly called out as
+    pointless indirection when the other leg still inlined the same
+    computation separately -- this version is what actually makes it one
+    shared computation for those two, instead of a same-shaped copy.
+
+    NOT the only scope-string mechanism in this file: Deputy's own
+    code-exchange leg (see its `if is_deputy:` block above) builds its
+    scope string by hand instead, for reasons specific to it -- it needs a
+    literal fallback ("longlife_refresh_token") this function has no
+    concept of, and doesn't dedupe, both deliberate per that block's own
+    comment. Left as-is rather than folded in here.
     """
     scopes = _merge_oauth_scopes(default_scopes or [], app_scopes)
     scope_str = _oauth_scope_separator(provider).join(scopes)
@@ -3342,20 +3349,33 @@ def generic_oauth_callback(
                     else ""
                 )
                 provider_user_id = uid_str or None
-                if raw_provider_user_id and provider_user_id is None:
-                    # Same "truthy but wrong type" convention as the
-                    # Salesforce branch above -- a missing "uid" would be a
-                    # genuinely malformed MYOB response (unlike Salesforce's
-                    # own "id", which real responses can legitimately omit),
-                    # but that case is covered by the outer warning below;
-                    # this one is specifically for a present-but-unusable
-                    # value.
-                    logger.warning(
-                        "MYOB token response's user.uid was not a usable "
-                        "string/int (got %s); falling back to NULL "
-                        "provider_user_id for this grant",
-                        type(raw_provider_user_id).__name__,
-                    )
+                if provider_user_id is None:
+                    if raw_provider_user_id:
+                        # Same "truthy but wrong type" convention as the
+                        # Salesforce branch above.
+                        logger.warning(
+                            "MYOB token response's user.uid was not a usable "
+                            "string/int (got %s); falling back to NULL "
+                            "provider_user_id for this grant",
+                            type(raw_provider_user_id).__name__,
+                        )
+                    else:
+                        # A missing/empty "uid" inside an otherwise-present
+                        # user object -- unlike Salesforce's own "id", which
+                        # real responses can legitimately omit, MYOB's
+                        # user.uid is documented as always present, so this
+                        # is genuinely malformed, not an expected variation.
+                        # Distinct from (and NOT covered by) the outer
+                        # "no usable user object" warning below, which only
+                        # fires when `user` itself isn't a dict at all --
+                        # a dict missing just "uid" never reaches that
+                        # branch.
+                        logger.warning(
+                            "MYOB token response's user object had no usable "
+                            "uid (got %s); connecting with no identity for "
+                            "this grant",
+                            type(raw_provider_user_id).__name__,
+                        )
                 raw_username = raw_user.get("username")
                 email = (
                     raw_username

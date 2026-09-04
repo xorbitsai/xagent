@@ -217,10 +217,16 @@ def test_list_items_unwraps_items_and_count():
 
 
 def test_list_items_tolerates_bare_array():
+    # total_count must stay None, not the page length -- a self-review
+    # round found that returning len(result) here made
+    # _success_with_capped_list's has_more math silently report "no more
+    # results" the instant this fallback fires, since next_skip would
+    # always equal a total_count that was never a real across-all-pages
+    # total to begin with.
     items, total_count = myob._list_items([{"UID": "1"}])
 
     assert items == [{"UID": "1"}]
-    assert total_count == 1
+    assert total_count is None
 
 
 def test_list_customers_sends_filter_orderby_and_paging(monkeypatch):

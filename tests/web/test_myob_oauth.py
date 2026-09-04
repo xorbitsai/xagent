@@ -478,6 +478,42 @@ def test_callback_warns_on_unusable_uid_type(db_session, monkeypatch, caplog):
     assert any("not a usable string/int" in record.message for record in caplog.records)
 
 
+def test_callback_warns_on_user_object_missing_uid(db_session, monkeypatch, caplog):
+    """A `user` object that's a dict (so it never reaches the outer 'no
+    usable user object' warning) but has no `uid` key at all must still
+    warn -- a self-review round found this exact gap: the code's own
+    comment claimed this case was "covered by the outer warning below",
+    which is only true when `user` isn't a dict in the first place."""
+    db, user = db_session
+    mock_post = Mock(
+        return_value=MockResponse(
+            {
+                "access_token": "myob-token",
+                "user": {"username": "alice@acme.example"},
+            }
+        )
+    )
+    monkeypatch.setattr(auth_api.requests, "post", mock_post)
+
+    with caplog.at_level("WARNING"):
+        response = generic_oauth_callback(
+            "myob",
+            _callback_request(db, user, business_id=BUSINESS_ID),
+            db,
+            _myob_provider(),
+        )
+
+    assert response.status_code == 200
+    oauth_account = (
+        db.query(UserOAuth)
+        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "myob")
+        .one()
+    )
+    assert oauth_account.provider_user_id is None
+    assert oauth_account.email == "alice@acme.example"
+    assert any("no usable uid" in record.message for record in caplog.records)
+
+
 def test_callback_rejects_boolean_uid_instead_of_stringifying_it(
     db_session, monkeypatch
 ):

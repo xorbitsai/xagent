@@ -3174,8 +3174,10 @@ def _finalize_resumed_task(
     (see ``task_orchestrator.finish_turn``'s matching handling) once this
     exact call has committed a genuine COMPLETED/FAILED transition - not
     when the lease release below is fenced out and the whole transaction
-    rolls back, and not for the WAITING_FOR_USER/PAUSED branches, which are
-    the same turn resuming again later under this same turn_id.
+    rolls back. A committed WAITING_FOR_USER/PAUSED transition instead
+    renews those secrets' TTL: it is the same turn resuming again later
+    under this same turn_id, now carrying a fresh interaction lifetime of
+    its own.
     """
     from ..models.agent import Agent
     from ..services.chat_history_service import persist_assistant_message_no_commit
@@ -3316,18 +3318,40 @@ def _finalize_resumed_task(
         finalized["lease_released"] = True
         finalized["final_status"] = final_task_status.value
         finalized["control_event_state"] = control_snapshot.as_dict()
-        if turn_id is not None and final_task_status in TERMINAL_TASK_STATUSES:
-            try:
-                from ..services.connector_runtime import pop_ephemeral_runtime_values
+        if turn_id is not None:
+            if final_task_status in TERMINAL_TASK_STATUSES:
+                try:
+                    from ..services.connector_runtime import (
+                        pop_ephemeral_runtime_values,
+                    )
 
-                pop_ephemeral_runtime_values(turn_id)
-            except Exception:
-                logger.warning(
-                    "connector runtime cleanup failed for task %s turn %s",
-                    task_id,
-                    turn_id,
-                    exc_info=True,
-                )
+                    pop_ephemeral_runtime_values(turn_id)
+                except Exception:
+                    logger.warning(
+                        "connector runtime cleanup failed for task %s turn %s",
+                        task_id,
+                        turn_id,
+                        exc_info=True,
+                    )
+            else:
+                # WAITING_FOR_USER/PAUSED: the same turn resuming again later
+                # under this same turn_id, with a fresh interaction lifetime -
+                # keep whatever ephemeral secrets it may still need from
+                # expiring on the original pause's clock (see
+                # connector_runtime.renew_ephemeral_runtime_values).
+                try:
+                    from ..services.connector_runtime import (
+                        renew_ephemeral_runtime_values,
+                    )
+
+                    renew_ephemeral_runtime_values(turn_id)
+                except Exception:
+                    logger.warning(
+                        "connector runtime secret renewal failed for task %s turn %s",
+                        task_id,
+                        turn_id,
+                        exc_info=True,
+                    )
         return finalized
     finally:
         try:

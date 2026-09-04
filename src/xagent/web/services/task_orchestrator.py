@@ -1459,6 +1459,25 @@ def _pop_ephemeral_runtime_values_best_effort(turn_id: str) -> None:
         )
 
 
+def _renew_ephemeral_runtime_values_best_effort(turn_id: str) -> None:
+    """Renew one turn's ephemeral connector secrets; never raise into a settler.
+
+    Called only from a branch that has just committed a genuine
+    PAUSED/WAITING_FOR_USER outcome for this exact turn_id - the same turn
+    resuming again later, not a finished one.
+    """
+    from .connector_runtime import renew_ephemeral_runtime_values
+
+    try:
+        renew_ephemeral_runtime_values(turn_id)
+    except Exception:
+        logger.warning(
+            "connector runtime secret renewal failed for turn %s",
+            turn_id,
+            exc_info=True,
+        )
+
+
 def settle_task_lease_isolated(
     lease: TaskLease,
     *,
@@ -1590,9 +1609,12 @@ def finish_turn(
     that read this same already-fenced ``fresh.status`` as genuinely
     terminal. This is the sole place that decides both things, so there is
     no separate later read of the row to race against a fast concurrent
-    resume: the PAUSED / WAITING_FOR_USER branch (the same turn resuming
-    later under this same turn_id) and the live-other-owner skip (this
-    coroutine is not the one settling the turn) never pop.
+    resume: the live-other-owner skip (this coroutine is not the one
+    settling the turn) never pops or renews. The PAUSED / WAITING_FOR_USER
+    branch instead renews the same secrets' TTL - it is the same turn
+    resuming later under this same turn_id, now carrying a fresh interaction
+    lifetime of its own, so its secrets must not expire on the original
+    pause's clock.
     """
     from ..models.chat_message import TaskChatMessage
     from .workforce_runtime import sync_workforce_run_status
@@ -1758,7 +1780,15 @@ def finish_turn(
     # PAUSED / WAITING_FOR_USER / other: preserve the control status while
     # releasing this exact run's lease. Legacy callers still leave it alone.
     if task_lease is not None:
-        return commit_terminal(status)
+        committed = commit_terminal(status)
+        # A fresh pause carries its own new interaction lifetime; the
+        # ephemeral secrets it may still need must not expire on the
+        # ORIGINAL pause's clock (see connector_runtime.
+        # renew_ephemeral_runtime_values's docstring for why this can't
+        # just be left to the opportunistic reaper).
+        if committed and turn_id is not None:
+            _renew_ephemeral_runtime_values_best_effort(turn_id)
+        return committed
     return False
 
 

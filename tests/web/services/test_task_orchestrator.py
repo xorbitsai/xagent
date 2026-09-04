@@ -57,6 +57,7 @@ from xagent.web.models.trigger import (
 )
 from xagent.web.models.user import User
 from xagent.web.models.workforce import Workforce, WorkforceRun
+from xagent.web.services import connector_runtime as connector_runtime_module
 from xagent.web.services import task_orchestrator as task_orchestrator_module
 from xagent.web.services.assistant_history_safety import (
     CLIENT_SAFE_FAILURE_MESSAGE_TYPE,
@@ -1696,6 +1697,42 @@ def test_finish_turn_does_not_touch_a_new_run_owned_by_same_process(
     assert persisted.runner_id == get_runner_id()
     assert persisted.run_id == "new-run"
     assert persisted.error_message is None
+
+
+def test_finish_turn_waiting_for_user_renews_ephemeral_secrets(
+    db_session, monkeypatch
+) -> None:
+    """A turn that pauses on waiting_for_user is the same turn resuming later
+    under its same turn_id, now carrying a fresh interaction lifetime of its
+    own - its ephemeral secrets must not expire on the ORIGINAL pause's
+    clock (see connector_runtime.renew_ephemeral_runtime_values)."""
+    user = _create_user(db_session)
+    task = _create_task(db_session, user.id, status=TaskStatus.WAITING_FOR_USER)
+    task.runner_id = get_runner_id()
+    task.run_id = "waiting-run"
+    task.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+    db_session.commit()
+    lease = TaskLease(
+        task_id=int(task.id), runner_id=get_runner_id(), run_id="waiting-run"
+    )
+
+    turn_id = "finish-turn-renews-waiting"
+    _store_runtime_secret_for_turn(turn_id)
+
+    real_monotonic = connector_runtime_module.time.monotonic
+    offset = {"value": connector_runtime_module._EPHEMERAL_RUNTIME_TTL_SECONDS - 1}
+    monkeypatch.setattr(
+        connector_runtime_module.time,
+        "monotonic",
+        lambda: real_monotonic() + offset["value"],
+    )
+
+    finish_turn(db_session, int(task.id), task_lease=lease, turn_id=turn_id)
+
+    # Past the ORIGINAL store's TTL window, but well within the renewed one.
+    offset["value"] += connector_runtime_module._EPHEMERAL_RUNTIME_TTL_SECONDS - 1
+    assert get_ephemeral_runtime_values(turn_id) is not None
+    assert pop_ephemeral_runtime_values(turn_id) is not None
 
 
 def test_finish_turn_cache_invalidation_failure_is_non_fatal_after_release(

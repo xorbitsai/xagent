@@ -744,6 +744,13 @@ def zendesk_create_ticket(
         subject = _require_non_blank(subject, "subject")
         comment = _require_comment_body(comment, "comment")
         ticket: dict[str, Any] = {"subject": subject, "comment": {"body": comment}}
+        # Blank-after-strip is treated the same as not provided (matching
+        # status/priority elsewhere in this function) rather than sent to
+        # Zendesk verbatim -- a whitespace-only requester_name would
+        # otherwise silently defeat the "name is required for a new
+        # requester" rule this parameter exists to satisfy.
+        requester_email = (requester_email or "").strip() or None
+        requester_name = (requester_name or "").strip() or None
         if requester_email:
             requester: dict[str, Any] = {"email": requester_email}
             if requester_name:
@@ -832,11 +839,9 @@ def zendesk_delete_ticket(ticket_id: str) -> str:
     Zendesk agent UI.
     """
     try:
-        _request(
-            "DELETE",
-            f"/tickets/{_resolve_path_id(ticket_id, _TICKET_URL_ID_PATTERN, 'ticket_id')}.json",
-        )
-        return _success(ticket_id=ticket_id)
+        path_id = _resolve_path_id(ticket_id, _TICKET_URL_ID_PATTERN, "ticket_id")
+        _request("DELETE", f"/tickets/{path_id}.json")
+        return _success(ticket_id=path_id)
     except Exception as e:
         logger.error(f"Error deleting Zendesk ticket {ticket_id}: {e}")
         return _error(str(e))

@@ -797,6 +797,44 @@ def test_create_ticket_rejects_requester_name_without_email():
     assert result["status"] == "error"
 
 
+def test_create_ticket_treats_whitespace_only_requester_name_as_not_provided(
+    monkeypatch,
+):
+    # A blank-looking name must not silently satisfy "name is required for
+    # a new requester" -- it's treated the same as name not being provided
+    # at all (matching status/priority's blank-vs-unset handling), not
+    # sent to Zendesk verbatim.
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"ticket": {"id": 1, "subject": "Help"}})
+    )
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    zendesk.zendesk_create_ticket(
+        "Help",
+        "Something's broken",
+        requester_email="new@example.com",
+        requester_name="   ",
+    )
+
+    body = mock_request.call_args.kwargs["json"]
+    assert body["ticket"]["requester"] == {"email": "new@example.com"}
+
+
+def test_create_ticket_treats_whitespace_only_requester_email_as_not_provided():
+    result = json.loads(
+        zendesk.zendesk_create_ticket(
+            "Help",
+            "Something's broken",
+            requester_email="   ",
+            requester_name="New User",
+        )
+    )
+
+    # requester_email is blank, so requester_name has nothing to attach
+    # to -- same error as omitting requester_email entirely.
+    assert result["status"] == "error"
+
+
 def test_create_ticket_cleans_tags(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(json_data={"ticket": {"id": 1, "subject": "Help"}})
@@ -890,6 +928,10 @@ def test_delete_ticket_accepts_agent_ui_url(monkeypatch):
 
     assert result["status"] == "success"
     assert mock_request.call_args.kwargs["url"].endswith("/tickets/123.json")
+    # The response must echo the resolved numeric id, not the raw URL
+    # the caller passed in -- so it's directly comparable with the id
+    # every other tool's response returns.
+    assert result["ticket_id"] == "123"
 
 
 def test_update_ticket_clears_tags_with_explicit_empty_list(monkeypatch):

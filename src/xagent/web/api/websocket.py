@@ -9648,10 +9648,16 @@ async def _execute_durable_task_command(
                     target_state_version,
                     int,
                 ):
+                    # ``invalid_target``, not ``stale_run``: nothing about
+                    # the run moved — the command payload itself carries no
+                    # usable version. Labelling it stale told the A2A error
+                    # renderer to advise a retry that can never succeed, and
+                    # let the broadcast gate below mistake a malformed stop
+                    # for a target-gone case whose silence is by design.
                     raise TaskCommandRejected(
                         f"Cancel command {command.command_id} has no exact "
                         "state-version target",
-                        reason="stale_run",
+                        reason="invalid_target",
                     )
                 # The A2A execution core loads its target as an A2A task, so
                 # a cancel for any other task source needs its own core. The
@@ -9890,22 +9896,34 @@ async def execute_durable_task_command(
         # Rejections come from handlers that already expose their durable
         # domain-level outcome. The dispatcher makes them terminal immediately.
         _command_origins.discard_command(command.command_id, command.task_id)
-        if (
+        _rejected_scope = _command_scope(command)
+        # Rejection reasons whose silence external_task_cancel.py's module
+        # docstring owns: the stop's target no longer exists as addressed
+        # (the run rotated, settled, or the task is gone), and that target's
+        # own settlement owns the transcript and the terminal event. A
+        # validation-class rejection is the opposite case — the target may
+        # be perfectly alive and the stop simply did not apply — and staying
+        # silent there strands an anonymous visitor with a stop button that
+        # did nothing (#1979 review, prior blocking finding).
+        _cancel_target_gone = exc.reason in {"stale_run", "task_not_found"}
+        if _rejected_scope == EXTERNAL_COMMAND_SCOPE and (
             command.kind == TaskCommandKind.MESSAGE
-            and _command_scope(command) == EXTERNAL_COMMAND_SCOPE
+            or (command.kind == TaskCommandKind.CANCEL and not _cancel_target_gone)
         ):
-            # The one command whose handler has no channel of its own: the
+            # The commands whose handlers have no channel of their own: the
             # external audience's answer travels through the seam executor,
-            # which reports outcomes only as these exceptions. Without a
-            # broadcast, a deferred answer that is later terminally rejected
-            # (revoked principal, stale request, spent id, quota) vanishes
-            # silently — the task stays parked and nobody is told
-            # (xorbitsai/xagent-saas#952 B2). First-party rejections keep
-            # their handler-owned notifications and are deliberately not
-            # re-broadcast here. An executor-bound presentation draft is
-            # preserved; the standard one is derived only when none was
-            # bound, so the persisted terminal event is classified either
-            # way.
+            # and its stop through the external cancel core — both report
+            # outcomes only as these exceptions. Without a broadcast, a
+            # deferred answer that is later terminally rejected (revoked
+            # principal, stale request, spent id, quota), or a stop whose
+            # command payload failed validation, vanishes silently — the
+            # task stays parked or running and nobody is told
+            # (xorbitsai/xagent-saas#952 B2; #1979 review round 3).
+            # First-party rejections keep their handler-owned notifications
+            # and are deliberately not re-broadcast here. An executor-bound
+            # presentation draft is preserved; the standard one is derived
+            # only when none was bound, so the persisted terminal event is
+            # classified either way.
             if terminal_event_draft_for_error(exc) is None:
                 bind_terminal_event_draft(
                     exc,
@@ -9916,8 +9934,11 @@ async def execute_durable_task_command(
             except Exception:
                 # The rejection is already classified and its draft is
                 # bound; a failed notification must not supersede the
-                # terminal rejection into a retried failure (the finalize
-                # broadcast in external_task_cancel.py keeps the same rule).
+                # terminal rejection into a retried failure. Unlike
+                # external_task_cancel.py's finalize, which commits its
+                # terminal row before broadcasting, this broadcast runs
+                # before the transport persists the disposition — the
+                # persist-then-notify ordering here is #1996's follow-up.
                 # Exception, never BaseException: cancellation propagates.
                 logger.warning(
                     "task %s external input rejection is terminal but its "

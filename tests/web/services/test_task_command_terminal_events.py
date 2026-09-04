@@ -271,7 +271,11 @@ def test_external_cancel_suppresses_command_identity_projection(
             TaskCommandKind.PAUSE,
             {"scope": "external"},
             True,
-            True,
+            # The disclosure rule is scope-based, not kind-based: any
+            # external-scope command withholds durable command identity,
+            # because the audience is anonymous whatever the kind
+            # (#1979 review NEW-1 widened this from cancel-only).
+            False,
             id="external-scope-on-non-cancel",
         ),
         pytest.param(

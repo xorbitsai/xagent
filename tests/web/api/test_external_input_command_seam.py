@@ -13,6 +13,7 @@ scoped command at the WebSocket enqueue boundary.
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -469,8 +470,6 @@ async def test_exhausted_external_deferral_withholds_command_identity(
     same chokepoint.
     """
 
-    from unittest.mock import AsyncMock, MagicMock
-
     agent_id, owner_user_id = _create_agent()
     task_id = _create_waiting_task(agent_id=agent_id, owner_user_id=owner_user_id)
 
@@ -559,8 +558,6 @@ async def test_defer_exhaustion_boundary_uses_the_effective_budget(
     handoff, the broadcast must assert only uncertainty, never
     non-application.
     """
-
-    from unittest.mock import AsyncMock, MagicMock
 
     monkeypatch.setenv("XAGENT_TASK_LEASE_TTL_SECONDS", "300")
     budget = max_command_defers()
@@ -689,8 +686,6 @@ async def test_exhausted_generic_failure_reports_an_unconfirmed_outcome(
     non-application.
     """
 
-    from unittest.mock import AsyncMock, MagicMock
-
     agent_id, owner_user_id = _create_agent()
     task_id = _create_waiting_task(agent_id=agent_id, owner_user_id=owner_user_id)
 
@@ -773,8 +768,6 @@ async def test_rejected_external_input_broadcasts_and_keeps_the_bound_draft(
     ``TerminalTaskEventDraft`` accepts but the fallback never produces, so
     only the bound draft winning can explain the assertion below.
     """
-
-    from unittest.mock import AsyncMock, MagicMock
 
     from xagent.web.services.task_command_terminal_events import (
         TerminalTaskEventDraft,
@@ -869,8 +862,6 @@ async def test_rejected_external_input_without_a_bound_draft_gets_the_fallback(
     -- the other half of the precedence contract pinned above.
     """
 
-    from unittest.mock import AsyncMock, MagicMock
-
     agent_id, owner_user_id = _create_agent()
     task_id = _create_waiting_task(agent_id=agent_id, owner_user_id=owner_user_id)
 
@@ -947,8 +938,6 @@ async def test_rejection_broadcast_failure_does_not_supersede_the_disposition(
     draft persisted.
     """
 
-    from unittest.mock import AsyncMock, MagicMock
-
     from xagent.web.services.task_command_terminal_events import (
         TerminalTaskEventDraft,
         bind_terminal_event_draft,
@@ -1014,6 +1003,232 @@ async def test_rejection_broadcast_failure_does_not_supersede_the_disposition(
         )
         assert event.outcome == "failed"
         assert event.message_code is None
+        assert event.include_command_identity is False
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_rejected_external_cancel_validation_broadcasts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stop whose payload fails validation must not vanish silently.
+
+    The target may be perfectly alive; only the command was malformed. The
+    visitor pressed a button that did nothing, and the cancel core's own
+    success-path broadcast is never reached — the wrapper owns this
+    notification (#1979 review, prior blocking finding). The broadcast uses
+    the external-cancel wording branch and never carries durable command
+    identity.
+    """
+
+    agent_id, owner_user_id = _create_agent()
+    task_id = _create_waiting_task(agent_id=agent_id, owner_user_id=owner_user_id)
+
+    broadcast_manager = MagicMock()
+    broadcast_manager.broadcast_to_task = AsyncMock()
+    monkeypatch.setattr(websocket_api, "manager", broadcast_manager)
+
+    db = _direct_db_session()
+    try:
+        enqueued = enqueue_task_command(
+            db,
+            task_id=task_id,
+            actor_user_id=None,
+            command_id="ext-cancel-invalid",
+            kind=TaskCommandKind.CANCEL,
+            payload={
+                "agent_id": agent_id,
+                "scope": "external",
+                # No target_state_version: the validation-class rejection.
+            },
+        )
+        assert enqueued.created
+    finally:
+        db.close()
+
+    processed = await dispatch_one_task_command(
+        websocket_api.execute_durable_task_command
+    )
+    assert processed is True
+
+    payloads = [
+        call.args[0] for call in broadcast_manager.broadcast_to_task.await_args_list
+    ]
+    assert [payload["type"] for payload in payloads] == ["agent_error"]
+    assert "command_id" not in payloads[0]
+    assert "command_kind" not in payloads[0]
+
+    db = _direct_db_session()
+    try:
+        row = (
+            db.query(TaskExecutionCommand)
+            .filter(TaskExecutionCommand.command_id == "ext-cancel-invalid")
+            .one()
+        )
+        assert row.status == COMMAND_FAILED
+        assert row.result == {"rejection_reason": "invalid_target"}
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_rejected_external_cancel_stale_target_stays_silent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stop whose target moved on keeps its documented silence.
+
+    ``external_task_cancel``'s module contract: a rejected command is
+    terminal without a client-visible error frame when the stop no longer
+    has a target — that run's own settlement owns the transcript and the
+    event. The broadcast gate must not widen into this family.
+    """
+
+    agent_id, owner_user_id = _create_agent()
+    task_id = _create_waiting_task(agent_id=agent_id, owner_user_id=owner_user_id)
+
+    broadcast_manager = MagicMock()
+    broadcast_manager.broadcast_to_task = AsyncMock()
+    monkeypatch.setattr(websocket_api, "manager", broadcast_manager)
+
+    db = _direct_db_session()
+    try:
+        enqueued = enqueue_task_command(
+            db,
+            task_id=task_id,
+            actor_user_id=None,
+            command_id="ext-cancel-stale",
+            kind=TaskCommandKind.CANCEL,
+            payload={
+                "agent_id": agent_id,
+                "scope": "external",
+                # Valid shape, wrong version: the run moved on.
+                "target_state_version": 999,
+            },
+        )
+        assert enqueued.created
+    finally:
+        db.close()
+
+    processed = await dispatch_one_task_command(
+        websocket_api.execute_durable_task_command
+    )
+    assert processed is True
+
+    broadcast_manager.broadcast_to_task.assert_not_awaited()
+
+    db = _direct_db_session()
+    try:
+        row = (
+            db.query(TaskExecutionCommand)
+            .filter(TaskExecutionCommand.command_id == "ext-cancel-stale")
+            .one()
+        )
+        assert row.status == COMMAND_FAILED
+        assert row.result == {"rejection_reason": "stale_run"}
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_first_party_message_rejection_does_not_broadcast(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """First-party rejections keep their handler-owned notifications.
+
+    The broadcast gate exists for audiences with no channel of their own;
+    a scopeless MESSAGE whose delivery is already FAILED must reject
+    without adding a task-wide agent_error on top of the handler's
+    personal reply (#1979 review NEW-7).
+    """
+
+    async def quiet_chat(_ws: Any, _task_id: int, _data: dict[str, Any]) -> None:
+        return None
+
+    monkeypatch.setattr(websocket_api, "_handle_chat_message_unserialized", quiet_chat)
+    monkeypatch.setattr(
+        websocket_api,
+        "_load_command_actor",
+        lambda _actor_id: SimpleNamespace(id=7, is_admin=False),
+    )
+    monkeypatch.setattr(
+        websocket_api,
+        "_load_command_message_delivery_status",
+        lambda _task_id, _turn_id: "failed",
+    )
+    broadcast_manager = MagicMock()
+    broadcast_manager.broadcast_to_task = AsyncMock()
+    monkeypatch.setattr(websocket_api, "manager", broadcast_manager)
+
+    command = ClaimedTaskCommand(
+        id=1,
+        task_id=55,
+        actor_user_id=7,
+        command_id="chat-rejected",
+        kind=TaskCommandKind.MESSAGE,
+        payload={"message": "hello"},
+        target_run_id=None,
+        attempt_count=1,
+    )
+
+    with pytest.raises(TaskCommandRejected, match="could not be applied"):
+        await websocket_api.execute_durable_task_command(command)
+
+    broadcast_manager.broadcast_to_task.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_successful_external_message_terminal_event_withholds_identity() -> None:
+    """The disclosure rule holds on the success path too.
+
+    ``finish_task_command`` stages its terminal event with a defaulted
+    draft whose ``include_command_identity`` is True; the persistence
+    chokepoint must strip it for any external-scope command, or a
+    successful answer leaks the durable command identity the failure paths
+    withhold (#1979 review NEW-1).
+    """
+
+    agent_id, owner_user_id = _create_agent()
+    task_id = _create_waiting_task(agent_id=agent_id, owner_user_id=owner_user_id)
+
+    async def executor(_command: ClaimedTaskCommand) -> dict[str, Any]:
+        return {"admitted": "dispatched"}
+
+    register_external_task_input_executor(executor)
+
+    db = _direct_db_session()
+    try:
+        enqueued = enqueue_task_command(
+            db,
+            task_id=task_id,
+            actor_user_id=None,
+            command_id="ext-input-success",
+            kind=TaskCommandKind.MESSAGE,
+            payload={"scope": "external", "message": "the answer"},
+        )
+        assert enqueued.created
+    finally:
+        db.close()
+
+    processed = await dispatch_one_task_command(
+        websocket_api.execute_durable_task_command
+    )
+    assert processed is True
+
+    db = _direct_db_session()
+    try:
+        row = (
+            db.query(TaskExecutionCommand)
+            .filter(TaskExecutionCommand.command_id == "ext-input-success")
+            .one()
+        )
+        assert row.status == COMMAND_COMPLETED
+        event = (
+            db.query(TaskCommandTerminalEvent)
+            .filter(TaskCommandTerminalEvent.task_command_id == int(row.id))
+            .one()
+        )
+        assert event.outcome == "completed"
         assert event.include_command_identity is False
     finally:
         db.close()

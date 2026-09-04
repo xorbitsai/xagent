@@ -147,9 +147,15 @@ def stage_terminal_event(
         outcome=outcome,
         message_code=(draft.message_code.value if draft.message_code else None),
         resend_safe=bool(draft.resend_safe),
+        # Any external-scope command, not only the cancel: the audience is
+        # anonymous, cannot act on durable command identity, and must not be
+        # shown it. Enforced here — the single persistence chokepoint —
+        # rather than at each draft-building call site, so a caller that
+        # forgets (or a defaulted draft on the success path, which carries
+        # include_command_identity=True) cannot leak the identity for an
+        # external MESSAGE terminal (#1979 review NEW-1).
         include_command_identity=bool(
-            draft.include_command_identity
-            and not is_external_cancel_command(kind=str(command.kind), scope=scope)
+            draft.include_command_identity and scope != _EXTERNAL_COMMAND_SCOPE
         ),
     )
     try:

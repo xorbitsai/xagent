@@ -19,6 +19,14 @@ terminal domain refusal. Any other exception consumes the failure budget.
 An executor may attach a ``TerminalTaskEventDraft`` to the exceptions it
 raises (``bind_terminal_event_draft``) to control the durable terminal
 outcome's client-safe presentation.
+
+Contract note on ``TaskCommandRejected``: raise it only when the refusal
+also *establishes non-application* -- the answer verifiably never reached
+the downstream operation. ``external_input_terminal_message`` renders every
+rejection with the categorical not-applied sentence on the strength of this
+contract; an executor that cannot prove non-application (for example, a
+spent delivery id whose original attempt may have landed) must raise a
+plain failure instead, whose wording asserts only uncertainty.
 """
 
 from __future__ import annotations

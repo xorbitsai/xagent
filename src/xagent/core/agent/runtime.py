@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -1128,11 +1129,16 @@ class PatternRuntime:
     ) -> None:
         event_metadata = metadata or {}
         usage = self._extract_token_usage(response)
+        # Internal calls (currently only "context_compaction") carry a
+        # purpose marker; their prompt is not the live conversation, so the
+        # records must not become the freshness baseline.
+        purpose = event_metadata.get("purpose")
         if usage is not None and callable(getattr(context, "record_llm_usage", None)):
             context.record_llm_usage(
                 input_tokens=usage[0],
                 output_tokens=usage[1],
                 prompt_message_count=len(getattr(context, "messages", [])),
+                synthetic_purpose=purpose,
             )
         cached_tokens = self._extract_cached_tokens(response)
         await self._emit_trace_event(
@@ -1156,9 +1162,39 @@ class PatternRuntime:
             },
         )
 
+    def _resolve_usage_payload(self, response: Any) -> list[tuple[str, Any]]:
+        """Candidate usage payloads of a chat response, most preferred first.
+
+        Looks at the top-level ``usage``/``usage_metadata`` keys first (the
+        adapter stamp and legacy shapes), then one level down inside ``raw``
+        for envelopes that embed the raw provider payload without a stamp.
+        Unknown shapes yield no candidates -- callers fail open to None/0
+        rather than raising.
+        """
+        candidates: list[tuple[str, Any]] = []
+        for key in ("usage", "usage_metadata"):
+            value = self._get_value(response, key)
+            if value is not None:
+                candidates.append((key, value))
+        raw = self._get_value(response, "raw")
+        if raw is not None:
+            for key in ("usage", "usage_metadata"):
+                value = self._get_value(raw, key)
+                if value is not None:
+                    candidates.append((key, value))
+        return candidates
+
     def _extract_token_usage(self, response: Any) -> tuple[int, int] | None:
-        usage = self._get_value(response, "usage")
-        if usage is not None:
+        for key, usage in self._resolve_usage_payload(response):
+            input_tokens, output_tokens = self._usage_pair(key, usage)
+            if input_tokens > 0 or output_tokens > 0:
+                return input_tokens, output_tokens
+
+        return None
+
+    def _usage_pair(self, key: str, usage: Any) -> tuple[int, int]:
+        """(input, output) tokens of one usage payload by candidate kind."""
+        if key == "usage":
             input_tokens = self._first_int(
                 usage, ("prompt_tokens", "input_tokens", "prompt_token_count")
             )
@@ -1171,43 +1207,78 @@ class PatternRuntime:
                     "completion_token_count",
                 ),
             )
-            if input_tokens > 0 or output_tokens > 0:
-                return input_tokens, output_tokens
-
-        usage_metadata = self._get_value(response, "usage_metadata")
-        if usage_metadata is not None:
+        else:
             input_tokens = self._first_int(
-                usage_metadata, ("prompt_token_count", "prompt_tokens", "input_tokens")
+                usage, ("prompt_token_count", "prompt_tokens", "input_tokens")
             )
             output_tokens = self._first_int(
-                usage_metadata,
+                usage,
                 ("candidates_token_count", "completion_tokens", "output_tokens"),
             )
-            if input_tokens > 0 or output_tokens > 0:
-                return input_tokens, output_tokens
-
-        return None
+        return input_tokens, output_tokens
 
     def _extract_cached_tokens(self, response: Any) -> int:
         """Prompt-cache-hit tokens from a response's usage payload, 0 if absent."""
-        usage = self._get_value(response, "usage")
-        if usage is None:
-            return 0
+        for key, usage in self._resolve_usage_payload(response):
+            if key != "usage":
+                continue
+            cached = self._cached_from_payload(usage)
+            if cached:
+                return cached
+        return 0
+
+    def _cached_from_payload(self, usage: Any) -> int:
+        """Strictly-coerced cache-hit tokens from one usage payload.
+
+        Same alias table as the ledger-side ``extract_cached_input_tokens``,
+        but through ``_coerce_usage_int``: malformed values (bools, strings,
+        non-finite or non-integral numbers, negatives) are rejected rather
+        than truncated, and an invalid or zero alias never shadows the
+        nested ``prompt_tokens_details.cached_tokens`` fallback.
+        """
         direct = self._first_int(
             usage, ("cached_input_tokens", "cache_read_input_tokens")
         )
         if direct > 0:
             return direct
-        return extract_cached_input_tokens(usage)
+        hit = self._coerce_usage_int(self._get_value(usage, "prompt_cache_hit_tokens"))
+        if hit:
+            return hit
+        details = self._get_value(usage, "prompt_tokens_details")
+        if details is not None:
+            nested = self._coerce_usage_int(self._get_value(details, "cached_tokens"))
+            if nested:
+                return nested
+        return 0
 
     def _first_int(self, source: Any, keys: tuple[str, ...]) -> int:
         for key in keys:
-            value = self._get_value(source, key)
-            if isinstance(value, int):
-                return value
-            if isinstance(value, float):
-                return int(value)
+            coerced = self._coerce_usage_int(self._get_value(source, key))
+            if coerced is not None:
+                return coerced
         return 0
+
+    @staticmethod
+    def _coerce_usage_int(value: Any) -> int | None:
+        """Coerce a usage counter to a non-negative int, or return None.
+
+        Usage numbers feed billing and context-freshness decisions, so the
+        coercion is strict: bools (an int subclass), non-finite floats
+        (NaN/inf, which ``int()`` would raise on), negatives, and
+        non-integral floats are all rejected instead of being truncated or
+        crashing the extractor. Integral floats (``10.0``) coerce. A None
+        result means "not a usable counter" -- callers skip to the next
+        alias/candidate rather than treating it as a measurement.
+        """
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value if value >= 0 else None
+        if isinstance(value, float):
+            if not math.isfinite(value) or value < 0 or not value.is_integer():
+                return None
+            return int(value)
+        return None
 
     def _get_value(self, source: Any, key: str) -> Any:
         if isinstance(source, dict):

@@ -22,6 +22,23 @@ from .base import BaseLLM
 
 logger = logging.getLogger(__name__)
 
+
+def _response_usage_payload(response: Any) -> Any:
+    """Return the provider usage payload of a raw SDK response, or None.
+
+    Stamped onto every chat/vision result envelope as a top-level ``usage``
+    key so consumers (notably ``PatternRuntime._extract_token_usage``) can
+    read usage without reaching into ``raw``. Read-only: the contextvar
+    ledger write stays with the adapter's single ``add_token_usage`` call.
+    """
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return None
+    if hasattr(usage, "model_dump"):
+        return usage.model_dump()
+    return usage
+
+
 # ``PROVIDER_STATE_METADATA_KEY`` now lives in ``chat.types`` (see there for
 # why); imported here so existing code and tests that import it from this
 # transport module keep working unchanged.
@@ -609,7 +626,9 @@ class OpenAICompatibleLLM(BaseLLM):
             choice = resp.choices[0]
             message = choice.message
 
-            # Record token usage to context
+            # Record token usage to context; snapshot it so every result
+            # envelope below can carry a top-level ``usage`` stamp.
+            usage_payload = _response_usage_payload(resp)
             if hasattr(resp, "usage") and resp.usage:
                 add_token_usage(
                     input_tokens=resp.usage.prompt_tokens,
@@ -648,6 +667,8 @@ class OpenAICompatibleLLM(BaseLLM):
                     "tool_calls": tool_calls,
                     "raw": resp.model_dump(),
                 }
+                if usage_payload is not None:
+                    result["usage"] = usage_payload
                 has_reasoning_content, reasoning_content = _message_reasoning_content(
                     message
                 )
@@ -695,7 +716,7 @@ class OpenAICompatibleLLM(BaseLLM):
                     and reasoning_content
                     and reasoning_content.strip()
                 ):
-                    return {
+                    result = {
                         "type": "text",
                         "content": reasoning_content,
                         CONTENT_SOURCE_KEY: CONTENT_SOURCE_REASONING_FALLBACK,
@@ -703,6 +724,9 @@ class OpenAICompatibleLLM(BaseLLM):
                         "reasoning": reasoning_content,
                         "raw": resp.model_dump(),
                     }
+                    if usage_payload is not None:
+                        result["usage"] = usage_payload
+                    return result
                 # If there are no tool calls and no content, this is an error
                 raise LLMEmptyContentError(
                     f"LLM returned {'empty' if content == '' else 'None'} content and no tool calls"
@@ -713,6 +737,8 @@ class OpenAICompatibleLLM(BaseLLM):
                 "content": content,
                 "raw": resp.model_dump(),
             }
+            if usage_payload is not None:
+                result["usage"] = usage_payload
             if has_reasoning_content:
                 result["reasoning_content"] = reasoning_content
                 result["reasoning"] = reasoning_content
@@ -981,7 +1007,9 @@ class OpenAICompatibleLLM(BaseLLM):
             choice = response.choices[0]
             message = choice.message
 
-            # Record token usage to context
+            # Record token usage to context; snapshot it so every result
+            # envelope below can carry a top-level ``usage`` stamp.
+            usage_payload = _response_usage_payload(response)
             if hasattr(response, "usage") and response.usage:
                 add_token_usage(
                     input_tokens=response.usage.prompt_tokens,
@@ -1020,6 +1048,8 @@ class OpenAICompatibleLLM(BaseLLM):
                     "tool_calls": tool_calls,
                     "raw": response.model_dump(),
                 }
+                if usage_payload is not None:
+                    result["usage"] = usage_payload
                 has_reasoning_content, reasoning_content = _message_reasoning_content(
                     message
                 )
@@ -1057,7 +1087,7 @@ class OpenAICompatibleLLM(BaseLLM):
                     and reasoning_content
                     and reasoning_content.strip()
                 ):
-                    return {
+                    result = {
                         "type": "text",
                         "content": reasoning_content,
                         CONTENT_SOURCE_KEY: CONTENT_SOURCE_REASONING_FALLBACK,
@@ -1065,6 +1095,9 @@ class OpenAICompatibleLLM(BaseLLM):
                         "reasoning": reasoning_content,
                         "raw": response.model_dump(),
                     }
+                    if usage_payload is not None:
+                        result["usage"] = usage_payload
+                    return result
                 # If there are no tool calls and no content, this is an error
                 raise LLMEmptyContentError(
                     f"LLM returned {'empty' if content == '' else 'None'} content and no tool calls"
@@ -1075,6 +1108,8 @@ class OpenAICompatibleLLM(BaseLLM):
                 "content": content,
                 "raw": response.model_dump(),
             }
+            if usage_payload is not None:
+                text_result["usage"] = usage_payload
             if has_reasoning_content:
                 text_result["reasoning_content"] = reasoning_content
                 text_result["reasoning"] = reasoning_content

@@ -783,8 +783,14 @@ class ExecutionContext:
         input_tokens: int,
         output_tokens: int,
         prompt_message_count: int | None = None,
+        synthetic_purpose: str | None = None,
     ) -> None:
-        """Record provider usage for an LLM call without appending a message."""
+        """Record provider usage for an LLM call without appending a message.
+
+        ``synthetic_purpose`` marks internal non-conversational calls (e.g.
+        ``"context_compaction"``) whose prompt token count must not serve as
+        the context-freshness baseline.
+        """
 
         if input_tokens <= 0 and output_tokens <= 0:
             return
@@ -802,6 +808,7 @@ class ExecutionContext:
                 prompt_content_chars=self._message_content_chars(
                     self.messages[:prompt_message_count]
                 ),
+                synthetic_purpose=synthetic_purpose,
             )
         )
 
@@ -919,6 +926,7 @@ class ExecutionContext:
                         prompt_message_count=call.prompt_message_count,
                         prompt_content_chars=call.prompt_content_chars,
                         timestamp=call.timestamp,
+                        synthetic_purpose=call.synthetic_purpose,
                     )
                 )
         self.llm_calls = merged_calls
@@ -993,6 +1001,7 @@ class ExecutionContext:
                     "prompt_message_count": call.prompt_message_count,
                     "prompt_content_chars": call.prompt_content_chars,
                     "timestamp": call.timestamp.isoformat(),
+                    "synthetic_purpose": call.synthetic_purpose,
                 }
                 for call in self.llm_calls
             ],
@@ -1041,6 +1050,9 @@ class ExecutionContext:
                 prompt_message_count=call.get("prompt_message_count"),
                 prompt_content_chars=call.get("prompt_content_chars"),
                 timestamp=datetime.fromisoformat(call["timestamp"]),
+                # Older checkpoints predate the field; absence means a real
+                # conversational call, i.e. eligible as freshness baseline.
+                synthetic_purpose=call.get("synthetic_purpose"),
             )
             for call in data.get("llm_calls", [])
         ]
@@ -1570,25 +1582,39 @@ class ExecutionContext:
         return self._get_total_tokens()
 
     def _get_total_tokens(self) -> int:
-        if self.llm_calls:
-            latest_call = self.llm_calls[-1]
-            if latest_call.input_tokens > 0:
-                prompt_message_count = latest_call.prompt_message_count
-                prompt_content_chars = latest_call.prompt_content_chars
-                if (
-                    prompt_message_count is not None
-                    and prompt_content_chars is not None
-                    and 0 <= prompt_message_count <= len(self.messages)
-                    and self._message_content_chars(
-                        self.messages[:prompt_message_count]
-                    )
-                    == prompt_content_chars
-                ):
-                    delta_chars = self._message_content_chars(
-                        self.messages[prompt_message_count:]
-                    )
-                    return latest_call.input_tokens + max(0, delta_chars // 4)
+        baseline_call = self._latest_freshness_baseline_call()
+        if baseline_call is not None and baseline_call.input_tokens > 0:
+            prompt_message_count = baseline_call.prompt_message_count
+            prompt_content_chars = baseline_call.prompt_content_chars
+            if (
+                prompt_message_count is not None
+                and prompt_content_chars is not None
+                and 0 <= prompt_message_count <= len(self.messages)
+                and self._message_content_chars(self.messages[:prompt_message_count])
+                == prompt_content_chars
+            ):
+                delta_chars = self._message_content_chars(
+                    self.messages[prompt_message_count:]
+                )
+                return baseline_call.input_tokens + max(0, delta_chars // 4)
         return self._estimate_message_tokens(self.messages)
+
+    def _latest_freshness_baseline_call(self) -> LLMCallRecord | None:
+        """Most recent usage record eligible as the context-size baseline.
+
+        Synthetic records (internal calls such as context compaction) are
+        skipped: their prompt is not the live conversation, so their token
+        count says nothing about the current context size. When a synthetic
+        call did not rewrite the messages (e.g. a declined LLM compaction),
+        its fingerprint still matches -- without this skip, a small
+        compact-prompt count would be mistaken for the live context size
+        and suppress the truncation fallback.
+        """
+        for call in reversed(self.llm_calls):
+            if call.synthetic_purpose:
+                continue
+            return call
+        return None
 
     def _estimate_message_tokens(self, messages: list[Message]) -> int:
         return sum(

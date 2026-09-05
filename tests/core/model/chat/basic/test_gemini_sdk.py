@@ -90,9 +90,10 @@ class TestGeminiLLMSDK:
 
         response = await llm.chat(messages)
 
-        # Verify response
-        assert isinstance(response, str)
-        assert response == "Hello World"
+        # Verify response: a text envelope carrying the usage stamp
+        assert response["type"] == "text"
+        assert response["content"] == "Hello World"
+        assert response["usage"] == {"prompt_tokens": 10, "completion_tokens": 5}
         print(f"Basic chat response: {response}")
 
     @pytest.mark.asyncio
@@ -286,6 +287,8 @@ class TestGeminiLLMSDK:
         assert isinstance(response, dict)
         assert response.get("type") == "tool_call"
         assert "tool_calls" in response
+        # The usage stamp rides on tool_call envelopes too (no ``raw`` here).
+        assert response["usage"] == {"prompt_tokens": 15, "completion_tokens": 10}
 
         tool_calls = response["tool_calls"]
         assert len(tool_calls) > 0
@@ -454,10 +457,11 @@ class TestGeminiLLMSDK:
 
         response = await llm.chat(messages, response_format={"type": "json_object"})
 
-        # Verify JSON response
-        assert isinstance(response, str)
-        assert "greeting" in response
-        assert "count" in response
+        # Verify JSON response: text envelope, JSON in its content
+        assert response["type"] == "text"
+        assert "greeting" in response["content"]
+        assert "count" in response["content"]
+        assert response["usage"] == {"prompt_tokens": 14, "completion_tokens": 20}
         print(f"JSON mode response: {response}")
 
     @pytest.mark.asyncio

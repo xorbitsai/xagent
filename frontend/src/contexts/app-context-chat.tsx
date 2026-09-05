@@ -1232,7 +1232,12 @@ export interface AppState {
   // the submitting instance being replaced (#1500). Rounds without a
   // request id are deliberately not tracked - with no round identity a
   // recorded reply could gate a different question.
-  clarificationSubmissions: Record<string, { commandId: string }>
+  // ``accepted`` distinguishes a reply the backend durably acknowledged from
+  // one recorded after an ack timeout (outcome unknown): only a confirmed
+  // acceptance may lock a freshly mounted form while no terminal outcome has
+  // arrived - an unconfirmed delivery keeps the advisory retry the composer
+  // has always offered.
+  clarificationSubmissions: Record<string, { commandId: string; accepted: boolean }>
 }
 
 type AppAction =
@@ -1246,7 +1251,7 @@ type AppAction =
   | { type: "SET_TASK_RUNTIME_EXTENSIONS"; payload: { taskId: number; extensions: TaskRuntimeExtensions } }
   | { type: "UPDATE_TASK_STATUS"; payload: { status: Task["status"]; waitingQuestion?: string; waitingInteractions?: Interaction[]; waitingRequestId?: string; runId?: string | null; stateVersion?: number; controlState?: TaskControlState; updatedAt?: string } }
   | { type: "RECORD_COMMAND_OUTCOME"; payload: { commandId: string; outcome: TerminalCommandOutcome } }
-  | { type: "RECORD_CLARIFICATION_SUBMISSION"; payload: { requestId: string; commandId: string } }
+  | { type: "RECORD_CLARIFICATION_SUBMISSION"; payload: { requestId: string; commandId: string; accepted: boolean } }
   | { type: "CLEAR_CLARIFICATION_SUBMISSION"; payload: { requestId: string } }
   | { type: "TRIGGER_TASK_UPDATE" }
   | { type: "SET_DAG_EXECUTION"; payload: DAGExecution | null }
@@ -1351,7 +1356,10 @@ function projectAppState(state: AppState, action: AppAction): AppState {
         ...state,
         clarificationSubmissions: {
           ...state.clarificationSubmissions,
-          [action.payload.requestId]: { commandId: action.payload.commandId },
+          [action.payload.requestId]: {
+            commandId: action.payload.commandId,
+            accepted: action.payload.accepted,
+          },
         },
       }
     case "CLEAR_CLARIFICATION_SUBMISSION": {

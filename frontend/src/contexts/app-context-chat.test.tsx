@@ -6822,7 +6822,7 @@ function ClarificationSubmissionProbe() {
         onClick={() =>
           dispatch({
             type: "RECORD_CLARIFICATION_SUBMISSION",
-            payload: { requestId: "req-1", commandId: "cmd-1" },
+            payload: { requestId: "req-1", commandId: "cmd-1", accepted: true },
           })
         }
       />
@@ -7028,7 +7028,7 @@ describe("terminal command outcomes (#1500)", () => {
         JSON.parse(
           screen.getByTestId("clarification-submissions").textContent || "{}"
         )
-      ).toEqual({ "req-1": { commandId: "cmd-1" } })
+      ).toEqual({ "req-1": { commandId: "cmd-1", accepted: true } })
     })
 
     act(() => {

@@ -952,7 +952,7 @@ describe("ClarificationForm terminal command outcomes", () => {
       .find((action) => action?.type === "RECORD_CLARIFICATION_SUBMISSION")
     expect(record).toEqual({
       type: "RECORD_CLARIFICATION_SUBMISSION",
-      payload: { requestId, commandId: expect.any(String) },
+      payload: { requestId, commandId: expect.any(String), accepted: true },
     })
     // The recorded command id is the client message id the delivery used.
     const config = appContextMock.sendMessage.mock.calls[0][1] as {
@@ -962,7 +962,7 @@ describe("ClarificationForm terminal command outcomes", () => {
     appContextMock.state = {
       ...appContextMock.state,
       clarificationSubmissions: {
-        [requestId]: { commandId: record.payload.commandId },
+        [requestId]: { commandId: record.payload.commandId, accepted: true },
       },
     }
     return record.payload.commandId as string
@@ -1061,6 +1061,34 @@ describe("ClarificationForm terminal command outcomes", () => {
     expect(submitButton()).toBeDisabled()
   })
 
+  it("locks a fresh component instance while the accepted reply is still in flight", async () => {
+    // A freshly mounted instance starts with isSubmitted=false, so without
+    // the in-flight lock it would offer Submit for a round whose durably
+    // accepted reply has not reached a terminal outcome yet (surfaced by
+    // review on #2126).
+    render(form(true))
+    await submitAccepted()
+    cleanup()
+
+    render(form(true))
+
+    expect(submitButton()).toBeDisabled()
+  })
+
+  it("does not lock a fresh instance for an unconfirmed ack-timeout delivery", async () => {
+    appContextMock.state = {
+      commandOutcomes: {},
+      clarificationSubmissions: {
+        inputreq_r1: { commandId: "maybe-sent", accepted: false },
+      },
+    }
+    render(form(true))
+
+    // The reply may never have been accepted at all: the composer keeps its
+    // advisory retry until a terminal outcome for the command arrives.
+    await waitFor(() => expect(submitButton()).toBeEnabled())
+  })
+
   it("records the submission when the delivery outcome is unknown", async () => {
     appContextMock.sendMessage.mockRejectedValue(Object.assign(
       new Error("ack timed out"),
@@ -1081,10 +1109,25 @@ describe("ClarificationForm terminal command outcomes", () => {
         payload: {
           requestId: "inputreq_r1",
           commandId: expect.any(String),
+          // Unconfirmed: an ack timeout must not lock the form while no
+          // terminal outcome exists.
+          accepted: false,
         },
       })
     })
-    // The existing advisory behavior is unchanged until an outcome arrives.
+    // The existing advisory behavior is unchanged until an outcome arrives -
+    // including on the gating effect's rerun after the entry is recorded.
+    appContextMock.state = {
+      ...appContextMock.state,
+      clarificationSubmissions: {
+        inputreq_r1: {
+          commandId: (appContextMock.sendMessage.mock.calls[0][1] as {
+            clientMessageId: string
+          }).clientMessageId,
+          accepted: false,
+        },
+      },
+    }
     expect(submitButton()).toBeEnabled()
   })
 

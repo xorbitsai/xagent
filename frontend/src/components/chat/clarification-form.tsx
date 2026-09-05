@@ -135,7 +135,9 @@ export function ClarificationForm({
   // If onSend is provided, use it (e.g., from builder chat), otherwise use useApp
   let sendMessage: any, dispatch: any, contextFilesDisabled: boolean | undefined;
   let commandOutcomes: Record<string, TerminalCommandOutcome> | undefined;
-  let clarificationSubmissions: Record<string, { commandId: string }> | undefined;
+  let clarificationSubmissions:
+    | Record<string, { commandId: string; accepted: boolean }>
+    | undefined;
   try {
     const appCtx = useApp();
     sendMessage = appCtx.sendMessage;
@@ -230,15 +232,24 @@ export function ClarificationForm({
     // While a submission is outstanding, reactivation requires a terminal
     // outcome for that exact command that proves non-application.
     if (outstandingSubmission) {
-      if (!outstandingOutcome || outstandingOutcome.resendSafe !== true) {
-        // Committed, still in flight, or unknown: surface the ambiguity
-        // (when a terminal outcome exists) without inviting a duplicate.
-        // The chat input remains available for a deliberate fresh message.
-        if (outstandingOutcome) {
-          setOutcomeNotice("unconfirmed")
+      if (!outstandingOutcome) {
+        // Still in flight with no terminal outcome. A confirmed-accepted
+        // reply locks the form even on a freshly mounted instance (whose
+        // initial isSubmitted is false); an unconfirmed ack-timeout
+        // delivery keeps the advisory retry the composer has always
+        // offered, because the reply may never have been accepted at all.
+        if (outstandingSubmission.accepted) {
           setIsSubmitted(true)
-          setIsOpen(true)
         }
+        return
+      }
+      if (outstandingOutcome.resendSafe !== true) {
+        // Committed or unknown: surface the ambiguity without inviting a
+        // duplicate. The chat input remains available for a deliberate
+        // fresh message.
+        setOutcomeNotice("unconfirmed")
+        setIsSubmitted(true)
+        setIsOpen(true)
         return
       }
       // Proven not applied: consume the record so the resend is armed once,
@@ -436,12 +447,19 @@ export function ClarificationForm({
     // request id - the gate would have no round identity to bind to, and a
     // recorded reply could end up gating a different question.
     const clientMessageId = generateClientMessageId()
-    const recordSubmission = () => {
+    // ``accepted`` separates a durably acknowledged reply from one whose
+    // ack timed out: only a confirmed acceptance may lock a freshly mounted
+    // form while its terminal outcome is still pending.
+    const recordSubmission = (accepted: boolean) => {
       if (onSend || !dispatch) return
       if (typeof submittedRequestId !== "string" || !submittedRequestId) return
       dispatch({
         type: "RECORD_CLARIFICATION_SUBMISSION",
-        payload: { requestId: submittedRequestId, commandId: clientMessageId },
+        payload: {
+          requestId: submittedRequestId,
+          commandId: clientMessageId,
+          accepted,
+        },
       })
     }
 
@@ -461,7 +479,7 @@ export function ClarificationForm({
           { force: true, metadata, clientMessageId },
           outboundFiles,
         )
-        recordSubmission()
+        recordSubmission(true)
       }
 
       if (latestRequestIdRef.current !== submittedRequestId) return
@@ -474,8 +492,9 @@ export function ClarificationForm({
       if (readSendDisposition(error) === "outcome_unknown") {
         // An ack timeout: the reply may still have been durably accepted,
         // so its eventual terminal outcome must gate this round exactly as
-        // an acknowledged submission's would.
-        recordSubmission()
+        // an acknowledged submission's would - but as an unconfirmed
+        // delivery it must not lock the form while no outcome exists.
+        recordSubmission(false)
       }
       if (latestRequestIdRef.current !== submittedRequestId) return
       console.error("Failed to send clarification response", error)

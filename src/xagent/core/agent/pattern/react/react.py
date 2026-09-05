@@ -81,6 +81,7 @@ from ...context.enrichment import (
 )
 from ...context.execution import (
     COMPACT_DROPPED_TOOL_NAME_MAX_CHARS,
+    COMPACT_DROPPED_TOOL_NOTICE_MAX_CHARS,
     COMPACT_DROPPED_TOOL_NOTICE_MAX_NAMES,
 )
 from ...context.memory_tool import build_memory_tools
@@ -730,6 +731,9 @@ class ReActPattern(AgentPattern):
             evidence_dropped = (
                 followup is not None and followup != FORCED_ANSWER_FOLLOWUP_REFETCHED
             )
+            # Set only on a turn that undoes the forcing, and read after that
+            # turn's tool batch to decide what the next turn is told.
+            recovery_names: set[str] | None = None
             interrupted = await self._interrupt_if_requested(
                 runtime=runtime,
                 context=context,
@@ -829,7 +833,44 @@ class ReActPattern(AgentPattern):
                     decline_reason = "no_recoverable_tools"
                 else:
                     decline_reason = None
-                if decline_reason is not None:
+                if decline_reason is None:
+                    # Undo the forcing for this one turn and hand back exactly
+                    # the tools whose observations went missing. final_answer
+                    # stays available so the model can still finish if it
+                    # judges what remains to be enough.
+                    self.force_final_answer_next = False
+                    self.forced_answer_reason = None
+                    force_final_answer_now = False
+                    tool_schemas = recovery_schemas
+                    recovery_names = set(recoverable_work)
+                    evidence_dropped = False
+                    self.forced_answer_compaction_recoveries += 1
+                    context.add_system_message(
+                        self._forced_answer_recovery_message(recoverable_work)
+                    )
+                    await runtime.checkpoint(
+                        "forced_answer_evidence_dropped_recovered",
+                        context=context,
+                        pattern=self,
+                        metadata={
+                            "iteration": iteration,
+                            "dropped_tool_result_count": dropped_count,
+                            "restored_tools": sorted(recoverable_work)[
+                                :COMPACT_DROPPED_TOOL_NOTICE_MAX_NAMES
+                            ],
+                        },
+                    )
+                    logger.warning(
+                        "Forced answer turn lost tool evidence to compaction; "
+                        "restoring the dropped tools for one turn. dropped=%d "
+                        "restored=%s execution_id=%s",
+                        dropped_count,
+                        sorted(recoverable_work)[
+                            :COMPACT_DROPPED_TOOL_NOTICE_MAX_NAMES
+                        ],
+                        getattr(context, "execution_id", None),
+                    )
+                else:
                     logger.warning(
                         "Forced answer turn lost tool evidence to compaction and "
                         "will report it as unavailable. reason=%s dropped=%d "
@@ -1112,11 +1153,21 @@ class ReActPattern(AgentPattern):
                 )
                 if pending_result is not None:
                     return pending_result
-                # This turn ran to completion, so the marker it was carrying has
-                # been acted on. Clearing it only here, past every checkpoint
-                # this turn writes and every early return, is what makes it
-                # survive an interrupt and still apply exactly once.
-                if followup is not None:
+                # A recovery turn settles what the next turn is told; any other
+                # turn has finished acting on the marker it was carrying.
+                # Writing and clearing share one branch so that a write can
+                # never be undone by the clear in the same turn.
+                #
+                # Clearing only here, past every checkpoint this turn writes and
+                # every early return, is what makes the marker survive an
+                # interrupt and still apply exactly once.
+                if recovery_names is not None:
+                    self.forced_answer_recovery_followup = (
+                        FORCED_ANSWER_FOLLOWUP_REFETCHED
+                        if self._recovery_evidence_arrived(tool_calls, recovery_names)
+                        else FORCED_ANSWER_FOLLOWUP_NO_EVIDENCE
+                    )
+                elif followup is not None:
                     self.forced_answer_recovery_followup = None
                 self.current_iteration = iteration + 1
                 self.status = "thinking"
@@ -1745,6 +1796,81 @@ class ReActPattern(AgentPattern):
         if not isinstance(by_name, dict):
             return count, set()
         return count, {str(name) for name in by_name}
+
+    def _forced_answer_recovery_message(self, names: set[str]) -> str:
+        """System message that reopens the dropped tools for a single turn.
+
+        Four things have to be said and the message is useless without any of
+        them: which observations went missing, that fetching them again is the
+        expected move on this turn and outranks the standing advice against
+        repeating tool work, that only reading tools may be re-run, and that no
+        final answer is due until the values are back or reported missing.
+
+        The second point exists because the ordinary tool-turn instruction
+        tells the model to answer from the results it already has rather than
+        repeat the same tool work, which on this turn is advice against the one
+        action that helps.
+
+        The name list mirrors all three bounds the compaction notice applies --
+        a name cap, a per-name length cap, and a total budget that skips an
+        over-long line rather than stopping at it -- because the names come
+        from dynamic server configuration and this message enters the context
+        on every recovery.
+        """
+        ordered = sorted(names)
+        listed = ordered[:COMPACT_DROPPED_TOOL_NOTICE_MAX_NAMES]
+        omitted = len(ordered) - len(listed)
+        prefix = (
+            "Tool observations were removed from context by compaction on this "
+            "turn, and their values are no longer available to read. Calling "
+            "those tools again is the expected action now: this instruction "
+            "takes priority over any earlier one telling you to answer from "
+            "results you already gathered, or not to repeat completed tool "
+            "work. Only re-run tools that read; if a value came from a tool "
+            "that writes, sends, executes, or otherwise changes state, do not "
+            "re-run it -- re-read the artifact it produced, or report the "
+            "value as unavailable. Do not give the final answer before those "
+            "values are back; if they cannot be fetched, say plainly which "
+            "ones are missing instead of reconstructing, estimating, or "
+            "illustrating them. Tools to call again:\n"
+        )
+        lines: list[str] = []
+        current_chars = len(prefix)
+        for name in listed:
+            clamped = name[:COMPACT_DROPPED_TOOL_NAME_MAX_CHARS]
+            line = f"- {clamped}"
+            if current_chars + len(line) + 1 > COMPACT_DROPPED_TOOL_NOTICE_MAX_CHARS:
+                omitted += 1
+                continue
+            lines.append(line)
+            current_chars += len(line) + 1
+        if omitted:
+            name_label = "name" if omitted == 1 else "names"
+            lines.append(f"- ... {omitted} additional tool {name_label} omitted")
+        return prefix + "\n".join(lines)
+
+    def _recovery_evidence_arrived(
+        self,
+        tool_calls: list[dict[str, Any]],
+        recovery_names: set[str],
+    ) -> bool:
+        """Whether this turn's own batch got a recovery-set tool to succeed.
+
+        Scoped to this turn's tool_call ids on purpose. The observation the
+        compaction dropped was itself a successful call of one of these names,
+        and its ledger record outlives the compaction -- compaction removes
+        messages, not ledger entries -- so matching by name alone would report
+        evidence that is no longer in context.
+        """
+        for tool_call in tool_calls:
+            record = self.tool_ledger.get(str(tool_call.get("id") or ""))
+            if record is None or record.tool_name not in recovery_names:
+                continue
+            if record.status == "completed" and self._tool_result_success(
+                record.result
+            ):
+                return True
+        return False
 
     def _tool_decision_groups_for_tools(self, tools: list[Any]) -> dict[str, str]:
         groups: dict[str, str] = {}

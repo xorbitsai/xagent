@@ -20,6 +20,11 @@ from pydantic import BaseModel
 
 import xagent.core.agent.pattern.react.react as react_module
 from xagent.core.agent import ExecutionContext, PatternRuntime, ReActPattern
+from xagent.core.agent.context.execution import (
+    COMPACT_DROPPED_TOOL_NAME_MAX_CHARS,
+    COMPACT_DROPPED_TOOL_NOTICE_MAX_CHARS,
+    COMPACT_DROPPED_TOOL_NOTICE_MAX_NAMES,
+)
 from xagent.core.agent.pattern.react.react import (
     FORCED_ANSWER_FOLLOWUP_NO_EVIDENCE,
     FORCED_ANSWER_FOLLOWUP_REFETCHED,
@@ -913,3 +918,438 @@ def test_the_forcing_flag_is_only_written_inside_the_react_module() -> None:
         and pattern.search(path.read_text(encoding="utf-8"))
     ]
     assert offenders == []
+
+
+class FailingTool(NamedTool):
+    """Work tool whose result is a structured failure."""
+
+    async def run_json_async(self, args: dict[str, Any]) -> Any:
+        self.calls.append(args)
+        return {"success": False, "error": f"{self.name} is unavailable"}
+
+
+def state_at(
+    runtime: PatternRuntime, label: str, occurrence: int = 0
+) -> dict[str, Any]:
+    matching = [entry for entry in runtime.checkpoints if entry.get("label") == label]
+    return dict(matching[occurrence].get("pattern_state") or {})
+
+
+def recovery_runtime(**metadata: Any) -> ScriptedCompactionRuntime:
+    """Runtime that destroys evidence on the first turn and nothing after.
+
+    Only the first turn needs to lose evidence. Letting every turn compact
+    would make the recovery turn's own re-fetch the next casualty, which is a
+    different scenario from the one under test.
+    """
+    return ScriptedCompactionRuntime([compact_result(**metadata)])
+
+
+FORCING_SOURCES = [
+    "repeated_tool_decision",
+    "finalize_after_tool_result",
+    "latest_tool_result_inline",
+    "empty_final_answer_rejected",
+]
+
+
+def forced_pattern(source: str, **kwargs: Any) -> ReActPattern:
+    if source == "latest_tool_result_inline":
+        # No flag: the loop derives the forcing from the last tool result.
+        return ReActPattern(finalize_after_tool_result=True, **kwargs)
+    pattern = ReActPattern(**kwargs)  # type: ignore[arg-type]
+    pattern.force_final_answer_next = True
+    pattern.forced_answer_reason = {
+        "repeated_tool_decision": FORCED_ANSWER_REASON_REPEATED_TOOL_DECISION,
+        "finalize_after_tool_result": FORCED_ANSWER_REASON_FINALIZE_AFTER_TOOL,
+        "empty_final_answer_rejected": FORCED_ANSWER_REASON_EMPTY_FINAL_ANSWER,
+    }[source]
+    return pattern
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("forcing_source", FORCING_SOURCES)
+@pytest.mark.parametrize("compact_strategy", ["llm_summary", "truncate"])
+async def test_recovery_hands_back_the_tools_whose_results_were_dropped(
+    forcing_source: str, compact_strategy: str
+) -> None:
+    """The turn stops being a forced answer and becomes a re-fetch instead.
+
+    Undoing the forcing is the whole point: the model is handed exactly the
+    tools whose observations went missing, plus final_answer so it can still
+    finish, and nothing else. Tools that lost nothing stay out, and the two
+    tools that talk to the user rather than read anything stay out on every
+    path.
+
+    The run picks ``tool_choice="auto"`` so the forcing override is visible: a
+    forced turn pins the choice to "required" regardless, and a recovery turn
+    has to be back on the run's own setting.
+    """
+    dropped = NamedTool("list_clients")
+    untouched = NamedTool("read_ledger")
+    pattern = forced_pattern(forcing_source, max_iterations=6, tool_choice="auto")
+    runtime = recovery_runtime(
+        by_name={"list_clients": 3}, count=3, strategy=compact_strategy
+    )
+    llm = RecordingLLM([tool_call_response("list_clients"), final_answer_response()])
+
+    await pattern.run(
+        context=build_context(tool_name="list_clients", max_messages=40),
+        tools=[dropped, untouched],
+        llm=llm,
+        compact_llm=None,
+        runtime=runtime,
+    )
+
+    recovery_tools = tool_names_of(llm, 0)
+    assert sorted(recovery_tools) == ["final_answer", "list_clients"]
+    assert "read_ledger" not in recovery_tools
+    assert "send_message" not in recovery_tools
+    assert "ask_user_question" not in recovery_tools
+    assert llm.calls[0]["tool_choice"] == "auto"
+    assert pattern.forced_answer_compaction_recoveries == 1
+    assert checkpoint_labels(runtime).count(RECOVERY_CHECKPOINT) == 1
+    # The recovery turn cleared the forcing outright rather than deferring it.
+    assert state_at(runtime, RECOVERY_CHECKPOINT)["force_final_answer_next"] is False
+    assert state_at(runtime, RECOVERY_CHECKPOINT)["forced_answer_reason"] is None
+    # The turn after it inherits a verdict, whichever way the re-fetch went.
+    assert (
+        state_at(runtime, "before_llm", 1)["forced_answer_recovery_followup"]
+        in FORCED_ANSWER_FOLLOWUPS
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_recovery_turn_is_followed_by_a_forced_answer_turn() -> None:
+    """A successful re-fetch buys exactly one ordinary forced answer turn."""
+    pattern = ReActPattern(max_iterations=6)
+    pattern.force_final_answer_next = True
+    pattern.forced_answer_reason = FORCED_ANSWER_REASON_REPEATED_TOOL_DECISION
+    runtime = recovery_runtime(by_name={"list_clients": 2}, count=2)
+    llm = RecordingLLM([tool_call_response("list_clients"), final_answer_response()])
+
+    await pattern.run(
+        context=build_context(tool_name="list_clients", max_messages=40),
+        tools=[NamedTool("list_clients")],
+        llm=llm,
+        compact_llm=None,
+        runtime=runtime,
+    )
+
+    assert (
+        state_at(runtime, "before_llm", 1)["forced_answer_recovery_followup"]
+        == FORCED_ANSWER_FOLLOWUP_REFETCHED
+    )
+    assert tool_names_of(llm, 1) == ["final_answer"]
+    assert llm.calls[1]["tool_choice"] == "required"
+    # The evidence came back, so the ordinary wording is correct again.
+    assert HONEST_PHRASE not in instruction_of(llm, 1)
+    assert STALE_EVIDENCE_PHRASE in instruction_of(llm, 1)
+    assert pattern.forced_answer_reason == FORCED_ANSWER_REASON_COMPACTION_RECOVERY
+
+
+@pytest.mark.asyncio
+async def test_a_failed_refetch_leads_to_an_honest_forced_answer() -> None:
+    """Calling the tool is not the same as getting the evidence back.
+
+    The verdict reads this turn's own call ids against the ledger, not the tool
+    name. The dropped observation was itself a successful call of that name and
+    its ledger entry outlives the compaction, so a name match would always say
+    the evidence is back.
+    """
+    pattern = ReActPattern(max_iterations=6)
+    pattern.force_final_answer_next = True
+    pattern.forced_answer_reason = FORCED_ANSWER_REASON_REPEATED_TOOL_DECISION
+    runtime = recovery_runtime(by_name={"list_clients": 2}, count=2)
+    llm = RecordingLLM([tool_call_response("list_clients"), final_answer_response()])
+    context = build_context(tool_name="list_clients", max_messages=40)
+
+    await pattern.run(
+        context=context,
+        tools=[FailingTool("list_clients")],
+        llm=llm,
+        compact_llm=None,
+        runtime=runtime,
+    )
+
+    assert (
+        state_at(runtime, "before_llm", 1)["forced_answer_recovery_followup"]
+        == FORCED_ANSWER_FOLLOWUP_NO_EVIDENCE
+    )
+    assert tool_names_of(llm, 1) == ["final_answer"]
+    assert HONEST_PHRASE in instruction_of(llm, 1)
+    assert STALE_EVIDENCE_PHRASE not in whole_prompt_of(llm, 1)
+
+
+@pytest.mark.asyncio
+async def test_a_stale_success_left_in_the_tail_does_not_count_as_recovered() -> None:
+    """The message-dropping path keeps a decoy, and the verdict ignores it.
+
+    Its tail window can hold an older successful observation of the same tool
+    while removing the one the answer needed. Asking "is there tool evidence in
+    context" answers yes here and is exactly the wrong question.
+    """
+    pattern = ReActPattern(max_iterations=6)
+    pattern.force_final_answer_next = True
+    pattern.forced_answer_reason = FORCED_ANSWER_REASON_REPEATED_TOOL_DECISION
+    runtime = recovery_runtime(
+        by_name={"list_clients": 1}, count=1, strategy="truncate"
+    )
+    llm = RecordingLLM([tool_call_response("list_clients"), final_answer_response()])
+    context = build_context(tool_name="list_clients", max_messages=40)
+
+    await pattern.run(
+        context=context,
+        tools=[FailingTool("list_clients")],
+        llm=llm,
+        compact_llm=None,
+        runtime=runtime,
+    )
+
+    assert any(message.role == "tool" for message in context.messages)
+    assert HONEST_PHRASE in instruction_of(llm, 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "second_forcing_from_repeated_decision",
+        "recovery_followup_never_chains",
+    ],
+)
+async def test_the_recovery_budget_is_spent_once_per_pattern(scenario: str) -> None:
+    """One re-fetch per pattern, and the turn it buys can never buy another.
+
+    Two separate things hold the line. The budget stops a second recovery in
+    the same run, and the follow-up turn's own reason sits in the exempt set so
+    that even with budget to spare it cannot recover again -- which is what
+    stops recovery from chaining indefinitely.
+    """
+    pattern = ReActPattern(max_iterations=8)
+    pattern.force_final_answer_next = True
+    pattern.forced_answer_reason = FORCED_ANSWER_REASON_REPEATED_TOOL_DECISION
+    if scenario == "recovery_followup_never_chains":
+        # Budget deliberately widened: whatever refuses the second recovery
+        # here, it is not the budget.
+        pattern.forced_answer_compaction_recoveries = -1
+    runtime = ScriptedCompactionRuntime(
+        [
+            compact_result(by_name={"list_clients": 2}, count=2),
+            compact_result(by_name={"list_clients": 2}, count=2),
+        ]
+    )
+    llm = RecordingLLM([tool_call_response("list_clients"), final_answer_response()])
+
+    await pattern.run(
+        context=build_context(tool_name="list_clients", max_messages=40),
+        tools=[NamedTool("list_clients")],
+        llm=llm,
+        compact_llm=None,
+        runtime=runtime,
+    )
+
+    # Turn 0 recovered. Turn 1 lost evidence again and must not recover.
+    assert checkpoint_labels(runtime).count(RECOVERY_CHECKPOINT) == 1
+    assert tool_names_of(llm, 1) == ["final_answer"]
+    assert HONEST_PHRASE in instruction_of(llm, 1)
+
+
+@pytest.mark.parametrize(
+    ("name_count", "name_length"),
+    [(0, 8), (1, 8), (20, 8), (21, 8), (1, 65), (20, 64)],
+)
+def test_the_recovery_message_authorizes_a_bounded_refetch(
+    name_count: int, name_length: int
+) -> None:
+    """Four things must be said, and the tool names must stay bounded.
+
+    The names come from dynamic server configuration and this message enters
+    the context on every recovery, so it mirrors all three bounds the
+    compaction notice already applies rather than inventing its own.
+    """
+    pattern = ReActPattern(max_iterations=6)
+    names = {
+        f"tool_{index}".ljust(name_length, "z")[:name_length]
+        for index in range(name_count)
+    }
+    message = pattern._forced_answer_recovery_message(names)
+
+    # 1: which observations went missing.
+    assert "removed from context by compaction" in message
+    # 2: re-fetching is expected, and it outranks the standing advice.
+    assert "expected action" in message
+    assert "takes priority over any earlier" in message
+    assert "not to repeat completed tool work" in message
+    # 3: only reading tools may be re-run.
+    assert "Only re-run tools that read" in message
+    assert "writes, sends, executes, or otherwise changes state" in message
+    # 4: no answer before the values are back, and no stand-in for them.
+    assert "Do not give the final answer before" in message
+    assert "reconstructing, estimating, or illustrating" in message
+
+    listed = [line for line in message.splitlines() if line.startswith("- tool_")]
+    assert len(listed) <= COMPACT_DROPPED_TOOL_NOTICE_MAX_NAMES
+    assert all(len(line) - 2 <= COMPACT_DROPPED_TOOL_NAME_MAX_CHARS for line in listed)
+    assert len(message) <= COMPACT_DROPPED_TOOL_NOTICE_MAX_CHARS + max(
+        (len(line) + 1 for line in message.splitlines()), default=0
+    )
+    if name_count > len(listed):
+        assert "additional tool name" in message
+    if name_count:
+        assert listed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        "no_evidence_dropped",
+        "refetch_succeeds",
+        "refetch_fails",
+        "model_answers_without_refetching",
+        "model_answers_in_plain_text",
+        "model_calls_out_of_set_tool",
+        "single_call_cannot_recover",
+        "recovery_at_the_exact_iteration_floor",
+    ],
+)
+async def test_an_evidence_loss_still_ends_the_run_with_an_answer(
+    outcome: str,
+) -> None:
+    """However the recovery turn ends, the run delivers an answer.
+
+    Spending a turn on re-fetching only helps if the run can still afford the
+    answer afterwards, which is what the remaining-iterations floor buys. A run
+    that recovers and then hits its iteration ceiling would have been better
+    off never recovering.
+    """
+    tools: list[Any] = [NamedTool("list_clients")]
+    pattern = ReActPattern(max_iterations=6)
+    pattern.force_final_answer_next = True
+    pattern.forced_answer_reason = FORCED_ANSWER_REASON_REPEATED_TOOL_DECISION
+    scripted: list[Any] = [compact_result(by_name={"list_clients": 2}, count=2)]
+    responses: list[Any] = [
+        tool_call_response("list_clients"),
+        final_answer_response(),
+    ]
+
+    if outcome == "no_evidence_dropped":
+        scripted = [compact_result(count=0, by_name={})]
+        responses = [final_answer_response()]
+    elif outcome == "refetch_fails":
+        tools = [FailingTool("list_clients")]
+    elif outcome == "model_answers_without_refetching":
+        responses = [final_answer_response()]
+    elif outcome == "model_answers_in_plain_text":
+        responses = [{"content": "Answering from the summary.", "done": True}]
+    elif outcome == "model_calls_out_of_set_tool":
+        tools = [NamedTool("list_clients"), NamedTool("read_ledger")]
+        responses = [
+            tool_call_response("read_ledger"),
+            final_answer_response(),
+        ]
+    elif outcome == "single_call_cannot_recover":
+        pattern = ReActPattern(max_iterations=2, finalize_after_tool_result=True)
+        pattern.current_iteration = 1
+        pattern.force_final_answer_next = True
+        pattern.forced_answer_reason = FORCED_ANSWER_REASON_FINALIZE_AFTER_TOOL
+        responses = [final_answer_response()]
+    elif outcome == "recovery_at_the_exact_iteration_floor":
+        # Exactly two iterations left: one to re-fetch, one to answer.
+        pattern = ReActPattern(max_iterations=4)
+        pattern.current_iteration = 2
+        pattern.force_final_answer_next = True
+        pattern.forced_answer_reason = FORCED_ANSWER_REASON_REPEATED_TOOL_DECISION
+        tools = [FailingTool("list_clients")]
+
+    runtime = ScriptedCompactionRuntime(scripted)
+    llm = RecordingLLM(responses)
+    result = await pattern.run(
+        context=build_context(tool_name="list_clients", max_messages=40),
+        tools=tools,
+        llm=llm,
+        compact_llm=None,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert isinstance(result["response"], str) and result["response"].strip()
+    assert result.get("status") != "max_iterations"
+    assert "max_iterations" not in checkpoint_labels(runtime)
+
+    if outcome == "single_call_cannot_recover":
+        assert checkpoint_labels(runtime).count(RECOVERY_CHECKPOINT) == 0
+        assert HONEST_PHRASE in instruction_of(llm, 0)
+    elif outcome == "no_evidence_dropped":
+        assert checkpoint_labels(runtime).count(RECOVERY_CHECKPOINT) == 0
+        assert HONEST_PHRASE not in instruction_of(llm, 0)
+    else:
+        assert checkpoint_labels(runtime).count(RECOVERY_CHECKPOINT) == 1
+
+    if outcome == "recovery_at_the_exact_iteration_floor":
+        # The floor is the only reason this run had room for both turns.
+        assert pattern.forced_answer_compaction_recoveries == 1
+        assert HONEST_PHRASE in instruction_of(llm, 1)
+    if outcome == "refetch_succeeds":
+        assert HONEST_PHRASE not in instruction_of(llm, 1)
+    if outcome == "refetch_fails":
+        assert HONEST_PHRASE in instruction_of(llm, 1)
+    if outcome == "model_calls_out_of_set_tool":
+        # The model fetched something, but not what went missing.
+        assert HONEST_PHRASE in instruction_of(llm, 1)
+
+
+class SucceedsThenFailsTool(NamedTool):
+    """Work tool that succeeds on its first call and fails afterwards."""
+
+    async def run_json_async(self, args: dict[str, Any]) -> Any:
+        self.calls.append(args)
+        if len(self.calls) == 1:
+            return {"output": f"{self.name} first result"}
+        return {"success": False, "error": f"{self.name} is unavailable now"}
+
+
+@pytest.mark.asyncio
+async def test_an_older_successful_call_does_not_pass_for_a_recovered_one() -> None:
+    """The ledger outlives compaction, so the verdict cannot go by name.
+
+    The observation compaction dropped was itself a successful call of a
+    recovery-set tool, and its ledger entry survives -- compaction removes
+    messages, not ledger entries. Asking "has a tool of this name ever
+    succeeded" therefore answers yes before the recovery turn even starts.
+    Here the same tool succeeds on the first turn and fails on the re-fetch,
+    so the two readings disagree and only the turn-scoped one is right.
+    """
+    tool = SucceedsThenFailsTool("list_clients")
+    pattern = ReActPattern(max_iterations=6, finalize_after_tool_result=True)
+    runtime = ScriptedCompactionRuntime(
+        [None, compact_result(by_name={"list_clients": 1}, count=1)]
+    )
+    llm = RecordingLLM(
+        [
+            tool_call_response("list_clients", call_id="first"),
+            tool_call_response("list_clients", call_id="refetch"),
+            final_answer_response(),
+        ]
+    )
+    context = ExecutionContext(execution_id="ledger-scope")
+    context.add_user_message("List every client.")
+
+    await pattern.run(
+        context=context,
+        tools=[tool],
+        llm=llm,
+        compact_llm=None,
+        runtime=runtime,
+    )
+
+    assert len(tool.calls) == 2
+    assert checkpoint_labels(runtime).count(RECOVERY_CHECKPOINT) == 1
+    assert "first" in pattern.tool_ledger
+    assert pattern.tool_ledger["first"].status == "completed"
+    assert (
+        state_at(runtime, "before_llm", 2)["forced_answer_recovery_followup"]
+        == FORCED_ANSWER_FOLLOWUP_NO_EVIDENCE
+    )
+    assert HONEST_PHRASE in instruction_of(llm, 2)

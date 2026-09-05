@@ -11,12 +11,13 @@ from typing import Callable, cast
 from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
-from ..models.uploaded_file import UploadedFile
+from ..models.uploaded_file import DETACHED_REASONS, UploadedFile
 from .db_runtime import is_database_pool_timeout, run_db_io_cancellation_safe
 from .uploaded_file_store import (
     StoragePresence,
     delete_registered_preview_caches,
     delete_uploaded_file_compensation_object,
+    delete_uploaded_file_local_copy_if_owned,
     settle_uploaded_file_compensation_no_commit,
     take_over_uploaded_file_compensation_no_commit,
 )
@@ -36,6 +37,8 @@ class UploadedFileCompensationCandidate:
     file_id: str
     task_id: int | None
     storage_key: str
+    storage_path: str
+    cleanup_local: bool
     updated_at: datetime | None
 
     @property
@@ -102,6 +105,15 @@ def get_stale_uploaded_file_compensation_candidates(
             file_id=str(record.file_id),
             task_id=(int(record.task_id) if record.task_id is not None else None),
             storage_key=str(record.storage_key),
+            storage_path=str(record.storage_path),
+            cleanup_local=(
+                (
+                    str(record.detached_reason) in DETACHED_REASONS
+                    if record.detached_reason is not None
+                    else False
+                )
+                or str(record.upload_source) == "taskless_share_upload"
+            ),
             updated_at=cast(datetime | None, record.updated_at),
         )
         for record in records
@@ -148,6 +160,7 @@ def recover_stale_uploaded_file_compensations_batch_isolated(
                     task_id=candidate.task_id,
                     storage_key=candidate.storage_key,
                     expected_updated_at=candidate.updated_at,
+                    storage_path=candidate.storage_path,
                 )
                 if takeover_token is None:
                     db.rollback()
@@ -167,6 +180,11 @@ def recover_stale_uploaded_file_compensations_batch_isolated(
             continue
 
         try:
+            if candidate.cleanup_local:
+                delete_uploaded_file_local_copy_if_owned(
+                    storage_path=candidate.storage_path,
+                    user_id=candidate.user_id,
+                )
             presence = compensation_delete(
                 user_id=candidate.user_id,
                 storage_key=candidate.storage_key,
@@ -196,6 +214,7 @@ def recover_stale_uploaded_file_compensations_batch_isolated(
                     storage_key=candidate.storage_key,
                     expected_updated_at=takeover_token,
                     presence="absent",
+                    storage_path=candidate.storage_path,
                 )
                 if settlement is None:
                     db.rollback()

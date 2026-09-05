@@ -36,8 +36,9 @@ from ...core.execution_scope import resolve_execution_scope
 from ...core.file_ref import FILE_REF_MODEL_INSTRUCTIONS
 from ..models.database import release_db_connection_if_clean
 from ..models.task import Task
-from ..models.uploaded_file import UploadedFile
+from ..models.uploaded_file import UploadedFile, uploaded_file_bind_values
 from .managed_file_ref import ensure_uploaded_file_local_path
+from .task_file_lifecycle import lock_task_no_commit
 
 logger = logging.getLogger(__name__)
 
@@ -287,6 +288,7 @@ def bind_turn_files(
         db=db,
     )
     if missing:
+        db.rollback()
         raise ValueError("Files are no longer bindable: " + ", ".join(missing))
     db.commit()
 
@@ -310,6 +312,15 @@ def bind_turn_files_no_commit(
     if not ids:
         return []
     ids = list(dict.fromkeys(ids))
+    if (
+        lock_task_no_commit(
+            db,
+            task_id=task_id,
+            owner_user_id=owner_user_id,
+        )
+        is None
+    ):
+        return ids
     # Claim every currently-unbound row first. On PostgreSQL the conditional
     # UPDATE waits for a concurrent writer and then re-evaluates its predicate;
     # on SQLite the serialized writer lock provides the same winner/loser
@@ -320,7 +331,7 @@ def bind_turn_files_no_commit(
         UploadedFile.user_id == owner_user_id,
         UploadedFile.task_id.is_(None),
         UploadedFile.storage_status != "compensating",
-    ).update({UploadedFile.task_id: task_id}, synchronize_session=False)
+    ).update(uploaded_file_bind_values(task_id), synchronize_session=False)
     bound_rows = (
         db.query(UploadedFile.file_id)
         .filter(

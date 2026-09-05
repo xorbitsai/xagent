@@ -1,3 +1,5 @@
+from dataclasses import replace
+from datetime import datetime, timezone
 from uuid import uuid4
 
 import pytest
@@ -88,6 +90,25 @@ def _generation_key(
         f"users/{user_id}/tasks/{task_id}/outputs/{file_id}/"
         f"_versions/{generation}/{filename}"
     )
+
+
+def _detached_record(db, *, user_id: int, file_id: str) -> UploadedFile:
+    record = UploadedFile(
+        file_id=file_id,
+        user_id=user_id,
+        task_id=None,
+        filename="result.txt",
+        storage_path=f"/tmp/{file_id}.txt",
+        storage_key=f"users/{user_id}/uploads/{file_id}/result.txt",
+        checksum="old-checksum",
+        storage_status="available",
+        detached_reason="task_deleted",
+        detached_at=datetime.now(timezone.utc),
+        file_size=7,
+    )
+    db.add(record)
+    db.commit()
+    return record
 
 
 def test_upsert_already_durable_rejects_a_compensating_version():
@@ -279,6 +300,114 @@ def test_upsert_already_durable_allows_explicit_same_owner_task_rebind():
     assert persisted.user_id == user_id
     assert persisted.task_id == 24
     assert persisted.storage_key == new_key
+
+
+def test_durable_rebind_clears_detach_provenance_atomically():
+    db = _session()
+    user = _user(db)
+    record = _detached_record(db, user_id=int(user.id), file_id="file-detached-rebind")
+    expected = snapshot_uploaded_file_version(record)
+
+    UploadedFileStore(db).upsert_already_durable(
+        _staged_version(
+            user_id=int(user.id),
+            file_id=str(record.file_id),
+            task_id=24,
+            storage_path=str(record.storage_path),
+            storage_key="users/1/tasks/24/outputs/file-detached-rebind/result.txt",
+            checksum="new-checksum",
+        ),
+        expected=expected,
+        allow_task_rebind=True,
+    )
+    db.commit()
+
+    db.refresh(record)
+    assert record.task_id == 24
+    assert record.detached_reason is None
+    assert record.detached_at is None
+
+
+def test_unbound_durable_refresh_preserves_detach_provenance():
+    db = _session()
+    user = _user(db)
+    record = _detached_record(db, user_id=int(user.id), file_id="file-detached-refresh")
+    detached_at = record.detached_at
+
+    UploadedFileStore(db).upsert_already_durable(
+        _staged_version(
+            user_id=int(user.id),
+            file_id=str(record.file_id),
+            task_id=None,
+            storage_path=str(record.storage_path),
+            storage_key="users/1/uploads/file-detached-refresh/v2/result.txt",
+            checksum="new-checksum",
+        ),
+        expected=snapshot_uploaded_file_version(record),
+    )
+    db.commit()
+
+    db.refresh(record)
+    assert record.task_id is None
+    assert record.detached_reason == "task_deleted"
+    assert record.detached_at == detached_at
+
+
+@pytest.mark.parametrize(
+    ("replacement_task_id", "replacement_filename", "keeps_marker"),
+    [(25, "result.txt", False), (None, "previous.txt", True)],
+)
+def test_metadata_restore_updates_detach_provenance_for_binding(
+    replacement_task_id, replacement_filename, keeps_marker
+):
+    db = _session()
+    user = _user(db)
+    record = _detached_record(
+        db,
+        user_id=int(user.id),
+        file_id=f"file-restore-{replacement_task_id or 'unbound'}",
+    )
+    detached_at = record.detached_at
+    expected = snapshot_uploaded_file_version(record)
+
+    UploadedFileStore(db).restore_metadata_version_no_commit(
+        expected=expected,
+        replacement=replace(
+            expected,
+            task_id=replacement_task_id,
+            filename=replacement_filename,
+        ),
+    )
+    db.commit()
+    db.refresh(record)
+
+    assert record.task_id == replacement_task_id
+    assert record.detached_reason == ("task_deleted" if keeps_marker else None)
+    assert record.detached_at == (detached_at if keeps_marker else None)
+
+
+def test_metadata_restore_rejects_a_stale_expected_version():
+    db = _session()
+    user = _user(db)
+    record = _detached_record(
+        db,
+        user_id=int(user.id),
+        file_id="file-restore-stale",
+    )
+    expected = snapshot_uploaded_file_version(record)
+    record.checksum = "concurrent-checksum"
+    db.commit()
+
+    with pytest.raises(UploadedFileVersionConflict, match="metadata rollback"):
+        UploadedFileStore(db).restore_metadata_version_no_commit(
+            expected=expected,
+            replacement=replace(expected, filename="previous.txt"),
+        )
+
+    db.rollback()
+    db.refresh(record)
+    assert record.filename == "result.txt"
+    assert record.checksum == "concurrent-checksum"
 
 
 def test_explicit_task_rebind_still_rejects_a_stale_version():

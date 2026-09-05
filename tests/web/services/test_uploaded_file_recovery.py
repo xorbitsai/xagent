@@ -54,6 +54,7 @@ def _create_compensating_file(
     *,
     suffix: str,
     updated_at: datetime | None,
+    storage_path: str | None = None,
 ) -> tuple[int, int, str, str]:
     with SessionLocal() as db:
         user = User(
@@ -70,7 +71,7 @@ def _create_compensating_file(
             file_id=file_id,
             user_id=user_id,
             filename=f"{suffix}.txt",
-            storage_path=f"/tmp/{suffix}.txt",
+            storage_path=storage_path or f"/tmp/{suffix}.txt",
             storage_backend="s3",
             storage_key=storage_key,
             checksum="checksum",
@@ -176,6 +177,71 @@ def test_recovery_deletes_absent_and_defers_unsafe_storage_outcomes(
                 str(record.storage_status) if record is not None else None
             ) == expected_status
         assert cache_path.exists() is (presence != "absent")
+    finally:
+        engine.dispose()
+
+
+def test_recovery_finishes_local_cleanup_after_a_claimed_gc_crash(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    uploads_root = tmp_path / "uploads"
+    monkeypatch.setenv("XAGENT_UPLOADS_DIR", str(uploads_root))
+    engine, SessionLocal = _database(tmp_path)
+    now = datetime.now(timezone.utc)
+
+    with SessionLocal() as db:
+        user = User(
+            username="claimed-gc-crash",
+            password_hash="hash",
+            is_admin=False,
+        )
+        db.add(user)
+        db.flush()
+        user_id = int(user.id)
+        local_path = uploads_root / f"user_{user_id}" / "claimed.txt"
+        local_path.parent.mkdir(parents=True)
+        local_path.write_text("payload", encoding="utf-8")
+        file_id = "recovery-claimed-gc-crash"
+        storage_key = f"users/{user_id}/uploads/{file_id}/claimed.txt"
+        record = UploadedFile(
+            file_id=file_id,
+            user_id=user_id,
+            filename="claimed.txt",
+            storage_path=str(local_path),
+            storage_backend="s3",
+            storage_key=storage_key,
+            checksum="checksum",
+            storage_status="compensating",
+            detached_reason="task_deleted",
+            detached_at=now - timedelta(days=8),
+            file_size=7,
+            updated_at=now - timedelta(minutes=10),
+        )
+        db.add(record)
+        db.commit()
+        row_id = int(record.id)
+
+    try:
+        with SessionLocal() as db:
+            candidate = get_stale_uploaded_file_compensation_candidates(
+                db,
+                cutoff=now - timedelta(minutes=5),
+                limit=1,
+            )[0]
+        assert candidate.storage_path == str(local_path)
+
+        result = recover_stale_uploaded_file_compensations_batch_isolated(
+            cutoff=now - timedelta(minutes=5),
+            batch_size=10,
+            session_factory=SessionLocal,
+            compensation_delete=lambda **_kwargs: "absent",
+        )
+
+        assert result.deleted == 1
+        assert not local_path.exists()
+        with SessionLocal() as db:
+            assert db.query(UploadedFile).filter_by(id=row_id).first() is None
     finally:
         engine.dispose()
 

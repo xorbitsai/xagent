@@ -2723,3 +2723,27 @@ class TestUrlUserinfoRejectionIsScopedToDeepDoc:
 
         assert get_public_api_base_url() == "http://user:pw@api.example.com"
         assert get_s2s_api_base_url() == "http://user:pw@api.example.com"
+
+
+def test_detached_upload_retention_defaults_to_seven_days(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("XAGENT_DETACHED_UPLOAD_RETENTION_SECONDS", raising=False)
+
+    assert config.get_detached_upload_retention_seconds() == 7 * 24 * 60 * 60
+
+
+def test_detached_upload_retention_accepts_an_explicit_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("XAGENT_DETACHED_UPLOAD_RETENTION_SECONDS", "7200")
+
+    assert config.get_detached_upload_retention_seconds() == 7200
+
+
+def test_detached_upload_retention_falls_back_below_one_hour(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("XAGENT_DETACHED_UPLOAD_RETENTION_SECONDS", "3599")
+
+    assert config.get_detached_upload_retention_seconds() == 7 * 24 * 60 * 60

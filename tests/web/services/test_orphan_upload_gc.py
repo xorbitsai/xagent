@@ -28,6 +28,7 @@ from xagent.web.services.orphan_upload_gc import (
     _claim_orphan,
     _OrphanUploadCandidate,
     _run_gc_tick,
+    cleanup_detached_uploaded_files,
     cleanup_orphaned_taskless_uploads,
 )
 from xagent.web.services.uploaded_file_recovery import (
@@ -52,6 +53,11 @@ def db_session(tmp_path):
         Base.metadata.drop_all(bind=get_engine())
 
 
+@pytest.fixture(autouse=True)
+def configured_uploads_root(tmp_path, monkeypatch):
+    monkeypatch.setenv("XAGENT_UPLOADS_DIR", str(tmp_path))
+
+
 @pytest.fixture()
 def owner(db_session) -> User:
     user = User(username="gc-owner", password_hash="h", is_admin=False)
@@ -69,11 +75,16 @@ def _mk_upload(
     marker: str | None,
     task_id: int | None,
     age_days: float,
+    detached_reason: str | None = None,
+    detached_age_days: float | None = None,
+    under_user_root: bool = True,
 ) -> tuple[UploadedFile, Path]:
     """One registered upload in the exact shape the public path leaves it:
     ``available`` with a durable storage key (the only state a marked row can
     exist in — the registration pipeline never commits anything else)."""
-    path = tmp_path / name
+    root = tmp_path / f"user_{int(owner.id)}" if under_user_root else tmp_path
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / name
     path.write_bytes(b"payload")
     now = datetime.now(timezone.utc)
     file_id = str(uuid4())
@@ -87,6 +98,12 @@ def _mk_upload(
         storage_status="available",
         file_size=path.stat().st_size,
         upload_source=marker,
+        detached_reason=detached_reason,
+        detached_at=(
+            now - timedelta(days=detached_age_days)
+            if detached_age_days is not None
+            else None
+        ),
         created_at=now - timedelta(days=age_days),
         updated_at=now - timedelta(days=age_days),
     )
@@ -104,6 +121,8 @@ def _candidate(row: UploadedFile) -> _OrphanUploadCandidate:
         storage_key=str(row.storage_key),
         storage_path=str(row.storage_path),
         created_at=row.created_at,
+        detached_reason=row.detached_reason,
+        detached_at=row.detached_at,
     )
 
 
@@ -332,9 +351,8 @@ def test_row_bound_between_fetch_and_claim_is_spared(
 ) -> None:
     """A run-start bind that commits after the batch query but before the
     claim must win: the claim's predicate no longer matches, so the metadata
-    row and durable object survive. (The local staging copy is deleted before
-    the claim by design — the bound consumer re-materializes it from the
-    durable object.)"""
+    row, local copy, and durable object survive because cleanup has not yet
+    won the claim."""
     task_id = _make_task(db_session, owner)
     row, path = _mk_upload(
         db_session,
@@ -365,7 +383,199 @@ def test_row_bound_between_fetch_and_claim_is_spared(
     survivor = db_session.query(UploadedFile).filter_by(id=row_id).one()
     assert survivor.task_id == task_id
     assert survivor.storage_status == "available"  # never claimed
-    assert not path.exists()  # local copy gone; durable object is the source
+    assert path.exists()  # GC never obtained cleanup ownership
+
+
+def test_gc_never_unlinks_an_external_shared_path(
+    db_session, owner, tmp_path, monkeypatch
+) -> None:
+    row, path = _mk_upload(
+        db_session,
+        owner,
+        tmp_path / "external",
+        name="shared.txt",
+        marker=None,
+        task_id=None,
+        age_days=30,
+        detached_reason="task_deleted",
+        detached_age_days=8,
+        under_user_root=False,
+    )
+    row_id = int(row.id)
+    monkeypatch.setattr(
+        orphan_upload_gc,
+        "delete_uploaded_file_compensation_object",
+        lambda **_kwargs: "absent",
+    )
+
+    result = cleanup_detached_uploaded_files(
+        db_session,
+        older_than_seconds=7 * DAY,
+    )
+
+    assert (result.scanned, result.deleted) == (1, 1)
+    assert db_session.query(UploadedFile).filter_by(id=row_id).first() is None
+    assert path.exists()
+
+
+def test_detached_gc_uses_detach_time_and_spares_unmarked_drafts(
+    db_session, owner, tmp_path, monkeypatch
+) -> None:
+    old, old_path = _mk_upload(
+        db_session,
+        owner,
+        tmp_path,
+        name="old-detached.txt",
+        marker=None,
+        task_id=None,
+        age_days=30,
+        detached_reason="task_deleted",
+        detached_age_days=8,
+    )
+    recent, recent_path = _mk_upload(
+        db_session,
+        owner,
+        tmp_path,
+        name="recent-detached.txt",
+        marker=None,
+        task_id=None,
+        age_days=30,
+        detached_reason="task_deleted",
+        detached_age_days=1,
+    )
+    draft, draft_path = _mk_upload(
+        db_session,
+        owner,
+        tmp_path,
+        name="draft.txt",
+        marker=None,
+        task_id=None,
+        age_days=30,
+    )
+    old_id, recent_id, draft_id = int(old.id), int(recent.id), int(draft.id)
+    monkeypatch.setattr(
+        orphan_upload_gc,
+        "delete_uploaded_file_compensation_object",
+        lambda **_kwargs: "absent",
+    )
+
+    result = cleanup_detached_uploaded_files(
+        db_session,
+        older_than_seconds=7 * DAY,
+    )
+
+    assert (result.scanned, result.deleted) == (1, 1)
+    assert db_session.query(UploadedFile).filter_by(id=old_id).first() is None
+    assert not old_path.exists()
+    assert db_session.query(UploadedFile).filter_by(id=recent_id).first() is not None
+    assert recent_path.exists()
+    assert db_session.query(UploadedFile).filter_by(id=draft_id).first() is not None
+    assert draft_path.exists()
+
+
+def test_taskless_gc_never_bypasses_detached_retention_for_hybrid_rows(
+    db_session, owner, tmp_path, monkeypatch
+) -> None:
+    hybrid, hybrid_path = _mk_upload(
+        db_session,
+        owner,
+        tmp_path,
+        name="recent-hybrid.txt",
+        marker=TASKLESS_SHARE_UPLOAD_SOURCE,
+        task_id=None,
+        age_days=30,
+        detached_reason="task_deleted",
+        detached_age_days=1,
+    )
+    ordinary, ordinary_path = _mk_upload(
+        db_session,
+        owner,
+        tmp_path,
+        name="ordinary-taskless.txt",
+        marker=TASKLESS_SHARE_UPLOAD_SOURCE,
+        task_id=None,
+        age_days=10,
+    )
+    hybrid_id, ordinary_id = int(hybrid.id), int(ordinary.id)
+    monkeypatch.setattr(
+        orphan_upload_gc,
+        "delete_uploaded_file_compensation_object",
+        lambda **_kwargs: "absent",
+    )
+
+    taskless = cleanup_orphaned_taskless_uploads(
+        db_session,
+        older_than_seconds=2 * DAY,
+    )
+
+    assert (taskless.scanned, taskless.deleted) == (1, 1)
+    assert db_session.query(UploadedFile).filter_by(id=ordinary_id).first() is None
+    assert not ordinary_path.exists()
+    assert db_session.query(UploadedFile).filter_by(id=hybrid_id).first() is not None
+    assert hybrid_path.exists()
+
+
+def test_detached_claim_rejects_a_newer_detach_generation(
+    db_session, owner, tmp_path
+) -> None:
+    row, _ = _mk_upload(
+        db_session,
+        owner,
+        tmp_path,
+        name="detached-again.txt",
+        marker=None,
+        task_id=None,
+        age_days=30,
+        detached_reason="task_deleted",
+        detached_age_days=8,
+    )
+    stale_candidate = _candidate(row)
+    newer_detached_at = datetime.now(timezone.utc)
+    db_session.query(UploadedFile).filter_by(id=int(row.id)).update(
+        {UploadedFile.detached_at: newer_detached_at},
+        synchronize_session=False,
+    )
+    db_session.commit()
+
+    assert _claim_orphan(db_session, stale_candidate) is None
+    survivor = db_session.query(UploadedFile).filter_by(id=int(row.id)).one()
+    assert survivor.storage_status == "available"
+
+
+def test_claim_commit_failure_performs_no_physical_io(
+    db_session, owner, tmp_path, monkeypatch
+) -> None:
+    row, path = _mk_upload(
+        db_session,
+        owner,
+        tmp_path,
+        name="commit-failed.txt",
+        marker=None,
+        task_id=None,
+        age_days=30,
+        detached_reason="task_deleted",
+        detached_age_days=8,
+    )
+    durable_calls: list[str] = []
+    monkeypatch.setattr(
+        orphan_upload_gc,
+        "delete_uploaded_file_compensation_object",
+        lambda **_kwargs: durable_calls.append("delete") or "absent",
+    )
+    monkeypatch.setattr(
+        db_session,
+        "commit",
+        lambda: (_ for _ in ()).throw(RuntimeError("commit failed")),
+    )
+
+    result = cleanup_detached_uploaded_files(
+        db_session,
+        older_than_seconds=7 * DAY,
+    )
+
+    assert (result.scanned, result.deleted) == (1, 0)
+    assert durable_calls == []
+    assert path.exists()
 
 
 def test_pages_thread_the_cursor_and_drain_the_backlog(
@@ -465,6 +675,68 @@ async def test_tick_drains_full_pages_before_sleeping(
     )
     assert cursor is None
     assert db_session.query(UploadedFile).count() == 0
+
+
+@pytest.mark.asyncio
+async def test_combined_tick_keeps_separate_fair_cursors(
+    db_session, owner, tmp_path, monkeypatch
+) -> None:
+    for index in range(3):
+        _mk_upload(
+            db_session,
+            owner,
+            tmp_path,
+            name=f"fair-taskless-{index}.txt",
+            marker=TASKLESS_SHARE_UPLOAD_SOURCE,
+            task_id=None,
+            age_days=10 - index,
+        )
+        _mk_upload(
+            db_session,
+            owner,
+            tmp_path,
+            name=f"fair-detached-{index}.txt",
+            marker=None,
+            task_id=None,
+            age_days=30,
+            detached_reason="task_deleted",
+            detached_age_days=10 - index,
+        )
+    monkeypatch.setattr(
+        orphan_upload_gc,
+        "delete_uploaded_file_compensation_object",
+        lambda **_kwargs: "absent",
+    )
+
+    first = await orphan_upload_gc._run_combined_gc_tick(
+        ttl_seconds=2 * DAY,
+        detached_retention_seconds=7 * DAY,
+        batch_size=1,
+        max_pages=2,
+        after=None,
+        detached_after=None,
+        session_factory=get_session_local(),
+    )
+
+    assert first.taskless.backlog is True
+    assert first.detached.backlog is True
+    assert first.taskless.cursor is not None
+    assert first.detached.cursor is not None
+    assert db_session.query(UploadedFile).count() == 4
+
+    second = await orphan_upload_gc._run_combined_gc_tick(
+        ttl_seconds=2 * DAY,
+        detached_retention_seconds=7 * DAY,
+        batch_size=1,
+        max_pages=2,
+        after=first.taskless.cursor,
+        detached_after=first.detached.cursor,
+        session_factory=get_session_local(),
+    )
+
+    assert second.taskless.cursor != first.taskless.cursor
+    assert second.detached.cursor != first.detached.cursor
+    assert db_session.query(UploadedFile).count() == 2
 
 
 @pytest.mark.asyncio

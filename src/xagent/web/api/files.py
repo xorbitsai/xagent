@@ -1271,7 +1271,12 @@ async def list_files(
     if task_id is not None:
         query = query.filter(UploadedFile.task_id == task_id)
     elif uploads_only:
-        query = query.filter(UploadedFile.task_id.is_(None))
+        query = query.filter(
+            UploadedFile.task_id.is_(None),
+            UploadedFile.detached_reason.is_(None),
+        )
+    else:
+        query = query.filter(UploadedFile.detached_reason.is_(None))
 
     total_count = query.count()
     total_pages = max((total_count + size - 1) // size, 1)

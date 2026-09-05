@@ -1,10 +1,19 @@
 import uuid
+from datetime import datetime
+from typing import Any
 
 from sqlalchemy import Column, DateTime, ForeignKey, Index, Integer, String
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
 from .database import Base
+
+DETACHED_REASON_TASK_DELETED = "task_deleted"
+DETACHED_REASON_TASK_CREATE_FAILED = "task_create_failed"
+DETACHED_REASONS = (
+    DETACHED_REASON_TASK_DELETED,
+    DETACHED_REASON_TASK_CREATE_FAILED,
+)
 
 
 class UploadedFile(Base):  # type: ignore
@@ -26,6 +35,13 @@ class UploadedFile(Base):  # type: ignore
             "task_id",
             "created_at",
         ),
+        Index(
+            "ix_uploaded_files_detached_gc",
+            "task_id",
+            "storage_status",
+            "detached_at",
+            "id",
+        ),
     )
 
     id = Column(Integer, primary_key=True, index=True)
@@ -39,7 +55,9 @@ class UploadedFile(Base):  # type: ignore
     user_id = Column(
         Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False
     )
-    task_id = Column(Integer, ForeignKey("tasks.id", ondelete="CASCADE"), nullable=True)
+    task_id = Column(
+        Integer, ForeignKey("tasks.id", ondelete="SET NULL"), nullable=True
+    )
     # Index is created by migration 20260410_add_index_on_uploaded_files_filename.py
     # to ensure existing databases have the index for URL deduplication queries.
     filename = Column(String(512), nullable=False)
@@ -57,6 +75,8 @@ class UploadedFile(Base):  # type: ignore
     # only orphan GC keys off this so a coarse "task_id IS NULL" sweep can't
     # reap a logged-in user's un-sent draft attachments.
     upload_source = Column(String(64), nullable=True)
+    detached_reason = Column(String(64), nullable=True)
+    detached_at = Column(DateTime(timezone=True), nullable=True)
     storage_status = Column(String(32), nullable=False, default="legacy")
     mime_type = Column(String(255), nullable=True)
     file_size = Column(Integer, nullable=False, default=0)
@@ -68,3 +88,27 @@ class UploadedFile(Base):  # type: ignore
 
     def __repr__(self) -> str:
         return f"<UploadedFile(file_id={self.file_id}, filename='{self.filename}', user_id={self.user_id})>"
+
+
+def uploaded_file_bind_values(task_id: int) -> dict[Any, Any]:
+    """Return one atomic transition from detached/unbound to task-bound."""
+
+    return {
+        UploadedFile.task_id: task_id,
+        UploadedFile.detached_reason: None,
+        UploadedFile.detached_at: None,
+    }
+
+
+def uploaded_file_detach_values(
+    *, reason: str, detached_at: datetime
+) -> dict[Any, Any]:
+    """Return one validated task-detach transition."""
+
+    if reason not in DETACHED_REASONS:
+        raise ValueError(f"Unsupported uploaded-file detach reason: {reason}")
+    return {
+        UploadedFile.task_id: None,
+        UploadedFile.detached_reason: reason,
+        UploadedFile.detached_at: detached_at,
+    }

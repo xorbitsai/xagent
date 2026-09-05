@@ -20,6 +20,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from ..config import (
     get_agent_runtime,
     get_background_job_sweep_interval_seconds,
+    get_detached_upload_retention_seconds,
     get_external_upload_dirs,
     get_file_storage_startup_sync_enabled,
     get_gmail_watch_enabled,
@@ -625,17 +626,20 @@ def start_orphan_upload_gc_task(
 
     poll_interval_seconds = get_orphan_upload_sweep_interval_seconds()
     ttl_seconds = get_taskless_upload_ttl_seconds()
+    detached_retention_seconds = get_detached_upload_retention_seconds()
     task = asyncio.create_task(
         run_orphan_upload_gc_loop(
             poll_interval_seconds=poll_interval_seconds,
             ttl_seconds=ttl_seconds,
+            detached_retention_seconds=detached_retention_seconds,
         )
     )
     app_instance.state.orphan_upload_gc_task = task
     logger.info(
-        "Started orphan upload GC loop (interval=%ss, ttl=%ss)",
+        "Started orphan upload GC loop (interval=%ss, ttl=%ss, detached=%ss)",
         poll_interval_seconds,
         ttl_seconds,
+        detached_retention_seconds,
     )
     return task
 

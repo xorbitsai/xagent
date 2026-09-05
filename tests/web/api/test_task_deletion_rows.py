@@ -49,7 +49,14 @@ def test_purge_task_rows_detaches_uploaded_files_instead_of_deleting_them() -> N
         )
         db.commit()
 
-        assert purge_task_rows(db, task_id=task_id) is True
+        assert (
+            purge_task_rows(
+                db,
+                task_id=task_id,
+                detached_reason="task_deleted",
+            )
+            is True
+        )
         db.commit()
 
         assert db.query(Task).filter(Task.id == task_id).count() == 0
@@ -58,6 +65,8 @@ def test_purge_task_rows_detaches_uploaded_files_instead_of_deleting_them() -> N
         )
         assert len(surviving) == 2
         assert all(row.task_id is None for row in surviving)
+        assert all(row.detached_reason == "task_deleted" for row in surviving)
+        assert all(row.detached_at is not None for row in surviving)
         assert {row.filename for row in surviving} == {"kept-0.txt", "kept-1.txt"}
     finally:
         db.close()
@@ -69,6 +78,13 @@ def test_purge_task_rows_returns_false_for_a_missing_task() -> None:
     _admin_headers()
     db = _direct_db_session()
     try:
-        assert purge_task_rows(db, task_id=987654321) is False
+        assert (
+            purge_task_rows(
+                db,
+                task_id=987654321,
+                detached_reason="task_create_failed",
+            )
+            is False
+        )
     finally:
         db.close()

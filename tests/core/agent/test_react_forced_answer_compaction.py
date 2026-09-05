@@ -39,6 +39,7 @@ from xagent.core.agent.pattern.react.react import (
     FORCED_ANSWER_RECOVERY_BUDGET,
     FORCED_ANSWER_RECOVERY_MIN_REMAINING_ITERATIONS,
 )
+from xagent.core.model.chat.exceptions import LLMToolProtocolError
 
 REACT_SOURCE_PATH = Path(react_module.__file__)
 
@@ -1353,3 +1354,212 @@ async def test_an_older_successful_call_does_not_pass_for_a_recovered_one() -> N
         == FORCED_ANSWER_FOLLOWUP_NO_EVIDENCE
     )
     assert HONEST_PHRASE in instruction_of(llm, 2)
+
+
+COMPLETE_SET_PHRASE = "Re-decide this turn using the complete current tool set"
+TURN_SET_PHRASE = "which is the set available on this turn"
+
+
+class ProtocolErrorLLM(RecordingLLM):
+    """Chat LLM that raises a provider protocol error on a chosen call."""
+
+    def __init__(self, responses: list[Any], *, fail_on: int, code: str) -> None:
+        super().__init__(responses)
+        self.fail_on = fail_on
+        self.code = code
+
+    async def chat(self, **kwargs: Any) -> Any:
+        index = len(self.calls)
+        self.calls.append(kwargs)
+        if index == self.fail_on:
+            raise LLMToolProtocolError(
+                provider="deepseek",
+                code=self.code,
+                message=f"provider returned {self.code}",
+            )
+        if not self.responses:
+            return {"content": "fallback answer", "done": True}
+        return self.responses.pop(0)
+
+
+async def run_protocol_retry(
+    turn_kind: str,
+    protocol_error: str,
+    *,
+    user_interaction_enabled: bool = True,
+) -> tuple[ReActPattern, ProtocolErrorLLM, ScriptedCompactionRuntime, set[str]]:
+    """Drive one turn whose first LLM call fails the tool protocol."""
+    tools = [NamedTool("list_clients"), NamedTool("read_ledger")]
+    pattern = ReActPattern(
+        max_iterations=6, user_interaction_enabled=user_interaction_enabled
+    )
+    scripted: list[Any] = [None]
+    recovery_set: set[str] = set()
+
+    if turn_kind == "recovery_turn":
+        pattern.force_final_answer_next = True
+        pattern.forced_answer_reason = FORCED_ANSWER_REASON_REPEATED_TOOL_DECISION
+        scripted = [compact_result(by_name={"list_clients": 2}, count=2)]
+        recovery_set = {"list_clients", "final_answer"}
+    elif turn_kind == "forced_turn":
+        pattern.force_final_answer_next = True
+        pattern.forced_answer_reason = FORCED_ANSWER_REASON_REPEATED_TOOL_DECISION
+
+    llm = ProtocolErrorLLM(
+        [tool_call_response("list_clients"), final_answer_response()],
+        fail_on=0,
+        code=(
+            "unavailable_tool_call"
+            if protocol_error == "unavailable_tool_call"
+            else "invalid_tool_protocol"
+        ),
+    )
+    runtime = ScriptedCompactionRuntime(scripted)
+    await pattern.run(
+        context=build_context(tool_name="list_clients", max_messages=40),
+        tools=tools,
+        llm=llm,
+        compact_llm=None,
+        runtime=runtime,
+    )
+    return pattern, llm, runtime, recovery_set
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("turn_kind", ["recovery_turn", "ordinary_turn", "forced_turn"])
+@pytest.mark.parametrize(
+    "protocol_error", ["unavailable_tool_call", "invalid_protocol"]
+)
+async def test_the_protocol_retry_uses_this_turns_own_tool_set(
+    turn_kind: str, protocol_error: str
+) -> None:
+    """A retry must not quietly widen the turn it is repairing.
+
+    The retry exists to let the model re-decide with the full picture, so on an
+    ordinary or forced turn it keeps handing back the run's whole tool set,
+    unchanged. A recovery turn is the one case where that set has to be
+    trimmed: it deliberately narrowed the tools, and the two tools that contact
+    the user rather than read anything have no business reappearing through a
+    repair path.
+    """
+    _pattern, llm, _runtime, recovery_set = await run_protocol_retry(
+        turn_kind, protocol_error
+    )
+
+    base_names = {
+        "list_clients",
+        "read_ledger",
+        "final_answer",
+        "send_message",
+        "ask_user_question",
+    }
+    retry_names = set(tool_names_of(llm, 1))
+
+    if turn_kind == "recovery_turn":
+        assert retry_names == base_names - {"send_message", "ask_user_question"}
+        # Stated as properties rather than a copied name list: the retry set
+        # must be able to reach everything the recovery turn offered, and must
+        # not smuggle in a tool that talks to the user.
+        assert recovery_set <= retry_names
+        assert retry_names & {"send_message", "ask_user_question"} == set()
+    elif turn_kind == "ordinary_turn":
+        assert retry_names == base_names
+    elif protocol_error == "unavailable_tool_call":
+        # The forced turn's whole-set recovery semantics are untouched.
+        assert retry_names == base_names
+    else:
+        assert retry_names == {"final_answer"}
+
+    retry_instruction = instruction_of(llm, 1)
+    if protocol_error == "unavailable_tool_call":
+        if turn_kind == "recovery_turn":
+            assert TURN_SET_PHRASE in retry_instruction
+            assert COMPLETE_SET_PHRASE not in retry_instruction
+        else:
+            assert COMPLETE_SET_PHRASE in retry_instruction
+
+
+@pytest.mark.asyncio
+async def test_narrowing_the_retry_set_removes_nothing_when_asking_is_off() -> None:
+    """With user interaction off the trim is already done and takes no work."""
+    _pattern, llm, _runtime, _recovery_set = await run_protocol_retry(
+        "recovery_turn", "unavailable_tool_call", user_interaction_enabled=False
+    )
+    assert set(tool_names_of(llm, 1)) == {
+        "list_clients",
+        "read_ledger",
+        "final_answer",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("turn_kind", "protocol_error", "expects_honest_retry"),
+    [
+        ("declined_forced_turn", "empty_final_answer", True),
+        ("declined_forced_turn", "malformed_tool_arguments", True),
+        ("consumption_turn", "empty_final_answer", True),
+        ("declined_forced_turn", "unavailable_tool_call", False),
+    ],
+)
+async def test_the_retry_that_produces_the_answer_is_honest_too(
+    turn_kind: str, protocol_error: str, expects_honest_retry: bool
+) -> None:
+    """The retry is the call that reaches the user, so it needs the wording.
+
+    The first call of a turn can carry the honest instruction and still be
+    thrown away: a blank final_answer or malformed arguments makes the retry
+    the one that actually produces the answer. If the retry rebuilds its own
+    prompt without knowing the evidence is gone, it hands back the very
+    sentence the turn was supposed to replace.
+
+    The last case is the deliberate exception. There the model named a tool
+    outside the narrowed set, the retry hands the full set back, and the right
+    move is to fetch the missing values -- not to be told they are unreachable.
+    """
+    pattern = ReActPattern(max_iterations=6)
+    scripted: list[Any] = [compact_result(by_name={"list_clients": 2}, count=2)]
+    if turn_kind == "consumption_turn":
+        # This turn is forced because the previous recovery turn came back
+        # empty-handed; nothing is dropped on the turn itself.
+        pattern.forced_answer_recovery_followup = FORCED_ANSWER_FOLLOWUP_NO_EVIDENCE
+        scripted = [None]
+    else:
+        pattern.force_final_answer_next = True
+        pattern.forced_answer_reason = FORCED_ANSWER_REASON_REPEATED_TOOL_DECISION
+        pattern.forced_answer_compaction_recoveries = FORCED_ANSWER_RECOVERY_BUDGET
+
+    llm: RecordingLLM
+    if protocol_error == "empty_final_answer":
+        blank = final_answer_response()
+        blank["tool_calls"][0]["function"]["arguments"] = (
+            '{"response_language":"English","answer":"   "}'
+        )
+        llm = RecordingLLM([blank, final_answer_response()])
+    else:
+        llm = ProtocolErrorLLM(
+            [final_answer_response()],
+            fail_on=0,
+            code=(
+                "unavailable_tool_call"
+                if protocol_error == "unavailable_tool_call"
+                else "malformed_tool_arguments"
+            ),
+        )
+
+    await pattern.run(
+        context=build_context(tool_name="list_clients", max_messages=40),
+        tools=[NamedTool("list_clients")],
+        llm=llm,
+        compact_llm=None,
+        runtime=ScriptedCompactionRuntime(scripted),
+    )
+
+    assert HONEST_PHRASE in instruction_of(llm, 0)
+    retry_instruction = instruction_of(llm, 1)
+    assert (HONEST_PHRASE in retry_instruction) is expects_honest_retry
+    if expects_honest_retry:
+        assert STALE_EVIDENCE_PHRASE not in retry_instruction
+        assert tool_names_of(llm, 1) == ["final_answer"]
+    else:
+        assert COMPLETE_SET_PHRASE in retry_instruction

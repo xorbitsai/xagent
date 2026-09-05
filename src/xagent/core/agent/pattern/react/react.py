@@ -734,6 +734,11 @@ class ReActPattern(AgentPattern):
             # Set only on a turn that undoes the forcing, and read after that
             # turn's tool batch to decide what the next turn is told.
             recovery_names: set[str] | None = None
+            # What a same-turn protocol repair may offer. It defaults to the
+            # run's whole set, which is what every turn but a recovery turn
+            # needs, and a recovery turn trims it below.
+            retry_tool_schemas = base_tool_schemas
+            recovery_turn = False
             interrupted = await self._interrupt_if_requested(
                 runtime=runtime,
                 context=context,
@@ -843,6 +848,18 @@ class ReActPattern(AgentPattern):
                     force_final_answer_now = False
                     tool_schemas = recovery_schemas
                     recovery_names = set(recoverable_work)
+                    # A repair on this turn keeps the whole-set recovery
+                    # semantics -- the model may genuinely need a tool the
+                    # narrowed set left out to reach the dropped values -- but
+                    # never reopens the two tools that contact the user, since
+                    # this turn deliberately withheld them.
+                    retry_tool_schemas = [
+                        schema
+                        for schema in base_tool_schemas
+                        if (schema.get("function") or {}).get("name")
+                        not in USER_INTERACTION_CONTROL_TOOL_NAMES
+                    ]
+                    recovery_turn = True
                     evidence_dropped = False
                     self.forced_answer_compaction_recoveries += 1
                     context.add_system_message(
@@ -962,11 +979,13 @@ class ReActPattern(AgentPattern):
                         llm=call_llm,
                         runtime=runtime,
                         iteration=iteration,
-                        tool_schemas=base_tool_schemas,
+                        tool_schemas=retry_tool_schemas,
                         force_final_answer=(
                             force_final_answer_now and not unavailable_tool_call
                         ),
                         recovery_reason=exc.code,
+                        narrowed_tool_set=recovery_turn,
+                        evidence_dropped=evidence_dropped,
                     )
                 except LLMCallInterrupted:
                     interrupted = await self._interrupt_if_requested(
@@ -1055,12 +1074,14 @@ class ReActPattern(AgentPattern):
                         llm=call_llm,
                         runtime=runtime,
                         iteration=iteration,
-                        tool_schemas=base_tool_schemas,
+                        tool_schemas=retry_tool_schemas,
                         force_final_answer=(
                             force_final_answer_now and not recover_full_tool_set
                         ),
                         recovery_reason=recovery_reason,
                         empty_final_answer=empty_final_answer is not None,
+                        narrowed_tool_set=recovery_turn,
+                        evidence_dropped=evidence_dropped,
                     )
                 except LLMCallInterrupted:
                     interrupted = await self._interrupt_if_requested(
@@ -1447,24 +1468,40 @@ class ReActPattern(AgentPattern):
         force_final_answer: bool,
         recovery_reason: str | None = None,
         empty_final_answer: bool = False,
+        narrowed_tool_set: bool = False,
+        evidence_dropped: bool = False,
     ) -> tuple[Any, ReActFinalAnswerStreamer]:
         tools = (
             [self._final_answer_tool_schema()] if force_final_answer else tool_schemas
         )
+        # The retry rebuilds the whole prompt, and on a turn whose evidence was
+        # destroyed it is the call that actually reaches the user. Without this
+        # the repair would hand back the very wording the first call replaced.
         messages = self._messages_for_llm(
             context,
             has_tools=True,
             force_final_answer=force_final_answer,
+            evidence_dropped=evidence_dropped,
             tool_names=self._schema_tool_names(tools),
         )
         if recovery_reason == "unavailable_tool_call":
+            # A turn that narrowed its own tools cannot be told this is the
+            # complete set: the retry set is wider than what that turn first
+            # offered, but still not everything the run has.
+            reconsider_instruction = (
+                "Re-decide this turn using the tool set listed above, which is "
+                "the set available on this turn."
+                if narrowed_tool_set
+                else "Re-decide this turn using the complete current tool set "
+                "listed above."
+            )
             retry_instruction = (
                 "The previous response called a tool that was unavailable in the "
-                "narrowed tool schema. Re-decide this turn using the complete "
-                "current tool set listed above. Call only a tool present in that "
-                "set. If the requested work or artifact has not been successfully "
-                "produced, call the appropriate work tool; call final_answer only "
-                "when the task is actually complete and its required results exist."
+                f"narrowed tool schema. {reconsider_instruction} Call only a tool "
+                "present in that set. If the requested work or artifact has not "
+                "been successfully produced, call the appropriate work tool; call "
+                "final_answer only when the task is actually complete and its "
+                "required results exist."
             )
             retry_phase = "unavailable_tool_call_recovery"
         elif recovery_reason == "malformed_tool_arguments":

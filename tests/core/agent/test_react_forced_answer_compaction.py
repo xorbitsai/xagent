@@ -1050,39 +1050,6 @@ async def test_a_recovery_turn_is_followed_by_a_forced_answer_turn() -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_failed_refetch_leads_to_an_honest_forced_answer() -> None:
-    """Calling the tool is not the same as getting the evidence back.
-
-    The verdict reads this turn's own call ids against the ledger, not the tool
-    name. The dropped observation was itself a successful call of that name and
-    its ledger entry outlives the compaction, so a name match would always say
-    the evidence is back.
-    """
-    pattern = ReActPattern(max_iterations=6)
-    pattern.force_final_answer_next = True
-    pattern.forced_answer_reason = FORCED_ANSWER_REASON_REPEATED_TOOL_DECISION
-    runtime = recovery_runtime(by_name={"list_clients": 2}, count=2)
-    llm = RecordingLLM([tool_call_response("list_clients"), final_answer_response()])
-    context = build_context(tool_name="list_clients", max_messages=40)
-
-    await pattern.run(
-        context=context,
-        tools=[FailingTool("list_clients")],
-        llm=llm,
-        compact_llm=None,
-        runtime=runtime,
-    )
-
-    assert (
-        state_at(runtime, "before_llm", 1)["forced_answer_recovery_followup"]
-        == FORCED_ANSWER_FOLLOWUP_NO_EVIDENCE
-    )
-    assert tool_names_of(llm, 1) == ["final_answer"]
-    assert HONEST_PHRASE in instruction_of(llm, 1)
-    assert STALE_EVIDENCE_PHRASE not in whole_prompt_of(llm, 1)
-
-
-@pytest.mark.asyncio
 async def test_a_stale_success_left_in_the_tail_does_not_count_as_recovered() -> None:
     """The message-dropping path keeps a decoy, and the verdict ignores it.
 
@@ -1296,6 +1263,8 @@ async def test_an_evidence_loss_still_ends_the_run_with_an_answer(
         assert HONEST_PHRASE not in instruction_of(llm, 1)
     if outcome == "refetch_fails":
         assert HONEST_PHRASE in instruction_of(llm, 1)
+        assert tool_names_of(llm, 1) == ["final_answer"]
+        assert STALE_EVIDENCE_PHRASE not in whole_prompt_of(llm, 1)
     if outcome == "model_calls_out_of_set_tool":
         # The model fetched something, but not what went missing.
         assert HONEST_PHRASE in instruction_of(llm, 1)

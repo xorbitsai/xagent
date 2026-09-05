@@ -1,5 +1,9 @@
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
-import { Interaction, TerminalCommandOutcome } from "@/contexts/app-context-chat"
+import {
+  ClarificationSubmission,
+  Interaction,
+  TerminalCommandOutcome,
+} from "@/contexts/app-context-chat"
 import { generateClientMessageId } from "@/lib/utils"
 import { Input } from "@/components/ui/input"
 import { Button } from "@/components/ui/button"
@@ -136,7 +140,7 @@ export function ClarificationForm({
   let sendMessage: any, dispatch: any, contextFilesDisabled: boolean | undefined;
   let commandOutcomes: Record<string, TerminalCommandOutcome> | undefined;
   let clarificationSubmissions:
-    | Record<string, { commandId: string; accepted: boolean }>
+    | Record<string, ClarificationSubmission[]>
     | undefined;
   try {
     const appCtx = useApp();
@@ -194,7 +198,7 @@ export function ClarificationForm({
   // Which outcome notice the form owes the user. Raw category only; the
   // sentence is resolved at render so a locale switch reaches it.
   const [outcomeNotice, setOutcomeNotice] = useState<
-    "notApplied" | "unconfirmed" | null
+    "notApplied" | "unconfirmed" | "pending" | null
   >(null)
 
   useLayoutEffect(() => {
@@ -211,49 +215,94 @@ export function ClarificationForm({
     setOutcomeNotice(null)
   }, [active, isConnectAppsOnly, requestId])
 
-  // The reply command this round is still accountable for, and its terminal
-  // disposition, both read from context so the gate survives this component
-  // instance being replaced (virtual waiting message vs. persisted timeline
-  // message render the same round). Derived per render: the effect below
-  // must re-run when either changes, and must NOT re-run when an unrelated
-  // command's outcome lands - that rerun used to wipe a visible failure
-  // alert.
-  const outstandingSubmission = requestId
-    ? clarificationSubmissions?.[requestId]
-    : undefined
-  const outstandingOutcome = outstandingSubmission
-    ? commandOutcomes?.[outstandingSubmission.commandId]
-    : undefined
+  // The reply commands this round is still accountable for, read from
+  // context so the gate survives this component instance being replaced
+  // (virtual waiting message vs. persisted timeline message render the same
+  // round). One round can hold several: an ack-timeout entry stays
+  // resubmittable, so a resubmit appends rather than replaces, and every
+  // tracked command's outcome still gets matched.
+  const outstandingSubmissions = useMemo<ClarificationSubmission[]>(
+    () => (requestId ? clarificationSubmissions?.[requestId] : undefined) ?? [],
+    [requestId, clarificationSubmissions],
+  )
+  // Reduced to booleans before entering the effect's dependency list: an
+  // unrelated command's outcome landing must not re-run the effect - that
+  // rerun used to wipe a visible failure alert.
+  const hasOutstanding = outstandingSubmissions.length > 0
+  // Any tracked reply whose terminal outcome cannot prove non-application
+  // may have been committed: the round must surface that and stay locked.
+  const anyUnsafeOutcome = outstandingSubmissions.some((submission) => {
+    const outcome = commandOutcomes?.[submission.commandId]
+    return outcome !== undefined && outcome.resendSafe !== true
+  })
+  // Every tracked reply is proven not applied: resending is safe.
+  const allProvenNotApplied =
+    hasOutstanding
+    && outstandingSubmissions.every(
+      (submission) => commandOutcomes?.[submission.commandId]?.resendSafe === true,
+    )
+  // A durably acknowledged reply is still awaiting its terminal outcome.
+  // (An unconfirmed ack-timeout entry without an outcome deliberately does
+  // not count: it may never have been accepted, and the composer keeps its
+  // advisory retry for it - which is also why it blocks the proven-safe
+  // unlock above without forcing a lock here.)
+  const confirmedPending = outstandingSubmissions.some(
+    (submission) =>
+      submission.accepted && commandOutcomes?.[submission.commandId] === undefined,
+  )
+  // Distinguishes the round that has heard nothing yet from the one whose
+  // resolved replies are all proven safe while unconfirmed ones remain.
+  const anyOutcome = outstandingSubmissions.some(
+    (submission) => commandOutcomes?.[submission.commandId] !== undefined,
+  )
 
   useEffect(() => {
     if (!active) return
     // Task state alone answers whether the task accepts input; it does not
     // prove that repeating this round's accepted reply is safe (#1500).
-    // While a submission is outstanding, reactivation requires a terminal
-    // outcome for that exact command that proves non-application.
-    if (outstandingSubmission) {
-      if (!outstandingOutcome) {
-        // Still in flight with no terminal outcome. A confirmed-accepted
-        // reply locks the form even on a freshly mounted instance (whose
-        // initial isSubmitted is false); an unconfirmed ack-timeout
-        // delivery keeps the advisory retry the composer has always
-        // offered, because the reply may never have been accepted at all.
-        if (outstandingSubmission.accepted) {
-          setIsSubmitted(true)
-        }
-        return
-      }
-      if (outstandingOutcome.resendSafe !== true) {
+    // While a submission is outstanding, reactivation requires terminal
+    // outcomes that prove non-application for every tracked reply.
+    if (hasOutstanding) {
+      if (anyUnsafeOutcome) {
         // Committed or unknown: surface the ambiguity without inviting a
         // duplicate. The chat input remains available for a deliberate
-        // fresh message.
+        // fresh message. The send-failure alert would compete with this
+        // one (two role="alert" regions), and this notice supersedes it.
         setOutcomeNotice("unconfirmed")
+        setIsSubmitted(true)
+        setIsOpen(true)
+        setSendFailure(null)
+        return
+      }
+      if (confirmedPending) {
+        // Accepted and still being applied: lock even a freshly mounted
+        // instance (whose initial isSubmitted is false), and say why the
+        // form is locked instead of leaving a bare greyed-out button.
+        setOutcomeNotice("pending")
         setIsSubmitted(true)
         setIsOpen(true)
         return
       }
-      // Proven not applied: consume the record so the resend is armed once,
-      // then reactivate below with the draft intact.
+      if (!allProvenNotApplied) {
+        if (anyOutcome) {
+          // Every resolved reply is proven not applied; only unconfirmed
+          // ack-timeout replies remain, and their duplicate risk is the
+          // same risk the advisory retry already accepted for them. Match
+          // the fresh-instance stance: return the round to advisory
+          // instead of leaving the submitting instance locked behind a
+          // now-stale pending notice. No proven-safe notice - that promise
+          // cannot be made while an unconfirmed reply is unresolved.
+          setOutcomeNotice((notice) => (notice === "pending" ? null : notice))
+          setIsSubmitted(false)
+          setIsOpen(true)
+        }
+        // Nothing resolved yet: keep the composer's advisory retry - and
+        // its ack-timeout warning alert - exactly as they stand.
+        return
+      }
+      // Every tracked reply is proven not applied: consume the record so
+      // the resend is armed once, then reactivate below with the draft
+      // intact.
       dispatch?.({
         type: "CLEAR_CLARIFICATION_SUBMISSION",
         payload: { requestId },
@@ -268,7 +317,16 @@ export function ClarificationForm({
     setIsSubmitted(false)
     setIsOpen(true)
     setSendFailure(null)
-  }, [active, outstandingSubmission, outstandingOutcome, requestId, dispatch])
+  }, [
+    active,
+    hasOutstanding,
+    anyUnsafeOutcome,
+    allProvenNotApplied,
+    confirmedPending,
+    anyOutcome,
+    requestId,
+    dispatch,
+  ])
 
   const normalizedInteractions = useMemo(() => {
     const seenFields = new Set<string>()
@@ -815,6 +873,11 @@ export function ClarificationForm({
             {outcomeNotice === "unconfirmed" && (
               <div role="alert" className="rounded-md border border-destructive/40 bg-destructive/5 p-3 text-sm text-destructive">
                 {t("chatPage.clarification.replyOutcomeUnknown")}
+              </div>
+            )}
+            {outcomeNotice === "pending" && (
+              <div role="status" className="rounded-md border bg-muted/50 p-3 text-sm text-muted-foreground">
+                {t("chatPage.clarification.replyPending")}
               </div>
             )}
             {outcomeNotice === "notApplied" && (

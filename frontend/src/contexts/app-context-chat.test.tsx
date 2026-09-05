@@ -6827,6 +6827,15 @@ function ClarificationSubmissionProbe() {
         }
       />
       <button
+        data-testid="record-second-submission"
+        onClick={() =>
+          dispatch({
+            type: "RECORD_CLARIFICATION_SUBMISSION",
+            payload: { requestId: "req-1", commandId: "cmd-2", accepted: false },
+          })
+        }
+      />
+      <button
         data-testid="clear-submission"
         onClick={() =>
           dispatch({
@@ -6899,11 +6908,7 @@ describe("terminal command outcomes (#1500)", () => {
       expect(
         JSON.parse(screen.getByTestId("command-outcomes").textContent || "{}")
       ).toEqual({
-        "client-msg-1": {
-          outcome: "failed",
-          resendSafe: true,
-          messageCode: "task_command_deferred",
-        },
+        "client-msg-1": { resendSafe: true },
       })
     })
   })
@@ -7000,16 +7005,148 @@ describe("terminal command outcomes (#1500)", () => {
       expect(
         JSON.parse(screen.getByTestId("command-outcomes").textContent || "{}")
       ).toEqual({
-        "client-msg-2": {
-          outcome: "failed",
-          resendSafe: false,
-          messageCode: "task_command_deferred",
-        },
+        "client-msg-2": { resendSafe: false },
       })
     })
     // The reasserted waiting state is retained, exactly as before.
     expect(screen.getByTestId("task-status").textContent).toBe("waiting_for_user")
     expect(screen.getByTestId("waiting-interactions").textContent).not.toBe("[]")
+  })
+
+  it("appends a second submission for the same round instead of overwriting", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <ClarificationSubmissionProbe />
+      </AppProvider>
+    )
+
+    act(() => {
+      screen.getByTestId("record-submission").click()
+    })
+    act(() => {
+      screen.getByTestId("record-second-submission").click()
+    })
+
+    // Both commands stay accountable: overwriting would orphan the first
+    // command's still-pending outcome (#2126 review round 2, finding 1).
+    await waitFor(() => {
+      expect(
+        JSON.parse(
+          screen.getByTestId("clarification-submissions").textContent || "{}"
+        )
+      ).toEqual({
+        "req-1": [
+          { commandId: "cmd-1", accepted: true },
+          { commandId: "cmd-2", accepted: false },
+        ],
+      })
+    })
+  })
+
+  it("records resendSafe false when the structured frame omits resend_safe", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.({
+        type: "agent_error",
+        timestamp: "2026-05-27T05:00:04Z",
+        data: {
+          type: "agent_error",
+          message: "Task command message failed: something",
+          command_id: "client-msg-no-flag",
+          command_kind: "message",
+          outcome: "failed",
+        },
+      })
+    })
+
+    await waitFor(() => {
+      expect(
+        JSON.parse(screen.getByTestId("command-outcomes").textContent || "{}")
+      ).toEqual({ "client-msg-no-flag": { resendSafe: false } })
+    })
+  })
+
+  it("does not record a non-failed outcome", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.({
+        type: "agent_error",
+        timestamp: "2026-05-27T05:00:04Z",
+        data: {
+          type: "agent_error",
+          message: "noise",
+          command_id: "client-msg-completed",
+          command_kind: "message",
+          outcome: "completed",
+          resend_safe: true,
+        },
+      })
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain("noise")
+    })
+    expect(
+      JSON.parse(screen.getByTestId("command-outcomes").textContent || "{}")
+    ).toEqual({})
+  })
+
+  it("records an outcome from another task's frame (harmless by design)", async () => {
+    // RECORD_COMMAND_OUTCOME is deliberately not task-scoped: command ids
+    // are globally unique UUIDs, the only consumer looks one up by exact
+    // id, and scoping would silently drop the one-time terminal event for
+    // background tasks. This pins the current deliberate behavior.
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.({
+        type: "agent_error",
+        timestamp: "2026-05-27T05:00:04Z",
+        task_id: 999,
+        data: {
+          type: "agent_error",
+          message: "This message was not applied to the task.",
+          command_id: "other-task-command",
+          command_kind: "message",
+          outcome: "failed",
+          resend_safe: true,
+          task: { id: 999, status: "waiting_for_user" },
+        },
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      expect(
+        JSON.parse(screen.getByTestId("command-outcomes").textContent || "{}")
+      ).toEqual({ "other-task-command": { resendSafe: true } })
+    })
   })
 
   it("records and consumes the round's accountable submission", async () => {
@@ -7028,7 +7165,7 @@ describe("terminal command outcomes (#1500)", () => {
         JSON.parse(
           screen.getByTestId("clarification-submissions").textContent || "{}"
         )
-      ).toEqual({ "req-1": { commandId: "cmd-1", accepted: true } })
+      ).toEqual({ "req-1": [{ commandId: "cmd-1", accepted: true }] })
     })
 
     act(() => {

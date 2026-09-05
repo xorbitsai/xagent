@@ -1170,9 +1170,20 @@ const normalizeDagExecutionPayload = (raw: Record<string, unknown>): DAGExecutio
  * the field — reads as "may be committed or still in flight".
  */
 export interface TerminalCommandOutcome {
-  outcome: "failed"
   resendSafe: boolean
-  messageCode: string | null
+}
+
+/**
+ * One clarification reply the round is still accountable for. `accepted`
+ * distinguishes a reply the backend durably acknowledged from one recorded
+ * after an ack timeout (outcome unknown): only a confirmed acceptance may
+ * lock a freshly mounted form while no terminal outcome has arrived — an
+ * unconfirmed delivery keeps the advisory retry the composer has always
+ * offered.
+ */
+export interface ClarificationSubmission {
+  commandId: string
+  accepted: boolean
 }
 
 export interface AppState {
@@ -1232,12 +1243,17 @@ export interface AppState {
   // the submitting instance being replaced (#1500). Rounds without a
   // request id are deliberately not tracked - with no round identity a
   // recorded reply could gate a different question.
-  // ``accepted`` distinguishes a reply the backend durably acknowledged from
-  // one recorded after an ack timeout (outcome unknown): only a confirmed
-  // acceptance may lock a freshly mounted form while no terminal outcome has
-  // arrived - an unconfirmed delivery keeps the advisory retry the composer
-  // has always offered.
-  clarificationSubmissions: Record<string, { commandId: string; accepted: boolean }>
+  // An ordered list, not a single slot: an ack-timeout entry stays
+  // resubmittable, so one round can accumulate several outstanding replies,
+  // and overwriting the earlier one would orphan its still-pending outcome -
+  // exactly the undetected-duplicate risk this state exists to surface.
+  // Growth is bounded by the user's own resubmits within one round.
+  // Deliberately NOT persisted across reloads: rebuilding the gate from
+  // browser storage without the durable terminal-event replay (#1904) would
+  // turn a missed outcome frame into a permanent, unexplainable lock
+  // (fail-closed with no exit). Reload-during-ambiguity is tracked in
+  // #2142 as server-authoritative reconstruction on the #2135/#1904 arc.
+  clarificationSubmissions: Record<string, ClarificationSubmission[]>
 }
 
 type AppAction =
@@ -1352,14 +1368,20 @@ function projectAppState(state: AppState, action: AppAction): AppState {
         },
       }
     case "RECORD_CLARIFICATION_SUBMISSION":
+      // Append, never overwrite: the round stays accountable for every
+      // outstanding reply, so an earlier command's late outcome can still
+      // be matched and surfaced.
       return {
         ...state,
         clarificationSubmissions: {
           ...state.clarificationSubmissions,
-          [action.payload.requestId]: {
-            commandId: action.payload.commandId,
-            accepted: action.payload.accepted,
-          },
+          [action.payload.requestId]: [
+            ...(state.clarificationSubmissions[action.payload.requestId] ?? []),
+            {
+              commandId: action.payload.commandId,
+              accepted: action.payload.accepted,
+            },
+          ],
         },
       }
     case "CLEAR_CLARIFICATION_SUBMISSION": {
@@ -5858,11 +5880,7 @@ export function AppProvider({
             payload: {
               commandId: terminalCommandId,
               outcome: {
-                outcome: "failed",
                 resendSafe: agentErrorData.resend_safe === true,
-                messageCode: typeof agentErrorData.message_code === "string"
-                  ? agentErrorData.message_code
-                  : null,
               },
             },
           })

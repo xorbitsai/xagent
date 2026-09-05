@@ -364,6 +364,7 @@ const zh = {
       sendNotSent: "你填写的内容已保留，可以重新提交。",
       sendOutcomeUnknown: "回复可能已经提交，请刷新会话后再重新提交。",
       replyNotApplied: "你的回复未生效，可以重新提交。",
+      replyPending: "你的回复已收到，正在生效中。",
       replyOutcomeUnknown: "无法确认回复是否已生效，请先查看会话内容，再决定是否重新提交。",
       selectOption: "请选择一个选项",
       selectOptions: "请选择选项",

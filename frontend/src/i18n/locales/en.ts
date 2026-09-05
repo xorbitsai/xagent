@@ -364,6 +364,7 @@ const en = {
       sendNotSent: "Your answers were kept — you can submit again.",
       sendOutcomeUnknown: "Your response may already have been submitted. Reload the conversation before submitting again.",
       replyNotApplied: "Your reply was not applied to the task. You can submit it again.",
+      replyPending: "Your reply was received and is still being applied.",
       replyOutcomeUnknown: "We couldn't confirm whether your reply was applied. Review the conversation before submitting it again.",
       selectOption: "Select an option",
       selectOptions: "Select options",

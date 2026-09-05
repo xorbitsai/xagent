@@ -1049,9 +1049,12 @@ class TestFileUpload:
         assert download.status_code == 200
         assert download.content == b"source content"
 
-    @pytest.mark.parametrize("route", ["preview", "download"])
+    @pytest.mark.parametrize(
+        ("route", "expected_disposition"),
+        [("preview", "inline"), ("download", "attachment")],
+    )
     def test_public_output_for_authenticated_task_with_selected_files_needs_no_token(
-        self, route, client, test_db, temp_uploads_dir
+        self, route, expected_disposition, client, test_db, temp_uploads_dir
     ):
         """An input attachment must not turn a signed-in task into a guest task.
 
@@ -1100,6 +1103,53 @@ class TestFileUpload:
 
         assert response.status_code == 200, response.text
         assert response.content == b"generated analysis"
+        assert response.headers["content-disposition"].startswith(expected_disposition)
+
+    def test_public_output_for_widget_task_requires_token(
+        self, client, test_db, temp_uploads_dir
+    ):
+        """Widget task outputs must not fall back to file-ID-only access."""
+        from xagent.web.models.task import Task
+
+        admin_user, test_app = test_db
+        output_path = (
+            temp_uploads_dir
+            / f"user_{admin_user.id}"
+            / "widget_task_output"
+            / "analysis.txt"
+        )
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"private widget analysis")
+
+        db = next(test_app.dependency_overrides[get_db]())
+        try:
+            task = Task(
+                title="Widget task",
+                user_id=admin_user.id,
+                agent_config={"auth_mode": "widget", "guest_id": "guest-1"},
+            )
+            db.add(task)
+            db.flush()
+
+            output = UploadedFile(
+                user_id=admin_user.id,
+                task_id=task.id,
+                filename="analysis.txt",
+                storage_path=str(output_path),
+                mime_type="text/plain",
+                file_size=output_path.stat().st_size,
+            )
+            db.add(output)
+            db.commit()
+            db.refresh(output)
+            file_id = output.file_id
+        finally:
+            db.close()
+
+        response = client.get(f"/api/files/public/download/{file_id}")
+
+        assert response.status_code == 403, response.text
+        assert response.json()["detail"] == "Public file access token required"
 
     def test_public_download_sets_attachment_content_disposition(
         self, client, temp_uploads_dir, auth_headers

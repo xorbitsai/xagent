@@ -755,6 +755,12 @@ def _validate_public_task_file_access(
     file_record: UploadedFile,
     token: str | None,
 ) -> None:
+    """Apply guest-token isolation without changing normal file capabilities.
+
+    Ordinary signed-in tasks use the unguessable file ID as the capability for
+    public preview and download URLs. Share and widget tasks additionally bind
+    file access to a signed guest token, which must resolve to the same task.
+    """
     if not file_record.task_id:
         return
 

@@ -665,6 +665,70 @@ async def test_a_declined_turn_still_speaks_honestly_after_a_resume(
 
 
 @pytest.mark.asyncio
+async def test_a_recoverable_turn_still_speaks_honestly_after_a_resume() -> None:
+    """The gate can agree to recover on a build that cannot recover yet.
+
+    Handing the dropped tools back is not implemented here, so a turn the gate
+    cleared for recovery is left exactly where a refused one is: still forced
+    to final_answer, with observations it can no longer read. It must therefore
+    record the same refusal in state. Setup below is the refused summary shape
+    with one line removed -- the spent-budget override -- which is the only
+    thing that separates the two paths on this build.
+    """
+    pattern = ReActPattern(max_iterations=6)
+    pattern.current_iteration = 1
+    pattern.force_final_answer_next = True
+    pattern.forced_answer_reason = FORCED_ANSWER_REASON_REPEATED_TOOL_DECISION
+    context = build_context(max_messages=40)
+    compact_llm = RecordingLLM([{"content": "A summary of the run."}])
+
+    runtime = PatternRuntime()
+    interrupting_llm = RecordingLLM([])
+
+    async def interrupt_before_answering(**kwargs: Any) -> Any:
+        interrupting_llm.calls.append(kwargs)
+        runtime.request_interrupt("user stop")
+        return {"content": "", "done": False}
+
+    interrupting_llm.chat = interrupt_before_answering  # type: ignore[method-assign]
+    await pattern.run(
+        context=context,
+        tools=[NamedTool("calculator")],
+        llm=interrupting_llm,
+        compact_llm=compact_llm,
+        runtime=runtime,
+    )
+
+    # The live turn was honest, so the checkpoint has to say so too.
+    assert HONEST_PHRASE in instruction_of(interrupting_llm)
+    state = pattern.get_state()
+    assert (
+        state["forced_answer_recovery_followup"] == FORCED_ANSWER_FOLLOWUP_NO_EVIDENCE
+    )
+
+    resumed = ReActPattern(max_iterations=pattern.max_iterations)
+    resumed.load_state(state)
+    resumed_runtime = PatternRuntime()
+    resumed_llm = RecordingLLM([final_answer_response()])
+    # The context has already been compacted once and is now under threshold,
+    # so this turn's compaction returns nothing and the gate never runs.
+    context.compact_config.threshold = 10**9
+    await resumed.run(
+        context=context,
+        tools=[NamedTool("calculator")],
+        llm=resumed_llm,
+        compact_llm=None,
+        runtime=resumed_runtime,
+    )
+
+    assert tool_names_of(resumed_llm) == ["final_answer"]
+    assert resumed_llm.calls[0]["tool_choice"] == "required"
+    assert HONEST_PHRASE in instruction_of(resumed_llm)
+    assert STALE_EVIDENCE_PHRASE not in whole_prompt_of(resumed_llm)
+    assert RECOVERY_CHECKPOINT not in checkpoint_labels(resumed_runtime)
+
+
+@pytest.mark.asyncio
 async def test_a_declined_turn_clears_its_marker_once_it_has_run() -> None:
     """The refusal applies to exactly one turn.
 

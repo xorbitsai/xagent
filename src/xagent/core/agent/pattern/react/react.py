@@ -699,9 +699,9 @@ class ReActPattern(AgentPattern):
             # every checkpoint this turn writes, or a resume would restore the
             # forcing without the reason for it and fall back to the ordinary
             # instruction. It is cleared once this turn has run, below. The
-            # gate further down overwrites this local when it declines, so
-            # treat it as "what this turn must clear", not a read-only
-            # snapshot of the previous turn.
+            # gate further down overwrites this local whenever it finds the
+            # evidence gone, so treat it as "what this turn must clear", not a
+            # read-only snapshot of the previous turn.
             followup = self.forced_answer_recovery_followup
             if followup is not None:
                 self.force_final_answer_next = True
@@ -781,8 +781,18 @@ class ReActPattern(AgentPattern):
             # dropped, or say plainly that they are unavailable.
             dropped_count, dropped_names = self._dropped_tool_evidence(compact_result)
             if force_final_answer_now and dropped_count > 0:
-                # Set first, cleared again only if the recovery below happens.
+                # Two halves of one decision. The loop local picks this turn's
+                # instruction; the marker carries the same decision across the
+                # checkpoint written below, so an interrupt between here and
+                # the LLM call resumes into a forced turn that still knows why.
+                # Reuse of the existing marker means the consumption block
+                # above and the clearing below already handle it. Anything that
+                # undoes the forcing has to undo both.
                 evidence_dropped = True
+                self.forced_answer_recovery_followup = (
+                    FORCED_ANSWER_FOLLOWUP_NO_EVIDENCE
+                )
+                followup = FORCED_ANSWER_FOLLOWUP_NO_EVIDENCE
                 base_names = set(self._schema_tool_names(base_tool_schemas))
                 # Subtracting the control names is redundant today -- the
                 # dropped-name mapping already excludes them upstream -- and is
@@ -820,16 +830,6 @@ class ReActPattern(AgentPattern):
                 else:
                     decline_reason = None
                 if decline_reason is not None:
-                    # Declining still has to survive a resume. Whether this
-                    # turn sends the honest instruction is otherwise only a
-                    # loop local, so an interrupt between here and the LLM call
-                    # would resume into a forced turn that has forgotten why.
-                    # Reuse of the existing marker means the consumption block
-                    # above and the clearing below already handle it.
-                    self.forced_answer_recovery_followup = (
-                        FORCED_ANSWER_FOLLOWUP_NO_EVIDENCE
-                    )
-                    followup = FORCED_ANSWER_FOLLOWUP_NO_EVIDENCE
                     logger.warning(
                         "Forced answer turn lost tool evidence to compaction and "
                         "will report it as unavailable. reason=%s dropped=%d "

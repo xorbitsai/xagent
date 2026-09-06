@@ -47,10 +47,12 @@ that declares it is checked; one that does not is not.
 | Call site | Caller holds while the hook runs | Committed before asking | ``caller_holds_lock`` |
 | --- | --- | --- | --- |
 | ``custom_api.update_custom_api`` | the ``custom_apis`` definition row, ``FOR UPDATE``, on the payloads that write that row | no | ``True`` |
+| ``custom_api._recheck_team_access_under_definition_lock`` | the ``custom_apis`` definition row, ``FOR UPDATE``, taken by ``update_custom_api`` before this call | no | ``True`` |
 | ``custom_api.delete_custom_api`` | the ``custom_apis`` definition row, ``FOR UPDATE`` | no | ``True`` |
 | ``mcp.update_mcp_server`` | the ``mcp_servers`` definition row, ``FOR UPDATE ... KEY SHARE``, on the payloads that write that row | no | ``True`` |
 | ``mcp.teardown_mcp_app_server`` | three row locks: ``public_mcp_apps``, ``mcp_servers``, ``user_mcpservers`` | no, within this function -- see the note below | ``True`` |
 | ``mcp.delete_mcp_server`` | two row locks: ``mcp_servers`` and ``user_mcpservers``, taken by ``_lock_active_mcp_oauth_lifecycle`` before this call | no | ``True`` |
+| ``custom_api._resolve_custom_api_for_request`` | nothing -- this resolution runs before either of its two routes takes any lock | no | ``False`` |
 
 ``mcp.teardown_mcp_app_server`` is a helper, not a route: it has no route
 decorator and no caller in this repository outside tests. "Nothing committed
@@ -69,11 +71,11 @@ check this at run time, so it is stated here rather than enforced.
 The remaining slots declare nothing. Every ``visibility`` and
 ``team_visibility`` call site is lock-free, and one of the ``team_visibility``
 paths runs on a lazily created session that may not be in a transaction at
-all. ``access`` has no call site in this repository; a caller that adds one
-while holding a lock owes this table a row and owes the call
-``caller_holds_lock=True``. One shape must never declare it: a call site that
-has already committed its own work before asking, because refusing there
-reports a failure for an operation that fully succeeded.
+all. A caller that adds a new ``access`` call site while holding a lock owes
+this table a row and owes the call ``caller_holds_lock=True``. One shape must
+never declare it: a call site that has already committed its own work before
+asking, because refusing there reports a failure for an operation that fully
+succeeded.
 
 What the check is not
 ---------------------

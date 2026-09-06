@@ -37,6 +37,7 @@ _SEAM_MODULE = "xagent.web.api.custom_api"
 # finding nothing.
 _SEAM_REACHING_FUNCTIONS = {
     "_resolve_custom_api_for_request",
+    "_recheck_team_access_under_definition_lock",
     "get_custom_api",
     "update_custom_api",
     "delete_custom_api",

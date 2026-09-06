@@ -298,11 +298,13 @@ def _http_from_connector_runtime(exc: ConnectorRuntimeError) -> HTTPException:
     """Map the connector team seam's typed error onto this module's HTTP answer.
 
     Four call sites need it -- ``get_custom_api``, and ``update_custom_api``
-    for its pre-lock resolution, its post-lock re-check and its rename hook --
-    so that every one of them answers with the status and message the seam
-    declares instead of letting the error reach the generic handler as a 500.
-    Each call site wraps only the seam call it makes, rather than the whole
-    route body, so the mapping itself lives here in one place.
+    for its pre-lock resolution, its post-lock re-check (which makes its raw
+    hook call through ``_recheck_team_access_under_definition_lock``) and its rename
+    hook -- so that every one of them answers with the status and message
+    the seam declares instead of letting the error reach the generic
+    handler as a 500. Each call site wraps only the seam call it makes,
+    rather than the whole route body, so the mapping itself lives here in
+    one place.
     """
     return HTTPException(status_code=exc.status_code, detail=exc.safe_message)
 
@@ -385,6 +387,40 @@ def _resolve_custom_api_for_request(
         user_api if user_api is not None else _TeamOwnedUserApi(int(user_id))
     )
     return resolved_user_api, cast(CustomApi, api), access
+
+
+def _recheck_team_access_under_definition_lock(
+    db: Session, user_id: int, api_id: int
+) -> "ConnectorAccess | None":
+    """Re-resolve the caller's team access verdict for ``update_custom_api``,
+    on behalf of a caller whose freshly-read personal link row does not
+    grant the edit on its own.
+
+    Lives as its own function, separate from ``update_custom_api``, so that
+    this call site and the route's rename hook call are each attributed to a
+    distinct function by the call-site table's accounting
+    (``connector_team_scope.py``'s "Call sites and what the caller holds"
+    table, checked against the source by
+    ``test_the_call_site_table_and_the_call_sites_agree``): that accounting
+    is keyed by enclosing function name, one row per function, and
+    ``update_custom_api`` already owns the rename hook's row.
+
+    Called only from inside ``update_custom_api``'s ``FOR UPDATE`` block, on
+    a payload that writes the ``custom_apis`` definition row, after that
+    lock has been taken and before anything this request has staged is
+    committed. Declares ``caller_holds_lock=True`` on the call it makes: a
+    hook that ends this transaction would release that lock without the
+    caller finding out, and the writes staged above would then commit
+    against a row somebody else may have moved.
+
+    Raises ``ConnectorRuntimeError`` when access resolution itself fails;
+    the caller translates that into an ``HTTPException`` and rolls back.
+    """
+    from ..services.connector_team_scope import resolve_one_connector_access_or_raise
+
+    return resolve_one_connector_access_or_raise(
+        db, user_id, ("custom_api", api_id), caller_holds_lock=True
+    )
 
 
 @custom_api_router.get("/{api_id}", response_model=CustomApiResponse)
@@ -555,11 +591,12 @@ def update_custom_api(
         #
         # So both halves of the gate's decision are re-established here from
         # fresh reads and the same combination is recomputed: the caller's
-        # own link row is re-read, and the team verdict is re-resolved when
-        # it is the half that has to grant the edit. A payload that writes
-        # only the caller's own link row skips this block entirely, and
-        # correctly so -- it took no lock above, so its gate was never
-        # separated from its writes by a wait of unbounded length.
+        # own link row is re-read, and the team verdict is re-resolved
+        # whenever that fresh read does not grant the edit on its own. A
+        # payload that writes only the caller's own link row skips this
+        # block entirely, and correctly so -- it took no lock above, so its
+        # gate was never separated from its writes by a wait of unbounded
+        # length.
         #
         # ``populate_existing()`` on the definition query above refreshes
         # the row of that statement and nothing else, so it does not cover
@@ -568,9 +605,12 @@ def update_custom_api(
         # ``populate_existing()`` so its columns are overwritten with the
         # database's current values rather than the ones the gate loaded.
         # When it returns a row, that row replaces ``user_api`` for the rest
-        # of the route -- the link-row write below and the response both read
-        # it; when it returns nothing, the caller had no personal row to begin
-        # with and keeps the stand-in it was resolved with.
+        # of the route -- the link-row write below and the response both
+        # read it. When it returns nothing, ``user_api`` becomes a freshly
+        # constructed stand-in rather than the one this route resolved
+        # before the lock: that earlier one may itself have been backed by
+        # a personal row that has since been deleted, and this statement is
+        # what finds that out.
         # A revocation that commits after these statements is the window
         # this route had before it took any lock at all: in-process, with
         # no wait in it. Closing that one needs an authorization fence of
@@ -584,29 +624,27 @@ def update_custom_api(
             .populate_existing()
             .first()
         )
-        # A caller who reached the gate through a personal link row and no
-        # longer has one gets the 404 that a caller with no association to
-        # this connector has always gotten. A caller who never had a personal
-        # row -- the stand-in -- legitimately has none, so its absence says
-        # nothing about that caller's authorization; the re-resolved team
-        # verdict below is what decides them.
-        if current_user_api is None and not is_stand_in:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Custom API not found",
-            )
-
         still_can_edit = current_user_api is not None and bool(
             current_user_api.can_edit
         )
-        if not still_can_edit and team_access is not None and team_access.can_edit:
-            # The verdict that granted this edit was resolved before this
-            # lock existed, and the application answering it can revoke the
-            # link at any moment through its own tables, which this lock does
-            # not cover. Re-resolve it whenever it is the half of the gate's
-            # decision that still has to grant the edit; a fresh link row that
-            # grants edit on its own already settles the question and spends
-            # no further hook call.
+        if not still_can_edit:
+            # The freshly-read personal row does not grant the edit on its
+            # own -- either it is gone, or its can_edit has been cleared --
+            # so the team verdict is re-resolved regardless of what the gate
+            # decided before the lock: unlike the narrower condition this
+            # replaces, this one also catches a caller whose personal row
+            # was deleted out from under a gate decision that never went
+            # through the team verdict at all. An owner (the fresh row still
+            # grants edit on its own) and a payload that writes only
+            # ``is_active`` (this whole block is skipped) both still cost
+            # nothing extra; a caller who reached the gate on the team
+            # verdict and still holds it spends the one extra hook call it
+            # always did; a request with no access hook installed spends
+            # nothing, because the hook slot being empty makes resolution
+            # return ``{}`` without a query. Only a request whose personal
+            # row or team verdict actually changed while it waited for the
+            # lock now gets a different -- and correct -- answer than it did
+            # before this change.
             #
             # This re-check assumes READ COMMITTED, PostgreSQL's default,
             # which this codebase sets no isolation_level on its engine to
@@ -616,18 +654,19 @@ def update_custom_api(
             # transaction's original snapshot, sees the pre-lock answer again,
             # and the re-check degrades to a no-op -- it would stop refusing,
             # not start refusing wrongly.
-            from ..services.connector_team_scope import (
-                resolve_one_connector_access_or_raise,
-            )
-
             try:
-                rechecked = resolve_one_connector_access_or_raise(
-                    db, int(current_user.id), ("custom_api", int(api_id))
+                rechecked = _recheck_team_access_under_definition_lock(
+                    db, int(current_user.id), api_id
                 )
             except ConnectorRuntimeError as exc:
                 db.rollback()
                 raise _http_from_connector_runtime(exc) from exc
-            if rechecked is None or not rechecked.can_edit:
+            if rechecked is not None and rechecked.can_edit:
+                still_can_edit = True
+            elif team_access is not None and team_access.can_edit:
+                # The gate's own read once granted this edit through the
+                # team verdict; that access was revoked while this request
+                # waited for the lock.
                 db.rollback()
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
@@ -636,15 +675,51 @@ def update_custom_api(
                         "this edit was in flight"
                     ),
                 )
-            still_can_edit = True
+            elif current_user_api is None:
+                # No personal row survived the wait, and neither the fresh
+                # nor the pre-lock team verdict grants the edit: the same
+                # 404 a caller with no association to this connector has
+                # always gotten, whether that caller reached the gate
+                # through a personal row that is now gone or never had one.
+                db.rollback()
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Custom API not found",
+                )
+            else:
+                db.rollback()
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="You do not have permission to edit this Custom API",
+                )
 
-        if not still_can_edit:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="You do not have permission to edit this Custom API",
-            )
         if current_user_api is not None:
             user_api = current_user_api
+        else:
+            # The gate's own read may have resolved a personal row that has
+            # since been deleted; carrying that ORM object forward would
+            # raise ``StaleDataError`` from ``db.commit()`` below on a
+            # payload that writes the definition row, or
+            # ``ObjectDeletedError`` while the response is built on a
+            # payload that does not -- and the latter fails only after this
+            # request's other writes have already committed. A freshly
+            # constructed stand-in never touches the database at all, so
+            # neither can happen.
+            from .mcp import _TeamOwnedUserApi
+
+            user_api = _TeamOwnedUserApi(int(current_user.id))
+
+        # A second is_active guard, under the lock. The one above the lock
+        # (see the ``is_stand_in`` check earlier in this route) catches a
+        # caller who already had no personal row when the gate ran; this one
+        # catches a caller whose personal row existed then and was deleted
+        # while this request waited for the lock.
+        if current_user_api is None and api_data.is_active is not None:
+            db.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No personal connection exists to configure is_active for this API",
+            )
 
     # Read only after the statement above: rename_team_connector's "old"
     # argument must be the name this transaction's own read established --
@@ -749,8 +824,11 @@ def update_custom_api(
         raise _http_from_connector_runtime(exc) from exc
 
     # Update UserCustomApi link. A caller with no personal row never reaches
-    # this: a payload carrying is_active from such a caller was rejected by
-    # the guard above the lock.
+    # this: a payload carrying is_active is rejected by one of two guards --
+    # the one above the lock, for a caller who already had no personal row
+    # when the gate ran, or the one under the lock, for a caller whose
+    # personal row existed then and was deleted while this request waited
+    # for the lock.
     if api_data.is_active is not None:
         user_api.is_active = api_data.is_active
 

@@ -315,6 +315,41 @@ def test_user_message_injection_outcome_truthiness_contract() -> None:
     assert UserMessageInjectionOutcome.POSTED_REPLAY
 
 
+def test_user_message_injection_outcome_member_set_has_not_drifted() -> None:
+    """The three call sites that key off this enum -- one in ``a2a.py`` and
+    two in ``websocket.py``, all spelled
+    ``is UserMessageInjectionOutcome.POSTED_FRESH`` -- use an allow-list
+    shape: only ``POSTED_FRESH`` retires the interaction row those sites are
+    guarding. A fourth member added to this enum falls into their
+    non-matching default branch without any of them raising or warning.
+
+    This test does not touch those three guards, and it does not give them
+    a branch per member -- a new member still lands in that same default
+    branch in production after this test exists. What it does instead is
+    make adding a member a deliberate act: the addition fails here first,
+    so whoever adds a fourth member is forced back to this line to read
+    what the default branch actually does before touching any guard.
+
+    That default is not equivalent to falling back to the legacy path. In
+    a deployment where the task's interaction protocol marker has been
+    written to 1 (nothing in this codebase writes that value today), an
+    interaction row left open by a non-matching outcome is read through the
+    structured view, so the same interaction is rendered again together
+    with its controls, and the resume-execution guard rejects the user's
+    "continue" action because it still finds that row open. A user can
+    still recover by sending another chat message -- that goes through the
+    online injection site, gets ``POSTED_FRESH``, and closes the row -- but
+    only at the cost of answering the same interaction a second time. That
+    is milder than a deny-list default, which would retire a still-open
+    interaction outright and lose data, but it is not free.
+    """
+    assert {member.name for member in UserMessageInjectionOutcome} == {
+        "NOT_POSTED",
+        "POSTED_FRESH",
+        "POSTED_REPLAY",
+    }
+
+
 @pytest.mark.asyncio
 async def test_runner_treats_canonical_empty_checkpoint_as_authoritative() -> None:
     checkpoint_store = EmptyCanonicalCheckpointStore()

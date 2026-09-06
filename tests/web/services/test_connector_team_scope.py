@@ -2045,9 +2045,11 @@ async def test_the_boundary_handler_answers_500_and_one_detail():
 
 
 def test_the_access_slot_lets_the_boundary_error_through_its_wrapper(db_session):
-    """``access`` has no call site in this repository today, so this is
-    constructed directly against the wrapper rather than through a route.
-    The seam's own transient-outage error gets folded into
+    """Constructed directly against the wrapper rather than through a route,
+    because the only ``access`` call site that holds a lock lives in
+    ``custom_api.py``, and that path is covered by
+    ``tests/web/api/test_custom_api_team_connector_edit.py`` instead. The
+    seam's own transient-outage error gets folded into
     ``ConnectorRuntimeError`` by the surrounding ``except Exception``; this
     one must not -- a permanent defect in the installing application's
     code is a different failure than an outage, and folding it in would

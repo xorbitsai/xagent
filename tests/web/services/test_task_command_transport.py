@@ -17,6 +17,12 @@ from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import QueuePool
 
+from tests.web.pool_contention_shared import (
+    GUARD_TIMEOUT,
+    LOOP_LIVENESS_TICKS,
+    gated_pool_checkout,
+    wait_for_ticks,
+)
 from xagent.core.agent.runner import UserMessageInjectionOutcome
 from xagent.db.sqlite import apply_sqlite_concurrency_pragmas
 from xagent.web.api import websocket as websocket_api
@@ -1292,20 +1298,28 @@ async def test_dispatch_claim_pool_wait_does_not_block_event_loop(
     async def execute(command: ClaimedTaskCommand) -> None:
         assert isinstance(command, ClaimedTaskCommand)
 
-    ticker_task = asyncio.create_task(ticker())
-    dispatch_task = asyncio.create_task(
-        dispatch_one_task_command(execute, command_db_id=enqueued.command_id)
-    )
-    try:
-        await asyncio.sleep(0.08)
-        assert ticks >= 3, "command claim QueuePool checkout blocked the event loop"
-        assert not dispatch_task.done()
-    finally:
-        held_connection.close()
-        ticker_stop.set()
-        await ticker_task
+    with gated_pool_checkout(engine) as gate:
+        ticker_task = asyncio.create_task(ticker())
+        dispatch_task = asyncio.create_task(
+            dispatch_one_task_command(execute, command_db_id=enqueued.command_id)
+        )
+        try:
+            await gate.wait_until_contending()
+            observed = await wait_for_ticks(lambda: ticks)
+            assert observed >= LOOP_LIVENESS_TICKS, (
+                "command claim QueuePool checkout blocked the event loop"
+            )
+            assert not dispatch_task.done()
+        finally:
+            held_connection.close()
+            gate.let_through()
+            ticker_stop.set()
+            await asyncio.wait_for(
+                asyncio.gather(dispatch_task, ticker_task, return_exceptions=True),
+                timeout=GUARD_TIMEOUT,
+            )
 
-    assert await asyncio.wait_for(dispatch_task, timeout=1)
+    assert dispatch_task.result()
     assert session_threads
     assert session_threads[0] != loop_thread
 

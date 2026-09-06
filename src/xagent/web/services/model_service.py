@@ -22,6 +22,8 @@ from ...core.model.image.openai import OpenAIImageModel
 from ...core.model.image.xinference import XinferenceImageModel
 from ...core.model.video.base import BaseVideoModel
 
+from .llm_utils import AutoModelUnavailableError
+
 logger = logging.getLogger(__name__)
 
 
@@ -212,6 +214,8 @@ def get_default_vision_model(
                         model_db, admin_vision_defaults[0].model, user_id
                     )
 
+        except AutoModelUnavailableError:
+            raise
         except Exception as e:
             logger.warning(f"Failed to get vision model from database: {e}")
             pass
@@ -278,6 +282,8 @@ def get_default_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
                     db, admin_defaults[0].model, user_id
                 )
 
+        except AutoModelUnavailableError:
+            raise
         except Exception as e:
             logger.warning(f"Failed to get default model from database: {e}")
             pass
@@ -344,6 +350,8 @@ def get_fast_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
                     db, admin_fast_defaults[0].model, user_id
                 )
 
+        except AutoModelUnavailableError:
+            raise
         except Exception as e:
             logger.warning(f"Failed to get fast model from database: {e}")
             pass
@@ -410,6 +418,8 @@ def get_compact_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
                     db, admin_compact_defaults[0].model, user_id
                 )
 
+        except AutoModelUnavailableError:
+            raise
         except Exception as e:
             logger.warning(f"Failed to get compact model from database: {e}")
             pass

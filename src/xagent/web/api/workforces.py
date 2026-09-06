@@ -23,6 +23,8 @@ from ..models.workforce import (
     WorkforceRun,
 )
 from ..schemas.widget import WidgetAllowedDomain
+from ..services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
+from ..services.llm_utils import AutoModelUnavailableError
 from ..services.agent_access import (
     AccessibleAgent,
     accessible_agent_permissions,
@@ -622,7 +624,10 @@ async def create_workforce_from_prompt_endpoint(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
-    result = await create_workforce_from_prompt(db, user, prompt=request.prompt)
+    try:
+        result = await create_workforce_from_prompt(db, user, prompt=request.prompt)
+    except AutoModelUnavailableError as exc:
+        raise HTTPException(409, detail=CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE) from exc
     workforce = _reload_workforce(db, result.workforce)
     return _serialize_workforce_detail(
         workforce, user, get_agent_team_scope(db, int(user.id))

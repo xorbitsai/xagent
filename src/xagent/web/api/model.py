@@ -2032,8 +2032,14 @@ async def update_model(
     effective_model_name = update_data.get("model_name", db_model.model_name)
     _validate_provider_model_name(effective_provider, effective_model_name)
     effective_category = update_data.get("category", db_model.category)
-    incompatible_with_auto = effective_category != "llm" or is_auto_router_model(
-        effective_provider, effective_model_name
+    identity_changed = any(
+        field in update_data and update_data[field] != getattr(db_model, field)
+        for field in ("model_provider", "model_name", "base_url")
+    )
+    incompatible_with_auto = (
+        identity_changed
+        or effective_category != "llm"
+        or is_auto_router_model(effective_provider, effective_model_name)
     )
     if incompatible_with_auto:
         own_auto_reference = (
@@ -2051,12 +2057,36 @@ async def update_model(
         if own_auto_reference is not None:
             raise HTTPException(
                 409,
-                detail="Cannot change this model into a non-LLM or Auto model while an Auto configuration uses it.",
+                detail="Remove this model from your Auto configuration before changing its identity or category.",
             )
         model_store.prune_external_auto_references(
             model_id=int(db_model.id),
             owner_user_id=int(user.id),
         )
+
+    auto_candidates = (
+        db.query(AutoModelCandidate)
+        .filter(AutoModelCandidate.target_model_id == db_model.id)
+        .all()
+    )
+    if auto_candidates and "abilities" in update_data:
+        from ..services.auto_model_service import (
+            load_router_profile_catalog,
+            validate_candidate_modalities,
+        )
+
+        try:
+            catalog = load_router_profile_catalog()
+            for candidate in auto_candidates:
+                validate_candidate_modalities(
+                    catalog,
+                    str(candidate.routing_model_id),
+                    update_data["abilities"] or [],
+                )
+        except AutoModelConfigurationError as exc:
+            raise HTTPException(409, detail=str(exc)) from exc
+        except AutoModelDependencyError as exc:
+            raise HTTPException(503, detail=str(exc)) from exc
 
     for field, value in update_data.items():
         # Don't update api_key with empty string
@@ -2068,6 +2098,11 @@ async def update_model(
         # Only set fields that exist on the model
         if hasattr(db_model, field):
             setattr(db_model, field, value)
+
+    if auto_candidates:
+        model_store.refresh_auto_model_abilities(
+            [int(candidate.config_id) for candidate in auto_candidates]
+        )
 
     if share_with_users is not None:
         try:

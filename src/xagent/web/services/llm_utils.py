@@ -750,7 +750,13 @@ class UserAwareModelStorage:
     ) -> tuple[ChatModelConfig, Callable[[str], BaseLLM]]:
         """Snapshot the user's Auto bindings into a resolver for this run."""
 
-        from .auto_model_service import AUTO_ROUTER_CONFIG_NAME
+        from .auto_model_service import (
+            AUTO_ROUTER_CONFIG_NAME,
+            AutoModelConfigurationError,
+            AutoModelDependencyError,
+            load_router_profile_catalog,
+            validate_candidate_modalities,
+        )
         from .model_service import _is_model_visible_to_user
 
         config = (
@@ -800,6 +806,15 @@ class UserAwareModelStorage:
                 "Auto model has no active configured candidates"
             )
 
+        try:
+            catalog = load_router_profile_catalog()
+            for profile_id, target_cfg in targets_by_profile.items():
+                validate_candidate_modalities(
+                    catalog, profile_id, target_cfg.abilities or []
+                )
+        except (AutoModelConfigurationError, AutoModelDependencyError) as exc:
+            raise AutoModelUnavailableError(str(exc)) from exc
+
         profile_ids = list(targets_by_profile)
         configured = router_cfg.model_copy(
             update={
@@ -839,7 +854,11 @@ class UserAwareModelStorage:
         return self.core_storage.create_llm_instance(model_config)
 
     def get_configured_defaults(
-        self, user_id: Optional[int] = None
+        self,
+        user_id: Optional[int] = None,
+        *,
+        config_types: tuple[str, ...] = ("general", "small_fast", "visual", "compact"),
+        fallback_llm: Optional[BaseLLM] = None,
     ) -> Tuple[
         Optional[BaseLLM], Optional[BaseLLM], Optional[BaseLLM], Optional[BaseLLM]
     ]:
@@ -848,6 +867,8 @@ class UserAwareModelStorage:
 
         Args:
             user_id: User ID for multi-tenant model resolution. If None, uses admin defaults.
+            config_types: Only these default slots are instantiated.
+            fallback_llm: Explicit general LLM to use when a requested specialized slot is unset.
 
         Returns:
             Tuple of (default_llm, fast_llm, vision_llm, compact_llm)
@@ -877,7 +898,11 @@ class UserAwareModelStorage:
                     .first()
                 )
 
-                if general_default and general_default.model:
+                if (
+                    "general" in config_types
+                    and general_default
+                    and general_default.model
+                ):
                     from .model_service import _is_model_visible_to_user
 
                     if _is_model_visible_to_user(
@@ -902,7 +927,7 @@ class UserAwareModelStorage:
                     .first()
                 )
 
-                if fast_default and fast_default.model:
+                if "small_fast" in config_types and fast_default and fast_default.model:
                     from .model_service import _is_model_visible_to_user
 
                     if _is_model_visible_to_user(
@@ -927,7 +952,7 @@ class UserAwareModelStorage:
                     .first()
                 )
 
-                if vision_default and vision_default.model:
+                if "visual" in config_types and vision_default and vision_default.model:
                     from .model_service import _is_model_visible_to_user
 
                     if _is_model_visible_to_user(
@@ -952,7 +977,11 @@ class UserAwareModelStorage:
                     .first()
                 )
 
-                if compact_default and compact_default.model:
+                if (
+                    "compact" in config_types
+                    and compact_default
+                    and compact_default.model
+                ):
                     from .model_service import _is_model_visible_to_user
 
                     if _is_model_visible_to_user(
@@ -975,9 +1004,7 @@ class UserAwareModelStorage:
                         UserDefaultModel.model_id == UserModel.model_id,
                     )
                     .filter(
-                        UserDefaultModel.config_type.in_(
-                            ["general", "small_fast", "visual", "compact"]
-                        ),
+                        UserDefaultModel.config_type.in_(config_types),
                         UserModel.is_shared.is_(True),
                         UserDefaultModel.user_id.in_(visible_ids),
                     )
@@ -1002,19 +1029,28 @@ class UserAwareModelStorage:
                             admin_default.model, user_id
                         )
 
-            # Fallback to environment variables if no configured models
-            if not default_llm:
-                default_llm = create_llm_from_env()
-                if default_llm:
-                    logger.info("Using environment variables for default LLM")
+            requested_defaults = {
+                "general": default_llm,
+                "small_fast": fast_llm,
+                "visual": vision_llm,
+                "compact": compact_llm,
+            }
+            if any(requested_defaults[kind] is None for kind in config_types):
+                default_llm = default_llm or fallback_llm
+                if default_llm is None and "general" not in config_types:
+                    default_llm, _, _, _ = self.get_configured_defaults(
+                        user_id, config_types=("general",)
+                    )
+                if default_llm is None:
+                    default_llm = create_llm_from_env()
 
-            if not fast_llm:
+            if "small_fast" in config_types and not fast_llm:
                 fast_llm = default_llm
 
-            if not vision_llm:
+            if "visual" in config_types and not vision_llm:
                 vision_llm = default_llm
 
-            if not compact_llm:
+            if "compact" in config_types and not compact_llm:
                 compact_llm = default_llm
 
             return default_llm, fast_llm, vision_llm, compact_llm
@@ -1074,7 +1110,9 @@ class UserAwareModelStorage:
             logger.warning(
                 f"Default LLM '{default_name}' not found or no access, falling back to configured default"
             )
-            default_llm, _, _, _ = self.get_configured_defaults(user_id)
+            default_llm, _, _, _ = self.get_configured_defaults(
+                user_id, config_types=("general",)
+            )
 
         # Get fast LLM (optional)
         fast_llm = None
@@ -1095,14 +1133,20 @@ class UserAwareModelStorage:
         default_fast_llm = None
         default_vision_llm = None
         default_compact_llm = None
-        needs_specialized_defaults = (
-            (bool(fast_name) and fast_llm is None)
-            or (bool(vision_name) and vision_llm is None)
-            or compact_llm is None
+        missing_defaults = tuple(
+            kind
+            for kind, needed in (
+                ("small_fast", bool(fast_name) and fast_llm is None),
+                ("visual", bool(vision_name) and vision_llm is None),
+                ("compact", compact_llm is None),
+            )
+            if needed
         )
-        if needs_specialized_defaults:
+        if missing_defaults:
             _, default_fast_llm, default_vision_llm, default_compact_llm = (
-                self.get_configured_defaults(user_id)
+                self.get_configured_defaults(
+                    user_id, config_types=missing_defaults, fallback_llm=default_llm
+                )
             )
 
         if fast_name and not fast_llm:

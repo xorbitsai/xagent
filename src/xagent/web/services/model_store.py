@@ -469,6 +469,26 @@ class ModelStore:
         invalidate_model_cache(None if default_was_shared else user_id)
         return user_default
 
+    def refresh_auto_model_abilities(self, config_ids: list[int]) -> None:
+        from ..models.auto_model import AutoModelCandidate, AutoModelConfig
+        from .auto_model_service import AutoModelService
+
+        self.db.flush()
+        for config in self.db.query(AutoModelConfig).filter(
+            AutoModelConfig.id.in_(config_ids)
+        ):
+            targets = (
+                self.db.query(DBModel)
+                .join(
+                    AutoModelCandidate, AutoModelCandidate.target_model_id == DBModel.id
+                )
+                .filter(AutoModelCandidate.config_id == config.id)
+                .all()
+            )
+            AutoModelService._update_router_model_abilities(
+                config.router_model, targets
+            )
+
     def commit_model_update(
         self, *, user_id: int, db_model: DBModel, invalidate_globally: bool
     ) -> None:
@@ -551,7 +571,7 @@ class ModelStore:
             AutoModelConfig.id.in_(external_config_ids),
             AutoModelConfig.fallback_model_id == model_id,
         ).update({AutoModelConfig.fallback_model_id: None}, synchronize_session=False)
-        return int(
+        deleted = int(
             self.db.query(AutoModelCandidate)
             .filter(
                 AutoModelCandidate.config_id.in_(external_config_ids),
@@ -559,6 +579,8 @@ class ModelStore:
             )
             .delete(synchronize_session=False)
         )
+        self.refresh_auto_model_abilities(external_config_ids)
+        return deleted
 
     def delete_model(
         self, *, model_storage: CoreStorage, user_model: UserModel

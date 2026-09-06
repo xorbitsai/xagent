@@ -23,6 +23,8 @@ from ....config import get_slack_app_token, get_storage_root
 from ....core.file_ref import build_file_id_ref
 from ...api.chat import get_agent_manager
 from ...models.task import TaskStatus
+from ...services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
+from ...services.llm_utils import AutoModelUnavailableError
 from ...services.channel_runtime import (
     ChannelAuthorizationError,
     ChannelConfigurationError,
@@ -672,7 +674,9 @@ class SlackBotInstance:
                         claimed_task_id,
                     )
                     return
-            if isinstance(error, SlackFileDownloadError):
+            if isinstance(error, AutoModelUnavailableError):
+                error_text = CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
+            elif isinstance(error, SlackFileDownloadError):
                 error_text = (
                     "I couldn't download the attached Slack file(s). "
                     "Please try uploading them again."

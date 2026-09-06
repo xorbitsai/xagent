@@ -21,6 +21,8 @@ from ...core.agent.runner import UserMessageInjectionOutcome
 from ..models.agent import Agent
 from ..models.database import get_session_local
 from ..models.task import Task, TaskStatus
+from ..services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
+from ..services.llm_utils import AutoModelUnavailableError
 from ..services.a2a_protocol import (
     A2A_VERSION,
     ALL_TASK_STATES,
@@ -614,10 +616,17 @@ async def _resume_input_required_a2a_task(
             status_code=503,
             details={"taskId": task_id},
         ) from exc
-    except BaseException:
+    except BaseException as exc:
         if not ownership_transferred and not prelease_cleanup_done:
             cleanup_task = asyncio.create_task(stop_and_restore_prelease())
             await drain_async_task_cancellation_safe(cleanup_task)
+        if isinstance(exc, AutoModelUnavailableError):
+            raise a2a_error(
+                "unsupported_operation",
+                CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE,
+                status_code=409,
+                details={"code": "auto_model_unavailable"},
+            ) from exc
         raise
     finally:
         if not ownership_transferred and not prelease_cleanup_done:

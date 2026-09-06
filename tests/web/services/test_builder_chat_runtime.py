@@ -55,9 +55,15 @@ async def test_load_builder_chat_runtime_inputs_uses_worker_owned_session(
             return selected_llm
 
         def get_configured_defaults(
-            self, user_id: int | None = None
+            self,
+            user_id: int | None = None,
+            *,
+            config_types: tuple[str, ...],
+            fallback_llm: object,
         ) -> tuple[None, None, None, object]:
             assert user_id == 42
+            assert config_types == ("compact",)
+            assert fallback_llm is selected_llm
             return None, None, None, default_compact_llm
 
     monkeypatch.setattr(

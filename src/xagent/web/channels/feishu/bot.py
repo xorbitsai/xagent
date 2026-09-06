@@ -16,6 +16,8 @@ from lark_oapi.api.im.v1 import (
 from ....core.file_ref import build_file_id_ref
 from ...api.chat import get_agent_manager
 from ...models.task import TaskStatus
+from ...services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
+from ...services.llm_utils import AutoModelUnavailableError
 from ...services.channel_runtime import (
     ChannelAuthorizationError,
     ChannelConfigurationError,
@@ -429,7 +431,10 @@ class FeishuBotInstance:
                     )
                     return
             await self._send_text(
-                chat_id, "Sorry, an error occurred while processing your request."
+                chat_id,
+                CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
+                if isinstance(e, AutoModelUnavailableError)
+                else "Sorry, an error occurred while processing your request.",
             )
         finally:
             if managed_lease is not None:

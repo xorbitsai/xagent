@@ -473,6 +473,8 @@ def client_safe_error_message(
     Read a passing sweep as "the recognized egress shapes are clean", never
     as "arbitrary Python data flow cannot reach a client raw".
     """
+    if isinstance(error, AutoModelUnavailableError):
+        return client_error_message(ClientErrorCode.AUTO_MODEL_UNAVAILABLE)
     if not isinstance(error, ClientVisibleError):
         return fallback
     message = str(error)
@@ -10514,9 +10516,10 @@ clarification questions as plain assistant text.
 
     except Exception as e:
         logger.error("Error handling builder chat: %s", e, exc_info=True)
-        await websocket.send_text(
-            json.dumps({"type": "error", "message": client_safe_error_message(e)})
-        )
+        payload = {"type": "error", "message": client_safe_error_message(e)}
+        if isinstance(e, AutoModelUnavailableError):
+            payload["error_code"] = ClientErrorCode.AUTO_MODEL_UNAVAILABLE.value
+        await websocket.send_text(json.dumps(payload))
 
 
 @ws_router.websocket("/ws/build/preview")

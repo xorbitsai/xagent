@@ -656,10 +656,11 @@ class _ResolvedRouterLLM(BaseLLM):
         self.context_window = context_window
         ability_source = downstream if router.uses_configured_candidates else router
         abilities = list(getattr(ability_source, "abilities", router.abilities))
-        for modality in input_modalities:
-            ability = _MODALITY_ABILITIES.get(modality)
-            if ability is not None and ability not in abilities:
-                abilities.append(ability)
+        if not router.uses_configured_candidates:
+            for modality in input_modalities:
+                ability = _MODALITY_ABILITIES.get(modality)
+                if ability is not None and ability not in abilities:
+                    abilities.append(ability)
         self._abilities = abilities
 
     @property

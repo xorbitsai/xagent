@@ -13,6 +13,8 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from xagent.web.services.llm_utils import AutoModelUnavailableError
+from xagent.web.services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
 
 from xagent.core.agent.checkpoint import (
     CheckpointAccessRefusedError,
@@ -795,6 +797,11 @@ def test_reply_checkpoint_missing_restore_clears_an_unpaired_marker(mock_start_t
     ("error", "expected_status", "expected_code"),
     [
         (
+            AutoModelUnavailableError("private model details"),
+            409,
+            "auto_model_unavailable",
+        ),
+        (
             CheckpointCorruptError("all matching rows undecodable"),
             409,
             "interaction_not_resumable",
@@ -843,6 +850,8 @@ def test_reply_checkpoint_read_error_maps_to_distinct_code(
 
     assert resp.status_code == expected_status, resp.text
     assert resp.json()["error"]["code"] == expected_code
+    if isinstance(error, AutoModelUnavailableError):
+        assert resp.json()["error"]["message"] == CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
 
     db = _direct_db_session()
     try:

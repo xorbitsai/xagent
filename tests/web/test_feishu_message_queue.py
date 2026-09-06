@@ -2,6 +2,8 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
+from xagent.web.services.llm_utils import AutoModelUnavailableError
+from xagent.web.services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
 
 from xagent.web.channels.feishu.bot import FeishuBotInstance, FeishuChannelManager
 from xagent.web.models.task import TaskStatus
@@ -30,16 +32,25 @@ def make_bot() -> FeishuBotInstance:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("auto_unavailable", [False, True])
 async def test_error_after_prepare_settles_preclaimed_task_instead_of_orphaning_it(
     monkeypatch: pytest.MonkeyPatch,
+    auto_unavailable: bool,
 ) -> None:
     bot = object.__new__(FeishuBotInstance)
     bot.channel_id = 1
     bot.channel_name = "Feishu prepare failure"
     bot.active_tasks = {}
     bot.api_client = object()
-    bot._save_active_tasks = lambda: (_ for _ in ()).throw(
-        RuntimeError("mapping persistence failed")
+    bot._save_active_tasks = lambda: None
+    failure = (
+        AutoModelUnavailableError("private model details")
+        if auto_unavailable
+        else RuntimeError("snapshot failed")
+    )
+    monkeypatch.setattr(
+        "xagent.web.channels.feishu.bot.load_task_setup_snapshot_sync",
+        lambda *_args: (_ for _ in ()).throw(failure),
     )
     lease = TaskLease(task_id=45, runner_id="runner-a", run_id="run-a")
     finalized: list[TaskStatus] = []
@@ -95,7 +106,11 @@ async def test_error_after_prepare_settles_preclaimed_task_instead_of_orphaning_
 
     assert finalized == [TaskStatus.FAILED]
     assert managed.closed is True
-    assert sent_messages == ["Sorry, an error occurred while processing your request."]
+    assert sent_messages == [
+        CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
+        if auto_unavailable
+        else "Sorry, an error occurred while processing your request."
+    ]
 
 
 @pytest.mark.asyncio

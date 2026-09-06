@@ -24,11 +24,16 @@ arrival order once it's ready -- see ``V1EventStreamSink._warm`` /
 ``_staged_messages`` for why an empty projector would otherwise fold a
 step's end event in as an orphan and silently drop it. That replay is
 bounded (``REPLAY_MAX_STEPS`` steps and ``MAX_SNAPSHOT_WIRE_BYTES`` of
-serialized frames, see ``_build_warm_up_frames``), so a client that
+serialized frames, see ``_build_warm_up_frames``), and it also ends
+early at a step whose ``data`` cannot be serialized, so a client that
 needs a task's complete history reconciles against
-``GET /v1/chat/tasks/{task_id}/steps``, which reads the database and so
-is unaffected by when the stream was opened or by what this stream's
-bounds admitted. The two attach-time fast paths are the exception to
+``GET /v1/chat/tasks/{task_id}/steps``, which reads the database rather
+than this stream's batch. That read does not depend on when the stream
+was opened or on what this stream's bounds admitted; it is not, however,
+an unconditional fallback -- see the endpoint docstring's best-effort
+delivery reasons in ``tasks.py`` for the full list of ways a replay can
+come up short, and for the one case where the reconciling read can fail
+on the same data. The two attach-time fast paths are the exception to
 all of this: an attach that finds the task already terminal, or already
 waiting on user input, closes without ever registering a projector, and
 sends a bounded one-shot snapshot of the task's steps between
@@ -1927,8 +1932,10 @@ def _snapshot_steps_within_wire_budget(
 
     A prefix, not a suffix, even though ``REPLAY_MAX_STEPS`` keeps the
     most recent steps: a step whose ``data`` cannot be serialized cannot
-    be measured either, and admitting it here is what keeps the emit loop
-    reaching it. Dropping from the oldest end instead would put an
+    be measured either, and admitting it here is what leaves the
+    decision with each caller -- the fast paths' emit loop reaches it
+    and reports it, the warm-up replay ends its batch at it. Dropping
+    from the oldest end instead would put an
     unserializable step at the head of the window, where it suppresses
     every good step behind it. The budget only binds on a window
     averaging more than 8 KiB per step.
@@ -1947,15 +1954,17 @@ def _snapshot_steps_within_wire_budget(
         would silently misreport a serialize failure as an ordinary size
         cut.
       - On the normal streaming path's warm-up replay
-        (``_build_warm_up_frames``), there is no per-step emit loop and no
-        conclusion frame to carry a marker: the bad step's serialization
-        raises out of the one call that builds the whole batch, so the
-        entire replayed history for that attach is discarded and the
-        connection closes for resync (see ``_generate``'s handling around
-        its call to ``_build_warm_up_frames``) rather than sending the
-        steps that came before it. There is no marker frame for this
-        either way; a client reconciles against ``GET .../steps``, same
-        as any other bounded or empty replay batch.
+        (``_build_warm_up_frames``), there is no per-step emit loop and
+        no conclusion frame to carry a marker. That caller serializes
+        the admitted steps one at a time and stops at the first one
+        that raises, so every step ahead of it is still replayed and
+        the connection still goes live -- the bad step, and whatever
+        the measuring pass stopped short of, are simply not in the
+        batch. There is no marker frame for this either way; a client
+        reconciles against ``GET .../steps``, same as any other bounded
+        or empty replay batch, and the endpoint's sixth best-effort
+        delivery reason in ``tasks.py`` states what that endpoint can
+        and cannot do for this particular case.
     """
     budget_remaining = MAX_SNAPSHOT_WIRE_BYTES
     admitted = 0
@@ -1963,8 +1972,10 @@ def _snapshot_steps_within_wire_budget(
         try:
             frame_bytes = len(_step_wire_frame(step))
         except Exception:
-            # Unmeasurable: admit it so the emit loop fails on it -- see
-            # the docstring above.
+            # Unmeasurable: admit it so the caller decides what to do
+            # about it -- the fast paths' emit loop reports it, the
+            # warm-up replay ends its batch there. See the docstring
+            # above.
             admitted += 1
             break
         if frame_bytes > budget_remaining:
@@ -2618,6 +2629,15 @@ def _build_warm_up_frames(
         replay contains is bounded by contract, and a client that needs
         the task's full history reconciles against ``GET .../steps`` --
         see the endpoint docstring in ``tasks.py``.
+      - A step whose serialization raises ends the batch at that step
+        rather than failing the whole attach: the frames already built
+        are returned, the stream goes live, and nothing on the wire
+        marks the cut. The shared budget admits such a step on purpose
+        -- it cannot be measured, so it cannot be budgeted -- which
+        makes it always the *last* admitted step, so "stop here" and
+        "skip it" produce the same batch today; stopping is what
+        matches the prefix the byte budget already produces. See the
+        endpoint's sixth best-effort delivery reason in ``tasks.py``.
 
     Validating to ``PublicStep`` up front is what lets the shared budget
     measure these steps at all (it takes the model, not a raw dict), and
@@ -2655,7 +2675,29 @@ def _build_warm_up_frames(
     admitted = _snapshot_steps_within_wire_budget(
         [PublicStep(**step) for step in steps[-REPLAY_MAX_STEPS:]]
     )
-    return warmed_projector, [_step_wire_frame(step) for step in admitted]
+    frames: list[str] = []
+    for step in admitted:
+        try:
+            frames.append(_step_wire_frame(step))
+        except Exception:
+            # One step whose ``data`` cannot be serialized ends this
+            # batch instead of taking the whole attach down with it:
+            # every step already serialized is still replayed and the
+            # stream still goes live. The shared budget admits such a
+            # step on purpose (unmeasurable, so unbudgetable) -- this
+            # loop is what keeps that decision from costing this attach
+            # the steps ahead of it. See the endpoint's sixth
+            # best-effort delivery reason in ``tasks.py``.
+            logger.exception(
+                "v1 SSE warm-up replay stopped at an unserializable step "
+                "for task %s; replaying the %d step(s) before it and "
+                "dropping %d admitted step(s)",
+                task_id,
+                len(frames),
+                len(admitted) - len(frames),
+            )
+            break
+    return warmed_projector, frames
 
 
 async def _generate(

@@ -1451,7 +1451,8 @@ async def stream_chat_task_events(
         later has a start to pair with and reaches the client as
         ``step.completed`` rather than being dropped as an orphan --
         unless the replay's byte budget trimmed that step out of the
-        batch, which is reason (5) below.
+        batch, or the batch ended early at a step this stream could not
+        serialize -- reasons (5) and (6) below.
       - The replay is bounded, and a client must not treat it as the
         task's complete history. It carries the same two caps, applied
         in the same order, that ``step.started``/``step.completed``
@@ -1461,15 +1462,21 @@ async def stream_chat_task_events(
         frame saying so, and a replay can legitimately be empty. This is
         a bound, not a failure:
         nothing about it closes the stream or emits ``stream.error``.
+        A step whose data this stream
+        cannot serialize ends the batch at that step, which shortens the
+        replay the same way without closing the stream either; that one
+        is reason (6) below.
         ``GET .../steps`` reads the database, is unaffected by when the
         stream was opened or by what the replay admitted, and is the
         authoritative full history -- a client that needs every step
-        reconciles there.
+        reconciles there. That is true of a replay shortened by either
+        cap. It is not unconditionally true of a replay shortened by a
+        step it could not serialize: reason (6) below says why.
       - Frame sequence into ``task.completed``: a task that fails emits
         ``task.status`` (``"failed"``) from the failure broadcast first,
         then the watchdog's authoritative ``task.completed`` close
         frame. Delivery of every ``step.*``/``message.*`` content frame
-        on this stream is best-effort, not guaranteed, for five
+        on this stream is best-effort, not guaranteed, for six
         separate reasons: (1) closing a stream for any reason drains its
         queued backlog before inserting the close frame, so any
         already-queued frame -- a ``task.status``, a ``step.*``, a
@@ -1507,8 +1514,18 @@ async def stream_chat_task_events(
         the end arrives with no start on this stream to pair with. This
         one is a stream-only artifact, unlike (4): ``GET .../steps``
         reads the task's full history directly and is unaffected by
-        what one stream attach's replay admitted. (2), (3), (4) and (5)
-        are silent: none of them ever produces a
+        what one stream attach's replay admitted. (6) a step whose data
+        cannot be turned into JSON ends the replay batch at that step:
+        the steps serialized before it still go out and the stream
+        still goes live, but that step and anything the batch had not
+        reached are missing from the replay, leaving the same
+        start-without-end shape reason (5) describes. Reconciling this
+        one against ``GET .../steps`` is not guaranteed to work the way
+        it does for (5): that endpoint serializes the same step data on
+        its own read path, so data that defeats the replay can make
+        that read fail as well. That is a property of the data, not of
+        this stream, and it is tracked separately. (2), (3), (4), (5)
+        and (6) are silent: none of them ever produces a
         ``stream.error`` frame or any other signal on the wire. (1) is
         not silent in the same way -- the
         close frame that follows a queue-drain is often itself a
@@ -1598,7 +1615,9 @@ async def stream_chat_task_events(
         separate story -- attaching mid-task replays known steps before
         going live specifically so a step's end event isn't misread as
         an orphan, unless the replay's byte budget trimmed that step
-        out of the batch, which is reason (5) below; that ordering
+        out of the batch, or the batch ended early at a step this
+        stream could not serialize -- reasons (5) and (6) below; that
+        ordering
         guarantee doesn't extend to ``task.status``). Accepted because
         only the three close frames
         above are treated as authoritative; each comes from a direct

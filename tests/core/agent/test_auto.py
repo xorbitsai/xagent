@@ -2420,3 +2420,60 @@ async def test_auto_summarizes_with_the_main_model_when_no_compact_model() -> No
     assert not any(
         "Conversation history to compact" in prompt for prompt in route_prompts
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool_name", ["send_message", "ask_user_question", "zhipu_web_search"]
+)
+async def test_auto_react_messages_preserve_user_turn_attribution(
+    tool_name: str,
+) -> None:
+    class WaitingSearchTool(FakeSearchTool):
+        async def run_json_async(self, args: dict[str, Any]) -> dict[str, Any]:
+            return {"status": "waiting_for_user", "message": "Which source?"}
+
+    context = ExecutionContext(execution_id="auto-message-source")
+    context.add_user_message("Ask before continuing", metadata={"turn_id": "turn-42"})
+    runtime = PatternRuntime()
+    observed: list[dict[str, Any]] = []
+
+    async def capture(payload: dict[str, Any]) -> None:
+        assert runtime.active_turn_id == "turn-42"
+        observed.append(payload)
+
+    runtime.outbound_message_handler = capture
+    args = (
+        {"query": "options"}
+        if tool_name == "zhipu_web_search"
+        else {"message": "Which option?", "expect_response": True}
+    )
+    llm = FakeLLM(
+        [
+            decision_tool_response("react", "Needs user input."),
+            {
+                "tool_calls": [
+                    {
+                        "id": "ask-1",
+                        "function": {
+                            "name": tool_name,
+                            "arguments": json.dumps(args),
+                        },
+                    }
+                ]
+            },
+        ]
+    )
+    result = await AutoPattern().run(
+        context=context, tools=[WaitingSearchTool()], llm=llm, runtime=runtime
+    )
+
+    assert result["status"] == "waiting_for_user"
+    assert len(observed) == 1
+    source = observed[0]["metadata"]
+    if tool_name == "zhipu_web_search":
+        assert len(source["tool_calls"]) == 1
+        source = source["tool_calls"][0]
+    assert source["tool_call_id"] == "ask-1"
+    assert source["tool_name"] == tool_name
+    assert source["turn_id"] == "turn-42"

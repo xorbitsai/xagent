@@ -181,6 +181,10 @@ class _AutoChildRuntime:
     def active_react_step_id(self) -> str | None:
         return self.parent.active_react_step_id
 
+    @property
+    def active_turn_id(self) -> str | None:
+        return self.parent.active_turn_id
+
     async def should_interrupt(self) -> bool:
         return await self.parent.should_interrupt()
 

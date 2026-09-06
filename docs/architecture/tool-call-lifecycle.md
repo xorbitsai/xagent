@@ -138,7 +138,7 @@ flowchart TB
 
 准备上下文时使用执行副本；控制处理器仍接收原 pending 对象，保留按对象身份取消其他调用的语义，也不把 step/turn 写回已保存的 checkpoint。最终答案已记为完成后若 checkpoint 失败，保留已完成记录并传播异常。
 
-单个控制消息的 metadata 增加 `tool_call_id`、`tool_name` 和可用的 step/turn 来源。聚合提问通过 metadata 的 `tool_calls` 有序列表保留各调用来源，不携带工具参数。DAG/Auto 现有转发已满足要求，因此未修改其接口或实现。
+单个控制消息的 metadata 增加 `tool_call_id`、`tool_name` 和可用的 step/turn 来源。聚合提问通过 metadata 的 `tool_calls` 有序列表保留各调用来源，不携带工具参数。DAG/Auto 的消息 metadata 转发保持不变；Auto 子 runtime 补充 `active_turn_id` 属性代理，使 ReAct 在构造来源时能读取父 runtime 当前轮次。
 
 在更新到 `origin/main` 的 `39004299c` 后，本地验证：
 

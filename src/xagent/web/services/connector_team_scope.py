@@ -49,16 +49,25 @@ that declares it is checked; one that does not is not.
 | ``custom_api.update_custom_api`` | the ``custom_apis`` definition row, ``FOR UPDATE``, on the payloads that write that row | no | ``True`` |
 | ``custom_api.delete_custom_api`` | the ``custom_apis`` definition row, ``FOR UPDATE`` | no | ``True`` |
 | ``mcp.update_mcp_server`` | the ``mcp_servers`` definition row, ``FOR UPDATE ... KEY SHARE``, on the payloads that write that row | no | ``True`` |
-| ``mcp.teardown_mcp_app_server`` | three row locks: ``public_mcp_apps``, ``mcp_servers``, ``user_mcpservers`` | no, within this function -- see the note below | ``True`` |
+| ``mcp._recheck_team_access_under_definition_lock`` | the ``mcp_servers`` definition row, ``FOR UPDATE ... KEY SHARE``, taken by ``update_mcp_server`` before this call | no | ``True`` |
+| ``mcp._teardown_mcp_app_server_locally`` | three row locks: ``public_mcp_apps``, ``mcp_servers``, ``user_mcpservers`` | no, within this function -- see the note below | ``True`` |
 | ``mcp.delete_mcp_server`` | two row locks: ``mcp_servers`` and ``user_mcpservers``, taken by ``_lock_active_mcp_oauth_lifecycle`` before this call | no | ``True`` |
+| ``mcp._resolve_mcp_server_for_request`` | nothing; this is the gate both ``GET`` and ``PUT`` run before any lock exists | no | ``False`` |
+| ``mcp.list_mcp_apps`` | nothing | no | ``False`` |
+| ``mcp.get_mcp_servers`` | nothing | no | ``False`` |
+| ``mcp.connect_mcp_app`` | nothing | **yes** -- the association is committed before the verdict is read, for a reported field only; must never declare | ``False`` |
+| ``mcp.toggle_mcp_server`` | nothing | **yes** -- the toggle is committed before the verdict is read, for a reported field only; must never declare | ``False`` |
 
-``mcp.teardown_mcp_app_server`` is a helper, not a route: it has no route
-decorator and no caller in this repository outside tests. "Nothing committed
-before asking" therefore holds inside its own body only. A future caller that
-commits and then calls it would turn its declaration into a report of failure
-for work that already succeeded, and nothing here would notice -- the check
-that keeps this table honest compares declarations against call sites, not
-against a caller's commit history.
+``mcp._teardown_mcp_app_server_locally`` is a helper, not a route: it has no
+route decorator and no caller in this repository outside tests (the async
+``teardown_mcp_app_server`` route only dispatches to it with
+``asyncio.to_thread`` and, after it returns, runs the external revocation that
+must not itself hold any of the three row locks). "Nothing committed before
+asking" therefore holds inside its own body only. A future caller that commits
+and then calls it would turn its declaration into a report of failure for work
+that already succeeded, and nothing here would notice -- the check that keeps
+this table honest compares declarations against call sites, not against a
+caller's commit history.
 
 While a hook runs at any of the row-locking call sites above, every
 concurrent request touching that connector is queued behind it. Keep the
@@ -66,14 +75,15 @@ hook's work local to the database: blocking on an external network call there
 holds that queue open for as long as the call takes. xagent has no way to
 check this at run time, so it is stated here rather than enforced.
 
-The remaining slots declare nothing. Every ``visibility`` and
-``team_visibility`` call site is lock-free, and one of the ``team_visibility``
-paths runs on a lazily created session that may not be in a transaction at
-all. ``access`` has no call site in this repository; a caller that adds one
-while holding a lock owes this table a row and owes the call
-``caller_holds_lock=True``. One shape must never declare it: a call site that
-has already committed its own work before asking, because refusing there
-reports a failure for an operation that fully succeeded.
+Every ``visibility`` and ``team_visibility`` call site is lock-free, and one
+of the ``team_visibility`` paths runs on a lazily created session that may
+not be in a transaction at all; none of them declares anything. ``access``
+has six call sites, all on the MCP routes, and only one of them holds a
+lock -- the re-resolve under ``update_mcp_server``'s definition-row lock.
+Two of the other five, ``connect_mcp_app`` and ``toggle_mcp_server``, are
+the shape that must never declare it: each commits its own work before
+reading the verdict, and refusing there would report a failure for an
+operation that fully succeeded.
 
 What the check is not
 ---------------------

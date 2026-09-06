@@ -67,6 +67,7 @@ on:
       - 'src/xagent/web/api/mcp.py'
       - 'src/xagent/core/tools/core/mcp/model.py'
       - 'tests/web/services/test_connector_hook_session_boundary.py'
+      - 'tests/web/api/test_connector_hook_session_fault_postgresql.py'
   pull_request:
     branches: [main]
   # Required by the merge queue: without this the two required contexts below
@@ -170,6 +171,7 @@ jobs:
             src/xagent/web/api/mcp.py
             src/xagent/core/tools/core/mcp/model.py
             tests/web/services/test_connector_hook_session_boundary.py
+            tests/web/api/test_connector_hook_session_fault_postgresql.py
           )
 
           case "$EVENT_NAME" in
@@ -543,6 +545,13 @@ jobs:
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
           pytest tests/web/services/test_connector_hook_session_boundary.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test connector hook session fault recovery (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/web/api/test_connector_hook_session_fault_postgresql.py -m postgresql -q
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 

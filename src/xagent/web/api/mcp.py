@@ -5,6 +5,7 @@ Provides REST API endpoints for managing MCP server configurations
 in the web application.
 """
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -13,10 +14,21 @@ import logging
 import secrets
 import shlex
 from collections.abc import Collection
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Annotated, Any, Callable, Dict, List, Literal, Optional, Union, cast
+from typing import (
+    TYPE_CHECKING,
+    Annotated,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Union,
+    cast,
+)
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import UUID
 
@@ -30,6 +42,7 @@ from sqlalchemy.orm import Session
 
 from ...config import get_app_base_url, get_public_api_base_url, get_session_secret
 from ...core.tools.adapters.vibe.connector_runtime import (
+    ConnectorRuntimeError,
     validate_runtime_config_declaration,
 )
 from ...core.tools.core.mcp.data_config import MCPServerConfig
@@ -81,6 +94,9 @@ from ..services.user_oauth import (
     list_scoped_user_oauth_accounts,
     normalize_user_oauth_resource_owner_key,
 )
+
+if TYPE_CHECKING:
+    from ..services.connector_team_scope import ConnectorAccess, ConnectorRef
 
 logger = logging.getLogger(__name__)
 
@@ -1928,11 +1944,25 @@ def _check_mcp_permission(
     user_mcp: "UserMCPServer | _TeamOwnedUserMCP",
     is_admin: bool,
     require: str = "edit",
+    *,
+    team_access: "ConnectorAccess | None" = None,
 ) -> bool:
     """Whether the user may mutate shared MCP config.
 
     ``edit`` gates changes to the shared global config; ``delete`` gates
     removing the shared server. Admins bypass both.
+
+    ``team_access`` is the caller's team access verdict for this connector
+    (``None`` when the caller's team does not link it, or when standalone
+    xagent has no access hook installed at all). It is a fallback only: an
+    owner's ``is_owner`` still wins the ``edit`` branch outright, with no
+    verdict consulted at all, and the ``delete`` branch does not read it --
+    ``can_delete`` is not part of the verdict this seam reports.
+
+    On the MCP routes the verdict reaching this parameter has already passed
+    through _team_access_for_shared_row, which withholds edit on a
+    platform-catalog row; this function itself applies no such test and
+    trusts what it is handed.
     """
     if is_admin:
         return True
@@ -1942,7 +1972,9 @@ def _check_mcp_permission(
         # non-owner. Checking is_owner too covers rows created before can_delete
         # was set (e.g. OAuth provisioning, migration-skipped is_owner rows).
         return is_owner or bool(getattr(user_mcp, "can_delete", False))
-    return is_owner
+    if is_owner:
+        return True
+    return bool(team_access is not None and team_access.can_edit)
 
 
 # Owner-only global fields that are safe to compare (non-secret; secret values
@@ -2000,8 +2032,26 @@ def _global_config_tampered(server_data: MCPServerUpdate, server: MCPServer) -> 
 
 class _TeamOwnedUserMCP:
     """Stand-in for a missing UserMCPServer row: a team connector the user does
-    not personally own. Exposes the attributes the response builders read with
-    not-owned defaults (usable, but not editable/deletable)."""
+    not personally own. Its class attributes report the same not-owned
+    defaults a real, ownerless row would (``is_owner``, ``can_edit`` and
+    ``can_delete`` all ``False``) -- reading the attributes alone never
+    grants anything. The route-level gate (``_check_mcp_permission``) looks
+    past those defaults only on the ``edit`` branch, falling back to the
+    caller's own team access verdict when one links this connector. Nothing
+    reads past them on the ``delete`` branch: this stand-in grants no delete
+    right, and none of its attributes changes that.
+
+    ``is_active`` and ``is_default`` are not read off any row -- there is
+    none -- and report a fixed placeholder instead: this user has no personal
+    activation state or default choice for a connector they never connected,
+    so there is no real value to report. A response built off this stand-in
+    (``update_mcp_server``'s post-lock cascade can construct one for a
+    caller whose personal row was deleted while it waited for the definition
+    lock, when the re-resolved verdict still authorizes the edit) reports
+    ``is_active=True`` and ``is_default=False`` for such a caller regardless
+    of what, if anything, their connection looked like before it was
+    removed.
+    """
 
     is_owner = False
     can_edit = False
@@ -2016,14 +2066,134 @@ class _TeamOwnedUserMCP:
 
 
 class _TeamOwnedUserApi:
-    """Stand-in for a missing UserCustomApi row (team-owned, not user-owned)."""
+    """Stand-in for a missing UserCustomApi row (team-owned, not user-owned).
 
+    Same shape as ``_TeamOwnedUserMCP``: ``is_owner`` and ``can_edit`` both
+    report the not-owned default, so reading the attributes alone never
+    grants anything. This module only ever reads them to build a response;
+    the Custom API routes that act on them live in their own module and
+    resolve their own rows.
+    """
+
+    is_owner = False
     can_edit = False
     is_active = True
     is_default = False
 
     def __init__(self, user_id: int) -> None:
         self.user_id = int(user_id)
+
+
+def _resolve_mcp_server_for_request(
+    db: Session,
+    user_id: int,
+    server_id: int,
+    *,
+    on_resolution_failure: Literal["raise", "degrade"] = "raise",
+) -> "tuple[UserMCPServer | _TeamOwnedUserMCP, MCPServer, ConnectorAccess | None]":
+    """Resolve the caller's association, the definition row, and the
+    caller's team access verdict, for ``GET``/``PUT /api/mcp/servers/{id}``.
+
+    Looks up the caller's own personal link row first, with the same
+    two-table join both routes have always run. When that row exists, the
+    association and the definition row both come from it and nothing else
+    runs. When it does not, the definition row is looked up on its own --
+    a team-owned connector's shared row must still be found even though
+    this caller has no personal link to it -- and the caller's team access
+    verdict decides what happens next:
+
+    - no personal row and no team access (``access is None``) -> 404, the
+      same outcome every caller without an association has always gotten.
+    - no personal row but the caller's team links the connector -> the
+      existing ``_TeamOwnedUserMCP`` stand-in takes the association's
+      place, the same stand-in the list endpoint's team-owned branch
+      already constructs.
+
+    An owner's personal row already decides the edit answer on its own --
+    ``_check_mcp_permission``'s edit branch returns ``True`` on ``is_owner``
+    without ever consulting a verdict -- so resolving one for an owner would
+    only add an unnecessary hook call; this skips the call entirely for an
+    owner's row and returns ``access=None``.
+
+    The verdict returned is the downgraded one -- see
+    _team_access_for_shared_row -- so both the gate and the reported field
+    below draw on the same object.
+
+    ``on_resolution_failure`` decides what a hook failure means for this
+    call, and only the caller can know which: ``"raise"`` (the default)
+    lets ``ConnectorRuntimeError`` propagate to the caller's own
+    HTTPException translation, appropriate whenever this verdict is a
+    gate (``PUT`` -- the verdict decides whether the request is even
+    authorized). ``"degrade"`` reports ``can_edit_global=False`` instead
+    and lets the request succeed, appropriate only when this verdict is
+    pure decoration on a field the caller can already read regardless
+    (``GET`` -- the caller already has a personal row or their team
+    already cleared the gate above). Degrading without a personal row
+    would answer "does not exist" for a connector this call merely failed
+    to ask about, which is why the degrade branch below still raises when
+    ``user_mcp is None``: the verdict *is* the gate in that case, not a
+    decoration on top of one.
+    """
+    from ..services.connector_team_scope import resolve_one_connector_access_or_raise
+
+    result = (
+        db.query(UserMCPServer, MCPServer)
+        .join(MCPServer, UserMCPServer.mcpserver_id == MCPServer.id)
+        .filter(UserMCPServer.user_id == user_id, MCPServer.id == server_id)
+        .first()
+    )
+    if result is not None:
+        user_mcp: "UserMCPServer | _TeamOwnedUserMCP | None" = result[0]
+        server: Optional[MCPServer] = result[1]
+    else:
+        user_mcp = None
+        server = db.query(MCPServer).filter(MCPServer.id == server_id).first()
+
+    already_decided = user_mcp is not None and bool(
+        getattr(user_mcp, "is_owner", False)
+    )
+
+    access: "ConnectorAccess | None" = None
+    if server is not None and not already_decided:
+        try:
+            access = resolve_one_connector_access_or_raise(
+                db, user_id, ("mcp", int(server.id))
+            )
+        except ConnectorRuntimeError as exc:
+            # Degrade only when the caller's own personal row already got
+            # them past the gate. With no personal row the verdict *is*
+            # the gate, and degrading it to None would answer "does not
+            # exist" for a connector we merely failed to ask about.
+            if user_mcp is None or on_resolution_failure == "raise":
+                raise
+            logger.warning(
+                "Connector access resolution failed (%s) for MCP server %s "
+                "while reading it for user %s; reporting "
+                "can_edit_global=False",
+                exc,
+                server_id,
+                user_id,
+            )
+            access = None
+
+    if user_mcp is None and access is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="MCP server not found"
+        )
+
+    if user_mcp is None:
+        user_mcp = _TeamOwnedUserMCP(int(user_id))
+
+    # Placed after the 404 above rather than before it. Today that ordering
+    # is belt-and-braces: this helper never turns a verdict into None, it only
+    # clears can_edit, so the 404 test above sees a non-None verdict either
+    # way. The ordering becomes load-bearing the moment the helper starts
+    # returning None for a row -- ahead of the 404, a catalog connector the
+    # caller's team genuinely links would read as "not found" to that member
+    # instead of as read-only.
+    access = _team_access_for_shared_row(db, cast(MCPServer, server), access)
+
+    return user_mcp, cast(MCPServer, server), access
 
 
 def _db_server_to_response(
@@ -2034,8 +2204,21 @@ def _db_server_to_response(
     app_id: Optional[str] = None,
     provider: Optional[str] = None,
     is_admin: bool = False,
+    team_access: "ConnectorAccess | None" = None,
 ) -> MCPServerResponse:
-    """Convert database MCPServer to response model."""
+    """Convert database MCPServer to response model.
+
+    ``team_access`` is the caller's team access verdict for this connector,
+    forwarded to ``_check_mcp_permission`` unchanged. ``None`` covers every
+    case where this function has nothing further to add: the caller's own
+    personal row already decided the answer so no hook was ever called for
+    it, a hook was called and genuinely answered "not linked", a hook call
+    was attempted and failed and the caller degraded rather than failing
+    the request, or no hook is installed in this deployment at all. Every
+    caller of this function decides for itself whether resolving a verdict
+    is worth a hook call before passing one in; this function never
+    resolves one on its own.
+    """
     # Get status from manager if available
     config = server.to_config_dict()
 
@@ -2066,7 +2249,9 @@ def _db_server_to_response(
         runtime_input_schema=server.runtime_input_schema,
         runtime_bindings=server.runtime_bindings,
         allow_delegated_authorization=bool(server.allow_delegated_authorization),
-        can_edit_global=_check_mcp_permission(user_mcp, is_admin, require="edit"),
+        can_edit_global=_check_mcp_permission(
+            user_mcp, is_admin, require="edit", team_access=team_access
+        ),
         transport_display=server.transport_display,
         created_at=_format_optional_datetime(server.created_at),
         updated_at=_format_optional_datetime(server.updated_at),
@@ -2079,8 +2264,24 @@ def _db_server_to_response(
 def _custom_api_to_mcp_response(
     api: CustomApi,
     user_api: UserCustomApi | _TeamOwnedUserApi,
+    team_access: "ConnectorAccess | None" = None,
 ) -> MCPServerResponse:
-    """Project a Custom API into the aggregate connector response contract."""
+    """Project a Custom API into the aggregate connector response contract.
+
+    ``can_edit_global`` reports the union of two grants: the caller's own
+    association row (``user_api.can_edit``) and, for a caller whose row
+    grants nothing, a team access verdict that grants edit. ``team_access``
+    is that verdict, or ``None`` whenever there is nothing to add -- the
+    caller's team does not link this connector, a hook call failed and the
+    caller degraded rather than failing the request, or no hook is installed
+    in this deployment at all.
+
+    The verdict half is reported here, in the aggregate connector listing
+    this module owns. Custom API's own ``PUT`` gates on the association row
+    alone, in its own module, so a caller who has only the verdict is
+    refused there today; this field is a UI hint and grants nothing, but
+    keep the two in step when that gate changes.
+    """
     masked_env: dict[str, Any] = _mask_env(api.env) if isinstance(api.env, dict) else {}
     config: dict[str, Any] = {"env": masked_env}
     for field_name in ("url", "method", "headers", "body"):
@@ -2101,7 +2302,8 @@ def _custom_api_to_mcp_response(
         runtime_input_schema=api.runtime_input_schema,
         runtime_bindings=api.runtime_bindings,
         allow_delegated_authorization=bool(api.allow_delegated_authorization),
-        can_edit_global=bool(user_api.can_edit),
+        can_edit_global=bool(user_api.can_edit)
+        or bool(team_access is not None and team_access.can_edit),
         transport_display="Custom API",
         created_at=_format_optional_datetime(api.created_at),
         updated_at=_format_optional_datetime(api.updated_at),
@@ -2161,7 +2363,8 @@ def _catalog_app_keys(app: dict) -> list[str]:
     after the display name (_ensure_user_mcp_server). Single-sourced so every
     caller asking "which row is this app's" — the connected-state and shared-row
     lookups, the names a custom server may not take, the rows the connector
-    listing must not re-emit, and the rows that carry a platform key — cannot
+    listing must not re-emit, the rows that carry a platform key, and the rows
+    a team verdict may not grant edit on — cannot
     drift apart; one such drift is exactly what #1346 was.
 
     Normalized keys only. The raw id/name strings stay in use where a value
@@ -2189,8 +2392,10 @@ def _server_catalog_keys(server: MCPServer) -> list[str]:
     against catalog *ids*, so one whose provider happens to equal some app's id
     is skipped even if it belongs to another app. Kept on purpose, because the
     catalog branch claims such a row by provider too (_is_oauth_server_for_app)
-    — a key this misses is a #1346 duplicate, while a key it over-matches only
-    moves a legacy row to the Remote tab, still editable via /api/mcp/servers.
+    — a key this misses is a #1346 duplicate, while a key it over-matches also
+    loses its team edit right through _team_access_for_shared_row; the row's
+    own owner is unaffected, since is_owner short-circuits that check in
+    _check_mcp_permission before any verdict is read.
     """
     if _normalize_app_key(server.transport) != "oauth":
         return _app_lookup_keys(server.name)
@@ -2208,6 +2413,120 @@ def _is_reserved_catalog_name(db: Session, name: object) -> bool:
     if not key:
         return False
     return any(key in _catalog_app_keys(app) for app in get_all_mcp_apps(db))
+
+
+def _catalog_reserved_keys(db: Session) -> "set[str]":
+    """Every normalized key the platform's app catalog claims, in one query.
+
+    The same set ``list_mcp_apps`` builds inline as ``library_keys`` from the
+    ``library_apps`` list it already holds. Kept separate rather than shared
+    with that loop because that loop reuses a list it fetched for other
+    reasons, while the callers of this function need the set on its own and
+    only sometimes.
+    """
+    return {key for app in get_all_mcp_apps(db) for key in _catalog_app_keys(app)}
+
+
+def _team_access_for_shared_row(
+    db: Session,
+    server: MCPServer,
+    access: "ConnectorAccess | None",
+    *,
+    reserved_keys: "set[str] | None" = None,
+) -> "ConnectorAccess | None":
+    """The team access verdict as this repo's MCP routes may act on it.
+
+    xagent provisions ONE shared ``MCPServer`` row per catalog app, and every
+    user who connects that app attaches to that same row; a key-based app's
+    row may additionally hold the administrator's platform fallback key in
+    ``env``. That row's configuration is the platform's, not any one team's,
+    so a verdict that grants edit on it is downgraded here rather than
+    trusted. Without this, an application answering ``can_edit=True`` for such
+    a ref would let one team rewrite ``command``/``args``/``url``/``env``/
+    ``auth`` for every user of that app, including users in no team at all.
+
+    Only ``can_edit`` is downgraded; ``team_owned`` is left as the application
+    answered it, so the connector stays visible and readable to the team and
+    the caller's stand-in resolution is unaffected. Dropping the verdict
+    entirely would not 404 such a row today -- the sole caller that can raise
+    a 404 applies this after that test, so the test sees the undowngraded
+    verdict either way. Keeping ``team_owned`` is what leaves the two
+    independent: neither this function's return shape nor that caller's
+    ordering has to hold for a connector the caller's team genuinely links to
+    stay reachable.
+
+    The catalog test is ``_server_catalog_keys`` against the catalog's own
+    keys -- the same predicate ``list_mcp_apps`` uses to decide that a stored
+    row is some catalog app's shared row, so this module holds one definition
+    of "catalog-managed", not two. Two nearby functions are deliberately NOT
+    used for it:
+
+    - ``_is_reserved_catalog_name`` answers a different question, "may a new
+      row take this name", and reads the name alone. A builtin-oauth catalog
+      row an administrator renamed still carries its ``app_id`` in ``auth``
+      and is still the platform's row; that function no longer recognizes it,
+      and builtin-oauth is the largest auth kind in the built-in catalog.
+    - ``_catalog_server_has_platform_key`` answers "catalog row that ALSO
+      carries the platform key", so every keyless and mcp_oauth row, and every
+      key-based row whose key each user supplies themselves, reads False there
+      while still being platform-owned configuration.
+
+    DECLARED BOUNDARY -- a connector someone built themselves under a name a
+    catalog app later took. The catalog claims that name, so this function
+    treats such a row as catalog-managed and withholds the team edit. Its
+    creator keeps their own edit right in full: an owner's ``is_owner``
+    decides the edit branch in ``_check_mcp_permission`` before any verdict is
+    read. What is withheld is only a TEAMMATE editing that connector on the
+    owner's behalf. Telling such a row apart from a real catalog row needs a
+    stored "who created this definition" fact the schema does not carry today;
+    until it does, this is the side the ambiguity is resolved on, on purpose.
+
+    ``reserved_keys`` lets a caller resolving many rows in one request build
+    the key set once and pass it in. The test runs only for a verdict that
+    already grants edit -- the one case where it can change an answer -- so a
+    deployment with no access hook installed resolves ``None`` for every row
+    and issues no additional query at all.
+    """
+    if access is None or not access.can_edit:
+        return access
+    keys = _catalog_reserved_keys(db) if reserved_keys is None else reserved_keys
+    if not keys.intersection(_server_catalog_keys(server)):
+        return access
+    return replace(access, can_edit=False)
+
+
+def _recheck_team_access_under_definition_lock(
+    db: Session, server: MCPServer, user_id: int, server_id: int
+) -> "ConnectorAccess | None":
+    """Re-resolve this caller's verdict while the definition row is locked.
+
+    Its own function rather than an inline call inside ``update_mcp_server``
+    for one reason: the call site table in ``connector_team_scope``'s module
+    docstring keys a row by "module.function", and that route already owns a
+    row for its rename-hook call. Two hook calls under one key have no way to
+    state two different declarations, and the check that keeps the table
+    honest refuses the collision outright.
+
+    ``caller_holds_lock=True``: this call runs after this transaction took
+    ``FOR UPDATE ... KEY SHARE`` on the ``mcp_servers`` definition row and
+    before anything is written. A hook that ends this transaction releases
+    that lock without the route noticing, so the seam refuses it here rather
+    than letting the write proceed on a lock that is already gone.
+
+    Like ``_teardown_mcp_app_server_locally``, this is a helper, not a route:
+    "the caller holds the definition row" is a fact about its one call site,
+    not something this function can check. A second caller that adds itself
+    without the lock owes the table a correction.
+    """
+    from ..services.connector_team_scope import resolve_one_connector_access_or_raise
+
+    return _team_access_for_shared_row(
+        db,
+        server,
+        resolve_one_connector_access_or_raise(
+            db, user_id, ("mcp", server_id), caller_holds_lock=True
+        ),
+    )
 
 
 def _oauth_account_can_connect(oauth_account: object) -> bool:
@@ -2600,39 +2919,56 @@ def _local_mcp_can_authorize(
 
 def _local_mcp_can_configure(
     association: Union[UserMCPServer, UserCustomApi, None],
+    team_access: "ConnectorAccess | None" = None,
 ) -> bool:
     """Whether this viewer's configuration route would resolve for a local entry.
 
     One rule for both local branches: the four routes the picker's Configure
-    button reaches all take the same first gate -- a personal association row
-    for the calling user -- and answer 404 without one. ``GET``/``PUT
-    /api/mcp/servers/{id}`` (mcp.py) and ``GET``/``PUT /api/custom-apis/{id}``
-    (custom_api.py) each query by ``user_id`` + connector id and raise 404 on
-    an empty result, which is why a team-owned connector reaching a member
-    through the visibility overlay alone (``association is None``) is not
-    configurable however visible or attachable it is.
+    button reaches -- ``GET``/``PUT /api/mcp/servers/{id}`` (mcp.py) and
+    ``GET``/``PUT /api/custom-apis/{id}`` (custom_api.py) -- resolve the
+    caller from two sources: a personal association row for the calling user,
+    or, when there is none, the caller's team access verdict for the
+    connector. Either source alone is enough; 404 only when both are absent.
+    A team-owned connector reaching a member through the visibility overlay
+    alone (``association is None``) is therefore configurable exactly when
+    that member's own verdict links it (``team_access is not None``),
+    independent of whatever the visibility overlay itself decided.
 
-    Deliberately reads nothing but the association's existence:
+    The MCP pair reads both sources. The Custom API pair reads only the
+    association row today and 404s without one, so passing a verdict for a
+    Custom API entry claims a form that route will not open until it reads
+    the verdict too. This is a UI hint, never a permission (see the closing
+    paragraph), so the cost of the mismatch is a Configure button whose
+    request fails, not an unauthorized read.
+
+    Deliberately reads nothing else:
 
     - Not the connector's shape. Unlike ``can_attach``/``can_authorize``, no
       route this answers for treats the mcp_oauth shape differently.
     - Not ``is_active``. Neither route filters it, so a deactivated connector's
       owner can still open and save its form -- and withholding the button
       there would remove the only affordance that population has left.
-    - Not ``can_edit``. Existence alone is what the four routes' first gate
-      reads, and it is what this answers. Custom API's ``PUT`` has a second,
-      owner-side gate on ``can_edit`` (403), so this field's accuracy there
-      rests on a convention rather than an identity: the one production write
-      point sets ``can_edit=True`` (custom_api.py), and no other code path
-      creates the row. A future writer that leaves the column at its ``False``
-      default would make this field claim an editable entry whose save is
-      refused -- add that gate here if that ever happens.
+    - Not ``can_edit``, and not the verdict's own ``can_edit`` field. A
+      verdict that links the connector but denies edit still resolves the
+      route -- the form opens, and a save attempt is refused owner-side, not
+      here. Existence of either source is what the four routes' first gate
+      reads, and it is what this answers. MCP's ``PUT`` carries that
+      owner-side refusal (403) as a structural check against the same
+      verdict this function reads -- it refuses a stand-in whose verdict
+      denies edit outright, before the shared-config tamper check ever runs
+      -- so it never drifts from what this field reports. Custom API's
+      ``PUT`` has its own owner-side gate on ``can_edit`` (403), so this
+      field's accuracy there rests on a convention rather than an identity:
+      the one production write point sets ``can_edit=True`` (custom_api.py),
+      and no other code path creates the row. A future writer that leaves the
+      column at its ``False`` default would make this field claim an editable
+      entry whose save is refused -- add that gate here if that ever happens.
 
     This is a UI hint, never a permission. Editing the shared configuration is
     additionally gated owner-side (``_check_mcp_permission(require="edit")``
     for MCP, ``can_edit`` for Custom API), and a forged value grants nothing.
     """
-    return association is not None
+    return association is not None or team_access is not None
 
 
 @mcp_router.get("/apps", response_model=List[dict])
@@ -2836,6 +3172,7 @@ def list_mcp_apps(
         # they always did.
         from ..services.connector_team_scope import (
             connector_visible_to_user,
+            resolve_connector_access_or_raise,
             visible_team_connector_ids,
         )
 
@@ -2883,6 +3220,73 @@ def list_mcp_apps(
         # fixable from the Tools page, unreachable from the picker. A team-shared
         # catalog connector loses its only picker entry the same way, which is
         # pre-existing for most apps and tracked in #1387.
+
+        # Custom APIs: gathered here, ahead of both append loops, so that
+        # every row needing a team access verdict -- MCP and Custom API
+        # alike -- is known before the single batched access call below.
+        user_custom_apis = (
+            db.query(UserCustomApi, CustomApi)
+            .join(CustomApi, UserCustomApi.custom_api_id == CustomApi.id)
+            .filter(UserCustomApi.user_id == current_user.id)
+            .all()
+        )
+
+        # Same overlay as the MCP half above: a team-owned Custom API has no
+        # UserCustomApi row for the member, so it is carried as (api, None).
+        # The association is read for can_attach and can_configure below — a
+        # team-owned API is one the runtime overlays by id, exactly like the
+        # MCP half.
+        local_custom_apis: list[tuple[CustomApi, UserCustomApi | None]] = [
+            (api, user_api) for user_api, api in user_custom_apis
+        ]
+        own_api_ids = {cast(int, api.id) for api, _ in local_custom_apis}
+        missing_api = [aid for aid in team_ids["custom_api"] if aid not in own_api_ids]
+        if missing_api:
+            local_custom_apis.extend(
+                (api, None)
+                for api in db.query(CustomApi)
+                .filter(CustomApi.id.in_(missing_api))
+                .all()
+            )
+
+        # One batched call covering every stand-in row across both halves --
+        # a personal row (user_mcp/user_api is not None) already answers
+        # can_configure on its own and needs no verdict at all. A resolution
+        # failure here degrades every stand-in row's can_configure to False
+        # rather than failing the whole listing -- the same per-row
+        # degradation this route has always offered, now paid for with one
+        # hook call instead of one per row.
+        access_refs: "set[ConnectorRef]" = {
+            ("mcp", cast(int, server.id))
+            for server, user_mcp in local_mcps
+            if user_mcp is None
+        } | {
+            ("custom_api", cast(int, api.id))
+            for api, user_api in local_custom_apis
+            if user_api is None
+        }
+        verdicts: "dict[ConnectorRef, ConnectorAccess]" = {}
+        if access_refs:
+            # Captured before the resolution call below: a failed hook can
+            # leave the shared session in a state where a lazy ORM attribute
+            # read triggers a query of its own, so the log line below reads
+            # a plain int gathered ahead of time rather than current_user.id
+            # off the row.
+            user_id_for_log = int(current_user.id)
+            try:
+                verdicts = resolve_connector_access_or_raise(
+                    db, user_id_for_log, access_refs
+                )
+            except ConnectorRuntimeError as exc:
+                logger.warning(
+                    "Connector access resolution failed (%s) while listing %s "
+                    "local connectors for user %s; reporting "
+                    "can_configure=False for those rows",
+                    exc,
+                    len(access_refs),
+                    user_id_for_log,
+                )
+
         library_keys = {key for app in library_apps for key in _catalog_app_keys(app)}
         for server, user_mcp in local_mcps:
             if library_keys.intersection(_server_catalog_keys(server)):
@@ -2898,6 +3302,18 @@ def list_mcp_apps(
 
             if category and category != "All":
                 continue
+
+            # A personal row already answers can_configure on its own; only
+            # a team-owned row with none (user_mcp is None) needs a verdict,
+            # looked up from the batch answer computed once above. A ref
+            # missing from that answer -- because the caller's team does not
+            # link it, or because the whole batch call failed and was
+            # degraded -- reports can_configure=False for this row alone.
+            local_team_access: "ConnectorAccess | None" = (
+                verdicts.get(("mcp", cast(int, server.id)))
+                if user_mcp is None
+                else None
+            )
 
             entry = {
                 "id": server.name,
@@ -2930,7 +3346,7 @@ def list_mcp_apps(
                     user_mcp,
                     token_resolver_installed=token_resolver_installed,
                 ),
-                "can_configure": _local_mcp_can_configure(user_mcp),
+                "can_configure": _local_mcp_can_configure(user_mcp, local_team_access),
             }
             # The picker dispatches its Connect button on auth_type, and custom
             # entries used to omit the field entirely — so an mcp_oauth server
@@ -2960,32 +3376,8 @@ def list_mcp_apps(
 
             results.append(entry)
 
-        # Append Custom APIs
-        user_custom_apis = (
-            db.query(UserCustomApi, CustomApi)
-            .join(CustomApi, UserCustomApi.custom_api_id == CustomApi.id)
-            .filter(UserCustomApi.user_id == current_user.id)
-            .all()
-        )
-
-        # Same overlay as the MCP half above: a team-owned Custom API has no
-        # UserCustomApi row for the member, so it is carried as (api, None).
-        # The association is read for can_attach and can_configure below — a
-        # team-owned API is one the runtime overlays by id, exactly like the
-        # MCP half.
-        local_custom_apis: list[tuple[CustomApi, UserCustomApi | None]] = [
-            (api, user_api) for user_api, api in user_custom_apis
-        ]
-        own_api_ids = {cast(int, api.id) for api, _ in local_custom_apis}
-        missing_api = [aid for aid in team_ids["custom_api"] if aid not in own_api_ids]
-        if missing_api:
-            local_custom_apis.extend(
-                (api, None)
-                for api in db.query(CustomApi)
-                .filter(CustomApi.id.in_(missing_api))
-                .all()
-            )
-
+        # Append Custom APIs (query and list assembled above, before the
+        # batched access call).
         for api, user_api in local_custom_apis:
             if search:
                 search_lower = search.lower()
@@ -2996,6 +3388,15 @@ def list_mcp_apps(
 
             if category and category != "All":
                 continue
+
+            # Same batch lookup as the MCP loop above: only a stand-in row
+            # (user_api is None) needs a verdict, and a ref missing from the
+            # batch answer degrades this row's can_configure to False.
+            local_team_access = (
+                verdicts.get(("custom_api", cast(int, api.id)))
+                if user_api is None
+                else None
+            )
 
             results.append(
                 {
@@ -3025,7 +3426,9 @@ def list_mcp_apps(
                         team_ids=team_ids["custom_api"],
                     ),
                     "can_authorize": False,
-                    "can_configure": _local_mcp_can_configure(user_api),
+                    "can_configure": _local_mcp_can_configure(
+                        user_api, local_team_access
+                    ),
                     "runtime_input_schema": api.runtime_input_schema,
                     "runtime_bindings": api.runtime_bindings,
                     "allow_delegated_authorization": bool(
@@ -3074,11 +3477,113 @@ def get_mcp_servers(
             if oauth.email and _oauth_account_can_connect(oauth)
         }
 
+        from ..services.connector_team_scope import (
+            resolve_connector_access_or_raise,
+            visible_team_connector_ids,
+        )
+
+        # Every query this route needs is run up front, before the single
+        # batched access call below, so every row needing a verdict is known
+        # in one place. Order here does not affect the response: the four
+        # append loops further down (personal MCP, personal Custom API,
+        # stand-in MCP, stand-in Custom API) preserve the exact row order
+        # this route has always produced.
+        user_custom_apis = (
+            db.query(UserCustomApi, CustomApi)
+            .join(CustomApi, UserCustomApi.custom_api_id == CustomApi.id)
+            .filter(UserCustomApi.user_id == effective_user_id)
+            .all()
+        )
+
+        # Team-owned connectors the user has no personal row for, so a team
+        # member sees the team's shared connectors in their own list.
+        team_ids = visible_team_connector_ids(db, effective_user_id)
+
+        own_mcp_ids = {int(server.id) for _um, server in user_mcps}
+        missing_mcp = [sid for sid in team_ids["mcp"] if sid not in own_mcp_ids]
+        stand_in_mcp_servers = (
+            db.query(MCPServer).filter(MCPServer.id.in_(missing_mcp)).all()
+            if missing_mcp
+            else []
+        )
+
+        own_api_ids = {int(api.id) for _ua, api in user_custom_apis}
+        missing_api = [aid for aid in team_ids["custom_api"] if aid not in own_api_ids]
+        stand_in_apis = (
+            db.query(CustomApi).filter(CustomApi.id.in_(missing_api)).all()
+            if missing_api
+            else []
+        )
+
+        # One batched call for every row this listing needs a verdict for.
+        # An owner's reported right cannot change with a verdict (the edit
+        # branch returns True on is_owner alone), so only a non-owner
+        # personal row is worth asking about; a stand-in row holds no
+        # personal row at all and is unconditionally worth asking about.
+        access_refs: "set[ConnectorRef]" = (
+            {
+                ("mcp", int(server.id))
+                for user_mcp, server in user_mcps
+                if not bool(getattr(user_mcp, "is_owner", False))
+            }
+            | {
+                ("custom_api", int(api.id))
+                for user_api, api in user_custom_apis
+                if not bool(getattr(user_api, "is_owner", False))
+            }
+            | {("mcp", int(server.id)) for server in stand_in_mcp_servers}
+            | {("custom_api", int(api.id)) for api in stand_in_apis}
+        )
+        # A resolution failure here degrades every row that still needed a
+        # verdict to can_edit_global=False rather than failing the whole
+        # list: this call is a single batch, so it either succeeds for
+        # every row asked about or fails for all of them together -- there
+        # is no partial-failure mode to preserve at this granularity. A
+        # per-connector granularity still exists and is preserved: a
+        # verdict genuinely missing from a *successful* answer degrades
+        # only that one row, the same as before batching.
+        verdicts: "dict[ConnectorRef, ConnectorAccess]" = {}
+        if access_refs:
+            try:
+                verdicts = resolve_connector_access_or_raise(
+                    db, effective_user_id, access_refs
+                )
+            except ConnectorRuntimeError as exc:
+                logger.warning(
+                    "Connector access resolution failed (%s) while listing %s "
+                    "connectors for user %s; reporting can_edit_global=False "
+                    "for those rows",
+                    exc,
+                    len(access_refs),
+                    effective_user_id,
+                )
+
+        # Built once per request, and only when some MCP verdict actually
+        # grants edit -- the downgrade below is its only reader. A listing
+        # with no granting verdict (every standalone deployment, and every
+        # team listing where nothing is editable) must cost exactly what it
+        # cost before this existed.
+        reserved_keys: "set[str] | None" = None
+        if any(
+            verdict.can_edit
+            for (kind, _connector_id), verdict in verdicts.items()
+            if kind == "mcp"
+        ):
+            reserved_keys = _catalog_reserved_keys(db)
+
         is_admin = getattr(current_user, "is_admin", False)
         responses = []
         for user_mcp, server in user_mcps:
             app_id, provider, connected_account = _enrich_oauth_server_info(
                 db, server, oauth_emails
+            )
+            team_access = _team_access_for_shared_row(
+                db,
+                server,
+                None
+                if bool(getattr(user_mcp, "is_owner", False))
+                else verdicts.get(("mcp", int(server.id))),
+                reserved_keys=reserved_keys,
             )
             responses.append(
                 _db_server_to_response(
@@ -3089,61 +3594,61 @@ def get_mcp_servers(
                     app_id,
                     provider,
                     is_admin=is_admin,
+                    team_access=team_access,
                 )
             )
 
-        # Append Custom APIs
-        user_custom_apis = (
-            db.query(UserCustomApi, CustomApi)
-            .join(CustomApi, UserCustomApi.custom_api_id == CustomApi.id)
-            .filter(UserCustomApi.user_id == effective_user_id)
-            .all()
-        )
-
         for user_api, api in user_custom_apis:
-            responses.append(_custom_api_to_mcp_response(api, user_api))
+            team_access = (
+                None
+                if bool(getattr(user_api, "is_owner", False))
+                else verdicts.get(("custom_api", int(api.id)))
+            )
+            responses.append(
+                _custom_api_to_mcp_response(api, user_api, team_access=team_access)
+            )
 
-        # Append team-owned connectors the user has no personal row for, so a
-        # team member sees the team's shared connectors in their own list.
-        from ..services.connector_team_scope import visible_team_connector_ids
-
-        team_ids = visible_team_connector_ids(db, effective_user_id)
-
-        own_mcp_ids = {int(server.id) for _um, server in user_mcps}
-        missing_mcp = [sid for sid in team_ids["mcp"] if sid not in own_mcp_ids]
-        if missing_mcp:
-            for server in (
-                db.query(MCPServer).filter(MCPServer.id.in_(missing_mcp)).all()
-            ):
-                app_id, provider, connected_account = _enrich_oauth_server_info(
-                    db, server, oauth_emails
+        for server in stand_in_mcp_servers:
+            app_id, provider, connected_account = _enrich_oauth_server_info(
+                db, server, oauth_emails
+            )
+            team_access = _team_access_for_shared_row(
+                db,
+                server,
+                verdicts.get(("mcp", int(server.id))),
+                reserved_keys=reserved_keys,
+            )
+            responses.append(
+                _db_server_to_response(
+                    server,
+                    _TeamOwnedUserMCP(effective_user_id),
+                    manager,
+                    connected_account,
+                    app_id,
+                    provider,
+                    is_admin=is_admin,
+                    team_access=team_access,
                 )
-                responses.append(
-                    _db_server_to_response(
-                        server,
-                        _TeamOwnedUserMCP(effective_user_id),
-                        manager,
-                        connected_account,
-                        app_id,
-                        provider,
-                        is_admin=is_admin,
-                    )
-                )
+            )
 
-        own_api_ids = {int(api.id) for _ua, api in user_custom_apis}
-        missing_api = [aid for aid in team_ids["custom_api"] if aid not in own_api_ids]
-        if missing_api:
-            for api in db.query(CustomApi).filter(CustomApi.id.in_(missing_api)).all():
-                responses.append(
-                    _custom_api_to_mcp_response(
-                        api, _TeamOwnedUserApi(effective_user_id)
-                    )
+        for api in stand_in_apis:
+            team_access = verdicts.get(("custom_api", int(api.id)))
+            responses.append(
+                _custom_api_to_mcp_response(
+                    api,
+                    _TeamOwnedUserApi(effective_user_id),
+                    team_access=team_access,
                 )
+            )
 
         return responses
 
     except HTTPException:
         raise
+    except ConnectorRuntimeError as exc:
+        raise HTTPException(
+            status_code=exc.status_code, detail=exc.safe_message
+        ) from exc
     except Exception as e:
         logger.error(f"Failed to list MCP servers: {e}")
         raise HTTPException(
@@ -3163,20 +3668,14 @@ def get_mcp_server(
         manager = DatabaseMCPServerManager(db)
         user_id = current_user.id
 
-        # Check user has access to this server
-        result = (
-            db.query(UserMCPServer, MCPServer)
-            .join(MCPServer, UserMCPServer.mcpserver_id == MCPServer.id)
-            .filter(UserMCPServer.user_id == user_id, MCPServer.id == server_id)
-            .first()
+        # Check user has access to this server: a personal row, or a team
+        # access verdict for a connector the caller has none for. The
+        # verdict is pure decoration on this read path -- degrade it to
+        # can_edit_global=False on a resolution failure rather than
+        # failing the whole read.
+        user_mcp, server, team_access = _resolve_mcp_server_for_request(
+            db, int(user_id), server_id, on_resolution_failure="degrade"
         )
-
-        if not result:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND, detail="MCP server not found"
-            )
-
-        user_mcp, server = result
 
         # Actor credentials are not personal server connections.
         oauth_accounts = list_scoped_user_oauth_accounts(
@@ -3202,10 +3701,15 @@ def get_mcp_server(
             app_id,
             provider,
             is_admin=getattr(current_user, "is_admin", False),
+            team_access=team_access,
         )
 
     except HTTPException:
         raise
+    except ConnectorRuntimeError as exc:
+        raise HTTPException(
+            status_code=exc.status_code, detail=exc.safe_message
+        ) from exc
     except Exception as e:
         logger.error(f"Failed to get MCP server: {e}")
         raise HTTPException(
@@ -3744,12 +4248,51 @@ def connect_mcp_app(
 
     db.refresh(assoc)
     logger.info(f"User {current_user.id} connected MCP app '{server_name}'")
+    # assoc is a personal row this call just created or updated, always with
+    # is_owner=False (connecting never grants ownership), so the verdict is
+    # what decides the reported can_edit_global. Resolve it here so that
+    # field comes from the same object the PUT gate would read. Every row
+    # this route returns is a catalog app's shared row, so the downgrade
+    # below makes the answer False -- the point is that it is False for the
+    # same reason the gate would refuse, not that it happens to default that
+    # way.
+    #
+    # The association has already committed by this point, so a verdict
+    # failure here must not fail the request -- it only degrades
+    # can_edit_global to False.
+    from ..services.connector_team_scope import resolve_one_connector_access_or_raise
+
+    # Captured before the resolution call below: a failed hook can leave the
+    # shared session in a state where a lazy ORM attribute read triggers a
+    # query of its own, so the log line below reads plain ints gathered
+    # ahead of time rather than server.id/current_user.id off the row.
+    server_id_for_log = int(server.id)
+    user_id_for_log = int(current_user.id)
+
+    team_access: "ConnectorAccess | None" = None
+    try:
+        team_access = resolve_one_connector_access_or_raise(
+            db, user_id_for_log, ("mcp", server_id_for_log)
+        )
+    except ConnectorRuntimeError as exc:
+        logger.warning(
+            "Connector access resolution failed (%s) for MCP server %s after "
+            "connecting it for user %s; reporting can_edit_global=False",
+            exc,
+            server_id_for_log,
+            user_id_for_log,
+        )
+    # Every row this route returns is a catalog app's shared row, so this is
+    # what keeps its reported can_edit_global from advertising an edit the PUT
+    # gate would refuse.
+    team_access = _team_access_for_shared_row(db, server, team_access)
     return _db_server_to_response(
         server,
         assoc,
         manager,
         app_id=str(app_info["id"]),
         is_admin=getattr(current_user, "is_admin", False),
+        team_access=team_access,
     )
 
 
@@ -3936,6 +4479,9 @@ def create_mcp_server(
         db.refresh(user_mcp)
 
         logger.info(f"Created MCP server '{server_data.name}' for user {user_id}")
+        # No verdict to resolve: user_mcp was just constructed above with
+        # is_owner=True, so _check_mcp_permission's edit branch returns True
+        # on that alone -- a team access verdict could not change the value.
         return _db_server_to_response(
             server, user_mcp, manager, is_admin=getattr(current_user, "is_admin", False)
         )
@@ -3963,23 +4509,59 @@ def update_mcp_server(
         manager = DatabaseMCPServerManager(db)
         user_id = current_user.id
 
-        # Check user has access to this server
-        result = (
-            db.query(UserMCPServer, MCPServer)
-            .join(MCPServer, UserMCPServer.mcpserver_id == MCPServer.id)
-            .filter(UserMCPServer.user_id == user_id, MCPServer.id == server_id)
-            .first()
+        # Check user has access to this server: a personal row, or a team
+        # access verdict for a connector the caller has none for.
+        user_mcp, server, team_access = _resolve_mcp_server_for_request(
+            db, int(user_id), server_id
+        )
+        is_stand_in = isinstance(user_mcp, _TeamOwnedUserMCP)
+        can_edit_global = _check_mcp_permission(
+            user_mcp,
+            getattr(current_user, "is_admin", False),
+            require="edit",
+            team_access=team_access,
         )
 
-        if not result:
+        # user_env and is_active both live on the personal association row;
+        # a caller with no personal row (the stand-in) has none to hold
+        # them, so a payload carrying either must be rejected outright --
+        # silently dropping them would report a 200 for a write that never
+        # happened. This is independent of can_edit_global: even a team
+        # editor with edit rights on the shared config has no personal row
+        # of their own to store a per-user override or activation flag on.
+        #
+        # This is the gate-side half of the guard; a caller who still has a
+        # personal row here can lose it during the wait for the definition
+        # lock, so a second copy runs again below, after that wait, on the
+        # row a fresh read then finds.
+        if is_stand_in and (
+            server_data.user_env is not None or server_data.is_active is not None
+        ):
             raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND, detail="MCP server not found"
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "No personal connection exists to configure user_env or "
+                    "is_active for this server"
+                ),
             )
 
-        user_mcp, server = result
-        can_edit_global = _check_mcp_permission(
-            user_mcp, getattr(current_user, "is_admin", False), require="edit"
-        )
+        # A stand-in whose verdict denies edit has an empty writable field
+        # set: the guard above refuses the personal fields (there is no
+        # personal row to hold them), the tamper check below refuses every
+        # shared field it can compare, and the ones it deliberately cannot
+        # compare (secrets) are emptied out of the payload. Every payload
+        # this caller can send therefore either fails already or commits
+        # nothing -- and a 200 for a write that provably cannot change
+        # anything reports success for a request that had none. Ordered
+        # after the personal-field guard on purpose: for a payload carrying
+        # only ``user_env``/``is_active``, "there is no personal connection
+        # to configure this on" is the more precise answer than "you may not
+        # edit this server", so that payload keeps its 400.
+        if is_stand_in and not can_edit_global:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have permission to edit this MCP server",
+            )
 
         # Which row a request writes decides which row it locks. Seven of the
         # nine fields of ``MCPServerUpdate`` target the shared ``MCPServer``
@@ -4014,15 +4596,24 @@ def update_mcp_server(
         # One flag, three decisions, and they are the same decision on
         # purpose: whether to take the row lock (the ``with_for_update``
         # below), whether to re-derive the caller's write authority after
-        # that wait (the block right after the lock), and whether to
-        # rebuild, validate and write the definition row (the block
-        # further down). Moving a field into the exclusion set above
-        # therefore also drops that payload's post-lock re-authorization --
-        # the hazard ``custom_api.py``'s equivalent comment warns about --
-        # and drops its runtime-config validation with it. Change that set
-        # only with all three in view;
+        # that wait (the block right after the lock, which re-reads the
+        # caller's link row, the caller's admin flag and the caller's team
+        # access verdict), and whether to rebuild, validate and write the
+        # definition row (the block further down). Moving a field into the
+        # exclusion set above therefore also drops that payload's post-lock
+        # re-authorization -- the hazard ``custom_api.py``'s equivalent
+        # comment warns about -- and drops its runtime-config validation with
+        # it. Change that set only with all three in view;
         # ``tests/web/api/test_mcp_update_lock_partition.py`` fails on a
         # field added to ``MCPServerUpdate`` without that decision.
+        #
+        # The exclusion set names exactly the two fields that write the
+        # caller's own association row and nothing shared, so a payload it
+        # excludes has no shared write for any of the three to protect. That
+        # makes ``writes_definition_row`` this route's only spelling of "the
+        # payload touches something shared": no other guard here re-tests the
+        # payload's field set, and a second such test would only drift from
+        # this one.
         #
         # This set is also exactly the set of payloads the block below
         # rebuilds and writes the definition row for: the whole rebuild --
@@ -4100,44 +4691,53 @@ def update_mcp_server(
         server = current_server
 
         if writes_definition_row:
-            # The join gate above ran before the lock statement, and the
-            # lock statement waits. Both inputs to ``can_edit_global`` --
-            # that the caller still has a ``UserMCPServer`` link to this
-            # server (link ownership), and whether the caller is a platform
-            # admin -- were read from that pre-wait state: the gate's join
-            # for the link, ``current_user`` (built once by the auth
-            # dependency before this route even started) for admin status.
-            # A supported admin user deletion removes association rows and
-            # leaves every definition row standing; a platform admin's own
-            # admin flag can itself be revoked by another admin; an MCP
-            # disconnect removes the caller's own link while another user's
-            # link keeps the definition alive. Any of these can commit
-            # inside the wait. The request would then write and commit the
-            # shared definition row on a revoked authority, and fail only
-            # afterwards, in ``db.refresh(user_mcp)`` below -- which runs
-            # after the commit, so the generic handler's rollback cannot
-            # take the shared write back and the caller sees a 500 over a
-            # durable change.
+            # The gate above ran before the lock statement, and the lock
+            # statement waits. All three inputs to ``can_edit_global`` --
+            # whether the caller still has a ``UserMCPServer`` link to this
+            # server (link ownership), whether the caller is a platform
+            # admin, and the caller's team access verdict for this
+            # connector -- were read from that pre-wait state: the gate's
+            # join for the link, ``current_user`` (built once by the auth
+            # dependency before this route even started) for admin status,
+            # and the gate's own hook call for the verdict. A supported
+            # admin user deletion removes association rows and leaves every
+            # definition row standing; a platform admin's own admin flag can
+            # itself be revoked by another admin; an MCP disconnect removes
+            # the caller's own link while another user's link keeps the
+            # definition alive; and the application that answers the verdict
+            # can revoke the team's link at any moment, writing its own
+            # tables, which this lock does not cover. Any of these can
+            # commit inside the wait. The request would then write and
+            # commit the shared definition row on a revoked authority, and
+            # fail only afterwards, in ``db.refresh(user_mcp)`` below --
+            # which runs after the commit, so the generic handler's rollback
+            # cannot take the shared write back and the caller sees a 500
+            # over a durable change.
             #
             # ``populate_existing()`` on the definition query above
-            # refreshes that statement's row and nothing else, so both
-            # inputs need their own fresh single-table reads here -- the
-            # gate above is a two-table join and cannot address either
-            # table alone. The link read below replaces ``user_mcp``; the
-            # admin read further below replaces the value passed into
-            # ``_check_mcp_permission``. Together they re-derive
-            # ``can_edit_global`` for the rest of the route: the per-user
-            # env write, the activation write, the refresh and the response
-            # all read ``user_mcp``, and the owner-only guard below reads
-            # ``can_edit_global``.
+            # refreshes that statement's row and nothing else, so all three
+            # inputs need their own fresh reads here -- the gate above is a
+            # two-table join and cannot address either table alone. The link
+            # read below replaces ``user_mcp``; the admin read after it
+            # replaces the value passed into ``_check_mcp_permission``; the
+            # verdict re-resolve after that replaces ``team_access``.
+            # Together they re-derive ``can_edit_global`` for the rest of
+            # the route: the per-user env write, the activation write, the
+            # refresh and the response all read ``user_mcp``, and the
+            # owner-only guard below reads ``can_edit_global``.
             #
-            # A gone link is this route's existing 404, matching the gate.
-            # A link that is still there but no longer owns the server is
-            # not an error by itself here -- the gate does not refuse a
-            # non-owner either -- so it is answered exactly as the gate
-            # would have answered it: the owner-only guard below rejects a
-            # payload that changes the shared configuration and drops one
-            # that does not.
+            # This whole block is skipped for a payload that writes nothing
+            # but the caller's own association row, because none of these
+            # re-reads can change what such a payload is allowed to do.
+            #
+            # A gone link no longer 404s by itself here: what a caller with
+            # no personal row may still do is the re-resolved verdict's
+            # answer, asked by the cascade below. A link that is still there
+            # but no longer owns the server is not an error either -- the
+            # gate does not refuse a non-owner -- so both cases are answered
+            # by that same cascade, exactly as the gate would have answered
+            # them: the owner-only guard further down rejects a payload that
+            # changes the shared configuration and drops one that does not.
             current_user_mcp = (
                 db.query(UserMCPServer)
                 .filter(
@@ -4147,18 +4747,26 @@ def update_mcp_server(
                 .populate_existing()
                 .first()
             )
-            if current_user_mcp is None:
-                # Same reasoning as the definition-row 404 above: this read
-                # ran inside the transaction that held the lock, so an
-                # explicit rollback keeps this 404 from leaving that
-                # transaction open for the outer ``except HTTPException``
-                # handler to skip past.
-                db.rollback()
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="MCP server not found",
-                )
-            user_mcp = current_user_mcp
+            # ``user_mcp`` is re-pointed in both directions, because the lock
+            # wait can move a caller either way: one who reached the gate on
+            # their team's verdict may have acquired a personal row, and one
+            # who reached it on a personal row may have had it deleted.
+            #
+            # Nothing is refused here. Whether a caller with no personal row
+            # may still write is the verdict's answer, and it is asked below;
+            # refusing first would 404 a team editor whose team does authorise
+            # this edit. What must not survive this point is the gate's ORM
+            # object: continuing to hold a row another session has deleted
+            # raises ``StaleDataError`` at commit for a payload that writes it,
+            # and ``ObjectDeletedError`` while building the response for one
+            # that does not -- and the second of those fails *after* the
+            # definition-row write has already committed.
+            if current_user_mcp is not None:
+                user_mcp = current_user_mcp
+                is_stand_in = False
+            else:
+                user_mcp = _TeamOwnedUserMCP(int(user_id))
+                is_stand_in = True
             # ``current_user.is_admin`` is the value the auth dependency's
             # own read fixed before this route's wait for the lock, same as
             # ``user_mcp``'s pre-lock read above -- and admin status is
@@ -4182,8 +4790,118 @@ def update_mcp_server(
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail="Requesting user account no longer exists",
                 )
+            is_admin_now = bool(current_admin_user.is_admin)
+
+            # The third fresh read: the caller's team access verdict, asked
+            # again while this transaction holds the definition row locked.
+            # This narrows the revocation window; it is not a fence, and
+            # cannot be one from inside this repository -- the revoke path
+            # lives in the application that installs the hook, and a real
+            # fence needs both sides to take the same lock.
+            #
+            # It also assumes READ COMMITTED, PostgreSQL's default, which this
+            # codebase sets no ``isolation_level`` on its engine to change: it
+            # needs a fresh snapshot to see a link revoked and committed after
+            # this request's pre-lock read. Under REPEATABLE READ or
+            # SERIALIZABLE the re-read reuses this transaction's original
+            # snapshot, sees the pre-lock answer again, and degrades to a
+            # no-op -- it would stop refusing, not start refusing wrongly.
+            #
+            # Skipped for a platform admin, whose write authority never came
+            # from the verdict (``_check_mcp_permission`` answers True on the
+            # admin flag before it ever reads one), and skipped for a caller
+            # whose freshly-read personal row still says ``is_owner`` -- that
+            # row decides the edit branch on its own, again without reading a
+            # verdict, so there is nothing here for a verdict to add.
+            #
+            # Everyone else re-asks, including the two populations the old
+            # condition let through unasked: a caller whose personal row
+            # granted edit at the gate (so no verdict was ever resolved) and
+            # lost it during the wait, and a caller whose gate verdict granted
+            # nothing. Both of those get the wrong answer without a re-ask --
+            # the first a 404 or a 403 for an edit their team does authorise,
+            # the second a refusal for an authority that arrived during the
+            # wait.
+            #
+            # Placed before any field below is read or mutated and before
+            # rename_team_connector runs, so a refusal here has nothing to
+            # undo: zero side effects is structural, not something the
+            # rollback has to achieve.
+            still_can_edit = is_admin_now or bool(
+                getattr(current_user_mcp, "is_owner", False)
+            )
+            if not still_can_edit:
+                rechecked = _recheck_team_access_under_definition_lock(
+                    db, server, int(user_id), int(server_id)
+                )
+                if rechecked is not None and rechecked.can_edit:
+                    # The response below reports the verdict this write was
+                    # actually authorized on, not the one resolved before the
+                    # lock existed.
+                    team_access = rechecked
+                elif team_access is not None and team_access.can_edit:
+                    # The gate's verdict granted edit and this one does not:
+                    # revoked inside the wait. Wording unchanged.
+                    db.rollback()
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail=(
+                            "Your team's access to this MCP server changed while "
+                            "this edit was in flight"
+                        ),
+                    )
+                elif current_user_mcp is None:
+                    # The personal row is gone and the re-resolved verdict does not
+                    # authorize the edit. When that verdict is None this is literally
+                    # the gate's own 404 condition -- ``_resolve_mcp_server_for_request``
+                    # answers 404 for a caller with neither a personal row nor a
+                    # verdict. When it is a verdict that merely denies edit, the gate
+                    # would instead have built a stand-in and the pre-lock guard above
+                    # would have answered 403; 404 is chosen here for the whole
+                    # population because it discloses less about a connector this
+                    # caller no longer holds any row on.
+                    db.rollback()
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail="MCP server not found",
+                    )
+                else:
+                    # A personal row that does not own the server, and no team
+                    # verdict either. NOT a refusal here, and this is where the
+                    # MCP side stops being a mirror of ``custom_api``: the gate
+                    # does not refuse a non-owner either, so this caller is
+                    # answered exactly as the gate would answer them -- the
+                    # owner-only guard below rejects a payload that changes the
+                    # shared configuration and drops one that does not.
+                    team_access = rechecked
+
+            # The lock-side counterpart of the guard above the lock: that one
+            # runs before the wait and cannot see a personal row deleted
+            # during it. Same wording on purpose -- it is the same refusal,
+            # discovered later.
+            #
+            # Ordered after the authorization branches above, which mirrors
+            # the gate's own order: the gate answers 404 for a caller with
+            # neither a personal row nor a verdict (in
+            # ``_resolve_mcp_server_for_request``) before it ever reaches its
+            # own personal-field 400.
+            if is_stand_in and (
+                server_data.user_env is not None or server_data.is_active is not None
+            ):
+                db.rollback()
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=(
+                        "No personal connection exists to configure user_env or "
+                        "is_active for this server"
+                    ),
+                )
+
             can_edit_global = _check_mcp_permission(
-                user_mcp, bool(current_admin_user.is_admin), require="edit"
+                user_mcp,
+                is_admin_now,
+                require="edit",
+                team_access=team_access,
             )
 
         # Read from the fresh definition-row read above, not the pre-lock
@@ -4316,7 +5034,13 @@ def update_mcp_server(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=f"Invalid user environment variables: {exc}",
                 ) from exc
-            user_mcp.env = encrypt_env_dict(merged_user_env) or None
+            # ``Any`` rather than ``UserMCPServer``: what mypy rejects is
+            # assigning through a ``Column[...]``-typed attribute, so a
+            # concrete cast fails here with "expression has type
+            # ``dict[Any, Any] | None``, variable has type ``Column[Any]``".
+            # Four sibling call sites in this module take the same escape
+            # hatch for the same reason.
+            cast(Any, user_mcp).env = encrypt_env_dict(merged_user_env) or None
 
         # Update user association if needed
         if server_data.is_active is not None:
@@ -4339,15 +5063,26 @@ def update_mcp_server(
 
         db.commit()
         db.refresh(server)
-        db.refresh(user_mcp)
+        # The stand-in is not an ORM instance -- there is no row to refresh.
+        if not is_stand_in:
+            db.refresh(user_mcp)
 
         logger.info(f"Updated MCP server '{server.name}' for user {user_id}")
         return _db_server_to_response(
-            server, user_mcp, manager, is_admin=getattr(current_user, "is_admin", False)
+            server,
+            user_mcp,
+            manager,
+            is_admin=getattr(current_user, "is_admin", False),
+            team_access=team_access,
         )
 
     except HTTPException:
         raise
+    except ConnectorRuntimeError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=exc.status_code, detail=exc.safe_message
+        ) from exc
     except Exception as e:
         db.rollback()
         logger.error(f"Failed to update MCP server: {e}")
@@ -4430,7 +5165,7 @@ def _locked_catalog_app_for_server(
     return expected_app if owners == {app_id} else None
 
 
-async def teardown_mcp_app_server(
+def _teardown_mcp_app_server_locally(
     server_id: int,
     *,
     app_id: str,
@@ -4439,13 +5174,24 @@ async def teardown_mcp_app_server(
     expected_association_generation: UUID,
     current_user: User,
     db: Session,
-) -> None:
-    """Atomically disconnect one exact catalog-app association lifecycle.
+) -> tuple[int, list[_MCPOAuthGrantRevocationSnapshot]]:
+    """Own the local teardown transaction and report what still needs revoking.
 
     The caller pins both generations during preflight. This function owns the
-    local transaction, revalidates every destructive identity while locked,
-    commits local cleanup once, and only then performs best-effort provider
-    revocation without ORM access or database locks.
+    local transaction, revalidates every destructive identity while locked, and
+    commits local cleanup once. Provider revocation stays with the caller,
+    because it may only run once this commit has released every lock.
+
+    Kept a plain ``def`` and run off the event loop by its caller: this half
+    calls the connector team seam, and an installed team hook answers from the
+    installing application's own tables, so it can be slow. A seam call made
+    from a coroutine runs on the event loop thread, where a slow hook stalls
+    every other request the process is serving instead of occupying one
+    worker.
+
+    Returns the acting user id alongside the revocation snapshots, so the
+    caller can log the completed teardown without reading an ORM attribute that
+    this function's commit has expired.
     """
     revocations: list[_MCPOAuthGrantRevocationSnapshot] = []
     try:
@@ -4671,6 +5417,45 @@ async def teardown_mcp_app_server(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to delete MCP server",
         ) from None
+
+    return user_id, revocations
+
+
+async def teardown_mcp_app_server(
+    server_id: int,
+    *,
+    app_id: str,
+    expected_provider_name: str | None,
+    expected_catalog_generation: UUID,
+    expected_association_generation: UUID,
+    current_user: User,
+    db: Session,
+) -> None:
+    """Atomically disconnect one exact catalog-app association lifecycle.
+
+    The locked local transaction -- every destructive identity revalidated, the
+    connector team seam consulted, one commit -- is
+    ``_teardown_mcp_app_server_locally``, and runs in a worker thread rather
+    than here, because an installed team hook may be slow and this coroutine
+    runs on the event loop thread that serves every other request. The same
+    session is handed to that thread and back, which is what an ``async``
+    route already does with a session ``get_db`` opened in a worker thread; the
+    ``await`` below means only one thread ever uses it at a time.
+
+    What remains here is the best-effort provider revocation, the one step that
+    genuinely needs to await. It needs no ORM access and holds no database
+    lock, and runs only after the commit above has released every lock.
+    """
+    user_id, revocations = await asyncio.to_thread(
+        _teardown_mcp_app_server_locally,
+        server_id,
+        app_id=app_id,
+        expected_provider_name=expected_provider_name,
+        expected_catalog_generation=expected_catalog_generation,
+        expected_association_generation=expected_association_generation,
+        current_user=current_user,
+        db=db,
+    )
 
     # No provider call may run until the local commit releases every lock.
     for revocation in revocations:
@@ -4944,12 +5729,20 @@ async def delete_mcp_server(
 
 
 @mcp_router.post("/servers/{server_id}/toggle", response_model=MCPServerResponse)
-async def toggle_mcp_server(
+def toggle_mcp_server(
     server_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> MCPServerResponse:
-    """Toggle MCP server active status."""
+    """Toggle MCP server active status.
+
+    Declared ``def`` rather than ``async def`` so FastAPI runs it in a
+    worker thread: the body issues blocking synchronous database work, and
+    the team access verdict it resolves below is answered by an installed
+    hook that may issue database work of its own. A coroutine route would
+    run all of that on the event loop thread and stall every other request
+    served by the same worker for its duration.
+    """
     try:
         manager = DatabaseMCPServerManager(db)
         user_id = current_user.id
@@ -4979,8 +5772,44 @@ async def toggle_mcp_server(
             f"{status_text.capitalize()} MCP server '{server.name}' for user {user_id}"
         )
 
+        # The gate above requires a personal row and 404s without one, owner
+        # or not; only the reported field below draws on a team verdict, and
+        # on the downgraded one, so a catalog row's reported field cannot
+        # advertise an edit the PUT gate would refuse. The toggle has already
+        # committed by the time this runs, so a verdict failure here must not
+        # fail the request -- it only degrades can_edit_global to False.
+        from ..services.connector_team_scope import (
+            resolve_one_connector_access_or_raise,
+        )
+
+        # Captured before the resolution call below: a failed hook can leave
+        # the shared session in a state where a lazy ORM attribute read
+        # triggers a query of its own, so the log line below reads plain
+        # ints gathered ahead of time rather than server.id/user_id off the
+        # row.
+        server_id_for_log = int(server.id)
+        user_id_for_log = int(user_id)
+
+        team_access: "ConnectorAccess | None" = None
+        try:
+            team_access = resolve_one_connector_access_or_raise(
+                db, user_id_for_log, ("mcp", server_id_for_log)
+            )
+        except ConnectorRuntimeError as exc:
+            logger.warning(
+                "Connector access resolution failed (%s) for MCP server %s after "
+                "toggling it for user %s; reporting can_edit_global=False",
+                exc,
+                server_id_for_log,
+                user_id_for_log,
+            )
+        team_access = _team_access_for_shared_row(db, server, team_access)
         return _db_server_to_response(
-            server, user_mcp, manager, is_admin=getattr(current_user, "is_admin", False)
+            server,
+            user_mcp,
+            manager,
+            is_admin=getattr(current_user, "is_admin", False),
+            team_access=team_access,
         )
 
     except HTTPException:

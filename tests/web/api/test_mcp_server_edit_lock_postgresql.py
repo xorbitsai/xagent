@@ -51,7 +51,10 @@ from tests.shared.postgres_disposable import disposable_database_factory
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.user import User
-from xagent.web.services.connector_team_scope import set_connector_team_hooks
+from xagent.web.services.connector_team_scope import (
+    ConnectorAccess,
+    set_connector_team_hooks,
+)
 
 pytestmark = pytest.mark.postgresql
 
@@ -1029,10 +1032,13 @@ def test_a_put_whose_association_is_revoked_after_the_lock_is_refused_with_no_sh
     or clear ``is_owner`` -- and commit while this route still holds the
     definition row locked, after the gate already let the request through.
     The re-read added after the lock, which re-derives ``can_edit_global``,
-    must catch that: a gone link is the gate's own 404. A link that no
-    longer owns the server is not an error by itself -- the gate does not
-    refuse a non-owner either -- so a payload that changes the shared
-    configuration is refused by the existing owner-only guard instead.
+    must catch that: a gone link is answered by the post-lock verdict
+    cascade, which falls back to the gate's own 404 when the verdict does
+    not authorise either (no hook is installed here, so it never does). A
+    link that no longer owns the server is not an error by itself -- the
+    gate does not refuse a non-owner either -- so a payload that changes the
+    shared configuration is refused by the existing owner-only guard
+    instead.
 
     The revocation fires on this route's first single-entity
     ``UserMCPServer`` read -- the gate's own read joins it to ``MCPServer``,
@@ -1652,3 +1658,423 @@ def test_a_link_row_only_edit_reports_the_stored_restart_policy_of_an_internal_r
         row = fresh.query(MCPServer).filter(MCPServer.id == server_id).one()
         assert row.restart_policy == "always"
         assert row.managed == "internal"
+
+
+class TestPostLockVerdictCascade:
+    """The post-lock re-authorization cascade
+    (``_recheck_team_access_under_definition_lock`` and the branches around
+    it in ``update_mcp_server``), exercised against a real row lock and a
+    real concurrent writer rather than an in-process hook sequence -- the
+    SQLite-backed cascade tests in ``test_mcp_team_connector_edit.py`` never
+    take a real row lock, so they cannot tell "the recheck saw a row deleted
+    by a second connection" from "the recheck saw a pre-built Python
+    object". Each test's concurrent change commits from a second connection
+    exactly when this route's own query for the definition row
+    (``(MCPServer,)``, the ``FOR UPDATE ... KEY SHARE`` statement) starts,
+    so the change is guaranteed visible to the post-lock re-reads and
+    invisible to the gate that ran before the lock.
+    """
+
+    def _intercept_definition_query(self, db, on_lock_query):
+        """Run ``on_lock_query`` exactly once, the first time ``db.query``
+        is asked for ``(MCPServer,)`` alone -- the route's lock statement,
+        distinct from the gate's ``(UserMCPServer, MCPServer)`` join and
+        from a later bare ``(UserMCPServer,)`` re-read."""
+        real_query = db.query
+        fired = threading.Event()
+
+        def intercepting_query(*entities, **kwargs):
+            if entities == (MCPServer,) and not fired.is_set():
+                fired.set()
+                on_lock_query()
+            return real_query(*entities, **kwargs)
+
+        db.query = intercepting_query
+        return fired
+
+    def test_i6a_an_owner_row_deleted_during_the_wait_with_an_authorizing_verdict_pays_one_call(
+        self, session_factory, seeded
+    ):
+        """The gate saw ``is_owner=True`` and never called the hook at all (an
+        owner's edit right never reads a verdict). A second connection deletes
+        that link row and commits just as this route reaches its definition-row
+        lock statement. The re-resolved verdict authorizes, so the edit proceeds
+        -- and it costs exactly one hook call, the recheck's, because the gate
+        never made one."""
+        import xagent.web.api.mcp as mcp_api
+        from xagent.web.api.mcp import MCPServerUpdate
+
+        owner_id, server_id = seeded
+        current_user = SimpleNamespace(id=owner_id, is_admin=False)
+
+        hook_calls: list[object] = []
+
+        def access_hook(hook_db, user_id, refs):
+            del hook_db, user_id
+            hook_calls.append(refs)
+            return {
+                ref: ConnectorAccess(team_owned=True, can_edit=True) for ref in refs
+            }
+
+        db = session_factory()
+
+        def delete_the_link():
+            with session_factory() as other:
+                other.execute(
+                    sa.delete(UserMCPServer).where(
+                        UserMCPServer.user_id == owner_id,
+                        UserMCPServer.mcpserver_id == server_id,
+                    )
+                )
+                other.commit()
+
+        fired = self._intercept_definition_query(db, delete_the_link)
+        set_connector_team_hooks(access=access_hook)
+        try:
+            response = mcp_api.update_mcp_server(
+                server_id,
+                MCPServerUpdate(description="i6a-edited"),
+                current_user=current_user,
+                db=db,
+            )
+        finally:
+            set_connector_team_hooks()
+            db.close()
+
+        assert fired.is_set(), "the concurrent delete never ran"
+        assert response.description == "i6a-edited"
+        assert len(hook_calls) == 1, hook_calls
+
+        with session_factory() as fresh:
+            row = fresh.query(MCPServer).filter(MCPServer.id == server_id).one()
+            assert row.description == "i6a-edited"
+
+    def test_i6b_a_non_owner_row_deleted_during_the_wait_with_an_authorizing_verdict_pays_two_calls(
+        self, session_factory, seeded
+    ):
+        """The gate saw a non-owner link row and called the hook once to decide the
+        edit; that call already granted edit, which is why the request reached
+        the lock at all. A second connection deletes the link row and commits
+        just as this route reaches its definition-row lock statement. The
+        recheck re-asks -- a personal row existing at the gate is no guarantee
+        it still does after the wait -- and the second grant lets the edit
+        proceed, at a cost of two hook calls."""
+        import xagent.web.api.mcp as mcp_api
+        from xagent.web.api.mcp import MCPServerUpdate
+
+        owner_id, server_id = seeded
+        member_id = owner_id + 1000
+        with session_factory() as db:
+            from xagent.web.models.user import User
+
+            member = User(username="mcp-i6b-member", password_hash="x", is_admin=False)
+            db.add(member)
+            db.flush()
+            member_id = int(member.id)
+            db.add(
+                UserMCPServer(
+                    user_id=member_id,
+                    mcpserver_id=server_id,
+                    is_owner=False,
+                    is_active=True,
+                )
+            )
+            db.commit()
+
+        current_user = SimpleNamespace(id=member_id, is_admin=False)
+        hook_calls: list[object] = []
+
+        def access_hook(hook_db, user_id, refs):
+            del hook_db, user_id
+            hook_calls.append(refs)
+            return {
+                ref: ConnectorAccess(team_owned=True, can_edit=True) for ref in refs
+            }
+
+        db = session_factory()
+
+        def delete_the_link():
+            with session_factory() as other:
+                other.execute(
+                    sa.delete(UserMCPServer).where(
+                        UserMCPServer.user_id == member_id,
+                        UserMCPServer.mcpserver_id == server_id,
+                    )
+                )
+                other.commit()
+
+        fired = self._intercept_definition_query(db, delete_the_link)
+        set_connector_team_hooks(access=access_hook)
+        try:
+            response = mcp_api.update_mcp_server(
+                server_id,
+                MCPServerUpdate(description="i6b-edited"),
+                current_user=current_user,
+                db=db,
+            )
+        finally:
+            set_connector_team_hooks()
+            db.close()
+
+        assert fired.is_set(), "the concurrent delete never ran"
+        assert response.description == "i6b-edited"
+        assert len(hook_calls) == 2, hook_calls
+
+        with session_factory() as fresh:
+            row = fresh.query(MCPServer).filter(MCPServer.id == server_id).one()
+            assert row.description == "i6b-edited"
+
+    def test_i7_a_row_downgraded_from_owner_during_the_wait_with_an_authorizing_verdict_still_writes(
+        self, session_factory, seeded
+    ):
+        """The gate saw ``is_owner=True`` and never called the hook. A second
+        connection clears ``is_owner`` on that same row (not deleting it) and
+        commits just as this route reaches its definition-row lock statement.
+        ``still_can_edit`` reads the fresh row's ``is_owner`` and finds it
+        False, so the recheck runs even though the row is still there; the re-
+        resolved verdict authorizes, and the rename commits."""
+        import xagent.web.api.mcp as mcp_api
+        from xagent.web.api.mcp import MCPServerUpdate
+
+        owner_id, server_id = seeded
+        current_user = SimpleNamespace(id=owner_id, is_admin=False)
+
+        hook_calls: list[object] = []
+
+        def access_hook(hook_db, user_id, refs):
+            del hook_db, user_id
+            hook_calls.append(refs)
+            return {
+                ref: ConnectorAccess(team_owned=True, can_edit=True) for ref in refs
+            }
+
+        db = session_factory()
+
+        def downgrade_the_link():
+            with session_factory() as other:
+                other.execute(
+                    sa.update(UserMCPServer)
+                    .where(
+                        UserMCPServer.user_id == owner_id,
+                        UserMCPServer.mcpserver_id == server_id,
+                    )
+                    .values(is_owner=False)
+                )
+                other.commit()
+
+        fired = self._intercept_definition_query(db, downgrade_the_link)
+        set_connector_team_hooks(access=access_hook)
+        try:
+            response = mcp_api.update_mcp_server(
+                server_id,
+                MCPServerUpdate(name="i7-renamed"),
+                current_user=current_user,
+                db=db,
+            )
+        finally:
+            set_connector_team_hooks()
+            db.close()
+
+        assert fired.is_set(), "the concurrent downgrade never ran"
+        assert response.name == "i7-renamed"
+        assert len(hook_calls) == 1, hook_calls
+
+        with session_factory() as fresh:
+            row = fresh.query(MCPServer).filter(MCPServer.id == server_id).one()
+            assert row.name == "i7-renamed"
+
+    def test_i6c_an_owner_row_deleted_during_the_wait_with_a_denying_verdict_is_the_gates_own_404(
+        self, session_factory, seeded
+    ):
+        """The gate saw ``is_owner=True`` and never called the hook. A second
+        connection deletes the link row and commits just as this route reaches
+        its definition-row lock statement. The re-resolved verdict also denies,
+        so this caller ends up with no personal row and no team verdict --
+        exactly the population the gate itself 404s, so the cascade answers the
+        same way, with zero durable side effects."""
+        import xagent.web.api.mcp as mcp_api
+        from xagent.web.api.mcp import MCPServerUpdate
+
+        owner_id, server_id = seeded
+        current_user = SimpleNamespace(id=owner_id, is_admin=False)
+
+        hook_calls: list[object] = []
+
+        def access_hook(hook_db, user_id, refs):
+            del hook_db, user_id
+            hook_calls.append(refs)
+            return {
+                ref: ConnectorAccess(team_owned=True, can_edit=False) for ref in refs
+            }
+
+        db = session_factory()
+        real_commit = db.commit
+        commits: list[str] = []
+
+        def record_commit():
+            commits.append("commit")
+            return real_commit()
+
+        db.commit = record_commit
+
+        def delete_the_link():
+            with session_factory() as other:
+                other.execute(
+                    sa.delete(UserMCPServer).where(
+                        UserMCPServer.user_id == owner_id,
+                        UserMCPServer.mcpserver_id == server_id,
+                    )
+                )
+                other.commit()
+
+        fired = self._intercept_definition_query(db, delete_the_link)
+        set_connector_team_hooks(access=access_hook)
+        try:
+            with pytest.raises(HTTPException) as exc:
+                mcp_api.update_mcp_server(
+                    server_id,
+                    MCPServerUpdate(description="i6c-should-not-land"),
+                    current_user=current_user,
+                    db=db,
+                )
+        finally:
+            set_connector_team_hooks()
+            db.close()
+
+        assert fired.is_set(), "the concurrent delete never ran"
+        assert exc.value.status_code == 404
+        assert exc.value.detail == "MCP server not found"
+        assert len(hook_calls) == 1, hook_calls
+        assert commits == [], "the refused edit must commit nothing"
+
+        with session_factory() as fresh:
+            row = fresh.query(MCPServer).filter(MCPServer.id == server_id).one()
+            assert row.description is None
+
+    def test_i6e_an_owner_row_deleted_during_the_wait_400s_on_the_personal_fields_despite_an_authorizing_verdict(
+        self, session_factory, seeded
+    ):
+        """The gate saw ``is_owner=True`` and a payload carrying both a shared
+        field (``name``) and a personal field (``is_active``): the gate's own
+        personal-field guard does not fire for this caller, because it has a
+        personal row at that point. A second connection deletes that row and
+        commits just as this route reaches its definition-row lock statement;
+        the re-resolved verdict authorizes the shared edit, but there is no
+        personal row left to carry ``is_active``, so the lock-side counterpart
+        of the same guard refuses -- with the exact wording the gate-side guard
+        uses -- before anything is written."""
+        import xagent.web.api.mcp as mcp_api
+        from xagent.web.api.mcp import MCPServerUpdate
+
+        owner_id, server_id = seeded
+        current_user = SimpleNamespace(id=owner_id, is_admin=False)
+
+        def access_hook(hook_db, user_id, refs):
+            del hook_db, user_id
+            return {
+                ref: ConnectorAccess(team_owned=True, can_edit=True) for ref in refs
+            }
+
+        db = session_factory()
+        real_commit = db.commit
+        commits: list[str] = []
+
+        def record_commit():
+            commits.append("commit")
+            return real_commit()
+
+        db.commit = record_commit
+
+        def delete_the_link():
+            with session_factory() as other:
+                other.execute(
+                    sa.delete(UserMCPServer).where(
+                        UserMCPServer.user_id == owner_id,
+                        UserMCPServer.mcpserver_id == server_id,
+                    )
+                )
+                other.commit()
+
+        fired = self._intercept_definition_query(db, delete_the_link)
+        set_connector_team_hooks(access=access_hook)
+        try:
+            with pytest.raises(HTTPException) as exc:
+                mcp_api.update_mcp_server(
+                    server_id,
+                    MCPServerUpdate(name="i6e-should-not-land", is_active=False),
+                    current_user=current_user,
+                    db=db,
+                )
+        finally:
+            set_connector_team_hooks()
+            db.close()
+
+        assert fired.is_set(), "the concurrent delete never ran"
+        assert exc.value.status_code == 400
+        assert exc.value.detail == (
+            "No personal connection exists to configure user_env or "
+            "is_active for this server"
+        )
+        assert commits == [], "the refused edit must commit nothing"
+
+        with session_factory() as fresh:
+            row = fresh.query(MCPServer).filter(MCPServer.id == server_id).one()
+            assert row.name == "edit-lock-target"
+
+    def test_i6f_an_owner_row_deleted_during_the_wait_still_builds_a_response_off_the_stand_in(
+        self, session_factory, seeded
+    ):
+        """Same concurrent delete as the tests above, on a payload that
+        carries only a shared field (``description``). Nothing here 400s:
+        the personal-field guard only fires for a payload that actually
+        carries ``user_env``/``is_active``. The response is built off the
+        stand-in the route substitutes for the caller's now-gone row --
+        not the deleted ORM object the gate read -- so it reports the
+        stand-in's placeholder ``is_active=True`` rather than raising
+        ``ObjectDeletedError`` while reading a row that is no longer
+        there."""
+        import xagent.web.api.mcp as mcp_api
+        from xagent.web.api.mcp import MCPServerUpdate
+
+        owner_id, server_id = seeded
+        current_user = SimpleNamespace(id=owner_id, is_admin=False)
+
+        def access_hook(hook_db, user_id, refs):
+            del hook_db, user_id
+            return {
+                ref: ConnectorAccess(team_owned=True, can_edit=True) for ref in refs
+            }
+
+        db = session_factory()
+
+        def delete_the_link():
+            with session_factory() as other:
+                other.execute(
+                    sa.delete(UserMCPServer).where(
+                        UserMCPServer.user_id == owner_id,
+                        UserMCPServer.mcpserver_id == server_id,
+                    )
+                )
+                other.commit()
+
+        fired = self._intercept_definition_query(db, delete_the_link)
+        set_connector_team_hooks(access=access_hook)
+        try:
+            response = mcp_api.update_mcp_server(
+                server_id,
+                MCPServerUpdate(description="i6f-edited"),
+                current_user=current_user,
+                db=db,
+            )
+        finally:
+            set_connector_team_hooks()
+            db.close()
+
+        assert fired.is_set(), "the concurrent delete never ran"
+        assert response.description == "i6f-edited"
+        assert response.is_active is True
+        assert response.can_edit_global is True
+
+        with session_factory() as fresh:
+            row = fresh.query(MCPServer).filter(MCPServer.id == server_id).one()
+            assert row.description == "i6f-edited"

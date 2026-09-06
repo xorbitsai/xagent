@@ -1,0 +1,72 @@
+[
+  {
+    "name": "ordinary info is durable chat without waiting",
+    "event_type": "agent_message",
+    "data": {"message_type": "info", "expect_response": false},
+    "surface": "chat",
+    "expects_response": false
+  },
+  {
+    "name": "progress stays in the timeline",
+    "event_type": "agent_message",
+    "data": {"message_type": "progress", "expect_response": false},
+    "surface": "timeline",
+    "expects_response": false
+  },
+  {
+    "name": "waiting prompt remains actionable",
+    "event_type": "agent_message",
+    "data": {"expect_response": true, "visible": false},
+    "surface": "chat",
+    "expects_response": true
+  },
+  {
+    "name": "question metadata does not imply waiting",
+    "event_type": "agent_message",
+    "data": {"message_type": "question", "expect_response": false},
+    "surface": "chat",
+    "expects_response": false
+  },
+  {
+    "name": "hidden non-waiting question stays hidden",
+    "event_type": "agent_message",
+    "data": {"message_type": "question", "expect_response": false, "visible": false},
+    "surface": "ignore",
+    "expects_response": false
+  },
+  {
+    "name": "waiting precedence is agent-message only",
+    "event_type": "ai_message",
+    "data": {"display": "timeline", "expect_response": true},
+    "surface": "timeline",
+    "expects_response": false
+  },
+  {
+    "name": "empty top-level display does not use metadata fallback",
+    "event_type": "agent_message",
+    "data": {"display": "", "metadata": {"display": "timeline"}},
+    "surface": "chat",
+    "expects_response": false
+  },
+  {
+    "name": "malformed display falls back safely",
+    "event_type": "agent_message",
+    "data": {"display": ["timeline"]},
+    "surface": "chat",
+    "expects_response": false
+  },
+  {
+    "name": "user transcript events are chat-visible",
+    "event_type": "user_message",
+    "data": {},
+    "surface": "chat",
+    "expects_response": false
+  },
+  {
+    "name": "final answer deltas use the stream",
+    "event_type": "final_answer_delta",
+    "data": {},
+    "surface": "stream",
+    "expects_response": false
+  }
+]

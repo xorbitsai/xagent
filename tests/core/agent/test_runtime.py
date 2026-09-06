@@ -553,7 +553,40 @@ async def test_runtime_send_message_includes_active_step_id() -> None:
 
     assert payload["step_id"] == "react-step-1"
     assert payload["metadata"]["step_id"] == "react-step-1"
+    assert payload["display"] == "timeline"
     assert outbound.events[0]["step_id"] == "react-step-1"
+
+
+@pytest.mark.asyncio
+async def test_runtime_send_message_resolves_display_independently_from_waiting() -> (
+    None
+):
+    runtime = PatternRuntime(execution_id="task-123")
+
+    info = await runtime.send_message(message="An ordinary update")
+    question = await runtime.send_message(
+        message="Need input", message_type="question", expect_response=False
+    )
+    explicit_timeline = await runtime.send_message(
+        message="A compact update", display="timeline"
+    )
+    hidden = await runtime.send_message(message="Internal", visible=False)
+    hidden_question = await runtime.send_message(
+        message="Required input", expect_response=True, visible=False
+    )
+    invalid_display = await runtime.send_message(
+        message="Fallback message",
+        display={"surface": "timeline"},  # type: ignore[arg-type]
+    )
+
+    assert info["display"] == "chat"
+    assert info["expect_response"] is False
+    assert question["display"] == "chat"
+    assert question["expect_response"] is False
+    assert explicit_timeline["display"] == "timeline"
+    assert hidden["display"] == "ignore"
+    assert hidden_question["display"] == "chat"
+    assert invalid_display["display"] == "chat"
 
 
 @pytest.mark.asyncio

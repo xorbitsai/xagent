@@ -39,6 +39,25 @@ from xagent.core.model.chat.types import ChunkType, StreamChunk
 DAG_COMPLETION_TOOL_NAME = "assess_dag_completion"
 
 
+@pytest.mark.asyncio
+async def test_auto_child_runtime_forwards_message_display() -> None:
+    parent = PatternRuntime(execution_id="auto-display")
+    child = _AutoChildRuntime(
+        parent=parent,
+        auto_pattern=object(),  # type: ignore[arg-type]
+        root_context=object(),
+    )
+
+    payload = await child.send_message(
+        message="Planning update",
+        message_type="info",
+        display="timeline",
+    )
+
+    assert payload["display"] == "timeline"
+    assert payload["metadata"]["display"] == "timeline"
+
+
 class SearchArgs(BaseModel):
     query: str
     count: int = 10

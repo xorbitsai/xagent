@@ -35,6 +35,7 @@ from ..tools.user_interaction import (
     tool_result_waits_for_user,
 )
 from .context.execution import COMPACT_SUMMARY_FALLBACK_BUDGETS
+from .message_display import MessageDisplay, resolve_message_display
 from .result import normalize_tool_failure_code, tool_result_succeeded
 from .streaming import merge_streamed_tool_call_arguments
 
@@ -745,11 +746,22 @@ class PatternRuntime:
         message_type: str = "info",
         expect_response: bool = False,
         visible: bool = True,
+        display: MessageDisplay | str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Emit an agent-to-user message through the runtime boundary."""
 
         outbound_metadata = dict(metadata or {})
+        resolved_display = resolve_message_display(
+            display=(
+                display if display is not None else outbound_metadata.get("display")
+            ),
+            event_type="agent_message",
+            message_type=message_type,
+            expect_response=expect_response,
+            visible=visible,
+        )
+        outbound_metadata["display"] = resolved_display
         step_id = (
             outbound_metadata.get("step_id")
             or outbound_metadata.get("dag_step_id")
@@ -765,6 +777,7 @@ class PatternRuntime:
             "message_type": message_type,
             "expect_response": expect_response,
             "visible": visible,
+            "display": resolved_display,
             "metadata": outbound_metadata,
         }
         if expect_response or message_type == "question":

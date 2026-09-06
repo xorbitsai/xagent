@@ -48,6 +48,27 @@ from xagent.core.task_runtime import PREFERRED_INPUT_MODALITIES_METADATA_KEY
 DAG_COMPLETION_TOOL_NAME = "assess_dag_completion"
 
 
+@pytest.mark.asyncio
+async def test_dag_step_runtime_forwards_display_and_step_metadata() -> None:
+    parent = PatternRuntime(execution_id="dag-display")
+    child = _DAGStepRuntime(
+        parent=parent,
+        dag_pattern=object(),  # type: ignore[arg-type]
+        root_context=object(),
+        step_id="step-1",
+    )
+
+    payload = await child.send_message(
+        message="Step update",
+        message_type="info",
+        display="timeline",
+    )
+
+    assert payload["display"] == "timeline"
+    assert payload["step_id"] == "step-1"
+    assert payload["metadata"]["dag_step_id"] == "step-1"
+
+
 @pytest.fixture(autouse=True)
 def reset_context_manager() -> None:
     manager = ContextManager()

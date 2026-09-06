@@ -467,6 +467,27 @@ function SeedRunningTask() {
   return null
 }
 
+function SeedCompletedTask() {
+  const { dispatch } = useApp()
+
+  React.useEffect(() => {
+    dispatch({ type: "SET_TASK_ID", payload: 1 })
+    dispatch({
+      type: "SET_CURRENT_TASK",
+      payload: {
+        id: "1",
+        title: "Completed task",
+        status: "completed",
+        description: "Completed task",
+        createdAt: "2026-05-27T05:00:00Z",
+        updatedAt: "2026-05-27T05:01:00Z",
+      },
+    })
+  }, [dispatch])
+
+  return null
+}
+
 function SeedExistingTask() {
   const { dispatch } = useApp()
 
@@ -622,6 +643,44 @@ describe("AppProvider websocket message routing", () => {
       )
     })
     expect(screen.getByTestId("messages").textContent).not.toContain("Searching")
+  })
+
+  it("does not turn a completed task into waiting from question metadata alone", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedCompletedTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("completed")
+    })
+
+    act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:00Z",
+        task_id: 1,
+        data: {
+          event_id: "stray-question-row",
+          event_type: "agent_message",
+          data: {
+            message: "A question-shaped note",
+            message_type: "question",
+            expect_response: false,
+            display: "chat",
+          },
+        },
+      })
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "A question-shaped note",
+      )
+    })
+    expect(screen.getByTestId("task-status").textContent).toBe("completed")
   })
 
   it("preserves workforce delegation event types for agent execution links", async () => {

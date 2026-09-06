@@ -19,6 +19,7 @@ import { useApp } from "@/contexts/app-context-chat"
 import { useFileAccess } from "@/contexts/file-access-context"
 import { useI18n } from "@/contexts/i18n-context"
 import { isStreamingFinalAnswerMessage } from "@/lib/streaming-final-answer"
+import { expectsUserResponse } from "@/lib/message-surface"
 import { getProcessGroupIndex, getUserTimelineAnchors } from "@/lib/task-timeline"
 import { resolveTraceProcessStatus } from "@/lib/trace-process-status"
 import { cn } from "@/lib/utils"
@@ -134,7 +135,7 @@ const findWaitingPrompt = (currentTask: any, traceEvents: any[]) => {
   for (let i = traceEvents.length - 1; i >= 0; i--) {
     const event = traceEvents[i]
     if (event.event_type === "agent_message") {
-      const expectsResponse = event.data?.expect_response === true
+      const expectsResponse = expectsUserResponse(event.event_type || "", event.data)
       const message = event.data?.message || event.data?.content
       if (expectsResponse && typeof message === "string" && message.trim()) {
         return message
@@ -167,7 +168,7 @@ const findWaitingInteractions = (currentTask: any, traceEvents: any[]) => {
   for (let i = traceEvents.length - 1; i >= 0; i--) {
     const event = traceEvents[i]
     if (event.event_type === "agent_message") {
-      const expectsResponse = event.data?.expect_response === true
+      const expectsResponse = expectsUserResponse(event.event_type || "", event.data)
       const interactions = event.data?.metadata?.interactions
       if (expectsResponse && Array.isArray(interactions) && interactions.length > 0) {
         return interactions

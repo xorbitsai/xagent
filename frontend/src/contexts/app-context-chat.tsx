@@ -6,6 +6,7 @@ import { FileText, Target, Zap, CheckCircle, XCircle, Wrench, Activity, Search, 
 import { JsonRenderer, MarkdownRenderer } from "../components/ui/markdown-renderer"
 import { UserMessageContent } from "@/components/chat/user-message-content"
 import { ReplayScheduler } from '@/lib/replay-scheduler'
+import { expectsUserResponse, getMessageSurface, isMessageDisplayEventType } from '@/lib/message-surface'
 import { CollapsibleSection } from "@/components/collapsible-section"
 import { Badge } from "@/components/ui/badge"
 import { ClarificationForm } from "@/components/chat/clarification-form"
@@ -3145,8 +3146,21 @@ export function AppProvider({
             dispatch({ type: "UPSERT_STREAMING_FINAL_ANSWER", payload })
           }
 
+          // These surfaces are handled outside the ordinary message router.
+          // Keeping an explicit guard prevents malformed/direct frames from
+          // falling through into the generic trace-event fallback.
+          else if (
+            isMessageDisplayEventType(eventType) &&
+            ["ignore", "stream"].includes(getMessageSurface(eventType, eventData))
+          ) {
+            return
+          }
+
           // Agent progress messages belong in the execution timeline, not the chat transcript.
-          else if (eventType === "agent_progress") {
+          else if (
+            isMessageDisplayEventType(eventType) &&
+            ["timeline", "status"].includes(getMessageSurface(eventType, eventData))
+          ) {
             dispatch({
               type: "ADD_TRACE_EVENT",
               payload: {
@@ -3180,7 +3194,7 @@ export function AppProvider({
           }
 
           // Agent-to-user messages, including ask_user_question prompts.
-          else if (eventType === "agent_message" || eventType === "ai_message") {
+          else if (isMessageDisplayEventType(eventType) && getMessageSurface(eventType, eventData) === "chat") {
             // Child Agent output belongs exclusively to the on-demand Agent
             // inspector. Rendering it as parent chat content makes live state
             // disagree with historical replay and can expose child clarifiers
@@ -3203,35 +3217,8 @@ export function AppProvider({
               : undefined
             const isAgentMessage = eventType === "agent_message"
             const isAiMessage = eventType === "ai_message"
-            const expectsUserResponse =
-              isAgentMessage &&
-              eventData.expect_response === true
-            const agentMessageDisplay = eventData.display || eventData.metadata?.display
-            const isExplicitTranscriptMessage =
-              agentMessageDisplay === "chat" ||
-              eventData.source === "chat_history" ||
-              eventData.role === "assistant"
-            const isTimelineAgentMessage =
-              eventType === "agent_message" &&
-              !isExplicitTranscriptMessage &&
-              agentMessageDisplay === "timeline"
-            if (isTimelineAgentMessage) {
-              dispatch({
-                type: "ADD_TRACE_EVENT",
-                payload: {
-                  event_id: message.event_id || eventData.event_id || generateMessageId("trace-agent-progress"),
-                  event_type: "agent_progress",
-                  step_id: message.step_id || eventData.step_id,
-                  timestamp: message.timestamp?.toString() || Date.now().toString(),
-                  data: eventData,
-                }
-              })
-              return
-            }
-            const shouldHideAgentMessage =
-              isAgentMessage &&
-              eventData.visible === false
-            if (expectsUserResponse) {
+            const expectsResponse = expectsUserResponse(eventType, eventData)
+            if (expectsResponse) {
               dispatch({
                 type: "UPDATE_TASK_STATUS",
                 payload: {
@@ -3246,9 +3233,6 @@ export function AppProvider({
               isAiMessage
                 ? getFinalAnswerStreamMessageId(eventData)
                 : undefined
-            if (shouldHideAgentMessage) {
-              return
-            }
             if (!streamMessageId && isDuplicateMessageForViewedTask(
               messageContent,
               'agent-message',

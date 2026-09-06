@@ -64,9 +64,20 @@ vi.mock("@/components/file/pptx-preview-renderer", () => ({
   }) => <div data-testid="pptx-preview">{base64Content ?? fileId ?? ""}</div>,
 }))
 
-import { TraceEventRenderer } from "./TraceEventRenderer"
+import { isAgentProgressEvent, TraceEventRenderer } from "./TraceEventRenderer"
 
 describe("TraceEventRenderer", () => {
+  it("does not classify an ordinary non-waiting agent message as progress", () => {
+    expect(isAgentProgressEvent({
+      event_type: "agent_message",
+      data: { message_type: "info", expect_response: false },
+    })).toBe(false)
+    expect(isAgentProgressEvent({
+      event_type: "agent_message",
+      data: { message_type: "info", display: "timeline" },
+    })).toBe(true)
+  })
+
   it("ignores null, primitive, and malformed trace event entries", () => {
     expect(() => render(
       <TraceEventRenderer

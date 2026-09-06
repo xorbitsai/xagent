@@ -77,6 +77,7 @@ SENSITIVE_PAYLOAD_FIELDS = {"type", "message", "error"}
 NON_ERROR_STREAM_EVENT_BUILDERS = {
     "_agent_outbound_event_type": None,
     "_waiting_or_paused_event_fields": 0,
+    "create_agent_outbound_stream_event": None,
 }
 DICT_ERROR_PAYLOAD_BUILDERS = {
     "_read_task_error_payload_offloop": "error",

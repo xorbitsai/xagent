@@ -38,8 +38,10 @@ from xagent.web.api.websocket import (
     _is_agent_checkpoint_data,
     _is_duplicate_user_message_turn,
     _persist_agent_outbound_event,
+    create_agent_outbound_stream_event,
     create_final_answer_stream_event,
     create_stream_event,
+    deliver_agent_outbound_message,
     make_agent_outbound_handler,
     send_historical_data_as_stream,
 )
@@ -207,7 +209,53 @@ def test_final_answer_stream_event_is_not_trace_event() -> None:
     assert "data" not in event
 
 
+@pytest.mark.asyncio
+async def test_shared_outbound_delivery_keeps_builder_final_answer_streams() -> None:
+    sent_events: list[dict[str, object]] = []
+
+    async def send_event(event: dict[str, object]) -> None:
+        sent_events.append(event)
+
+    for payload in (
+        {"type": "final_answer_start", "message_id": "answer-1"},
+        {
+            "type": "final_answer_delta",
+            "message_id": "answer-1",
+            "delta": "Hello",
+        },
+        {
+            "type": "final_answer_end",
+            "message_id": "answer-1",
+            "content": "Hello",
+        },
+    ):
+        await deliver_agent_outbound_message(
+            task_id=-1,
+            payload=payload,
+            send_event=send_event,
+            persist_event=False,
+            reconcile_final_answer=False,
+        )
+
+    assert [event["type"] for event in sent_events] == [
+        "final_answer_start",
+        "final_answer_delta",
+        "final_answer_end",
+    ]
+    assert sent_events[-1]["content"] == "Hello"
+
+
 def test_agent_outbound_event_type_separates_progress_from_questions() -> None:
+    assert (
+        _agent_outbound_event_type(
+            {
+                "message": "An ordinary update",
+                "message_type": "info",
+                "expect_response": False,
+            }
+        )
+        == "agent_message"
+    )
     assert (
         _agent_outbound_event_type(
             {
@@ -231,12 +279,74 @@ def test_agent_outbound_event_type_separates_progress_from_questions() -> None:
     assert (
         _agent_outbound_event_type(
             {
+                "message": "Timeline narration",
+                "message_type": "info",
+                "display": "timeline",
+            }
+        )
+        == "agent_progress"
+    )
+    assert (
+        _agent_outbound_event_type(
+            {
                 "message": "Need input",
                 "message_type": "info",
                 "expect_response": True,
             }
         )
         == "agent_message"
+    )
+
+
+def test_agent_outbound_stream_event_carries_resolved_display() -> None:
+    chat_event = create_agent_outbound_stream_event(
+        365, {"message": "Visible update", "message_type": "info"}
+    )
+    timeline_event = create_agent_outbound_stream_event(
+        365, {"message": "Progress", "message_type": "progress"}
+    )
+
+    assert chat_event is not None
+    assert chat_event["event_type"] == "agent_message"
+    assert chat_event["data"]["display"] == "chat"
+    assert timeline_event is not None
+    assert timeline_event["event_type"] == "agent_progress"
+    assert timeline_event["data"]["display"] == "timeline"
+    metadata_timeline_event = create_agent_outbound_stream_event(
+        365,
+        {
+            "message": "Metadata progress",
+            "metadata": {"display": "timeline"},
+        },
+    )
+    assert metadata_timeline_event is not None
+    assert metadata_timeline_event["event_type"] == "agent_progress"
+    assert metadata_timeline_event["data"]["display"] == "timeline"
+    assert (
+        create_agent_outbound_stream_event(365, {"message": "Hidden", "visible": False})
+        is None
+    )
+    assert (
+        create_agent_outbound_stream_event(
+            365, {"message": "Ignored", "display": "ignore"}
+        )
+        is None
+    )
+    invalid_display_event = create_agent_outbound_stream_event(
+        365, {"message": "Fallback", "display": ["timeline"]}
+    )
+    assert invalid_display_event is not None
+    assert invalid_display_event["event_type"] == "agent_message"
+    assert invalid_display_event["data"]["display"] == "chat"
+    assert (
+        create_agent_outbound_stream_event(
+            365,
+            {
+                "type": "final_answer_start",
+                "message_id": "final-answer-1",
+            },
+        )
+        is None
     )
 
 
@@ -364,13 +474,42 @@ def test_persist_agent_outbound_event_uses_payload_ids(monkeypatch) -> None:
     )
 
     _persist_agent_outbound_event(int(task.id), event)
+    non_waiting_question = create_stream_event(
+        "agent_message",
+        int(task.id),
+        {
+            "event_id": "agent-question-1",
+            "message": "Here is a question-shaped note",
+            "message_type": "question",
+            "expect_response": False,
+        },
+    )
+    waiting_question = create_stream_event(
+        "agent_message",
+        int(task.id),
+        {
+            "event_id": "agent-question-2",
+            "message": "Which option?",
+            "message_type": "question",
+            "expect_response": True,
+        },
+    )
+    _persist_agent_outbound_event(int(task.id), non_waiting_question)
+    _persist_agent_outbound_event(int(task.id), waiting_question)
 
     db = SessionLocal()
     try:
-        trace_event = db.query(DatabaseTraceEvent).filter_by(task_id=int(task.id)).one()
+        trace_event = (
+            db.query(DatabaseTraceEvent)
+            .filter_by(task_id=int(task.id), event_id="agent-event-1")
+            .one()
+        )
         assert trace_event.event_id == "agent-event-1"
         assert trace_event.event_type == "agent_progress"
         assert trace_event.step_id == "react-step-1"
+        chat_message = db.query(TaskChatMessage).filter_by(task_id=int(task.id)).one()
+        assert chat_message.content == "Which option?"
+        assert chat_message.message_type == "question"
     finally:
         db.close()
 
@@ -4093,6 +4232,85 @@ async def test_historical_replay_marks_assistant_chat_history_for_chat_display(
     assert assistant_data["expect_response"] is False
     assert assistant_data["source"] == "chat_history"
     assert assistant_data["display"] == "chat"
+
+
+@pytest.mark.asyncio
+async def test_historical_replay_keeps_equal_progress_and_final_answer_text(
+    monkeypatch,
+) -> None:
+    SessionLocal, db, task = _create_trace_handler_test_task("chat-history-collision")
+    try:
+        task_id = int(task.id)
+        user_id = int(task.user_id)
+        base_time = datetime(2026, 5, 27, tzinfo=timezone.utc)
+        db.add_all(
+            [
+                DatabaseTraceEvent(
+                    task_id=task_id,
+                    event_id="ordinary-agent-message",
+                    event_type="agent_message",
+                    timestamp=base_time,
+                    data={
+                        "message": "Done.",
+                        "message_type": "info",
+                        "expect_response": False,
+                        "display": "chat",
+                    },
+                ),
+                TaskChatMessage(
+                    task_id=task_id,
+                    user_id=user_id,
+                    role="assistant",
+                    content="Done.",
+                    message_type="assistant",
+                    created_at=base_time + timedelta(seconds=1),
+                ),
+            ]
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    def get_test_db() -> Iterator[Session]:
+        session = SessionLocal()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    sent_events: list[dict] = []
+
+    async def send_personal_message(event: dict, websocket: object) -> None:
+        sent_events.append(event)
+
+    monkeypatch.setattr("xagent.web.models.database.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.api.websocket.cache_get", lambda *args: None)
+    monkeypatch.setattr(
+        "xagent.web.api.websocket.cache_set", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        "xagent.web.api.websocket.manager.send_personal_message",
+        send_personal_message,
+    )
+
+    await send_historical_data_as_stream(
+        websocket=object(),
+        task_id=task_id,
+        user=SimpleNamespace(id=user_id, is_admin=False),
+    )
+
+    matching_events = [
+        event
+        for event in sent_events
+        if event.get("type") == "trace_event"
+        and event.get("event_type") == "agent_message"
+        and event.get("data", {}).get("message") == "Done."
+    ]
+    assert len(matching_events) == 2
+    assert {event["data"].get("source") for event in matching_events} == {
+        None,
+        "chat_history",
+    }
 
 
 @pytest.mark.asyncio

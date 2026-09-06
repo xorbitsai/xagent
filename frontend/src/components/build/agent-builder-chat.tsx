@@ -15,6 +15,8 @@ import { useI18n } from "@/contexts/i18n-context"
 import { toast } from "@/components/ui/sonner"
 import { getBrandingFromEnv } from "@/lib/branding"
 import { normalizeUploadFileIds } from "@/lib/upload-file-ids"
+import { expectsUserResponse, getMessageSurface, isMessageDisplayEventType } from "@/lib/message-surface"
+import { isFinalAnswerStreamEventType } from "@/lib/streaming-final-answer"
 
 import { Interaction } from "@/contexts/app-context-chat"
 
@@ -27,18 +29,38 @@ interface Message {
   timestamp?: number
   interactions?: Interaction[]
   processStatus?: TraceProcessStatus
+  isPending?: boolean
+  isFinalAnswer?: boolean
+}
+
+const findLastAssistantIndex = (
+  messages: Message[],
+  predicate: (message: Message) => boolean = () => true,
+  afterIndex = -1,
+): number => {
+  for (let i = messages.length - 1; i > afterIndex; i--) {
+    if (messages[i].role === "assistant" && predicate(messages[i])) return i
+  }
+  return -1
+}
+
+const findLastUserIndex = (messages: Message[]): number => {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === "user") return i
+  }
+  return -1
 }
 
 const updateLastAssistantMessage = (
   messages: Message[],
   update: (message: Message) => Message
 ): Message[] => {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i].role === "assistant") {
-      const updated = [...messages]
-      updated[i] = update(messages[i])
-      return updated
-    }
+  const pendingIndex = findLastAssistantIndex(messages, message => message.isPending === true)
+  const index = pendingIndex >= 0 ? pendingIndex : findLastAssistantIndex(messages)
+  if (index >= 0) {
+    const updated = [...messages]
+    updated[index] = update(messages[index])
+    return updated
   }
   return messages
 }
@@ -163,7 +185,13 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
     setIsLoading(true)
 
     // Add empty assistant message for streaming
-    setMessages(prev => [...prev, { role: "assistant", content: "", traceEvents: [], timestamp: Date.now() }])
+    setMessages(prev => [...prev, {
+      role: "assistant",
+      content: "",
+      traceEvents: [],
+      timestamp: Date.now(),
+      isPending: true,
+    }])
 
     let currentReply = ""
     let finalMessage = text;
@@ -281,16 +309,81 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
           try {
             const data = JSON.parse(event.data)
 
-            if (data.type === "trace_event") {
-              // Update the last message (assistant) with the new trace event
-              setMessages(prev => {
-                return updateLastAssistantMessage(prev, lastMsg => ({
-                  ...lastMsg,
-                    traceEvents: [...(lastMsg.traceEvents || []), data]
-                }))
-              })
+            if (isFinalAnswerStreamEventType(data.type)) {
+              if (data.type === "final_answer_error") {
+                setIsLoading(false)
+                setMessages(prev => updateLastAssistantMessage(prev, message => ({
+                  ...message,
+                  isPending: false,
+                  processStatus: "failed",
+                })))
+                return
+              }
 
-              if (data.event_type === "ai_message") {
+              if (data.type === "final_answer_start") {
+                currentReply = ""
+                return
+              }
+              if (data.type === "final_answer_delta") {
+                currentReply += typeof data.delta === "string" ? data.delta : ""
+              } else if (data.type === "final_answer_end") {
+                currentReply = typeof data.content === "string" ? data.content : currentReply
+              }
+
+              if (currentReply) {
+                setMessages(prev => {
+                  const updated = [...prev]
+                  const lastUserIndex = findLastUserIndex(updated)
+                  let index = findLastAssistantIndex(
+                    updated,
+                    message => message.isPending === true,
+                    lastUserIndex,
+                  )
+                  if (index < 0) {
+                    index = findLastAssistantIndex(
+                      updated,
+                      message => message.isFinalAnswer === true,
+                      lastUserIndex,
+                    )
+                  }
+                  if (index < 0) {
+                    updated.push({
+                      role: "assistant",
+                      content: "",
+                      traceEvents: [],
+                      timestamp: Date.now(),
+                      isPending: true,
+                    })
+                    index = updated.length - 1
+                  }
+                  updated[index] = {
+                    ...updated[index],
+                    content: currentReply,
+                    isFinalAnswer: true,
+                    isPending: data.type !== "final_answer_end",
+                  }
+                  return updated
+                })
+              }
+            } else if (data.type === "trace_event") {
+              const messageSurface = isMessageDisplayEventType(data.event_type)
+                ? getMessageSurface(data.event_type, data.data)
+                : null
+              if (messageSurface === "ignore") {
+                return
+              }
+              // Chat-surface events are attached to the bubble they create
+              // below. Other events stay on the active execution bubble.
+              if (messageSurface !== "chat") {
+                setMessages(prev => {
+                  return updateLastAssistantMessage(prev, lastMsg => ({
+                    ...lastMsg,
+                    traceEvents: [...(lastMsg.traceEvents || []), data]
+                  }))
+                })
+              }
+
+              if (data.event_type === "ai_message" && messageSurface === "chat") {
                 if (data.data?.message_type === "reasoning") {
                   // Do not update the main message content for reasoning.
                   // TraceEventRenderer will handle displaying it in the execution logs.
@@ -335,30 +428,74 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
 
                   setMessages(prev => {
                     const updated = [...prev]
-                    updated[updated.length - 1].content = displayReply
-                    if (interactions) {
-                      updated[updated.length - 1].interactions = interactions;
+                    let index = findLastAssistantIndex(
+                      updated,
+                      message => message.isPending === true,
+                    )
+                    if (index < 0) {
+                      updated.push({
+                        role: "assistant",
+                        content: "",
+                        traceEvents: [],
+                        timestamp: Date.now(),
+                        isPending: true,
+                      })
+                      index = updated.length - 1
+                    }
+                    updated[index] = {
+                      ...updated[index],
+                      content: displayReply,
+                      interactions: interactions || updated[index].interactions,
+                      traceEvents: [...(updated[index].traceEvents || []), data],
+                      isPending: false,
+                      isFinalAnswer: true,
                     }
                     return updated
                   })
                 }
-              } else if (data.event_type === "agent_message") {
-                const displayReply = data.data?.message || ""
+              } else if (isMessageDisplayEventType(data.event_type) && messageSurface === "chat") {
+                const displayReply = data.data?.message || data.data?.content || ""
                 const interactions = data.data?.metadata?.interactions
-                if (!data.data?.expect_response && data.data?.message_type !== "question") {
+                if (!displayReply) {
                   return
                 }
-                setIsLoading(false)
+                const waitsForUser = expectsUserResponse(data.event_type, data.data)
+                if (waitsForUser) {
+                  setIsLoading(false)
+                }
                 setMessages(prev => {
                   const updated = [...prev]
-                  const lastMsg = updated[updated.length - 1]
-                  if (!lastMsg || lastMsg.role !== 'assistant') {
-                    return updated
+                  let index = findLastAssistantIndex(
+                    updated,
+                    message => message.isPending === true,
+                  )
+                  if (index < 0) {
+                    updated.push({
+                      role: "assistant",
+                      content: "",
+                      traceEvents: [],
+                      timestamp: Date.now(),
+                      isPending: true,
+                    })
+                    index = updated.length - 1
                   }
-                  updated[updated.length - 1] = {
-                    ...lastMsg,
+                  const target = updated[index]
+                  updated[index] = {
+                    ...target,
                     content: displayReply,
-                    interactions: Array.isArray(interactions) ? interactions : lastMsg.interactions
+                    interactions: Array.isArray(interactions) ? interactions : target.interactions,
+                    traceEvents: [...(target.traceEvents || []), data],
+                    isPending: false,
+                    isFinalAnswer: false,
+                  }
+                  if (!waitsForUser) {
+                    updated.push({
+                      role: "assistant",
+                      content: "",
+                      traceEvents: [],
+                      timestamp: Date.now(),
+                      isPending: true,
+                    })
                   }
                   return updated
                 })
@@ -470,11 +607,65 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
               }
 
               setMessages(prev => {
-                return updateLastAssistantMessage(prev, message => ({
+                const updated = [...prev]
+                const hasFinalContent = typeof cleanReply === "string" && cleanReply.length > 0
+                const lastUserIndex = findLastUserIndex(updated)
+                const finalIndex = findLastAssistantIndex(
+                  updated,
+                  message => message.isFinalAnswer === true,
+                  lastUserIndex,
+                )
+                if (finalIndex >= 0) {
+                  updated[finalIndex] = {
+                    ...updated[finalIndex],
+                    content: hasFinalContent ? cleanReply : updated[finalIndex].content,
+                    interactions: interactions || updated[finalIndex].interactions,
+                    processStatus: taskCompletion.status,
+                    isPending: false,
+                  }
+                  return updated.filter(message => !(
+                    message.role === "assistant" &&
+                    message.isPending === true &&
+                    message.content === ""
+                  ))
+                }
+
+                if (hasFinalContent) {
+                  return updateLastAssistantMessage(updated, message => ({
+                    ...message,
+                    content: cleanReply,
+                    interactions: interactions || message.interactions,
+                    processStatus: taskCompletion.status,
+                    isPending: false,
+                    isFinalAnswer: true,
+                  }))
+                }
+
+                let meaningfulIndex = -1
+                for (let i = updated.length - 1; i > lastUserIndex; i--) {
+                  if (updated[i].role === "assistant" && updated[i].content !== "") {
+                    meaningfulIndex = i
+                    break
+                  }
+                }
+                if (meaningfulIndex >= 0) {
+                  updated[meaningfulIndex] = {
+                    ...updated[meaningfulIndex],
+                    processStatus: taskCompletion.status,
+                  }
+                  return updated.filter(message => !(
+                    message.role === "assistant" &&
+                    message.isPending === true &&
+                    message.content === ""
+                  ))
+                }
+
+                return updateLastAssistantMessage(updated, message => ({
                   ...message,
-                  content: cleanReply || t("builds.configForm.chat.defaultReply") || "I have updated the configuration based on your request.",
+                  content: t("builds.configForm.chat.defaultReply") || "I have updated the configuration based on your request.",
                   interactions: interactions || message.interactions,
                   processStatus: taskCompletion.status,
+                  isPending: false,
                 }))
               })
 

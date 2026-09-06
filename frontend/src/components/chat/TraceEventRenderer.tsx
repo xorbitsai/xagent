@@ -35,6 +35,7 @@ import {
   isStoppedTraceProcessStatus,
   resolveTraceProcessStatus,
 } from '@/lib/trace-process-status';
+import { expectsUserResponse, getMessageSurface } from '@/lib/message-surface';
 
 // Types
 interface ToolArgs {
@@ -244,7 +245,7 @@ const getWaitingQuestionFromEvents = (events: TraceEvent[]): string | null => {
   for (let i = events.length - 1; i >= 0; i--) {
     const event = events[i];
     if (event.event_type === 'agent_message') {
-      const expectsResponse = event.data?.expect_response === true || event.data?.message_type === 'question';
+      const expectsResponse = expectsUserResponse(event.event_type || '', event.data);
       if (!expectsResponse) {
         continue;
       }
@@ -316,11 +317,10 @@ export function getRawToolName(event: TraceEvent): string {
 }
 
 export const isAgentProgressEvent = (event: TraceEvent): boolean => (
-  event.event_type === 'agent_progress' ||
+  event.event_type === 'agent_progress' || event.event_type === 'agent_status' ||
   (
     event.event_type === 'agent_message' &&
-    event.data?.expect_response !== true &&
-    event.data?.message_type !== 'question'
+    getMessageSurface(event.event_type, event.data) === 'timeline'
   )
 );
 

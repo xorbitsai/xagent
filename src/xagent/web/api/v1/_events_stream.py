@@ -1405,6 +1405,21 @@ class V1EventStreamSink:
         overflow a property of the task rather than of the load on it:
         one long description, re-stamped per frame, crosses the budget
         on its own and closes every attach to that task identically.
+
+        The count cap is exactly ``OUTBOUND_QUEUE_MAX_SIZE``, not one
+        less, which leaves the hand-off no margin: lifecycle frames
+        (``task.status``) skip staging and go straight into the
+        outbound queue while this sink is still cold, so a staging list
+        at its cap plus one such frame is one item more than the queue
+        can hold, and ``finish_warm_up``'s drain overflows into the same
+        ``resync_required`` close an over-full queue always takes. That
+        overflow is the documented outcome for this case, not an
+        unhandled edge. Reserving a slot here instead would buy one
+        frame of headroom against a backlog that is already at the
+        "this client cannot keep up" threshold, at the cost of a
+        second, differently-sized cap to keep in step with the first.
+        Pinned by
+        ``test_a_cold_status_frame_leaves_the_staging_drain_no_margin``.
         """
         if self._closing:
             return
@@ -2776,6 +2791,19 @@ async def _generate(
                 key_prefix,
             )
         manager.register_connection(cast(WebSocket, sink), task_id)
+        # Registering before the watermark read below is deliberate, and
+        # it leans on an ordering this file cannot enforce on its own: a
+        # trace row is committed by ``DatabaseTraceHandler`` before
+        # ``WebSocketTraceHandler`` broadcasts it, because
+        # ``create_task_tracer`` (``web/tracing.py``) lists them in that
+        # order and the tracer awaits each handler in turn rather than
+        # dispatching them concurrently (``Tracer``'s notify loop in
+        # ``core/agent/trace.py``). That is what makes "already
+        # committed" imply "its broadcast has not gone out yet, or went
+        # out to a sink that was already registered" -- so registering
+        # first costs at most a duplicate frame, never a lost one.
+        # Handler order has its own test; the sequential dispatch does
+        # not, and lives outside this module.
         # Capture the replay watermark as close to registration as this
         # generator can manage -- see ``TaskStepsVersionReader`` and
         # ``_build_warm_up_frames``'s docstring for what it bounds and

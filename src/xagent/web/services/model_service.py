@@ -21,7 +21,6 @@ from ...core.model.image.gemini import GeminiImageModel
 from ...core.model.image.openai import OpenAIImageModel
 from ...core.model.image.xinference import XinferenceImageModel
 from ...core.model.video.base import BaseVideoModel
-
 from .llm_utils import AutoModelUnavailableError
 
 logger = logging.getLogger(__name__)

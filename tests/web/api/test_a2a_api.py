@@ -7,8 +7,6 @@ from threading import Event, get_ident
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from xagent.web.services.llm_utils import AutoModelUnavailableError
-from xagent.web.services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import QueuePool
@@ -39,6 +37,8 @@ from xagent.web.services.a2a_protocol import (
     A2AApiError,
     A2ATaskSnapshot,
 )
+from xagent.web.services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
+from xagent.web.services.llm_utils import AutoModelUnavailableError
 from xagent.web.services.task_command_transport import (
     COMMAND_FAILED,
     MAX_COMMAND_FAILURES,

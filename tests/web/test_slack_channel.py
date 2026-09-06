@@ -8,8 +8,6 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
 import pytest
-from xagent.web.services.llm_utils import AutoModelUnavailableError
-from xagent.web.services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
 from fastapi import BackgroundTasks, HTTPException
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -43,6 +41,8 @@ from xagent.web.models.user import User
 from xagent.web.models.user_channel import SlackOAuthFlowState, UserChannel
 from xagent.web.schemas.user_channel import UserChannelCreate, UserChannelUpdate
 from xagent.web.services.channel_runtime import ChannelConfigSnapshot
+from xagent.web.services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
+from xagent.web.services.llm_utils import AutoModelUnavailableError
 from xagent.web.services.task_execution_context_service import (
     TaskExecutionRecoverySnapshot,
 )

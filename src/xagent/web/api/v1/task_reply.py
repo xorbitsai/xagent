@@ -53,12 +53,12 @@ from ....core.agent.checkpoint import (
 from ...models.database import get_session_local
 from ...models.task import Task, TaskStatus
 from ...schemas.v1 import ReplyRequest, ReplyResponse
-from ...services.llm_utils import AutoModelUnavailableError
 from ...services.db_runtime import (
     cancel_and_drain_async_task,
     drain_async_task_cancellation_safe,
     run_db_io_cancellation_safe,
 )
+from ...services.llm_utils import AutoModelUnavailableError
 from ...services.task_execution_controller import TaskControlState
 from ...services.task_interaction_close import (
     active_interaction_id_sync,

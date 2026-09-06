@@ -23,8 +23,6 @@ from ....config import get_slack_app_token, get_storage_root
 from ....core.file_ref import build_file_id_ref
 from ...api.chat import get_agent_manager
 from ...models.task import TaskStatus
-from ...services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
-from ...services.llm_utils import AutoModelUnavailableError
 from ...services.channel_runtime import (
     ChannelAuthorizationError,
     ChannelConfigurationError,
@@ -38,6 +36,7 @@ from ...services.channel_runtime import (
     register_channel_uploaded_files,
     update_channel_task_fields,
 )
+from ...services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
 from ...services.db_runtime import (
     cancel_and_drain_async_task,
     drain_async_task_cancellation_safe,
@@ -49,6 +48,7 @@ from ...services.file_turn import (
     build_uploaded_files_context,
     normalize_attachments_for_persistence,
 )
+from ...services.llm_utils import AutoModelUnavailableError
 from ...services.managed_task_lease import ManagedTaskLease
 from ...services.task_execution_context_service import (
     materialize_task_execution_recovery_state,

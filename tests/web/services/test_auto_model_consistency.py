@@ -12,8 +12,9 @@ from sqlalchemy.pool import StaticPool
 
 from xagent.core.model.chat.basic.router import RouterLLM, _ResolvedRouterLLM
 from xagent.web import models
-from xagent.web.api import admin_users, agents, workforces
+from xagent.web.api import admin_users, agents
 from xagent.web.api import model as model_api
+from xagent.web.api import workforces
 from xagent.web.auth_dependencies import get_current_user
 from xagent.web.models import database
 from xagent.web.models.auto_model import AutoModelCandidate, AutoModelConfig

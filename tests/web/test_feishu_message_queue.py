@@ -2,11 +2,11 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
-from xagent.web.services.llm_utils import AutoModelUnavailableError
-from xagent.web.services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
 
 from xagent.web.channels.feishu.bot import FeishuBotInstance, FeishuChannelManager
 from xagent.web.models.task import TaskStatus
+from xagent.web.services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
+from xagent.web.services.llm_utils import AutoModelUnavailableError
 from xagent.web.services.task_execution_context_service import (
     TaskExecutionRecoverySnapshot,
 )

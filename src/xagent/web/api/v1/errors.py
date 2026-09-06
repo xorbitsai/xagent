@@ -27,7 +27,6 @@ from typing import Any, NoReturn
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
-
 from ...services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
 
 

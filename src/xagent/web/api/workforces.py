@@ -23,8 +23,6 @@ from ..models.workforce import (
     WorkforceRun,
 )
 from ..schemas.widget import WidgetAllowedDomain
-from ..services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
-from ..services.llm_utils import AutoModelUnavailableError
 from ..services.agent_access import (
     AccessibleAgent,
     accessible_agent_permissions,
@@ -35,12 +33,14 @@ from ..services.agent_team_scope import (
     get_agent_team_scope,
     owns_agent,
 )
+from ..services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
 from ..services.deployments import (
     get_deployment,
     get_or_create_deployment,
     new_share_token,
     new_widget_key,
 )
+from ..services.llm_utils import AutoModelUnavailableError
 from ..services.trace_event_types import GENERAL_ERROR_EVENT_TYPES
 from ..services.trace_message_storage import decode_trace_events_data
 from ..services.triggers import unregister_deleted_trigger_bindings

@@ -6,8 +6,6 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from xagent.web.services.llm_utils import AutoModelUnavailableError
-from xagent.web.services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
 from fastapi import WebSocketDisconnect
 
 from xagent.web.api import websocket as websocket_api
@@ -17,6 +15,8 @@ from xagent.web.api.websocket import (
 )
 from xagent.web.models.user import User
 from xagent.web.services.builder_chat_runtime import BuilderChatRuntimeInputs
+from xagent.web.services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
+from xagent.web.services.llm_utils import AutoModelUnavailableError
 
 
 @pytest.mark.asyncio

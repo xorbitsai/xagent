@@ -21,8 +21,6 @@ from ...core.agent.runner import UserMessageInjectionOutcome
 from ..models.agent import Agent
 from ..models.database import get_session_local
 from ..models.task import Task, TaskStatus
-from ..services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
-from ..services.llm_utils import AutoModelUnavailableError
 from ..services.a2a_protocol import (
     A2A_VERSION,
     ALL_TASK_STATES,
@@ -45,11 +43,13 @@ from ..services.a2a_protocol import (
     task_state,
     task_to_a2a,
 )
+from ..services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
 from ..services.db_runtime import (
     cancel_and_drain_async_task,
     drain_async_task_cancellation_safe,
     run_db_io_cancellation_safe,
 )
+from ..services.llm_utils import AutoModelUnavailableError
 from ..services.task_command_transport import (
     COMMAND_COMPLETED,
     COMMAND_FAILED,

@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, Field, model_validator
 
 from ...core.task_runtime import MAX_TASK_RUNTIME_EXTENSIONS
+from .connector_runtime import ConnectorRuntimeRequirementsModel
 
 # Only ever read here (TaskCreateRequest.seed_interactions is passed straight
 # through to create_task_with_message as-is - see api/chat.py), unlike
@@ -192,6 +193,20 @@ class TaskCreateResponse(BaseModel):
             "Extension names whose metadata was dropped for the aggregate "
             "size cap, i.e. the names missing from `runtime_extensions` when "
             "the status is `truncated`. Empty otherwise."
+        ),
+    )
+    connector_runtime_requirements: ConnectorRuntimeRequirementsModel | None = Field(
+        ...,
+        description=(
+            "Which runtime inputs this task's connectors still need, and "
+            "which of them already have a value. Always present in the "
+            "response body -- a client must not treat its absence as "
+            "meaning anything. Never includes a stored value itself, only "
+            "whether one exists. Present with a report on the web chat "
+            "create path (`POST /api/chat/task/create`); `null` on the "
+            "public chat and share-link create paths, meaning the "
+            "requirements were not evaluated there -- those visitors never "
+            "receive connector key names."
         ),
     )
 

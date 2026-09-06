@@ -26,6 +26,7 @@ from xagent.web.models.task import Task
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 from xagent.web.schemas.chat import TaskCreateResponse
+from xagent.web.schemas.connector_runtime import ConnectorRuntimeRequirementsModel
 
 
 class _BlockingPreviewWebSocket:
@@ -104,6 +105,9 @@ async def test_handle_build_preview_execution_uses_normal_task_flow():
         title="test message",
         status="pending",
         created_at="2026-05-20T00:00:00Z",
+        connector_runtime_requirements=ConnectorRuntimeRequirementsModel(
+            satisfied=True, secrets_expires_at=None, connectors=[]
+        ),
     )
     with (
         patch("xagent.web.models.database.get_db", return_value=iter([mock_db])),
@@ -159,6 +163,9 @@ async def test_handle_build_preview_execution_does_not_use_preview_sessions():
         title="test message",
         status="pending",
         created_at="2026-05-20T00:00:00Z",
+        connector_runtime_requirements=ConnectorRuntimeRequirementsModel(
+            satisfied=True, secrets_expires_at=None, connectors=[]
+        ),
     )
     with (
         patch("xagent.web.models.database.get_db", return_value=iter([mock_db])),
@@ -244,6 +251,9 @@ async def test_handle_build_preview_execution_creates_task_when_no_preview_task_
         title="second turn",
         status="pending",
         created_at="2026-05-20T00:00:00Z",
+        connector_runtime_requirements=ConnectorRuntimeRequirementsModel(
+            satisfied=True, secrets_expires_at=None, connectors=[]
+        ),
     )
     with (
         patch("xagent.web.models.database.get_db", return_value=iter([mock_db])),

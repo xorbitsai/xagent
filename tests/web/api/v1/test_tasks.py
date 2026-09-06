@@ -17,7 +17,6 @@ drive the mapping.
 import asyncio
 import io
 import threading
-import time
 from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -618,10 +617,15 @@ async def test_upload_durable_phase_releases_pool_and_event_loop(
     engine = _install_one_slot_queue_pool(monkeypatch)
     checked_out_during_durable: list[int] = []
     original_sync = ManagedFileRef.sync_to_durable
+    entered = threading.Event()
+    release = threading.Event()
+    loop_thread = threading.get_ident()
 
     def delayed_sync(self, *args, **kwargs):  # type: ignore[no-untyped-def]
         checked_out_during_durable.append(engine.pool.checkedout())
-        time.sleep(0.1)
+        entered.set()
+        assert threading.get_ident() != loop_thread
+        assert release.wait(timeout=30), "durable upload was never released"
         return original_sync(self, *args, **kwargs)
 
     monkeypatch.setattr(ManagedFileRef, "sync_to_durable", delayed_sync)
@@ -641,17 +645,18 @@ async def test_upload_durable_phase_releases_pool_and_event_loop(
             user_id=user_id,
         )
 
-    started_at = asyncio.get_running_loop().time()
     upload_task = asyncio.create_task(upload_once())
-    ticker_task = asyncio.create_task(asyncio.sleep(0.02))
     try:
-        await ticker_task
-        assert asyncio.get_running_loop().time() - started_at < 0.08
-        await upload_task
+        assert await asyncio.to_thread(entered.wait, 30)
+        assert not upload_task.done()
         assert checked_out_during_durable == [0]
         assert engine.pool.checkedout() == 0
     finally:
-        engine.dispose()
+        release.set()
+        try:
+            await asyncio.wait_for(upload_task, timeout=30)
+        finally:
+            engine.dispose()
 
 
 @pytest.mark.asyncio

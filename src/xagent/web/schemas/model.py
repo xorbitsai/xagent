@@ -1,7 +1,7 @@
 from datetime import datetime
-from typing import Any, List, Optional, Set
+from typing import Any, List, Literal, Optional, Set
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 def _strip_whitespace(v: Any) -> Any:
@@ -384,6 +384,73 @@ class ModelWithAccessInfo(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class AutoModelCandidateUpdate(BaseModel):
+    """Bind one saved model to the matching xrouter profile."""
+
+    target_model_id: int
+    routing_model_id: str
+
+    @field_validator("routing_model_id", mode="before")
+    @classmethod
+    def strip_routing_model_id(cls, v: Any) -> Any:
+        return _strip_whitespace(v)
+
+
+class AutoModelConfigUpdate(BaseModel):
+    """Create or replace the current user's Auto model configuration."""
+
+    strategy: Literal["balanced", "quality", "cost"] = Field(
+        default="balanced",
+        deprecated=True,
+        description="Deprecated compatibility field; Auto always uses xrouter auto.",
+    )
+    fallback_model_id: Optional[int] = None
+    set_as_default: Optional[bool] = None
+    candidates: List[AutoModelCandidateUpdate]
+
+    @model_validator(mode="after")
+    def validate_candidates(self) -> "AutoModelConfigUpdate":
+        if not self.candidates:
+            raise ValueError("Auto needs at least one candidate model")
+
+        target_ids = [candidate.target_model_id for candidate in self.candidates]
+        routing_ids = [candidate.routing_model_id for candidate in self.candidates]
+        if any(not routing_id for routing_id in routing_ids):
+            raise ValueError("routing_model_id must not be empty")
+        if len(target_ids) != len(set(target_ids)):
+            raise ValueError("Each saved model can only appear once")
+        if len(routing_ids) != len(set(routing_ids)):
+            raise ValueError("Each routing profile can only appear once")
+        if (
+            self.fallback_model_id is not None
+            and self.fallback_model_id not in target_ids
+        ):
+            raise ValueError("The fallback model must be one of the candidates")
+        return self
+
+
+class AutoModelCandidateResponse(BaseModel):
+    routing_model_id: str
+    target_model_id: int
+    target_model: ModelWithAccessInfo
+
+
+class AutoModelConfigResponse(BaseModel):
+    configured: bool
+    strategy: Literal["balanced"] = "balanced"
+    fallback_model_id: Optional[int] = None
+    auto_model: Optional[ModelWithAccessInfo] = None
+    candidates: List[AutoModelCandidateResponse] = Field(default_factory=list)
+
+
+class RouterProfileResponse(BaseModel):
+    id: str
+    provider: Optional[str] = None
+    aliases: List[str] = Field(default_factory=list)
+    input_modalities: List[str] = Field(default_factory=list)
+    context_window: Optional[int] = None
 
 
 class FetchProviderModelsRequest(BaseModel):

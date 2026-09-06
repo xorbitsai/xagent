@@ -69,6 +69,19 @@ def test_requires_app_scoped_oauth_grant_github_addition_leaves_meta_unaffected(
     assert requires_app_scoped_oauth_grant("meta") is False
 
 
+def test_requires_app_scoped_oauth_grant_covers_myob():
+    """MYOB's oauth_providers row seeds an empty default_scopes (there is no
+    shared identity scope; every functional sme-* scope lives solely on the
+    app row) -- an even more extreme version of github's situation, since a
+    bare grant here would request zero scopes, not just an under-scoped
+    identity-only set. Pin membership the same way as github's own
+    regression test above, and confirm it didn't flip anything unrelated."""
+    assert requires_app_scoped_oauth_grant("myob") is True
+    assert requires_app_scoped_oauth_grant("MyOB") is True
+    assert requires_app_scoped_oauth_grant("instagram") is False
+    assert requires_app_scoped_oauth_grant("meta") is False
+
+
 def test_restrict_to_app_scoped_oauth_grant_dedupes_and_preserves_order():
     assert restrict_to_app_scoped_oauth_grant(
         "instagram", ["meta", "meta", "instagram", None, ""]
@@ -164,3 +177,67 @@ def test_legacy_token_resolution_uses_app_scoped_facebook_grant(db_session):
     )
 
     assert resolution.access_token == "app-scoped-facebook-token"
+
+
+def test_app_scoped_token_resolution_picks_newest_row_on_tie(db_session):
+    """More than one UserOAuth row for the same (user, app-scoped provider
+    set) shouldn't normally exist, but a provider whose identity backfill
+    can't always derive a non-NULL provider_user_id (e.g. Employment Hero
+    with zero accessible organisations) can leave more than one row behind
+    after a race. Resolution must deterministically prefer the
+    newest-created row rather than whatever order the backend happens to
+    return, so a stale token left behind by a lost race isn't the one
+    silently used."""
+    db_session.add(
+        UserOAuth(
+            user_id=1,
+            provider="facebook",
+            access_token="stale-facebook-token",
+        )
+    )
+    db_session.commit()
+    db_session.add(
+        UserOAuth(
+            user_id=1,
+            provider="facebook",
+            access_token="fresh-facebook-token",
+        )
+    )
+    db_session.commit()
+
+    cfg = WebToolConfig(db=None, request=None, db_factory=lambda: db_session, user_id=1)
+
+    resolution = asyncio.run(
+        cfg._resolve_legacy_oauth_access_token(provider_name="meta", app_id="facebook")
+    )
+
+    assert resolution.access_token == "fresh-facebook-token"
+
+
+def test_bare_provider_token_resolution_picks_newest_row_on_tie(db_session):
+    """Same tie-break as the app-scoped case above, but for the bare
+    (app_id-less) provider-lookup branch."""
+    db_session.add(
+        UserOAuth(
+            user_id=1,
+            provider="meta",
+            access_token="stale-meta-token",
+        )
+    )
+    db_session.commit()
+    db_session.add(
+        UserOAuth(
+            user_id=1,
+            provider="meta",
+            access_token="fresh-meta-token",
+        )
+    )
+    db_session.commit()
+
+    cfg = WebToolConfig(db=None, request=None, db_factory=lambda: db_session, user_id=1)
+
+    resolution = asyncio.run(
+        cfg._resolve_legacy_oauth_access_token(provider_name="meta", app_id=None)
+    )
+
+    assert resolution.access_token == "fresh-meta-token"

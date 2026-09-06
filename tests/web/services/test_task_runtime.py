@@ -464,17 +464,25 @@ async def test_blocking_provider_timeout_does_not_consume_default_executor(
     registered_names: list[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
     import xagent.web.services.task_runtime as task_runtime
 
     release_hook = threading.Event()
+    hook_started = asyncio.Event()
+    hook_finished = threading.Event()
 
     class _BlockingProvider(_Provider):
         def build_runtime(
             self,
             context: TaskRuntimeContext,
         ) -> TaskRuntimeContribution:
-            release_hook.wait()
-            return TaskRuntimeContribution(environment="released")
+            loop.call_soon_threadsafe(hook_started.set)
+            try:
+                release_hook.wait()
+                return TaskRuntimeContribution(environment="released")
+            finally:
+                hook_finished.set()
 
     _register(
         "blocking_runtime",
@@ -487,14 +495,27 @@ async def test_blocking_provider_timeout_does_not_consume_default_executor(
         0.01,
     )
 
+    loop = asyncio.get_running_loop()
+    original_executor = loop._default_executor
+    probe_executor = ThreadPoolExecutor(max_workers=1)
+    monkeypatch.setattr(loop, "_default_executor", probe_executor)
     try:
         contribution = await build_task_runtime(_context())
+        await asyncio.wait_for(hook_started.wait(), timeout=30)
+        assert not hook_finished.is_set()
+        # A single default worker exposes accidental use by the blocked hook;
+        # extra idle workers would let this probe pass despite that regression.
         default_executor_result = await asyncio.wait_for(
             asyncio.to_thread(lambda: "available"),
-            timeout=0.5,
+            timeout=30,
         )
     finally:
         release_hook.set()
+        try:
+            assert await asyncio.to_thread(hook_finished.wait, 30)
+        finally:
+            monkeypatch.setattr(loop, "_default_executor", original_executor)
+            probe_executor.shutdown(wait=True)
 
     assert contribution == TaskRuntimeContribution()
     assert default_executor_result == "available"

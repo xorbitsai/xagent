@@ -820,6 +820,46 @@ async def test_join_channel_is_discoverable_via_mcp_list_tools():
     assert "explicitly confirmed" in (tool.description or "")
 
 
+async def test_read_tools_expose_channel_scope_rule_via_mcp_list_tools():
+    """The read/list tools' docstrings are the only thing steering the agent
+    away from sweeping every listed conversation: a broad request ("check my
+    channels") must turn into list -> ask_user_question -> read only the
+    selected ones, and a selection must exclude unselected conversations
+    even when the bot can already read them. Pin the phrases the agent
+    relies on so a docstring rewrite can't silently drop the rule."""
+    # Collapse the docstring line wrapping so the assertions pin phrases, not
+    # where a sentence happens to break across lines.
+    tools = {
+        t.name: " ".join((t.description or "").split())
+        for t in await slack.mcp.list_tools()
+    }
+
+    # slack_get_channel_history carries the canonical rule; the other
+    # conversation-reading tools point at it by name rather than repeating it.
+    canonical = tools["slack_get_channel_history"]
+    assert "selected in a previous ask_user_question" in canonical
+    assert "do not report on it in your answer" in canonical
+    assert "If asking is not possible in this run" in canonical
+    # The ask-first path: a broad, unnamed request must become a single
+    # question, not a one-by-one sweep of every listed conversation.
+    assert "offer the candidates in a single ask_user_question" in canonical
+    # "my channels" is exactly the incident-trigger phrasing (task 251938:
+    # "check my slack channels") — it must not qualify as an explicit set
+    # that lets the model skip asking.
+    assert '"my channels" or "my Slack" is not a set' in canonical
+    for name in (
+        "slack_search_messages",
+        "slack_get_thread_replies",
+        "slack_join_channel",
+        "slack_list_channels",
+        "slack_list_direct_messages",
+    ):
+        assert "slack_get_channel_history's scope rule" in tools[name], name
+    for name in ("slack_list_channels", "slack_list_direct_messages"):
+        assert "discovery, not permission" in tools[name], name
+    assert "does not put it in scope for reading" in tools["slack_join_channel"]
+
+
 def test_join_channel_sends_expected_payload(monkeypatch):
     mock_request = Mock(return_value=MockResponse({"ok": True}))
     monkeypatch.setattr(slack.requests, "request", mock_request)

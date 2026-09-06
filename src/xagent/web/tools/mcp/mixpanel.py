@@ -9,6 +9,7 @@ from typing import Any
 import requests
 from mcp.server.fastmcp import FastMCP
 
+from ....config import get_tool_max_output_length
 from ....core.utils.security import redact_sensitive_text
 from ...utils.graphql_errors import truncate_error_text
 from .utils import clamp_limit, setup_proxy_env, success_with_capped_dict, url_path_id
@@ -59,6 +60,41 @@ def _success(**payload: Any) -> str:
 
 def _error(message: str) -> str:
     return json.dumps({"status": "error", "message": message}, ensure_ascii=False)
+
+
+def _success_with_capped_list(key: str, items: Any) -> str:
+    """Wrap a bare list under ``key`` for success_with_capped_dict, then
+    restore the nested key if its phase-2 fallback dropped it -- but only
+    when the restored size still fits XAGENT_TOOL_MAX_OUTPUT_LENGTH.
+
+    success_with_capped_dict can drop the wrapper's sole key entirely once
+    list-halving alone can't fit an aggressively low limit, leaving
+    capped[key] == {} instead of {key: []} -- a caller doing
+    result[key][key] then raises KeyError. Restoring the key
+    unconditionally isn't safe: this string ends up at
+    result["content"][0]["text"] in the MCP adapter's response, which the
+    separate OutputFilteredToolWrapper re-checks against this same limit
+    and hard-truncates by raw character count with no JSON awareness --
+    turning a valid but now-over-budget string into truncated, unparsable
+    garbage, worse than the KeyError. The required {key: [...]} shape has
+    a fixed minimum byte size; below it, no representation is both
+    correctly shaped and within budget, so the limit wins and
+    result[key][key] can still KeyError in that narrow window -- a
+    pre-existing gap in success_with_capped_dict itself (shared by every
+    other caller), not one this local wrapper can close without touching
+    that shared function.
+    """
+    max_output_length = get_tool_max_output_length()
+    capped_response = success_with_capped_dict(key, {key: items})
+    capped = json.loads(capped_response)
+    if key in capped[key]:
+        return capped_response
+    candidate_response = json.dumps(
+        {**capped, key: {**capped[key], key: []}}, ensure_ascii=False
+    )
+    if len(candidate_response) <= max_output_length:
+        return candidate_response
+    return capped_response
 
 
 def _auth() -> tuple[str, str]:
@@ -301,7 +337,7 @@ def mixpanel_list_event_names(event_type: str = "general", limit: int = 50) -> s
             "/api/query/events/names",
             params={"type": event_type, "limit": max_results},
         )
-        return success_with_capped_dict("event_names", {"event_names": result})
+        return _success_with_capped_list("event_names", result)
     except Exception as e:
         logger.error(f"Error listing Mixpanel event names: {e}")
         return _error(str(e))
@@ -455,7 +491,7 @@ def mixpanel_list_funnels() -> str:
     """
     try:
         result = _request("GET", _region_hosts()["query"], "/api/query/funnels/list")
-        return success_with_capped_dict("funnels", {"funnels": result})
+        return _success_with_capped_list("funnels", result)
     except Exception as e:
         logger.error(f"Error listing Mixpanel funnels: {e}")
         return _error(str(e))
@@ -551,7 +587,7 @@ def mixpanel_list_annotations(from_date: str, to_date: str) -> str:
         annotations = (
             (result.get("results") or []) if isinstance(result, dict) else result
         )
-        return success_with_capped_dict("annotations", {"annotations": annotations})
+        return _success_with_capped_list("annotations", annotations)
     except Exception as e:
         logger.error(f"Error listing Mixpanel annotations: {e}")
         return _error(str(e))

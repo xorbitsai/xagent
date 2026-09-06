@@ -10,6 +10,7 @@ from xagent.web.models.database import Base
 from xagent.web.models.model import Model
 from xagent.web.models.user import User, UserDefaultModel, UserModel
 from xagent.web.services.model_service import (
+    _create_default_llm_instance,
     _is_model_visible_to_user,
     get_asr_models,
     get_default_embedding_model,
@@ -95,6 +96,32 @@ def sample_model(db_session):
 
 class TestModelService:
     """Test model service functionality"""
+
+    def test_configured_auto_default_uses_user_aware_resolver(self):
+        db = MagicMock()
+        db_model = MagicMock(
+            model_provider="router", model_name="auto", model_id="router-auto"
+        )
+        resolved_llm = MagicMock()
+
+        with (
+            patch(
+                "xagent.web.services.llm_utils.UserAwareModelStorage"
+            ) as storage_class,
+            patch(
+                "xagent.web.services.llm_utils._create_llm_instance"
+            ) as legacy_create,
+        ):
+            storage_class.return_value.get_llm_by_id.return_value = resolved_llm
+
+            result = _create_default_llm_instance(db, db_model, user_id=7)
+
+        assert result is resolved_llm
+        storage_class.assert_called_once_with(db)
+        storage_class.return_value.get_llm_by_id.assert_called_once_with(
+            "router-auto", 7
+        )
+        legacy_create.assert_not_called()
 
     def test_get_default_model_user_specific(self):
         """Test getting user-specific default model"""

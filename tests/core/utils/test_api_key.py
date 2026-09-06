@@ -12,18 +12,18 @@ Covers the three key contracts callers rely on:
 
 Plus a couple of robustness checks:
 
-  - verify_dummy spends roughly the same time as a real verify_api_key
-    call, so an attacker can't enumerate prefixes by timing.
+  - verify_dummy performs a bcrypt check with the same cost as real API
+    keys, so missing prefixes do not skip the expensive verification.
   - generate_api_key retries on prefix collision and gives up cleanly
     if a mock keeps colliding.
 """
 
 import re
-import time
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
+from xagent.core.utils import api_key as api_key_module
 from xagent.core.utils.api_key import (
     BCRYPT_COST,
     KEY_ALPHABET,
@@ -200,32 +200,20 @@ def test_verify_dummy_runs_without_raising() -> None:
     assert verify_dummy() is None
 
 
-def test_verify_dummy_timing_similar_to_verify() -> None:
-    """verify_dummy() runs roughly as long as a real verify_api_key() call.
-
-    We don't need tight bounds; the threat model is "an attacker can tell
-    fast (index miss) from slow (bcrypt run) responses". A ratio inside
-    [0.3, 3.0] is good enough -- bcrypt timing is dominated by the cost
-    factor, not by what's being verified. Generous bounds keep CI happy
-    on overcommitted runners.
-    """
+def test_verify_dummy_uses_the_same_bcrypt_cost_as_real_verification() -> None:
+    """Both paths execute bcrypt at the configured cost, without timing CI."""
     full, _prefix, key_hash = generate_api_key(db=None)
+    with patch.object(
+        api_key_module.bcrypt, "checkpw", wraps=api_key_module.bcrypt.checkpw
+    ) as checkpw:
+        assert verify_api_key(full, key_hash) is True
+        checkpw.assert_called_once_with(full.encode(), key_hash.encode())
+        checkpw.reset_mock()
 
-    # Warm any lazy bcrypt init so we don't measure first-call overhead
-    verify_api_key(full, key_hash)
-    verify_dummy()
-
-    t0 = time.perf_counter()
-    verify_api_key(full, key_hash)
-    real_elapsed = time.perf_counter() - t0
-
-    t0 = time.perf_counter()
-    verify_dummy()
-    dummy_elapsed = time.perf_counter() - t0
-
-    ratio = dummy_elapsed / real_elapsed
-    assert 0.3 < ratio < 3.0, (
-        f"verify_dummy timing diverged from verify_api_key: "
-        f"real={real_elapsed * 1000:.1f}ms, dummy={dummy_elapsed * 1000:.1f}ms, "
-        f"ratio={ratio:.2f}"
-    )
+        assert verify_dummy() is None
+        checkpw.assert_called_once()
+        dummy_password, dummy_hash = checkpw.call_args.args
+        assert isinstance(dummy_password, bytes)
+        assert isinstance(dummy_hash, bytes)
+        assert int(dummy_hash.split(b"$")[2]) == BCRYPT_COST
+        assert int(key_hash.split("$")[2]) == BCRYPT_COST

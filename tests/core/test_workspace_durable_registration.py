@@ -1,5 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier, BrokenBarrierError
+from threading import Event, Lock, local
 from uuid import UUID
 
 import pytest
@@ -1188,29 +1188,61 @@ def test_concurrent_registration_of_one_path_uses_one_workspace_owner(
     )
     output_path = workspace.output_dir / "report.txt"
     output_path.write_text("one artifact", encoding="utf-8")
-    load_barrier = Barrier(2)
+    first_entered = Event()
+    second_attempted = Event()
+    release_first = Event()
+    attempts_lock = Lock()
+    attempts = 0
+    registration_lock = workspace._registration_lock
+    ownership = local()
     original_load = workspace._load_file_registration_plans
 
-    def synchronized_load(*args, **kwargs):
-        plans = original_load(*args, **kwargs)
-        try:
-            load_barrier.wait(timeout=0.2)
-        except BrokenBarrierError:
-            pass
-        return plans
+    def checked_load(*args, **kwargs):
+        assert getattr(ownership, "depth", 0) > 0, (
+            "registration read must hold the lock"
+        )
+        return original_load(*args, **kwargs)
 
-    monkeypatch.setattr(
-        workspace,
-        "_load_file_registration_plans",
-        synchronized_load,
-    )
+    monkeypatch.setattr(workspace, "_load_file_registration_plans", checked_load)
+
+    class ObservedRegistrationLock:
+        def __enter__(self):
+            nonlocal attempts
+            with attempts_lock:
+                attempts += 1
+                attempt = attempts
+            if attempt == 2:
+                acquired = registration_lock.acquire(blocking=False)
+                if acquired:
+                    registration_lock.release()
+                assert not acquired, "the first registration must still hold the lock"
+                second_attempted.set()
+            registration_lock.acquire()
+            if attempt == 1:
+                first_entered.set()
+                if not release_first.wait(timeout=30):
+                    registration_lock.release()
+                    raise AssertionError("first registration was never released")
+            ownership.depth = getattr(ownership, "depth", 0) + 1
+            return self
+
+        def __exit__(self, *_exc):
+            ownership.depth -= 1
+            registration_lock.release()
+
+    monkeypatch.setattr(workspace, "_registration_lock", ObservedRegistrationLock())
     try:
         with ThreadPoolExecutor(max_workers=2) as executor:
-            futures = [
-                executor.submit(workspace.register_file, str(output_path))
-                for _ in range(2)
-            ]
-            file_ids = [future.result() for future in futures]
+            first = executor.submit(workspace.register_file, str(output_path))
+            try:
+                assert first_entered.wait(timeout=30)
+                second = executor.submit(workspace.register_file, str(output_path))
+                assert second_attempted.wait(timeout=30)
+                assert not first.done()
+                assert not second.done()
+            finally:
+                release_first.set()
+            file_ids = [first.result(timeout=30), second.result(timeout=30)]
 
         assert file_ids[0] == file_ids[1]
         with SessionLocal() as verify_db:

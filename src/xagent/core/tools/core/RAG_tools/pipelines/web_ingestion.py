@@ -33,12 +33,46 @@ from ..utils.config_utils import coerce_ingestion_config
 from ..utils.string_utils import sanitize_for_doc_id
 from ..utils.user_scope import resolve_user_scope
 from ..web_crawler import WebCrawler
+from ..web_crawler.crawler import STOPPED_NO_ELIGIBLE_LINKS
+from ..web_crawler.url_filter import REJECTED_ROBOTS, SITE_REJECTIONS
 from .document_ingestion import run_document_ingestion
 
 if TYPE_CHECKING:
     from ..kb import KBPipelineCompatibilityFacade
 
 logger = logging.getLogger(__name__)
+
+# Reason keys are internal identifiers; this text reaches an end user. Only
+# SITE_REJECTIONS reasons are ever rendered, so this covers exactly those -
+# a reason added to that set needs a label here too.
+_REJECTION_LABELS = {
+    REJECTED_ROBOTS: "blocked by robots.txt rules",
+}
+
+
+def _blocked_crawl_explanation(
+    crawl_stats: dict, documents_created: int, pages_crawled: int
+) -> str:
+    """Say that the site refused the crawl, counting only what the site did.
+
+    Configured rejections are the operator's own scope rules; listing them in a
+    sentence that blames the site would report that filtering as a refusal.
+    """
+    rejections = crawl_stats.get("link_rejections", {})
+    refused = ", ".join(
+        f"{rejections[reason]} {_REJECTION_LABELS.get(reason, reason)}"
+        for reason in sorted(SITE_REJECTIONS)
+        if rejections.get(reason)
+    )
+    # Unreachable today - the stop reason this message explains requires a site
+    # rejection - but an empty parenthetical would read as a formatting bug.
+    cause = f" ({refused})" if refused else ""
+    return (
+        f"Only {documents_created} document(s) from {pages_crawled} page(s) "
+        f"could be imported: every link found was refused{cause}. The pages "
+        f"that were reachable have been ingested."
+    )
+
 
 FileHandlerCallback = Callable[..., Any]
 
@@ -857,6 +891,22 @@ async def _run_web_ingestion_impl(
     if rollback_failed_urls:
         status = "error"
 
+    # A crawl can end with zero failures and still not be what the user asked
+    # for: every link the start page offered was refused by the site. Configured
+    # stops (page cap, depth, deliberate filtering) are not this case, which is
+    # why the reason comes from the crawler rather than from link counts.
+    #
+    # This deliberately does not touch `status`. The pages that landed were
+    # ingested and published, which is what "success" means to every consumer
+    # of that enum - the REST handler returns 200 and both frontend call sites
+    # treat anything else as a hard failure. The blocked crawl is a different
+    # fact about the same run, so it travels as its own flag plus a warning.
+    crawl_stats = crawler.get_statistics()
+    blocked_stop = (
+        status == "success"
+        and crawl_stats.get("stop_reason") == STOPPED_NO_ELIGIBLE_LINKS
+    )
+
     crawled_urls_list = [r.url for r in crawl_results if r.status == "success"]
 
     # Build a status-aware message. Previously this was unconditionally
@@ -901,6 +951,11 @@ async def _run_web_ingestion_impl(
                     f"{pages_crawled} pages, {len(failed_urls)} failed "
                     f"(first: {first_url} returned {first_err})"
                 )
+    elif blocked_stop:
+        message = _blocked_crawl_explanation(
+            crawl_stats, documents_created, pages_crawled
+        )
+        warnings = [*warnings, message]
     else:
         message = (
             f"Web ingestion completed: {documents_created} documents, "
@@ -909,6 +964,7 @@ async def _run_web_ingestion_impl(
 
     result = WebIngestionResult(
         status=status,
+        crawl_blocked_by_site=blocked_stop,
         collection=collection,
         total_urls_found=crawler.total_urls_found,
         pages_crawled=pages_crawled,

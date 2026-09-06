@@ -15,13 +15,16 @@ import shlex
 from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 from typing import Annotated, Any, Callable, Dict, List, Literal, Optional, Union, cast
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from uuid import UUID
 
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -50,6 +53,7 @@ from ..models.mcp_oauth import (
     mcp_oauth_client_registration_lookup_hash,
     mcp_oauth_grant_lookup_hash,
 )
+from ..models.public_mcp import PublicMCPApp
 from ..models.user import User
 from ..services.mcp_oauth import (
     MCP_OAUTH_HTTP_TIMEOUT_SECONDS,
@@ -75,6 +79,7 @@ from ..services.mcp_runtime import HTTP_MCP_TRANSPORTS
 from ..services.user_oauth import (
     delete_scoped_user_oauth_accounts,
     list_scoped_user_oauth_accounts,
+    normalize_user_oauth_resource_owner_key,
 )
 
 logger = logging.getLogger(__name__)
@@ -492,6 +497,19 @@ def _mcp_oauth_callback_error_redirect(
     raw_redirect_after = (
         str(flow_state.redirect_after) if flow_state.redirect_after else None
     )
+    return _mcp_oauth_callback_error_redirect_for_path(
+        raw_redirect_after,
+        error_code=error_code,
+        message=message,
+    )
+
+
+def _mcp_oauth_callback_error_redirect_for_path(
+    raw_redirect_after: str | None,
+    *,
+    error_code: str,
+    message: str,
+) -> RedirectResponse:
     redirect_path = _redirect_after_with_params(
         raw_redirect_after,
         (
@@ -540,6 +558,40 @@ def _validate_mcp_oauth_state_cookie(request: Request, state_value: str) -> None
 
 def _default_resource_owner_key(user_id: int) -> str:
     return f"xagent:user:{user_id}"
+
+
+def _has_actor_owned_mcp_oauth_state(
+    db: Session,
+    *,
+    server_id: int,
+    user_id: int,
+) -> bool:
+    """Whether generic deletion would cross an actor ownership boundary."""
+    default_owner = _default_resource_owner_key(user_id)
+    actor_grant = (
+        db.query(MCPOAuthGrant.id)
+        .filter(
+            MCPOAuthGrant.mcp_server_id == server_id,
+            MCPOAuthGrant.user_id == user_id,
+            MCPOAuthGrant.resource_owner_key != default_owner,
+            MCPOAuthGrant.status == "active",
+        )
+        .first()
+    )
+    if actor_grant is not None:
+        return True
+
+    return (
+        db.query(MCPOAuthFlowState.id)
+        .filter(
+            MCPOAuthFlowState.mcp_server_id == server_id,
+            MCPOAuthFlowState.user_id == user_id,
+            MCPOAuthFlowState.resource_owner_key != default_owner,
+            MCPOAuthFlowState.expires_at > _utc_now(),
+        )
+        .first()
+        is not None
+    )
 
 
 def _oauth_authorization_url(endpoint: str, params: dict[str, str]) -> str:
@@ -776,6 +828,275 @@ def _upsert_mcp_oauth_client(
         return client
 
 
+class _OAuthPersistence(Enum):
+    COMMIT = "commit"
+    CALLER = "caller"
+
+
+class _SQLiteOAuthPersistenceTransactionError(RuntimeError):
+    """The caller has SQLite writes that the persistence fence cannot reset."""
+
+
+def _begin_sqlite_oauth_persistence(db: Session) -> None:
+    """Acquire SQLite write intent before lifecycle identity is re-read."""
+    if db.new or db.dirty or db.deleted:
+        raise _SQLiteOAuthPersistenceTransactionError(
+            "SQLite OAuth persistence requires a read-only preflight"
+        )
+
+    connection = db.connection()
+    driver_connection = connection.connection.driver_connection
+    if bool(getattr(driver_connection, "in_transaction", False)):
+        raise _SQLiteOAuthPersistenceTransactionError(
+            "SQLite OAuth persistence requires an owned transaction"
+        )
+
+    # SQLAlchemy has logically autobegun for the read-only preflight even
+    # though pysqlite has not emitted BEGIN. End that logical transaction,
+    # then reserve SQLite's single writer before the identity reads.
+    db.rollback()
+    connection = db.connection()
+    driver_connection = connection.connection.driver_connection
+    if bool(getattr(driver_connection, "in_transaction", False)):
+        raise RuntimeError("SQLite OAuth persistence could not reset preflight")
+    connection.exec_driver_sql("BEGIN IMMEDIATE")
+
+
+@dataclass(frozen=True)
+class _MCPOAuthAssociationIdentity:
+    server_id: int
+    user_id: int
+    lifecycle_generation: UUID
+
+
+@dataclass(frozen=True)
+class _MCPOAuthFlowIdentity:
+    id: int
+    state: str
+    server_id: int
+    user_id: int
+    client_id: int
+    association_lifecycle_generation: UUID
+
+
+def _mcp_oauth_flow_identity(flow_state: MCPOAuthFlowState) -> _MCPOAuthFlowIdentity:
+    generation = flow_state.association_lifecycle_generation
+    if not isinstance(generation, UUID):
+        raise RuntimeError("MCP OAuth flow has no association lifecycle generation")
+    return _MCPOAuthFlowIdentity(
+        id=int(flow_state.id),
+        state=str(flow_state.state),
+        server_id=int(flow_state.mcp_server_id),
+        user_id=int(flow_state.user_id),
+        client_id=int(flow_state.mcp_oauth_client_id),
+        association_lifecycle_generation=generation,
+    )
+
+
+def _lock_active_mcp_oauth_lifecycle(
+    db: Session,
+    *,
+    association_identity: _MCPOAuthAssociationIdentity,
+    flow_identity: _MCPOAuthFlowIdentity | None = None,
+    association_must_be_active: bool = True,
+) -> tuple[MCPServer, UserMCPServer, MCPOAuthFlowState | None] | None:
+    """Lock server, exact association generation, then exact flow if supplied."""
+    if db.get_bind().dialect.name == "sqlite":
+        _begin_sqlite_oauth_persistence(db)
+    db.expire_all()
+
+    server = (
+        db.query(MCPServer)
+        .filter(MCPServer.id == association_identity.server_id)
+        .with_for_update()
+        .one_or_none()
+    )
+    if server is None:
+        return None
+    association_query = db.query(UserMCPServer).filter(
+        UserMCPServer.user_id == association_identity.user_id,
+        UserMCPServer.mcpserver_id == association_identity.server_id,
+        UserMCPServer.lifecycle_generation == association_identity.lifecycle_generation,
+    )
+    if association_must_be_active:
+        association_query = association_query.filter(UserMCPServer.is_active.is_(True))
+    association = association_query.with_for_update().one_or_none()
+    if association is None:
+        return None
+
+    flow_state: MCPOAuthFlowState | None = None
+    if flow_identity is not None:
+        if (
+            flow_identity.server_id != association_identity.server_id
+            or flow_identity.user_id != association_identity.user_id
+            or flow_identity.association_lifecycle_generation
+            != association_identity.lifecycle_generation
+        ):
+            return None
+        flow_state = (
+            db.query(MCPOAuthFlowState)
+            .filter(
+                MCPOAuthFlowState.id == flow_identity.id,
+                MCPOAuthFlowState.state == flow_identity.state,
+                MCPOAuthFlowState.mcp_server_id == flow_identity.server_id,
+                MCPOAuthFlowState.user_id == flow_identity.user_id,
+                MCPOAuthFlowState.mcp_oauth_client_id == flow_identity.client_id,
+                MCPOAuthFlowState.association_lifecycle_generation
+                == flow_identity.association_lifecycle_generation,
+            )
+            .with_for_update()
+            .one_or_none()
+        )
+        if flow_state is None:
+            return None
+    return server, association, flow_state
+
+
+def _lock_caller_oauth_lifecycle(
+    db: Session,
+    *,
+    association_identity: _MCPOAuthAssociationIdentity,
+) -> tuple[MCPServer, UserMCPServer] | None:
+    """Lock and activate a caller-owned lifecycle after provider I/O."""
+    db.flush()
+    server = (
+        db.query(MCPServer)
+        .filter(MCPServer.id == association_identity.server_id)
+        .with_for_update()
+        .one_or_none()
+    )
+    if server is None:
+        return None
+    association = (
+        db.query(UserMCPServer)
+        .filter(
+            UserMCPServer.user_id == association_identity.user_id,
+            UserMCPServer.mcpserver_id == association_identity.server_id,
+            UserMCPServer.lifecycle_generation
+            == association_identity.lifecycle_generation,
+        )
+        .with_for_update()
+        .one_or_none()
+    )
+    if association is None:
+        return None
+    if not association.is_active:
+        setattr(association, "is_active", True)
+        db.flush()
+    return server, association
+
+
+def _sweep_expired_mcp_oauth_flow_states(db: Session) -> None:
+    """Delete one bounded batch of dead flow states outside lifecycle locks."""
+    # Sweep this table's dead rows before adding another, mirroring the Slack
+    # OAuth flow-state ledger in channel.py. Every abandoned, denied or
+    # double-submitted authorization leaves a row that is permanently unusable
+    # once it expires (the claim query requires consumed_at IS NULL and
+    # expires_at > now), but nothing else removes it until a disconnect or a
+    # server cascade. Deliberately global so users who never reconnect do not
+    # retain rows forever, and bounded so one user-facing request does not drain
+    # an unbounded historical backlog.
+    try:
+        stale_flow_state_ids = (
+            db.query(MCPOAuthFlowState.id)
+            .filter(
+                MCPOAuthFlowState.expires_at
+                < _utc_now() - MCP_OAUTH_FLOW_STATE_RETENTION
+            )
+            .order_by(MCPOAuthFlowState.id)
+            .with_for_update(skip_locked=True)
+            .limit(MCP_OAUTH_FLOW_STATE_SWEEP_BATCH)
+            .scalar_subquery()
+        )
+        db.query(MCPOAuthFlowState).filter(
+            MCPOAuthFlowState.id.in_(stale_flow_state_ids)
+        ).delete(synchronize_session=False)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+
+def _persist_mcp_oauth_connect_flow(
+    db: Session,
+    *,
+    association_identity: _MCPOAuthAssociationIdentity,
+    discovery: Any,
+    client_id: str,
+    client_secret: str | None,
+    token_endpoint_auth_method: str,
+    redirect_uri: str,
+    registration_lookup_hash: str | None,
+    resource_owner_key: str,
+    selected_issuer: str,
+    selected_resource: str,
+    selected_scope: str,
+    redirect_after: str | None,
+    persistence: _OAuthPersistence = _OAuthPersistence.COMMIT,
+) -> tuple[str, str, str] | None:
+    """Persist a client and flow only for the preflight association generation."""
+    if persistence is _OAuthPersistence.COMMIT:
+        # Commit independent maintenance before taking lifecycle row locks.
+        _sweep_expired_mcp_oauth_flow_states(db)
+        lifecycle = _lock_active_mcp_oauth_lifecycle(
+            db,
+            association_identity=association_identity,
+        )
+    else:
+        caller_lifecycle = _lock_caller_oauth_lifecycle(
+            db,
+            association_identity=association_identity,
+        )
+        lifecycle = (*caller_lifecycle, None) if caller_lifecycle is not None else None
+    if lifecycle is None:
+        if persistence is _OAuthPersistence.COMMIT:
+            db.rollback()
+        return None
+
+    try:
+        oauth_client = _upsert_mcp_oauth_client(
+            db,
+            server_id=association_identity.server_id,
+            discovery=discovery,
+            client_id=client_id,
+            client_secret=client_secret,
+            token_endpoint_auth_method=token_endpoint_auth_method,
+            redirect_uri=redirect_uri,
+            registration_lookup_hash=registration_lookup_hash,
+        )
+
+        state_value = secrets.token_urlsafe(32)
+        code_verifier = secrets.token_urlsafe(64)
+        db.add(
+            MCPOAuthFlowState(
+                state=state_value,
+                mcp_server_id=association_identity.server_id,
+                user_id=association_identity.user_id,
+                association_lifecycle_generation=(
+                    association_identity.lifecycle_generation
+                ),
+                mcp_oauth_client_id=oauth_client.id,
+                resource_owner_key=resource_owner_key,
+                issuer=selected_issuer,
+                resource=selected_resource,
+                scope=selected_scope,
+                code_verifier=encrypt_value(code_verifier),
+                redirect_after=_safe_mcp_oauth_redirect_after(redirect_after),
+                expires_at=_utc_now() + MCP_OAUTH_STATE_TTL,
+            )
+        )
+        persisted_client_id = str(oauth_client.client_id)
+        if persistence is _OAuthPersistence.COMMIT:
+            db.commit()
+        else:
+            db.flush()
+        return persisted_client_id, state_value, code_verifier
+    except Exception:
+        if persistence is _OAuthPersistence.COMMIT:
+            db.rollback()
+        raise
+
+
 def _mcp_oauth_grant_response(grant: MCPOAuthGrant) -> MCPOAuthGrantResponse:
     return MCPOAuthGrantResponse(
         id=cast(int, grant.id),
@@ -835,12 +1156,19 @@ def _mcp_oauth_flow_state_error(
         return "state_already_consumed", "OAuth state consumed"
     if _as_aware_utc(flow_state.expires_at) <= _utc_now():
         return "expired_state", "OAuth state expired"
+    association_generation = flow_state.association_lifecycle_generation
+    if association_generation is None:
+        return (
+            "invalid_state",
+            "OAuth state is not bound to an MCP server connection lifecycle",
+        )
     if (
         db.query(UserMCPServer)
         .filter(
             UserMCPServer.user_id == flow_state.user_id,
             UserMCPServer.mcpserver_id == flow_state.mcp_server_id,
-            UserMCPServer.is_active,
+            UserMCPServer.lifecycle_generation == association_generation,
+            UserMCPServer.is_active.is_(True),
         )
         .first()
         is None
@@ -860,6 +1188,12 @@ def _claim_mcp_oauth_flow_state(
         db.query(MCPOAuthFlowState)
         .filter(
             MCPOAuthFlowState.id == flow_state.id,
+            MCPOAuthFlowState.state == flow_state.state,
+            MCPOAuthFlowState.mcp_server_id == flow_state.mcp_server_id,
+            MCPOAuthFlowState.user_id == flow_state.user_id,
+            MCPOAuthFlowState.mcp_oauth_client_id == flow_state.mcp_oauth_client_id,
+            MCPOAuthFlowState.association_lifecycle_generation
+            == flow_state.association_lifecycle_generation,
             MCPOAuthFlowState.consumed_at.is_(None),
             MCPOAuthFlowState.expires_at > claimed_at,
         )
@@ -872,7 +1206,6 @@ def _claim_mcp_oauth_flow_state(
         db.rollback()
         return "state_already_consumed", "OAuth state consumed"
     db.commit()
-    db.refresh(flow_state)
     return None
 
 
@@ -965,94 +1298,314 @@ async def _exchange_mcp_oauth_code(
     return payload
 
 
+@dataclass(frozen=True)
+class _MCPOAuthIssuedTokenSnapshot:
+    flow_id: int
+    revocation_endpoint: str | None
+    client_id: str
+    encrypted_client_secret: str | None
+    token_endpoint_auth_method: str
+    access_token: str
+    refresh_token: str | None
+
+
+def _mcp_oauth_issued_token_snapshot(
+    *,
+    client: MCPOAuthClient,
+    flow_id: int,
+    token_data: dict[str, Any],
+) -> _MCPOAuthIssuedTokenSnapshot:
+    metadata: dict[str, Any] = (
+        client.metadata_json if isinstance(client.metadata_json, dict) else {}
+    )
+    revocation_endpoint = metadata.get("revocation_endpoint")
+    refresh_token = token_data.get("refresh_token")
+    return _MCPOAuthIssuedTokenSnapshot(
+        flow_id=flow_id,
+        revocation_endpoint=(
+            revocation_endpoint
+            if isinstance(revocation_endpoint, str) and revocation_endpoint
+            else None
+        ),
+        client_id=str(client.client_id),
+        encrypted_client_secret=(
+            str(client.client_secret) if client.client_secret else None
+        ),
+        token_endpoint_auth_method=str(client.token_endpoint_auth_method or "none"),
+        access_token=str(token_data["access_token"]),
+        refresh_token=str(refresh_token) if refresh_token else None,
+    )
+
+
+async def _revoke_mcp_oauth_issued_token_externally(
+    snapshot: _MCPOAuthIssuedTokenSnapshot,
+) -> None:
+    """Best-effort revoke a token whose final local persistence failed."""
+    if snapshot.revocation_endpoint is None:
+        return
+    try:
+        client_secret = (
+            decrypt_value(snapshot.encrypted_client_secret)
+            if snapshot.encrypted_client_secret
+            else ""
+        )
+    except Exception:
+        logger.warning(
+            "Skipping issued MCP OAuth token revocation for flow %s because "
+            "client credentials are unavailable",
+            snapshot.flow_id,
+        )
+        return
+
+    auth: httpx.Auth | None = None
+    data_base: dict[str, str] = {"client_id": snapshot.client_id}
+    if snapshot.token_endpoint_auth_method == "client_secret_post" and client_secret:
+        data_base["client_secret"] = client_secret
+    elif snapshot.token_endpoint_auth_method == "client_secret_basic" and client_secret:
+        auth = httpx.BasicAuth(snapshot.client_id, client_secret)
+    elif snapshot.token_endpoint_auth_method not in {
+        "none",
+        "client_secret_post",
+        "client_secret_basic",
+    }:
+        logger.warning(
+            "Skipping issued MCP OAuth token revocation for flow %s because "
+            "the client authentication method is unsupported",
+            snapshot.flow_id,
+        )
+        return
+
+    try:
+        async with create_mcp_oauth_http_client(
+            timeout=MCP_OAUTH_HTTP_TIMEOUT_SECONDS,
+        ) as http_client:
+            for token, token_type_hint in (
+                (snapshot.access_token, "access_token"),
+                (snapshot.refresh_token, "refresh_token"),
+            ):
+                if token is None:
+                    continue
+                request_kwargs: dict[str, Any] = {
+                    "data": {
+                        **data_base,
+                        "token": token,
+                        "token_type_hint": token_type_hint,
+                    },
+                    "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+                }
+                if auth is not None:
+                    request_kwargs["auth"] = auth
+                try:
+                    response = await oauth_post(
+                        snapshot.revocation_endpoint,
+                        client=http_client,
+                        **request_kwargs,
+                    )
+                    if response.status_code >= 400:
+                        logger.warning(
+                            "Issued MCP OAuth token revocation returned HTTP %s "
+                            "for flow %s",
+                            response.status_code,
+                            snapshot.flow_id,
+                        )
+                except Exception:
+                    logger.warning(
+                        "Issued MCP OAuth token revocation failed for flow %s",
+                        snapshot.flow_id,
+                    )
+    except Exception:
+        logger.warning(
+            "Issued MCP OAuth token revocation could not start for flow %s",
+            snapshot.flow_id,
+        )
+
+
+async def _rollback_and_revoke_mcp_oauth_issued_token(
+    db: Session,
+    snapshot: _MCPOAuthIssuedTokenSnapshot,
+) -> None:
+    """Release database locks before any compensating provider request."""
+    db.rollback()
+    await _revoke_mcp_oauth_issued_token_externally(snapshot)
+
+
+@dataclass(frozen=True)
+class _MCPOAuthGrantRevocationSnapshot:
+    grant_id: int
+    revocation_endpoint: str | None
+    client_id: str
+    encrypted_client_secret: str | None
+    token_endpoint_auth_method: str
+    encrypted_access_token: str | None
+    encrypted_refresh_token: str | None
+
+
+def _mcp_oauth_grant_revocation_snapshot(
+    *, client: MCPOAuthClient, grant: MCPOAuthGrant
+) -> _MCPOAuthGrantRevocationSnapshot:
+    metadata: dict[str, Any] = (
+        client.metadata_json if isinstance(client.metadata_json, dict) else {}
+    )
+    revocation_endpoint = metadata.get("revocation_endpoint")
+    return _MCPOAuthGrantRevocationSnapshot(
+        grant_id=int(grant.id),
+        revocation_endpoint=(
+            revocation_endpoint
+            if isinstance(revocation_endpoint, str) and revocation_endpoint
+            else None
+        ),
+        client_id=str(client.client_id),
+        encrypted_client_secret=(
+            str(client.client_secret) if client.client_secret else None
+        ),
+        token_endpoint_auth_method=str(client.token_endpoint_auth_method or "none"),
+        encrypted_access_token=(
+            str(grant.access_token) if grant.access_token else None
+        ),
+        encrypted_refresh_token=(
+            str(grant.refresh_token) if grant.refresh_token else None
+        ),
+    )
+
+
+async def _revoke_mcp_oauth_grant_snapshot_externally(
+    snapshot: _MCPOAuthGrantRevocationSnapshot,
+) -> None:
+    """Best-effort revoke a detached grant snapshot without ORM access."""
+    if snapshot.revocation_endpoint is None:
+        return
+
+    try:
+        client_secret = (
+            decrypt_value(snapshot.encrypted_client_secret)
+            if snapshot.encrypted_client_secret
+            else ""
+        )
+    except Exception as exc:
+        logger.warning(
+            "Skipping MCP OAuth token revocation for grant %s "
+            "(stage=decrypt_client_secret, exception_type=%s)",
+            snapshot.grant_id,
+            type(exc).__name__,
+        )
+        return
+    auth_method = snapshot.token_endpoint_auth_method
+    auth: httpx.Auth | None = None
+    base_data: dict[str, str] = {"client_id": snapshot.client_id}
+    if auth_method == "client_secret_post" and client_secret:
+        base_data["client_secret"] = client_secret
+    elif auth_method == "client_secret_basic" and client_secret:
+        auth = httpx.BasicAuth(snapshot.client_id, client_secret)
+    elif auth_method not in {"none", "client_secret_post", "client_secret_basic"}:
+        logger.warning(
+            "Skipping MCP OAuth token revocation for grant %s "
+            "(stage=validate_auth_method)",
+            snapshot.grant_id,
+        )
+        return
+
+    try:
+        async with create_mcp_oauth_http_client(
+            timeout=MCP_OAUTH_HTTP_TIMEOUT_SECONDS,
+        ) as http_client:
+            for encrypted_token, token_type_hint in (
+                (snapshot.encrypted_access_token, "access_token"),
+                (snapshot.encrypted_refresh_token, "refresh_token"),
+            ):
+                if not encrypted_token:
+                    continue
+                try:
+                    decrypted_token = decrypt_value(encrypted_token)
+                except Exception as exc:
+                    logger.warning(
+                        "Skipping MCP OAuth token revocation for grant %s "
+                        "(stage=decrypt_%s, exception_type=%s)",
+                        snapshot.grant_id,
+                        token_type_hint,
+                        type(exc).__name__,
+                    )
+                    continue
+                request_kwargs: dict[str, Any] = {
+                    "data": {
+                        **base_data,
+                        "token": decrypted_token,
+                        "token_type_hint": token_type_hint,
+                    },
+                    "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+                }
+                if auth is not None:
+                    request_kwargs["auth"] = auth
+                try:
+                    response = await oauth_post(
+                        snapshot.revocation_endpoint,
+                        client=http_client,
+                        **request_kwargs,
+                    )
+                    if response.status_code >= 400:
+                        logger.warning(
+                            "MCP OAuth token revocation returned HTTP %s for grant %s",
+                            response.status_code,
+                            snapshot.grant_id,
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "MCP OAuth token revocation failed for grant %s "
+                        "(stage=revoke_%s, exception_type=%s)",
+                        snapshot.grant_id,
+                        token_type_hint,
+                        type(exc).__name__,
+                    )
+    except Exception as exc:
+        logger.warning(
+            "MCP OAuth token revocation could not start for grant %s "
+            "(stage=create_client, exception_type=%s)",
+            snapshot.grant_id,
+            type(exc).__name__,
+        )
+
+
 async def _revoke_mcp_oauth_grant_externally(
     *,
     client: MCPOAuthClient,
     grant: MCPOAuthGrant,
 ) -> None:
-    metadata: dict[str, Any] = (
-        client.metadata_json if isinstance(client.metadata_json, dict) else {}
+    await _revoke_mcp_oauth_grant_snapshot_externally(
+        _mcp_oauth_grant_revocation_snapshot(client=client, grant=grant)
     )
-    revocation_endpoint = metadata.get("revocation_endpoint")
-    if not isinstance(revocation_endpoint, str) or not revocation_endpoint:
-        return
 
+
+@dataclass(frozen=True)
+class MCPOAuthOwnerRevocation:
+    """Provider work staged by an exact-owner local transaction."""
+
+    grant_count: int
+    _snapshots: tuple[_MCPOAuthGrantRevocationSnapshot, ...]
+
+    async def revoke_tokens(self) -> None:
+        """Revoke provider tokens only after the caller commits local state."""
+        for snapshot in self._snapshots:
+            await _revoke_mcp_oauth_grant_snapshot_externally(snapshot)
+
+
+def _trusted_mcp_oauth_owner_key(resource_owner_key: str, *, user_id: int) -> str:
     try:
-        client_secret = (
-            decrypt_value(str(client.client_secret)) if client.client_secret else ""
+        owner_key = normalize_user_oauth_resource_owner_key(resource_owner_key)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+    if owner_key is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="resource_owner_key must not be null",
         )
-    except Exception as exc:
-        logger.warning(
-            "Skipping MCP OAuth token revocation for grant %s because client secret "
-            "could not be decrypted: %s",
-            grant.id,
-            exc,
+    if owner_key == _default_resource_owner_key(user_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="resource_owner_key must not use the default user namespace",
         )
-        return
-    auth_method = str(client.token_endpoint_auth_method or "none")
-    auth: httpx.Auth | None = None
-    base_data: dict[str, str] = {"client_id": str(client.client_id)}
-    if auth_method == "client_secret_post" and client_secret:
-        base_data["client_secret"] = client_secret
-    elif auth_method == "client_secret_basic" and client_secret:
-        auth = httpx.BasicAuth(str(client.client_id), client_secret)
-    elif auth_method not in {"none", "client_secret_post", "client_secret_basic"}:
-        logger.warning(
-            "Skipping MCP OAuth token revocation for unsupported auth method %s",
-            auth_method,
-        )
-        return
-
-    encrypted_tokens = (
-        (grant.access_token, "access_token"),
-        (grant.refresh_token, "refresh_token"),
-    )
-    async with create_mcp_oauth_http_client(
-        timeout=MCP_OAUTH_HTTP_TIMEOUT_SECONDS,
-    ) as http_client:
-        for encrypted_token, token_type_hint in encrypted_tokens:
-            if not encrypted_token:
-                continue
-            try:
-                decrypted_token = decrypt_value(str(encrypted_token))
-            except Exception as exc:
-                logger.warning(
-                    "Skipping MCP OAuth %s revocation for grant %s because token "
-                    "could not be decrypted: %s",
-                    token_type_hint,
-                    grant.id,
-                    exc,
-                )
-                continue
-            data = {
-                **base_data,
-                "token": decrypted_token,
-                "token_type_hint": token_type_hint,
-            }
-            request_kwargs: dict[str, Any] = {
-                "data": data,
-                "headers": {"Content-Type": "application/x-www-form-urlencoded"},
-            }
-            if auth is not None:
-                request_kwargs["auth"] = auth
-            try:
-                response = await oauth_post(
-                    revocation_endpoint,
-                    client=http_client,
-                    **request_kwargs,
-                )
-                if response.status_code >= 400:
-                    logger.warning(
-                        "MCP OAuth token revocation returned HTTP %s for grant %s",
-                        response.status_code,
-                        grant.id,
-                    )
-            except (MCPOAuthDiscoveryError, httpx.HTTPError) as exc:
-                logger.warning(
-                    "MCP OAuth token revocation failed for grant %s: %s",
-                    grant.id,
-                    exc,
-                )
+    return owner_key
 
 
 def _upsert_mcp_oauth_grant(
@@ -2983,7 +3536,7 @@ def _ensure_catalog_mcp_oauth_server(
                 if value and isinstance(value, str):
                     encrypted_auth[key] = encrypt_value(value)
             cast(Any, server).auth = encrypted_auth
-            db.commit()
+            db.flush()
     if not server:
         try:
             config = _build_server_config(
@@ -2999,7 +3552,69 @@ def _ensure_catalog_mcp_oauth_server(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Invalid app configuration: {str(e)}",
             )
-        server = _add_catalog_server_with_race_recovery(db, config, server_name)
+
+        candidate = MCPServer.from_config(config.model_dump())
+        try:
+            with db.begin_nested():
+                db.add(candidate)
+                db.flush()
+            server = candidate
+        except IntegrityError as exc:
+            server = db.query(MCPServer).filter(MCPServer.name == server_name).first()
+            if server is None:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Failed to create catalog server: {str(exc)}",
+                ) from exc
+            return _ensure_catalog_mcp_oauth_server(db, app_id)
+    return server, app_info
+
+
+def _ensure_mcp_oauth_app_user(
+    db: Session,
+    *,
+    app_id: str,
+    user_id: int,
+    persistence: _OAuthPersistence,
+) -> tuple[MCPServer, dict]:
+    """Ensure one catalog server and non-owning user link."""
+    server, app_info = _ensure_catalog_mcp_oauth_server(db, app_id)
+    association = (
+        db.query(UserMCPServer)
+        .filter(
+            UserMCPServer.user_id == user_id,
+            UserMCPServer.mcpserver_id == server.id,
+        )
+        .first()
+    )
+    if association is None:
+        candidate = UserMCPServer(
+            user_id=user_id,
+            mcpserver_id=server.id,
+            is_active=True,
+            is_owner=False,
+            can_edit=False,
+            can_delete=True,
+        )
+        try:
+            with db.begin_nested():
+                db.add(candidate)
+                db.flush()
+            association = candidate
+        except IntegrityError:
+            association = (
+                db.query(UserMCPServer)
+                .filter(
+                    UserMCPServer.user_id == user_id,
+                    UserMCPServer.mcpserver_id == server.id,
+                )
+                .first()
+            )
+            if association is None:
+                raise
+    elif not association.is_active and persistence is _OAuthPersistence.COMMIT:
+        setattr(association, "is_active", True)
+        db.flush()
     return server, app_info
 
 
@@ -3154,53 +3769,63 @@ async def connect_mcp_oauth_app(
     server; only the server row's origin (catalog vs. a user-typed URL)
     differs.
     """
-    server, app_info = _ensure_catalog_mcp_oauth_server(db, app_id)
-
-    assoc: Any = (
-        db.query(UserMCPServer)
-        .filter(
-            UserMCPServer.user_id == current_user.id,
-            UserMCPServer.mcpserver_id == server.id,
-        )
-        .first()
+    user_id = cast(int, current_user.id)
+    server, app_info = _ensure_mcp_oauth_app_user(
+        db,
+        app_id=app_id,
+        user_id=user_id,
+        persistence=_OAuthPersistence.COMMIT,
     )
-    if assoc is None:
-        assoc = UserMCPServer(
-            user_id=current_user.id,
-            mcpserver_id=server.id,
-            is_active=True,
-            is_owner=False,
-            can_edit=False,
-            can_delete=True,
-        )
-        db.add(assoc)
-        try:
-            db.commit()
-        except IntegrityError:
-            # Concurrent same-user connect (double-click/client retry): another
-            # request already inserted the (user_id, mcpserver_id) association.
-            db.rollback()
-            assoc = (
-                db.query(UserMCPServer)
-                .filter(
-                    UserMCPServer.user_id == current_user.id,
-                    UserMCPServer.mcpserver_id == server.id,
-                )
-                .first()
-            )
-            if assoc is None:
-                raise
-    elif not assoc.is_active:
-        # A reconnect after the user previously disconnected their own
-        # association — re-activate it rather than leaving it dormant.
-        assoc.is_active = True
-        db.commit()
-
+    # Release durable catalog and association writes before provider I/O.
+    db.commit()
     logger.info(
-        f"User {current_user.id} starting OAuth connect for MCP app '{app_info['id']}'"
+        "User %s starting OAuth connect for MCP app %r",
+        user_id,
+        app_info["id"],
     )
     return await connect_mcp_oauth(
         cast(int, server.id), request_data, current_user, db, accept
+    )
+
+
+async def connect_mcp_oauth_app_for_owner(
+    app_id: str,
+    request_data: MCPOAuthConnectRequest,
+    current_user: User,
+    db: Session,
+    *,
+    resource_owner_key: str,
+    accept: str | None = None,
+) -> RedirectResponse | JSONResponse:
+    """Start catalog MCP OAuth for a trusted server-owned resource owner.
+
+    The caller commits or rolls back the returned flow and catalog visibility.
+    """
+
+    user_id = cast(int, current_user.id)
+    owner_key = _trusted_mcp_oauth_owner_key(resource_owner_key, user_id=user_id)
+    # Keep nested race-recovery savepoints inside one caller-owned transaction,
+    # including on SQLite where releasing a top-level savepoint commits it.
+    db.begin_nested()
+    server, app_info = _ensure_mcp_oauth_app_user(
+        db,
+        app_id=app_id,
+        user_id=user_id,
+        persistence=_OAuthPersistence.CALLER,
+    )
+    logger.info(
+        "User %s starting trusted OAuth connect for MCP app %r",
+        user_id,
+        app_info["id"],
+    )
+    return await _connect_mcp_oauth_for_owner(
+        cast(int, server.id),
+        request_data,
+        current_user,
+        db,
+        resource_owner_key=owner_key,
+        accept=accept,
+        persistence=_OAuthPersistence.CALLER,
     )
 
 
@@ -3700,7 +4325,16 @@ def update_mcp_server(
         from ..services.connector_team_scope import rename_team_connector
 
         rename_team_connector(
-            db, int(user_id), "mcp", int(server_id), old_name, str(server.name)
+            db,
+            int(user_id),
+            "mcp",
+            int(server_id),
+            old_name,
+            str(server.name),
+            # This transaction holds the definition row FOR UPDATE ... KEY
+            # SHARE and has not committed anything yet; a hook that ends it
+            # drops that lock with this route none the wiser.
+            caller_holds_lock=True,
         )
 
         db.commit()
@@ -3750,6 +4384,311 @@ def _catalog_server_has_platform_key(db: Session, server: MCPServer) -> bool:
     return False
 
 
+def _lock_catalog_for_app_teardown(db: Session) -> None:
+    """Serialize catalog ownership reads before an app-scoped teardown."""
+    dialect = db.get_bind().dialect.name
+    if dialect == "postgresql":
+        # A row lock on the expected app cannot exclude a different row being
+        # renamed into a legacy server's name. SHARE conflicts with catalog
+        # INSERT/UPDATE/DELETE while still allowing concurrent readers.
+        db.execute(text("LOCK TABLE public_mcp_apps IN SHARE MODE"))
+    elif dialect == "sqlite":
+        # SQLite ignores FOR UPDATE. Reuse the producer fence's owned
+        # BEGIN IMMEDIATE transaction so no catalog or lifecycle writer can
+        # pass identity validation before the destructive work commits.
+        _begin_sqlite_oauth_persistence(db)
+
+
+def _locked_catalog_app_for_server(
+    db: Session,
+    *,
+    server: MCPServer,
+    expected_app: PublicMCPApp,
+) -> PublicMCPApp | None:
+    """Return the locked catalog row only when it still owns ``server``."""
+    app_id = str(expected_app.app_id)
+    if str(server.transport or "").lower() != "oauth":
+        # Catalog provisioning names non-OAuth rows by exact app id. Their
+        # caller-authored auth mapping is not trusted as ownership evidence.
+        return expected_app if str(server.name or "") == app_id else None
+
+    auth = server.auth
+    if isinstance(auth, dict) and "app_id" in auth:
+        return expected_app if auth.get("app_id") == app_id else None
+
+    # Legacy builtin OAuth rows may use app id or mutable display name. The
+    # catalog table lock keeps this ownership set stable through commit.
+    server_name = str(server.name or "")
+    owners = {
+        str(candidate.app_id)
+        for candidate in db.query(PublicMCPApp)
+        .filter(
+            (PublicMCPApp.app_id == server_name) | (PublicMCPApp.name == server_name)
+        )
+        .all()
+    }
+    return expected_app if owners == {app_id} else None
+
+
+async def teardown_mcp_app_server(
+    server_id: int,
+    *,
+    app_id: str,
+    expected_provider_name: str | None,
+    expected_catalog_generation: UUID,
+    expected_association_generation: UUID,
+    current_user: User,
+    db: Session,
+) -> None:
+    """Atomically disconnect one exact catalog-app association lifecycle.
+
+    The caller pins both generations during preflight. This function owns the
+    local transaction, revalidates every destructive identity while locked,
+    commits local cleanup once, and only then performs best-effort provider
+    revocation without ORM access or database locks.
+    """
+    revocations: list[_MCPOAuthGrantRevocationSnapshot] = []
+    try:
+        with db.no_autoflush:
+            user_id = int(current_user.id)
+            current_user_is_admin = bool(getattr(current_user, "is_admin", False))
+        if (
+            not isinstance(server_id, int)
+            or isinstance(server_id, bool)
+            or not isinstance(app_id, str)
+            or not app_id
+            or app_id != app_id.strip()
+            or (
+                expected_provider_name is not None
+                and not isinstance(expected_provider_name, str)
+            )
+            or not isinstance(expected_catalog_generation, UUID)
+            or not isinstance(expected_association_generation, UUID)
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="MCP app teardown identity could not be verified",
+            )
+
+        _lock_catalog_for_app_teardown(db)
+        # Preflight may have populated the identity map before another session
+        # committed. Locks serialize future writes; expiration makes these
+        # reads observe the state that existed when serialization was won.
+        db.expire_all()
+        with db.no_autoflush:
+            expected_app = (
+                db.query(PublicMCPApp)
+                .filter(
+                    PublicMCPApp.generation == expected_catalog_generation,
+                    PublicMCPApp.app_id == app_id,
+                    PublicMCPApp.provider_name == expected_provider_name,
+                )
+                .with_for_update()
+                .one_or_none()
+            )
+            if expected_app is None:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="MCP app teardown owner changed",
+                )
+
+            # Match the producer fence's lock order after the teardown-only
+            # catalog fence: server, exact association generation, artifacts.
+            server = (
+                db.query(MCPServer)
+                .filter(MCPServer.id == server_id)
+                .with_for_update()
+                .one_or_none()
+            )
+            if server is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="MCP server not found",
+                )
+            user_mcp = (
+                db.query(UserMCPServer)
+                .filter(
+                    UserMCPServer.user_id == user_id,
+                    UserMCPServer.mcpserver_id == server_id,
+                    UserMCPServer.lifecycle_generation
+                    == expected_association_generation,
+                )
+                .with_for_update()
+                .one_or_none()
+            )
+            if user_mcp is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="MCP server not found",
+                )
+            if (
+                _locked_catalog_app_for_server(
+                    db, server=server, expected_app=expected_app
+                )
+                is None
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="MCP app teardown owner changed",
+                )
+
+        if not _check_mcp_permission(user_mcp, current_user_is_admin, require="delete"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have permission to delete this MCP server",
+            )
+
+        from ..services.connector_team_scope import delete_team_connector
+
+        team_delete = delete_team_connector(
+            db,
+            user_id,
+            "mcp",
+            server_id,
+            # Three row locks are held here -- public_mcp_apps, mcp_servers
+            # and user_mcpservers -- and nothing has been committed. A hook
+            # that ends this transaction releases all three at once.
+            caller_holds_lock=True,
+        )
+        if team_delete.blocked_reason:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=team_delete.blocked_reason,
+            )
+        if team_delete.team_owned and not team_delete.authorized:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only a team admin can delete a team MCP server",
+            )
+
+        if str(server.transport or "").lower() == "oauth":
+            provider = expected_app.provider_name
+            providers_to_delete = restrict_to_app_scoped_oauth_grant(
+                app_id, [provider, app_id]
+            )
+            if providers_to_delete:
+                delete_scoped_user_oauth_accounts(
+                    db,
+                    user_id=user_id,
+                    resource_owner_key=None,
+                    providers=providers_to_delete,
+                )
+            if provider and provider not in providers_to_delete:
+                other_servers = (
+                    db.query(MCPServer)
+                    .join(UserMCPServer, UserMCPServer.mcpserver_id == MCPServer.id)
+                    .filter(
+                        UserMCPServer.user_id == user_id,
+                        MCPServer.id != server_id,
+                    )
+                    .all()
+                )
+                normalized_provider = _normalize_app_key(provider)
+                sibling_still_connected = any(
+                    (sibling_app := get_app_for_mcp_server(db, other_server))
+                    and _normalize_app_key(sibling_app.get("provider"))
+                    == normalized_provider
+                    for other_server in other_servers
+                )
+                if not sibling_still_connected:
+                    delete_scoped_user_oauth_accounts(
+                        db,
+                        user_id=user_id,
+                        resource_owner_key=None,
+                        providers=[provider],
+                    )
+
+        for grant in (
+            db.query(MCPOAuthGrant)
+            .filter(
+                MCPOAuthGrant.mcp_server_id == server_id,
+                MCPOAuthGrant.user_id == user_id,
+            )
+            .with_for_update()
+            .all()
+        ):
+            if str(grant.status) == "active" and isinstance(
+                grant.oauth_client, MCPOAuthClient
+            ):
+                revocations.append(
+                    _mcp_oauth_grant_revocation_snapshot(
+                        client=grant.oauth_client, grant=grant
+                    )
+                )
+            db.delete(grant)
+
+        db.query(MCPOAuthFlowState).filter(
+            MCPOAuthFlowState.mcp_server_id == server_id,
+            MCPOAuthFlowState.user_id == user_id,
+        ).delete(synchronize_session=False)
+        db.delete(user_mcp)
+        db.flush()
+
+        other_user = (
+            db.query(UserMCPServer)
+            .filter(UserMCPServer.mcpserver_id == server_id)
+            .with_for_update()
+            .first()
+        )
+        if other_user is None:
+            if team_delete.team_owned and not team_delete.delete_definition:
+                logger.info(
+                    "Kept team-owned MCP server %s after app teardown", server_id
+                )
+            elif _catalog_server_has_platform_key(db, server):
+                logger.info(
+                    "Kept platform-key MCP server %s after app teardown", server_id
+                )
+            else:
+                # FK cascades delete clients, client secrets, and any remaining
+                # server-scoped artifacts in this same local transaction.
+                db.delete(server)
+
+        db.commit()
+    except HTTPException:
+        db.rollback()
+        raise
+    except _SQLiteOAuthPersistenceTransactionError:
+        # The write-intent helper has not changed caller state on this path.
+        logger.error(
+            "App-scoped MCP teardown requires an owned SQLite transaction "
+            "for app %r, server %s",
+            app_id,
+            server_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to delete MCP server",
+        ) from None
+    except Exception:
+        db.rollback()
+        logger.error(
+            "App-scoped MCP teardown failed for app %r, server %s",
+            app_id,
+            server_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to delete MCP server",
+        ) from None
+
+    # No provider call may run until the local commit releases every lock.
+    for revocation in revocations:
+        try:
+            await _revoke_mcp_oauth_grant_snapshot_externally(revocation)
+        except Exception:
+            logger.warning(
+                "MCP OAuth token revocation failed after teardown for grant %s",
+                revocation.grant_id,
+            )
+    logger.info(
+        "Completed app-scoped MCP teardown for app %r, server %s, user %s",
+        app_id,
+        server_id,
+        user_id,
+    )
+
+
 @mcp_router.delete("/servers/{server_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_mcp_server(
     server_id: int,
@@ -3758,7 +4697,6 @@ async def delete_mcp_server(
 ) -> None:
     """Delete an MCP server."""
     try:
-        manager = DatabaseMCPServerManager(db)
         user_id = current_user.id
 
         # Check user has access to this server
@@ -3775,6 +4713,25 @@ async def delete_mcp_server(
             )
 
         user_mcp, server = result
+        association_identity = _MCPOAuthAssociationIdentity(
+            server_id=int(server.id),
+            user_id=int(user_id),
+            lifecycle_generation=user_mcp.lifecycle_generation,
+        )
+        # Serialize teardown with OAuth producers before enumerating artifacts.
+        # The exact generation prevents a stale DELETE from touching a replacement
+        # association created for the same user and shared server.
+        lifecycle = _lock_active_mcp_oauth_lifecycle(
+            db,
+            association_identity=association_identity,
+            association_must_be_active=False,
+        )
+        if lifecycle is None:
+            db.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="MCP server not found"
+            )
+        server, user_mcp, _ = lifecycle
 
         # Deleting cascades to the shared config once no associations remain;
         # gate it on ownership, consistent with the update handler.
@@ -3786,11 +4743,32 @@ async def delete_mcp_server(
                 detail="You do not have permission to delete this MCP server",
             )
 
-        server_name = server.name
+        if _has_actor_owned_mcp_oauth_state(
+            db,
+            server_id=server_id,
+            user_id=int(user_id),
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="MCP server has actor-owned OAuth connections",
+            )
+
+        server_name = str(server.name)
 
         from ..services.connector_team_scope import delete_team_connector
 
-        team_delete = delete_team_connector(db, int(user_id), "mcp", int(server_id))
+        team_delete = delete_team_connector(
+            db,
+            int(user_id),
+            "mcp",
+            int(server_id),
+            # Two row locks are already held here: _lock_active_mcp_oauth_lifecycle
+            # above takes them on ``mcp_servers`` and ``user_mcpservers`` before
+            # this call, and the same delete work follows as on the two locking
+            # delete call sites. Declaring keeps the three of them answering the
+            # same way.
+            caller_holds_lock=True,
+        )
         if team_delete.blocked_reason:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -3873,15 +4851,16 @@ async def delete_mcp_server(
                             providers=[provider],
                         )
 
-        # Revoke and purge this user's MCP OAuth grants for the server. On a
+        # Snapshot and purge this user's MCP OAuth grants for the server. On a
         # shared (multi-user) row the server outlives this disconnect, so
         # without this the grant's refresh token would stay usable — and its
         # row would stay stored — until the LAST user disconnects and the
-        # cascade finally removes it. Best-effort external revocation first
-        # (now awaitable, unlike the previous local-only status flip), then a
-        # hard delete rather than a "revoked" status flip: a revoked grant
+        # cascade finally removes it. The provider-facing revocation happens
+        # only after the local commit releases lifecycle locks. Use a hard
+        # delete rather than a "revoked" status flip: a revoked grant
         # row is otherwise never swept, accumulating indefinitely as an
         # inert but secret-bearing row (F10).
+        grant_revocations: list[_MCPOAuthGrantRevocationSnapshot] = []
         for grant in (
             db.query(MCPOAuthGrant)
             .filter(
@@ -3892,8 +4871,10 @@ async def delete_mcp_server(
             .all()
         ):
             if isinstance(grant.oauth_client, MCPOAuthClient):
-                await _revoke_mcp_oauth_grant_externally(
-                    client=grant.oauth_client, grant=grant
+                grant_revocations.append(
+                    _mcp_oauth_grant_revocation_snapshot(
+                        client=grant.oauth_client, grant=grant
+                    )
                 )
             db.delete(grant)
 
@@ -3908,41 +4889,54 @@ async def delete_mcp_server(
 
         # Remove user-server association
         db.delete(user_mcp)
-        db.commit()
+        db.flush()
 
-        # Check if any other users are using this server
+        # Decide shared-row retention while the server lifecycle lock is still
+        # held. A post-commit check followed by a second delete transaction can
+        # erase a replacement association committed between those operations.
         other_users = (
             db.query(UserMCPServer)
             .filter(UserMCPServer.mcpserver_id == server_id)
             .first()
         )
-
-        # Only remove from manager and delete if no other users
+        server_deleted = False
+        retained_team_server = False
+        retained_platform_server = False
         if not other_users:
-            if team_delete.team_owned and not team_delete.delete_definition:
-                logger.info(
-                    f"Kept shared MCP server '{server_name}' after team disconnect"
-                )
-                return
-            if _catalog_server_has_platform_key(db, server):
-                # Keep the shared catalog row: it holds the admin's platform
-                # fallback key and is reused by future connects. Deleting it would
-                # silently wipe the platform key with no signal to the admin.
-                logger.info(
-                    f"Kept shared catalog server '{server_name}' after last user "
-                    "disconnect (preserves platform fallback key)"
-                )
-            else:
-                manager.remove_server(server_name)
-                logger.info(f"Deleted MCP server '{server_name}'")
+            retained_team_server = bool(
+                team_delete.team_owned and not team_delete.delete_definition
+            )
+            if not retained_team_server:
+                retained_platform_server = _catalog_server_has_platform_key(db, server)
+            if not retained_team_server and not retained_platform_server:
+                db.delete(server)
+                server_deleted = True
+
+        db.commit()
+
+        for snapshot in grant_revocations:
+            await _revoke_mcp_oauth_grant_snapshot_externally(snapshot)
+
+        if retained_team_server:
+            logger.info(f"Kept shared MCP server '{server_name}' after team disconnect")
+        elif retained_platform_server:
+            logger.info(
+                f"Kept shared catalog server '{server_name}' after last user "
+                "disconnect (preserves platform fallback key)"
+            )
+        elif server_deleted:
+            logger.info(f"Deleted MCP server '{server_name}'")
         else:
             logger.info(f"Removed user {user_id} access to MCP server '{server_name}'")
 
     except HTTPException:
-        raise
-    except Exception as e:
         db.rollback()
-        logger.error(f"Failed to delete MCP server: {e}")
+        raise
+    except Exception as exc:
+        db.rollback()
+        logger.error(
+            "Failed to delete MCP server (exception_type=%s)", type(exc).__name__
+        )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to delete MCP server",
@@ -4334,6 +5328,9 @@ async def mcp_oauth_callback(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"code": "invalid_state", "message": "Invalid OAuth state"},
         )
+    callback_redirect_after = (
+        str(flow_state.redirect_after) if flow_state.redirect_after else None
+    )
     try:
         _validate_mcp_oauth_state_cookie(request, state_value)
     except HTTPException as exc:
@@ -4351,8 +5348,8 @@ async def mcp_oauth_callback(
     state_error = _mcp_oauth_flow_state_error(db, flow_state)
     if state_error is not None:
         error_code, message = state_error
-        return _mcp_oauth_callback_error_redirect(
-            flow_state,
+        return _mcp_oauth_callback_error_redirect_for_path(
+            callback_redirect_after,
             error_code=error_code,
             message=message,
         )
@@ -4368,6 +5365,20 @@ async def mcp_oauth_callback(
             error_code="token_exchange_failed",
             message="OAuth client metadata not found",
         )
+
+    try:
+        flow_identity = _mcp_oauth_flow_identity(flow_state)
+    except RuntimeError:
+        return _mcp_oauth_callback_error_redirect_for_path(
+            callback_redirect_after,
+            error_code="invalid_state",
+            message="OAuth state is not bound to an MCP server connection lifecycle",
+        )
+    association_identity = _MCPOAuthAssociationIdentity(
+        server_id=flow_identity.server_id,
+        user_id=flow_identity.user_id,
+        lifecycle_generation=flow_identity.association_lifecycle_generation,
+    )
 
     try:
         _validate_mcp_oauth_callback_issuer(
@@ -4387,52 +5398,98 @@ async def mcp_oauth_callback(
                 or "Authorization response issuer did not match flow state"
             ),
         )
+    code_verifier = decrypt_value(str(flow_state.code_verifier))
+    resource = str(flow_state.resource)
+    # The claim commit expires ORM instances. Keep the provider-facing client
+    # snapshot detached so a concurrent server deletion cannot make token
+    # exchange or compensation reload stale ORM state.
+    db.expunge(client)
     claim_error = _claim_mcp_oauth_flow_state(db, flow_state)
     if claim_error is not None:
         error_code, message = claim_error
-        return _mcp_oauth_callback_error_redirect(
-            flow_state,
+        return _mcp_oauth_callback_error_redirect_for_path(
+            callback_redirect_after,
             error_code=error_code,
             message=message,
         )
     if error:
-        return _mcp_oauth_callback_error_redirect(
-            flow_state,
+        return _mcp_oauth_callback_error_redirect_for_path(
+            callback_redirect_after,
             error_code="token_exchange_failed",
             message=oauth_error_message(
                 {"error": error}, "MCP OAuth authorization failed"
             ),
         )
     if not code:
-        return _mcp_oauth_callback_error_redirect(
-            flow_state,
+        return _mcp_oauth_callback_error_redirect_for_path(
+            callback_redirect_after,
             error_code="invalid_state",
             message="Missing authorization code",
         )
+    issued_token: _MCPOAuthIssuedTokenSnapshot | None = None
+    failure_stage = "token_exchange"
     try:
         token_data = await _exchange_mcp_oauth_code(
             client=client,
             code=code,
-            code_verifier=decrypt_value(str(flow_state.code_verifier)),
-            resource=str(flow_state.resource),
+            code_verifier=code_verifier,
+            resource=resource,
         )
-        _upsert_mcp_oauth_grant(db, flow_state=flow_state, token_data=token_data)
+        failure_stage = "snapshot_issued_token"
+        issued_token = _mcp_oauth_issued_token_snapshot(
+            client=client,
+            flow_id=flow_identity.id,
+            token_data=token_data,
+        )
+        failure_stage = "lock_lifecycle"
+        lifecycle = _lock_active_mcp_oauth_lifecycle(
+            db,
+            association_identity=association_identity,
+            flow_identity=flow_identity,
+        )
+        if lifecycle is None:
+            await _rollback_and_revoke_mcp_oauth_issued_token(db, issued_token)
+            return _mcp_oauth_callback_error_redirect_for_path(
+                callback_redirect_after,
+                error_code="invalid_state",
+                message="MCP server connection changed during OAuth authorization",
+            )
+        locked_flow_state = lifecycle[2]
+        if locked_flow_state is None:
+            raise RuntimeError("MCP OAuth lifecycle lock did not return the flow")
+        failure_stage = "persist_grant"
+        _upsert_mcp_oauth_grant(
+            db,
+            flow_state=locked_flow_state,
+            token_data=token_data,
+        )
+        failure_stage = "commit_grant"
         db.commit()
     except HTTPException as exc:
-        db.rollback()
+        if issued_token is not None:
+            await _rollback_and_revoke_mcp_oauth_issued_token(db, issued_token)
+        else:
+            db.rollback()
         detail: dict[str, Any] = exc.detail if isinstance(exc.detail, dict) else {}
         error_code = str(detail.get("code") or "token_exchange_failed")
         message = str(detail.get("message") or "MCP OAuth authorization failed")
-        return _mcp_oauth_callback_error_redirect(
-            flow_state,
+        return _mcp_oauth_callback_error_redirect_for_path(
+            callback_redirect_after,
             error_code=error_code,
             message=message,
         )
-    except Exception:
-        db.rollback()
-        logger.exception("MCP OAuth callback failed after state claim")
-        return _mcp_oauth_callback_error_redirect(
-            flow_state,
+    except Exception as exc:
+        if issued_token is not None:
+            await _rollback_and_revoke_mcp_oauth_issued_token(db, issued_token)
+        else:
+            db.rollback()
+        logger.error(
+            "MCP OAuth callback failed after state claim (stage=%s, exception_type=%s)",
+            failure_stage,
+            type(exc).__name__,
+        )
+        return _mcp_oauth_callback_error_redirect_for_path(
+            callback_redirect_after,
             error_code="token_exchange_failed",
             message="MCP OAuth authorization failed",
         )
@@ -4444,7 +5501,7 @@ async def mcp_oauth_callback(
     response = RedirectResponse(
         _mcp_oauth_redirect_after_url(
             _redirect_after_with_params(
-                str(flow_state.redirect_after) if flow_state.redirect_after else None,
+                callback_redirect_after,
                 (("mcp_oauth_success", "1"),),
             )
         )
@@ -4481,9 +5538,48 @@ async def connect_mcp_oauth(
     accept: Annotated[str | None, Header()] = None,
 ) -> RedirectResponse | JSONResponse:
     """Start MCP OAuth Authorization Code + PKCE for the current user."""
+    return await _connect_mcp_oauth_for_owner(
+        server_id,
+        request_data,
+        current_user,
+        db,
+        resource_owner_key=_default_resource_owner_key(cast(int, current_user.id)),
+        accept=accept,
+        persistence=_OAuthPersistence.COMMIT,
+    )
+
+
+async def _connect_mcp_oauth_for_owner(
+    server_id: int,
+    request_data: MCPOAuthConnectRequest,
+    current_user: User,
+    db: Session,
+    *,
+    resource_owner_key: str,
+    accept: str | None,
+    persistence: _OAuthPersistence,
+) -> RedirectResponse | JSONResponse:
+    """Start OAuth for one exact owner with an explicit transaction owner."""
     user_id = cast(int, current_user.id)
-    _, server = _get_user_mcp_server_or_404(
-        db, user_id=user_id, server_id=server_id, require_active=True
+    association, server = _get_user_mcp_server_or_404(
+        db,
+        user_id=user_id,
+        server_id=server_id,
+        require_active=persistence is _OAuthPersistence.COMMIT,
+    )
+    association_generation = association.lifecycle_generation
+    if not isinstance(association_generation, UUID):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "oauth_lifecycle_changed",
+                "message": "MCP server connection lifecycle is unavailable",
+            },
+        )
+    association_identity = _MCPOAuthAssociationIdentity(
+        server_id=server_id,
+        user_id=user_id,
+        lifecycle_generation=association_generation,
     )
     auth_config = _get_mcp_oauth_config(server)
     discovery = await _discover_mcp_oauth_for_server(server, auth_config)
@@ -4540,6 +5636,9 @@ async def connect_mcp_oauth(
                 registered_client.token_endpoint_auth_method
             )
         else:
+            # Public requests own their transaction and release it before I/O.
+            if persistence is _OAuthPersistence.COMMIT:
+                db.rollback()
             try:
                 registration = await register_mcp_oauth_public_client(
                     discovery.authorization_server,
@@ -4555,7 +5654,7 @@ async def connect_mcp_oauth(
             token_endpoint_auth_method = registration.token_endpoint_auth_method
     selected_scope = _scope_string(auth_config.get("scope") or discovery.scopes)
     resource_owner_key = _bounded_mcp_oauth_value(
-        _default_resource_owner_key(user_id),
+        resource_owner_key,
         field_name="resource_owner_key",
         max_length=MCP_OAUTH_RESOURCE_OWNER_KEY_MAX_LENGTH,
     )
@@ -4563,70 +5662,35 @@ async def connect_mcp_oauth(
         str(discovery.resource), field_name="resource"
     )
 
-    oauth_client = _upsert_mcp_oauth_client(
+    persisted = _persist_mcp_oauth_connect_flow(
         db,
-        server_id=server_id,
+        association_identity=association_identity,
         discovery=discovery,
         client_id=client_id,
         client_secret=client_secret,
         token_endpoint_auth_method=token_endpoint_auth_method,
         redirect_uri=redirect_uri,
         registration_lookup_hash=registration_lookup_hash,
-    )
-
-    # Sweep this table's dead rows before adding another, mirroring the Slack
-    # OAuth flow-state ledger in channel.py. Every abandoned, denied or
-    # double-submitted authorization leaves a row that is permanently unusable
-    # once it expires (the claim query requires consumed_at IS NULL and
-    # expires_at > now), but nothing deleted it: the only other deletes are the
-    # per-user purge on disconnect and the FK cascade on server deletion, so
-    # the table grew without bound. Deliberately global rather than scoped to
-    # this user/server — a user who never reconnects would otherwise keep their
-    # rows forever, which is the leak this is meant to close. Filtering on
-    # expires_at alone (an indexed column) also covers consumed rows, since
-    # every row expires within MCP_OAUTH_STATE_TTL of being created.
-    #
-    # Bounded per request. The index narrows the scan but does not cap the work,
-    # and this table is precisely the one that has never been swept — the first
-    # connect after this ships meets whatever backlog has accumulated, inside a
-    # user-facing transaction. Draining a fixed batch per connect keeps that
-    # transaction short; the remainder is already dead, so later connects
-    # clearing it costs nothing. Deleting by a bounded id subquery rather than
-    # an IN list of fetched ids keeps it to one statement and clear of any
-    # bound-parameter limit.
-    stale_flow_state_ids = (
-        db.query(MCPOAuthFlowState.id)
-        .filter(
-            MCPOAuthFlowState.expires_at < _utc_now() - MCP_OAUTH_FLOW_STATE_RETENTION
-        )
-        .limit(MCP_OAUTH_FLOW_STATE_SWEEP_BATCH)
-        .scalar_subquery()
-    )
-    db.query(MCPOAuthFlowState).filter(
-        MCPOAuthFlowState.id.in_(stale_flow_state_ids)
-    ).delete(synchronize_session=False)
-
-    state_value = secrets.token_urlsafe(32)
-    code_verifier = secrets.token_urlsafe(64)
-    flow_state = MCPOAuthFlowState(
-        state=state_value,
-        mcp_server_id=server_id,
-        user_id=user_id,
-        mcp_oauth_client_id=oauth_client.id,
         resource_owner_key=resource_owner_key,
-        issuer=selected_issuer,
-        resource=selected_resource,
-        scope=selected_scope,
-        code_verifier=encrypt_value(code_verifier),
-        redirect_after=_safe_mcp_oauth_redirect_after(request_data.redirect_after),
-        expires_at=_utc_now() + MCP_OAUTH_STATE_TTL,
+        selected_issuer=selected_issuer,
+        selected_resource=selected_resource,
+        selected_scope=selected_scope,
+        redirect_after=request_data.redirect_after,
+        persistence=persistence,
     )
-    db.add(flow_state)
-    db.commit()
+    if persisted is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "oauth_lifecycle_changed",
+                "message": "MCP server connection changed during OAuth setup",
+            },
+        )
+    persisted_client_id, state_value, code_verifier = persisted
 
     params = {
         "response_type": "code",
-        "client_id": str(oauth_client.client_id),
+        "client_id": persisted_client_id,
         "redirect_uri": redirect_uri,
         "state": state_value,
         "code_challenge": _pkce_code_challenge(code_verifier),
@@ -4667,6 +5731,7 @@ async def get_mcp_oauth_status(
         server_id=server_id,
         user_id=user_id,
         auth_config=auth_config if isinstance(auth_config, dict) else {},
+        resource_owner_key=_default_resource_owner_key(user_id),
     )
     return MCPOAuthStatusResponse(
         server_id=server_id,
@@ -4675,6 +5740,54 @@ async def get_mcp_oauth_status(
         issuer=auth_config.get("issuer") if isinstance(auth_config, dict) else None,
         scope=auth_config.get("scope") if isinstance(auth_config, dict) else None,
         grants=[_mcp_oauth_grant_response(grant) for grant in grants],
+    )
+
+
+async def revoke_mcp_oauth_grants_for_owner(
+    server_id: int,
+    current_user: User,
+    db: Session,
+    *,
+    resource_owner_key: str,
+) -> MCPOAuthOwnerRevocation:
+    """Stage exact-owner revocation in the caller-owned transaction."""
+
+    user_id = cast(int, current_user.id)
+    owner_key = _trusted_mcp_oauth_owner_key(resource_owner_key, user_id=user_id)
+    _get_user_mcp_server_or_404(
+        db,
+        user_id=user_id,
+        server_id=server_id,
+        require_active=False,
+    )
+    db.query(MCPOAuthFlowState).filter(
+        MCPOAuthFlowState.mcp_server_id == server_id,
+        MCPOAuthFlowState.user_id == user_id,
+        MCPOAuthFlowState.resource_owner_key == owner_key,
+    ).delete(synchronize_session=False)
+    grants = (
+        db.query(MCPOAuthGrant)
+        .filter(
+            MCPOAuthGrant.mcp_server_id == server_id,
+            MCPOAuthGrant.user_id == user_id,
+            MCPOAuthGrant.resource_owner_key == owner_key,
+            MCPOAuthGrant.status == "active",
+        )
+        .all()
+    )
+    snapshots = tuple(
+        _mcp_oauth_grant_revocation_snapshot(client=grant.oauth_client, grant=grant)
+        for grant in grants
+        if isinstance(grant.oauth_client, MCPOAuthClient)
+    )
+    now = _utc_now()
+    for grant in grants:
+        setattr(grant, "status", "revoked")
+        setattr(grant, "revoked_at", now)
+    db.flush()
+    return MCPOAuthOwnerRevocation(
+        grant_count=len(grants),
+        _snapshots=snapshots,
     )
 
 
@@ -4699,6 +5812,7 @@ async def delete_mcp_oauth_grant(
             MCPOAuthGrant.id == grant_id,
             MCPOAuthGrant.mcp_server_id == server_id,
             MCPOAuthGrant.user_id == user_id,
+            MCPOAuthGrant.resource_owner_key == _default_resource_owner_key(user_id),
         )
         .first()
     )

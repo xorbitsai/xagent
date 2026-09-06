@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ssl
 from typing import Any
 
 import httpx
@@ -9,6 +10,7 @@ from xagent.core.tools.adapters.vibe import a2a_agent_tool
 from xagent.core.tools.adapters.vibe.a2a_agent_tool import (
     A2A_TOOL_ERROR_MESSAGE,
     A2AAgentTool,
+    _PinnedA2ATransport,
     create_a2a_agent_tools,
 )
 from xagent.core.tools.adapters.vibe.config import ToolConfig
@@ -388,3 +390,30 @@ async def test_a2a_agent_tool_reports_timeout_as_failure(monkeypatch) -> None:
 
     assert result["success"] is False
     assert result["error"] == "A2A call timed out after 1s."
+
+
+def test_pinned_a2a_transport_disables_http2_and_pins_ca_bundle(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class CaptureTransport(httpx.AsyncBaseTransport):
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, request=request)
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(a2a_agent_tool.httpx, "AsyncHTTPTransport", CaptureTransport)
+    # This constructs the real build_ca_bundle_ssl_context() (only
+    # AsyncHTTPTransport is mocked); clear both env vars so an ambient
+    # SSL_CERT_FILE/SSL_CERT_DIR can't make this fail nondeterministically.
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+
+    _PinnedA2ATransport(allow_private_networks=False)
+
+    assert captured["trust_env"] is False
+    assert captured["http2"] is False
+    assert isinstance(captured["verify"], ssl.SSLContext)

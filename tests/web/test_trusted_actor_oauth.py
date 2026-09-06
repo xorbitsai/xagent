@@ -260,6 +260,9 @@ def test_actor_cookie_header_check() -> None:
 
     assert auth_api.is_actor_oauth_cookie_header(actor_cookie)
     assert not auth_api.is_actor_oauth_cookie_header("session=proof; HttpOnly; Secure")
+    assert not auth_api.is_actor_oauth_cookie_header(
+        f"xagent_actor_oauth_{'a' * 24}=; Max-Age=0"
+    )
 
 
 def test_actor_start_leaves_commit_to_caller(oauth_db) -> None:

@@ -738,6 +738,11 @@ def update_custom_api(
             int(api_id),
             old_name,
             str(api.name),
+            # This transaction holds the definition row FOR UPDATE and has not
+            # committed anything yet. A hook that ends it releases that lock
+            # without this route finding out, and the writes staged above would
+            # then commit against a row somebody else may have moved.
+            caller_holds_lock=True,
         )
     except ConnectorRuntimeError as exc:
         db.rollback()
@@ -906,7 +911,15 @@ def delete_custom_api(
     from ..services.connector_team_scope import delete_team_connector
 
     team_delete = delete_team_connector(
-        db, int(current_user.id), "custom_api", int(api_id)
+        db,
+        int(current_user.id),
+        "custom_api",
+        int(api_id),
+        # This transaction holds the definition row FOR UPDATE and has run
+        # nothing but SELECTs, which is exactly the state in which a helper
+        # that "returns a clean connection" rolls it back -- releasing the
+        # lock while this route goes on to delete.
+        caller_holds_lock=True,
     )
     if team_delete.blocked_reason:
         raise HTTPException(

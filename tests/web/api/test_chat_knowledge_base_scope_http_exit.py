@@ -34,6 +34,10 @@ from fastapi import HTTPException
 
 from xagent.core.tools.core.knowledge_base_scope import KnowledgeBaseScopeError
 from xagent.web.schemas.chat import TaskCreateRequest
+from xagent.web.services.client_error_messages import (
+    CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE,
+)
+from xagent.web.services.llm_utils import AutoModelUnavailableError
 
 _SAFE_MESSAGE = "Knowledge base team scope is unavailable."
 _PRIVATE_DETAIL = "team_scope_resolution_failed"
@@ -75,3 +79,24 @@ async def test_create_task_answers_knowledge_base_scope_error_with_its_own_statu
     detail = str(excinfo.value.detail)
     assert _PRIVATE_DETAIL not in detail
     assert _ERROR_CODE not in detail
+
+
+@pytest.mark.asyncio
+async def test_create_task_reports_unavailable_auto_model(monkeypatch) -> None:
+    from xagent.web.api import chat as chat_module
+
+    def _raise(*args: object, **kwargs: object) -> None:
+        raise AutoModelUnavailableError("private inactive candidate details")
+
+    monkeypatch.setattr(chat_module, "validate_task_extension_requests", _raise)
+
+    with pytest.raises(HTTPException) as excinfo:
+        await chat_module.create_task(
+            TaskCreateRequest(title="unavailable-auto-model"),
+            http_request=None,
+            db=MagicMock(),
+            user=MagicMock(id=1, is_admin=False),
+        )
+
+    assert excinfo.value.status_code == 409
+    assert excinfo.value.detail == CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE

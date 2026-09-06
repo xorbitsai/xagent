@@ -1,8 +1,8 @@
 import React, { useEffect, useState } from 'react'
 import ReactMarkdown, { defaultUrlTransform } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import remarkMath from 'remark-math'
 import rehypeKatex from 'rehype-katex'
+import { remarkCurrencySafeMath } from '@/lib/remark-currency-safe-math'
 import type { Components, ExtraProps } from 'react-markdown'
 import { apiRequest } from '@/lib/api-wrapper'
 import { AgentCard } from '@/components/chat/AgentCard'
@@ -604,7 +604,7 @@ export function MarkdownRenderer({
     <MarkdownRendererContext.Provider value={contextValue}>
       <div className={`prose prose-invert max-w-none break-words [overflow-wrap:anywhere] ${className}`}>
         <ReactMarkdown
-          remarkPlugins={[remarkGfm, remarkMath]}
+          remarkPlugins={[remarkGfm, remarkCurrencySafeMath]}
           rehypePlugins={[rehypeKatex]}
           components={markdownComponents}
           urlTransform={safeUrlTransform}

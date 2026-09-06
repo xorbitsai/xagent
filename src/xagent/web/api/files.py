@@ -755,6 +755,12 @@ def _validate_public_task_file_access(
     file_record: UploadedFile,
     token: str | None,
 ) -> None:
+    """Apply guest-token isolation without changing normal file capabilities.
+
+    Ordinary signed-in tasks use the unguessable file ID as the capability for
+    public preview and download URLs. Share and widget tasks additionally bind
+    file access to a signed guest token, which must resolve to the same task.
+    """
     if not file_record.task_id:
         return
 
@@ -762,11 +768,13 @@ def _validate_public_task_file_access(
     if not task or not isinstance(task.agent_config, dict):
         return
 
-    if not token:
-        raise HTTPException(status_code=403, detail="Public file access token required")
     auth_mode = task.agent_config.get("auth_mode")
 
     if auth_mode == "share":
+        if not token:
+            raise HTTPException(
+                status_code=403, detail="Public file access token required"
+            )
         from .public_chat_access import get_share_chat_user, get_task_for_share_context
 
         access_context = get_share_chat_user(token, db)
@@ -776,6 +784,9 @@ def _validate_public_task_file_access(
     guest_id = task.agent_config.get("guest_id")
     if not isinstance(guest_id, str) or not guest_id:
         return
+
+    if not token:
+        raise HTTPException(status_code=403, detail="Public file access token required")
 
     from .public_chat_access import get_public_chat_user, get_task_for_public_context
 

@@ -2174,10 +2174,15 @@ def _resolve_read_direction_anchor(
       -- when the checkpoint row carries one -- execution identity) is
       copied deliberately: this set must agree with trace_handlers' own,
       because both are answering the same question, "is this a legitimate
-      checkpoint row", from different directions. (A shared, stateless
-      predicate the two resolvers could both import is a real
-      simplification, left as a follow-up, not done here -- see the
-      module docstring's delivered-here accounting.)
+      checkpoint row", from different directions. (That shared predicate now
+      exists -- ``failed_checkpoint_row_conditions``,
+      ``trace_event_staging.py`` -- and the two by-primary-key resolvers
+      read it. This resolver does not: its judgment carries a seventh
+      condition that one has no input for (``trace_row.event_id`` against
+      ``row.resume_event_id``) and compares the partition against a
+      non-null ``resume_run_partition`` rather than a task's possibly-null
+      ``run_id``. Adopting it would mean adding an optional condition and a
+      second partition rule for one caller.)
     - One condition in that judgment is this resolver's alone and is not
       expected to appear in trace_handlers': ``trace_row.event_id`` must
       equal ``row.resume_event_id``. It is the identity the write-direction

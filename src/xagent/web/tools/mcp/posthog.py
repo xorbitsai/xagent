@@ -9,6 +9,7 @@ from urllib.parse import quote, urlsplit
 import requests
 from mcp.server.fastmcp import FastMCP
 
+from ....core.tools.core.web_content import get_trusted_proxy_url
 from ....core.utils.security import (
     PrivateNetworkHostError,
     redact_sensitive_text,
@@ -190,6 +191,42 @@ def _extract_error_detail(response: requests.Response) -> str | None:
     return detail if isinstance(detail, str) and detail else None
 
 
+def _make_request(**kwargs: Any) -> requests.Response:
+    """Issue the actual HTTP call with `trust_env=False`, so `requests`
+    never falls back to an ambient/OS-native proxy source
+    `get_trusted_proxy_url()` doesn't police -- passing `proxies=` alone
+    isn't enough, since a `trust_env=True` Session (`requests.request()`'s
+    default) still calls `urllib.request.getproxies()`, which itself falls
+    back *past* `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` to the OS's own proxy
+    configuration (`getproxies_macosx_sysconf()`/`getproxies_registry()`)
+    once no env var is set -- the same DNS-rebinding-via-proxy bypass this
+    gate exists to close, one layer deeper than an env-var scrub alone
+    reaches.
+
+    `trust_env=False` also disables `requests`' `REQUESTS_CA_BUNDLE`/
+    `CURL_CA_BUNDLE` lookup and `.netrc` auto-auth (both gated behind the
+    same `if self.trust_env:` check in `requests`' own Session code) --
+    re-applying the CA bundle explicitly below matters even though PostHog
+    Cloud's own two hosts always terminate TLS with a publicly trusted CA:
+    the only case `proxies` is ever non-empty here is an operator opting in
+    via `XAGENT_TRUSTED_EGRESS_PROXY=1`, the textbook case for a corporate
+    egress proxy doing TLS interception with an internally-issued CA. Without
+    this, that proxy path would fail closed with an opaque `SSLError` for
+    every operator who actually needs it, rather than the intercepting
+    proxy's CA being honored the way it would under `requests`' own default
+    `trust_env=True`. `.netrc` is left disabled since this connector always
+    sends its own Bearer header.
+    """
+    with requests.Session() as session:
+        session.trust_env = False
+        ca_bundle = os.environ.get("REQUESTS_CA_BUNDLE") or os.environ.get(
+            "CURL_CA_BUNDLE"
+        )
+        if ca_bundle:
+            session.verify = ca_bundle
+        return session.request(**kwargs)
+
+
 def _request(
     method: str,
     path: str,
@@ -197,16 +234,39 @@ def _request(
     params: dict[str, Any] | None = None,
     json_data: dict[str, Any] | None = None,
 ) -> Any:
+    # An ambient HTTP(S) proxy makes the *proxy* perform DNS resolution for
+    # the real connection, not this process -- silently bypassing
+    # _base_url()'s own private-network validation of POSTHOG_HOST, which
+    # only checks the addresses this process itself resolves. Mirrors
+    # web_content.py's fetch_web_content: get_trusted_proxy_url() raises
+    # unless the proxy is explicitly marked trusted to enforce its own
+    # private-range egress policy (XAGENT_TRUSTED_EGRESS_PROXY=1), rather
+    # than silently trusting every ambient proxy setup_proxy_env() promotes
+    # from the OS's own settings. The result is then passed to
+    # `_make_request()` (see above), which issues the call on a
+    # trust_env=False Session -- disabling every ambient/OS-native proxy
+    # source, not just the env vars this function checks -- so "no proxy"
+    # here is an actual guarantee for this call. Redacted the same as every
+    # other error path below: today's message text never echoes the proxy
+    # URL itself, but this keeps that an invariant of this function rather
+    # than of get_trusted_proxy_url()'s current wording.
+    try:
+        proxy_url = get_trusted_proxy_url()
+    except PrivateNetworkHostError as exc:
+        raise type(exc)(redact_sensitive_text(str(exc))) from exc
+    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else {}
+
     url = f"{_base_url()}{path}"
     try:
         for attempt in (0, 1):
-            response = requests.request(
+            response = _make_request(
                 method=method,
                 url=url,
                 headers=_headers(),
                 params=params,
                 json=json_data,
                 timeout=DEFAULT_TIMEOUT_SECONDS,
+                proxies=proxies,
                 # A redirect response is never followed with the Bearer
                 # header still attached: PostHog's documented API doesn't
                 # redirect, so a 3xx here is either a misconfiguration or
@@ -226,11 +286,11 @@ def _request(
             break
     except requests.RequestException as exc:
         # A connection/timeout/proxy failure's message can itself embed
-        # sensitive data -- e.g. a ProxyError echoing the ambient
-        # HTTPS_PROXY URL, which may carry embedded user:pass@ credentials
-        # (setup_proxy_env() exports whatever the OS has configured) -- so
-        # this gets the same redaction the HTTPError response-body path
-        # below already has, not just that one case.
+        # sensitive data -- e.g. a ProxyError connecting through a proxy
+        # that passed the trust check above can still echo that proxy's
+        # URL, which may carry embedded user:pass@ credentials -- so this
+        # gets the same redaction the HTTPError response-body path below
+        # already has, not just that one case.
         raise RuntimeError(redact_sensitive_text(str(exc))) from exc
 
     if 300 <= response.status_code < 400:

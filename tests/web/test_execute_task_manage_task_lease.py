@@ -13,6 +13,12 @@ from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import QueuePool
 
+from tests.web.pool_contention_shared import (
+    GUARD_TIMEOUT,
+    LOOP_LIVENESS_TICKS,
+    gated_pool_checkout,
+    wait_for_ticks,
+)
 from xagent.core.model.chat.token_context import TokenUsage
 from xagent.web.api.chat import AgentServiceManager, _update_task_title_isolated
 from xagent.web.models.agent import Agent, AgentStatus
@@ -809,48 +815,55 @@ async def test_execute_task_preflight_pool_wait_does_not_block_event_loop(
             ticks += 1
             await asyncio.sleep(0.01)
 
-    ticker_task = asyncio.create_task(ticker())
-    try:
-        with (
-            patch(
-                "xagent.web.models.database.get_session_local",
-                return_value=factory,
-            ),
-            patch.object(
-                manager, "_acquire_sandbox_task", new=AsyncMock(return_value=None)
-            ),
-            patch.object(manager, "_release_sandbox_task", new=AsyncMock()),
-            patch(
-                "xagent.web.tracking.task_tracker.TaskTracker",
-                side_effect=RuntimeError("skip tracking in pool-boundary test"),
-            ),
-        ):
-            await asyncio.sleep(0.02)
-            ticks_before_wait = ticks
-            execute = asyncio.create_task(
-                manager.execute_task(
-                    agent_service=_FakeAgentService(),
-                    task="hello",
-                    tracking_task_id=str(task_id),
-                    db_session=caller_db,
-                    manage_task_lease=False,
+    execute = None
+    with gated_pool_checkout(engine) as gate:
+        ticker_task = asyncio.create_task(ticker())
+        try:
+            with (
+                patch(
+                    "xagent.web.models.database.get_session_local",
+                    return_value=factory,
+                ),
+                patch.object(
+                    manager, "_acquire_sandbox_task", new=AsyncMock(return_value=None)
+                ),
+                patch.object(manager, "_release_sandbox_task", new=AsyncMock()),
+                patch(
+                    "xagent.web.tracking.task_tracker.TaskTracker",
+                    side_effect=RuntimeError("skip tracking in pool-boundary test"),
+                ),
+            ):
+                execute = asyncio.create_task(
+                    manager.execute_task(
+                        agent_service=_FakeAgentService(),
+                        task="hello",
+                        tracking_task_id=str(task_id),
+                        db_session=caller_db,
+                        manage_task_lease=False,
+                    )
                 )
-            )
-            await asyncio.sleep(0.08)
+                await gate.wait_until_contending()
+                observed = await wait_for_ticks(lambda: ticks)
+                assert observed >= LOOP_LIVENESS_TICKS
+                assert not execute.done()
 
-            assert ticks - ticks_before_wait >= 4
-            assert not execute.done()
-
-            held_connection.close()
-            result = await execute
-            assert result["success"] is True
-    finally:
-        if not held_connection.closed:
-            held_connection.close()
-        stop.set()
-        await ticker_task
-        caller_db.close()
-        engine.dispose()
+                held_connection.close()
+                gate.let_through()
+                result = await asyncio.wait_for(execute, timeout=GUARD_TIMEOUT)
+                assert result["success"] is True
+        finally:
+            if not held_connection.closed:
+                held_connection.close()
+                gate.let_through()
+            if execute is not None:
+                await asyncio.wait_for(
+                    asyncio.gather(execute, return_exceptions=True),
+                    timeout=GUARD_TIMEOUT,
+                )
+            stop.set()
+            await ticker_task
+            caller_db.close()
+            engine.dispose()
 
 
 @pytest.mark.asyncio

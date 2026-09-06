@@ -44,6 +44,14 @@ type TaskControlState =
   | "completed"
   | "failed"
 
+// The structured half of a terminal task_error frame: the stable error code
+// the client renders and localizes. The frame carries nothing else
+// connector-specific -- its audience includes anonymous widget and
+// share-link visitors.
+type TaskErrorProjection = {
+  code: string
+}
+
 type TaskControlEnvelope = {
   isStateEvent: boolean
   taskId?: number
@@ -350,7 +358,7 @@ import { generateClientMessageId, getApiUrl, getUploadApiUrl, shouldAutoOpenTask
 import { apiRequest, classifyUploadError, getApiErrorMessage, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper"
 import { clientErrorTranslationKey, readClientErrorCode } from "@/lib/client-errors"
 import { normalizeUploadFileIds } from "@/lib/upload-file-ids"
-import { useI18n } from "@/contexts/i18n-context"
+import { useI18n, type Translate } from "@/contexts/i18n-context"
 import { normalizeTimestampMs } from "@/lib/time-utils"
 import { unwrapFinalAnswerContent } from "@/lib/final-answer"
 import { normalizeTaskCompletedMessage } from "@/lib/task-completion"
@@ -918,6 +926,20 @@ const getWebSocketErrorCode = (message: WebSocketMessage) => {
   return errorCode.present ? readClientErrorCode(errorCode.value) : null
 }
 
+// The frame deliberately carries nothing connector-specific beyond the code:
+// its audience includes anonymous widget and share-link visitors. Which
+// connector, which key, and each key's declared type all come from the
+// per-task requirements endpoint, which selects on
+// `Task.id == task_id AND Task.user_id == current_user.id`.
+const getTaskErrorProjection = (
+  message: WebSocketMessage,
+): TaskErrorProjection | null => {
+  const root = message as unknown as Record<string, unknown>
+  const data = isJsonRecord(message.data) ? message.data : null
+  const code = getString(data?.code) || getString(root.code)
+  return code ? { code } : null
+}
+
 const getWebSocketTaskStatus = (message: WebSocketMessage): Task["status"] | null => {
   const root = message as unknown as Record<string, unknown>
   const data = isJsonRecord(message.data) ? message.data : null
@@ -928,6 +950,117 @@ const getWebSocketTaskStatus = (message: WebSocketMessage): Task["status"] | nul
 
 const shouldStopProcessingForTaskStatus = (status: unknown): boolean =>
   isStoppedTaskStatus(status)
+
+export type ErrorFrameDisplay = {
+  /** Terminal (`task_error`) or a rejection on the mixed root `error` channel. */
+  isTerminal: boolean
+  /** Status carried by the frame, or null when it carries none. */
+  taskStatus: Task["status"] | null
+  stopsProcessing: boolean
+  /** First argument to the dedup check: the server sentence, or the constant
+   *  that stands in for it on a transport that marks legacy prose untrusted. */
+  dedupText: string
+  /** Third argument to the dedup check. Undefined means "no identity, key on
+   *  the text alone". */
+  occurrenceIdentity: string | undefined
+  bubbleContent: string
+  isResult: boolean
+}
+
+// One place where a frame on the error/task_error handler becomes the five
+// values the handler needs: the bubble's wording, the dedup text, the dedup
+// identity, the result flag, and the task status to dispatch. Each of those
+// needs a different subset of "is this terminal / is legacy prose trusted /
+// did a code survive / is there a state version", and deriving each subset at
+// its own use site is what let five separate defects land in this handler.
+// Pure on purpose: no dispatch, no refs, nothing
+// outside its arguments, so every cell of that matrix is unit-testable
+// without rendering the provider -- the same shape extractTaskControlEnvelope
+// above already uses.
+export const projectErrorFrameForDisplay = (
+  message: WebSocketMessage,
+  options: {
+    trustLegacyErrorProse: boolean
+    translate: Translate
+    controlEnvelope: TaskControlEnvelope
+  },
+): ErrorFrameDisplay => {
+  const { trustLegacyErrorProse, translate, controlEnvelope } = options
+  const websocketErrorCode = getWebSocketErrorCode(message)
+  const dedupText = websocketErrorCode
+    ? translate(clientErrorTranslationKey(websocketErrorCode))
+    : getWebSocketErrorMessage(message, trustLegacyErrorProse)
+  const taskStatus = getWebSocketTaskStatus(message)
+  // Only task_error is terminal. Every frame of that type is emitted after
+  // the row has been committed FAILED -- task_orchestrator.py's settled
+  // branch, and websocket.py's legacy helper, which settles under
+  // only_if_running=True and does not broadcast when that update matches
+  // no row -- and task_error is also the only frame that carries the
+  // structured code. The root "error" type is a mixed
+  // channel: rejected chat messages, rejected pause and rejected resume
+  // all arrive on it while the viewed task is still RUNNING or
+  // WAITING_FOR_USER, and a rejection is not this turn's answer.
+  const isTerminal = message.type === "task_error"
+  const projection = isTerminal ? getTaskErrorProjection(message) : null
+  // The frame's own code decides the wording, and one code has one sentence
+  // for every audience. This is the same table the root error channel already
+  // uses for its error_code field, extended with the connector-runtime codes
+  // that reach this frame -- not a second vocabulary beside it. It also fixes
+  // what the relayed sentence could not: on a transport that marks legacy
+  // prose untrusted, getWebSocketErrorMessage returns a constant by design
+  // (#1938: never render server free text there), so before this the curated
+  // sentence existed for three codes and every other code read "Unknown
+  // error". Nothing here relays server prose; the wording is the client's own,
+  // selected by code. A code the table does not list keeps the generic
+  // prefixed wording.
+  const projectedCode = projection ? readClientErrorCode(projection.code) : null
+  const connectorRuntimeBubble = projectedCode
+    ? translate(clientErrorTranslationKey(projectedCode))
+    : null
+  // The dedup identity has to name WHICH occurrence this frame reports, not
+  // which class of failure it belongs to. broadcast_to_task stamps every frame
+  // of this type with the row's (run_id, state_version) pair before it goes
+  // out -- task_error is in websocket.py's _VERSIONED_TASK_EVENT_TYPES -- and
+  // state_version is bumped by every control transition that actually changes
+  // (status, control_state). So one settlement broadcast twice carries one
+  // version and still collapses, while two failed turns are at least two
+  // versions apart (the retry takes the lease FAILED -> RUNNING, then settles
+  // RUNNING -> FAILED) and both are shown. Keying on the failure's class
+  // instead -- the code, the reason, or the rendered sentence -- cannot tell
+  // those two apart, and on this handler the collapsed frame is the turn's
+  // result. The identity is withheld when the frame carries no version (the
+  // row was already gone when it was broadcast, so no state tuple was
+  // attached), which falls back to keying on the text alone:
+  // canAcceptTaskControlVersion drops such a frame once any versioned event
+  // has been seen for the task, and when none has, two of them key on the
+  // same text and the second still collapses -- the behaviour that predates
+  // this change. Withholding the identity is the honest answer there;
+  // attaching a state tuple needs the row, and a settled FAILED task has one.
+  const occurrenceIdentity =
+    isTerminal && controlEnvelope.stateVersion !== undefined
+      ? `${controlEnvelope.runId ?? ""}:${controlEnvelope.stateVersion}`
+      : undefined
+  return {
+    isTerminal,
+    taskStatus,
+    stopsProcessing: shouldStopProcessingForTaskStatus(taskStatus),
+    dedupText,
+    occurrenceIdentity,
+    bubbleContent:
+      connectorRuntimeBubble
+      ?? `${translate('agent.logs.event.messages.errorPrefix')} ${dedupText}`,
+    // A terminal failure IS this turn's result: without the flag the
+    // conversation panel (which renders only user / isResult / system-notice
+    // messages) filters the bubble out and falls back to a virtual "unknown
+    // error" placeholder until reload. A non-terminal rejection is not, and
+    // flagging it would close the live progress indicator and the
+    // waiting-answer form of a turn that is still running, and drain this
+    // turn's accumulated trace events into the rejection bubble (see the
+    // ADD_MESSAGE reducer case's isResult branch, which merges
+    // state.traceEvents into the message and clears it).
+    isResult: isTerminal,
+  }
+}
 
 const stepsFromPlanData = (planData: unknown, existingSteps: StepExecution[]): StepExecution[] | null => {
   const planRecord = planData && typeof planData === "object" ? planData as Record<string, unknown> : null
@@ -5655,35 +5788,43 @@ export function AppProvider({
         break
 
       case "error":
-      case "task_error":
+      case "task_error": {
         console.trace('Original message:', JSON.stringify(message), 'Handler: handleMessage (error)')
-        const websocketErrorCode = getWebSocketErrorCode(message)
-        const websocketErrorMessage = websocketErrorCode
-          ? t(clientErrorTranslationKey(websocketErrorCode))
-          : getWebSocketErrorMessage(message, trustLegacyErrorProse)
-        const websocketTaskStatus = getWebSocketTaskStatus(message)
+        const errorFrame = projectErrorFrameForDisplay(message, {
+          trustLegacyErrorProse,
+          translate: t,
+          controlEnvelope,
+        })
 
-        if (websocketTaskStatus) {
-          dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: websocketTaskStatus } })
+        if (errorFrame.taskStatus) {
+          dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: errorFrame.taskStatus } })
           dispatch({ type: "TRIGGER_TASK_UPDATE" })
         }
-        if (shouldStopProcessingForTaskStatus(websocketTaskStatus)) {
+        if (errorFrame.stopsProcessing) {
           dispatch({ type: "SET_PROCESSING", payload: false })
         }
 
-        if (!isDuplicateMessageForViewedTask(websocketErrorMessage, "agent-error")) {
+        if (
+          !isDuplicateMessageForViewedTask(
+            errorFrame.dedupText,
+            "agent-error",
+            errorFrame.occurrenceIdentity,
+          )
+        ) {
           dispatch({
             type: "ADD_MESSAGE",
             payload: {
               id: generateMessageId("msg-error"),
               role: "assistant",
-              content: `${t('agent.logs.event.messages.errorPrefix')} ${websocketErrorMessage}`,
+              content: errorFrame.bubbleContent,
               timestamp: message.timestamp,
               status: "failed",
+              isResult: errorFrame.isResult,
             },
           })
         }
         break
+      }
 
       case "message_received":
         console.trace('Original message:', JSON.stringify(message), 'Handler: handleMessage (message_received)')

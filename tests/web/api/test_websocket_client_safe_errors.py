@@ -1988,6 +1988,8 @@ async def test_terminal_command_failure_keeps_context_and_redacts_detail() -> No
         task_id=7,
         command_id="cmd-7",
         payload={},
+        target_run_id="run-7",
+        attempt_count=1,
     )
     with patch.object(websocket_api, "manager", connection_manager):
         await websocket_api._broadcast_terminal_command_error(

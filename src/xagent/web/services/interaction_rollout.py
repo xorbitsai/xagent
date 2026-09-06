@@ -165,13 +165,35 @@ COUNTER_ROLLOUT_DECISION_BLOCKED_SCHEMA_ABSENT = (
 # Incremented by resolve_interaction_anchor (task_interaction_anchor.py),
 # not by anything in this module -- named here because this registry is the
 # one counter namespace, not because the rollout gate produces them. There
-# is deliberately no anchor.corrupt counter alongside these three: the
+# is deliberately no anchor.corrupt counter alongside these four: the
 # corrupt outcome registers an ops_signals degradation instead (see that
 # resolver's own docstring for why the two observability surfaces diverge
 # there).
 COUNTER_ANCHOR_ABSENT_NO_RUN = "anchor.absent_no_run"
 COUNTER_ANCHOR_UNAVAILABLE_DANGLING_POINTER = "anchor.unavailable_dangling_pointer"
 COUNTER_ANCHOR_ABSENT_LEGACY_CHECKPOINT_TYPE = "anchor.absent_legacy_checkpoint_type"
+# Missing-run-partition reclassification: a pre-existing row, not a
+# corrupt one -- see that resolver's own docstring for the six-outcome
+# table this entry belongs to.
+COUNTER_ANCHOR_ABSENT_MISSING_RUN_PARTITION = "anchor.absent_missing_run_partition"
+
+# Incremented by DatabaseTraceHandler._root_checkpoint_read_partition
+# (web/api/trace_handlers.py) each time a lease-bound read widens to the
+# untagged partition because the task has no run-tagged checkpoint yet.
+# That condition also holds for a task with no checkpoint at all, so this
+# is not a clean count of genuine legacy (pre-partitioning) reads -- it
+# mixes them with ordinary tasks that simply have not checkpointed yet.
+# It is also monotonic (never reset) and process-local (see
+# counters_snapshot()'s own docstring), so it can only be read as a rate
+# over a deploy's lifetime, never inspected for "has it reached zero."
+# It deliberately covers a narrower set than the read path's own
+# ``_ResolvedReadPartition.widened`` flag: that flag is also set for the
+# legacy unleased branch's permanent untagged partition
+# (``trace_handlers.py``'s own docstring for it), which this counter does
+# not increment. The two are not meant to agree -- this counter answers
+# "how often does the lease-bound compatibility widening this PR added
+# engage", not "how often does any read widen".
+COUNTER_CHECKPOINT_READ_PARTITION_WIDENED = "checkpoint.read_partition_widened"
 
 # Two constants below are actively incremented, both from
 # task_interaction_service.py: COUNTER_COMPAT_READ_FALLBACK by the

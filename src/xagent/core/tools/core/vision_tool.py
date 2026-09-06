@@ -23,7 +23,7 @@ from pydantic import BaseModel, Field
 from ...model.chat.basic.base import BaseLLM
 from ...utils.security import fetch_public_http_bytes
 from ...utils.svg import MAX_SVG_BYTES, rasterize_svg_bytes, validate_svg_bytes
-from .web_content import get_trusted_proxy_url
+from .web_content import build_isolated_httpx_client_kwargs, get_trusted_proxy_url
 
 try:
     from PIL import Image, ImageDraw, ImageFont
@@ -381,10 +381,8 @@ class VisionCore:
         )
 
     async def _download_remote_svg_source(self, url: str) -> str:
-        client_kwargs: dict[str, Any] = {}
         proxy_url = get_trusted_proxy_url()
-        if proxy_url:
-            client_kwargs["proxy"] = proxy_url
+        client_kwargs = build_isolated_httpx_client_kwargs(proxy_url)
 
         async with httpx.AsyncClient(**client_kwargs) as client:
             response = await fetch_public_http_bytes(

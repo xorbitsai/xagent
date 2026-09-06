@@ -7,6 +7,7 @@ their OAuth configurations, and server launch configurations.
 from collections.abc import Iterable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Dict, List
 
 from sqlalchemy.exc import IntegrityError
@@ -36,7 +37,16 @@ from .models.public_mcp import PublicMCPApp
 # (the catalog UI always passes app_id="github", and app_id == provider_name
 # for this connector, so an already-connected grant already satisfies the
 # app-scoped match trivially).
-APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT = frozenset({"facebook", "github"})
+#
+# myob: same structural situation as github, just more extreme -- the myob
+# oauth_providers row's own default_scopes is empty (there's no shared
+# identity scope to request; see the provider row's own comment), and every
+# functional sme-* scope this connector needs lives solely on the app row.
+# Without this entry, a bare GET /api/auth/myob/login would request NO
+# scopes at all, yet the callback would still complete (MYOB's businessId
+# guard has nothing to do with scopes) and activate the app's UserMCPServer
+# against a grant with zero sme-* permissions.
+APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT = frozenset({"facebook", "github", "myob"})
 
 
 def _normalize_oauth_grant_key(value: object) -> str | None:
@@ -224,6 +234,15 @@ def get_app_by_name(db: Session, name: str) -> Dict[str, Any] | None:
 
 class BuiltinOAuthServerDefinitionError(ValueError):
     """Raised when trusted builtin OAuth identity is absent or ambiguous."""
+
+
+class RemoteOAuthServerDefinitionError(ValueError):
+    """Raised when a remote catalog OAuth server is not canonical."""
+
+
+class RemoteOAuthDefinitionOwnership(Enum):
+    UNKNOWN = "unknown"
+    TEAM = "team"
 
 
 def _normalized_catalog_key(value: object) -> str | None:
@@ -726,6 +745,17 @@ def ensure_builtin_oauth_server_visibility_for_user(
     return server
 
 
+def _get_app_for_server_name(db: Session, name: str) -> Dict[str, Any] | None:
+    candidates = (
+        db.query(PublicMCPApp)
+        .filter((PublicMCPApp.app_id == name) | (PublicMCPApp.name == name))
+        .all()
+    )
+    if len({str(candidate.app_id) for candidate in candidates}) != 1:
+        return None
+    return _app_to_dict(candidates[0])
+
+
 def get_app_for_mcp_server(db: Session, server: Any) -> Dict[str, Any] | None:
     """Resolve a server's catalog app by stable identity when it is available.
 
@@ -769,12 +799,95 @@ def get_app_for_mcp_server(db: Session, server: Any) -> Dict[str, Any] | None:
     # fails closed -- deletion keeps the credentials, listing and runtime
     # decline to name an app -- rather than acting on a coin flip. Only the
     # stamp settles it, which is what the branch above is for.
-    candidates = (
-        db.query(PublicMCPApp)
-        .filter((PublicMCPApp.app_id == name) | (PublicMCPApp.name == name))
-        .all()
+    return _get_app_for_server_name(db, name)
+
+
+def classify_actor_remote_oauth_server(
+    db: Session,
+    server: Any,
+    *,
+    definition_ownership: RemoteOAuthDefinitionOwnership = (
+        RemoteOAuthDefinitionOwnership.UNKNOWN
+    ),
+) -> Dict[str, Any] | None:
+    """Validate catalog OAuth or preserve a proven custom definition."""
+
+    from .models.mcp import MCPServer, UserMCPServer
+    from .services.mcp_runtime import HTTP_MCP_TRANSPORTS
+
+    auth = getattr(server, "auth", None)
+    is_remote_oauth = (
+        str(getattr(server, "transport", "") or "").lower() in HTTP_MCP_TRANSPORTS
+        and isinstance(auth, Mapping)
+        and auth.get("type") == "mcp_oauth"
     )
-    owners = {str(candidate.app_id) for candidate in candidates}
-    if len(owners) != 1:
+    app_info = _get_app_for_server_name(db, str(getattr(server, "name", "")))
+    if app_info is None or app_info.get("auth_type") != "mcp_oauth":
+        if is_remote_oauth:
+            # Native OAuth servers have an owner. Catalog rows do not.
+            has_owner = (
+                db.query(UserMCPServer.id)
+                .filter(
+                    UserMCPServer.mcpserver_id == int(server.id),
+                    UserMCPServer.is_owner,
+                )
+                .first()
+                is not None
+            )
+            if (
+                not has_owner
+                and definition_ownership is not RemoteOAuthDefinitionOwnership.TEAM
+            ):
+                raise RemoteOAuthServerDefinitionError(
+                    "remote OAuth catalog identity is unavailable"
+                )
         return None
-    return _app_to_dict(candidates[0])
+    if not app_info.get("is_visible_in_connector", True):
+        raise RemoteOAuthServerDefinitionError("remote OAuth app is hidden")
+
+    app_id = str(app_info["id"])
+    app_name = str(app_info["name"])
+    # Remote catalog identity is the reserved server name, not mutable auth.
+    candidates = (
+        db.query(MCPServer).filter(MCPServer.name.in_((app_id, app_name))).all()
+    )
+    if len(candidates) != 1 or int(candidates[0].id) != int(server.id):
+        raise RemoteOAuthServerDefinitionError(
+            "remote OAuth app must have exactly one server definition"
+        )
+
+    launch = app_info.get("launch_config") or {}
+    expected_auth = launch.get("auth") or {}
+    decrypted_auth = server._decrypt_auth_config(server.auth)
+    if not isinstance(decrypted_auth, Mapping):
+        raise RemoteOAuthServerDefinitionError("remote OAuth auth is invalid")
+    actual_auth = dict(decrypted_auth)
+    actual_auth.pop("app_id", None)
+    failures = []
+    if str(server.managed or "") != "external":
+        failures.append("managed")
+    if (
+        str(server.transport or "").lower()
+        != str(app_info.get("transport") or "").lower()
+    ):
+        failures.append("transport")
+    if server.url != launch.get("url"):
+        failures.append("url")
+    if actual_auth != expected_auth:
+        failures.append("auth")
+    if (
+        db.query(UserMCPServer.id)
+        .filter(
+            UserMCPServer.mcpserver_id == int(server.id),
+            UserMCPServer.is_owner,
+        )
+        .first()
+        is not None
+    ):
+        failures.append("ownership")
+    if failures:
+        raise RemoteOAuthServerDefinitionError(
+            f"remote OAuth app {app_id!r} has non-canonical fields: "
+            f"{', '.join(sorted(failures))}"
+        )
+    return app_info

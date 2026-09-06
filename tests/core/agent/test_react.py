@@ -1537,6 +1537,30 @@ def test_react_grounding_rule_present_in_both_answer_paths() -> None:
     assert "call get_workspace_output_files once before finalizing" not in forced_prompt
 
 
+def test_react_forced_final_answer_respects_prior_clarification_scope() -> None:
+    """A selected subset must stay the scope at the moment the model writes
+    the user-visible answer, not just while it can still call tools.
+
+    Without this, a sweep that already ran before the user narrowed the
+    request (list every conversation, then ask which to review) leaves data
+    about the unselected ones sitting in tool results — and nothing stopped
+    the forced final-answer turn from reporting on it anyway (PR #2099
+    review, F4)."""
+    pattern = ReActPattern()
+    context = ExecutionContext(system_prompt="You are helpful.")
+    context.add_user_message("check my channels for action items")
+
+    forced_prompt = pattern._messages_for_llm(
+        context, has_tools=True, force_final_answer=True, tool_names=["final_answer"]
+    )[0]["content"]
+
+    assert "narrowed the request to a selected" in forced_prompt
+    assert (
+        "leave out anything outside it even if an earlier tool call already "
+        "returned data about it" in forced_prompt
+    )
+
+
 @pytest.mark.parametrize("user_interaction_enabled", [True, False])
 def test_react_missing_argument_value_instruction_matches_interaction_policy(
     user_interaction_enabled: bool,
@@ -1572,14 +1596,29 @@ def test_react_missing_argument_value_instruction_matches_interaction_policy(
         0
     ]["content"]
 
+    # The subset-selection rule describes how to read an ask_user_question
+    # answer, so it travels with the branch where that tool exists; a run that
+    # cannot ask must not be told how to interpret an answer it can't receive.
+    # It's scoped to questions about which items/resources to act on (not
+    # every ask_user_question, e.g. a format pick) — see PR #2099 review.
+    subset_instruction = (
+        "that asked which items or resources to act on by selecting a "
+        "subset of the offered options, that selection is the complete "
+        "scope for that work"
+    )
+
     if user_interaction_enabled:
         assert ask_instruction in prompt
         assert blocked_instruction not in prompt
         assert "do not fill the value in yourself" in prompt
+        assert subset_instruction in prompt
+        assert "even ones that are already accessible" in prompt
+        assert "or that fit the original request" in prompt
     else:
         assert blocked_instruction in prompt
         assert ask_instruction not in prompt
         assert "finish with outcome=blocked and explain what is missing" in prompt
+        assert subset_instruction not in prompt
 
 
 @pytest.mark.asyncio
@@ -8785,3 +8824,156 @@ async def test_react_summarizes_with_the_main_model_when_no_compact_model() -> N
     # One routing decision for the whole turn, taken on the conversation.
     assert len(route_prompts) == 1
     assert "Conversation history to compact" not in route_prompts[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("name", "args"),
+    [
+        ("calculator", {"expression": "2+2"}),
+        ("send_message", {"message": "Working"}),
+        ("ask_user_question", {"message": "Which option?"}),
+        ("final_answer", {"answer": "Done"}),
+    ],
+)
+async def test_react_shared_lifecycle_preserves_tool_observers(
+    name: str, args: dict[str, Any], mocker: Any
+) -> None:
+    pattern = ReActPattern()
+    call = {"id": "call-1", "name": name, "args": args}
+    pattern.pending_tool_calls = [call]
+    runtime = PatternRuntime()
+    runtime.active_react_step_id = "step-1"
+    runtime.active_turn_id = "turn-1"
+    context = ExecutionContext()
+    records = mocker.spy(pattern, "_record_tool_call")
+    started = mocker.spy(runtime, "on_tool_start")
+    ended = mocker.spy(runtime, "on_tool_end")
+    billed = mocker.patch("xagent.core.model.chat.token_context.add_tool_call_usage")
+
+    await pattern._execute_pending_tool_calls(
+        context=context, tools=[FakeTool()], llm=FakeLLM([]), runtime=runtime
+    )
+
+    assert [entry.kwargs["status"] for entry in records.call_args_list] == [
+        "running",
+        "completed",
+    ]
+    assert pattern.tool_ledger["call-1"].status == "completed"
+    assert len(context.get_messages_by_role("tool")) == 1
+    ordinary_count = int(name == "calculator")
+    assert started.call_count == ended.call_count == billed.call_count == ordinary_count
+    # Preparing execution context must not mutate an existing checkpoint's
+    # pending object or interfere with control handlers' identity comparisons.
+    assert call == {"id": "call-1", "name": name, "args": args}
+    if name in {"send_message", "ask_user_question"}:
+        metadata = runtime.outbound_messages[0]["metadata"]
+        assert metadata["tool_call_id"] == "call-1"
+        assert metadata["tool_name"] == name
+        assert metadata["step_id"] == "step-1"
+        assert metadata["turn_id"] == "turn-1"
+        assert "args" not in metadata
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure_type", "status"),
+    [
+        (RuntimeError, "failed"),
+        (ToolCallInterrupted, "interrupted"),
+        (asyncio.CancelledError, "interrupted"),
+    ],
+)
+async def test_react_control_send_failure_settles_lifecycle_and_propagates(
+    failure_type: type[BaseException], status: str, mocker: Any
+) -> None:
+    pattern = ReActPattern()
+    call = {"id": "send-1", "name": "send_message", "args": {"message": "Hi"}}
+    pattern.pending_tool_calls = [call]
+    failure = failure_type("send aborted")
+
+    async def send(payload: dict[str, Any]) -> None:
+        assert pattern.tool_ledger["send-1"].status == "running"
+        assert payload["metadata"]["tool_call_id"] == "send-1"
+        raise failure
+
+    runtime = PatternRuntime(outbound_message_handler=send)
+    context = ExecutionContext()
+    records = mocker.spy(pattern, "_record_tool_call")
+    with pytest.raises(failure_type) as caught:
+        await pattern._execute_pending_tool_calls(
+            context=context, tools=[], llm=None, runtime=runtime
+        )
+    assert caught.value is failure
+    assert [entry.kwargs["status"] for entry in records.call_args_list] == [
+        "running",
+        status,
+    ]
+    assert pattern.tool_ledger["send-1"].error == "send aborted"
+    assert pattern.pending_tool_calls == [call]
+    assert context.get_messages_by_role("tool") == []
+
+
+@pytest.mark.asyncio
+async def test_react_aggregated_question_preserves_ordered_call_sources() -> None:
+    pattern = ReActPattern()
+    runtime = PatternRuntime()
+    runtime.active_react_step_id = "parent-step"
+    runtime.active_turn_id = "turn-1"
+    calls = [
+        {"id": "a", "name": "first", "step_id": "child-step"},
+        {"id": "b", "name": "second"},
+    ]
+    await pattern._pause_for_tool_results(
+        waiting_pairs=[(call, {"message": call["name"]}) for call in calls],
+        context=ExecutionContext(),
+        runtime=runtime,
+    )
+    assert runtime.outbound_messages[0]["metadata"]["tool_calls"] == [
+        {
+            "tool_call_id": "a",
+            "tool_name": "first",
+            "step_id": "child-step",
+            "turn_id": "turn-1",
+        },
+        {
+            "tool_call_id": "b",
+            "tool_name": "second",
+            "step_id": "parent-step",
+            "dag_step_id": "parent-step",
+            "turn_id": "turn-1",
+        },
+    ]
+    assert calls == [
+        {"id": "a", "name": "first", "step_id": "child-step"},
+        {"id": "b", "name": "second"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_react_final_checkpoint_failure_preserves_completed_call(
+    mocker: Any,
+) -> None:
+    pattern = ReActPattern()
+    pattern.pending_tool_calls = [
+        {"id": "final-1", "name": "final_answer", "args": {"answer": "Done"}}
+    ]
+    runtime = PatternRuntime()
+    failure = RuntimeError("checkpoint unavailable")
+    mocker.patch.object(runtime, "checkpoint", side_effect=failure)
+    records = mocker.spy(pattern, "_record_tool_call")
+    context = ExecutionContext()
+
+    with pytest.raises(RuntimeError) as caught:
+        await pattern._execute_pending_tool_calls(
+            context=context, tools=[], llm=None, runtime=runtime
+        )
+
+    assert caught.value is failure
+    assert [entry.kwargs["status"] for entry in records.call_args_list] == [
+        "running",
+        "completed",
+    ]
+    assert pattern.tool_ledger["final-1"].status == "completed"
+    assert pattern.tool_ledger["final-1"].error is None
+    assert len(context.get_messages_by_role("tool")) == 1

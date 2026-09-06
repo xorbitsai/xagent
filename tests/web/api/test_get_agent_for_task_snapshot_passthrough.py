@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import ExitStack
-from time import monotonic
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -36,6 +35,11 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import QueuePool
 
+from tests.web.pool_contention_shared import (
+    GUARD_TIMEOUT,
+    LOOP_LIVENESS_TICKS,
+    wait_for_ticks,
+)
 from xagent.core.execution_scope import scope_fingerprint
 from xagent.web.api.chat import AgentServiceManager
 from xagent.web.models.agent import AgentStatus
@@ -197,12 +201,18 @@ async def test_snapshot_startup_stays_responsive_with_exhausted_pool(tmp_path) -
             await asyncio.sleep(0.01)
 
     with ExitStack() as stack:
+        checkout = stack.enter_context(
+            patch.object(
+                engine.pool,
+                "_do_get",
+                side_effect=AssertionError("snapshot startup checked out a connection"),
+            )
+        )
         for p in _common_patches(manager):
             stack.enter_context(p)
         stack.enter_context(
             patch.object(manager, "_get_or_create_task_sandbox", blocked_sandbox)
         )
-        started = monotonic()
         build_task = asyncio.create_task(
             manager.get_agent_for_task(
                 task_id=42,
@@ -215,14 +225,10 @@ async def test_snapshot_startup_stays_responsive_with_exhausted_pool(tmp_path) -
         )
         ticker_task = asyncio.create_task(ticker())
         try:
-            await asyncio.wait_for(sandbox_entered.wait(), timeout=0.4)
-            elapsed = monotonic() - started
-            await asyncio.sleep(0.04)
-            assert elapsed < 0.15, (
-                "Snapshot startup waited for the exhausted request pool; "
-                f"sandbox boundary reached after {elapsed:.3f}s."
-            )
-            assert ticks >= 3, f"Event-loop ticker advanced only {ticks} time(s)."
+            await asyncio.wait_for(sandbox_entered.wait(), timeout=GUARD_TIMEOUT)
+            observed = await wait_for_ticks(lambda: ticks)
+            assert observed >= LOOP_LIVENESS_TICKS
+            checkout.assert_not_called()
         finally:
             release_sandbox.set()
             ticker_stop.set()

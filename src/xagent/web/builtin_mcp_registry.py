@@ -346,6 +346,66 @@ def get_builtin_oauth_provider_rows() -> list[dict[str, Any]]:
                 "read:me",
             ],
         },
+        {
+            "provider_name": "myob",
+            "name": "MYOB",
+            "client_id": os.environ.get("MYOB_CLIENT_ID", ""),
+            "client_secret": os.environ.get("MYOB_CLIENT_SECRET", ""),
+            "auth_url": "https://secure.myob.com/oauth2/account/authorize/",
+            "token_url": "https://secure.myob.com/oauth2/v1/authorize/",
+            "redirect_uri": os.environ.get("MYOB_REDIRECT_URI", ""),
+            # MYOB has no dedicated userinfo endpoint -- the token response
+            # already embeds identity inline as `user: {uid, username}`, so
+            # generic_oauth_callback's `elif userinfo_url and access_token:`
+            # REST-GET branch is skipped entirely (left empty, same as
+            # Deputy/Linear/Salesforce above for their own reasons); identity
+            # instead comes from a dedicated `elif is_myob` branch there that
+            # reads those two fields straight off token_data.
+            "userinfo_url": "",
+            "user_id_path": "",
+            "email_path": "",
+            # Empty, not identity-only like zoom/github above: MYOB has no
+            # separate identity scope to request, and every functional scope
+            # this connector needs is granular (AuthAccount-scoped, e.g.
+            # sme-sales/sme-contacts-customer) and app-specific, so it lives
+            # on the app row's oauth_scopes below instead, merged in at
+            # authorize time by _merge_oauth_scopes.
+            "default_scopes": [],
+        },
+        {
+            "provider_name": "employment-hero",
+            "name": "Employment Hero",
+            "client_id": os.environ.get("EMPLOYMENT_HERO_CLIENT_ID", ""),
+            "client_secret": os.environ.get("EMPLOYMENT_HERO_CLIENT_SECRET", ""),
+            "auth_url": "https://oauth.employmenthero.com/oauth2/authorize",
+            "token_url": "https://oauth.employmenthero.com/oauth2/token",
+            "redirect_uri": os.environ.get("EMPLOYMENT_HERO_REDIRECT_URI", ""),
+            # Employment Hero has no OIDC-style "me"/identity endpoint — its
+            # closest resource, GET /api/v1/organisations, returns a *list*
+            # of organisations the token can access rather than a single
+            # object with an id/email shape this callback's flat
+            # user_id_path/email_path lookup could use. Left empty so that
+            # lookup is skipped entirely (generic_oauth_callback's `if
+            # userinfo_url and access_token:` guard); identity comes instead
+            # from a dedicated `elif matches_provider_family(provider,
+            # "employment-hero")` branch there that calls
+            # _fetch_employment_hero_identity, deriving provider_user_id
+            # from the grant's accessible organisation ids (None only for a
+            # grant with zero accessible organisations) — is_connected still
+            # works from access_token alone regardless, and an agent calls
+            # employment_hero_list_organisations to discover the
+            # organisation_id every other tool needs anyway.
+            "userinfo_url": "",
+            "user_id_path": "id",
+            "email_path": "email",
+            # Employment Hero has no separate identity-only scope (unlike
+            # google/zoom/github above) — every scope here is a functional
+            # read permission this connector's tools actually call, so they
+            # live entirely on the app row's oauth_scopes below and are
+            # merged in at authorize time by _merge_oauth_scopes, same
+            # no-default-scopes convention as intercom's row above.
+            "default_scopes": [],
+        },
     ]
 
 
@@ -1171,6 +1231,36 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             },
         },
         {
+            "app_id": "employment-hero",
+            "name": "Employment Hero",
+            "description": "Connect to Employment Hero to look up organisations, employees, teams, and timesheet entries.",
+            "icon": "https://www.google.com/s2/favicons?domain=employmenthero.com&sz=128",
+            "transport": "oauth",
+            "provider_name": "employment-hero",
+            # No existing sidebar category filter (connect-mcp-dialog.tsx)
+            # fits an HR/payroll connector -- reusing "Operations" (currently
+            # only aws, an infra-monitoring connector) would be the same
+            # mismatch the salesforce/notion comments above call out on
+            # other rows, not something to repeat. Like storage/development/
+            # productivity elsewhere in this file, this category has no
+            # dedicated sidebar button; the connector still surfaces under
+            # "All".
+            "category": "HR",
+            "oauth_scopes": [
+                "organisations:list",
+                "employees:list",
+                "employees:show",
+                "teams:list",
+                "timesheet_entries:list",
+            ],
+            "is_visible_in_connector": True,
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.employment_hero"],
+                "env_mapping": {"EMPLOYMENT_HERO_ACCESS_TOKEN": "access_token"},
+            },
+        },
+        {
             "app_id": "chartmogul",
             "name": "ChartMogul",
             "description": "Connect your ChartMogul account (with a per-user API key from Profile -> API keys) to look up and manage customers, contacts, and sales opportunities.",
@@ -1194,6 +1284,121 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                 "command": "python",
                 "args": ["-m", "xagent.web.tools.mcp.chartmogul"],
                 "required_env": ["CHARTMOGUL_API_KEY"],
+            },
+        },
+        {
+            "app_id": "myob",
+            "name": "MYOB",
+            "description": "Connect to MYOB AccountRight to look up and manage contacts, sales invoices, and purchase bills, and browse general ledger accounts and tax codes.",
+            "icon": "https://www.google.com/s2/favicons?domain=myob.com&sz=128",
+            "transport": "oauth",
+            "provider_name": "myob",
+            "category": "Operations",
+            # Granular AuthAccount scopes (MYOB retired the old blanket
+            # CompanyFile scope) matching the tool set this connector
+            # exposes -- sme-company-file for myob_get_business_info, the
+            # rest one per resource family (contacts/sales/purchases/
+            # general ledger). Deliberately excludes sme-banking (no
+            # banking tools exposed) and sme-payroll/sme-contacts-employee/
+            # sme-contacts-personal/sme-timebilling (no payroll or
+            # personal-employee-data tools) -- nothing here would justify
+            # requesting access to any of them.
+            "oauth_scopes": [
+                "sme-company-file",
+                "sme-contacts-customer",
+                "sme-contacts-supplier",
+                "sme-sales",
+                "sme-purchases",
+                "sme-general-ledger",
+            ],
+            "is_visible_in_connector": True,
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.myob"],
+                "env_mapping": {
+                    "MYOB_ACCESS_TOKEN": "access_token",
+                    # The company file GUID captured from the authorization
+                    # redirect (see api/auth.py's is_myob handling) -- same
+                    # instance_url mechanism Salesforce/Deputy already use
+                    # for their own per-connection value, just sourced from
+                    # a different place in the OAuth flow.
+                    "MYOB_BUSINESS_ID": "instance_url",
+                },
+                # x-myobapi-key identifies the calling *application*, not the
+                # end user -- every MYOB connection made by this deployment
+                # uses the same client_id, so it's forwarded verbatim from
+                # this process's own env rather than threaded through
+                # env_mapping like the per-user access token above.
+                # Unlike Google Ads' developer-token static_env above,
+                # MYOB_CLIENT_ID is also the same value the OAuth login/
+                # token-exchange flow resolves via _resolve_oauth_secret
+                # (DB-first, env-fallback -- see the provider row above and
+                # admin_mcp.py's provider-edit routes). static_env itself
+                # only ever reads the bare host env var, with no DB
+                # fallback of its own, so an admin who configures MYOB's
+                # client_id purely through the admin UI (never setting this
+                # env var) would see OAuth connect succeed while every
+                # actual myob_*.py tool call then fails on a missing
+                # MYOB_API_KEY -- a real deployment footgun, not just a
+                # theoretical one, but one shared by static_env's design
+                # generally rather than something specific to fix here.
+                # MYOB_CLIENT_ID must be set as an env var for this
+                # connector to work, even if client_id/client_secret are
+                # also configured via the admin UI.
+                "static_env": {"MYOB_API_KEY": "MYOB_CLIENT_ID"},
+            },
+        },
+        {
+            "app_id": "magento",
+            "name": "Magento",
+            "description": 'Connect to a self-hosted Magento/Adobe Commerce store with an Integration access token to search and manage products, look up orders and add order comments, and browse customers and categories. On Magento 2.4.4+, enable Stores > Configuration > Services > OAuth > Consumer Settings > "Allow OAuth Access Tokens to be used as standalone Bearer tokens" first.',
+            "icon": "https://www.google.com/s2/favicons?domain=magento.com&sz=128",
+            "transport": "stdio",
+            "provider_name": None,
+            # "Commerce" is not one of the connect dialog's fixed sidebar
+            # category filters (connect-mcp-dialog.tsx only has CRM/Support/
+            # Marketing/Payments/Analytics/etc.), so this connector won't
+            # get a dedicated filter button yet -- still findable via the
+            # catalog's "All" view/search. "Payments" (Stripe's category)
+            # would be actively misleading: Magento is store/inventory/
+            # order management, not a payments processor.
+            "category": "Commerce",
+            "oauth_scopes": None,
+            "is_visible_in_connector": True,
+            # Key-based (non-oauth), like posthog/stripe: a Magento
+            # "Integration" (Admin -> System -> Extensions -> Integrations
+            # -> Add New Integration) issues a store-scoped access token
+            # self-serve, with no Magento Marketplace review -- OAuth on
+            # Magento is only a review-gated path for a *public* extension
+            # distributed to many merchants, not for a store granting
+            # itself access. MAGENTO_BASE_URL is the store's own full
+            # origin (Magento is commonly self-hosted at an arbitrary
+            # domain, unlike Shopify/Zendesk's fixed "*.myshopify.com"/
+            # "*.zendesk.com" suffix) -- validated in magento.py as a bare
+            # https origin, then resolved and pinned against private/
+            # internal IP ranges before every request, since here (unlike
+            # those two) there is no small fixed-hostname allowlist to lean
+            # on first. That pinning only holds when no HTTP(S) proxy is in
+            # play (a proxy does its own DNS resolution this process can't
+            # see -- magento.py's _request() calls the same
+            # get_trusted_proxy_url() gate web_content.py uses, raising
+            # unless the proxy is explicitly marked trusted via
+            # XAGENT_TRUSTED_EGRESS_PROXY=1); upfront private-IP rejection
+            # at validation time is the unconditional baseline either way.
+            # MAGENTO_STORE_CODE is in required_env (there is no
+            # optional_env concept in the connect flow) even though
+            # magento.py itself defaults to the default store view when
+            # it's empty -- same precedent as the mixpanel row's
+            # MIXPANEL_REGION above, so a multi-storefront install isn't
+            # stuck unable to select a non-default store view.
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.magento"],
+                "required_env": [
+                    "MAGENTO_BASE_URL",
+                    "MAGENTO_ACCESS_TOKEN",
+                    "MAGENTO_STORE_CODE",
+                ],
             },
         },
     ]

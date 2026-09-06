@@ -227,6 +227,27 @@ class TestGetConfiguredDefaults:
         assert mock_core_storage.load.call_count == 4
         assert mock_core_storage.create_llm_instance.call_count == 4
 
+    def test_all_explicit_models_do_not_load_unrelated_defaults(self, storage):
+        names = ["general", "fast", "vision", "compact"]
+        llms = {name: Mock(model_name=name) for name in names}
+
+        with (
+            patch.object(
+                storage,
+                "get_llm_by_name_with_access",
+                side_effect=lambda name, user_id: llms[name],
+            ),
+            patch.object(
+                storage,
+                "get_configured_defaults",
+                side_effect=AssertionError("unrelated defaults must not be loaded"),
+            ) as get_defaults,
+        ):
+            result = storage.resolve_llms_from_names(names, user_id=7)
+
+        assert result == tuple(llms[name] for name in names)
+        get_defaults.assert_not_called()
+
     def test_falls_back_to_admin_defaults(
         self, storage, mock_db, mock_core_storage, monkeypatch
     ):

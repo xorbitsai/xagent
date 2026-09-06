@@ -47,6 +47,28 @@ def test_openrouter_auto_returns_router_llm():
     assert llm.model_name == "auto"
 
 
+def test_configured_auto_returns_router_with_explicit_bindings(monkeypatch):
+    monkeypatch.setenv("XAGENT_ROUTER_FALLBACK_MODEL", "ambient/model")
+    config = ChatModelConfig(
+        id="configured-auto",
+        model_provider="router",
+        model_name="auto",
+        router_config_name="cheap-pair",
+        router_candidate_models=["openai/gpt-5.5", "deepseek/deepseek-v4-flash"],
+        router_fallback_model="deepseek/deepseek-v4-flash",
+    )
+
+    llm = create_base_llm(config, downstream_resolver=lambda _profile: "target")
+
+    assert isinstance(llm, RouterLLM)
+    assert llm.model_name == "cheap-pair"
+    assert llm._candidate_models == (
+        "openai/gpt-5.5",
+        "deepseek/deepseek-v4-flash",
+    )
+    assert llm._fallback_model == "deepseek/deepseek-v4-flash"
+
+
 def test_openrouter_non_auto_is_not_router_llm():
     # A normal OpenRouter slug is dispatched directly, not via xrouter.
     config = ChatModelConfig(

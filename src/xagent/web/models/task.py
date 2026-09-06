@@ -3,6 +3,7 @@ from typing import Any, Collection
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     Boolean,
     CheckConstraint,
     Column,
@@ -277,6 +278,28 @@ class Task(Base):  # type: ignore
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     title = Column(String(200), nullable=False)
     description = Column(Text)
+    # Stage 3.1 only supports legacy routing. Widen this pin together with
+    # the event-backed runtime, never by changing the creation default alone.
+    conversation_storage_version = Column(
+        Integer,
+        CheckConstraint(
+            "conversation_storage_version = 1",
+            name="ck_tasks_conversation_storage_version",
+        ),
+        nullable=False,
+        default=1,
+        server_default="1",
+    )
+    conversation_event_sequence = Column(
+        BigInteger,
+        CheckConstraint(
+            "conversation_event_sequence >= 0",
+            name="ck_tasks_conversation_event_sequence",
+        ),
+        nullable=False,
+        default=0,
+        server_default="0",
+    )
     # sqlalchemy.Enum(TaskStatus) with no values_callable persists member
     # *names* (e.g. "WAITING_FOR_USER"), not member values
     # ("waiting_for_user"). validate_strings=True rejects a raw string that

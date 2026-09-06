@@ -11,6 +11,12 @@ from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import QueuePool
 
+from tests.web.pool_contention_shared import (
+    GUARD_TIMEOUT,
+    LOOP_LIVENESS_TICKS,
+    gated_pool_checkout,
+    wait_for_ticks,
+)
 from xagent.core.model.chat.token_context import (
     TokenUsage,
     add_token_usage,
@@ -153,15 +159,6 @@ def _run_tracker_ownership_race(
     return result["owned"], persisted
 
 
-# Loop progress is waited for, not counted inside a fixed window: an
-# oversubscribed CI runner can starve the loop for longer than the window, so a
-# rate assertion fails on scheduling rather than on the property under test
-# (#1993). The window stays under the pool's 1s timeout, which keeps the worker
-# parked while the assertions run.
-_REQUIRED_LOOP_TICKS = 3
-_LOOP_PROGRESS_WINDOW_SECONDS = 0.5
-
-
 def _create_tracker_pool_db(tmp_path, filename):
     engine = create_engine(
         f"sqlite:///{tmp_path / filename}",
@@ -200,7 +197,6 @@ async def _assert_tracker_operation_keeps_loop_responsive_under_pool_pressure(
     verify,
     *,
     operation_scheduled=None,
-    timer_created=None,
 ):
     """Exercise one tracker DB operation while its QueuePool is exhausted."""
     from xagent.web.models import database
@@ -212,23 +208,15 @@ async def _assert_tracker_operation_keeps_loop_responsive_under_pool_pressure(
     operation_task = None
     ticker_task = None
     held_connection = None
-    window_timer = None
     ticker_stop = threading.Event()
-    window_elapsed = threading.Event()
     ticker_ticks = 0
-    worker_entered = threading.Event()
     event_loop_thread_id = threading.get_ident()
     worker_thread_id: int | None = None
     original_helper = getattr(tracker_module, sync_helper_name)
 
     def traced_helper(*args, **kwargs):
-        nonlocal window_timer, worker_thread_id
+        nonlocal worker_thread_id
         worker_thread_id = threading.get_ident()
-        window_timer = threading.Timer(_LOOP_PROGRESS_WINDOW_SECONDS, end_window)
-        if timer_created is not None:
-            timer_created(window_timer)
-        window_timer.start()
-        worker_entered.set()
         return original_helper(*args, **kwargs)
 
     async def ticker():
@@ -236,68 +224,44 @@ async def _assert_tracker_operation_keeps_loop_responsive_under_pool_pressure(
         while not ticker_stop.is_set():
             await asyncio.sleep(0.01)
             ticker_ticks += 1
-            if ticker_ticks >= _REQUIRED_LOOP_TICKS:
-                # The timer is only the safety net; enough loop progress closes
-                # the window on its own.
-                end_window()
-
-    def end_window():
-        ticker_stop.set()
-        window_elapsed.set()
 
     try:
         await prepare(tracker)
         monkeypatch.setattr(tracker_module, sync_helper_name, traced_helper)
         held_connection = engine.connect()
-        ticker_task = asyncio.create_task(ticker())
-        await asyncio.sleep(0)
-        operation_task = asyncio.create_task(operation(tracker))
-        if operation_scheduled is not None:
-            operation_scheduled.set()
-        assert await asyncio.wait_for(
-            asyncio.to_thread(worker_entered.wait, 2), timeout=2
-        )
-
-        assert await asyncio.wait_for(
-            asyncio.to_thread(window_elapsed.wait, _LOOP_PROGRESS_WINDOW_SECONDS + 0.1),
-            timeout=_LOOP_PROGRESS_WINDOW_SECONDS + 0.2,
-        )
-        assert ticker_ticks >= _REQUIRED_LOOP_TICKS
-        assert not operation_task.done()
-        assert worker_thread_id is not None
-        assert worker_thread_id != event_loop_thread_id
-
-        held_connection.close()
-        held_connection = None
-        result = await asyncio.wait_for(operation_task, timeout=1)
-        verify(tracker, session_factory, result)
+        with gated_pool_checkout(engine) as gate:
+            ticker_task = asyncio.create_task(ticker())
+            operation_task = asyncio.create_task(operation(tracker))
+            if operation_scheduled is not None:
+                operation_scheduled.set()
+            try:
+                await gate.wait_until_contending()
+                observed = await wait_for_ticks(lambda: ticker_ticks)
+                assert observed >= LOOP_LIVENESS_TICKS
+                assert not operation_task.done()
+                assert worker_thread_id is not None
+                assert worker_thread_id != event_loop_thread_id
+            finally:
+                held_connection.close()
+                held_connection = None
+                gate.let_through()
+                # Drain even when cancelled before the worker reaches checkout.
+                await drain_async_task_cancellation_safe(operation_task)
+            result = operation_task.result()
+            verify(tracker, session_factory, result)
     finally:
-        window_elapsed.set()
         ticker_stop.set()
         try:
             if held_connection is not None:
                 held_connection.close()
+            if ticker_task is not None:
+                await drain_async_task_cancellation_safe(ticker_task)
         finally:
             try:
-                if operation_task is not None:
-                    await drain_async_task_cancellation_safe(operation_task)
+                if tracker.is_tracking:
+                    await tracker.stop_periodic_updates()
             finally:
-                try:
-                    if window_timer is not None:
-                        try:
-                            window_timer.cancel()
-                        finally:
-                            window_timer.join()
-                finally:
-                    try:
-                        if ticker_task is not None:
-                            await drain_async_task_cancellation_safe(ticker_task)
-                    finally:
-                        try:
-                            if tracker.is_tracking:
-                                await tracker.stop_periodic_updates()
-                        finally:
-                            engine.dispose()
+                engine.dispose()
 
 
 class TestTaskTracker:
@@ -447,21 +411,32 @@ class TestTaskTracker:
         ids=["normal-cleanup", "cleanup-error"],
     )
     @pytest.mark.asyncio
-    async def test_tracker_pool_helper_joins_timer_created_by_delayed_worker(
+    async def test_tracker_pool_helper_drains_delayed_worker(
         self, monkeypatch, tmp_path, inject_cleanup_error
     ):
-        """Cancellation must not leave a delayed worker's timer alive."""
+        """Cancellation must drain a worker queued before it reaches checkout."""
         loop = asyncio.get_running_loop()
         executor = ThreadPoolExecutor(max_workers=1)
         original_executor = getattr(loop, "_default_executor")
         blocker_started = asyncio.Event()
         release_worker = threading.Event()
         operation_scheduled = asyncio.Event()
-        recorded_timers = []
+        worker_finished = threading.Event()
+        from xagent.web.tracking import task_tracker as tracker_module
+
+        original_seed = tracker_module._load_task_seed_sync
+
+        def observed_seed(*args, **kwargs):
+            try:
+                return original_seed(*args, **kwargs)
+            finally:
+                worker_finished.set()
+
+        monkeypatch.setattr(tracker_module, "_load_task_seed_sync", observed_seed)
 
         def occupy_default_executor():
             loop.call_soon_threadsafe(blocker_started.set)
-            assert release_worker.wait(timeout=2)
+            assert release_worker.wait(timeout=GUARD_TIMEOUT)
 
         async def prepare(_tracker):
             return None
@@ -473,7 +448,7 @@ class TestTaskTracker:
             blocker = loop.run_in_executor(None, occupy_default_executor)
             helper_task = None
             try:
-                await asyncio.wait_for(blocker_started.wait(), timeout=1)
+                await asyncio.wait_for(blocker_started.wait(), timeout=GUARD_TIMEOUT)
                 helper_task = asyncio.create_task(
                     _assert_tracker_operation_keeps_loop_responsive_under_pool_pressure(
                         monkeypatch,
@@ -484,10 +459,11 @@ class TestTaskTracker:
                         lambda tracker: tracker.start_tracking(),
                         verify,
                         operation_scheduled=operation_scheduled,
-                        timer_created=recorded_timers.append,
                     )
                 )
-                await asyncio.wait_for(operation_scheduled.wait(), timeout=1)
+                await asyncio.wait_for(
+                    operation_scheduled.wait(), timeout=GUARD_TIMEOUT
+                )
                 helper_task.cancel()
                 release_worker.set()
                 await blocker
@@ -495,8 +471,7 @@ class TestTaskTracker:
                     await helper_task
 
                 assert helper_task.cancelled()
-                assert len(recorded_timers) == 1
-                assert not recorded_timers[0].is_alive()
+                assert worker_finished.is_set()
             finally:
                 try:
                     release_worker.set()

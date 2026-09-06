@@ -15,11 +15,12 @@ require an actual agent runtime (``execute_task_background``).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from datetime import datetime, timedelta, timezone
-from threading import Barrier, get_ident
+from threading import Barrier, Event, get_ident
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -34,12 +35,16 @@ from tests.web.pool_contention_shared import (
     EXHAUSTION_POOL_TIMEOUT,
     GUARD_TIMEOUT,
     LOOP_LIVENESS_TICKS,
+    assert_pool_checkout_off_loop,
     gated_pool_checkout,
     wait_for_ticks,
 )
 from xagent.core.agent.checkpoint import CHECKPOINT_TYPE
 from xagent.core.tools.adapters.vibe.config import RequiredMCPUnavailableError
-from xagent.core.tools.adapters.vibe.connector_runtime import ConnectorRef
+from xagent.core.tools.adapters.vibe.connector_runtime import (
+    ConnectorRef,
+    ConnectorRuntimeError,
+)
 from xagent.web.models import database as database_module
 from xagent.web.models.agent import Agent
 from xagent.web.models.chat_message import TaskChatMessage
@@ -56,6 +61,7 @@ from xagent.web.models.workforce import Workforce, WorkforceRun
 from xagent.web.services import task_orchestrator as task_orchestrator_module
 from xagent.web.services.assistant_history_safety import (
     CLIENT_SAFE_FAILURE_MESSAGE_TYPE,
+    TASK_FAILURE_MESSAGE_TYPE,
 )
 from xagent.web.services.chat_history_service import (
     DELIVERY_COMPLETED,
@@ -66,6 +72,7 @@ from xagent.web.services.chat_history_service import (
     inspect_user_message_delivery,
     mark_user_message_delivery,
 )
+from xagent.web.services.client_error_messages import CLIENT_SAFE_TASK_FAILURE
 from xagent.web.services.connector_runtime import (
     get_ephemeral_runtime_values,
     pop_ephemeral_runtime_values,
@@ -1271,13 +1278,17 @@ async def test_begin_turn_schedules_even_when_caller_cancelled(db_session) -> No
     off-loop claim is in flight (which commits RUNNING in a worker thread),
     the owned claim+schedule task must settle before cancellation propagates,
     so a committed RUNNING task is never left with no scheduled worker."""
-    import time as _time
+    import threading
 
     user = _create_user(db_session)
     task = _create_task(db_session, user.id, status=TaskStatus.PENDING)
 
+    claim_started = threading.Event()
+    release_claim = threading.Event()
+
     def slow_claim(task_id, task_owner_user_id, *, payload, kind):
-        _time.sleep(0.15)  # window during which we cancel the caller
+        claim_started.set()
+        assert release_claim.wait(timeout=GUARD_TIMEOUT)
         return _ClaimedTurn(
             task_lease=TaskLease(
                 task_id=task_id,
@@ -1310,10 +1321,16 @@ async def test_begin_turn_schedules_even_when_caller_cancelled(db_session) -> No
                 kind=TurnKind.CREATE,
             )
         )
-        await asyncio.sleep(0.05)  # let it enter the off-loop claim
-        t.cancel()
+        try:
+            assert await asyncio.to_thread(claim_started.wait, GUARD_TIMEOUT)
+            t.cancel()
+        finally:
+            release_claim.set()
+            await asyncio.wait_for(
+                asyncio.gather(t, return_exceptions=True), timeout=GUARD_TIMEOUT
+            )
         with pytest.raises(asyncio.CancelledError):
-            await t
+            t.result()
 
     sched.assert_called_once()  # scheduled despite the cancellation
 
@@ -1394,29 +1411,23 @@ async def test_schedule_claimed_create_turn_offloads_cache_invalidation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A committed domain claim must not invalidate Redis on the event loop."""
-    import time as _time
-
     task_id = 987654
     event_loop_thread = get_ident()
     invalidations: list[tuple[int, int]] = []
-    ticker_stop = asyncio.Event()
-    ticks = 0
+    entered = Event()
+    release = Event()
 
     def slow_invalidate(observed_task_id: int) -> None:
         invalidations.append((observed_task_id, get_ident()))
-        _time.sleep(0.08)
+        entered.set()
+        assert get_ident() != event_loop_thread
+        assert release.wait(timeout=30), "cache invalidation was never released"
 
     async def fake_schedule(**_kwargs):
         async def done() -> None:
             return None
 
         return asyncio.create_task(done())
-
-    async def ticker() -> None:
-        nonlocal ticks
-        while not ticker_stop.is_set():
-            ticks += 1
-            await asyncio.sleep(0.005)
 
     monkeypatch.setattr(
         task_orchestrator_module,
@@ -1441,24 +1452,26 @@ async def test_schedule_claimed_create_turn_offloads_cache_invalidation(
         run_id="committed-run",
     )
 
-    ticker_task = asyncio.create_task(ticker())
-    try:
-        started = await TaskTurnOrchestrator.schedule_claimed_create_turn(
+    startup = asyncio.create_task(
+        TaskTurnOrchestrator.schedule_claimed_create_turn(
             task_id=task_id,
             task_owner_user_id=1,
             actor_user_id=1,
             payload=TaskTurnPayload("start"),
             claimed=claimed,
         )
-        await started.background_task
+    )
+    try:
+        assert await asyncio.to_thread(entered.wait, 30)
+        assert not startup.done()
     finally:
-        ticker_stop.set()
-        await ticker_task
+        release.set()
+        started = await asyncio.wait_for(startup, timeout=30)
+    await started.background_task
 
     assert len(invalidations) == 1
     assert invalidations[0][0] == task_id
     assert invalidations[0][1] != event_loop_thread
-    assert ticks >= 3, "claim-cache invalidation blocked the asyncio event loop"
 
 
 @pytest.mark.asyncio
@@ -2145,14 +2158,6 @@ async def test_schedule_bg_pool_timeout_defers_settlement_to_lease_recovery(
         seed_db.commit()
 
     lease = TaskLease(task_id=task_id, runner_id="test-runner", run_id="run-a")
-    ticker_stop = asyncio.Event()
-    ticks = 0
-
-    async def ticker() -> None:
-        nonlocal ticks
-        while not ticker_stop.is_set():
-            ticks += 1
-            await asyncio.sleep(0.01)
 
     def load_snapshot_from_contended_pool(*_args, **_kwargs):
         with SessionLocal() as snapshot_db:
@@ -2164,9 +2169,9 @@ async def test_schedule_bg_pool_timeout_defers_settlement_to_lease_recovery(
         logging.ERROR,
         logger="xagent.web.services.task_orchestrator",
     )
-    ticker_task = asyncio.create_task(ticker())
     try:
         with (
+            assert_pool_checkout_off_loop(engine),
             patch(
                 "xagent.web.services.task_orchestrator.acquire_task_lease_isolated",
                 return_value=lease,
@@ -2209,13 +2214,7 @@ async def test_schedule_bg_pool_timeout_defers_settlement_to_lease_recovery(
         mock_execute.assert_not_awaited()
         mock_stop_heartbeat.assert_awaited_once()
         mock_settle.assert_not_called()
-        assert ticks >= 10, (
-            "setup QueuePool timeout blocked the asyncio event loop; "
-            f"ticker advanced only {ticks} times"
-        )
     finally:
-        ticker_stop.set()
-        await ticker_task
         held_connection.close()
 
     with SessionLocal() as verify_db:
@@ -3846,3 +3845,350 @@ def test_reconcile_finalized_delivery_noop_on_already_terminal_row(
     )
 
     assert _delivery_status(db_session, "turn-term") == seeded_status
+
+
+# ---------------------------------------------------------------------------
+# Connector-runtime failures reach the client as a structured, wire-safe frame
+# ---------------------------------------------------------------------------
+
+
+CONNECTOR_RUNTIME_CODES = [
+    "missing_runtime_context",
+    "runtime_secret_unavailable",
+    "scheduled_secret_unavailable",
+]
+
+# The reason a missing declared context key produces, used to populate the
+# exception's own ``details`` below. The key half is a name the connector's
+# owner chose; nothing under ``details`` reaches the terminal frame at all,
+# so these fixtures exist to exercise the operator log, which still reads it.
+WITHHELD_KEY_REASON = "missing_context.auth_token"
+# An arbitrary reason value with no significance of its own -- it lives only
+# in the exception's ``details``, which the frame never carries, so which
+# string this is does not affect any assertion below.
+PUBLIC_REASON = "not_provided"
+
+
+@contextmanager
+def _captured_terminal_broadcast(setup_or_run_error: BaseException, db_session):
+    """Drive one owned run to failure and hand back both halves it produced.
+
+    The branch under test writes two things: the broadcast frame the live
+    client renders, and the durable settlement the transcript replays after a
+    reload. Capturing only the frame would let the durable half be deleted
+    with every test still green, so the settlement kwargs come back too.
+    """
+
+    from xagent.web.api.websocket import background_task_manager
+
+    user = _create_user(db_session)
+    task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
+    task_id = int(task.id)
+    lease = TaskLease(task_id=task_id, runner_id="runner-a", run_id="run-a")
+    frames: list[dict] = []
+    settlements: list[dict] = []
+
+    async def broadcast(event, *_args, **_kwargs) -> None:
+        frames.append(event)
+
+    def settle(*_args, **kwargs) -> bool:
+        settlements.append(kwargs)
+        return True
+
+    with (
+        patch(
+            "xagent.web.services.task_orchestrator.acquire_task_lease_isolated",
+            return_value=lease,
+        ),
+        patch(
+            "xagent.web.services.task_orchestrator.run_task_lease_heartbeat",
+            new=AsyncMock(),
+        ),
+        patch(
+            "xagent.web.services.task_orchestrator.load_task_setup_snapshot_sync",
+            return_value=MagicMock(),
+        ),
+        patch.object(
+            task_orchestrator_module,
+            "resolve_execution_scope",
+            return_value=None,
+            create=True,
+        ),
+        patch(
+            "xagent.web.api.websocket.execute_task_background",
+            new=AsyncMock(side_effect=setup_or_run_error),
+        ),
+        patch(
+            "xagent.web.services.task_orchestrator.settle_task_lease_isolated",
+            side_effect=settle,
+        ),
+        patch(
+            "xagent.web.api.websocket.manager",
+            MagicMock(broadcast_to_task=AsyncMock(side_effect=broadcast)),
+        ),
+        patch.object(background_task_manager, "register_task"),
+        patch(
+            "xagent.web.services.task_orchestrator._get_agent_manager",
+            return_value=MagicMock(),
+        ),
+    ):
+        yield task_id, frames, settlements
+
+
+async def _run_failing_turn(task_id: int, user_id: int, source) -> None:
+    await _schedule_bg(
+        task_id=task_id,
+        task_owner_user_id=user_id,
+        task_source=source,
+        payload=TaskTurnPayload("hello"),
+        force_fresh=False,
+        context=None,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", CONNECTOR_RUNTIME_CODES)
+async def test_connector_runtime_failure_broadcasts_its_safe_message(
+    db_session,
+    code: str,
+) -> None:
+    """The curated sentence replaces the opaque task-failure fallback."""
+
+    safe_message = f"Required connector runtime input is missing ({code})."
+    error = ConnectorRuntimeError(
+        code,
+        safe_message,
+        details={"reason": WITHHELD_KEY_REASON},
+    )
+
+    with _captured_terminal_broadcast(error, db_session) as (
+        task_id,
+        frames,
+        settlements,
+    ):
+        task = db_session.query(Task).filter(Task.id == task_id).one()
+        await _run_failing_turn(task_id, int(task.user_id), task.source)
+
+    assert [frame["message"] for frame in frames] == [safe_message]
+    assert frames[0]["error"] == safe_message
+    assert frames[0]["code"] == code
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        ValueError("secret-token-xyz"),
+        KeyError("secret-token-xyz"),
+        RuntimeError("secret-token-xyz"),
+    ],
+    ids=["value-error", "key-error", "runtime-error"],
+)
+async def test_incidental_failure_still_redacts(
+    db_session,
+    error: BaseException,
+) -> None:
+    """Only the connector-runtime class earns the new branch."""
+
+    with _captured_terminal_broadcast(error, db_session) as (
+        task_id,
+        frames,
+        settlements,
+    ):
+        task = db_session.query(Task).filter(Task.id == task_id).one()
+        await _run_failing_turn(task_id, int(task.user_id), task.source)
+
+    assert len(frames) == 1
+    assert frames[0]["message"] == CLIENT_SAFE_TASK_FAILURE
+    assert frames[0]["error"] == CLIENT_SAFE_TASK_FAILURE
+    assert "secret-token-xyz" not in json.dumps(frames[0])
+    assert "code" not in frames[0]
+    assert "details" not in frames[0]
+
+
+@pytest.mark.asyncio
+async def test_connector_runtime_frame_carries_code_only(db_session) -> None:
+    """Whatever the raise site attached to ``details``, none of it reaches the wire."""
+
+    error = ConnectorRuntimeError(
+        "runtime_secret_unavailable",
+        "Required runtime secret is unavailable.",
+        details={
+            "reason": PUBLIC_REASON,
+            "internal_sql": "SELECT value FROM task_connector_runtime_contexts",
+            "raw_value": "tenant-secret",
+            "connector_ref": {"connector_type": "mcp", "connector_id": 7},
+        },
+    )
+
+    with _captured_terminal_broadcast(error, db_session) as (
+        task_id,
+        frames,
+        settlements,
+    ):
+        task = db_session.query(Task).filter(Task.id == task_id).one()
+        await _run_failing_turn(task_id, int(task.user_id), task.source)
+
+    assert set(frames[0]) == {
+        "type",
+        "message",
+        "task_id",
+        "task",
+        "error",
+        "timestamp",
+        "code",
+    }
+    assert "details" not in frames[0]
+
+
+@pytest.mark.asyncio
+async def test_connector_runtime_frame_never_carries_connector_ref(
+    db_session,
+) -> None:
+    """The frame's audience includes anonymous widget and share visitors.
+
+    The three assertions are structural on purpose. An earlier form of this
+    test also asserted the connector's numeric id was absent from the
+    serialized frame, which goes red on any fixture where that id collides
+    with the task id or a timestamp digit.
+    """
+
+    error = ConnectorRuntimeError(
+        "runtime_secret_unavailable",
+        "Required runtime secret is unavailable.",
+        connector_ref=ConnectorRef(connector_type="mcp", connector_id=7),
+        details={"reason": PUBLIC_REASON},
+    )
+
+    with _captured_terminal_broadcast(error, db_session) as (
+        task_id,
+        frames,
+        settlements,
+    ):
+        task = db_session.query(Task).filter(Task.id == task_id).one()
+        await _run_failing_turn(task_id, int(task.user_id), task.source)
+
+    frame = frames[0]
+    assert set(frame) == {
+        "type",
+        "message",
+        "task_id",
+        "task",
+        "error",
+        "timestamp",
+        "code",
+    }
+    serialized = json.dumps(frame)
+    assert "connector_ref" not in serialized
+    assert "connector_id" not in serialized
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", CONNECTOR_RUNTIME_CODES)
+async def test_connector_runtime_failure_logs_missing_key(
+    db_session,
+    caplog,
+    code: str,
+) -> None:
+    """Operators read the raw details, connector identity included."""
+
+    error = ConnectorRuntimeError(
+        code,
+        "Required connector runtime context is missing.",
+        connector_ref=ConnectorRef(connector_type="mcp", connector_id=7),
+        details={"reason": WITHHELD_KEY_REASON},
+    )
+
+    with caplog.at_level(logging.ERROR):
+        with _captured_terminal_broadcast(error, db_session) as (
+            task_id,
+            frames,
+            settlements,
+        ):
+            task = db_session.query(Task).filter(Task.id == task_id).one()
+            await _run_failing_turn(task_id, int(task.user_id), task.source)
+
+    structured = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.ERROR
+        and "component=connector-runtime" in record.getMessage()
+    ]
+    assert len(structured) == 1
+    assert f"code={code}" in structured[0]
+    assert f"reason={WITHHELD_KEY_REASON}" in structured[0]
+    assert "connector=" in structured[0]
+    assert "'connector_id': 7" in structured[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", CONNECTOR_RUNTIME_CODES)
+async def test_connector_runtime_failure_persists_client_safe_history(
+    db_session,
+    code: str,
+) -> None:
+    """The durable half: what the transcript replays after a reload.
+
+    The new branch writes three things -- the frame, the settlement error and
+    the history message type. Without this test the whole
+    ``client_history_message_type`` line could be deleted and every other test
+    in this file would stay green, while a reloading user dropped back to the
+    generic failure text the frame no longer shows.
+    """
+
+    safe_message = f"Required connector runtime input is missing ({code})."
+    error = ConnectorRuntimeError(
+        code,
+        safe_message,
+        details={"reason": WITHHELD_KEY_REASON},
+    )
+
+    with _captured_terminal_broadcast(error, db_session) as (
+        task_id,
+        frames,
+        settlements,
+    ):
+        task = db_session.query(Task).filter(Task.id == task_id).one()
+        await _run_failing_turn(task_id, int(task.user_id), task.source)
+
+    assert len(settlements) == 1
+    settled = settlements[0]
+    assert settled["client_message_type"] == CLIENT_SAFE_FAILURE_MESSAGE_TYPE
+    # The durable row and the frame's own message field are the same server
+    # sentence. The live bubble is not that sentence: for a missing-value code
+    # the client replaces it with its own localized wording (see the
+    # "terminal error frames" suite in app-context-chat.test.tsx). What the two
+    # views owe each other is the facts they carry, and the key name is in
+    # neither -- the frame never carries a details object at all, so there is
+    # no key name for the client to render.
+    assert settled["client_error_message"] == safe_message
+    assert settled["client_error_message"] == frames[0]["message"]
+    assert "details" not in frames[0]
+    assert "auth_token" not in json.dumps(frames[0])
+    # The durable error keeps the code prefix operators grep for, and never
+    # the "setup/run error: <ExceptionType>" shape the else branch produces.
+    assert settled["error_message"] == f"{code}: {safe_message}"
+    assert "setup/run error" not in settled["error_message"]
+
+
+@pytest.mark.asyncio
+async def test_incidental_failure_persists_the_generic_history_type(
+    db_session,
+) -> None:
+    """The counterpart: an incidental failure keeps the untrusted settlement."""
+
+    error = RuntimeError("secret-token-xyz")
+
+    with _captured_terminal_broadcast(error, db_session) as (
+        task_id,
+        frames,
+        settlements,
+    ):
+        task = db_session.query(Task).filter(Task.id == task_id).one()
+        await _run_failing_turn(task_id, int(task.user_id), task.source)
+
+    assert len(settlements) == 1
+    settled = settlements[0]
+    assert settled["client_message_type"] == TASK_FAILURE_MESSAGE_TYPE
+    assert settled["client_error_message"] == CLIENT_SAFE_TASK_FAILURE
+    assert "secret-token-xyz" not in settled["client_error_message"]

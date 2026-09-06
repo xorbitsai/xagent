@@ -999,6 +999,37 @@ async def refresh_oauth_token_if_needed(
         if requires_json_accept_header(normalized_provider):
             headers["Accept"] = "application/json"
 
+        from ..api.auth import _is_employment_hero_token_url
+        from ..oauth_provider_quirks import matches_provider_family
+
+        if matches_provider_family(
+            normalized_provider, "employment-hero"
+        ) and _is_employment_hero_token_url(refresh_token_url):
+            # Matches the code-exchange branch in api/auth.py: Employment
+            # Hero's partner guide requires grant_type and refresh_token as
+            # query parameters on the refresh request too, with only the
+            # credential fields in the form body. Gated on
+            # _is_employment_hero_token_url too, not just the family match
+            # -- same reasoning as the code-exchange branch: an admin-
+            # created "employment-hero"-family row's token_url isn't
+            # guaranteed to actually be Employment Hero's, and this
+            # EH-specific wire quirk would break a genuinely different
+            # token endpoint's refresh instead of using the standard RFC
+            # 6749 body-only shape it likely expects. Putting a long-lived
+            # credential (refresh_token) in a query string is a generic
+            # secret-exposure anti-pattern (it can end up in proxy/server
+            # access logs a form body wouldn't) -- accepted here as a
+            # residual risk forced by Employment Hero's documented contract,
+            # not a choice this codebase would otherwise make. No httpx/
+            # httpcore request-logging middleware exists in this codebase
+            # today (those loggers are pinned to WARNING) and the
+            # configured HTTPS proxy only sees a CONNECT tunnel, never this
+            # URL's query string -- reassess this note if either changes.
+            post_kwargs["params"] = {
+                "grant_type": data.pop("grant_type"),
+                "refresh_token": data.pop("refresh_token"),
+            }
+
         # Matches the code-exchange branch in api/auth.py: Atlassian's token
         # endpoint requires a JSON body on refresh too, not form-urlencoded.
         body_kwarg: dict[str, Any] = {"data": data}
@@ -1065,8 +1096,18 @@ async def refresh_oauth_token_if_needed(
                             "endpoint; keeping the previously stored value"
                         )
                 if "expires_in" in data:
+                    # int(), not a bare pass-through: MYOB's documented token
+                    # response (both the code-exchange and refresh legs)
+                    # returns this as a JSON *string* (e.g. "1200"), which
+                    # timedelta()'s seconds kwarg rejects outright
+                    # (TypeError) -- MYOB is the first provider whose
+                    # refresh reaches this generic branch with no
+                    # provider-specific handling (unlike Meta's own branch
+                    # a few lines above, or the code-exchange leg in
+                    # api/auth.py's generic_oauth_callback, both of which
+                    # already cast this the same way).
                     oauth_account.expires_at = datetime.now(timezone.utc) + timedelta(
-                        seconds=data["expires_in"]
+                        seconds=int(data["expires_in"])
                     )
                 db.flush([oauth_account])
                 logger.info(
@@ -3774,7 +3815,14 @@ class WebToolConfig(BaseToolConfig):
                 )
             else:
                 actor_query = actor_query.with_for_update()
-            oauth_account = actor_query.first()
+            # See the ordinary-flow branches in _resolve_legacy_oauth_access_
+            # token for why this is ordered rather than left arbitrary: the
+            # lock above prevents a *new* duplicate from forming during this
+            # resolution, but doesn't retroactively fix a namespace that
+            # already has more than one row from before locking existed (or
+            # from a provider whose identity backfill can't always derive a
+            # non-NULL provider_user_id).
+            oauth_account = actor_query.order_by(UserOAuth.id.desc()).first()
             logger.info(
                 "OAUTH CONFIG: Checked actor app credential for user %s. Found: %s",
                 user_id,
@@ -3869,6 +3917,13 @@ class WebToolConfig(BaseToolConfig):
                         resource_owner_key=None,
                     )
                     .filter(UserOAuth.provider.in_(providers_to_check))
+                    # Deterministic tie-break for the rare case of more than
+                    # one row for this (user, provider) set (e.g. a provider
+                    # whose identity backfill can't always derive a non-NULL
+                    # provider_user_id, like Employment Hero with zero
+                    # accessible organisations) -- most-recently-created wins,
+                    # rather than an arbitrary, backend-dependent row order.
+                    .order_by(UserOAuth.id.desc())
                     .first()
                 )
                 logger.info(
@@ -3885,6 +3940,9 @@ class WebToolConfig(BaseToolConfig):
                         resource_owner_key=None,
                     )
                     .filter(UserOAuth.provider == provider_name)
+                    # See the app_id-scoped branch above for why this is
+                    # ordered rather than left to an arbitrary row order.
+                    .order_by(UserOAuth.id.desc())
                     .first()
                 )
                 logger.info(
@@ -3914,11 +3972,14 @@ class WebToolConfig(BaseToolConfig):
         user_env_by_id: Mapping[int, Any],
         shared_env_by_id: Mapping[int, Any],
         env_source_by_id: Mapping[int, Any],
-        actor_builtin_app_info: Mapping[str, Any] | None = None,
+        actor_catalog_app_info: Mapping[str, Any] | None = None,
         actor_builtin_invalid: bool = False,
     ) -> Dict[str, Any]:
         """Build one MCP server config, preserving explicit unavailable outcomes."""
-        actor_builtin = actor_builtin_app_info is not None
+        actor_builtin = bool(
+            actor_catalog_app_info is not None
+            and actor_catalog_app_info.get("auth_type") == "builtin_oauth"
+        )
         if actor_builtin_invalid:
             policy_diagnostic = {
                 "code": "config_load_failed",
@@ -3968,8 +4029,8 @@ class WebToolConfig(BaseToolConfig):
             "name": server.name,
             "transport": server.transport,
             "description": (
-                actor_builtin_app_info.get("description")
-                if actor_builtin_app_info is not None
+                actor_catalog_app_info.get("description")
+                if actor_catalog_app_info is not None
                 else server.description
             ),
         }
@@ -3997,8 +4058,8 @@ class WebToolConfig(BaseToolConfig):
             from ...web.mcp_apps import get_app_for_mcp_server
 
             app_info = (
-                dict(actor_builtin_app_info)
-                if actor_builtin_app_info is not None
+                dict(actor_catalog_app_info)
+                if actor_catalog_app_info is not None
                 else get_app_for_mcp_server(self.db, server)
             )
             if app_info is None:
@@ -4153,22 +4214,86 @@ class WebToolConfig(BaseToolConfig):
 
         elif server.transport in ["sse", "websocket", "streamable_http"]:
             from ...web.mcp_apps import get_app_for_mcp_server
+            from ...web.services.mcp_oauth import select_mcp_oauth_owner
             from ...web.services.mcp_runtime import (
                 build_mcp_runtime_connection,
                 connection_to_transport_config,
                 effective_mcp_oauth_resource,
             )
 
+            resolver, registration_generation = _get_oauth_token_resolver_hook()
+            policy = self._mcp_runtime_authorization_policy
+            if policy is not None:
+                app_info = (
+                    dict(actor_catalog_app_info)
+                    if actor_catalog_app_info is not None
+                    else (
+                        get_app_for_mcp_server(self.db, server)
+                        if resolver is not None
+                        else None
+                    )
+                )
+            else:
+                app_info = (
+                    get_app_for_mcp_server(self.db, server)
+                    if resolver is not None
+                    else None
+                )
+            actor_remote_oauth = (
+                policy is not None and actor_catalog_app_info is not None
+            )
+            if actor_remote_oauth:
+                runtime_bindings = None
+                allow_delegated_authorization = False
+                runtime_values = None
+                for key in (
+                    "runtime_input_schema",
+                    "runtime_bindings",
+                    "allow_delegated_authorization",
+                    "connector_runtime",
+                ):
+                    config.pop(key, None)
+            if actor_remote_oauth and (self._mcp_auth_context or {}).get(
+                str(server.id)
+            ):
+                policy_diagnostic = {
+                    "code": "config_load_failed",
+                    "message": "Task-supplied MCP authorization is not accepted",
+                    "server_id": int(server.id),
+                    "server_name": server.name,
+                }
+                self._mcp_oauth_diagnostics.append(policy_diagnostic)
+                return self._build_unavailable_mcp_config(
+                    server=server,
+                    reason="config_load_failed",
+                    diagnostic=policy_diagnostic,
+                )
+
             auth_context = self._mcp_auth_context_for_server(
                 server_id=int(server.id),
                 runtime_values=runtime_values,
             )
-            resolver, registration_generation = _get_oauth_token_resolver_hook()
+            if actor_remote_oauth:
+                policy = cast(
+                    Any,
+                    self._mcp_runtime_authorization_policy,
+                )
+                auth_context = {
+                    str(server.id): {
+                        "resource_owner_key": select_mcp_oauth_owner(
+                            self.db,
+                            server_id=int(server.id),
+                            user_id=int(cast(int, self._user_id)),
+                            actor_owner_key=policy.resource_owner_key,
+                            auth_config=server._decrypt_auth_config(server.auth),
+                        )
+                    }
+                }
+
             remote_providers_to_resolve: list[str] = []
             remote_configured_resource: str | None = None
             remote_hook_token: _ResolvedHookToken | None = None
-            if resolver is not None:
-                app_info = get_app_for_mcp_server(self.db, server)
+            if resolver is not None and not actor_remote_oauth:
                 remote_providers_to_resolve = (
                     _oauth_token_provider_candidates(app_info)
                     if app_info
@@ -4269,6 +4394,13 @@ class WebToolConfig(BaseToolConfig):
                             diagnostic=diagnostic,
                             failure_code="oauth_token_required",
                         )
+                    if actor_remote_oauth:
+                        # Actor catalog execution trusts only its selected bearer.
+                        runtime_build.connection["headers"] = {
+                            "Authorization": runtime_build.connection["headers"][
+                                "Authorization"
+                            ]
+                        }
                     transport_config.update(
                         connection_to_transport_config(runtime_build.connection)
                     )
@@ -4316,7 +4448,7 @@ class WebToolConfig(BaseToolConfig):
         user_env_by_id: Mapping[int, Any],
         shared_env_by_id: Mapping[int, Any],
         env_source_by_id: Mapping[int, Any],
-        actor_builtin_app_info: Mapping[str, Any] | None = None,
+        actor_catalog_app_info: Mapping[str, Any] | None = None,
         actor_builtin_invalid: bool = False,
     ) -> Dict[str, Any]:
         """Isolate unexpected failures while loading one MCP server config."""
@@ -4326,7 +4458,7 @@ class WebToolConfig(BaseToolConfig):
                 user_env_by_id=user_env_by_id,
                 shared_env_by_id=shared_env_by_id,
                 env_source_by_id=env_source_by_id,
-                actor_builtin_app_info=actor_builtin_app_info,
+                actor_catalog_app_info=actor_catalog_app_info,
                 actor_builtin_invalid=actor_builtin_invalid,
             )
         except ConnectorRuntimeError:
@@ -4376,13 +4508,16 @@ class WebToolConfig(BaseToolConfig):
         # for "the scope could not be resolved". The typed error is what
         # survives the tool-creator frame -- an untyped one is dropped there
         # with a WARNING and no tool set at all.
-        from ..services.connector_team_scope import resolve_team_connector_ids_or_raise
-
-        team_mcp_ids = frozenset(
-            resolve_team_connector_ids_or_raise(
-                self.db, team_id=self._connector_team_id, log_subject=self._user_id
-            )["mcp"]
+        from ..services.connector_team_scope import (
+            resolve_team_connector_selection_or_raise,
         )
+
+        team_selection = resolve_team_connector_selection_or_raise(
+            self.db,
+            team_id=self._connector_team_id,
+            log_subject=self._user_id,
+        )
+        team_mcp_ids = team_selection.mcp_ids
 
         try:
             from ..services.mcp_runtime import (
@@ -4411,18 +4546,36 @@ class WebToolConfig(BaseToolConfig):
             if self._mcp_runtime_authorization_policy is not None:
                 from ...web.mcp_apps import (
                     BuiltinOAuthServerDefinitionError,
+                    RemoteOAuthDefinitionOwnership,
+                    RemoteOAuthServerDefinitionError,
                     classify_actor_builtin_oauth_server,
+                    classify_actor_remote_oauth_server,
                 )
 
                 for visible_server in servers:
                     try:
+                        catalog_app = classify_actor_builtin_oauth_server(
+                            self.db, visible_server
+                        )
+                        if catalog_app is None:
+                            catalog_app = classify_actor_remote_oauth_server(
+                                self.db,
+                                visible_server,
+                                definition_ownership=(
+                                    RemoteOAuthDefinitionOwnership.TEAM
+                                    if int(visible_server.id)
+                                    in team_selection.owned_mcp_definition_ids
+                                    else RemoteOAuthDefinitionOwnership.UNKNOWN
+                                ),
+                            )
                         actor_classifications[int(visible_server.id)] = (
-                            classify_actor_builtin_oauth_server(
-                                self.db, visible_server
-                            ),
+                            catalog_app,
                             False,
                         )
-                    except BuiltinOAuthServerDefinitionError:
+                    except (
+                        BuiltinOAuthServerDefinitionError,
+                        RemoteOAuthServerDefinitionError,
+                    ):
                         actor_classifications[int(visible_server.id)] = (None, True)
 
             # Prefetch shared runtime state once before entering the isolated
@@ -4499,7 +4652,7 @@ class WebToolConfig(BaseToolConfig):
                 user_env_by_id=user_env_by_id,
                 shared_env_by_id=shared_env_by_id,
                 env_source_by_id=env_source_by_id,
-                actor_builtin_app_info=actor_classifications.get(
+                actor_catalog_app_info=actor_classifications.get(
                     int(server.id), (None, False)
                 )[0],
                 actor_builtin_invalid=actor_classifications.get(

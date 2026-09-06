@@ -28,6 +28,7 @@ import { useI18n } from "@/contexts/i18n-context"
 import { ModelManagementDialog } from "./model-management-dialog"
 import { toast } from "@/components/ui/sonner"
 import { getProviderDisplayCapabilities } from "./model-display-capabilities"
+import { AutoModelConfigCard } from "./auto-model-config-card"
 
 const MODEL_TABS = ["llm", "embedding", "rerank", "image", "video", "audio"] as const
 const DEFAULT_MODEL_TAB = "llm"
@@ -364,18 +365,21 @@ export function ModelsPage() {
   }
 
   const modelCounts = useMemo(() => {
+    const concreteModels = models.filter(m => m.model_provider.toLowerCase() !== 'router')
     return {
-      llm: models.filter(m => m.category === 'llm').length,
-      embedding: models.filter(m => m.category === 'embedding').length,
-      rerank: models.filter(m => m.category === 'rerank').length,
-      image: models.filter(m => m.category === 'image').length,
-      video: models.filter(m => m.category === 'video').length,
-      audio: models.filter(m => AUDIO_MODEL_CATEGORIES.has(m.category)).length
+      llm: concreteModels.filter(m => m.category === 'llm').length,
+      embedding: concreteModels.filter(m => m.category === 'embedding').length,
+      rerank: concreteModels.filter(m => m.category === 'rerank').length,
+      image: concreteModels.filter(m => m.category === 'image').length,
+      video: concreteModels.filter(m => m.category === 'video').length,
+      audio: concreteModels.filter(m => AUDIO_MODEL_CATEGORIES.has(m.category)).length
     }
   }, [models])
 
   const filteredModels = useMemo(() => {
-    return models.filter(m => modelMatchesTab(m.category, activeTab))
+    return models.filter(m =>
+      m.model_provider.toLowerCase() !== 'router' && modelMatchesTab(m.category, activeTab)
+    )
   }, [models, activeTab])
 
   const enabledProviders = useMemo(() => {
@@ -507,6 +511,14 @@ export function ModelsPage() {
             </TabsTrigger>
           </TabsList>
         </Tabs>
+
+        {activeTab === "llm" && (
+          <AutoModelConfigCard
+            models={models}
+            generalDefault={defaultModels.general}
+            onSuccess={handleDialogSuccess}
+          />
+        )}
 
         {/* Enabled Models */}
         {Object.keys(enabledProviders).length > 0 && (

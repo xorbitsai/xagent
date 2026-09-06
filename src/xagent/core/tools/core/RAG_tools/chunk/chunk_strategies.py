@@ -58,28 +58,43 @@ def _split_by_separators_core(text: str, separators: Optional[List[str]]) -> Lis
         separators: List of separator strings to use for splitting (defaults applied inside)
 
     Returns:
-        List of text chunks with delimiters attached to the previous chunk
+        List of text chunks with delimiters attached to the previous chunk.
+        Joining *these* chunks reproduces the input exactly, separator-only
+        runs included. The guarantee is this function's alone: callers further
+        up strip and drop blank windows by design.
     """
     if not separators:
         separators = DEFAULT_SEPARATORS
 
     escaped_separators = [re.escape(sep) for sep in separators]
-    pattern = "|".join(f"({escaped_sep})" for escaped_sep in escaped_separators)
+    # One capturing group around the whole alternation, not one per separator:
+    # re.split emits an element for *every* group on each match, so N groups
+    # make the stride N+1 while the loop below walks it in twos. With the eight
+    # default separators that dropped every other delimiter, gluing words
+    # together ("CSV integration" -> "CSVintegration").
+    pattern = "(" + "|".join(escaped_separators) + ")"
 
     parts = re.split(pattern, text)
 
     chunks: List[str] = []
     for i in range(0, len(parts), 2):
-        if i + 1 < len(parts):
-            text_part = parts[i] if parts[i] is not None else ""
-            delimiter_part = parts[i + 1] if parts[i + 1] is not None else ""
-            chunk = text_part + delimiter_part
-            if chunk.strip():
-                chunks.append(chunk)
+        text_part = parts[i]
+        delimiter_part = parts[i + 1] if i + 1 < len(parts) else ""
+        chunk = text_part + delimiter_part
+        if not chunk:
+            continue
+        if text_part.strip():
+            chunks.append(chunk)
+        elif chunks:
+            # Adjacent separators ("。 " after a space) leave a piece with a
+            # delimiter but no text. It is still part of the document, so it
+            # joins the chunk it follows - dropping it deleted characters, and
+            # keeping it standalone made a chunk of pure punctuation.
+            chunks[-1] += chunk
         else:
-            text_part = parts[i] if parts[i] is not None else ""
-            if text_part.strip():
-                chunks.append(text_part)
+            # Only reachable for the very first fragment, when the text opens
+            # with a separator and there is nothing yet to attach it to.
+            chunks.append(chunk)
 
     return chunks
 
@@ -94,13 +109,15 @@ def _split_by_separators_with_metadata(
     separators: Optional[List[str]],
     source_paragraph: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
-    """Wrapper: returns structured chunks with metadata using the core splitter."""
+    """Wrapper: returns structured chunks with metadata using the core splitter.
+
+    Passes every unit through, which is what carries the core splitter's
+    lossless guarantee to this level. Filtering blank units here used to drop
+    the separator between two protected regions - the whole of a segment can be
+    blank when a code fence ends and the next one begins.
+    """
     units = _split_by_separators_core(text, separators)
-    return [
-        {"text": unit, "source_paragraph": source_paragraph}
-        for unit in units
-        if unit.strip()
-    ]
+    return [{"text": unit, "source_paragraph": source_paragraph} for unit in units]
 
 
 def _find_protected_ranges(

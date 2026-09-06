@@ -193,6 +193,25 @@ async def _create_knowledge_base_from_url_impl(
             ).model_dump()
         await kb_service.refresh_collection_metadata(collection_name)
 
+        if result.crawl_blocked_by_site:
+            # Narrower than status == "partial" on purpose: a partial caused by
+            # individual pages failing to parse keeps reporting success, which
+            # is the existing policy. This is the other kind - nothing failed,
+            # the site simply refused everything past the start page. The pages
+            # that did land stay published (re-importing would re-crawl them),
+            # but calling it success would let an agent build on a knowledge
+            # base holding one page.
+            return CreateKnowledgeBaseFromUrlResult(
+                success=False,
+                collection_name=collection_name,
+                message=(
+                    f"{result.message} '{collection_name}' is published and "
+                    f"usable with what did land. Re-importing under the same "
+                    f"crawl settings will hit the same refusals."
+                ),
+                pages_crawled=result.pages_crawled,
+            ).model_dump()
+
         return CreateKnowledgeBaseFromUrlResult(
             success=True,
             collection_name=collection_name,

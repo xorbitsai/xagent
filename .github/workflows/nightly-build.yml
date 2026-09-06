@@ -34,6 +34,9 @@ env:
 
 jobs:
   build-and-push-nightly:
+    # Upstream only: the schedule pushes to the xprobe/* Docker Hub namespace.
+    # workflow_dispatch stays open so a fork can test changes by hand.
+    if: github.event_name == 'workflow_dispatch' || github.repository_owner == 'xorbitsai'
     timeout-minutes: 240
     runs-on: ubuntu-latest
     permissions:
@@ -190,7 +193,8 @@ jobs:
           labels: ${{ steps.meta-frontend-ghcr.outputs.labels }}
 
       - name: Notify on failure
-        if: failure()
+        # Forks have Issues disabled by default, so this would just fail again.
+        if: ${{ failure() && github.repository_owner == 'xorbitsai' }}
         uses: actions/github-script@v9
         with:
           script: |

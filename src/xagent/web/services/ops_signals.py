@@ -54,8 +54,11 @@ INTERACTION_RUN_PARTITION_MISMATCH_DEGRADED = (
 )
 # Set by resolve_interaction_anchor (task_interaction_anchor.py) when the
 # trace_events row its pointer names fails the ownership/type/partition/
-# identity checks that make it a valid anchor. Deliberately not paired with
-# a clear site, the same reasoning as INTERACTION_ROLLOUT_UNKNOWN_TASK_SOURCE
+# identity checks that make it a valid anchor -- with one shape excluded: a
+# row that fails only the partition check, and only because the field is
+# absent, is a pre-existing row rather than a corrupt one and increments a
+# counter instead (see that resolver's own judgment table). Deliberately not
+# paired with a clear site, the same reasoning as INTERACTION_ROLLOUT_UNKNOWN_TASK_SOURCE
 # above: a corrupt anchor is a property of a persisted trace_events row, and
 # no in-process registry can observe that row being fixed. Auto-clearing
 # would assert "the data got fixed" without evidence for it.

@@ -1,9 +1,18 @@
-"""Tests for release_db_connection_if_clean (issue #889)."""
+"""Session transaction bookkeeping in models/database.py.
 
+Covers release_db_connection_if_clean (issue #889) and the root-transaction-end
+counter that the connector hook session boundary check reads.
+"""
+
+import pytest
 from sqlalchemy import Column, Integer, String, create_engine, insert, text, update
 from sqlalchemy.orm import declarative_base, sessionmaker
 
-from xagent.web.models.database import release_db_connection_if_clean
+from xagent.web.models.database import (
+    _ROOT_TXN_END_COUNT_KEY,
+    release_db_connection_if_clean,
+    root_transaction_end_count,
+)
 
 Base = declarative_base()
 
@@ -164,3 +173,75 @@ def test_none_session_is_noop():
 def test_no_transaction_returns_true():
     db = _make_session()
     assert release_db_connection_if_clean(db) is True
+
+
+def test_an_object_with_no_info_mapping_reports_no_count():
+    """A duck-typed session with no ``.info`` cannot report a count at all."""
+
+    class _NoInfo:
+        pass
+
+    assert root_transaction_end_count(_NoInfo()) is None
+
+
+def test_info_present_but_not_a_mapping_raises():
+    class _BadInfo:
+        info = "not-a-mapping"
+
+    with pytest.raises(AttributeError):
+        root_transaction_end_count(_BadInfo())
+
+
+def test_a_string_value_in_the_counter_key_raises():
+    db = _make_session()
+    db.info[_ROOT_TXN_END_COUNT_KEY] = "not-a-count"
+
+    with pytest.raises(TypeError):
+        root_transaction_end_count(db)
+
+
+def test_a_boolean_value_in_the_counter_key_raises():
+    """``isinstance(True, int)`` is ``True`` in Python; a hook writing a bare
+    boolean into the counter key must not be read back as a count of 1."""
+    db = _make_session()
+    db.info[_ROOT_TXN_END_COUNT_KEY] = True
+
+    with pytest.raises(TypeError):
+        root_transaction_end_count(db)
+
+
+def test_the_counter_and_the_write_flag_do_not_disturb_each_other():
+    """The write-flag listener and the root-transaction-end counter listener
+    both fire on ``after_transaction_end`` and must not step on each other."""
+    db = _make_session()
+    db.add(Item(name="outer"))
+    db.flush()
+
+    nested = db.begin_nested()
+    nested.commit()
+
+    # Savepoint completion clears neither the write flag nor the count.
+    assert release_db_connection_if_clean(db) is False
+    assert root_transaction_end_count(db) == 0
+
+    db.commit()
+    assert root_transaction_end_count(db) == 1
+
+    db.query(Item).all()
+    assert release_db_connection_if_clean(db) is True
+    assert root_transaction_end_count(db) == 2
+
+
+def test_a_non_count_value_does_not_raise_from_inside_the_listener():
+    """A hook that leaves a non-count value in the counter key while the
+    transaction is still open must not make ``commit()`` itself raise: the
+    listener has to tolerate it and reset, leaving the refusal to
+    ``root_transaction_end_count`` on the next read."""
+    db = _make_session()
+    db.add(Item(name="one"))
+    db.info[_ROOT_TXN_END_COUNT_KEY] = "not-a-count"
+
+    db.commit()
+
+    assert db.query(Item).count() == 1
+    assert root_transaction_end_count(db) == 1

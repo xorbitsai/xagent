@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from xagent.core.agent.runner import UserMessageInjectionOutcome
 from xagent.web.api import websocket as websocket_api
 from xagent.web.api.websocket import (
     ResumeReservationOutcome,
@@ -107,7 +108,16 @@ def _live_control_environment(
     agent = MagicMock()
     agent.supports_live_control.return_value = True
     agent.get_dag_pattern.return_value = None
-    agent.post_user_message = AsyncMock(return_value=True)
+    # The injection outcome is read two ways downstream: truthiness (did an
+    # exact checkpoint accept the message at all) and identity against
+    # ``POSTED_FRESH`` (did this call write a new turn, as opposed to a
+    # replayed one). A bare ``True`` satisfies the first read but is never
+    # ``is POSTED_FRESH``, so it silently skips the branch that fires only
+    # on identity -- the stub has to be a real enum member to exercise that
+    # branch at all.
+    agent.post_user_message = AsyncMock(
+        return_value=UserMessageInjectionOutcome.POSTED_FRESH
+    )
     if background_manager is None:
         background_manager = MagicMock()
         background_manager.try_reserve_resume.return_value = outcome
@@ -283,11 +293,24 @@ async def test_dispatcher_reclaims_and_applies_message_after_contention_clears(
         background_manager.release_resume_reservation(int(task.id))
         stored.claim_expires_at = None
         db_session.commit()
-        assert await dispatch_one_task_command(
-            execute_durable_task_command,
-            command_db_id=enqueued.command_id,
-        )
-        await asyncio.sleep(0)
+        # A stub that is truthy but not `is POSTED_FRESH` would let the
+        # dispatch above still report success while silently skipping the
+        # legacy-interaction close below it -- truthiness alone cannot tell
+        # the two apart. `wraps=` keeps the real close running (so its own
+        # behavior is unchanged) and only counts how often it ran, making a
+        # stub that regresses to a truthy-but-wrong-identity value fail
+        # here instead of passing unnoticed.
+        with patch.object(
+            websocket_api,
+            "close_legacy_resume_interaction_sync",
+            wraps=websocket_api.close_legacy_resume_interaction_sync,
+        ) as close_spy:
+            assert await dispatch_one_task_command(
+                execute_durable_task_command,
+                command_db_id=enqueued.command_id,
+            )
+            await asyncio.sleep(0)
+        assert close_spy.call_count == 1
 
     db_session.expire_all()
     stored = db_session.get(TaskExecutionCommand, enqueued.command_id)

@@ -1212,9 +1212,10 @@ def test_concurrent_registration_of_one_path_uses_one_workspace_owner(
                 attempts += 1
                 attempt = attempts
             if attempt == 2:
-                assert not registration_lock.acquire(blocking=False), (
-                    "the first registration must still hold the lock"
-                )
+                acquired = registration_lock.acquire(blocking=False)
+                if acquired:
+                    registration_lock.release()
+                assert not acquired, "the first registration must still hold the lock"
                 second_attempted.set()
             registration_lock.acquire()
             if attempt == 1:

@@ -431,12 +431,15 @@ def resolve_agent_runtime_requirements(
 
     Calls ``resolve_agent_selected_connectors`` exactly once. The returned
     refs are ``_runtime_declared_refs`` applied to that same call's result
-    -- same filter, same order -- because a caller creating a task persists
-    them verbatim into ``Task.connector_runtime_selected_refs``, and every
-    later reader of that column (the per-turn gate, the values endpoint's
-    selection check, ``load_connector_runtime_view``) depends on it holding
-    exactly that set in exactly that order. Do not derive the refs any
-    other way, even one that looks equivalent.
+    -- same filter, same canonical order -- because a caller creating a
+    task persists them into ``Task.connector_runtime_selected_refs``, and
+    every later reader of that column (the per-turn gate,
+    ``load_connector_runtime_view``) depends on it holding exactly that
+    set. Both the write and the read of that column sort by
+    ``(connector_type, connector_id)``, so the invariant the column
+    carries is the set under that canonical order, not the order a caller
+    happened to hand over. Do not derive the refs any other way, even one
+    that looks equivalent.
 
     The report has no task to consult, so every input's ``satisfied`` is
     ``False`` and the top-level ``satisfied`` answers "would a task created

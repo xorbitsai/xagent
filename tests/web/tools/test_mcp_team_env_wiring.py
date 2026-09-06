@@ -27,9 +27,12 @@ throughout):
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import threading
 from collections.abc import Iterator
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 from sqlalchemy import create_engine
@@ -40,7 +43,10 @@ from xagent.core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeEr
 from xagent.core.tools.adapters.vibe.mcp_tools import create_mcp_tools
 from xagent.web.models import Base, MCPServer, User, UserMCPServer
 from xagent.web.services import agent_team_scope, connector_team_scope, mcp_runtime
-from xagent.web.tools.config import WebToolConfig
+from xagent.web.tools.config import (
+    WebToolConfig,
+    _load_mcp_team_hook_snapshot_from_db,
+)
 
 T1 = 301  # the governing team throughout this file
 T2 = 302  # a team the runner might also belong to, never the governing one
@@ -155,6 +161,9 @@ def seed(db_session: Session):
     personal_server = _create_stdio_mcp(
         db_session, "personal-server", owner=c, env={"GLOBAL": "global-value"}
     )
+    # StaticPool shares one DBAPI connection across caller and worker Sessions.
+    # Commit first because closing the worker can roll back shared pending rows.
+    db_session.commit()
     return SimpleNamespace(
         c=c, team_server=team_server, personal_server=personal_server
     )
@@ -180,6 +189,9 @@ def _cfg(db_session: Session, seed, *, connector_team_id: int | None) -> WebTool
 
 
 async def _env_for(db_session, seed, server, *, connector_team_id) -> dict:
+    # Tests add links after the seed fixture commits. Commit those per-test rows
+    # here before the worker snapshot; the seed fixture cannot include them.
+    db_session.commit()
     cfg = _cfg(db_session, seed, connector_team_id=connector_team_id)
     configs = await cfg._load_mcp_server_configs()
     (config,) = [c for c in configs if c["id"] == int(server.id)]
@@ -204,6 +216,9 @@ def _create_http_mcp(db: Session, name: str) -> MCPServer:
 
 
 async def _config_for(db_session, seed, server, *, connector_team_id) -> dict:
+    # Tests add links after the seed fixture commits. Commit those per-test rows
+    # here before the worker snapshot; the seed fixture cannot include them.
+    db_session.commit()
     cfg = _cfg(db_session, seed, connector_team_id=connector_team_id)
     configs = await cfg._load_mcp_server_configs()
     (config,) = [c for c in configs if c["id"] == int(server.id)]
@@ -218,6 +233,40 @@ async def _config_for(db_session, seed, server, *, connector_team_id) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def test_team_env_snapshot_mapping_is_read_only(db_session, seed):
+    server_id = int(seed.team_server.id)
+    _install_visibility(ids_by_team={T1: {server_id}})
+    mcp_runtime.set_mcp_team_env_hook(
+        lambda db, *, team_id: {server_id: {"TEAM_KEY": "team-value"}}
+    )
+
+    snapshot = _load_mcp_team_hook_snapshot_from_db(
+        db_session,
+        user_id=int(seed.c.id),
+        connector_team_id=T1,
+    )
+
+    assert snapshot.team_env_by_id[server_id]["TEAM_KEY"] == "team-value"
+    with pytest.raises(TypeError):
+        cast(dict[int, dict[str, str]], snapshot.team_env_by_id)[server_id] = {}
+
+
+def test_team_env_snapshot_detaches_nested_hook_values(db_session, seed):
+    server_id = int(seed.team_server.id)
+    hook_owned = {server_id: {"TEAM_KEY": "initial"}}
+    _install_visibility(ids_by_team={T1: {server_id}})
+    mcp_runtime.set_mcp_team_env_hook(lambda db, *, team_id: hook_owned)
+
+    snapshot = _load_mcp_team_hook_snapshot_from_db(
+        db_session,
+        user_id=int(seed.c.id),
+        connector_team_id=T1,
+    )
+    hook_owned[server_id]["TEAM_KEY"] = "mutated"
+
+    assert snapshot.team_env_by_id[server_id]["TEAM_KEY"] == "initial"
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "runner_is_member", [True, False], ids=["member", "non-member"]
@@ -225,22 +274,69 @@ async def _config_for(db_session, seed, server, *, connector_team_id) -> dict:
 async def test_team_env_layer_keyed_on_governing_team(
     db_session, seed, runner_is_member
 ):
-    _install_visibility(ids_by_team={T1: {int(seed.team_server.id)}})
+    team_server_id = int(seed.team_server.id)
+    run_user_id = int(seed.c.id)
+    _install_visibility(ids_by_team={T1: {team_server_id}})
     mcp_runtime.set_mcp_team_env_hook(
         lambda db, *, team_id: (
-            {seed.team_server.id: {"TEAM_KEY": "team-value"}} if team_id == T1 else {}
+            {team_server_id: {"TEAM_KEY": "team-value"}} if team_id == T1 else {}
         )
     )
     agent_team_scope.set_agent_team_scope_hook(
         lambda db, user_id: (
             agent_team_scope.AgentTeamScope(team_id=T1, is_team_admin=False)
-            if runner_is_member and user_id == int(seed.c.id)
+            if runner_is_member and user_id == run_user_id
             else None
         )
     )
 
     env = await _env_for(db_session, seed, seed.team_server, connector_team_id=T1)
     assert env.get("TEAM_KEY") == "team-value"
+
+
+@pytest.mark.asyncio
+async def test_team_env_hook_wait_does_not_block_event_loop(db_session, seed):
+    _install_visibility(ids_by_team={T1: {int(seed.team_server.id)}})
+    release = threading.Event()
+    wait_results: list[bool] = []
+    ticks_during_hook: list[int] = []
+    # This diagnostic targets CPython. Its GIL serializes these integer reads
+    # and writes, and the threshold allows substantial scheduling variance.
+    ticks = 0
+    stop = False
+    team_server_id = int(seed.team_server.id)
+
+    def blocking_team_env(db, *, team_id):
+        ticks_before_wait = ticks
+        timer = threading.Timer(0.1, release.set)
+        timer.daemon = True
+        timer.start()
+        wait_results.append(release.wait(timeout=1))
+        ticks_during_hook.append(ticks - ticks_before_wait)
+        return {team_server_id: {"TEAM_KEY": "team-value"}}
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while not stop:
+            ticks += 1
+            await asyncio.sleep(0.01)
+
+    mcp_runtime.set_mcp_team_env_hook(blocking_team_env)
+    ticker_task = asyncio.create_task(ticker())
+    try:
+        config = await _config_for(
+            db_session,
+            seed,
+            seed.team_server,
+            connector_team_id=T1,
+        )
+    finally:
+        stop = True
+        await ticker_task
+
+    assert wait_results == [True]
+    assert ticks_during_hook[0] >= 3
+    assert config["config"]["env"]["TEAM_KEY"] == "team-value"
 
 
 # ---------------------------------------------------------------------------
@@ -312,7 +408,8 @@ async def test_empty_team_mcp_ids_never_invokes_team_env_hook(db_session, seed):
 
 @pytest.mark.asyncio
 async def test_no_cross_team_env_borrowing(db_session, seed):
-    _install_visibility(ids_by_team={T1: {int(seed.team_server.id)}})
+    team_server_id = int(seed.team_server.id)
+    _install_visibility(ids_by_team={T1: {team_server_id}})
     # T1 (governing) has no row; T2 (a different team) does -- this must
     # never surface, and production code never even calls the hook with
     # team_id=T2 for this run.
@@ -321,7 +418,7 @@ async def test_no_cross_team_env_borrowing(db_session, seed):
     def hook(db, *, team_id):
         calls.append(team_id)
         if team_id == T2:
-            return {seed.team_server.id: {"STOLEN": "stolen-value"}}
+            return {team_server_id: {"STOLEN": "stolen-value"}}
         return {}
 
     mcp_runtime.set_mcp_team_env_hook(hook)
@@ -386,10 +483,11 @@ async def test_governing_team_no_row_scrubs_legacy_shared_value(db_session, seed
 async def test_shared_pick_degrades_when_owning_team_has_no_row(
     db_session, seed, has_own_key
 ):
-    _install_visibility(ids_by_team={T1: {int(seed.team_server.id)}})
+    team_server_id = int(seed.team_server.id)
+    _install_visibility(ids_by_team={T1: {team_server_id}})
     mcp_runtime.set_mcp_team_env_hook(
         lambda db, *, team_id: (
-            {seed.team_server.id: {"STOLEN": "stolen-value"}} if team_id == T2 else {}
+            {team_server_id: {"STOLEN": "stolen-value"}} if team_id == T2 else {}
         )
     )
     _link_own_env(
@@ -419,10 +517,11 @@ async def test_shared_pick_degrades_when_owning_team_has_no_row(
 
 @pytest.mark.asyncio
 async def test_team_env_occupies_shared_slot_user_still_wins(db_session, seed):
-    _install_visibility(ids_by_team={T1: {int(seed.team_server.id)}})
+    team_server_id = int(seed.team_server.id)
+    _install_visibility(ids_by_team={T1: {team_server_id}})
     mcp_runtime.set_mcp_team_env_hook(
         lambda db, *, team_id: (
-            {seed.team_server.id: {"SHARED_KEY": "from-team", "ONLY_TEAM": "team-only"}}
+            {team_server_id: {"SHARED_KEY": "from-team", "ONLY_TEAM": "team-only"}}
             if team_id == T1
             else {}
         )
@@ -509,12 +608,14 @@ async def test_installed_hook_answering_empty_still_applies_degrade(db_session, 
 
 @pytest.mark.asyncio
 async def test_ids_outside_team_mcp_ids_untouched(db_session, seed):
-    _install_visibility(ids_by_team={T1: {int(seed.team_server.id)}})
+    team_server_id = int(seed.team_server.id)
+    personal_server_id = int(seed.personal_server.id)
+    _install_visibility(ids_by_team={T1: {team_server_id}})
     mcp_runtime.set_mcp_team_env_hook(
         lambda db, *, team_id: (
             {
-                seed.team_server.id: {"TEAM_KEY": "team-value"},
-                seed.personal_server.id: {"SHOULD_NOT_APPEAR": "leak"},
+                team_server_id: {"TEAM_KEY": "team-value"},
+                personal_server_id: {"SHOULD_NOT_APPEAR": "leak"},
             }
             if team_id == T1
             else {}
@@ -627,10 +728,11 @@ async def test_shared_pick_with_team_row_uses_the_team_row(db_session, seed):
     """The pick="shared" + row-PRESENT combination: the team row is the
     shared layer and the runner's own key is not merged at all. The
     row-ABSENT half of this pick is pinned separately above."""
-    _install_visibility(ids_by_team={T1: {int(seed.team_server.id)}})
+    team_server_id = int(seed.team_server.id)
+    _install_visibility(ids_by_team={T1: {team_server_id}})
     mcp_runtime.set_mcp_team_env_hook(
         lambda db, *, team_id: (
-            {seed.team_server.id: {"TEAM_KEY": "team-value"}} if team_id == T1 else {}
+            {team_server_id: {"TEAM_KEY": "team-value"}} if team_id == T1 else {}
         )
     )
     _link_own_env(
@@ -653,10 +755,11 @@ async def test_own_pick_on_a_team_server_ignores_the_team_row(db_session, seed):
     """Removing the `== "shared"` condition from the degrade in the wiring
     block would flip this pick to the legacy fallback and leak the team row
     into an "own" run; nothing else in this file would notice."""
-    _install_visibility(ids_by_team={T1: {int(seed.team_server.id)}})
+    team_server_id = int(seed.team_server.id)
+    _install_visibility(ids_by_team={T1: {team_server_id}})
     mcp_runtime.set_mcp_team_env_hook(
         lambda db, *, team_id: (
-            {seed.team_server.id: {"TEAM_KEY": "team-value"}} if team_id == T1 else {}
+            {team_server_id: {"TEAM_KEY": "team-value"}} if team_id == T1 else {}
         )
     )
     _link_own_env(
@@ -676,10 +779,11 @@ async def test_own_pick_on_a_team_server_ignores_the_team_row(db_session, seed):
 
 @pytest.mark.asyncio
 async def test_platform_pick_on_a_team_server_stays_global_only(db_session, seed):
-    _install_visibility(ids_by_team={T1: {int(seed.team_server.id)}})
+    team_server_id = int(seed.team_server.id)
+    _install_visibility(ids_by_team={T1: {team_server_id}})
     mcp_runtime.set_mcp_team_env_hook(
         lambda db, *, team_id: (
-            {seed.team_server.id: {"TEAM_KEY": "team-value"}} if team_id == T1 else {}
+            {team_server_id: {"TEAM_KEY": "team-value"}} if team_id == T1 else {}
         )
     )
     _link_own_env(
@@ -704,11 +808,12 @@ async def test_non_stdio_team_server_never_receives_an_env_layer(db_session):
     c = _create_user(db_session, "run-owner")
     http_server = _create_http_mcp(db_session, "team-http-server")
     seed = SimpleNamespace(c=c, team_server=http_server, personal_server=http_server)
+    http_server_id = int(http_server.id)
 
-    _install_visibility(ids_by_team={T1: {int(http_server.id)}})
+    _install_visibility(ids_by_team={T1: {http_server_id}})
     mcp_runtime.set_mcp_team_env_hook(
         lambda db, *, team_id: (
-            {http_server.id: {"TEAM_KEY": "team-value"}} if team_id == T1 else {}
+            {http_server_id: {"TEAM_KEY": "team-value"}} if team_id == T1 else {}
         )
     )
 
@@ -729,7 +834,8 @@ async def test_empty_team_row_behaves_exactly_like_no_row(db_session, seed):
     """A stored row carrying an empty env mapping must be indistinguishable
     from no row at all. Both are run here and their outcomes compared
     directly, so the two states cannot drift apart later."""
-    _install_visibility(ids_by_team={T1: {int(seed.team_server.id)}})
+    team_server_id = int(seed.team_server.id)
+    _install_visibility(ids_by_team={T1: {team_server_id}})
     _link_own_env(
         db_session,
         user=seed.c,
@@ -738,7 +844,7 @@ async def test_empty_team_row_behaves_exactly_like_no_row(db_session, seed):
         env_source="shared",
     )
 
-    mcp_runtime.set_mcp_team_env_hook(lambda db, *, team_id: {seed.team_server.id: {}})
+    mcp_runtime.set_mcp_team_env_hook(lambda db, *, team_id: {team_server_id: {}})
     env_empty_row = await _env_for(
         db_session, seed, seed.team_server, connector_team_id=T1
     )

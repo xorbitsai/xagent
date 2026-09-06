@@ -20,19 +20,24 @@ Fixture seed (five MCP rows, run owner ``C`` throughout unless noted):
 
 from __future__ import annotations
 
+import asyncio
+import threading
 from collections.abc import Iterator
 from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.pool import StaticPool
+from sqlalchemy.pool import QueuePool, StaticPool
 
+from xagent.core.tools.adapters.vibe.config import MCPConfigLoadError
 from xagent.core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
 from xagent.core.tools.adapters.vibe.mcp_tools import create_mcp_tools
 from xagent.web.models import Base, MCPServer, User, UserMCPServer
 from xagent.web.services import agent_team_scope, connector_team_scope
+from xagent.web.tools import config as config_module
 from xagent.web.tools.config import WebToolConfig
 
 T1 = 101
@@ -41,6 +46,16 @@ T2 = 102
 
 class _ProbeError(RuntimeError):
     """Distinguishable failure raised by a broken team-visibility hook."""
+
+
+class _QueryDb:
+    """Non-Session database double with the loader's supported query surface."""
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def query(self, *entities):
+        return self._session.query(*entities)
 
 
 @pytest.fixture()
@@ -111,6 +126,9 @@ def seed(db_session: Session):
     stranger = _create_mcp(db_session, "stranger", owner=z)
     team_s = _create_mcp(db_session, "team-s")
     team_x = _create_mcp(db_session, "team-x")
+    # StaticPool shares one DBAPI connection across caller and worker Sessions.
+    # Commit first because closing the worker can roll back shared pending rows.
+    db_session.commit()
     return SimpleNamespace(
         c=c,
         z=z,
@@ -151,12 +169,14 @@ def install_team_hooks(*, team_visibility, agent_owner_id: int) -> None:
 
 def _team_visibility_hook(seed):
     """A team_visibility hook whose answer is disjoint per team, empty otherwise."""
+    team_s_id = int(seed.team_s.id)
+    team_x_id = int(seed.team_x.id)
 
     def _hook(db, *, team_id):
         if team_id == T1:
-            return {"mcp": {int(seed.team_s.id)}, "custom_api": set()}
+            return {"mcp": {team_s_id}, "custom_api": set()}
         if team_id == T2:
-            return {"mcp": {int(seed.team_x.id)}, "custom_api": set()}
+            return {"mcp": {team_x_id}, "custom_api": set()}
         return {"mcp": set(), "custom_api": set()}
 
     return _hook
@@ -207,6 +227,176 @@ async def test_no_hooks_matches_legacy_result_set(db_session, seed, connector_te
 # A team agent resolves its team's connector for a run owner with no
 # personal row on that server.
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_mcp_team_snapshot_uses_query_shaped_db_inline(db_session, seed):
+    team_server_id = int(seed.team_s.id)
+    hook_databases: list[object] = []
+    query_db = _QueryDb(db_session)
+
+    def team_visibility(hook_db, *, team_id):
+        hook_databases.append(hook_db)
+        return {
+            "mcp": {team_server_id} if team_id == T1 else set(),
+            "custom_api": set(),
+        }
+
+    install_team_hooks(
+        team_visibility=team_visibility,
+        agent_owner_id=int(seed.c.id),
+    )
+    cfg = WebToolConfig(
+        db=query_db,
+        request=None,
+        user_id=int(seed.c.id),
+        connector_team_id=T1,
+        include_mcp_tools=True,
+    )
+
+    configs = await cfg._load_mcp_server_configs()
+
+    assert hook_databases == [query_db]
+    assert {config["name"] for config in configs} == {
+        seed.active_own.name,
+        seed.team_s.name,
+    }
+
+
+@pytest.mark.asyncio
+async def test_mcp_team_snapshot_resolves_factory_before_worker(
+    db_session, seed, monkeypatch
+):
+    team_server_id = int(seed.team_s.id)
+    connector_team_scope.set_connector_team_hooks(
+        team_visibility=lambda db, *, team_id: {
+            "mcp": {team_server_id} if team_id == T1 else set(),
+            "custom_api": set(),
+        }
+    )
+    cfg = _cfg(db_session, seed, connector_team_id=T1)
+    main_thread_id = threading.get_ident()
+    factory_thread_ids: list[int] = []
+    worker_thread_ids: list[int] = []
+    factory_resolved = False
+    caller_released = False
+    original_get_session_factory = cfg.get_session_factory
+    original_release = cfg.release_db_connection
+
+    def record_session_factory():
+        nonlocal factory_resolved
+        assert not caller_released
+        factory_thread_ids.append(threading.get_ident())
+        factory_resolved = True
+        session_factory = original_get_session_factory()
+
+        def worker_session_factory():
+            worker_thread_ids.append(threading.get_ident())
+            return session_factory()
+
+        return worker_session_factory
+
+    def record_release():
+        nonlocal caller_released
+        assert factory_resolved
+        caller_released = True
+        return original_release()
+
+    monkeypatch.setattr(cfg, "get_session_factory", record_session_factory)
+    monkeypatch.setattr(cfg, "release_db_connection", record_release)
+
+    configs = await cfg._load_mcp_server_configs()
+
+    assert factory_thread_ids == [main_thread_id]
+    assert worker_thread_ids and worker_thread_ids[0] != main_thread_id
+    assert {config["name"] for config in configs} == {
+        seed.active_own.name,
+        seed.team_s.name,
+    }
+
+
+@pytest.mark.asyncio
+async def test_team_hook_wait_does_not_block_event_loop(db_session, seed):
+    release = threading.Event()
+    wait_results: list[bool] = []
+    ticks_during_hook: list[int] = []
+    # This diagnostic targets CPython. Its GIL serializes these integer reads
+    # and writes, and the threshold allows substantial scheduling variance.
+    ticks = 0
+    stop = False
+    team_server_id = int(seed.team_s.id)
+
+    def blocking_visibility(db, *, team_id):
+        ticks_before_wait = ticks
+        timer = threading.Timer(0.1, release.set)
+        timer.daemon = True
+        timer.start()
+        wait_results.append(release.wait(timeout=1))
+        ticks_during_hook.append(ticks - ticks_before_wait)
+        return {
+            "mcp": {team_server_id} if team_id == T1 else set(),
+            "custom_api": set(),
+        }
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while not stop:
+            ticks += 1
+            await asyncio.sleep(0.01)
+
+    install_team_hooks(
+        team_visibility=blocking_visibility,
+        agent_owner_id=int(seed.c.id),
+    )
+    ticker_task = asyncio.create_task(ticker())
+    try:
+        configs = await _cfg(
+            db_session, seed, connector_team_id=T1
+        )._load_mcp_server_configs()
+    finally:
+        stop = True
+        await ticker_task
+
+    assert wait_results == [True]
+    assert ticks_during_hook[0] >= 3
+    assert {config["name"] for config in configs} == {
+        seed.active_own.name,
+        seed.team_s.name,
+    }
+
+
+@pytest.mark.asyncio
+async def test_mcp_team_snapshot_drains_worker_before_cancellation(db_session, seed):
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    wait_results: list[bool] = []
+
+    def blocking_visibility(db, *, team_id):
+        started.set()
+        wait_results.append(release.wait(timeout=1))
+        finished.set()
+        return {"mcp": set(), "custom_api": set()}
+
+    install_team_hooks(
+        team_visibility=blocking_visibility,
+        agent_owner_id=int(seed.c.id),
+    )
+    caller = asyncio.create_task(
+        _cfg(db_session, seed, connector_team_id=T1)._load_mcp_server_configs()
+    )
+    assert await asyncio.to_thread(started.wait, 1)
+
+    caller.cancel()
+    await asyncio.sleep(0.02)
+    assert not caller.done()
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(caller, timeout=1)
+
+    assert wait_results == [True]
+    assert finished.is_set()
 
 
 @pytest.mark.asyncio
@@ -427,9 +617,11 @@ async def test_direct_private_loader_call_resolves_nothing_without_identity(db_s
     knows the measured behaviour without identity is silence, not a leak.
     """
     team_server = _create_mcp(db_session, "team-only-private-loader-probe")
+    team_server_id = int(team_server.id)
+    db_session.commit()
     connector_team_scope.set_connector_team_hooks(
         team_visibility=lambda db, *, team_id: (
-            {"mcp": {int(team_server.id)}, "custom_api": set()}
+            {"mcp": {team_server_id}, "custom_api": set()}
             if team_id == T1
             else {"mcp": set(), "custom_api": set()}
         )
@@ -446,3 +638,233 @@ async def test_direct_private_loader_call_resolves_nothing_without_identity(db_s
         assert configs == []
     finally:
         connector_team_scope.set_connector_team_hooks()
+
+
+@pytest.mark.asyncio
+async def test_mcp_team_snapshot_maps_unexpected_error_to_config_error(
+    db_session, seed, monkeypatch
+):
+    failure = _ProbeError("unexpected worker failure")
+
+    def fail_snapshot(*args, **kwargs):
+        raise failure
+
+    connector_team_scope.set_connector_team_hooks(
+        team_visibility=lambda db, *, team_id: {
+            "mcp": set(),
+            "custom_api": set(),
+        }
+    )
+    monkeypatch.setattr(config_module, "_run_with_checked_out_session", fail_snapshot)
+    cfg = _cfg(db_session, seed, connector_team_id=T1)
+
+    with pytest.raises(MCPConfigLoadError) as excinfo:
+        await cfg._load_mcp_server_configs()
+
+    assert excinfo.value.__cause__ is failure
+
+
+@pytest.mark.asyncio
+async def test_mcp_team_snapshot_maps_pool_timeout_to_config_error(tmp_path):
+    """A saturated worker checkout must keep MCP failure handling typed."""
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'mcp-team-timeout.db'}",
+        poolclass=QueuePool,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=0.05,
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(bind=engine)
+    factory = sessionmaker(bind=engine)
+    db = factory()
+    try:
+        user = User(username="pending-team-user", password_hash="hash")
+        db.add(user)
+        db.flush()
+        connector_team_scope.set_connector_team_hooks(
+            team_visibility=lambda db, *, team_id: {
+                "mcp": set(),
+                "custom_api": set(),
+            }
+        )
+        cfg = WebToolConfig(
+            db=db,
+            request=None,
+            user_id=int(user.id),
+            connector_team_id=T1,
+            include_mcp_tools=True,
+        )
+
+        with pytest.raises(MCPConfigLoadError) as exc_info:
+            await cfg._load_mcp_server_configs()
+
+        assert isinstance(exc_info.value.__cause__, SQLAlchemyTimeoutError)
+    finally:
+        db.rollback()
+        db.close()
+        Base.metadata.drop_all(bind=engine)
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_mcp_team_snapshot_keeps_dirty_caller_session(tmp_path):
+    """A dirty caller can keep its connection when the pool has spare capacity."""
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'mcp-team-dirty-caller.db'}",
+        poolclass=QueuePool,
+        pool_size=2,
+        max_overflow=0,
+        pool_timeout=0.05,
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(bind=engine)
+    factory = sessionmaker(bind=engine)
+    db = factory()
+    try:
+        user = _create_user(db, "dirty-caller-user")
+        server = _create_mcp(db, "dirty-caller-server", owner=user)
+        user_id = int(user.id)
+        server_id = int(server.id)
+        db.commit()
+
+        pending = User(username="pending-dirty-user", password_hash="hash")
+        db.add(pending)
+        db.flush()
+
+        def team_visibility(hook_db, *, team_id):
+            hook_db.connection()
+            return {
+                "mcp": {server_id} if team_id == T1 else set(),
+                "custom_api": set(),
+            }
+
+        connector_team_scope.set_connector_team_hooks(team_visibility=team_visibility)
+        cfg = WebToolConfig(
+            db=db,
+            request=None,
+            user_id=user_id,
+            connector_team_id=T1,
+            include_mcp_tools=True,
+        )
+
+        assert engine.pool.checkedout() == 1
+        configs = await cfg._load_mcp_server_configs()
+
+        assert {config["id"] for config in configs} == {server_id}
+        assert engine.pool.checkedout() == 1
+        assert pending in db
+    finally:
+        db.rollback()
+        db.close()
+        Base.metadata.drop_all(bind=engine)
+        engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("connector_team_id", "install_hook"),
+    [(None, True), (T1, False)],
+    ids=["no-team", "no-hook"],
+)
+@pytest.mark.asyncio
+async def test_mcp_team_snapshot_skips_worker_without_team_scope(
+    tmp_path, connector_team_id, install_hook
+):
+    """No team-hook work must not require a second pool connection."""
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'mcp-team-skip.db'}",
+        poolclass=QueuePool,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=0.05,
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(bind=engine)
+    factory = sessionmaker(bind=engine)
+    db = factory()
+    try:
+        user = User(username="pending-user", password_hash="hash")
+        db.add(user)
+        db.flush()
+        if install_hook:
+            connector_team_scope.set_connector_team_hooks(
+                team_visibility=lambda db, *, team_id: {
+                    "mcp": set(),
+                    "custom_api": set(),
+                }
+            )
+        cfg = WebToolConfig(
+            db=db,
+            request=None,
+            user_id=int(user.id),
+            connector_team_id=connector_team_id,
+            include_mcp_tools=True,
+        )
+
+        assert engine.pool.checkedout() == 1
+        assert await cfg._load_mcp_server_configs() == []
+        assert engine.pool.checkedout() == 1
+    finally:
+        db.rollback()
+        db.close()
+        Base.metadata.drop_all(bind=engine)
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_mcp_team_snapshot_releases_clean_caller_session(tmp_path):
+    """The worker checks out its own connection after the caller releases one."""
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'mcp-team-handoff.db'}",
+        poolclass=QueuePool,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=0.05,
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(bind=engine)
+    factory = sessionmaker(bind=engine)
+    db = factory()
+    main_thread_id = threading.get_ident()
+    hook_session_ids: list[int] = []
+    hook_thread_ids: list[int] = []
+    try:
+        user = _create_user(db, "handoff-user")
+        server = _create_mcp(db, "handoff-server", owner=user)
+        user_id = int(user.id)
+        server_id = int(server.id)
+        db.commit()
+
+        def team_visibility(hook_db, *, team_id):
+            hook_session_ids.append(id(hook_db))
+            hook_thread_ids.append(threading.get_ident())
+            return {
+                "mcp": {server_id} if team_id == T1 else set(),
+                "custom_api": set(),
+            }
+
+        connector_team_scope.set_connector_team_hooks(team_visibility=team_visibility)
+        cfg = WebToolConfig(
+            db=db,
+            request=None,
+            user_id=user_id,
+            connector_team_id=T1,
+            include_mcp_tools=True,
+        )
+
+        assert db.query(MCPServer).all() == [server]
+        assert engine.pool.checkedout() == 1
+
+        configs = await cfg._load_mcp_server_configs()
+
+        assert {config["id"] for config in configs} == {server_id}
+        assert hook_session_ids and hook_session_ids[0] != id(db)
+        assert hook_thread_ids and hook_thread_ids[0] != main_thread_id
+        assert engine.pool.checkedout() == 1
+
+        db.rollback()
+        assert engine.pool.checkedout() == 0
+    finally:
+        db.close()
+        Base.metadata.drop_all(bind=engine)
+        engine.dispose()

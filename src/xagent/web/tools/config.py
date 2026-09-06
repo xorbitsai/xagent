@@ -1288,6 +1288,45 @@ def _run_with_checked_out_session(
         return operation(db)
 
 
+@dataclass(frozen=True)
+class _MCPTeamHookSnapshot:
+    """Detached result of the team-scoped MCP hooks."""
+
+    mcp_ids: frozenset[int]
+    team_env_by_id: Mapping[int, dict[str, str]]
+    team_env_hook_installed: bool
+
+
+def _load_mcp_team_hook_snapshot_from_db(
+    db: Any,
+    *,
+    user_id: int | None,
+    connector_team_id: int | None,
+) -> _MCPTeamHookSnapshot:
+    """Read hook values from a caller-owned database handle and detach them."""
+    from ..services.connector_team_scope import resolve_team_connector_ids_or_raise
+    from ..services.mcp_runtime import (
+        load_team_env_overrides,
+        team_env_hook_installed,
+    )
+
+    mcp_ids = frozenset(
+        resolve_team_connector_ids_or_raise(
+            db, team_id=connector_team_id, log_subject=user_id
+        )["mcp"]
+    )
+    has_team_env_hook = team_env_hook_installed()
+    team_env_by_id: Mapping[int, dict[str, str]] = {}
+    if connector_team_id is not None and mcp_ids and has_team_env_hook:
+        # Prevent later hook-side mutation through nested dictionary aliases.
+        team_env_by_id = copy.deepcopy(load_team_env_overrides(db, connector_team_id))
+    return _MCPTeamHookSnapshot(
+        mcp_ids=mcp_ids,
+        team_env_by_id=MappingProxyType(team_env_by_id),
+        team_env_hook_installed=has_team_env_hook,
+    )
+
+
 def _load_tool_factory_runtime_snapshot(
     session_factory: Any,
     plan: _ToolFactoryRuntimeLoadPlan,
@@ -2665,6 +2704,12 @@ class WebToolConfig(BaseToolConfig):
         # an earlier in-request read must not latch deny-all onto this snapshot.
         self._unresolved_tool_policy_inputs.clear()
 
+    def _needs_inline_db(self) -> bool:
+        """Return True for database doubles that cannot mint worker Sessions."""
+        from sqlalchemy.orm import Session
+
+        return self._db_factory is None and not isinstance(self._live_db, Session)
+
     async def prepare_factory_runtime(self) -> None:
         """Prefetch synchronous ToolFactory inputs without blocking its loop.
 
@@ -2672,15 +2717,12 @@ class WebToolConfig(BaseToolConfig):
         owns and closes every Session it creates; the request Session and ORM
         user retained by this config never cross the thread boundary.
         """
-        if self._db_factory is None:
-            from sqlalchemy.orm import Session
-
-            # Some standalone/test configs supply duck-typed DB objects rather
-            # than a real SQLAlchemy Session. They retain the legacy synchronous
-            # getter contract; there is no safe engine from which to mint a
-            # worker-owned Session.
-            if not isinstance(self._live_db, Session):
-                return
+        # Some standalone/test configs supply duck-typed DB objects rather
+        # than a real SQLAlchemy Session. They retain the legacy synchronous
+        # getter contract; there is no safe engine from which to mint a
+        # worker-owned Session.
+        if self._needs_inline_db():
+            return
 
         from ..services.db_runtime import run_db_io_cancellation_safe
 
@@ -2802,9 +2844,7 @@ class WebToolConfig(BaseToolConfig):
         if self._user_id is None or not has_user_tool_policy_hooks():
             policy_snapshot = _ToolRuntimePolicySnapshot()
         else:
-            from sqlalchemy.orm import Session
-
-            if self._db_factory is None and not isinstance(self._live_db, Session):
+            if self._needs_inline_db():
                 self._cached_tool_overrides = None
                 self._tool_allowlist_cached = False
                 self._cached_tool_allowlist = None
@@ -4425,30 +4465,73 @@ class WebToolConfig(BaseToolConfig):
         server id, this method also re-keys the shared env layer onto the
         governing team's own row -- see the team-env block below -- instead
         of leaving the shared layer keyed on the run owner's personal
-        shared-env hook answer."""
+        shared-env hook answer.
+
+        Worker offload can release a clean caller connection. Its rollback can
+        expire caller-held ORM objects, which reload on their next access.
+        """
         self._mcp_oauth_diagnostics = []
         self._reset_mcp_config_load_cache_state()
 
-        # Resolved before the guarded region below: that region reports
-        # "every selected server is unavailable", which is the wrong answer
-        # for "the scope could not be resolved". The typed error is what
-        # survives the tool-creator frame -- an untyped one is dropped there
-        # with a WARNING and no tool set at all.
-        from ..services.connector_team_scope import resolve_team_connector_ids_or_raise
+        # Team hooks can query the database. Keep those waits off Uvicorn.
+        from ..services.connector_team_scope import team_connector_hook_installed
+        from ..services.db_runtime import run_db_io_cancellation_safe
 
-        team_mcp_ids = frozenset(
-            resolve_team_connector_ids_or_raise(
-                self.db, team_id=self._connector_team_id, log_subject=self._user_id
-            )["mcp"]
-        )
+        try:
+            if self._connector_team_id is None or not team_connector_hook_installed():
+                # Both shortcuts have no team MCP ids, so env-hook state cannot
+                # affect the downstream team-env branch.
+                team_snapshot = _MCPTeamHookSnapshot(
+                    mcp_ids=frozenset(),
+                    team_env_by_id=MappingProxyType({}),
+                    team_env_hook_installed=False,
+                )
+            elif self._needs_inline_db():
+                # Standalone callers can supply a query-shaped test double. It has
+                # no engine from which to mint a worker-owned session.
+                team_snapshot = _load_mcp_team_hook_snapshot_from_db(
+                    self.db,
+                    user_id=self._user_id,
+                    connector_team_id=self._connector_team_id,
+                )
+            else:
+                # Resolve only detached inputs before offload. The worker Session
+                # sees committed state, not caller-flushed uncommitted rows.
+                session_factory = self.get_session_factory()
+                user_id = self._user_id
+                connector_team_id = self._connector_team_id
+                # A clean release can expire caller ORM objects. Later access
+                # reloads their attributes from the database.
+                self.release_db_connection()
+                team_snapshot = await run_db_io_cancellation_safe(
+                    lambda: _run_with_checked_out_session(
+                        session_factory,
+                        lambda db: _load_mcp_team_hook_snapshot_from_db(
+                            db,
+                            user_id=user_id,
+                            connector_team_id=connector_team_id,
+                        ),
+                    )
+                )
+        except ConnectorRuntimeError:
+            # Preserve the team-scope 503. MCPConfigLoadError reports a
+            # different failure: selected server configuration could not load.
+            raise
+        except Exception as error:
+            logger.warning(
+                "Failed to resolve MCP team scope with %s",
+                type(error).__name__,
+                exc_info=True,
+            )
+            raise MCPConfigLoadError() from error
+
+        team_mcp_ids = team_snapshot.mcp_ids
 
         try:
             from ..services.mcp_runtime import (
                 load_shared_env_overrides,
-                load_team_env_overrides,
                 load_user_env_overrides,
                 load_user_env_sources,
-                team_env_hook_installed,
                 warn_team_env_hook_missing_once,
             )
 
@@ -4499,15 +4582,13 @@ class WebToolConfig(BaseToolConfig):
             # layer stays user-keyed in that state, which is exactly the
             # cross-team influence this block exists to remove.
             if self._connector_team_id is not None and team_mcp_ids:
-                if not team_env_hook_installed():
+                if not team_snapshot.team_env_hook_installed:
                     warn_team_env_hook_missing_once(
                         team_id=self._connector_team_id,
                         connector_count=len(team_mcp_ids),
                     )
                 else:
-                    team_env_by_id = load_team_env_overrides(
-                        self.db, self._connector_team_id
-                    )
+                    team_env_by_id = team_snapshot.team_env_by_id
                     # Both copies are load-bearing, for different reasons.
                     # shared_env_by_id: load_shared_env_overrides hands back the
                     # installing application's own object unwrapped, so writing

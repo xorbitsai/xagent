@@ -162,6 +162,9 @@ def seed(db_session: Session):
     stranger_api = _create_custom_api(db_session, "stranger-api", owner=stranger_owner)
     team_a_api = _create_custom_api(db_session, "team-a-api", owner=team_a_owner)
     team_b_api = _create_custom_api(db_session, "team-b-api", owner=team_b_owner)
+    # StaticPool shares one DBAPI connection across caller and worker Sessions.
+    # Commit first because closing the worker can roll back shared pending rows.
+    db_session.commit()
 
     connector_team_scope.set_connector_team_hooks(
         # inactive_own/inactive_own_api also carry a live T1 team grant here,

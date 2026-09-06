@@ -25,6 +25,7 @@ from xagent.web.channels.telegram import bot as telegram_bot_module
 from xagent.web.channels.telegram.bot import TelegramBotInstance
 from xagent.web.models.agent import Agent, AgentOrigin, AgentStatus
 from xagent.web.models.chat_message import TaskChatMessage
+from xagent.web.models.custom_api import CustomApi, UserCustomApi
 from xagent.web.models.database import (
     Base,
     get_db,
@@ -1386,6 +1387,7 @@ def test_agent_requirements_hides_connection_config_and_normalizes_type(
     # normalize to "string", not pass through unnormalized.
     assert inputs_by_key["profile"]["type"] == "string"
     assert inputs_by_key["auth_token"]["satisfied"] is False
+    assert inputs_by_key["auth_token"]["expired"] is False
 
     # A task created from this same agent, with this same connector's
     # required key filled directly in storage, must not move this report's
@@ -1520,6 +1522,80 @@ def test_agent_requirements_hides_non_visible_agents(
     finally:
         if team_hook_installed:
             set_agent_team_scope_hook(None)
+
+
+def test_custom_api_requirements_report_lists_context_only(e2e_db: None) -> None:
+    """A custom_api connector's declared ``context`` key is listed, and its
+    declared ``auth_selector`` key is not: the ``auth_selector`` section is
+    only ever emitted for an MCP connector, so a non-MCP connector's
+    declaration of it is never surfaced in a report.
+    """
+    headers = _setup_admin_headers()
+    db = _db_session()
+    try:
+        user = _admin_user(db)
+        api = CustomApi(
+            name="custom-runtime-api",
+            description="custom-runtime-api description",
+            url="https://example.com/custom",
+            method="GET",
+            runtime_input_schema={
+                "context": {"tenant_id": {"type": "string", "required": True}},
+                "auth_selector": {"profile": {"type": "string", "required": False}},
+            },
+            runtime_bindings=[
+                {
+                    "source": {"input_type": "context", "key": "tenant_id"},
+                    "target": {"target_type": "headers", "key": "X-Tenant-Id"},
+                }
+            ],
+        )
+        db.add(api)
+        db.flush()
+        api_id = int(api.id)
+        db.add(
+            UserCustomApi(
+                user_id=user.id,
+                custom_api_id=api_id,
+                is_owner=True,
+                can_edit=True,
+                can_delete=True,
+                is_active=True,
+            )
+        )
+        agent = _create_agent(
+            db,
+            user,
+            name="Custom API Agent",
+            tool_categories=["mcp:custom-runtime-api"],
+        )
+        db.commit()
+        db.refresh(agent)
+        agent_id = int(agent.id)
+    finally:
+        db.close()
+
+    response = client.get(
+        f"/api/chat/agent/{agent_id}/connector-runtime-requirements",
+        headers=headers,
+    )
+    assert response.status_code == 200, response.text
+    assert "https://example.com/custom" not in response.text
+    payload = response.json()
+    assert len(payload["connectors"]) == 1
+    connector = payload["connectors"][0]
+    assert connector["connector_ref"] == {
+        "connector_type": "custom_api",
+        "connector_id": api_id,
+    }
+    section_keys = {(item["section"], item["key"]) for item in connector["inputs"]}
+    assert section_keys == {("context", "tenant_id")}
+    tenant_id_input = next(
+        item for item in connector["inputs"] if item["key"] == "tenant_id"
+    )
+    assert tenant_id_input["satisfied"] is False
+    assert tenant_id_input["expired"] is False
+    assert tenant_id_input["required"] is True
 
 
 def test_team_shared_connector_visible_across_read_endpoints(e2e_db: None) -> None:
@@ -1674,18 +1750,14 @@ def test_team_shared_connector_visible_across_read_endpoints(e2e_db: None) -> No
         connector_team_scope.set_connector_team_hooks()
 
 
-def test_agent_requirements_endpoint_bypassing_team_resolver_hides_shared_connector(
+def test_agent_requirements_lists_connector_shared_only_through_agent_team(
     e2e_db: None,
 ) -> None:
-    """If the agent-keyed endpoint ever bypasses
-    ``resolve_agent_selected_connectors`` and loads visible connectors with
-    ``agent_team_id=None`` instead of the value that resolver derives from
-    the agent, a team-shared-only connector silently disappears from the
-    report. This test pins the *correct* behavior (the connector is
-    listed); the mutation itself has no test-visible seam to monkeypatch
-    without changing which production code path runs, so it is applied and
-    reverted directly against ``resolve_agent_runtime_requirements`` in the
-    execution report's mutation table rather than parametrized here.
+    """A connector the caller can reach only through the agent's team --
+    no personal link of their own -- is listed by the agent-keyed report.
+    The team id the report resolves connectors under comes from the agent,
+    not from the caller, so this is the case that would silently vanish if
+    that scope were ever taken from the caller instead.
     """
     db = _db_session()
     try:
@@ -1757,12 +1829,265 @@ def test_agent_requirements_endpoint_bypassing_team_resolver_hides_shared_connec
         connector_team_scope.set_connector_team_hooks()
 
 
+def test_task_requirements_reports_stored_context_key_as_satisfied(
+    e2e_db: None,
+) -> None:
+    """A ``context`` key that already has a stored value is reported
+    ``satisfied`` on the task-keyed read endpoint, and the top-level
+    ``satisfied`` follows it when it is the connector's only required key.
+    """
+    headers = _setup_admin_headers()
+    db = _db_session()
+    try:
+        user = _admin_user(db)
+        server = _mcp_server_with_context_schema(
+            db,
+            user,
+            name="satisfied-server",
+            context_schema={"auth_token": {"type": "string", "required": True}},
+        )
+        agent = _create_agent(
+            db, user, name="Satisfied Context Agent", tool_categories=["mcp"]
+        )
+        db.commit()
+        db.refresh(agent)
+        db.refresh(server)
+        agent_id = int(agent.id)
+        server_id = int(server.id)
+    finally:
+        db.close()
+
+    create_response = client.post(
+        "/api/chat/task/create",
+        headers=headers,
+        json={"title": "satisfied task", "description": "d", "agent_id": agent_id},
+    )
+    assert create_response.status_code == 200, create_response.text
+    task_id = int(create_response.json()["task_id"])
+
+    db = _db_session()
+    try:
+        db.add(
+            TaskConnectorRuntimeContext(
+                task_id=task_id,
+                connector_type="mcp",
+                connector_id=server_id,
+                context={"auth_token": "stored"},
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get(
+        f"/api/chat/task/{task_id}/connector-runtime-requirements",
+        headers=headers,
+    )
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    inputs_by_key = {
+        item["key"]: item
+        for connector in payload["connectors"]
+        for item in connector["inputs"]
+    }
+    assert inputs_by_key["auth_token"]["satisfied"] is True
+    assert inputs_by_key["auth_token"]["expired"] is False
+    assert payload["satisfied"] is True
+
+
+def test_task_requirements_uses_runtime_agent_resolution_for_team_scope(
+    e2e_db: None,
+) -> None:
+    """A task whose agent is a workforce-generated manager agent, but for
+    which no matching ``WorkforceRun`` exists, gets its connector scope
+    from ``_load_agent_for_task_runtime`` returning ``None`` -- the same
+    outcome a turn would get for this task -- so a connector reachable
+    only through the agent's team is omitted while a personally linked
+    connector is still reported.
+
+    The task is built directly rather than through ``POST /task/create``:
+    that path 404s for a workforce-generated manager agent
+    (``_load_agent_for_task_create`` returns ``None`` for one), so a task
+    with this agent can only exist by way of a row the workforce side
+    creates directly, and a direct row is the only reachable construction
+    for exercising the read endpoint against one.
+    """
+    db = _db_session()
+    try:
+        caller = _create_user(db, "wf-task-owner")
+        db.flush()
+        personal = _mcp_server_with_context_schema(
+            db,
+            caller,
+            name="wf-personal-server",
+            context_schema={"auth_token": {"type": "string", "required": True}},
+            url="https://example.com/personal/mcp",
+        )
+        team_shared = MCPServer(
+            name="wf-team-shared-server",
+            description="wf-team-shared-server description",
+            managed="external",
+            transport="streamable_http",
+            url="https://example.com/team/mcp",
+            runtime_input_schema={
+                "context": {"auth_token": {"type": "string", "required": True}}
+            },
+            runtime_bindings=[
+                {
+                    "source": {"input_type": "context", "key": "auth_token"},
+                    "target": {"target_type": "mcp_meta", "key": "auth_token"},
+                }
+            ],
+        )
+        db.add(team_shared)
+        db.flush()
+        # No UserMCPServer link for `caller` at all -- reachable only
+        # through the team hook below.
+        personal_id = int(personal.id)
+        team_shared_id = int(team_shared.id)
+        agent = Agent(
+            user_id=caller.id,
+            name="WF Manager Agent",
+            instructions="i",
+            execution_mode="balanced",
+            status=AgentStatus.PUBLISHED,
+            tool_categories=["mcp"],
+            team_id=303,
+            origin=AgentOrigin.WORKFORCE_GENERATED_MANAGER.value,
+        )
+        db.add(agent)
+        db.flush()
+        agent_id = int(agent.id)
+        ordered_ids = sorted([personal_id, team_shared_id])
+        task = Task(
+            user_id=caller.id,
+            agent_id=agent_id,
+            title="workforce manager task",
+            description="d",
+            status=TaskStatus.PENDING,
+            connector_runtime_selected_refs=[
+                {"connector_type": "mcp", "connector_id": ref_id}
+                for ref_id in ordered_ids
+            ],
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        task_id = int(task.id)
+        caller_headers = _auth_headers_for_user(caller)
+    finally:
+        db.close()
+
+    def _hook(db: Session, *, team_id: int) -> dict[str, set[int]]:
+        if team_id == 303:
+            return {"mcp": {team_shared_id}, "custom_api": set()}
+        return {"mcp": set(), "custom_api": set()}
+
+    connector_team_scope.set_connector_team_hooks(team_visibility=_hook)
+    try:
+        response = client.get(
+            f"/api/chat/task/{task_id}/connector-runtime-requirements",
+            headers=caller_headers,
+        )
+    finally:
+        connector_team_scope.set_connector_team_hooks()
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    refs_seen = [item["connector_ref"] for item in payload["connectors"]]
+    assert refs_seen == [{"connector_type": "mcp", "connector_id": personal_id}]
+    auth_token_input = next(
+        item
+        for item in payload["connectors"][0]["inputs"]
+        if item["key"] == "auth_token"
+    )
+    assert auth_token_input["satisfied"] is False
+
+
+def test_task_requirements_reports_unfillable_declared_key_as_unsatisfied(
+    e2e_db: None,
+) -> None:
+    """A declared ``context`` key whose name the per-turn gate rejects as
+    malformed is still listed in the report, but is reported unsatisfied
+    unconditionally -- even with a stored value under that name -- so the
+    top-level ``satisfied`` stays false while a required key of that kind
+    is declared. The report itself never raises on this key; only the
+    per-turn gate does.
+    """
+    headers = _setup_admin_headers()
+    db = _db_session()
+    try:
+        user = _admin_user(db)
+        server = _mcp_server_with_context_schema(
+            db,
+            user,
+            name="malformed-key-server",
+            context_schema={
+                "auth_token": {"type": "string", "required": True},
+                "bad.key": {"type": "string", "required": True},
+            },
+            url="https://example.com/malformed/mcp",
+        )
+        agent = _create_agent(
+            db, user, name="Malformed Key Agent", tool_categories=["mcp"]
+        )
+        db.commit()
+        db.refresh(agent)
+        db.refresh(server)
+        agent_id = int(agent.id)
+        server_id = int(server.id)
+    finally:
+        db.close()
+
+    create_response = client.post(
+        "/api/chat/task/create",
+        headers=headers,
+        json={
+            "title": "malformed key task",
+            "description": "d",
+            "agent_id": agent_id,
+        },
+    )
+    assert create_response.status_code == 200, create_response.text
+    task_id = int(create_response.json()["task_id"])
+
+    db = _db_session()
+    try:
+        db.add(
+            TaskConnectorRuntimeContext(
+                task_id=task_id,
+                connector_type="mcp",
+                connector_id=server_id,
+                context={"auth_token": "stored", "bad.key": "stored"},
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get(
+        f"/api/chat/task/{task_id}/connector-runtime-requirements",
+        headers=headers,
+    )
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    inputs_by_key = {
+        item["key"]: item
+        for connector in payload["connectors"]
+        for item in connector["inputs"]
+    }
+    assert set(inputs_by_key) == {"auth_token", "bad.key"}
+    assert inputs_by_key["bad.key"]["satisfied"] is False
+    assert inputs_by_key["auth_token"]["satisfied"] is True
+    assert payload["satisfied"] is False
+
+
 def test_task_requirements_endpoint_requires_task_ownership_by_caller(
     e2e_db: None,
 ) -> None:
     """A task belonging to another logged-in user is a uniform 404 on the
-    task-keyed read endpoint, matching the values endpoint's ownership
-    predicate.
+    task-keyed read endpoint, per plain task ownership with no admin
+    exception.
     """
     headers = _setup_admin_headers()
     db = _db_session()
@@ -2187,9 +2512,9 @@ def test_create_task_persists_same_selected_refs_as_legacy_snapshot(
     e2e_db: None,
 ) -> None:
     """The persisted ``Task.connector_runtime_selected_refs`` column -- which
-    the per-turn gate, the values endpoint's selection check, and
-    ``load_connector_runtime_view`` all read -- is unchanged in content and
-    order by task creation's switch to ``resolve_agent_runtime_requirements``.
+    the per-turn gate and ``load_connector_runtime_view`` both read -- is
+    unchanged in content and order by task creation's switch to
+    ``resolve_agent_runtime_requirements``.
     Compared against the legacy ``prepare_connector_runtime_selection_snapshot``
     (the column's pre-existing source of truth) on the same agent, with
     list equality (not set equality) so a reordering would fail this too.
@@ -2249,8 +2574,3 @@ def test_create_task_persists_same_selected_refs_as_legacy_snapshot(
     persisted_refs = _task(task_id).connector_runtime_selected_refs
     expected_wire = [ref.to_wire() for ref in expected_refs]
     assert persisted_refs == expected_wire
-
-
-# ---------------------------------------------------------------------------
-# A4: POST /task/{task_id}/connector-runtime-values.
-# ---------------------------------------------------------------------------

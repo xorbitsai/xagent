@@ -906,11 +906,24 @@ def _build_connector_report(
             continue
         declarations = _schema_section(schema, section_name)
         for key, declaration in declarations.items():
-            satisfied = (
-                key in context_stored
-                if section_name == RUNTIME_INPUT_CONTEXT
-                else False
-            )
+            try:
+                validate_runtime_source_key(key)
+            except ValueError:
+                # No value can ever be stored under this key's syntax --
+                # the per-turn gate rejects it with a 400, required or
+                # not. It is still listed, unconditionally unsatisfied
+                # even with a stored value under that name, so a required
+                # one holds the top-level ``satisfied`` at false; dropping
+                # the key would let that flag read true instead. This
+                # report still never raises: the real fix is validating
+                # key syntax at connector create/update time, not here.
+                satisfied = False
+            else:
+                satisfied = (
+                    key in context_stored
+                    if section_name == RUNTIME_INPUT_CONTEXT
+                    else False
+                )
             inputs.append(
                 ConnectorRuntimeInputModel(
                     section=section_name,

@@ -5360,11 +5360,17 @@ async def get_task_connector_runtime_requirements(
     task = db.query(Task).filter(Task.id == task_id, Task.user_id == user.id).first()
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
-    agent = (
-        db.query(Agent).filter(Agent.id == task.agent_id).first()
-        if task.agent_id is not None
-        else None
-    )
+    # The connector scope this report is built from must be the scope a
+    # turn would actually run under, so the agent is resolved by the same
+    # two calls the per-turn tool build makes for this task, in the same
+    # order. Reading the agent row directly would key team-shared
+    # connectors on the raw row's team even where the runtime resolves the
+    # agent to None, and resolving with no workforce runtime would drop
+    # the team of a workforce manager agent whose run the runtime does
+    # find. A report that says what a turn will need can afford neither
+    # the over-report nor the under-report.
+    workforce_runtime = resolve_workforce_task_runtime(db, task)
+    agent = _load_agent_for_task_runtime(db, task, workforce_runtime)
     try:
         return build_task_runtime_requirements(db=db, task=task, agent=agent)
     except ConnectorRuntimeError as exc:

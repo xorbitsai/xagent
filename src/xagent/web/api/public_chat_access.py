@@ -34,6 +34,7 @@ from ..models.user import User
 from ..models.user_channel import UserChannel
 from ..models.workforce import Workforce, WorkforceRun
 from ..schemas.chat import TaskCreateRequest, TaskCreateResponse
+from ..schemas.connector_runtime import ConnectorRuntimeRequirementsModel
 from ..services.client_error_messages import ClientErrorCode, client_error_message
 from ..services.connector_runtime import (
     bind_connector_runtime_selection_snapshot,
@@ -75,6 +76,12 @@ db_session_context = contextmanager(get_db)
 # public-share write surface with no downstream owner scoping; the cap blocks
 # the worst single-request abuse. Broader quota + orphan GC tracked in #973.
 MAX_TASKLESS_SHARE_UPLOAD_FILES = 10
+
+# Every public create path in this module answers this field the same way:
+# it never resolves connector-runtime requirements for its caller, because
+# the widget/share guest must not see connector key names. Kept as one
+# named constant so the four call sites cannot drift apart.
+_NO_CONNECTOR_RUNTIME_REQUIREMENTS: ConnectorRuntimeRequirementsModel | None = None
 
 
 class PublicChatAuthResponse(BaseModel):
@@ -1036,10 +1043,7 @@ async def _create_workforce_widget_chat_task(
         else None,
         channel_id=task.channel_id,
         channel_name=task.channel_name,
-        # This path never resolves connector-runtime requirements for
-        # its caller: the widget/share guest never sees connector key
-        # names.
-        connector_runtime_requirements=None,
+        connector_runtime_requirements=_NO_CONNECTOR_RUNTIME_REQUIREMENTS,
     )
 
 
@@ -1144,10 +1148,7 @@ async def create_public_chat_task(
         else None,
         channel_id=task.channel_id,
         channel_name=task.channel_name,
-        # This path never resolves connector-runtime requirements for
-        # its caller: the widget/share guest never sees connector key
-        # names.
-        connector_runtime_requirements=None,
+        connector_runtime_requirements=_NO_CONNECTOR_RUNTIME_REQUIREMENTS,
     )
 
 
@@ -1217,10 +1218,7 @@ async def _create_workforce_share_chat_task(
         else None,
         channel_id=task.channel_id,
         channel_name=task.channel_name,
-        # This path never resolves connector-runtime requirements for
-        # its caller: the widget/share guest never sees connector key
-        # names.
-        connector_runtime_requirements=None,
+        connector_runtime_requirements=_NO_CONNECTOR_RUNTIME_REQUIREMENTS,
     )
 
 
@@ -1309,10 +1307,7 @@ async def create_share_chat_task(
         else None,
         channel_id=task.channel_id,
         channel_name=task.channel_name,
-        # This path never resolves connector-runtime requirements for
-        # its caller: the widget/share guest never sees connector key
-        # names.
-        connector_runtime_requirements=None,
+        connector_runtime_requirements=_NO_CONNECTOR_RUNTIME_REQUIREMENTS,
     )
 
 

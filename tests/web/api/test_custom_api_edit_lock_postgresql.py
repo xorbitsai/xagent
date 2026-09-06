@@ -1184,8 +1184,9 @@ def test_a_link_deleted_mid_wait_with_a_denying_verdict_is_a_404_with_no_shared_
         )
 
 
+@pytest.mark.parametrize("is_active_value", [False, None])
 def test_a_link_deleted_mid_wait_on_a_mixed_payload_is_400_not_a_stale_data_error(
-    session_factory, seeded, member
+    session_factory, seeded, member, is_active_value
 ) -> None:
     """A payload that carries ``is_active`` alongside a definition-row
     field takes the lock (the definition field decides that), and the
@@ -1195,6 +1196,13 @@ def test_a_link_deleted_mid_wait_on_a_mixed_payload_is_400_not_a_stale_data_erro
     locked guard must refuse with the same 400 the pre-lock guard uses,
     rather than letting ``user_api.is_active = ...`` set a shadow
     attribute on an ORM object backed by a row that no longer exists.
+
+    Parametrized over the value ``is_active`` carries, because the guard
+    tests presence, not value: an explicit ``{"is_active": null}`` carries
+    the field just as ``false`` does and must be refused the same way. A
+    value-based guard (``api_data.is_active is not None``) lets the null
+    case through and commits the definition-row half for a caller with no
+    link row left to hold ``is_active``.
     """
     import xagent.web.api.custom_api as custom_api_api
     from xagent.web.api.custom_api import CustomApiUpdate
@@ -1217,11 +1225,13 @@ def test_a_link_deleted_mid_wait_on_a_mixed_payload_is_400_not_a_stale_data_erro
     )
     hook = _sequenced_access_hook(ConnectorAccess(team_owned=True, can_edit=True))
     set_connector_team_hooks(access=hook)
+    payload = CustomApiUpdate(description="should-not-land", is_active=is_active_value)
+    assert "is_active" in payload.model_fields_set
     try:
         with pytest.raises(HTTPException) as exc:
             custom_api_api.update_custom_api(
                 api_id,
-                CustomApiUpdate(description="should-not-land", is_active=False),
+                payload,
                 current_user=current_user,
                 db=db,
             )

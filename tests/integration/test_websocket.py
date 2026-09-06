@@ -288,7 +288,7 @@ class TestWebSocket(unittest.IsolatedAsyncioTestCase):
 
         for i in range(max_connections):
             websocket = AsyncMock()
-            await manager.connect(websocket, f"task_{i}")
+            await manager.connect(websocket, i)
             websockets.append(websocket)
 
         # 验证连接数量
@@ -299,21 +299,27 @@ class TestWebSocket(unittest.IsolatedAsyncioTestCase):
 
         import time
 
-        start_time = time.time()
+        start_time = time.thread_time()
 
         # 向所有连接广播消息
         for i in range(max_connections):
             await manager.broadcast_to_task(test_message, i)
 
-        end_time = time.time()
+        end_time = time.thread_time()
         duration = end_time - start_time
 
-        # 验证性能
-        self.assertLess(duration, 5.0, f"{max_connections}次广播应该在5秒内完成")
+        # Count only CPU work; CI scheduling stalls are not a broadcast regression.
+        for websocket in websockets:
+            websocket.send_text.assert_awaited_once()
+            self.assertEqual(
+                json.loads(websocket.send_text.call_args.args[0]), test_message
+            )
+
+        self.assertLess(duration, 5.0, f"{max_connections}次广播应该在5个 CPU 秒内完成")
 
         print("连接限制验证: ✅")
         print(f"  最大连接数: {max_connections}")
-        print(f"  广播耗时: {duration:.3f}秒")
+        print(f"  广播 CPU 耗时: {duration:.3f}秒")
         print(f"  平均每次广播: {duration / max_connections * 1000:.3f}毫秒")
 
     async def test_websocket_message_validation(self):

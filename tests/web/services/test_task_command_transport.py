@@ -5,6 +5,7 @@ import logging
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from dataclasses import FrozenInstanceError, is_dataclass
 from datetime import datetime, timedelta
 from threading import Barrier, Event, get_ident
@@ -20,6 +21,7 @@ from sqlalchemy.pool import QueuePool
 from tests.web.pool_contention_shared import (
     GUARD_TIMEOUT,
     LOOP_LIVENESS_TICKS,
+    assert_pool_checkout_off_loop,
     gated_pool_checkout,
     wait_for_ticks,
 )
@@ -1349,14 +1351,7 @@ async def test_command_handler_pool_timeout_does_not_checkout_again(
 
     monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
     held_connections = []
-    ticker_stop = asyncio.Event()
-    ticks = 0
-
-    async def ticker() -> None:
-        nonlocal ticks
-        while not ticker_stop.is_set():
-            ticks += 1
-            await asyncio.sleep(0.01)
+    checkout_probe = ExitStack()
 
     def checkout_from_exhausted_pool() -> None:
         with SessionLocal() as db:
@@ -1364,27 +1359,24 @@ async def test_command_handler_pool_timeout_does_not_checkout_again(
 
     async def execute(_command: ClaimedTaskCommand) -> None:
         held_connections.append(engine.connect())
+        checkout_probe.enter_context(assert_pool_checkout_off_loop(engine))
         await asyncio.to_thread(checkout_from_exhausted_pool)
 
     caplog.set_level(
         logging.ERROR,
         logger="xagent.web.services.task_command_transport",
     )
-    ticker_task = asyncio.create_task(ticker())
     try:
         assert await dispatch_one_task_command(
             execute,
             command_db_id=enqueued.command_id,
         )
-        assert ticks >= 10, (
-            "command handler QueuePool timeout blocked the event loop; "
-            f"ticker advanced only {ticks} times"
-        )
     finally:
-        ticker_stop.set()
-        await ticker_task
-        for connection in held_connections:
-            connection.close()
+        try:
+            checkout_probe.close()
+        finally:
+            for connection in held_connections:
+                connection.close()
 
     with SessionLocal() as verify_db:
         stored = verify_db.get(TaskExecutionCommand, enqueued.command_id)
@@ -1509,38 +1501,28 @@ async def test_real_final_disposition_pool_timeout_stays_off_event_loop(
 
     monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
     held_connections = []
-    ticker_stop = asyncio.Event()
-    ticks = 0
-
-    async def ticker() -> None:
-        nonlocal ticks
-        while not ticker_stop.is_set():
-            ticks += 1
-            await asyncio.sleep(0.01)
+    checkout_probe = ExitStack()
 
     async def execute(_command: ClaimedTaskCommand) -> dict[str, bool]:
         held_connections.append(engine.connect())
+        checkout_probe.enter_context(assert_pool_checkout_off_loop(engine))
         return {"ok": True}
 
     caplog.set_level(
         logging.ERROR,
         logger="xagent.web.services.task_command_transport",
     )
-    ticker_task = asyncio.create_task(ticker())
     try:
         assert await dispatch_one_task_command(
             execute,
             command_db_id=enqueued.command_id,
         )
-        assert ticks >= 10, (
-            "final disposition QueuePool timeout blocked the event loop; "
-            f"ticker advanced only {ticks} times"
-        )
     finally:
-        ticker_stop.set()
-        await ticker_task
-        for connection in held_connections:
-            connection.close()
+        try:
+            checkout_probe.close()
+        finally:
+            for connection in held_connections:
+                connection.close()
 
     with SessionLocal() as verify_db:
         stored = verify_db.get(TaskExecutionCommand, enqueued.command_id)

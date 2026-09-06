@@ -1226,18 +1226,19 @@ def test_reconcile_stays_fast_on_a_large_unresolvable_reference():
     # and scale quadratically, on a function that reruns on every read of
     # attacker-influenceable chat history. Generous bound (real fix runs in
     # well under a second even at far larger sizes) to avoid environment
-    # flakiness while still catching a real regression.
+    # flakiness while still catching a real regression. Measure thread CPU
+    # time so a preempted CI worker is not mistaken for regex backtracking.
     db, user, task = _create_context()
     try:
         content = "[x](file:" + "a" * 100_000
-        start = time.monotonic()
+        start = time.thread_time()
         result = reconcile_assistant_file_references(
             db,
             task_id=int(task.id),
             user_id=int(user.id),
             content=content,
         )
-        elapsed = time.monotonic() - start
+        elapsed = time.thread_time() - start
 
         assert result == content
         assert elapsed < 2.0

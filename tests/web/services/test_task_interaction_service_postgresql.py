@@ -815,73 +815,73 @@ def test_concurrent_ownership_change_is_blocked_until_respond_commits(
     _respond_pg, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import time
+    from concurrent.futures import ThreadPoolExecutor
 
     owner_id, task_id = _pg_waiting_task(_respond_pg)
     interaction_id = _pg_active_row(_respond_pg, task_id=task_id)
-    setup_db = _respond_pg()
-    try:
+    with _respond_pg() as setup_db:
         intruder_id = make_user(setup_db)
-    finally:
-        setup_db.close()
 
-    results: dict = {}
-
-    # Sleep injected between step 2's lock and the fence write, standing in
-    # for step 3's authorization work, by wrapping the fence statement
-    # builder. Patched via monkeypatch (not a manual assign-then-restore)
-    # so the module-global attribute is restored at fixture teardown no
-    # matter what happens on the holder thread below -- a raise before its
-    # own restore code ran would otherwise leave every later test in this
-    # process patched.
+    pids: dict[str, int] = {}
+    lock_taken = threading.Event()
+    release_holder = threading.Event()
+    racer_ready = threading.Event()
     real_fence_stmt = svc._answer_fence_stmt
 
-    # The holder signals here rather than letting the racer guess with a
-    # wall-clock stagger. This function runs after respond()'s step 2 has
-    # taken the tasks row lock and before its fence write, so setting the
-    # event here is the exact moment the racer's UPDATE must start blocking
-    # from. With a fixed 0.1s stagger instead, the test could fail in both
-    # directions on a loaded runner: a holder more than 0.1s late to reach
-    # step 2 lets the racer's UPDATE through unblocked, and a racer late to
-    # issue its UPDATE measures less than the full hold.
-    lock_taken = threading.Event()
+    def holder_session():
+        db = _respond_pg()
+        pids["holder"] = db.scalar(sa.text("SELECT pg_backend_pid()"))
+        return db
 
-    def _slow_fence_stmt(*args, **kwargs):
+    monkeypatch.setattr(database_module, "get_session_local", lambda: holder_session)
+
+    def paused_fence_stmt(*args, **kwargs):
+        # respond() has acquired the task lock. Keep it held until PostgreSQL
+        # itself confirms that this owner update is blocked by this session.
         lock_taken.set()
-        time.sleep(1.0)
+        assert release_holder.wait(timeout=30), "holder was never released"
         return real_fence_stmt(*args, **kwargs)
 
-    monkeypatch.setattr(svc, "_answer_fence_stmt", _slow_fence_stmt)
+    monkeypatch.setattr(svc, "_answer_fence_stmt", paused_fence_stmt)
 
-    def holder() -> None:
-        principal = _pg_owning_principal(owner_id)
-        outcome = svc.respond(
+    def holder():
+        return svc.respond(
             interaction_id=interaction_id,
             task_id=task_id,
-            principal=principal,
+            principal=_pg_owning_principal(owner_id),
             envelope=_pg_envelope("pg-a5-holder"),
         )
-        results["holder_outcome"] = outcome
 
     def racer() -> None:
-        assert lock_taken.wait(timeout=30.0), "holder never reached the fence"
-        t0 = time.monotonic()
-        db = _respond_pg()
-        try:
+        with _respond_pg() as db:
+            pids["racer"] = db.scalar(sa.text("SELECT pg_backend_pid()"))
+            racer_ready.set()
             db.query(Task).filter(Task.id == task_id).update({"user_id": intruder_id})
             db.commit()
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        held = workers.submit(holder)
+        try:
+            assert lock_taken.wait(timeout=30), "holder never reached the fence"
+            raced = workers.submit(racer)
+            assert racer_ready.wait(timeout=30), "racer never acquired its connection"
+            deadline = time.monotonic() + 30
+            blockers: list[int] = []
+            while time.monotonic() < deadline and not raced.done():
+                with _respond_pg() as observer:
+                    blockers = observer.scalar(
+                        sa.text("SELECT pg_blocking_pids(:pid)"),
+                        {"pid": pids["racer"]},
+                    )
+                if pids["holder"] in blockers:
+                    break
+                time.sleep(0.01)
+            assert pids["holder"] in blockers, "owner update did not wait on respond()"
+            assert not raced.done()
         finally:
-            db.close()
-        results["racer_wait_s"] = time.monotonic() - t0
-
-    t1 = threading.Thread(target=holder)
-    t2 = threading.Thread(target=racer)
-    t1.start()
-    t2.start()
-    t1.join()
-    t2.join()
-
-    assert isinstance(results["holder_outcome"], svc.RespondAccepted), results
-    assert results["racer_wait_s"] >= 0.8, results
+            release_holder.set()
+        assert isinstance(held.result(timeout=30), svc.RespondAccepted)
+        raced.result(timeout=30)
 
 
 def test_two_concurrent_respond_calls_serialize_on_the_tasks_row(_respond_pg) -> None:

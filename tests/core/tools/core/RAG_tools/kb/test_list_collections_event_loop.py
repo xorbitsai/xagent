@@ -16,15 +16,13 @@ The blocking calls live at two layers, and each is asserted where it belongs:
   hands the worker thread a coroutine object and never runs it. Their dispatch
   lives inside ``LanceDBMetadataStore`` and is asserted against that class.
 
-Every blocking call is scored **individually**. A single cumulative tick total
-cannot tell a fully-fixed run from one that dropped a single dispatch, because
-the calls that still yield donate far more than enough idle time to clear the
-threshold on their own.
+Every blocking call must individually observe an acknowledgement from the event
+loop while it runs on a worker thread. Progress in one call cannot hide another
+call that accidentally runs inline.
 """
 
 import asyncio
 import threading
-import time
 
 import pyarrow as pa
 import pytest
@@ -36,58 +34,36 @@ from xagent.core.tools.core.RAG_tools.storage.lancedb_stores import (
     LanceDBMetadataStore,
 )
 
-BLOCKING_SECONDS = 0.3
-HEARTBEAT_INTERVAL = 0.01
-# A 0.3s call that yields the loop leaves room for ~30 ticks; one that holds the
-# loop thread leaves room for zero or one.
-MIN_TICKS_PER_CALL = 10
-
 
 class _Heartbeat:
-    """Tick counter that scores each blocking call over its own window."""
+    """Record loop progress during each blocked worker call, without a rate."""
 
     def __init__(self) -> None:
-        self.ticks = 0
-        self.ticks_per_call: dict[str, int] = {}
         self.thread_per_call: dict[str, int] = {}
-        self._task: asyncio.Task | None = None
+        self.acknowledged: set[str] = set()
 
     async def __aenter__(self) -> "_Heartbeat":
-        async def beat() -> None:
-            while True:
-                await asyncio.sleep(HEARTBEAT_INTERVAL)
-                self.ticks += 1
-
-        self._task = asyncio.create_task(beat())
+        self._loop = asyncio.get_running_loop()
+        self._loop_thread = threading.get_ident()
         return self
 
     async def __aexit__(self, *_exc: object) -> None:
-        assert self._task is not None
-        self._task.cancel()
+        pass
 
     def block(self, label: str) -> None:
-        """Block the calling thread the way a real LanceDB call does."""
-        before = self.ticks
         self.thread_per_call[label] = threading.get_ident()
-        time.sleep(BLOCKING_SECONDS)
-        self.ticks_per_call[label] = self.ticks - before
+        assert self.thread_per_call[label] != self._loop_thread, (
+            f"{label} ran on the event loop thread"
+        )
+        acknowledged = threading.Event()
+        self._loop.call_soon_threadsafe(acknowledged.set)
+        assert acknowledged.wait(timeout=30), f"the loop never acknowledged {label}"
+        self.acknowledged.add(label)
 
     def assert_yielded_the_loop(self, *labels: str) -> None:
-        """Assert each named call ran off-loop and left the loop running.
-
-        Must be awaited from the event loop thread so ``get_ident`` identifies
-        the loop rather than a worker.
-        """
-        loop_thread = threading.get_ident()
         for label in labels:
-            assert label in self.ticks_per_call, f"{label} was never called"
-            assert self.thread_per_call[label] != loop_thread, (
-                f"{label} ran on the event loop thread"
-            )
-            assert self.ticks_per_call[label] >= MIN_TICKS_PER_CALL, (
-                f"{label} blocked the event loop: only "
-                f"{self.ticks_per_call[label]} ticks elapsed during its call"
-            )
+            assert label in self.acknowledged, f"{label} did not observe loop progress"
+            assert self.thread_per_call[label] != threading.get_ident()
 
 
 # --------------------------------------------------------------------------

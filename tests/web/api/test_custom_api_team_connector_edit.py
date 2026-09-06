@@ -824,17 +824,17 @@ class TestPostLockRecheckDeclaresTheLock:
 
 
 class TestHookCallCountAcrossPayloadShapes:
-    """How many times a single request calls the access hook, across the
-    two shapes not already covered by ``TestTheRecheckCostsExactlyOneExtraHookCall``
-    above: a payload that writes only ``is_active`` never takes the lock, so
-    a personal row that needs the team verdict to grant the edit asks once,
-    at the gate, and never again; and a deployment with no access hook
-    installed asks nothing at either point, because the hook slot being
-    empty answers ``{}`` without ever reaching the ``hook`` object a test
-    installs. The other two shapes -- an owner's row that already grants
-    the edit, and a stand-in caller who writes the shared definition row --
-    are the same call counts ``TestTheRecheckCostsExactlyOneExtraHookCall``
-    already covers above.
+    """How many times a single request calls the access hook, for a payload
+    that writes only ``is_active`` and never takes the lock: a personal row
+    that needs the team verdict to grant the edit asks once, at the gate,
+    and never again. A deployment with no access hook installed is covered
+    alongside it below for the 404 it gives a stand-in caller, not for a
+    call count: an empty hook slot resolves to ``{}`` on its own, with no
+    hook object installed to call and so nothing to count. The other two
+    shapes -- an owner's row that already grants the edit, and a stand-in
+    caller who writes the shared definition row -- are the same call
+    counts ``TestTheRecheckCostsExactlyOneExtraHookCall`` already covers
+    above.
     """
 
     def test_is_active_only_payload_from_a_can_edit_false_personal_row_pays_one_call(
@@ -862,15 +862,11 @@ class TestHookCallCountAcrossPayloadShapes:
 
         assert len(hook.calls) == 1
 
-    def test_no_hook_installed_pays_zero_calls_regardless_of_payload(self, db):
+    def test_no_hook_installed_answers_404_for_a_stand_in_caller(self, db):
         owner = _make_user(db, 1)
         member = _make_user(db, 2)
         api = _make_owned_api(db, owner.id, name="count-no-hook")
         api_id = api.id
-        # Never installed through ``set_connector_team_hooks``, so nothing
-        # in the seam can reach it; used only to prove that fact rather
-        # than to answer anything.
-        hook = _sequenced_access_hook(ConnectorAccess(team_owned=True, can_edit=True))
 
         with snapshot_connector_team_hooks():
             set_connector_team_hooks()
@@ -887,7 +883,6 @@ class TestHookCallCountAcrossPayloadShapes:
         # refuses with the same 404 an unrelated caller with no personal
         # row has always gotten, before this route's own 403 is reached.
         assert exc.value.status_code == 404
-        assert len(hook.calls) == 0
 
 
 class TestReachablePathAWritesIsActiveWithoutRetakingTheLock:

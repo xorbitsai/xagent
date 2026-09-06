@@ -2864,6 +2864,16 @@ export function AppProvider({
     }
 
     const controlEnvelope = extractTaskControlEnvelope(message)
+    // A stale-versioned error frame must not roll task state back, but its
+    // body is not versioned state: it carries the error notice - and, since
+    // #2124, the structured terminal command outcome - which the backend
+    // sends exactly once. Dropping the whole frame silences that notice
+    // forever, so error frames fall through with their control tuple
+    // neutralized (this flag suppresses every status side effect below)
+    // instead of being swallowed. This extends the same reasoning
+    // ``canAcceptTaskControlVersion`` already applies to UNversioned error
+    // frames ("error frames remain informational") to versioned ones.
+    let staleControlErrorFrame = false
     if (controlEnvelope.isStateEvent && controlEnvelope.taskId !== undefined) {
       if (
         !acceptTaskControlVersion(
@@ -2871,13 +2881,16 @@ export function AppProvider({
           controlEnvelope,
           taskStateVersionsRef.current,
         )
-      ) return
+      ) {
+        if (message.type !== "error" && message.type !== "agent_error") return
+        staleControlErrorFrame = true
+      }
 
       // A late event may have an old semantic type (for example
       // ``task_paused``) after a newer run is already RUNNING. The backend
       // rewrites its state tuple to the canonical row; apply only that tuple
       // and skip the stale event-specific side effects.
-      if (!taskEventMatchesControlState(message, controlEnvelope)) {
+      if (!staleControlErrorFrame && !taskEventMatchesControlState(message, controlEnvelope)) {
         if (controlEnvelope.status) {
           dispatch({
             type: "UPDATE_TASK_STATUS",
@@ -3198,9 +3211,17 @@ export function AppProvider({
               return
             }
             const interactions = normalizeInteractions(eventData.metadata?.interactions)
-            const interactionRequestId = typeof eventData.request_id === "string"
-              ? eventData.request_id
-              : undefined
+            // The round identity: no backend emits ``request_id`` today - the
+            // stable per-ask id the runtime mints and every ask frame carries
+            // is ``event_id`` (see core/agent/clarification.py: "event_id is
+            // the clarification's stable identity"). ``request_id`` stays the
+            // preferred field so a backend that later adopts the explicit
+            // name wins over the fallback - but only with a non-empty
+            // string; anything else falls through to the next candidate.
+            const interactionRequestId = [
+              eventData.request_id,
+              eventData.event_id,
+            ].find((id): id is string => typeof id === "string" && id !== "")
             const isAgentMessage = eventType === "agent_message"
             const isAiMessage = eventType === "ai_message"
             const expectsUserResponse =
@@ -5685,10 +5706,17 @@ export function AppProvider({
         const interactions = normalizeInteractions(
           waitingRoot.interactions ?? waitingData.interactions
         )
-        const waitingRequestIdValue = waitingRoot.request_id ?? waitingData.request_id
-        const waitingRequestId = typeof waitingRequestIdValue === "string"
-          ? waitingRequestIdValue
-          : undefined
+        // ``request_id`` first (the explicit name, if a backend ever emits
+        // it), then ``event_id`` - the stable per-ask identity the runtime
+        // actually mints and forwards on ask frames today. First non-empty
+        // string wins: nullish coalescing alone would let an empty or
+        // non-string ``request_id`` block the ``event_id`` fallback.
+        const waitingRequestId = [
+          waitingRoot.request_id,
+          waitingData.request_id,
+          waitingRoot.event_id,
+          waitingData.event_id,
+        ].find((id): id is string => typeof id === "string" && id !== "")
         dispatch({
           type: "UPDATE_TASK_STATUS",
           payload: {
@@ -5747,7 +5775,11 @@ export function AppProvider({
         const agentErrorMessage = agentErrorCode
           ? t(clientErrorTranslationKey(agentErrorCode))
           : getWebSocketErrorMessage(message, trustLegacyErrorProse)
-        const agentErrorTaskStatus = getWebSocketTaskStatus(message)
+        // A stale-versioned frame keeps its notice but asserts nothing about
+        // task state - its control tuple lost to a newer version above.
+        const agentErrorTaskStatus = staleControlErrorFrame
+          ? null
+          : getWebSocketTaskStatus(message)
 
         if (agentErrorTaskStatus) {
           dispatch({
@@ -5796,11 +5828,17 @@ export function AppProvider({
           controlEnvelope,
         })
 
-        if (errorFrame.taskStatus) {
+        // Stale-versioned "error" frames keep their notice but assert
+        // nothing about task state (see staleControlErrorFrame above).
+        // task_error deliberately stays outside that exemption - its bubble
+        // IS the turn's terminal result, mirroring the unversioned rule in
+        // canAcceptTaskControlVersion - so for task_error this guard is
+        // vacuously true.
+        if (errorFrame.taskStatus && !staleControlErrorFrame) {
           dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: errorFrame.taskStatus } })
           dispatch({ type: "TRIGGER_TASK_UPDATE" })
         }
-        if (errorFrame.stopsProcessing) {
+        if (errorFrame.stopsProcessing && !staleControlErrorFrame) {
           dispatch({ type: "SET_PROCESSING", payload: false })
         }
 

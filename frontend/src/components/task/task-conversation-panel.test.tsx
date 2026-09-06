@@ -602,6 +602,192 @@ describe("TaskConversationPanel", () => {
     expect(rendered[1]).toHaveAttribute("data-request-id", "inputreq_q2")
   })
 
+  it("adopts the ask frame's event_id as the waiting round id when no request_id exists", () => {
+    // No backend emits request_id today; the stable per-ask identity on the
+    // wire is event_id. The trace fallback must surface it so the round is
+    // identified even when the status frame carried nothing.
+    appState.messages = [{
+      id: "user-1",
+      role: "user",
+      content: "Start the question",
+      timestamp: 2000,
+    }]
+    appState.traceEvents = [
+      {
+        event_type: "agent_message",
+        timestamp: 1000,
+        data: {
+          expect_response: true,
+          message: "Which region should I use?",
+          event_id: "evt-round-1",
+          metadata: {
+            interactions: [{ type: "text_input", field: "region", label: "Region" }],
+          },
+        },
+      },
+    ]
+    appState.currentTask = {
+      id: "42",
+      title: "Preview",
+      description: "Preview",
+      status: "waiting_for_user",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+      waitingQuestion: "Which region should I use?",
+    }
+
+    render(<TaskConversationPanel mode="embedded-preview" />)
+
+    const activeWait = screen.getAllByTestId("chat-message").find(
+      (message) => message.getAttribute("data-active") === "true",
+    )
+    expect(activeWait).toBeDefined()
+    expect(activeWait).toHaveAttribute("data-request-id", "evt-round-1")
+  })
+
+  it("keeps at most one instance active for a waiting round", () => {
+    // The two-instances window: the round's question is persisted on the
+    // timeline AND an optimistic user message is the last item (so the
+    // virtual assistant message renders too). The timeline instance owns the
+    // round; the virtual copy must stay inert, or two forms accept the same
+    // question at once.
+    appState.messages = [
+      {
+        id: "q1",
+        role: "assistant",
+        content: "Which city?",
+        timestamp: "1000",
+        isResult: true,
+        interactions: [{ type: "text_input", field: "city", label: "City" }],
+        interactionRequestId: "round-1",
+      },
+      {
+        id: "u1",
+        role: "user",
+        content: "City: Beijing",
+        timestamp: "2000",
+        isOptimistic: true,
+      },
+    ]
+    appState.traceEvents = []
+    appState.currentTask = {
+      id: "42",
+      title: "Preview",
+      description: "Preview",
+      status: "waiting_for_user",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+      waitingQuestion: "Which city?",
+      waitingRequestId: "round-1",
+      waitingInteractions: [{ type: "text_input", field: "city", label: "City" }],
+    }
+
+    render(<TaskConversationPanel mode="embedded-preview" />)
+
+    const active = screen.getAllByTestId("chat-message")
+      .filter((node) => node.getAttribute("data-active") === "true")
+    expect(active).toHaveLength(1)
+    expect(active[0]).toHaveAttribute("data-request-id", "round-1")
+    expect(active[0]).toHaveTextContent("Which city?")
+  })
+
+  it("never adopts a client-minted trace id as the round id", () => {
+    // react_task_end rows in state get generateMessageId placeholders as
+    // their top-level event_id; adopting one would name a round no message
+    // carries, deactivating every instance. With no data-level id on the
+    // newest ask, the prompt-text match stays in charge and activates the
+    // persisted bubble.
+    appState.messages = [
+      {
+        id: "q1",
+        role: "assistant",
+        content: "Choose a region",
+        timestamp: 1000,
+        isResult: true,
+        interactions: [{ type: "text_input", field: "region", label: "Region" }],
+      },
+      {
+        id: "u1",
+        role: "user",
+        content: "Working on it",
+        timestamp: 2000,
+      },
+    ]
+    appState.traceEvents = [
+      {
+        event_id: "react-task-end-1757200000000-abc12",
+        event_type: "react_task_end",
+        timestamp: 1500,
+        data: {
+          result: {
+            status: "waiting_for_user",
+            message: "Choose a region",
+          },
+        },
+      },
+    ]
+    appState.currentTask = {
+      id: "42",
+      title: "Preview",
+      description: "Preview",
+      status: "waiting_for_user",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+      waitingQuestion: "Choose a region",
+    }
+
+    render(<TaskConversationPanel mode="embedded-preview" />)
+
+    const active = screen.getAllByTestId("chat-message")
+      .filter((node) => node.getAttribute("data-active") === "true")
+    expect(active).toHaveLength(1)
+    expect(active[0]).toHaveTextContent("Choose a region")
+    expect(active[0]).toHaveAttribute("data-request-id", "")
+  })
+
+  it("activates the round-id match rather than a same-text lookalike", () => {
+    // Prompt-text equality can pick the wrong message when two rounds asked
+    // the same question; the round id is authoritative when present.
+    appState.messages = [
+      {
+        id: "q1",
+        role: "assistant",
+        content: "Which city?",
+        timestamp: "1000",
+        isResult: true,
+        interactions: [{ type: "text_input", field: "city", label: "City" }],
+        interactionRequestId: "round-1",
+      },
+      {
+        id: "q2",
+        role: "assistant",
+        content: "Which city?",
+        timestamp: "2000",
+        isResult: true,
+        interactions: [{ type: "text_input", field: "city", label: "City" }],
+        interactionRequestId: "round-2",
+      },
+    ]
+    appState.traceEvents = []
+    appState.currentTask = {
+      id: "42",
+      title: "Preview",
+      description: "Preview",
+      status: "waiting_for_user",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+      waitingQuestion: "Which city?",
+      waitingRequestId: "round-1",
+    }
+
+    render(<TaskConversationPanel mode="embedded-preview" />)
+
+    const active = screen.getAllByTestId("chat-message")
+      .filter((node) => node.getAttribute("data-active") === "true")
+    expect(active).toHaveLength(1)
+    expect(active[0]).toHaveAttribute("data-request-id", "round-1")
+  })
+
   it("keeps an identified text-only wait separate from stale structured trace interactions", () => {
     appState.messages = [{
       id: "user-r2",

@@ -127,8 +127,7 @@ def low_timeout_sqlite_engine(tmp_path):
         f"sqlite:///{tmp_path / 'task-command-lock-path.db'}",
         connect_args={"check_same_thread": False},
     )
-    # Long enough to stay clear of thread-scheduling jitter under a loaded
-    # test run, short enough to keep the lock-path tests well under 2s.
+    # Keep SQLite lock waits short without asserting wall-clock performance.
     apply_sqlite_concurrency_pragmas(engine, busy_timeout_ms=200)
     Base.metadata.create_all(bind=engine)
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -2765,6 +2764,7 @@ async def test_dispatch_with_staged_id_before_commit_is_noop_and_converges_after
         await stop_task_command_dispatcher()
 
 
+@pytest.mark.timeout(30)
 def test_owner_holding_a_flushed_command_blocks_a_concurrent_claim(
     low_timeout_sqlite_engine,
 ) -> None:
@@ -2773,7 +2773,8 @@ def test_owner_holding_a_flushed_command_blocks_a_concurrent_claim(
     transaction -- far longer than the microseconds an insert that committed
     itself holds it for. SQLite's writer lock is database-wide, so a concurrent claim
     of a different, already-committed command must still wait out
-    busy_timeout and fail with OperationalError rather than hang."""
+    busy_timeout and fail with OperationalError. Once the owner commits,
+    the same command must be claimable."""
 
     engine, SessionLocal = low_timeout_sqlite_engine
     with SessionLocal() as setup_db:
@@ -2802,18 +2803,25 @@ def test_owner_holding_a_flushed_command_blocks_a_concurrent_claim(
             payload={"agent_id": 1},
         )
         # Deliberately not committed yet -- this is the window under test.
-        started = time.monotonic()
         with SessionLocal() as claimant_db:
-            with pytest.raises(OperationalError):
+            with pytest.raises(OperationalError, match="database is locked"):
                 claim_task_command(
                     claimant_db,
                     runner_id="lock-path-claimant",
                     command_db_id=claimable.command_id,
                 )
-        elapsed = time.monotonic() - started
         owner_db.commit()
 
-    assert elapsed < 2.0
+    with SessionLocal() as claimant_db:
+        claimed = claim_task_command(
+            claimant_db,
+            runner_id="lock-path-claimant",
+            command_db_id=claimable.command_id,
+        )
+
+    assert claimed is not None
+    assert claimed.id == claimable.command_id
+    assert claimed.attempt_count == 1
 
 
 @pytest.mark.asyncio

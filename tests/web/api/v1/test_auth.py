@@ -519,15 +519,19 @@ async def test_record_key_usage_pool_wait_keeps_event_loop_responsive(
     async def invoke_usage() -> None:
         await record_key_usage(prefix)
 
-    usage_task = asyncio.create_task(invoke_usage())
-    started_at = asyncio.get_running_loop().time()
-    ticker_task = asyncio.create_task(asyncio.sleep(0.02))
+    from tests.web.pool_contention_shared import GUARD_TIMEOUT, gated_pool_checkout
+
     try:
-        await ticker_task
-        assert asyncio.get_running_loop().time() - started_at < 0.08
+        with gated_pool_checkout(engine) as gate:
+            usage_task = asyncio.create_task(invoke_usage())
+            try:
+                await gate.wait_until_contending()
+                assert not usage_task.done()
+            finally:
+                held_connection.close()
+                gate.let_through()
+                await asyncio.wait_for(usage_task, timeout=GUARD_TIMEOUT)
     finally:
-        held_connection.close()
-        await usage_task
         engine.dispose()
 
 

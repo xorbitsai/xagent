@@ -20,7 +20,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from datetime import datetime, timedelta, timezone
-from threading import Barrier, get_ident
+from threading import Barrier, Event, get_ident
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1411,29 +1411,23 @@ async def test_schedule_claimed_create_turn_offloads_cache_invalidation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A committed domain claim must not invalidate Redis on the event loop."""
-    import time as _time
-
     task_id = 987654
     event_loop_thread = get_ident()
     invalidations: list[tuple[int, int]] = []
-    ticker_stop = asyncio.Event()
-    ticks = 0
+    entered = Event()
+    release = Event()
 
     def slow_invalidate(observed_task_id: int) -> None:
         invalidations.append((observed_task_id, get_ident()))
-        _time.sleep(0.08)
+        entered.set()
+        assert get_ident() != event_loop_thread
+        assert release.wait(timeout=30), "cache invalidation was never released"
 
     async def fake_schedule(**_kwargs):
         async def done() -> None:
             return None
 
         return asyncio.create_task(done())
-
-    async def ticker() -> None:
-        nonlocal ticks
-        while not ticker_stop.is_set():
-            ticks += 1
-            await asyncio.sleep(0.005)
 
     monkeypatch.setattr(
         task_orchestrator_module,
@@ -1458,24 +1452,26 @@ async def test_schedule_claimed_create_turn_offloads_cache_invalidation(
         run_id="committed-run",
     )
 
-    ticker_task = asyncio.create_task(ticker())
-    try:
-        started = await TaskTurnOrchestrator.schedule_claimed_create_turn(
+    startup = asyncio.create_task(
+        TaskTurnOrchestrator.schedule_claimed_create_turn(
             task_id=task_id,
             task_owner_user_id=1,
             actor_user_id=1,
             payload=TaskTurnPayload("start"),
             claimed=claimed,
         )
-        await started.background_task
+    )
+    try:
+        assert await asyncio.to_thread(entered.wait, 30)
+        assert not startup.done()
     finally:
-        ticker_stop.set()
-        await ticker_task
+        release.set()
+        started = await asyncio.wait_for(startup, timeout=30)
+    await started.background_task
 
     assert len(invalidations) == 1
     assert invalidations[0][0] == task_id
     assert invalidations[0][1] != event_loop_thread
-    assert ticks >= 3, "claim-cache invalidation blocked the asyncio event loop"
 
 
 @pytest.mark.asyncio

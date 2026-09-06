@@ -10516,10 +10516,18 @@ clarification questions as plain assistant text.
 
     except Exception as e:
         logger.error("Error handling builder chat: %s", e, exc_info=True)
-        payload = {"type": "error", "message": client_safe_error_message(e)}
+        error_metadata = {}
         if isinstance(e, AutoModelUnavailableError):
-            payload["error_code"] = ClientErrorCode.AUTO_MODEL_UNAVAILABLE.value
-        await websocket.send_text(json.dumps(payload))
+            error_metadata["error_code"] = ClientErrorCode.AUTO_MODEL_UNAVAILABLE.value
+        await websocket.send_text(
+            json.dumps(
+                {
+                    **error_metadata,
+                    "type": "error",
+                    "message": client_safe_error_message(e),
+                }
+            )
+        )
 
 
 @ws_router.websocket("/ws/build/preview")

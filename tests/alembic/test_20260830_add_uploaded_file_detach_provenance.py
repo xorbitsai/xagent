@@ -149,6 +149,67 @@ def test_sqlite_upgrade_preserves_history_and_replaces_task_fk(
         )
 
 
+def test_sqlite_upgrade_skips_partial_schema_without_uploaded_files(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    migration = _load_migration()
+    engine = sa.create_engine("sqlite:///:memory:")
+
+    with engine.connect() as connection:
+        connection.execute(sa.text("CREATE TABLE users (id INTEGER PRIMARY KEY)"))
+        monkeypatch.setattr(alembic_context, "is_offline_mode", lambda: False)
+        monkeypatch.setattr(alembic_context, "get_bind", lambda: connection)
+
+        _run_migration(migration, "upgrade", connection)
+
+        assert "uploaded_files" not in sa.inspect(connection).get_table_names()
+
+
+def test_sqlite_upgrade_is_idempotent_with_existing_columns_and_index(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    migration = _load_migration()
+    engine = sa.create_engine("sqlite:///:memory:")
+
+    with engine.connect() as connection:
+        _create_pre_migration_schema(connection)
+        connection.execute(
+            sa.text("ALTER TABLE uploaded_files ADD COLUMN detached_reason VARCHAR(64)")
+        )
+        connection.execute(
+            sa.text("ALTER TABLE uploaded_files ADD COLUMN detached_at DATETIME")
+        )
+        connection.execute(
+            sa.text(
+                "CREATE INDEX ix_uploaded_files_detached_gc ON uploaded_files "
+                "(task_id, storage_status, detached_at, id)"
+            )
+        )
+        connection.execute(
+            sa.text(
+                "CREATE INDEX ix_uploaded_files_filename ON uploaded_files (filename)"
+            )
+        )
+        monkeypatch.setattr(alembic_context, "is_offline_mode", lambda: False)
+        monkeypatch.setattr(alembic_context, "get_bind", lambda: connection)
+
+        _run_migration(migration, "upgrade", connection)
+        _run_migration(migration, "upgrade", connection)
+
+        inspector = sa.inspect(connection)
+        assert _task_fk_ondelete(connection) == "SET NULL"
+        indexes = {
+            index["name"]: index for index in inspector.get_indexes("uploaded_files")
+        }
+        assert indexes[migration.INDEX]["column_names"] == [
+            "task_id",
+            "storage_status",
+            "detached_at",
+            "id",
+        ]
+        assert indexes["ix_uploaded_files_filename"]["column_names"] == ["filename"]
+
+
 @pytest.mark.parametrize(
     ("file_id", "storage_path"),
     [

@@ -246,6 +246,46 @@ def test_recovery_finishes_local_cleanup_after_a_claimed_gc_crash(
         engine.dispose()
 
 
+def test_recovery_logs_when_external_local_copy_is_left_untouched(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog,
+) -> None:
+    monkeypatch.setenv("XAGENT_UPLOADS_DIR", str(tmp_path / "uploads"))
+    external_path = tmp_path / "external" / "shared.txt"
+    external_path.parent.mkdir()
+    external_path.write_text("shared", encoding="utf-8")
+    engine, SessionLocal = _database(tmp_path)
+    now = datetime.now(timezone.utc)
+    row_id, _, file_id, _ = _create_compensating_file(
+        SessionLocal,
+        suffix="external-local",
+        updated_at=now - timedelta(minutes=10),
+        storage_path=str(external_path),
+    )
+    with SessionLocal() as db:
+        record = db.query(UploadedFile).filter(UploadedFile.id == row_id).one()
+        record.detached_reason = "task_deleted"
+        record.detached_at = now - timedelta(days=8)
+        record.updated_at = now - timedelta(minutes=10)
+        db.commit()
+    caplog.set_level("WARNING", logger=uploaded_file_recovery.__name__)
+
+    try:
+        result = recover_stale_uploaded_file_compensations_batch_isolated(
+            cutoff=now - timedelta(minutes=5),
+            batch_size=10,
+            session_factory=SessionLocal,
+            compensation_delete=lambda **_kwargs: "absent",
+        )
+
+        assert result.deleted == 1
+        assert external_path.exists()
+        assert f"Skipped local recovery cleanup for file {file_id}" in caplog.text
+    finally:
+        engine.dispose()
+
+
 def test_recovery_takeover_is_cas_safe_across_workers(tmp_path) -> None:
     engine, SessionLocal = _database(tmp_path)
     now = datetime.now(timezone.utc)

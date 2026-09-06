@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -788,6 +789,18 @@ def test_selected_file_refs_from_task_revalidates_owner_and_task_binding(
         task_id=11,
         filename="other-task.txt",
     )
+    detached_file = _create_uploaded_file(
+        db_session,
+        tmp_path,
+        file_id="detached-file",
+        user_id=1,
+        task_id=None,
+        filename="detached.txt",
+    )
+    detached_file.detached_reason = "task_deleted"
+    detached_file.detached_at = datetime.now(timezone.utc)
+    task.agent_config["selected_file_ids"].insert(-1, "detached-file")
+    db_session.flush()
     assert _selected_file_refs_from_task(task, db_session) == [
         {
             "file_id": "task-file",

@@ -860,6 +860,7 @@ def _selected_file_refs_from_task(task: Any, db: Session) -> list[dict[str, Any]
             UploadedFile.file_id.in_(selected_file_ids),
             UploadedFile.user_id == task_owner_id_int,
             UploadedFile.storage_status != "compensating",
+            UploadedFile.detached_reason.is_(None),
             or_(UploadedFile.task_id == task_id_int, UploadedFile.task_id.is_(None)),
         )
         .all()

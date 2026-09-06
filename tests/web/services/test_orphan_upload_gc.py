@@ -387,7 +387,7 @@ def test_row_bound_between_fetch_and_claim_is_spared(
 
 
 def test_gc_never_unlinks_an_external_shared_path(
-    db_session, owner, tmp_path, monkeypatch
+    db_session, owner, tmp_path, monkeypatch, caplog
 ) -> None:
     row, path = _mk_upload(
         db_session,
@@ -407,6 +407,7 @@ def test_gc_never_unlinks_an_external_shared_path(
         "delete_uploaded_file_compensation_object",
         lambda **_kwargs: "absent",
     )
+    caplog.set_level("WARNING", logger=orphan_upload_gc.__name__)
 
     result = cleanup_detached_uploaded_files(
         db_session,
@@ -416,6 +417,7 @@ def test_gc_never_unlinks_an_external_shared_path(
     assert (result.scanned, result.deleted) == (1, 1)
     assert db_session.query(UploadedFile).filter_by(id=row_id).first() is None
     assert path.exists()
+    assert "Skipped local orphan cleanup for file" in caplog.text
 
 
 def test_detached_gc_uses_detach_time_and_spares_unmarked_drafts(

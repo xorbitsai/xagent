@@ -1,4 +1,5 @@
 import time
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 import pytest
@@ -109,6 +110,33 @@ def test_reconcile_repairs_invented_id_from_unique_filename():
             "下载：[generated_video_253a6da9.mp4]"
             "(file:c6553861-5bdd-4628-9b15-1310e34fe499)"
         )
+    finally:
+        db.close()
+
+
+def test_reconcile_does_not_repair_invented_id_to_detached_file():
+    db, user, task = _create_context()
+    try:
+        detached = _add_file(
+            db,
+            user,
+            None,
+            file_id="detached-id",
+            filename="report.pdf",
+            mime_type="application/pdf",
+        )
+        detached.detached_reason = "task_deleted"
+        detached.detached_at = datetime.now(timezone.utc)
+        db.flush()
+
+        content = reconcile_assistant_file_references(
+            db,
+            task_id=int(task.id),
+            user_id=int(user.id),
+            content="[report.pdf](file:invented-id)",
+        )
+
+        assert content == "report.pdf"
     finally:
         db.close()
 

@@ -451,6 +451,7 @@ def load_assistant_file_reference_records(
         db.query(UploadedFile)
         .filter(
             UploadedFile.user_id == int(user_id),
+            UploadedFile.detached_reason.is_(None),
             or_(UploadedFile.task_id == int(task_id), UploadedFile.task_id.is_(None)),
         )
         .all()

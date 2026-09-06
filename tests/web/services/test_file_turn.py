@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import QueuePool
 
 from tests.shared.execution_scope import register_scope_resolver
+from tests.shared.postgres_disposable import disposable_database_factory
 from xagent.core.execution_scope import (
     DeferToSnapshot,
     ExecutionScope,
@@ -23,6 +25,7 @@ from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
+from xagent.web.services import file_turn as file_turn_service
 from xagent.web.services.execution_scope_snapshot import (
     load_task_execution_scope_snapshot,
 )
@@ -137,6 +140,97 @@ def test_bind_turn_files_rejects_a_missing_task(db_runtime) -> None:
 
         assert missing == ["available"]
         assert _task_id_for_file(db, "available") is None
+
+
+@pytest.mark.postgresql
+def test_postgresql_bind_turn_files_does_not_deadlock_child_insert(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Binding must not take a task lock that conflicts with FK KEY SHARE."""
+    with disposable_database_factory("xagent_file_turn") as make_database:
+        engine = make_database("bind_child")
+        Base.metadata.create_all(bind=engine)
+        SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+        user_id, task_id, _competing_task_id = _seed_binding_rows(SessionLocal)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "CREATE TABLE file_turn_child ("
+                    "id INTEGER PRIMARY KEY, "
+                    "task_id INTEGER NOT NULL REFERENCES tasks(id))"
+                )
+            )
+
+        file_locked = threading.Event()
+        task_locked = threading.Event()
+        results: dict[str, object] = {}
+        real_lock_task = file_turn_service.lock_task_no_commit
+
+        def observed_lock_task(*args, **kwargs):
+            task = real_lock_task(*args, **kwargs)
+            task_locked.set()
+            return task
+
+        monkeypatch.setattr(
+            file_turn_service,
+            "lock_task_no_commit",
+            observed_lock_task,
+        )
+
+        def update_file_then_insert_child() -> None:
+            with SessionLocal() as db:
+                try:
+                    db.execute(text("SET LOCAL deadlock_timeout = '100ms'"))
+                    db.execute(text("SET LOCAL statement_timeout = '5s'"))
+                    db.query(UploadedFile).filter(
+                        UploadedFile.file_id == "available"
+                    ).update(
+                        {UploadedFile.filename: "writer-holds-file.txt"},
+                        synchronize_session=False,
+                    )
+                    file_locked.set()
+                    assert task_locked.wait(timeout=5)
+                    db.execute(
+                        text(
+                            "INSERT INTO file_turn_child (id, task_id) "
+                            "VALUES (1, :task_id)"
+                        ),
+                        {"task_id": task_id},
+                    )
+                    db.commit()
+                    results["writer"] = "committed"
+                except Exception as exc:  # noqa: BLE001
+                    db.rollback()
+                    results["writer"] = type(exc).__name__
+
+        def bind_file() -> None:
+            assert file_locked.wait(timeout=5)
+            with SessionLocal() as db:
+                try:
+                    db.execute(text("SET LOCAL deadlock_timeout = '100ms'"))
+                    db.execute(text("SET LOCAL statement_timeout = '5s'"))
+                    missing = file_turn_service.bind_turn_files_no_commit(
+                        file_ids=["available"],
+                        task_id=task_id,
+                        owner_user_id=user_id,
+                        db=db,
+                    )
+                    db.commit()
+                    results["binder"] = missing
+                except Exception as exc:  # noqa: BLE001
+                    db.rollback()
+                    results["binder"] = type(exc).__name__
+
+        writer = threading.Thread(target=update_file_then_insert_child)
+        binder = threading.Thread(target=bind_file)
+        writer.start()
+        binder.start()
+        writer.join(timeout=10)
+        binder.join(timeout=10)
+
+        assert not writer.is_alive(), results
+        assert not binder.is_alive(), results
+        assert results == {"writer": "committed", "binder": []}
 
 
 def test_bind_turn_files_rechecks_after_another_task_wins(db_runtime) -> None:

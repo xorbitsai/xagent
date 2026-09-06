@@ -181,10 +181,15 @@ def recover_stale_uploaded_file_compensations_batch_isolated(
 
         try:
             if candidate.cleanup_local:
-                delete_uploaded_file_local_copy_if_owned(
+                local_cleaned = delete_uploaded_file_local_copy_if_owned(
                     storage_path=candidate.storage_path,
                     user_id=candidate.user_id,
                 )
+                if not local_cleaned:
+                    logger.warning(
+                        "Skipped local recovery cleanup for file %s: path is not managed locally",
+                        candidate.file_id,
+                    )
             presence = compensation_delete(
                 user_id=candidate.user_id,
                 storage_key=candidate.storage_key,

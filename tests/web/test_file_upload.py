@@ -1112,6 +1112,45 @@ class TestFileUpload:
         )
         assert download.status_code == 404
 
+    @pytest.mark.parametrize("route", ["download", "preview"])
+    def test_public_routes_reject_detached_file_without_task_authority(
+        self,
+        client,
+        test_db,
+        temp_uploads_dir,
+        route,
+    ):
+        """A deleted task must not turn its former file into a public draft."""
+        admin_user, test_app = test_db
+        file_id = "55555555-5555-4555-8555-555555555555"
+        detached_path = temp_uploads_dir / f"user_{admin_user.id}" / "detached.txt"
+        detached_path.parent.mkdir(parents=True)
+        detached_path.write_text("detached", encoding="utf-8")
+
+        db = next(test_app.dependency_overrides[get_db]())
+        try:
+            db.add(
+                UploadedFile(
+                    file_id=file_id,
+                    user_id=int(admin_user.id),
+                    task_id=None,
+                    filename=detached_path.name,
+                    storage_path=str(detached_path),
+                    storage_status="available",
+                    detached_reason="task_deleted",
+                    detached_at=datetime.now(timezone.utc),
+                    mime_type="text/plain",
+                    file_size=detached_path.stat().st_size,
+                )
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        response = client.get(f"/api/files/public/{route}/{file_id}")
+
+        assert response.status_code == 403
+
     def test_public_download_registered_file_rejects_local_path_outside_uploads(
         self, client, test_db, tmp_path
     ):

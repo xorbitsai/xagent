@@ -11,9 +11,9 @@ def lock_task_no_commit(
     task_id: int,
     owner_user_id: int | None = None,
 ) -> Task | None:
-    """Lock and return a task without committing the caller-owned transaction."""
+    """Lock a task for mutation without blocking child-FK ``KEY SHARE`` locks."""
 
     query = db.query(Task).filter(Task.id == task_id)
     if owner_user_id is not None:
         query = query.filter(Task.user_id == owner_user_id)
-    return query.with_for_update().one_or_none()
+    return query.with_for_update(key_share=True).one_or_none()

@@ -21,6 +21,7 @@ depends_on: Union[str, Sequence[str], None] = None
 TABLE = "uploaded_files"
 TASK_FK = "fk_uploaded_files_task_id_tasks"
 INDEX = "ix_uploaded_files_detached_gc"
+INDEX_COLUMNS = ["task_id", "storage_status", "detached_at", "id"]
 SQLITE_NAMING = {
     "fk": "fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s",
 }
@@ -44,35 +45,60 @@ def _task_fk(inspector: sa.Inspector) -> ReflectedForeignKeyConstraint | None:
 def _sqlite_upgrade(inspector: sa.Inspector) -> None:
     task_fk = _task_fk(inspector)
     has_tasks = "tasks" in inspector.get_table_names()
-    with op.batch_alter_table(
-        TABLE,
-        recreate="always",
-        naming_convention=SQLITE_NAMING,
-        table_args=SQLITE_UNIQUE_TABLE_ARGS,
-    ) as batch:
-        batch.add_column(sa.Column("detached_reason", sa.String(64), nullable=True))
-        batch.add_column(
-            sa.Column("detached_at", sa.DateTime(timezone=True), nullable=True)
-        )
-        if task_fk is not None:
-            batch.drop_constraint(
-                str(task_fk.get("name") or TASK_FK),
-                type_="foreignkey",
-            )
-        if has_tasks:
-            batch.create_foreign_key(
-                TASK_FK,
-                "tasks",
-                ["task_id"],
-                ["id"],
-                ondelete="SET NULL",
-            )
-    op.create_index(
-        INDEX,
-        TABLE,
-        ["task_id", "storage_status", "detached_at", "id"],
-        unique=False,
+    columns = {column["name"] for column in inspector.get_columns(TABLE)}
+    missing_columns = {"detached_reason", "detached_at"} - columns
+    task_fk_options = task_fk.get("options") if task_fk is not None else None
+    task_fk_ondelete = (
+        str(task_fk_options.get("ondelete") or "") if task_fk_options else ""
     )
+    replace_task_fk = (
+        task_fk is not None and task_fk_ondelete.upper() != "SET NULL"
+    ) or (task_fk is None and has_tasks)
+    drop_dangling_task_fk = task_fk is not None and not has_tasks
+
+    if missing_columns or replace_task_fk or drop_dangling_task_fk:
+        with op.batch_alter_table(
+            TABLE,
+            recreate="always",
+            naming_convention=SQLITE_NAMING,
+            table_args=SQLITE_UNIQUE_TABLE_ARGS,
+        ) as batch:
+            if "detached_reason" in missing_columns:
+                batch.add_column(
+                    sa.Column("detached_reason", sa.String(64), nullable=True)
+                )
+            if "detached_at" in missing_columns:
+                batch.add_column(
+                    sa.Column("detached_at", sa.DateTime(timezone=True), nullable=True)
+                )
+            if task_fk is not None and (replace_task_fk or drop_dangling_task_fk):
+                batch.drop_constraint(
+                    str(task_fk.get("name") or TASK_FK),
+                    type_="foreignkey",
+                )
+            if has_tasks and replace_task_fk:
+                batch.create_foreign_key(
+                    TASK_FK,
+                    "tasks",
+                    ["task_id"],
+                    ["id"],
+                    ondelete="SET NULL",
+                )
+
+    existing_indexes = {index["name"]: index for index in inspector.get_indexes(TABLE)}
+    existing = existing_indexes.get(INDEX)
+    if existing is not None and (
+        existing.get("column_names") != INDEX_COLUMNS or existing.get("unique") is True
+    ):
+        op.drop_index(INDEX, table_name=TABLE)
+        existing = None
+    if existing is None:
+        op.create_index(
+            INDEX,
+            TABLE,
+            INDEX_COLUMNS,
+            unique=False,
+        )
 
 
 def _sqlite_downgrade(inspector: sa.Inspector) -> None:
@@ -141,10 +167,9 @@ def _postgresql_upgrade(inspector: sa.Inspector) -> None:
             op.execute(sa.text(f"ALTER TABLE {TABLE} VALIDATE CONSTRAINT {TASK_FK}"))
 
     existing_indexes = {index["name"]: index for index in inspector.get_indexes(TABLE)}
-    expected_columns = ["task_id", "storage_status", "detached_at", "id"]
     existing = existing_indexes.get(INDEX)
     if existing is not None and (
-        existing.get("column_names") != expected_columns
+        existing.get("column_names") != INDEX_COLUMNS
         or _postgresql_index_state(op.get_bind()) != (True, False)
     ):
         with op.get_context().autocommit_block():
@@ -155,7 +180,7 @@ def _postgresql_upgrade(inspector: sa.Inspector) -> None:
             op.create_index(
                 INDEX,
                 TABLE,
-                expected_columns,
+                INDEX_COLUMNS,
                 unique=False,
                 postgresql_concurrently=True,
             )
@@ -194,6 +219,8 @@ def upgrade() -> None:
         )
 
     inspector = sa.inspect(op.get_bind())
+    if TABLE not in inspector.get_table_names():
+        return
     if dialect == "sqlite":
         _sqlite_upgrade(inspector)
     elif dialect == "postgresql":
@@ -210,11 +237,13 @@ def downgrade() -> None:
             "offline detach-provenance migration is not supported; "
             "the task foreign-key name must be inspected online"
         )
+    inspector = sa.inspect(op.get_bind())
+    if TABLE not in inspector.get_table_names():
+        return
     if dialect == "sqlite":
-        _sqlite_downgrade(sa.inspect(op.get_bind()))
+        _sqlite_downgrade(inspector)
         return
 
-    inspector = sa.inspect(op.get_bind())
     op.drop_index(INDEX, table_name=TABLE)
     _drop_current_task_fk(inspector)
     if "tasks" in inspector.get_table_names():

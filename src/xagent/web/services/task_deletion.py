@@ -25,10 +25,10 @@ def purge_task_rows(
 ) -> bool:
     """Delete one task and its non-cascading rows in a caller-owned transaction.
 
-    ``UploadedFile`` rows are detached, not deleted: ``Task.uploaded_files`` is a
-    relationship without a cascade, so the unit of work nulls
-    ``UploadedFile.task_id`` before the task row is removed. The rows and their
-    backing blobs therefore outlive the task and are not reclaimed here.
+    ``UploadedFile`` rows are detached, not deleted. The bulk update clears
+    ``task_id`` and records ``detached_reason`` / ``detached_at`` atomically;
+    their backing blobs therefore outlive the task and remain traceable until
+    the retention-based detached-file GC claims them.
 
     ``task_interaction_requests`` rows, unlike ``UploadedFile``, are deleted
     outright: the CASCADE on ``task_id`` would remove them anyway, and the

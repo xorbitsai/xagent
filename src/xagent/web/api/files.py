@@ -755,6 +755,8 @@ def _validate_public_task_file_access(
     file_record: UploadedFile,
     token: str | None,
 ) -> None:
+    if file_record.detached_reason is not None:
+        raise HTTPException(status_code=403, detail="Access denied")
     if not file_record.task_id:
         return
 
@@ -1971,10 +1973,11 @@ async def public_download_file(
     ``/api/files/download/{file_id}`` route would 401 every plain
     browser navigation.
 
-    The ``file_id`` is the only required capability, matching the
-    existing ``public/preview`` contract. ``relative_path`` is
-    intentionally NOT supported: 'Open' always targets the registered
-    source artifact, never a sub-path inside it.
+    For active or draft records, the ``file_id`` is the required capability,
+    matching the existing ``public/preview`` contract. Detached records are
+    denied because their deleted task can no longer supply an authorization
+    context. ``relative_path`` is intentionally NOT supported: 'Open' always
+    targets the registered source artifact, never a sub-path inside it.
     """
     file_record: Optional[UploadedFile] = None
     target_path: Optional[Path] = None

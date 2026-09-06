@@ -97,7 +97,6 @@ class OrphanUploadSweepResult:
 class _SweepTickState:
     cursor: OrphanUploadSweepCursor | None
     backlog: bool
-    failed: bool = False
 
 
 @dataclass(frozen=True)
@@ -126,6 +125,12 @@ class _OrphanUploadCandidate:
 
     @property
     def cursor(self) -> OrphanUploadSweepCursor:
+        """Return the active sweep's ordering timestamp and row id.
+
+        ``created_at`` carries the creation time for task-less candidates and
+        the detach time for detached candidates, because both sweeps share the
+        same keyset cursor shape.
+        """
         return self.created_at, self.row_id
 
 
@@ -294,10 +299,15 @@ def _reap_orphan(db: Session, candidate: _OrphanUploadCandidate) -> bool:
     if token is None:
         return False  # bound, or claimed by another owner — spared
 
-    delete_uploaded_file_local_copy_if_owned(
+    local_cleaned = delete_uploaded_file_local_copy_if_owned(
         storage_path=candidate.storage_path,
         user_id=candidate.user_id,
     )
+    if not local_cleaned:
+        logger.warning(
+            "Skipped local orphan cleanup for file %s: path is not managed locally",
+            candidate.file_id,
+        )
 
     presence = delete_uploaded_file_compensation_object(
         user_id=candidate.user_id,
@@ -548,11 +558,7 @@ async def _run_combined_gc_tick(
             raise
         except Exception as exc:
             active[sweep_index] = False
-            states[sweep_index] = _SweepTickState(
-                cursors[sweep_index],
-                False,
-                True,
-            )
+            states[sweep_index] = _SweepTickState(cursors[sweep_index], False)
             if is_database_pool_timeout(exc):
                 logger.warning("%s GC skipped after database pool timeout", label)
             else:

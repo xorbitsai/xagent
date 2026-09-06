@@ -2040,6 +2040,17 @@ class _TeamOwnedUserMCP:
     caller's own team access verdict when one links this connector. Nothing
     reads past them on the ``delete`` branch: this stand-in grants no delete
     right, and none of its attributes changes that.
+
+    ``is_active`` and ``is_default`` are not read off any row -- there is
+    none -- and report a fixed placeholder instead: this user has no personal
+    activation state or default choice for a connector they never connected,
+    so there is no real value to report. A response built off this stand-in
+    (``update_mcp_server``'s post-lock cascade can construct one for a
+    caller whose personal row was deleted while it waited for the definition
+    lock, when the re-resolved verdict still authorizes the edit) reports
+    ``is_active=True`` and ``is_default=False`` for such a caller regardless
+    of what, if anything, their connection looked like before it was
+    removed.
     """
 
     is_owner = False
@@ -2482,6 +2493,40 @@ def _team_access_for_shared_row(
     if not keys.intersection(_server_catalog_keys(server)):
         return access
     return replace(access, can_edit=False)
+
+
+def _recheck_team_access_under_definition_lock(
+    db: Session, server: MCPServer, user_id: int, server_id: int
+) -> "ConnectorAccess | None":
+    """Re-resolve this caller's verdict while the definition row is locked.
+
+    Its own function rather than an inline call inside ``update_mcp_server``
+    for one reason: the call site table in ``connector_team_scope``'s module
+    docstring keys a row by "module.function", and that route already owns a
+    row for its rename-hook call. Two hook calls under one key have no way to
+    state two different declarations, and the check that keeps the table
+    honest refuses the collision outright.
+
+    ``caller_holds_lock=True``: this call runs after this transaction took
+    ``FOR UPDATE ... KEY SHARE`` on the ``mcp_servers`` definition row and
+    before anything is written. A hook that ends this transaction releases
+    that lock without the route noticing, so the seam refuses it here rather
+    than letting the write proceed on a lock that is already gone.
+
+    Like ``_teardown_mcp_app_server_locally``, this is a helper, not a route:
+    "the caller holds the definition row" is a fact about its one call site,
+    not something this function can check. A second caller that adds itself
+    without the lock owes the table a correction.
+    """
+    from ..services.connector_team_scope import resolve_one_connector_access_or_raise
+
+    return _team_access_for_shared_row(
+        db,
+        server,
+        resolve_one_connector_access_or_raise(
+            db, user_id, ("mcp", server_id), caller_holds_lock=True
+        ),
+    )
 
 
 def _oauth_account_can_connect(oauth_account: object) -> bool:
@@ -4484,6 +4529,11 @@ def update_mcp_server(
         # happened. This is independent of can_edit_global: even a team
         # editor with edit rights on the shared config has no personal row
         # of their own to store a per-user override or activation flag on.
+        #
+        # This is the gate-side half of the guard; a caller who still has a
+        # personal row here can lose it during the wait for the definition
+        # lock, so a second copy runs again below, after that wait, on the
+        # row a fresh read then finds.
         if is_stand_in and (
             server_data.user_env is not None or server_data.is_active is not None
         ):
@@ -4680,13 +4730,14 @@ def update_mcp_server(
             # but the caller's own association row, because none of these
             # re-reads can change what such a payload is allowed to do.
             #
-            # A gone link is this route's existing 404 for a caller who had
-            # one at the gate, matching the gate. A link that is still there
-            # but no longer owns the server is not an error by itself here
-            # -- the gate does not refuse a non-owner either -- so it is
-            # answered exactly as the gate would have answered it: the
-            # owner-only guard below rejects a payload that changes the
-            # shared configuration and drops one that does not.
+            # A gone link no longer 404s by itself here: what a caller with
+            # no personal row may still do is the re-resolved verdict's
+            # answer, asked by the cascade below. A link that is still there
+            # but no longer owns the server is not an error either -- the
+            # gate does not refuse a non-owner -- so both cases are answered
+            # by that same cascade, exactly as the gate would have answered
+            # them: the owner-only guard further down rejects a payload that
+            # changes the shared configuration and drops one that does not.
             current_user_mcp = (
                 db.query(UserMCPServer)
                 .filter(
@@ -4696,30 +4747,26 @@ def update_mcp_server(
                 .populate_existing()
                 .first()
             )
-            if current_user_mcp is None and not is_stand_in:
-                # Same reasoning as the definition-row 404 above: this read
-                # ran inside the transaction that held the lock, so an
-                # explicit rollback keeps this 404 from leaving that
-                # transaction open for the outer ``except HTTPException``
-                # handler to skip past.
-                #
-                # Only for a caller who had a personal row at the gate: a
-                # caller reaching this route through their team's verdict
-                # alone legitimately has none, and finding none here says
-                # nothing about them. Their authority is re-derived from the
-                # re-resolved verdict below instead.
-                db.rollback()
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="MCP server not found",
-                )
+            # ``user_mcp`` is re-pointed in both directions, because the lock
+            # wait can move a caller either way: one who reached the gate on
+            # their team's verdict may have acquired a personal row, and one
+            # who reached it on a personal row may have had it deleted.
+            #
+            # Nothing is refused here. Whether a caller with no personal row
+            # may still write is the verdict's answer, and it is asked below;
+            # refusing first would 404 a team editor whose team does authorise
+            # this edit. What must not survive this point is the gate's ORM
+            # object: continuing to hold a row another session has deleted
+            # raises ``StaleDataError`` at commit for a payload that writes it,
+            # and ``ObjectDeletedError`` while building the response for one
+            # that does not -- and the second of those fails *after* the
+            # definition-row write has already committed.
             if current_user_mcp is not None:
-                # A caller who reached the gate through their team's verdict
-                # may have acquired a personal row inside the lock wait; the
-                # fresh row is what the rest of the route must read from and
-                # refresh, so the stand-in is dropped when one turns up.
                 user_mcp = current_user_mcp
                 is_stand_in = False
+            else:
+                user_mcp = _TeamOwnedUserMCP(int(user_id))
+                is_stand_in = True
             # ``current_user.is_admin`` is the value the auth dependency's
             # own read fixed before this route's wait for the lock, same as
             # ``user_mcp``'s pre-lock read above -- and admin status is
@@ -4746,10 +4793,9 @@ def update_mcp_server(
             is_admin_now = bool(current_admin_user.is_admin)
 
             # The third fresh read: the caller's team access verdict, asked
-            # again while this transaction holds the definition row locked,
-            # and refused if it no longer grants the edit the pre-lock answer
-            # granted. This narrows the revocation window; it is not a fence,
-            # and cannot be one from inside this repository -- the revoke path
+            # again while this transaction holds the definition row locked.
+            # This narrows the revocation window; it is not a fence, and
+            # cannot be one from inside this repository -- the revoke path
             # lives in the application that installs the hook, and a real
             # fence needs both sides to take the same lock.
             #
@@ -4761,33 +4807,41 @@ def update_mcp_server(
             # snapshot, sees the pre-lock answer again, and degrades to a
             # no-op -- it would stop refusing, not start refusing wrongly.
             #
-            # Skipped for a platform admin, who does not write on the
-            # verdict's authority at all (``_check_mcp_permission`` answers
-            # True on the admin flag before it ever reads the verdict), and
-            # skipped when the pre-lock verdict granted no edit to begin with
-            # -- there is nothing for a revocation to take away.
+            # Skipped for a platform admin, whose write authority never came
+            # from the verdict (``_check_mcp_permission`` answers True on the
+            # admin flag before it ever reads one), and skipped for a caller
+            # whose freshly-read personal row still says ``is_owner`` -- that
+            # row decides the edit branch on its own, again without reading a
+            # verdict, so there is nothing here for a verdict to add.
+            #
+            # Everyone else re-asks, including the two populations the old
+            # condition let through unasked: a caller whose personal row
+            # granted edit at the gate (so no verdict was ever resolved) and
+            # lost it during the wait, and a caller whose gate verdict granted
+            # nothing. Both of those get the wrong answer without a re-ask --
+            # the first a 404 or a 403 for an edit their team does authorise,
+            # the second a refusal for an authority that arrived during the
+            # wait.
             #
             # Placed before any field below is read or mutated and before
             # rename_team_connector runs, so a refusal here has nothing to
             # undo: zero side effects is structural, not something the
             # rollback has to achieve.
-            if not is_admin_now and team_access is not None and team_access.can_edit:
-                from ..services.connector_team_scope import (
-                    resolve_one_connector_access_or_raise,
+            still_can_edit = is_admin_now or bool(
+                getattr(current_user_mcp, "is_owner", False)
+            )
+            if not still_can_edit:
+                rechecked = _recheck_team_access_under_definition_lock(
+                    db, server, int(user_id), int(server_id)
                 )
-
-                # Re-derived against the row this transaction holds locked,
-                # not against the pre-lock read: the name and auth that
-                # ``_team_access_for_shared_row``'s catalog test reads are
-                # both mutable through this very route.
-                rechecked = _team_access_for_shared_row(
-                    db,
-                    server,
-                    resolve_one_connector_access_or_raise(
-                        db, int(user_id), ("mcp", int(server_id))
-                    ),
-                )
-                if rechecked is None or not rechecked.can_edit:
+                if rechecked is not None and rechecked.can_edit:
+                    # The response below reports the verdict this write was
+                    # actually authorized on, not the one resolved before the
+                    # lock existed.
+                    team_access = rechecked
+                elif team_access is not None and team_access.can_edit:
+                    # The gate's verdict granted edit and this one does not:
+                    # revoked inside the wait. Wording unchanged.
                     db.rollback()
                     raise HTTPException(
                         status_code=status.HTTP_403_FORBIDDEN,
@@ -4796,10 +4850,52 @@ def update_mcp_server(
                             "this edit was in flight"
                         ),
                     )
-                # The response below reports the verdict this write was
-                # actually authorized on, not the one resolved before the
-                # lock existed.
-                team_access = rechecked
+                elif current_user_mcp is None:
+                    # The personal row is gone and the re-resolved verdict does not
+                    # authorize the edit. When that verdict is None this is literally
+                    # the gate's own 404 condition -- ``_resolve_mcp_server_for_request``
+                    # answers 404 for a caller with neither a personal row nor a
+                    # verdict. When it is a verdict that merely denies edit, the gate
+                    # would instead have built a stand-in and the pre-lock guard above
+                    # would have answered 403; 404 is chosen here for the whole
+                    # population because it discloses less about a connector this
+                    # caller no longer holds any row on.
+                    db.rollback()
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail="MCP server not found",
+                    )
+                else:
+                    # A personal row that does not own the server, and no team
+                    # verdict either. NOT a refusal here, and this is where the
+                    # MCP side stops being a mirror of ``custom_api``: the gate
+                    # does not refuse a non-owner either, so this caller is
+                    # answered exactly as the gate would answer them -- the
+                    # owner-only guard below rejects a payload that changes the
+                    # shared configuration and drops one that does not.
+                    team_access = rechecked
+
+            # The lock-side counterpart of the guard above the lock: that one
+            # runs before the wait and cannot see a personal row deleted
+            # during it. Same wording on purpose -- it is the same refusal,
+            # discovered later.
+            #
+            # Ordered after the authorization branches above, which mirrors
+            # the gate's own order: the gate answers 404 for a caller with
+            # neither a personal row nor a verdict (in
+            # ``_resolve_mcp_server_for_request``) before it ever reaches its
+            # own personal-field 400.
+            if is_stand_in and (
+                server_data.user_env is not None or server_data.is_active is not None
+            ):
+                db.rollback()
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=(
+                        "No personal connection exists to configure user_env or "
+                        "is_active for this server"
+                    ),
+                )
 
             can_edit_global = _check_mcp_permission(
                 user_mcp,

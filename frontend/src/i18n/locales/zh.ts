@@ -2944,6 +2944,7 @@ const zh = {
     }
   },
   markdownRenderer: {
+    tableScrollLabel: "表格（可横向滚动查看更多列）",
     loadAgentDetailsFailed: "无法加载 Agent 详情",
   },
   agent: {

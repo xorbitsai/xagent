@@ -2949,6 +2949,7 @@ Build when you need.`,
     }
   },
   markdownRenderer: {
+    tableScrollLabel: "Table (scroll horizontally to see more columns)",
     loadAgentDetailsFailed: "Unable to load agent details",
   },
   agent: {

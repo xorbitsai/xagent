@@ -3,6 +3,7 @@ import ReactMarkdown, { defaultUrlTransform } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeKatex from 'rehype-katex'
 import { remarkCurrencySafeMath } from '@/lib/remark-currency-safe-math'
+import { remarkPreserveTableContent } from '@/lib/remark-preserve-table-content'
 import type { Components, ExtraProps } from 'react-markdown'
 import { apiRequest } from '@/lib/api-wrapper'
 import { AgentCard } from '@/components/chat/AgentCard'
@@ -338,6 +339,20 @@ function MarkdownParagraph({
   return <p {...props}>{children}</p>
 }
 
+function MarkdownTable({ node: _node, children, ...props }: MarkdownComponentProps<'table'>) {
+  const { t } = useI18n()
+  return (
+    <div
+      className="markdown-table-scroll"
+      role="region"
+      aria-label={t('markdownRenderer.tableScrollLabel')}
+      tabIndex={0}
+    >
+      <table {...props}>{children}</table>
+    </div>
+  )
+}
+
 function MarkdownLink({
   node,
   href,
@@ -566,6 +581,7 @@ const markdownComponents: Components = {
   p: MarkdownParagraph,
   a: MarkdownLink,
   img: MarkdownImage,
+  table: MarkdownTable,
 }
 
 export function MarkdownRenderer({
@@ -604,7 +620,7 @@ export function MarkdownRenderer({
     <MarkdownRendererContext.Provider value={contextValue}>
       <div className={`prose prose-invert max-w-none break-words [overflow-wrap:anywhere] ${className}`}>
         <ReactMarkdown
-          remarkPlugins={[remarkGfm, remarkCurrencySafeMath]}
+          remarkPlugins={[remarkGfm, remarkCurrencySafeMath, remarkPreserveTableContent]}
           rehypePlugins={[rehypeKatex]}
           components={markdownComponents}
           urlTransform={safeUrlTransform}

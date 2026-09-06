@@ -269,6 +269,144 @@ describe('MarkdownRenderer', () => {
     }
   })
 
+  it('wraps each table in its own keyboard-accessible scroll region', () => {
+    render(<MarkdownRenderer content={[
+      '| Long plan description | Price |', '| :--- | ---: |', '| SIMBA | $15 |',
+      '', 'Another comparison:', '',
+      '| Country | Status |', '| --- | --- |', '| AU | Paused |',
+    ].join('\n')} />)
+    const tables = screen.getAllByRole('table')
+    expect(tables).toHaveLength(2)
+    for (const table of tables) {
+      expect(table.parentElement).toHaveClass('markdown-table-scroll')
+      expect(table.parentElement).toHaveAttribute('tabindex', '0')
+      expect(table.parentElement).toHaveAttribute('role', 'region')
+      expect(table.parentElement).toHaveAttribute('aria-label', 'markdownRenderer.tableScrollLabel')
+    }
+    expect(screen.getByRole('columnheader', { name: 'Price' })).toHaveStyle({ textAlign: 'right' })
+    expect(screen.getByRole('cell', { name: '$15' })).toHaveStyle({ textAlign: 'right' })
+  })
+
+  it('preserves escaped pipes and code inside cells without moving values between columns', () => {
+    render(<MarkdownRenderer content={[
+      '| Campaign | Country | Status | Spend |', '| --- | --- | --- | --- |',
+      String.raw`| Jack \| TEST | AU | Paused | $1,909.81 |`,
+      String.raw`| \`a\|b\` | SG | Active | $15–$25 |`.replaceAll('\\`', '`'),
+    ].join('\n')} />)
+    expect(screen.getAllByRole('cell').map((cell) => cell.textContent)).toEqual([
+      'Jack | TEST', 'AU', 'Paused', '$1,909.81', 'a|b', 'SG', 'Active', '$15–$25',
+    ])
+  })
+
+  it('keeps the table and scroll wrapper stable while a streamed row grows', () => {
+    const header = '| Plan | Price |\n| --- | --- |\n'
+    const { rerender } = render(<MarkdownRenderer content={header + '| SIMBA |'} />)
+    const table = screen.getByRole('table')
+    const wrapper = table.parentElement
+    expect(screen.getAllByRole('cell').map((cell) => cell.textContent)).toEqual(['SIMBA', ''])
+    for (const row of ['| SIMBA |', '| SIMBA | $', '| SIMBA | $15', '| SIMBA | $15–$25 |']) {
+      rerender(<MarkdownRenderer content={header + row} />)
+      expect(screen.getByRole('table')).toBe(table)
+      expect(table.parentElement).toBe(wrapper)
+    }
+    expect(screen.getAllByRole('cell').map((cell) => cell.textContent)).toEqual(['SIMBA', '$15–$25'])
+  })
+
+  it.each([
+    '| SIMBA | $15 | never discard this |',
+    '| Jack | TEST | $1,909.81 |',
+    '| `a|b` | $15 |',
+    '| <img src=x onerror=alert(1)> | $15 | private value |',
+  ])('preserves the exact source of a table with mismatched cells: %s', (row) => {
+    const source = ['| Plan | Price |', '| --- | --- |', row].join('\n')
+    const { container } = render(<MarkdownRenderer content={source} />)
+    expect(screen.queryByRole('table')).not.toBeInTheDocument()
+    expect(container.querySelector('pre code')?.textContent).toBe(source + '\n')
+    expect(container.querySelector('img')).toBeNull()
+  })
+
+  it('preserves nested mismatched tables without changing surrounding content', () => {
+    const source = '> | A | B |\n> | --- | --- |\n> | one | two | three |'
+    const { container } = render(<MarkdownRenderer content={[
+      'Before **table**.', '', source, '',
+      '- Nested list:', '', '  | A | B |', '  | --- | --- |', '  | x | y | z |', '',
+      '| Valid | Table |', '| --- | --- |', '| yes | $15 |', '', 'After table.',
+    ].join('\n')} />)
+    expect(container.querySelector('blockquote pre code')?.textContent).toBe(source.slice(2) + '\n')
+    expect(container.querySelector('li pre code')?.textContent).toBe('| A | B |\n  | --- | --- |\n  | x | y | z |\n')
+    expect(screen.getAllByRole('table')).toHaveLength(1)
+    expect(screen.getByText('After table.')).toBeInTheDocument()
+    expect(container.querySelector('strong')?.textContent).toBe('table')
+  })
+
+  it('preserves surplus cells from CRLF input and renders valid CRLF tables', () => {
+    const header = '| A | B |\r\n| --- | --- |\r\n'
+    const { container, rerender } = render(<MarkdownRenderer content={header + '| x | y | z |'} />)
+    expect(container.querySelector('pre code')?.textContent).toBe(header + '| x | y | z |\n')
+    rerender(<MarkdownRenderer content={header + '| x | y |'} />)
+    expect(screen.getAllByRole('cell').map((cell) => cell.textContent)).toEqual(['x', 'y'])
+  })
+
+  it('switches safely between incomplete, valid and overflowing streamed rows', () => {
+    const header = '| Campaign | Spend |\n| --- | --- |\n'
+    const { container, rerender } = render(<MarkdownRenderer content={header + '| Jack |'} />)
+    expect(screen.getAllByRole('cell').map((cell) => cell.textContent)).toEqual(['Jack', ''])
+    expect(container.querySelector('pre')).toBeNull()
+    rerender(<MarkdownRenderer content={header + '| Jack | $15 |'} />)
+    expect(screen.getAllByRole('cell').map((cell) => cell.textContent)).toEqual(['Jack', '$15'])
+    const overflow = header + '| Jack | TEST | $15 |'
+    rerender(<MarkdownRenderer content={overflow} />)
+    expect(container.querySelector('pre code')?.textContent).toBe(overflow + '\n')
+    expect(screen.queryByRole('table')).not.toBeInTheDocument()
+    rerender(<MarkdownRenderer content={header + String.raw`| Jack \| TEST | $15 |`} />)
+    expect(screen.getAllByRole('cell').map((cell) => cell.textContent)).toEqual(['Jack | TEST', '$15'])
+  })
+
+  it('retains explicitly empty cells and leaves table-shaped code examples alone', () => {
+    const { container } = render(<MarkdownRenderer content={[
+      '| A | B |', '| --- | --- |', '| one | |', '| | two |', '',
+      '```markdown', '| A | B |', '| --- | --- |', '| x | y | z |', '```',
+    ].join('\n')} />)
+    expect(screen.getAllByRole('cell').map((cell) => cell.textContent)).toEqual(['one', '', '', 'two'])
+    expect(container.querySelector('pre code')?.textContent).toBe('| A | B |\n| --- | --- |\n| x | y | z |\n')
+  })
+
+  it.each([
+    ['| A | B |\n| --- | --- |', 2, []],
+    ['| A |\n| --- |\n| one |', 1, ['one']],
+    ['| A |\n| --- |', 1, []],
+    ['| A | B | C |\n| --- | --- | --- |\n| one |\n| two | three |', 3, ['one', '', '', 'two', 'three', '']],
+  ])('keeps lossless GFM tables rendered: %s', (source, columns, cells) => {
+    const { container } = render(<MarkdownRenderer content={source} />)
+    expect(screen.getByRole('table')).toBeInTheDocument()
+    expect(screen.getAllByRole('columnheader')).toHaveLength(columns)
+    expect(screen.queryAllByRole('cell').map((cell) => cell.textContent)).toEqual(cells)
+    expect(container.querySelector('pre')).toBeNull()
+  })
+
+  it('replays the plan comparison table captured from the original TC6 task', () => {
+    // Verbatim table excerpt from local benchmark task 880, assistant message
+    // 2555. This is a rendering fixture, not a claim about current plan prices.
+    const source = [
+      '| Provider | Representative plans | Main proposition | Competitive strength | Weakness |',
+      '|---|---:|---|---|---|',
+      '| **SIMBA** | $10–$25 per 30 days | 500–800GB local data, large APAC/global roaming bundles, IDD and local-call benefits | Best international value; highly generous roaming; low prices | Plan architecture is complicated; very large headline data quotas can look less credible or less relevant to ordinary users |',
+      '| **Singtel hi!** | About $15–$40 per 4 weeks, plus senior options | Large local data bundles, Singtel 5G+ network, roaming and IDD, app-based top-up | Strongest brand and perceived network reliability; broad retail and service ecosystem | Usually weaker raw value than SIMBA, Maxx or eight; higher prices for comparable heavy-data users |',
+      '| **eight** | About $8–$18 per 30 days | 488–688GB headline data, 4G/5G tiers, roaming, IDD and local benefits | Strong data value plus automatic rollover; rollover balance can build up to eight months of current-plan entitlement | More complex naming and benefit structure; customers may struggle to understand what is local data versus roaming data |',
+      '| **Maxx** | About $7.90–$12 per month | 290–500GB plans, 4G/5G options, Singapore/Malaysia or wider Asian usage, IDD and roaming | Very sharp price points; simple proposition; backed by M1’s network | Less generous than SIMBA/eight at the top end; no data rollover in the surfaced comparison; physical SIM availability may be less flexible than eSIM-led rivals |',
+    ].join('\n')
+    const { container } = render(<MarkdownRenderer content={source} />)
+    expect(screen.getAllByRole('columnheader')).toHaveLength(5)
+    expect(screen.getAllByRole('row')).toHaveLength(5)
+    expect(screen.getAllByRole('cell').map((cell) => cell.textContent)).toEqual(
+      source.split('\n').slice(2).flatMap((row) => row.split('|').slice(1, -1).map(
+        (cell) => cell.trim().replaceAll('**', ''),
+      )),
+    )
+    expect(screen.getByRole('table').parentElement).toHaveClass('markdown-table-scroll')
+    expect(container.querySelector('.katex')).toBeNull()
+  })
+
   it('renders numeric formulas alongside currency without merging their delimiters', () => {
     const { container } = render(
       <MarkdownRenderer content="Pay $15 or $25; the equation is $2 + 2 = 4$, then $x^2$." />,

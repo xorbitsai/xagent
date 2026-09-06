@@ -1,6 +1,7 @@
 from .actor_oauth_flow import ActorOAuthFlowState
 from .agent import Agent
 from .agent_api_key import AgentApiKey
+from .auto_model import AutoModelCandidate, AutoModelConfig
 from .background_job import BackgroundJob, BackgroundJobStatus, BackgroundJobType
 from .chat_message import TaskChatMessage
 from .custom_api import CustomApi, UserCustomApi
@@ -86,6 +87,8 @@ __all__ = [
     "SystemSetting",
     "Agent",
     "AgentApiKey",
+    "AutoModelConfig",
+    "AutoModelCandidate",
     "BackgroundJob",
     "BackgroundJobStatus",
     "BackgroundJobType",

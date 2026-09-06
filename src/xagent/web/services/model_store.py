@@ -490,6 +490,11 @@ class ModelStore:
         if share_with_users:
             user_model.is_shared = True  # type: ignore[assignment]
         elif currently_shared:
+            self.prune_external_auto_references(
+                model_id=model_id,
+                owner_user_id=user_id,
+            )
+
             owner_defaults = (
                 self.db.query(UserDefaultModel)
                 .filter(
@@ -517,6 +522,43 @@ class ModelStore:
         self.db.refresh(db_model)
         self.db.refresh(user_model)
         invalidate_model_cache(None)
+
+    def prune_external_auto_references(
+        self, *, model_id: int, owner_user_id: int
+    ) -> int:
+        """Remove Auto bindings that lose access when an owner mutates a model."""
+
+        from ..models.auto_model import AutoModelCandidate, AutoModelConfig
+
+        external_config_ids = [
+            int(config_id)
+            for (config_id,) in (
+                self.db.query(AutoModelCandidate.config_id)
+                .join(
+                    AutoModelConfig,
+                    AutoModelCandidate.config_id == AutoModelConfig.id,
+                )
+                .filter(
+                    AutoModelCandidate.target_model_id == model_id,
+                    AutoModelConfig.user_id != owner_user_id,
+                )
+                .all()
+            )
+        ]
+        if not external_config_ids:
+            return 0
+        self.db.query(AutoModelConfig).filter(
+            AutoModelConfig.id.in_(external_config_ids),
+            AutoModelConfig.fallback_model_id == model_id,
+        ).update({AutoModelConfig.fallback_model_id: None}, synchronize_session=False)
+        return int(
+            self.db.query(AutoModelCandidate)
+            .filter(
+                AutoModelCandidate.config_id.in_(external_config_ids),
+                AutoModelCandidate.target_model_id == model_id,
+            )
+            .delete(synchronize_session=False)
+        )
 
     def delete_model(
         self, *, model_storage: CoreStorage, user_model: UserModel

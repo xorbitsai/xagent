@@ -263,7 +263,7 @@ def _allow_standalone_connector_delete(monkeypatch) -> None:
     monkeypatch.setattr(
         connector_team_scope,
         "delete_team_connector",
-        lambda *args: SimpleNamespace(
+        lambda *args, **kwargs: SimpleNamespace(
             blocked_reason=None,
             team_owned=False,
             authorized=False,
@@ -814,7 +814,7 @@ def test_connect_producer_first_blocks_disconnect_until_flow_commit(
     monkeypatch.setattr(
         connector_team_scope,
         "delete_team_connector",
-        lambda *args: SimpleNamespace(
+        lambda *args, **kwargs: SimpleNamespace(
             blocked_reason=None,
             team_owned=False,
             authorized=False,
@@ -911,7 +911,7 @@ def test_callback_producer_first_blocks_real_disconnect_until_grant_commit(
     monkeypatch.setattr(
         connector_team_scope,
         "delete_team_connector",
-        lambda *args: SimpleNamespace(
+        lambda *args, **kwargs: SimpleNamespace(
             blocked_reason=None,
             team_owned=False,
             authorized=False,
@@ -1024,7 +1024,7 @@ def test_real_disconnect_first_rejects_stale_callback_and_preserves_replacement(
     producer_results: list[object] = []
     errors: list[BaseException] = []
 
-    def gated_team_delete(*args):
+    def gated_team_delete(*args, **kwargs):
         teardown_locked.set()
         assert allow_teardown.wait(timeout=5)
         return SimpleNamespace(
@@ -5089,7 +5089,7 @@ async def test_app_teardown_preserves_only_governed_non_oauth_servers(
         monkeypatch.setattr(
             connector_team_scope,
             "delete_team_connector",
-            lambda *args: SimpleNamespace(
+            lambda *args, **kwargs: SimpleNamespace(
                 blocked_reason=None,
                 team_owned=True,
                 authorized=not refused,

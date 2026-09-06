@@ -154,6 +154,7 @@ from ..services.hot_path_cache import (
     task_cache_ttl_seconds,
     web_task_history_key,
 )
+from ..services.llm_utils import AutoModelUnavailableError
 from ..services.managed_file_ref import (
     DurableObjectIntegrityError,
     DurableStorageOperationError,
@@ -2976,11 +2977,12 @@ async def execute_task_background(
             raise
 
         error_message = str(e)
-        error_code = (
-            e.error_code
-            if isinstance(e, ClientVisibleError)
-            else ClientErrorCode.TASK_EXECUTION_FAILED
-        )
+        if isinstance(e, AutoModelUnavailableError):
+            error_code = ClientErrorCode.AUTO_MODEL_UNAVAILABLE
+        elif isinstance(e, ClientVisibleError):
+            error_code = e.error_code
+        else:
+            error_code = ClientErrorCode.TASK_EXECUTION_FAILED
         safe_error_message = client_error_message(error_code)
         terminal_payload = await run_db_io_cancellation_safe(
             lambda: _terminal_task_error_payload(

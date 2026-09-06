@@ -9,12 +9,9 @@ What this test pins:
        The test asserts the loader's ``threading.get_ident()`` differs
        from the loop thread's.
 
-    2. While the loader is sleeping, the event loop is still able to
-       drive other coroutines forward. We verify by kicking off a
-       concurrent ``asyncio.sleep`` task and confirming it advances
-       during the snapshot load window. This is the core invariant
-       the off-loop snapshot loader exists to provide -- main-loop
-       release during the synchronous DB block (issue #427).
+    2. While the loader is parked on a release event, the event loop resumes
+       the test coroutine. The test releases the worker only after observing
+       that the load is still pending (issue #427).
 
     3. The snapshot's fields are observed by ``get_agent_for_task``
        on the loop thread without lazy-loading from the loader's
@@ -426,39 +423,17 @@ async def test_snapshot_runs_off_loop_thread() -> None:
 
 @pytest.mark.asyncio
 async def test_event_loop_stays_responsive_during_snapshot_load() -> None:
-    """The other half of the off-loop contract: while the snapshot
-    loader is sleeping (simulating a slow DB read), other coroutines
-    on the same loop must still be able to make progress.
-
-    We block the loader for 0.3s and concurrently schedule a tight
-    polling task that records its tick count. If ``to_thread`` works,
-    the polling task progresses across many ticks during the loader's
-    sleep. If the loader regresses back to an inline synchronous
-    call, the polling task records at most one tick (no progress
-    until the blocking sleep returns).
-    """
+    """The loop resumes while the actual snapshot loader is parked off-loop."""
     snapshot = _build_snapshot()
-    ticks: list[float] = []
-    loader_done = asyncio.Event()
+    entered = threading.Event()
+    release = threading.Event()
+    loop_thread = threading.get_ident()
 
     def slow_loader(task_id: int, user_id: int | None) -> TaskSetupSnapshot:
-        # Synchronous sleep on the worker thread. If the call is
-        # actually executed inline on the loop thread, this freezes
-        # the entire loop and the poll task can't tick.
-        import time
-
-        time.sleep(0.3)
+        entered.set()
+        assert threading.get_ident() != loop_thread
+        assert release.wait(timeout=30), "snapshot loader was never released"
         return snapshot
-
-    async def poll() -> None:
-        loop = asyncio.get_running_loop()
-        start = loop.time()
-        while not loader_done.is_set():
-            ticks.append(loop.time() - start)
-            # Short sleep to yield, but the *loop* must run to come
-            # back to us. If the loader is hogging the loop this
-            # await never resumes until the sleep returns.
-            await asyncio.sleep(0.02)
 
     manager = AgentServiceManager()
     user = _make_user()
@@ -492,20 +467,14 @@ async def test_event_loop_stays_responsive_during_snapshot_load() -> None:
                 await manager.get_agent_for_task(task_id=42, db=db, user=user)
             except Exception:
                 pass
-        loader_done.set()
 
-    await asyncio.gather(driver(), poll())
-
-    # With a 0.3s blocking sleep on the worker thread and 0.02s
-    # polling intervals on the loop, we expect on the order of ~10
-    # ticks. Use a permissive floor of >= 5 to keep the test stable
-    # under busy CI while still failing loudly if the loop genuinely
-    # freezes (which would yield 0-1 ticks).
-    assert len(ticks) >= 5, (
-        f"Loop ticked only {len(ticks)} times during the 0.3s snapshot "
-        "load -- the loader appears to be running inline on the loop "
-        "thread (the off-loop invariant regressed)."
-    )
+    loading = asyncio.create_task(driver())
+    try:
+        assert await asyncio.to_thread(entered.wait, 30)
+        assert not loading.done()
+    finally:
+        release.set()
+        await asyncio.wait_for(loading, timeout=30)
 
 
 @pytest.mark.asyncio

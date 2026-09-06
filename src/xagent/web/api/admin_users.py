@@ -213,7 +213,9 @@ def _record_settled_bindings_sync(
 def _delete_user_rows_sync(*, user_id: int) -> bool:
     """Delete one user and every row it owns in an operation-local session."""
 
+    from ..models.auto_model import AutoModelConfig
     from ..models.mcp import UserMCPServer
+    from ..models.model import Model as DBModel
 
     session_factory = get_session_local()
     delete_db = session_factory()
@@ -229,6 +231,19 @@ def _delete_user_rows_sync(*, user_id: int) -> bool:
 
         # Delete user's MCP server associations (not the servers themselves)
         delete_db.query(UserMCPServer).filter(UserMCPServer.user_id == user_id).delete()
+
+        # Auto configs own a virtual model row. Removing the model first also
+        # cascades its config and prevents an orphaned router model.
+        auto_model_ids = [
+            int(model_id)
+            for (model_id,) in delete_db.query(AutoModelConfig.router_model_id)
+            .filter(AutoModelConfig.user_id == user_id)
+            .all()
+        ]
+        if auto_model_ids:
+            delete_db.query(DBModel).filter(DBModel.id.in_(auto_model_ids)).delete(
+                synchronize_session=False
+            )
 
         # Delete the user (UserModel and UserDefaultModel have cascade delete)
         delete_db.delete(user)

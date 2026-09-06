@@ -8824,3 +8824,156 @@ async def test_react_summarizes_with_the_main_model_when_no_compact_model() -> N
     # One routing decision for the whole turn, taken on the conversation.
     assert len(route_prompts) == 1
     assert "Conversation history to compact" not in route_prompts[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("name", "args"),
+    [
+        ("calculator", {"expression": "2+2"}),
+        ("send_message", {"message": "Working"}),
+        ("ask_user_question", {"message": "Which option?"}),
+        ("final_answer", {"answer": "Done"}),
+    ],
+)
+async def test_react_shared_lifecycle_preserves_tool_observers(
+    name: str, args: dict[str, Any], mocker: Any
+) -> None:
+    pattern = ReActPattern()
+    call = {"id": "call-1", "name": name, "args": args}
+    pattern.pending_tool_calls = [call]
+    runtime = PatternRuntime()
+    runtime.active_react_step_id = "step-1"
+    runtime.active_turn_id = "turn-1"
+    context = ExecutionContext()
+    records = mocker.spy(pattern, "_record_tool_call")
+    started = mocker.spy(runtime, "on_tool_start")
+    ended = mocker.spy(runtime, "on_tool_end")
+    billed = mocker.patch("xagent.core.model.chat.token_context.add_tool_call_usage")
+
+    await pattern._execute_pending_tool_calls(
+        context=context, tools=[FakeTool()], llm=FakeLLM([]), runtime=runtime
+    )
+
+    assert [entry.kwargs["status"] for entry in records.call_args_list] == [
+        "running",
+        "completed",
+    ]
+    assert pattern.tool_ledger["call-1"].status == "completed"
+    assert len(context.get_messages_by_role("tool")) == 1
+    ordinary_count = int(name == "calculator")
+    assert started.call_count == ended.call_count == billed.call_count == ordinary_count
+    # Preparing execution context must not mutate an existing checkpoint's
+    # pending object or interfere with control handlers' identity comparisons.
+    assert call == {"id": "call-1", "name": name, "args": args}
+    if name in {"send_message", "ask_user_question"}:
+        metadata = runtime.outbound_messages[0]["metadata"]
+        assert metadata["tool_call_id"] == "call-1"
+        assert metadata["tool_name"] == name
+        assert metadata["step_id"] == "step-1"
+        assert metadata["turn_id"] == "turn-1"
+        assert "args" not in metadata
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure_type", "status"),
+    [
+        (RuntimeError, "failed"),
+        (ToolCallInterrupted, "interrupted"),
+        (asyncio.CancelledError, "interrupted"),
+    ],
+)
+async def test_react_control_send_failure_settles_lifecycle_and_propagates(
+    failure_type: type[BaseException], status: str, mocker: Any
+) -> None:
+    pattern = ReActPattern()
+    call = {"id": "send-1", "name": "send_message", "args": {"message": "Hi"}}
+    pattern.pending_tool_calls = [call]
+    failure = failure_type("send aborted")
+
+    async def send(payload: dict[str, Any]) -> None:
+        assert pattern.tool_ledger["send-1"].status == "running"
+        assert payload["metadata"]["tool_call_id"] == "send-1"
+        raise failure
+
+    runtime = PatternRuntime(outbound_message_handler=send)
+    context = ExecutionContext()
+    records = mocker.spy(pattern, "_record_tool_call")
+    with pytest.raises(failure_type) as caught:
+        await pattern._execute_pending_tool_calls(
+            context=context, tools=[], llm=None, runtime=runtime
+        )
+    assert caught.value is failure
+    assert [entry.kwargs["status"] for entry in records.call_args_list] == [
+        "running",
+        status,
+    ]
+    assert pattern.tool_ledger["send-1"].error == "send aborted"
+    assert pattern.pending_tool_calls == [call]
+    assert context.get_messages_by_role("tool") == []
+
+
+@pytest.mark.asyncio
+async def test_react_aggregated_question_preserves_ordered_call_sources() -> None:
+    pattern = ReActPattern()
+    runtime = PatternRuntime()
+    runtime.active_react_step_id = "parent-step"
+    runtime.active_turn_id = "turn-1"
+    calls = [
+        {"id": "a", "name": "first", "step_id": "child-step"},
+        {"id": "b", "name": "second"},
+    ]
+    await pattern._pause_for_tool_results(
+        waiting_pairs=[(call, {"message": call["name"]}) for call in calls],
+        context=ExecutionContext(),
+        runtime=runtime,
+    )
+    assert runtime.outbound_messages[0]["metadata"]["tool_calls"] == [
+        {
+            "tool_call_id": "a",
+            "tool_name": "first",
+            "step_id": "child-step",
+            "turn_id": "turn-1",
+        },
+        {
+            "tool_call_id": "b",
+            "tool_name": "second",
+            "step_id": "parent-step",
+            "dag_step_id": "parent-step",
+            "turn_id": "turn-1",
+        },
+    ]
+    assert calls == [
+        {"id": "a", "name": "first", "step_id": "child-step"},
+        {"id": "b", "name": "second"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_react_final_checkpoint_failure_preserves_completed_call(
+    mocker: Any,
+) -> None:
+    pattern = ReActPattern()
+    pattern.pending_tool_calls = [
+        {"id": "final-1", "name": "final_answer", "args": {"answer": "Done"}}
+    ]
+    runtime = PatternRuntime()
+    failure = RuntimeError("checkpoint unavailable")
+    mocker.patch.object(runtime, "checkpoint", side_effect=failure)
+    records = mocker.spy(pattern, "_record_tool_call")
+    context = ExecutionContext()
+
+    with pytest.raises(RuntimeError) as caught:
+        await pattern._execute_pending_tool_calls(
+            context=context, tools=[], llm=None, runtime=runtime
+        )
+
+    assert caught.value is failure
+    assert [entry.kwargs["status"] for entry in records.call_args_list] == [
+        "running",
+        "completed",
+    ]
+    assert pattern.tool_ledger["final-1"].status == "completed"
+    assert pattern.tool_ledger["final-1"].error is None
+    assert len(context.get_messages_by_role("tool")) == 1

@@ -66,6 +66,7 @@ on:
       - 'tests/web/api/test_mcp_server_edit_lock_postgresql.py'
       - 'src/xagent/web/api/mcp.py'
       - 'src/xagent/core/tools/core/mcp/model.py'
+      - 'tests/web/services/test_connector_hook_session_boundary.py'
       - 'tests/web/api/test_connector_hook_session_fault_postgresql.py'
   pull_request:
     branches: [main]
@@ -169,6 +170,7 @@ jobs:
             tests/web/api/test_mcp_server_edit_lock_postgresql.py
             src/xagent/web/api/mcp.py
             src/xagent/core/tools/core/mcp/model.py
+            tests/web/services/test_connector_hook_session_boundary.py
             tests/web/api/test_connector_hook_session_fault_postgresql.py
           )
 
@@ -533,6 +535,16 @@ jobs:
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
           pytest tests/web/api/test_mcp_server_edit_lock_postgresql.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      # -m postgresql because this file is mixed: the PostgreSQL cells need a
+      # live server, and the SQLite cells pin the same grid on the default
+      # backend and already run in the ordinary suite.
+      - name: Test connector hook session boundary (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/web/services/test_connector_hook_session_boundary.py -m postgresql -q
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 

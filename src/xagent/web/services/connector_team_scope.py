@@ -3,6 +3,92 @@
 Standalone xagent keeps connectors user-owned. A multi-tenant application can
 install these hooks to overlay team visibility without teaching xagent about
 the application's team tables.
+
+Session contract
+----------------
+
+Every hook here is called with the endpoint's own live database session --
+the same object the route is using, mid-request, sometimes with row locks
+already taken. A hook that ends that transaction releases those locks, and
+the route finds out about none of it: it keeps running, writes, and commits
+believing it still holds them. Two concurrent edits of one connector can
+then interleave into a final row neither of them submitted.
+
+A hook must not:
+
+- call ``commit()`` on the session it was handed;
+- call ``rollback()`` on it;
+- call ``close()`` on it;
+- call a helper that conditionally does one of those three. This repository
+  ships one such helper: ``release_db_connection_if_clean``
+  (``models/database.py``), which rolls back and returns the connection when
+  the session has no pending writes -- which is exactly the state a hook is
+  usually called in, so a hook reusing it lands on the rollback branch.
+
+A hook may:
+
+- open a savepoint with ``begin_nested()`` and commit or roll back that
+  savepoint. This is the supported way for a hook to recover from a failure
+  of its own, and it does not end the caller's transaction;
+- raise. The seam restores the session and propagates the failure, and
+  raising is not a contract violation;
+- write on the session and ``flush()`` without ending the transaction. The
+  ``deleted`` and ``renamed`` slots exist so a hook can do exactly this;
+- open a ``Session`` of its own and do whatever it likes on that one.
+
+Call sites and what the caller holds
+------------------------------------
+
+Each row states what the caller's transaction is holding while the hook
+runs, whether the caller had already committed work of its own before
+asking, and whether the call declares ``caller_holds_lock``. A call site
+that declares it is checked; one that does not is not.
+
+| Call site | Caller holds while the hook runs | Committed before asking | ``caller_holds_lock`` |
+| --- | --- | --- | --- |
+| ``custom_api.update_custom_api`` | the ``custom_apis`` definition row, ``FOR UPDATE``, on the payloads that write that row | no | ``True`` |
+| ``custom_api.delete_custom_api`` | the ``custom_apis`` definition row, ``FOR UPDATE`` | no | ``True`` |
+| ``mcp.update_mcp_server`` | the ``mcp_servers`` definition row, ``FOR UPDATE ... KEY SHARE``, on the payloads that write that row | no | ``True`` |
+| ``mcp.teardown_mcp_app_server`` | three row locks: ``public_mcp_apps``, ``mcp_servers``, ``user_mcpservers`` | no, within this function -- see the note below | ``True`` |
+| ``mcp.delete_mcp_server`` | two row locks: ``mcp_servers`` and ``user_mcpservers``, taken by ``_lock_active_mcp_oauth_lifecycle`` before this call | no | ``True`` |
+
+``mcp.teardown_mcp_app_server`` is a helper, not a route: it has no route
+decorator and no caller in this repository outside tests. "Nothing committed
+before asking" therefore holds inside its own body only. A future caller that
+commits and then calls it would turn its declaration into a report of failure
+for work that already succeeded, and nothing here would notice -- the check
+that keeps this table honest compares declarations against call sites, not
+against a caller's commit history.
+
+While a hook runs at any of the row-locking call sites above, every
+concurrent request touching that connector is queued behind it. Keep the
+hook's work local to the database: blocking on an external network call there
+holds that queue open for as long as the call takes. xagent has no way to
+check this at run time, so it is stated here rather than enforced.
+
+The remaining slots declare nothing. Every ``visibility`` and
+``team_visibility`` call site is lock-free, and one of the ``team_visibility``
+paths runs on a lazily created session that may not be in a transaction at
+all. ``access`` has no call site in this repository; a caller that adds one
+while holding a lock owes this table a row and owes the call
+``caller_holds_lock=True``. One shape must never declare it: a call site that
+has already committed its own work before asking, because refusing there
+reports a failure for an operation that fully succeeded.
+
+What the check is not
+---------------------
+
+- The count lives in ``session.info``, which a hook can read and overwrite.
+  This detects a hook author who does not know the rule. It is not a barrier
+  against a hook deliberately working around it, and must not be cited as
+  one.
+- A failure of the check itself refuses the request. It is never caught and
+  read as a pass, and the session is restored before the refusal.
+- Restoring the session recovers a hook's uncommitted work only. Work a hook
+  already committed stays committed -- on the rename slot that commit carries
+  the route's own staged field writes with it, so the caller sees a failure
+  over a durable write. That is why ``commit()`` is forbidden outright rather
+  than treated as something the check cleans up after.
 """
 
 from __future__ import annotations
@@ -11,8 +97,10 @@ import logging
 from collections.abc import Callable, Collection, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeVar
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeVar, cast
 
+from fastapi import Request
+from fastapi.responses import JSONResponse
 from sqlalchemy.sql.elements import ColumnElement
 
 if TYPE_CHECKING:
@@ -23,10 +111,46 @@ from ...core.tools.adapters.vibe.connector_runtime import (
     ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
     ConnectorRuntimeError,
 )
+from ..models.database import root_transaction_end_count
 
 logger = logging.getLogger(__name__)
 
+
+class ConnectorHookSessionBoundaryError(RuntimeError):
+    """An installed connector hook ended the caller's own transaction."""
+
+
+async def connector_hook_session_boundary_error_handler(
+    request: Request, exc: ConnectorHookSessionBoundaryError
+) -> JSONResponse:
+    """Return one stable public response for a broken hook session contract.
+
+    500 rather than the 503 this module uses elsewhere: 503 announces a
+    transient outage of the installing application and invites a retry,
+    while a hook that ends the caller's transaction does the same thing on
+    every request until its code changes. The body names nothing about the
+    hook, the slot, or the session -- the operator reads the log line, the
+    caller does not.
+    """
+    logger.error(
+        "Connector hook ended the caller transaction for %s",
+        request.url.path,
+        exc_info=exc,
+    )
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Connector team integration is unavailable."},
+    )
+
+
 ConnectorType = Literal["mcp", "custom_api"]
+
+ConnectorHookSlot = Literal[
+    "visibility", "team_visibility", "access", "deleted", "renamed"
+]
+
+# Called with the endpoint's live session; see the session contract in this
+# module's docstring for what a hook may and may not do to it.
 ConnectorRenamedHook = Callable[[Any, int, ConnectorType, int, str, str], None]
 
 
@@ -41,6 +165,8 @@ class ConnectorDeleteDecision:
     blocked_reason: str | None = None
 
 
+# Called with the endpoint's live session; see the session contract in this
+# module's docstring for what a hook may and may not do to it.
 ConnectorDeletedHook = Callable[[Any, int, ConnectorType, int], ConnectorDeleteDecision]
 
 
@@ -67,11 +193,31 @@ class ConnectorAccess:
 
 ConnectorRef = tuple[ConnectorType, int]
 
+# Called with the endpoint's live session; see the session contract in this
+# module's docstring for what a hook may and may not do to it.
 ConnectorAccessHook = Callable[
     [Any, int, "Collection[ConnectorRef]"], "dict[ConnectorRef, ConnectorAccess]"
 ]
 
+# Called with the endpoint's live session; see the session contract in this
+# module's docstring for what a hook may and may not do to it.
 ConnectorVisibilityHook = Callable[[Any, int], dict[str, set[int]]]
+TEAM_OWNED_MCP_DEFINITIONS_KEY = "owned_mcp_definitions"
+
+
+@dataclass(frozen=True)
+class TeamConnectorSelection:
+    """Team-visible connector ids plus positive definition ownership."""
+
+    mcp_ids: frozenset[int]
+    custom_api_ids: frozenset[int]
+    owned_mcp_definition_ids: frozenset[int]
+
+    def connector_ids(self) -> dict[str, set[int]]:
+        return {
+            "mcp": set(self.mcp_ids),
+            "custom_api": set(self.custom_api_ids),
+        }
 
 
 class TeamConnectorVisibilityHook(Protocol):
@@ -99,6 +245,10 @@ class TeamConnectorVisibilityHook(Protocol):
     necessarily a member of that team even in deployments whose policy
     layer is otherwise membership-scoped. This is accepted platform
     behavior, not a defect this hook is meant to close.
+
+    The optional ``owned_mcp_definitions`` set marks MCP definitions the team
+    owns. It must be a subset of ``mcp``. Absence means no positive ownership
+    evidence; xagent never infers ownership from visibility alone.
 
     Every connector id a hook returns becomes executable by *any* runner of
     that team's agents, not only members: for stdio and other static-auth
@@ -130,6 +280,9 @@ class TeamConnectorVisibilityHook(Protocol):
     on), for every runner, member or not. Sharing a custom API with a team
     means sharing whatever credential it holds with everyone who can run
     the team's agents.
+
+    Called with the endpoint's live session; see the session contract in
+    this module's docstring for what a hook may and may not do to it.
     """
 
     def __call__(self, db: Any, *, team_id: int) -> dict[str, set[int]]: ...
@@ -188,7 +341,9 @@ def visible_team_connector_ids(db: Any, user_id: int) -> dict[str, set[int]]:
     """
     if _connector_visibility_hook is None:
         return {"mcp": set(), "custom_api": set()}
-    return _call_connector_hook_gate(db, _connector_visibility_hook, db, int(user_id))
+    return _call_connector_hook_gate(
+        db, _connector_visibility_hook, db, int(user_id), slot="visibility"
+    )
 
 
 def _validate_team_connector_answer(answer: Any) -> dict[str, set[int]]:
@@ -203,10 +358,8 @@ def _validate_team_connector_answer(answer: Any) -> dict[str, set[int]]:
     ``set`` requirement is exact and deliberate: ``frozenset`` and other
     iterables are rejected too, matching the hook Protocol's declared
     ``set[int]`` rather than duck-typing around it.
-    Extra keys beyond the two required ones are accepted and silently
-    ignored: only ``"mcp"`` and ``"custom_api"`` are ever read by callers,
-    so this function does not iterate the answer's keys at all, only probe
-    the two it needs.
+    Extra keys beyond the two required ones are accepted here. The selection
+    validator separately checks the reserved ``owned_mcp_definitions`` key.
     """
     if not isinstance(answer, dict):
         raise ValueError(
@@ -238,6 +391,50 @@ def _validate_team_connector_answer(answer: Any) -> dict[str, set[int]]:
     return {"mcp": set(answer["mcp"]), "custom_api": set(answer["custom_api"])}
 
 
+def _validate_team_connector_selection(answer: Any) -> TeamConnectorSelection:
+    connector_ids = _validate_team_connector_answer(answer)
+    owned = answer.get(TEAM_OWNED_MCP_DEFINITIONS_KEY, set())
+    if not isinstance(owned, set):
+        raise ValueError(
+            "team visibility hook returned a malformed answer: key "
+            f"{TEAM_OWNED_MCP_DEFINITIONS_KEY!r} must be a set, got "
+            f"{type(owned).__name__}"
+        )
+    for member in owned:
+        if isinstance(member, bool) or not isinstance(member, int):
+            raise ValueError(
+                "team visibility hook returned a malformed answer: key "
+                f"{TEAM_OWNED_MCP_DEFINITIONS_KEY!r} contains a member "
+                f"{member!r} that is not a connector id (must be int, not bool)"
+            )
+    if not owned.issubset(connector_ids["mcp"]):
+        raise ValueError(
+            "team visibility hook returned definition ownership for a hidden MCP connector"
+        )
+    return TeamConnectorSelection(
+        mcp_ids=frozenset(connector_ids["mcp"]),
+        custom_api_ids=frozenset(connector_ids["custom_api"]),
+        owned_mcp_definition_ids=frozenset(owned),
+    )
+
+
+def team_connector_selection(db: Any, *, team_id: int | None) -> TeamConnectorSelection:
+    """Resolve team visibility and positive definition ownership once."""
+    if team_id is None or _team_connector_visibility_hook is None:
+        return TeamConnectorSelection(frozenset(), frozenset(), frozenset())
+    return cast(
+        TeamConnectorSelection,
+        _call_connector_hook_gate(
+            db,
+            _team_connector_visibility_hook,
+            db,
+            team_id=int(team_id),
+            slot="team_visibility",
+            validate=_validate_team_connector_selection,
+        ),
+    )
+
+
 def team_connector_ids(db: Any, *, team_id: int | None) -> dict[str, set[int]]:
     """Connector ids owned by ``team_id``; empty for no team and for standalone.
 
@@ -246,15 +443,7 @@ def team_connector_ids(db: Any, *, team_id: int | None) -> dict[str, set[int]]:
     hook. A non-``None`` answer is shape-validated (see
     ``_validate_team_connector_answer``) before it reaches any caller.
     """
-    if team_id is None or _team_connector_visibility_hook is None:
-        return {"mcp": set(), "custom_api": set()}
-    return _call_connector_hook_gate(
-        db,
-        _team_connector_visibility_hook,
-        db,
-        team_id=int(team_id),
-        validate=_validate_team_connector_answer,
-    )
+    return team_connector_selection(db, team_id=team_id).connector_ids()
 
 
 def team_connector_hook_installed() -> bool:
@@ -428,6 +617,8 @@ def _resolve_normalized_connector_access(
     user_id: int,
     hook: "ConnectorAccessHook",
     requested: "frozenset[ConnectorRef]",
+    *,
+    caller_holds_lock: bool = False,
 ) -> "dict[ConnectorRef, ConnectorAccess]":
     """Ask an already-resolved hook about an already-normalized ref set.
 
@@ -440,6 +631,10 @@ def _resolve_normalized_connector_access(
     hook installed" is answered once per call, by the entry point, and that
     same answer is what gets used. Reading the global here instead would make
     the ``None`` check every future caller's job to remember.
+
+    ``caller_holds_lock``: see this module's "Call sites and what the
+    caller holds" section and ``delete_team_connector`` for what it means
+    and who must declare it.
     """
     if not requested:
         return {}
@@ -449,12 +644,18 @@ def _resolve_normalized_connector_access(
         db,
         int(user_id),
         requested,
+        slot="access",
         validate=lambda answer: _validate_connector_access_answer(answer, requested),
+        session_boundary_checked=caller_holds_lock,
     )
 
 
 def resolve_connector_access(
-    db: Any, user_id: int, refs: "Collection[ConnectorRef]"
+    db: Any,
+    user_id: int,
+    refs: "Collection[ConnectorRef]",
+    *,
+    caller_holds_lock: bool = False,
 ) -> "dict[ConnectorRef, ConnectorAccess]":
     """Whether the caller's team links each of ``refs``, and may edit it.
 
@@ -492,12 +693,20 @@ def resolve_connector_access(
     hook said is what the caller gets. A connector one hook reports and
     the other omits is not a defect in xagent -- it is what the installed
     answers said.
+
+    ``caller_holds_lock``: see this module's "Call sites and what the
+    caller holds" section and ``delete_team_connector`` for what it means
+    and who must declare it.
     """
     hook = _connector_access_hook
     if hook is None:
         return {}
     return _resolve_normalized_connector_access(
-        db, user_id, hook, _normalize_connector_refs(refs)
+        db,
+        user_id,
+        hook,
+        _normalize_connector_refs(refs),
+        caller_holds_lock=caller_holds_lock,
     )
 
 
@@ -553,7 +762,9 @@ def _call_connector_hook_gate(
     db: Any,
     hook: "Callable[..., _HookResult]",
     *args: Any,
+    slot: ConnectorHookSlot,
     validate: "Callable[[Any], _HookResult] | None" = None,
+    session_boundary_checked: bool = False,
     **kwargs: Any,
 ) -> _HookResult:
     """The one door every installed connector hook is called through, and
@@ -564,10 +775,12 @@ def _call_connector_hook_gate(
     failed leaves that transaction unusable on PostgreSQL, and a failed
     ORM ``flush`` leaves it unusable on every backend -- so restoring the
     session belongs to the invocation itself, not to whichever caller
-    happens to wrap it. Placing it here is what makes the property hold
+    happens to wrap it. Placing it here is what makes restoration hold
     for a hook slot added to this module later, without that slot's author
     having to know about it: every one of the five slots this module
-    defines is invoked through this one function.
+    defines is invoked through this one function. Session boundary
+    checking is the one thing here that is not inherited that way -- see
+    ``session_boundary_checked`` below.
 
     ``validate``, when given, runs inside the same ``try`` because a hook
     can poison the session *without* raising: run a statement that fails,
@@ -584,21 +797,117 @@ def _call_connector_hook_gate(
     translated. That stays with the ``*_or_raise`` wrappers below, which
     own the seam's typed-error contract.
 
-    One shape stays uncovered, deliberately: a hook that poisons the
-    session, swallows its own failure, and still returns a well-formed
-    answer produces no exception at all -- neither here nor in a
-    validator -- so nothing triggers a restore. Closing it would mean
-    probing the session's health after every hook call, which is a
-    different design than a failure path.
+    One shape produces no exception at all: a hook that ends this
+    session's own transaction, swallows whatever it was doing, and still
+    returns a well-formed answer. Neither this function nor a validator
+    sees a failure, while the caller's row locks are already gone. That
+    one is caught by comparing a root-transaction-end count across the
+    call (``root_transaction_end_count``, ``models/database.py``) on the
+    success path, and refusing with
+    ``ConnectorHookSessionBoundaryError`` when it moved. A hook that
+    raised is not compared: the restore above is itself an unconditional
+    rollback, so it moves the count on its own, and comparing there would
+    read every ordinary hook failure as a contract violation.
+
+    ``session_boundary_checked`` says whether to compare at all, and it
+    is off by default. Session boundary checking is declared per call
+    site, not inherited by every slot: a call site holding a row lock
+    across a hook call declares it, and a call site that has already
+    committed its own work before asking must not, because refusing there
+    would report a failure for an operation that already succeeded.
+    Which call sites declare it, and why, is the table in this module's
+    docstring. The cost of that default is stated there too: a new
+    lock-holding call site that forgets to declare is not checked.
+
+    ``slot`` names which of this module's five slots the call belongs to
+    (``visibility``, ``team_visibility``, ``access``, ``deleted``,
+    ``renamed``). It appears only in the log lines below, never in an
+    exception message or a response body.
     """
+    # Read before the ``try`` on purpose. The hook has not run yet, so a
+    # counter this session cannot report -- a value that is present but is
+    # not a count, left there by an earlier hook -- refuses the request
+    # with the hook never called and nothing to restore. Moving this read
+    # inside the ``try`` would call ``_restore_session_after_hook_failure``
+    # on a session no hook has touched.
+    end_count_before = (
+        root_transaction_end_count(db) if session_boundary_checked else None
+    )
+    if session_boundary_checked and end_count_before is None:
+        # A duck-typed session -- ``web/tools/config.py`` documents that
+        # those reach this seam -- cannot report the count, so this call
+        # site's declaration buys it nothing. Say so rather than skipping
+        # silently: a skipped check and a passed check look identical.
+        logger.debug(
+            "Connector hook session boundary check skipped: %s cannot report "
+            "a root transaction end count",
+            type(db).__name__,
+        )
+    already_restored = False
     try:
         answer = hook(*args, **kwargs)
-        if validate is None:
-            return answer
-        return validate(answer)
+        if validate is not None:
+            answer = validate(answer)
+        if end_count_before is not None:
+            end_count_after = root_transaction_end_count(db)
+            if end_count_after is None:
+                # Symmetric with the pre-hook read above: a skipped check
+                # and a passed check look identical, so say which one this
+                # was rather than falling through silently.
+                logger.debug(
+                    "Connector hook session boundary check skipped after "
+                    "the hook ran: %s cannot report a root transaction end "
+                    "count",
+                    type(db).__name__,
+                )
+            elif end_count_after > end_count_before:
+                _restore_session_after_hook_failure(db)
+                already_restored = True
+                # The hook's identity and its slot go in the log line, not
+                # in the exception message: one route converts a stray
+                # exception into a response body carrying ``str(exc)``, so
+                # anything put here can reach a caller.
+                logger.error(
+                    "Connector hook %r for the %s slot ended the caller's "
+                    "database transaction",
+                    getattr(hook, "__name__", type(hook).__name__),
+                    slot,
+                )
+                raise ConnectorHookSessionBoundaryError(
+                    "An installed connector hook ended the caller's "
+                    "database transaction"
+                )
+        return answer
     except Exception:
-        _restore_session_after_hook_failure(db)
+        # Read, not merely assigned: the restore has to happen exactly
+        # once whichever way this call failed, and matching on the
+        # exception's type instead would restore zero times for a hook
+        # that raises this module's own boundary error.
+        if not already_restored:
+            _restore_session_after_hook_failure(db)
         raise
+
+
+def resolve_team_connector_selection_or_raise(
+    db: Any, *, team_id: int | None, log_subject: int | None
+) -> TeamConnectorSelection:
+    """Resolve team connector visibility and provenance with a typed failure."""
+    try:
+        return team_connector_selection(db, team_id=team_id)
+    except ConnectorRuntimeError:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "Failed to resolve team connector scope for user %s",
+            log_subject,
+            exc_info=True,
+        )
+        raise ConnectorRuntimeError(
+            ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
+            "Connector team scope is unavailable.",
+            details={"reason": "team_scope_resolution_failed"},
+            status_code=503,
+        ) from exc
 
 
 def resolve_team_connector_ids_or_raise(
@@ -636,29 +945,26 @@ def resolve_team_connector_ids_or_raise(
     rejects. Neither is something the generic-exception arm below could
     own, and both are restored before either arm sees the exception.
     """
-    try:
-        return team_connector_ids(db, team_id=team_id)
-    except ConnectorRuntimeError:
-        raise
-    except Exception as exc:
-        logger.warning(
-            "Failed to resolve team connector scope for user %s",
-            log_subject,
-            exc_info=True,
-        )
-        raise ConnectorRuntimeError(
-            ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
-            "Connector team scope is unavailable.",
-            details={"reason": "team_scope_resolution_failed"},
-            status_code=503,
-        ) from exc
+    return resolve_team_connector_selection_or_raise(
+        db,
+        team_id=team_id,
+        log_subject=log_subject,
+    ).connector_ids()
 
 
 def resolve_connector_access_or_raise(
-    db: Any, user_id: int, refs: "Collection[ConnectorRef]"
+    db: Any,
+    user_id: int,
+    refs: "Collection[ConnectorRef]",
+    *,
+    caller_holds_lock: bool = False,
 ) -> "dict[ConnectorRef, ConnectorAccess]":
     """``resolve_connector_access(db, user_id, refs)``, with every failure of the
     hook call and of its answer validation converted into the seam's one typed 503.
+
+    ``caller_holds_lock``: see this module's "Call sites and what the
+    caller holds" section and ``delete_team_connector`` for what it means
+    and who must declare it.
 
     Returns ``{}`` without reading ``refs`` at all when no hook is installed,
     before any normalization -- the same first move ``resolve_connector_access``
@@ -723,7 +1029,17 @@ def resolve_connector_access_or_raise(
         return {}
     requested = _normalize_connector_refs(refs)
     try:
-        return _resolve_normalized_connector_access(db, user_id, hook, requested)
+        return _resolve_normalized_connector_access(
+            db, user_id, hook, requested, caller_holds_lock=caller_holds_lock
+        )
+    except ConnectorHookSessionBoundaryError:
+        # A hook that ended this session's transaction is a permanent
+        # defect in the installing application's code, not the transient
+        # outage ``ConnectorRuntimeError`` describes. Converting it here
+        # would send an operator looking for an outage that is not
+        # happening, and would give this slot a different answer from
+        # every other slot for the same failure.
+        raise
     except ConnectorRuntimeError:
         raise
     except Exception as exc:
@@ -747,7 +1063,11 @@ def resolve_connector_access_or_raise(
 
 
 def resolve_one_connector_access_or_raise(
-    db: Any, user_id: int, ref: "ConnectorRef"
+    db: Any,
+    user_id: int,
+    ref: "ConnectorRef",
+    *,
+    caller_holds_lock: bool = False,
 ) -> "ConnectorAccess | None":
     """Single-``ref`` convenience wrapper around
     ``resolve_connector_access_or_raise``: wraps ``ref`` in a one-element
@@ -757,8 +1077,14 @@ def resolve_one_connector_access_or_raise(
     omit -- never a failure, which still raises ``ConnectorRuntimeError``
     same as the batch form. Exists so a caller resolving a single
     connector does not repeat the wrap-then-``.get(ref)`` shape by hand.
+
+    ``caller_holds_lock``: see this module's "Call sites and what the
+    caller holds" section and ``delete_team_connector`` for what it means
+    and who must declare it.
     """
-    return resolve_connector_access_or_raise(db, user_id, [ref]).get(ref)
+    return resolve_connector_access_or_raise(
+        db, user_id, [ref], caller_holds_lock=caller_holds_lock
+    ).get(ref)
 
 
 @contextmanager
@@ -895,19 +1221,38 @@ def visible_custom_api_clause(
 
 
 def delete_team_connector(
-    db: Any, user_id: int, connector_type: ConnectorType, connector_id: int
+    db: Any,
+    user_id: int,
+    connector_type: ConnectorType,
+    connector_id: int,
+    *,
+    caller_holds_lock: bool = False,
 ) -> ConnectorDeleteDecision:
     """Remove team ownership before a global delete.
 
     Returns whether the application recognized the connector as team-owned.
     Hooks must use the passed session and must not commit independently, so a
     refused endpoint request can discard all hook-side mutations atomically.
+
+    ``caller_holds_lock`` says this call happens while the caller's
+    transaction is holding something it cannot afford to lose -- a row
+    lock, typically -- and turns on the session boundary check for this
+    one call. It is off by default, so a call site that holds a lock and
+    does not pass it is not checked; the call site table in this module's
+    docstring is where every call site and what it declares are listed.
     """
 
     if _connector_deleted_hook is None:
         return ConnectorDeleteDecision()
     return _call_connector_hook_gate(
-        db, _connector_deleted_hook, db, user_id, connector_type, connector_id
+        db,
+        _connector_deleted_hook,
+        db,
+        user_id,
+        connector_type,
+        connector_id,
+        slot="deleted",
+        session_boundary_checked=caller_holds_lock,
     )
 
 
@@ -918,8 +1263,18 @@ def rename_team_connector(
     connector_id: int,
     old_name: str,
     new_name: str,
+    *,
+    caller_holds_lock: bool = False,
 ) -> None:
-    """Keep application-owned connector selectors aligned after a rename."""
+    """Keep application-owned connector selectors aligned after a rename.
+
+    ``caller_holds_lock`` says this call happens while the caller's
+    transaction is holding something it cannot afford to lose -- a row
+    lock, typically -- and turns on the session boundary check for this
+    one call. It is off by default, so a call site that holds a lock and
+    does not pass it is not checked; the call site table in this module's
+    docstring is where every call site and what it declares are listed.
+    """
 
     if _connector_renamed_hook is not None and old_name != new_name:
         _call_connector_hook_gate(
@@ -931,4 +1286,6 @@ def rename_team_connector(
             connector_id,
             old_name,
             new_name,
+            slot="renamed",
+            session_boundary_checked=caller_holds_lock,
         )

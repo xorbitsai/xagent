@@ -1,5 +1,6 @@
 from xagent.core.tools.adapters.vibe.config import RequiredMCPUnavailableError
 from xagent.web.services.client_error_messages import (
+    CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE,
     CLIENT_SAFE_GUIDANCE_IN_PROGRESS,
     CLIENT_SAFE_TASK_FAILURE,
     CLIENT_SAFE_VALIDATION_ERROR,
@@ -19,12 +20,20 @@ def test_client_error_codes_have_fixed_safe_fallbacks() -> None:
         == CLIENT_SAFE_TASK_FAILURE
     )
     assert (
+        client_error_message(ClientErrorCode.AUTO_MODEL_UNAVAILABLE)
+        == CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
+    )
+    assert (
         client_error_message(ClientErrorCode.GUIDANCE_IN_PROGRESS)
         == CLIENT_SAFE_GUIDANCE_IN_PROGRESS
     )
     assert {code.value: client_error_message(code) for code in ClientErrorCode} == {
         "message_processing_failed": "The message could not be processed. Please try again.",
         "task_execution_failed": "Task execution failed.",
+        "auto_model_unavailable": (
+            "Your Auto model configuration has no usable candidate models. "
+            "Review your Auto model settings."
+        ),
         "guidance_in_progress": (
             "A previous guidance message is still being applied. "
             "Please wait for it to finish."

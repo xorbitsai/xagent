@@ -91,6 +91,16 @@ class _ScriptedChatLLM(BaseLLM):
         yield StreamChunk(type=ChunkType.TOKEN, content="ok", delta="ok")
 
 
+class _ThinkingChatLLM(_ScriptedChatLLM):
+    @property
+    def abilities(self) -> list[str]:
+        return ["chat", "vision", "thinking_mode"]
+
+    @property
+    def supports_thinking_mode(self) -> bool:
+        return True
+
+
 @pytest.mark.asyncio
 async def test_prepare_for_call_reuses_route_and_exposes_profile_context_window(
     monkeypatch,
@@ -124,6 +134,40 @@ async def test_prepare_for_call_reuses_route_and_exposes_profile_context_window(
     assert prepared.context_window == 1_048_576
     assert await prepared.chat([{"role": "user", "content": "continue"}]) == "ok"
     assert selected == ["make a podcast"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("candidate_models", "expected_abilities", "expected_thinking"),
+    [
+        (None, ["chat"], False),
+        (("deepseek/deepseek-v4-flash",), ["chat", "vision", "thinking_mode"], True),
+    ],
+)
+async def test_resolved_router_delegates_capabilities_only_for_configured_auto(
+    monkeypatch,
+    candidate_models,
+    expected_abilities,
+    expected_thinking,
+):
+    downstream = _ThinkingChatLLM([])
+    router = RouterLLM(
+        abilities=["chat", "vision", "thinking_mode"],
+        downstream_resolver=lambda _model_id: downstream,
+        candidate_models=candidate_models,
+    )
+
+    async def select_model(_prompt: str, **_kwargs: Any) -> str:
+        return "deepseek/deepseek-v4-flash"
+
+    monkeypatch.setattr(router, "_select_model", select_model)
+    monkeypatch.setattr(router, "_profile_context_window", lambda _model_id: None)
+    monkeypatch.setattr(router, "_profile_input_modalities", lambda _model_id: ())
+
+    prepared = await router.prepare_for_call([{"role": "user", "content": "hi"}])
+
+    assert prepared.abilities == expected_abilities
+    assert prepared.supports_thinking_mode is expected_thinking
 
 
 @pytest.mark.asyncio
@@ -273,6 +317,44 @@ def test_route_sync_forwards_modalities_when_router_supports_them(
             "prompt": "inspect",
             "config_name": "auto",
             "preferred_input_modalities": ("image",),
+        }
+    ]
+
+
+def test_route_sync_limits_selection_to_configured_candidates(monkeypatch) -> None:
+    calls: list[dict[str, Any]] = []
+
+    class Service:
+        def route(
+            self,
+            prompt: str,
+            *,
+            config_name: str,
+            models: list[str],
+        ) -> dict[str, Any]:
+            calls.append(
+                {"prompt": prompt, "config_name": config_name, "models": models}
+            )
+            return {"selected": [models[0]]}
+
+    monkeypatch.setattr(
+        "xagent.core.model.chat.basic.router._get_service",
+        lambda: Service(),
+    )
+    router = RouterLLM(
+        model_name="quality-pair",
+        candidate_models=["openai/gpt-5.5", "deepseek/deepseek-v4-flash"],
+        use_environment_fallback=False,
+    )
+
+    selected = router._route_sync("implement this")
+
+    assert selected == ["openai/gpt-5.5"]
+    assert calls == [
+        {
+            "prompt": "implement this",
+            "config_name": "quality-pair",
+            "models": ["openai/gpt-5.5", "deepseek/deepseek-v4-flash"],
         }
     ]
 
@@ -484,6 +566,37 @@ async def test_modality_support_error_is_not_hidden_by_generic_fallback(
     router = RouterLLM()
 
     with pytest.raises(RouterModalityRoutingError, match="explicit compatible model"):
+        await router._select_model(
+            "inspect",
+            preferred_input_modalities=("image",),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "route_result",
+    [RuntimeError("router unavailable"), []],
+    ids=["routing-error", "empty-selection"],
+)
+async def test_text_only_fallback_rejects_required_image(
+    monkeypatch, route_result
+) -> None:
+    monkeypatch.setenv("XAGENT_ROUTER_FALLBACK_MODEL", "fallback/model")
+    router = RouterLLM()
+
+    def route(*_args, **_kwargs):
+        if isinstance(route_result, Exception):
+            raise route_result
+        return route_result
+
+    monkeypatch.setattr(router, "_route_sync", route)
+    monkeypatch.setattr(
+        router,
+        "_profile_input_modalities",
+        lambda _model_id: ("text",),
+    )
+
+    with pytest.raises(RouterModalityRoutingError, match="fallback/model.*image"):
         await router._select_model(
             "inspect",
             preferred_input_modalities=("image",),

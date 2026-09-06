@@ -6,7 +6,6 @@ import asyncio
 import builtins
 import io
 import threading
-import time
 from pathlib import Path
 
 import pytest
@@ -96,14 +95,18 @@ def _stage_path_in(root: Path, user_id: int):
 class _SlowTrackingSource(io.BytesIO):
     """A synchronous source that reveals an accidental event-loop read."""
 
-    def __init__(self, payload: bytes, delay_seconds: float) -> None:
+    def __init__(self, payload: bytes) -> None:
         super().__init__(payload)
-        self.delay_seconds = delay_seconds
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.loop_thread = threading.get_ident()
         self.read_threads: list[int] = []
 
     def read(self, size: int = -1) -> bytes:
         self.read_threads.append(threading.get_ident())
-        time.sleep(self.delay_seconds)
+        self.started.set()
+        assert threading.get_ident() != self.loop_thread
+        assert self.release.wait(timeout=30), "upload read was never released"
         return super().read(size)
 
 
@@ -213,14 +216,13 @@ async def test_staging_copy_reads_off_loop_with_no_database_checkout(
         files_api, "get_upload_path", _stage_path_in(upload_root, user_id)
     )
     engine = _install_one_slot_queue_pool(monkeypatch)
-    source = _SlowTrackingSource(b"bounded-copy", delay_seconds=0.2)
+    source = _SlowTrackingSource(b"bounded-copy")
     upload = UploadFile(
         filename="off-loop.txt",
         file=source,
         headers={"content-type": "text/plain"},
     )
     loop_thread = threading.get_ident()
-    started_at = asyncio.get_running_loop().time()
     task = asyncio.create_task(
         files_api.store_uploaded_files(
             upload_items=[upload],
@@ -232,15 +234,20 @@ async def test_staging_copy_reads_off_loop_with_no_database_checkout(
         )
     )
     try:
-        await asyncio.sleep(0.01)
-        assert asyncio.get_running_loop().time() - started_at < 0.1
+        assert await asyncio.to_thread(source.started.wait, 30)
+        assert not task.done()
         assert engine.pool.checkedout() == 0
-        await task
+        source.release.set()
+        await asyncio.wait_for(task, timeout=30)
         assert source.read_threads
         assert all(thread_id != loop_thread for thread_id in source.read_threads)
         assert engine.pool.checkedout() == 0
     finally:
-        engine.dispose()
+        source.release.set()
+        try:
+            await asyncio.wait_for(task, timeout=30)
+        finally:
+            engine.dispose()
 
 
 def test_reserve_and_copy_enforces_max_size_and_cleans_partial_file(

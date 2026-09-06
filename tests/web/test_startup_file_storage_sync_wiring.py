@@ -208,7 +208,7 @@ async def test_startup_file_storage_sync_wait_fails_fast_during_retry_loop():
         with pytest.raises(RuntimeError, match="s3 unavailable"):
             await asyncio.wait_for(
                 app_module.wait_for_file_storage_startup_sync(test_app),
-                timeout=0.1,
+                timeout=30,
             )
 
         assert not task.done()

@@ -85,6 +85,10 @@ from .dynamic_memory_store import get_memory_store
 from .logging_config import setup_logging
 from .models.database import init_db
 from .services.a2a_protocol import A2AApiError, a2a_api_error_handler, a2a_error
+from .services.connector_team_scope import (
+    ConnectorHookSessionBoundaryError,
+    connector_hook_session_boundary_error_handler,
+)
 from .services.interaction_rollout import (
     get_interaction_rollout_policy,
     is_native_schema_ready,
@@ -1166,6 +1170,10 @@ app.add_exception_handler(A2AApiError, a2a_api_error_handler)  # type: ignore[ar
 app.add_exception_handler(
     SkillRuntimeSessionBoundaryError,
     cast(Any, skill_runtime_session_boundary_error_handler),
+)
+app.add_exception_handler(
+    ConnectorHookSessionBoundaryError,
+    cast(Any, connector_hook_session_boundary_error_handler),
 )
 
 

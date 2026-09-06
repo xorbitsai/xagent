@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import threading
-import time
 from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -689,13 +688,17 @@ async def test_historical_replay_detaches_before_slow_network_send(
     event_loop_thread = threading.get_ident()
     cache_threads: list[int] = []
     sent_events: list[dict] = []
-    ticker_stop = asyncio.Event()
-    ticks = 0
+    cache_entered = threading.Event()
+    release_cache = threading.Event()
+    send_entered = asyncio.Event()
+    release_send = asyncio.Event()
 
     def slow_cache_get(_key: str):
         assert engine.pool.checkedout() == 0
         cache_threads.append(threading.get_ident())
-        time.sleep(0.05)
+        cache_entered.set()
+        assert threading.get_ident() != event_loop_thread
+        assert release_cache.wait(timeout=30), "history cache was never released"
         return None
 
     def record_cache_set(*_args, **_kwargs) -> None:
@@ -711,13 +714,8 @@ async def test_historical_replay_detaches_before_slow_network_send(
 
         await asyncio.to_thread(read_during_send)
         sent_events.append(event)
-        await asyncio.sleep(0.02)
-
-    async def ticker() -> None:
-        nonlocal ticks
-        while not ticker_stop.is_set():
-            ticks += 1
-            await asyncio.sleep(0.01)
+        send_entered.set()
+        await release_send.wait()
 
     monkeypatch.setattr(database_module, "get_db", get_test_db)
     monkeypatch.setattr(websocket_api, "get_session_local", lambda: SessionLocal)
@@ -729,19 +727,29 @@ async def test_historical_replay_detaches_before_slow_network_send(
         slow_send,
     )
 
-    ticker_task = asyncio.create_task(ticker())
-    try:
-        await send_historical_data_as_stream(
+    replay = asyncio.create_task(
+        send_historical_data_as_stream(
             websocket=object(),
             task_id=task_id,
             user=SimpleNamespace(id=owner_id, is_admin=False),
         )
+    )
+    try:
+        assert await asyncio.to_thread(cache_entered.wait, 30)
+        assert not replay.done()
+        assert not sent_events
+        release_cache.set()
+        await asyncio.wait_for(send_entered.wait(), timeout=30)
+        assert not replay.done()
+        assert engine.pool.checkedout() == 0
     finally:
-        ticker_stop.set()
-        await ticker_task
-        engine.dispose()
+        release_cache.set()
+        release_send.set()
+        try:
+            await asyncio.wait_for(replay, timeout=30)
+        finally:
+            engine.dispose()
 
-    assert ticks >= 5
     assert cache_threads
     assert all(thread_id != event_loop_thread for thread_id in cache_threads)
     assert [event["event_type"] for event in sent_events] == [

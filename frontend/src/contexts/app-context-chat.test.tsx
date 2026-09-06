@@ -6646,3 +6646,136 @@ describe("error frame display projection", () => {
     ).toEqual(expected)
   })
 })
+
+describe("clarification round identity (#1500)", () => {
+  beforeEach(() => {
+    webSocketOptions.current = null
+    webSocketOptions.all = []
+    sessionControls = null
+    wsHarness.isConnected = true
+    apiRequestMock.mockReset()
+    routerPushMock.mockReset()
+    sendRawMessageMock.mockReset()
+    sendRawMessageMock.mockReturnValue("sent")
+    sendChatMessageMock.mockReset()
+    sendChatMessageMock.mockResolvedValue({
+      client_message_id: "turn-optimistic",
+      turn_id: "turn-optimistic",
+    })
+    localStorage.clear()
+    ;(window as typeof window & { clearDuplicateMessageCache?: () => void })
+      .clearDuplicateMessageCache?.()
+  })
+
+  afterEach(() => {
+    cleanup()
+    localStorage.clear()
+  })
+
+  it("adopts the ask frame's event_id as the waiting round id", async () => {
+    // No backend emits request_id; the stable per-ask identity is event_id.
+    // request_id stays the preferred field so a backend that later adopts
+    // the explicit name wins over the fallback.
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.({
+        type: "task_waiting_for_user",
+        timestamp: "2026-05-27T05:00:01Z",
+        task_id: 1,
+        task: { id: 1, status: "waiting_for_user" },
+        message: "Which region should I use?",
+        event_id: "evt-round-1",
+        interactions: [
+          { type: "text", prompt: "Which region should I use?" },
+        ],
+      } as TestWebSocketMessage)
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("waiting-request-id").textContent).toBe("evt-round-1")
+    })
+
+    act(() => {
+      onMessage?.({
+        type: "task_waiting_for_user",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        task: { id: 1, status: "waiting_for_user" },
+        message: "Which hotel?",
+        request_id: "req-explicit",
+        event_id: "evt-round-2",
+        interactions: [
+          { type: "text", prompt: "Which hotel?" },
+        ],
+      } as TestWebSocketMessage)
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("waiting-request-id").textContent).toBe("req-explicit")
+    })
+  })
+
+  it("keeps a stale-versioned error notice without rolling back task state", async () => {
+    // The version guard protects task state, but an error frame's body is
+    // not versioned state: it carries a notice (and, since #2124, the
+    // structured terminal command outcome) the backend sends exactly once.
+    // A stale control tuple must lose the state argument yet keep the
+    // notice.
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.({
+        type: "task_waiting_for_user",
+        timestamp: "2026-05-27T05:00:01Z",
+        task_id: 1,
+        run_id: "run-1",
+        state_version: 6,
+        task: { id: 1, status: "waiting_for_user" },
+        message: "Which region should I use?",
+      } as TestWebSocketMessage)
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("waiting_for_user")
+    })
+
+    act(() => {
+      onMessage?.({
+        type: "agent_error",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        run_id: "run-1",
+        state_version: 5,
+        data: {
+          type: "agent_error",
+          message: "This message was not applied to the task.",
+          command_id: "client-msg-1",
+          command_kind: "message",
+          task: { id: 1, status: "failed" },
+        },
+      } as TestWebSocketMessage)
+    })
+
+    // The notice reaches the transcript; the stale status assertion does not.
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "This message was not applied to the task."
+      )
+    })
+    expect(screen.getByTestId("task-status").textContent).toBe("waiting_for_user")
+  })
+})

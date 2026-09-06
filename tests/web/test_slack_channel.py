@@ -41,6 +41,8 @@ from xagent.web.models.user import User
 from xagent.web.models.user_channel import SlackOAuthFlowState, UserChannel
 from xagent.web.schemas.user_channel import UserChannelCreate, UserChannelUpdate
 from xagent.web.services.channel_runtime import ChannelConfigSnapshot
+from xagent.web.services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
+from xagent.web.services.llm_utils import AutoModelUnavailableError
 from xagent.web.services.task_execution_context_service import (
     TaskExecutionRecoverySnapshot,
 )
@@ -1205,8 +1207,10 @@ def test_slack_only_handles_mentions_in_shared_channels() -> None:
 
 
 @pytest.mark.asyncio
-async def test_successful_slack_turn_reuses_channel_runtime(
+@pytest.mark.parametrize("auto_unavailable", [False, True])
+async def test_slack_turn_reuses_channel_runtime_and_reports_auto_failure(
     monkeypatch: pytest.MonkeyPatch,
+    auto_unavailable: bool,
 ) -> None:
     bot = make_bot()
     bot._save_active_tasks = lambda: None  # type: ignore[method-assign]
@@ -1266,6 +1270,8 @@ async def test_successful_slack_turn_reuses_channel_runtime(
 
     class FakeAgentManager:
         async def get_agent_for_task(self, *_args: Any, **_kwargs: Any) -> Any:
+            if auto_unavailable:
+                raise AutoModelUnavailableError("private model details")
             return agent_service
 
         async def execute_task(self, **_kwargs: Any) -> dict[str, Any]:
@@ -1284,6 +1290,8 @@ async def test_successful_slack_turn_reuses_channel_runtime(
         thread_ts: str | None,
     ) -> str:
         assert thread_ts is None
+        if auto_unavailable:
+            final_messages.append({"text": _text})
         return "loading-ts"
 
     async def send_final_text(**kwargs: Any) -> None:
@@ -1327,6 +1335,11 @@ async def test_successful_slack_turn_reuses_channel_runtime(
     )
 
     assert bot.active_tasks == {"T1:D1:U1:direct": 45}
+    if auto_unavailable:
+        assert finalized == [(TaskStatus.FAILED, "")]
+        assert final_messages == [{"text": CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE}]
+        assert managed.closed is True
+        return
     assert persisted[0]["content"] == "hello"
     assert finalized == [(TaskStatus.COMPLETED, "Slack reply")]
     assert finalized_execution_results == [execution_result]

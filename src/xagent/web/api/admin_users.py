@@ -213,9 +213,11 @@ def _record_settled_bindings_sync(
 def _delete_user_rows_sync(*, user_id: int) -> bool:
     """Delete one user and every row it owns in an operation-local session."""
 
-    from ..models.auto_model import AutoModelConfig
+    from ..models.auto_model import AutoModelCandidate, AutoModelConfig
     from ..models.mcp import UserMCPServer
     from ..models.model import Model as DBModel
+    from ..models.user import UserModel
+    from ..services.model_service import _is_model_visible_to_user
 
     session_factory = get_session_local()
     delete_db = session_factory()
@@ -245,8 +247,34 @@ def _delete_user_rows_sync(*, user_id: int) -> bool:
                 synchronize_session=False
             )
 
-        # Delete the user (UserModel and UserDefaultModel have cascade delete)
+        affected_candidates = (
+            delete_db.query(AutoModelCandidate)
+            .join(AutoModelConfig)
+            .filter(
+                AutoModelCandidate.target_model_id.in_(
+                    select(UserModel.model_id).where(UserModel.user_id == user_id)
+                ),
+                AutoModelConfig.user_id != user_id,
+            )
+            .all()
+        )
+
+        # Delete the user, then evaluate the surviving grants. Other owners or
+        # shared grants can still make a target available to a bound Auto.
         delete_db.delete(user)
+        delete_db.flush()
+        changed_configs = set()
+        for candidate in affected_candidates:
+            config = candidate.config
+            if _is_model_visible_to_user(
+                delete_db, candidate.target_model_id, int(config.user_id)
+            ):
+                continue
+            if config.fallback_model_id == candidate.target_model_id:
+                config.fallback_model_id = None
+            changed_configs.add(int(config.id))
+            delete_db.delete(candidate)
+        ModelStore(delete_db).refresh_auto_model_abilities(list(changed_configs))
         delete_db.commit()
         ModelStore(delete_db).invalidate_after_user_delete()
         return True

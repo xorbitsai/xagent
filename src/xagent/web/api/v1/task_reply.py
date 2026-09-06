@@ -58,6 +58,7 @@ from ...services.db_runtime import (
     drain_async_task_cancellation_safe,
     run_db_io_cancellation_safe,
 )
+from ...services.llm_utils import AutoModelUnavailableError
 from ...services.task_execution_controller import TaskControlState
 from ...services.task_interaction_close import (
     active_interaction_id_sync,
@@ -599,10 +600,12 @@ async def reply_to_task(
         # failure, so an unrecognized failure mode never silently
         # collapses into a data-losing branch.
         raise V1ApiError(V1ErrorCode.TEMPORARILY_UNAVAILABLE, 503) from exc
-    except BaseException:
+    except BaseException as exc:
         if not ownership_transferred and not prelease_cleanup_done:
             cleanup_task = asyncio.create_task(stop_and_restore_prelease())
             await drain_async_task_cancellation_safe(cleanup_task)
+        if isinstance(exc, AutoModelUnavailableError):
+            raise V1ApiError(V1ErrorCode.AUTO_MODEL_UNAVAILABLE, 409) from exc
         raise
     finally:
         if not ownership_transferred and not prelease_cleanup_done:

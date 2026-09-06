@@ -3,6 +3,7 @@
 import asyncio
 import os
 import tempfile
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 from urllib.parse import quote
 
@@ -496,7 +497,7 @@ class TestModelAPI:
     """Test model management API endpoints"""
 
     def test_auto_config_binds_existing_models_and_blocks_candidate_delete(
-        self, test_db, regular_user, regular_headers, sample_model_data
+        self, test_db, regular_user, regular_headers, sample_model_data, monkeypatch
     ):
         first = client.post(
             "/api/models/",
@@ -522,6 +523,18 @@ class TestModelAPI:
             def known_model_ids():
                 return ("openai/gpt-5.5", "deepseek/deepseek-v4-flash")
 
+            @staticmethod
+            def get(profile_id):
+                return SimpleNamespace(
+                    input_modalities=("text", "image")
+                    if profile_id == "openai/gpt-5.5"
+                    else ("text",)
+                )
+
+        monkeypatch.setattr(
+            "xagent.web.services.auto_model_service.load_router_profile_catalog",
+            lambda: Catalog(),
+        )
         with patch(
             "xagent.web.services.auto_model_service.load_router_profile_catalog",
             return_value=Catalog(),

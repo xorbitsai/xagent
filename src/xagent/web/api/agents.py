@@ -63,7 +63,8 @@ from ..services.agent_team_scope import (
     owned_agent_clause,
 )
 from ..services.api_keys import AgentApiKeyService, KeyRotationConflict
-from ..services.llm_utils import UserAwareModelStorage
+from ..services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
+from ..services.llm_utils import AutoModelUnavailableError, UserAwareModelStorage
 from ..services.workforce_access import get_visible_agent_ids
 from ..tools.config import WebToolConfig
 from ..user_isolated_memory import UserContext
@@ -592,6 +593,8 @@ async def optimize_instructions(
 
         return {"optimized_instructions": content}
 
+    except AutoModelUnavailableError as exc:
+        raise HTTPException(409, detail=CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE) from exc
     except Exception as e:
         logger.error(f"Failed to optimize instructions: {e}")
         raise HTTPException(status_code=500, detail=str(e))

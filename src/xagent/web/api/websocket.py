@@ -354,7 +354,7 @@ def create_terminal_task_error_event(
     failure this path exists to remove. A bad optional argument costs that
     argument and nothing else. The rejection is logged with its stack.
 
-    ``code`` must be a member of ``CONNECTOR_RUNTIME_CLIENT_ERROR_CODES``.
+    ``code`` must be a connector-runtime code or ``AUTO_MODEL_UNAVAILABLE``.
     """
 
     # Python annotations are not enforced at run time, so the mypy gate on the
@@ -370,7 +370,11 @@ def create_terminal_task_error_event(
     # and an unhashable value would raise inside the membership test on a
     # path whose whole point is that it never raises.
     if code is not None and (
-        not isinstance(code, str) or code not in CONNECTOR_RUNTIME_CLIENT_ERROR_CODES
+        not isinstance(code, str)
+        or (
+            code not in CONNECTOR_RUNTIME_CLIENT_ERROR_CODES
+            and code != ClientErrorCode.AUTO_MODEL_UNAVAILABLE.value
+        )
     ):
         logger.error(
             "task_id=%s component=terminal-error-frame dropped=code "
@@ -473,6 +477,8 @@ def client_safe_error_message(
     Read a passing sweep as "the recognized egress shapes are clean", never
     as "arbitrary Python data flow cannot reach a client raw".
     """
+    if isinstance(error, AutoModelUnavailableError):
+        return client_error_message(ClientErrorCode.AUTO_MODEL_UNAVAILABLE)
     if not isinstance(error, ClientVisibleError):
         return fallback
     message = str(error)
@@ -10514,8 +10520,17 @@ clarification questions as plain assistant text.
 
     except Exception as e:
         logger.error("Error handling builder chat: %s", e, exc_info=True)
+        error_metadata = {}
+        if isinstance(e, AutoModelUnavailableError):
+            error_metadata["error_code"] = ClientErrorCode.AUTO_MODEL_UNAVAILABLE.value
         await websocket.send_text(
-            json.dumps({"type": "error", "message": client_safe_error_message(e)})
+            json.dumps(
+                {
+                    **error_metadata,
+                    "type": "error",
+                    "message": client_safe_error_message(e),
+                }
+            )
         )
 
 

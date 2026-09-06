@@ -64,7 +64,18 @@ def _load_builder_chat_runtime_inputs_sync(
 
         if not llm or compact_llm is None:
             default_llm, _fast_llm, _vision_llm, default_compact_llm = (
-                resolver.get_configured_defaults(user_id=user_id)
+                resolver.get_configured_defaults(
+                    user_id=user_id,
+                    config_types=tuple(
+                        kind
+                        for kind, missing in (
+                            ("general", llm is None),
+                            ("compact", compact_llm is None),
+                        )
+                        if missing
+                    ),
+                    fallback_llm=llm,
+                )
             )
             if not llm:
                 llm = default_llm

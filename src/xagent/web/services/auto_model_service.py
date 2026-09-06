@@ -64,6 +64,27 @@ def list_router_profiles() -> list[dict[str, Any]]:
     ]
 
 
+def validate_candidate_modalities(
+    catalog: Any, profile_id: str, abilities: Iterable[str]
+) -> None:
+    """A profile must describe the saved endpoint's declared input capabilities."""
+    if profile_id not in catalog.known_model_ids():
+        raise AutoModelConfigurationError(f"Unknown Auto profile {profile_id!r}")
+    profile = catalog.get(profile_id)
+    modality_abilities = {"image": "vision", "audio": "audio", "video": "video"}
+    profile_modalities = set(profile.input_modalities) & modality_abilities.keys()
+    target_modalities = {
+        modality
+        for modality, ability in modality_abilities.items()
+        if ability in abilities
+    }
+    if profile_modalities != target_modalities:
+        raise AutoModelConfigurationError(
+            f"Profile {profile_id!r} input modalities do not match the candidate model's abilities. "
+            "Choose a matching profile or correct the model's abilities."
+        )
+
+
 class AutoModelService:
     def __init__(self, db: Session) -> None:
         self.db = db
@@ -102,6 +123,13 @@ class AutoModelService:
             raise AutoModelConfigurationError(
                 "Candidate model(s) are inactive, missing, or inaccessible: "
                 + ", ".join(str(model_id) for model_id in missing_target_ids)
+            )
+
+        for candidate in request.candidates:
+            validate_candidate_modalities(
+                catalog,
+                candidate.routing_model_id,
+                targets[candidate.target_model_id].abilities or [],
             )
 
         config = (

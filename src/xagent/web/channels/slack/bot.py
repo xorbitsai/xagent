@@ -36,6 +36,7 @@ from ...services.channel_runtime import (
     register_channel_uploaded_files,
     update_channel_task_fields,
 )
+from ...services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
 from ...services.db_runtime import (
     cancel_and_drain_async_task,
     drain_async_task_cancellation_safe,
@@ -47,6 +48,7 @@ from ...services.file_turn import (
     build_uploaded_files_context,
     normalize_attachments_for_persistence,
 )
+from ...services.llm_utils import AutoModelUnavailableError
 from ...services.managed_task_lease import ManagedTaskLease
 from ...services.task_execution_context_service import (
     materialize_task_execution_recovery_state,
@@ -672,7 +674,9 @@ class SlackBotInstance:
                         claimed_task_id,
                     )
                     return
-            if isinstance(error, SlackFileDownloadError):
+            if isinstance(error, AutoModelUnavailableError):
+                error_text = CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
+            elif isinstance(error, SlackFileDownloadError):
                 error_text = (
                     "I couldn't download the attached Slack file(s). "
                     "Please try uploading them again."

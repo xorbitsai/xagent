@@ -72,12 +72,16 @@ from xagent.web.services.chat_history_service import (
     inspect_user_message_delivery,
     mark_user_message_delivery,
 )
-from xagent.web.services.client_error_messages import CLIENT_SAFE_TASK_FAILURE
+from xagent.web.services.client_error_messages import (
+    CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE,
+    CLIENT_SAFE_TASK_FAILURE,
+)
 from xagent.web.services.connector_runtime import (
     get_ephemeral_runtime_values,
     pop_ephemeral_runtime_values,
     store_ephemeral_runtime_values,
 )
+from xagent.web.services.llm_utils import AutoModelUnavailableError
 from xagent.web.services.mcp_runtime import (
     MCPBuiltinOAuthActorPolicy,
     MCPBuiltinOAuthActorPolicyRequiredError,
@@ -4192,3 +4196,32 @@ async def test_incidental_failure_persists_the_generic_history_type(
     assert settled["client_message_type"] == TASK_FAILURE_MESSAGE_TYPE
     assert settled["client_error_message"] == CLIENT_SAFE_TASK_FAILURE
     assert "secret-token-xyz" not in settled["client_error_message"]
+
+
+@pytest.mark.asyncio
+async def test_leased_auto_failure_preserves_client_classification(db_session) -> None:
+    error = AutoModelUnavailableError("private model binding details")
+    with _captured_terminal_broadcast(error, db_session) as (
+        task_id,
+        frames,
+        settlements,
+    ):
+        task = db_session.query(Task).filter(Task.id == task_id).one()
+        with patch(
+            "xagent.web.api.websocket.execute_task_background",
+            new=AsyncMock(side_effect=error),
+        ) as execute:
+            await _run_failing_turn(task_id, int(task.user_id), task.source)
+        execute.assert_awaited_once()
+        assert execute.await_args.kwargs["task_lease"] == TaskLease(
+            task_id=task_id, runner_id="runner-a", run_id="run-a"
+        )
+
+    assert len(frames) == 1
+    assert frames[0]["code"] == "auto_model_unavailable"
+    assert frames[0]["message"] == CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
+    assert len(settlements) == 1
+    assert settlements[0]["client_message_type"] == CLIENT_SAFE_FAILURE_MESSAGE_TYPE
+    assert settlements[0]["client_error_message"] == CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
+    assert settlements[0]["error_message"] == CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
+    assert "private model binding details" not in json.dumps(frames)

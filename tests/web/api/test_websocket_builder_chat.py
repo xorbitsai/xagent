@@ -15,6 +15,8 @@ from xagent.web.api.websocket import (
 )
 from xagent.web.models.user import User
 from xagent.web.services.builder_chat_runtime import BuilderChatRuntimeInputs
+from xagent.web.services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
+from xagent.web.services.llm_utils import AutoModelUnavailableError
 
 
 @pytest.mark.asyncio
@@ -531,6 +533,23 @@ async def test_handle_builder_chat_no_llm() -> None:
         sent_data = json.loads(mock_websocket.send_text.call_args[0][0])
         assert sent_data["type"] == "error"
         assert "No LLM configured" in sent_data["message"]
+
+
+@pytest.mark.asyncio
+async def test_builder_auto_unavailable_has_safe_message_and_code():
+    websocket = AsyncMock()
+    user = SimpleNamespace(id=1, is_admin=False)
+    with patch(
+        "xagent.web.services.builder_chat_runtime.load_builder_chat_runtime_inputs",
+        AsyncMock(side_effect=AutoModelUnavailableError("private model details")),
+    ):
+        await handle_builder_chat(websocket, {"message": "Create an agent"}, user)
+    payload = json.loads(websocket.send_text.call_args.args[0])
+    assert payload == {
+        "type": "error",
+        "message": CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE,
+        "error_code": "auto_model_unavailable",
+    }
 
 
 if __name__ == "__main__":

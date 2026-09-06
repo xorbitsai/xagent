@@ -27,6 +27,7 @@ from ...services.channel_runtime import (
     register_channel_uploaded_files,
     update_channel_task_fields,
 )
+from ...services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
 from ...services.db_runtime import (
     cancel_and_drain_async_task,
     drain_async_task_cancellation_safe,
@@ -34,6 +35,7 @@ from ...services.db_runtime import (
 )
 from ...services.execution_result_projection import project_execution_result_for_channel
 from ...services.file_turn import normalize_attachments_for_persistence
+from ...services.llm_utils import AutoModelUnavailableError
 from ...services.managed_task_lease import ManagedTaskLease
 from ...services.task_execution_context_service import (
     materialize_task_execution_recovery_state,
@@ -429,7 +431,10 @@ class FeishuBotInstance:
                     )
                     return
             await self._send_text(
-                chat_id, "Sorry, an error occurred while processing your request."
+                chat_id,
+                CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
+                if isinstance(e, AutoModelUnavailableError)
+                else "Sorry, an error occurred while processing your request.",
             )
         finally:
             if managed_lease is not None:

@@ -167,11 +167,16 @@ async def test_collection_configs_load_concurrently(monkeypatch):
     so its cost scaled linearly with the number of collections.
     """
     collection_count = 8
-    per_call_delay = 0.05
+    all_started = asyncio.Event()
+    release = asyncio.Event()
+    started = set()
 
     class _SlowConfigStore:
         async def get_collection_config(self, collection, user_id, is_admin=False):
-            await asyncio.sleep(per_call_delay)
+            started.add(collection)
+            if len(started) == collection_count:
+                all_started.set()
+            await release.wait()
             return None
 
     monkeypatch.setattr(
@@ -179,15 +184,16 @@ async def test_collection_configs_load_concurrently(monkeypatch):
     )
 
     keys = [f"kb{index}" for index in range(collection_count)]
-    started = time.perf_counter()
-    await collections_module._load_collection_ingestion_configs(keys, 1, False)
-    elapsed = time.perf_counter() - started
-
-    serial_cost = per_call_delay * collection_count
-    assert elapsed < serial_cost / 2, (
-        f"config lookups look serialised: {elapsed:.3f}s for {collection_count} "
-        f"collections (serial would cost ~{serial_cost:.3f}s)"
+    loading = asyncio.create_task(
+        collections_module._load_collection_ingestion_configs(keys, 1, False)
     )
+    try:
+        await asyncio.wait_for(all_started.wait(), timeout=30)
+        assert started == set(keys)
+        assert not loading.done()
+    finally:
+        release.set()
+        await asyncio.wait_for(loading, timeout=30)
 
 
 # --------------------------------------------------------------------------

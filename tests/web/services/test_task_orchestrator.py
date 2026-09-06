@@ -1277,13 +1277,17 @@ async def test_begin_turn_schedules_even_when_caller_cancelled(db_session) -> No
     off-loop claim is in flight (which commits RUNNING in a worker thread),
     the owned claim+schedule task must settle before cancellation propagates,
     so a committed RUNNING task is never left with no scheduled worker."""
-    import time as _time
+    import threading
 
     user = _create_user(db_session)
     task = _create_task(db_session, user.id, status=TaskStatus.PENDING)
 
+    claim_started = threading.Event()
+    release_claim = threading.Event()
+
     def slow_claim(task_id, task_owner_user_id, *, payload, kind):
-        _time.sleep(0.15)  # window during which we cancel the caller
+        claim_started.set()
+        assert release_claim.wait(timeout=GUARD_TIMEOUT)
         return _ClaimedTurn(
             task_lease=TaskLease(
                 task_id=task_id,
@@ -1316,10 +1320,16 @@ async def test_begin_turn_schedules_even_when_caller_cancelled(db_session) -> No
                 kind=TurnKind.CREATE,
             )
         )
-        await asyncio.sleep(0.05)  # let it enter the off-loop claim
-        t.cancel()
+        try:
+            assert await asyncio.to_thread(claim_started.wait, GUARD_TIMEOUT)
+            t.cancel()
+        finally:
+            release_claim.set()
+            await asyncio.wait_for(
+                asyncio.gather(t, return_exceptions=True), timeout=GUARD_TIMEOUT
+            )
         with pytest.raises(asyncio.CancelledError):
-            await t
+            t.result()
 
     sched.assert_called_once()  # scheduled despite the cancellation
 

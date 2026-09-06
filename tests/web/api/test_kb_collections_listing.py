@@ -87,21 +87,31 @@ def team_listing_env(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_team_owner_scans_run_concurrently(team_listing_env):
-    """Each distinct team-KB owner scan must be awaited concurrently, not serially."""
+async def test_team_owner_scans_run_concurrently(team_listing_env, monkeypatch):
+    """Every owner scan must enter before any owner scan is released."""
     recorder = team_listing_env
     user = SimpleNamespace(id=1, is_admin=False)
+    started = set()
+    all_started = asyncio.Event()
+    release = asyncio.Event()
 
-    started = time.perf_counter()
-    await kb_api.list_collections_api(_user=user, db=None)
-    elapsed = time.perf_counter() - started
+    async def gated_scan(user_id, is_admin=False):
+        if user_id in OWNER_IDS:
+            started.add(user_id)
+            if started == set(OWNER_IDS):
+                all_started.set()
+            await release.wait()
+        return await recorder(user_id, is_admin)
 
+    monkeypatch.setattr(kb_api, "list_collections", gated_scan)
+    listing = asyncio.create_task(kb_api.list_collections_api(_user=user, db=None))
+    try:
+        await asyncio.wait_for(all_started.wait(), timeout=30)
+        assert not listing.done()
+    finally:
+        release.set()
+        await asyncio.wait_for(listing, timeout=30)
     assert recorder.max_in_flight == len(OWNER_IDS)
-    serial_cost = SCAN_DELAY_SECONDS * (len(OWNER_IDS) + 1)
-    assert elapsed < serial_cost * 0.6, (
-        f"team owner scans look serial: {elapsed:.3f}s "
-        f"(serial cost would be ~{serial_cost:.3f}s)"
-    )
 
 
 @pytest.mark.asyncio

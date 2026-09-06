@@ -1635,22 +1635,18 @@ def test_replace_markdown_file_references_propagates_a_raising_callback():
 
 
 def test_the_parsers_skip_content_without_the_file_literal():
-    """A cheap containment check in front of a pattern whose atomic label
-    group explores bracket-run candidates.
-
-    ``"[" * 100000 + "]"`` measures at ~1.5s through ``finditer`` and is
-    instant with the precheck. Asserted as a time bound rather than by
-    inspection because the cost is the whole point; the threshold is two
-    orders of magnitude below the unguarded figure, so it cannot flake on a
-    slow machine while still failing outright if the precheck is removed."""
+    """Content without file: must bypass both regex scanning entry points."""
     pathological = "[" * 100_000 + "]"
-
-    started = time.perf_counter()
-    assert list(iter_markdown_file_references(pathological)) == []
-    assert replace_markdown_file_references(pathological, lambda _: "X") == pathological
-    elapsed = time.perf_counter() - started
-
-    assert elapsed < 0.2, f"the file: precheck is not short-circuiting ({elapsed:.3f}s)"
+    with patch(
+        "xagent.web.services.file_reference_output_service._MARKDOWN_FILE_REFERENCE_RE"
+    ) as pattern:
+        assert list(iter_markdown_file_references(pathological)) == []
+        assert (
+            replace_markdown_file_references(pathological, lambda _: "X")
+            == pathological
+        )
+        pattern.finditer.assert_not_called()
+        pattern.sub.assert_not_called()
 
 
 def test_a_non_string_still_raises_rather_than_yielding_nothing():

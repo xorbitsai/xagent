@@ -28,6 +28,10 @@ from fastapi import HTTPException
 from fastapi.datastructures import UploadFile
 from sqlalchemy.orm import Session
 
+from tests.web.pool_contention_shared import (
+    GUARD_TIMEOUT,
+    gated_pool_checkout,
+)
 from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
 from xagent.web.api.v1 import tasks as v1_tasks
 from xagent.web.api.v1.deps import (
@@ -3513,23 +3517,31 @@ async def test_task_read_pool_wait_does_not_block_event_loop(
         return original_helper(*args, **kwargs)
 
     monkeypatch.setattr(v1_tasks, helper_name, recording_helper)
-    operation = asyncio.create_task(
-        v1_tasks.get_chat_task(task_id, principal)
-        if read_surface == "task"
-        else v1_tasks.get_chat_task_steps(task_id, principal)
-    )
+    with gated_pool_checkout(engine) as gate:
+        operation = asyncio.create_task(
+            v1_tasks.get_chat_task(task_id, principal)
+            if read_surface == "task"
+            else v1_tasks.get_chat_task_steps(task_id, principal)
+        )
 
-    try:
-        assert await asyncio.to_thread(worker_entered.wait, 1)
-        await asyncio.wait_for(asyncio.sleep(0.02), timeout=0.1)
-        assert not operation.done()
-    finally:
-        held_connection.close()
+        try:
+            await gate.wait_until_contending()
+            # A checkpoint while the checkout is still parked proves loop progress.
+            await asyncio.sleep(0)
+            assert worker_entered.is_set()
+            assert not operation.done()
+        finally:
+            held_connection.close()
+            gate.let_through()
+            await asyncio.wait_for(
+                asyncio.gather(operation, return_exceptions=True), timeout=GUARD_TIMEOUT
+            )
+            checked_out = engine.pool.checkedout()
+            engine.dispose()
 
-    response = await operation
-    assert response.task_id == task_id
-    assert engine.pool.checkedout() == 0
-    engine.dispose()
+        response = operation.result()
+        assert response.task_id == task_id
+        assert checked_out == 0
 
 
 def test_get_missing_task_returns_404(mock_start_task):

@@ -14,6 +14,12 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import QueuePool
 
 from tests.shared.db_teardown import drop_all_tables
+from tests.web.pool_contention_shared import (
+    GUARD_TIMEOUT,
+    LOOP_LIVENESS_TICKS,
+    gated_pool_checkout,
+    wait_for_ticks,
+)
 from xagent.core.agent.checkpoint import CHECKPOINT_TYPE, LEGACY_CHECKPOINT_TYPES
 from xagent.web.models import database as database_module
 from xagent.web.models.database import Base, get_db, get_engine, init_db
@@ -532,26 +538,32 @@ async def test_lease_heartbeat_keeps_loop_responsive_during_pool_checkout(
             await asyncio.sleep(0.01)
             ticks += 1
 
-    heartbeat_task = asyncio.create_task(
-        run_task_lease_heartbeat(
-            TaskLease(task_id=task_id, runner_id="runner-a", run_id="run-a"),
-            stop_event,
+    with gated_pool_checkout(engine) as gate:
+        heartbeat_task = asyncio.create_task(
+            run_task_lease_heartbeat(
+                TaskLease(task_id=task_id, runner_id="runner-a", run_id="run-a"),
+                stop_event,
+            )
         )
-    )
-    ticker_task = asyncio.create_task(ticker())
-    try:
-        await asyncio.sleep(0.12)
-        assert ticks >= 3, "QueuePool checkout blocked the asyncio event loop"
-    finally:
-        held_connection.close()
-        stop_event.set()
-        await asyncio.wait_for(heartbeat_task, timeout=1)
-        ticker_stop.set()
-        await ticker_task
+        ticker_task = asyncio.create_task(ticker())
+        try:
+            await gate.wait_until_contending()
+            observed = await wait_for_ticks(lambda: ticks)
+            assert observed >= LOOP_LIVENESS_TICKS
+        finally:
+            held_connection.close()
+            gate.let_through()
+            stop_event.set()
+            ticker_stop.set()
+            await asyncio.wait_for(
+                asyncio.gather(heartbeat_task, ticker_task, return_exceptions=True),
+                timeout=GUARD_TIMEOUT,
+            )
+        heartbeat_task.result()
 
-    with SessionLocal() as verify_db:
-        refreshed = verify_db.query(Task).filter(Task.id == task_id).one()
-        assert refreshed.last_heartbeat_at is not None
+        with SessionLocal() as verify_db:
+            refreshed = verify_db.query(Task).filter(Task.id == task_id).one()
+            assert refreshed.last_heartbeat_at is not None
 
 
 @pytest.mark.asyncio

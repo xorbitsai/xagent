@@ -151,6 +151,73 @@ const findWaitingPrompt = (currentTask: any, traceEvents: any[]) => {
   return null
 }
 
+// The waiting round's identity. Prefers the id the task-state handler
+// already extracted (request_id, falling back to the ask frame's event_id -
+// see the app context's task_waiting_for_user case); when the status frame
+// carried none, falls back to the same ask trace events the prompt and
+// interactions fall back to, so all three stay sourced from one ask.
+type WaitingRoundTraceEvent = {
+  event_id?: unknown
+  event_type?: unknown
+  data?: {
+    request_id?: unknown
+    event_id?: unknown
+    expect_response?: unknown
+    result?: {
+      status?: unknown
+      request_id?: unknown
+      event_id?: unknown
+    }
+  }
+}
+
+const firstRoundId = (...candidates: unknown[]): string | undefined => {
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate) return candidate
+  }
+  return undefined
+}
+
+const findWaitingRequestId = (
+  currentTask: { status?: unknown; waitingRequestId?: unknown } | null | undefined,
+  traceEvents: WaitingRoundTraceEvent[],
+): string | undefined => {
+  if (currentTask?.status !== "waiting_for_user") {
+    return undefined
+  }
+  if (
+    typeof currentTask.waitingRequestId === "string"
+    && currentTask.waitingRequestId
+  ) {
+    return currentTask.waitingRequestId
+  }
+
+  // Only data-level ids count: a trace row's top-level event_id can be a
+  // client-minted placeholder (react_task_end rows get generateMessageId
+  // ids), and adopting one would name a round no message ever carried,
+  // leaving no instance active. And the scan STOPS at the most recent ask
+  // whether or not it carries an id - reaching past it could return an
+  // older round's id for the current question. An id-less newest ask
+  // returns undefined so the prompt-text match below stays in charge.
+  for (let i = traceEvents.length - 1; i >= 0; i--) {
+    const event = traceEvents[i]
+    if (event.event_type === "agent_message" && event.data?.expect_response === true) {
+      return firstRoundId(event.data?.request_id, event.data?.event_id)
+    }
+    if (
+      event.event_type === "react_task_end"
+      && event.data?.result?.status === "waiting_for_user"
+    ) {
+      return firstRoundId(
+        event.data?.result?.request_id,
+        event.data?.result?.event_id,
+      )
+    }
+  }
+
+  return undefined
+}
+
 const findWaitingInteractions = (currentTask: any, traceEvents: any[]) => {
   if (currentTask?.status !== "waiting_for_user") {
     return undefined
@@ -480,9 +547,31 @@ export function TaskConversationPanel({
     () => findWaitingInteractions(state.currentTask, managerTraceEvents as any[]),
     [managerTraceEvents, state.currentTask]
   )
+  const waitingRoundId = useMemo(
+    () => findWaitingRequestId(
+      state.currentTask,
+      managerTraceEvents as WaitingRoundTraceEvent[],
+    ),
+    [managerTraceEvents, state.currentTask]
+  )
 
   const activeWaitingMessageId = useMemo(() => {
     if (state.currentTask?.status !== "waiting_for_user") {
+      return null
+    }
+
+    // When the waiting round has an identity, match by it exactly: the
+    // prompt-text fallback below can pick a message whose text merely equals
+    // the question while the round actually lives on a different item,
+    // leaving TWO instances active at once (the timeline one and the
+    // virtual one) with independently diverging state.
+    if (waitingRoundId) {
+      for (let i = messageItems.length - 1; i >= 0; i--) {
+        const item = messageItems[i]
+        if (item.role === "assistant" && item.interactionRequestId === waitingRoundId) {
+          return item.id
+        }
+      }
       return null
     }
 
@@ -504,7 +593,7 @@ export function TaskConversationPanel({
     }
 
     return null
-  }, [messageItems, state.currentTask?.status, waitingPrompt])
+  }, [messageItems, state.currentTask?.status, waitingPrompt, waitingRoundId])
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView?.({ behavior: "smooth" })
@@ -815,8 +904,15 @@ export function TaskConversationPanel({
                       processStatus={state.currentTask?.status}
                       taskStatus={state.currentTask?.status}
                       interactions={state.currentTask?.status === "waiting_for_user" ? waitingInteractions : undefined}
-                      interactionRequestId={state.currentTask?.status === "waiting_for_user" ? state.currentTask.waitingRequestId : undefined}
-                      interactionsActive={state.currentTask?.status === "waiting_for_user"}
+                      interactionRequestId={state.currentTask?.status === "waiting_for_user" ? waitingRoundId : undefined}
+                      // At most one instance of a waiting round is active: a
+                      // timeline message already owning the round keeps the
+                      // virtual copy inert, so two forms can never both
+                      // accept a submission for the same question.
+                      interactionsActive={
+                        state.currentTask?.status === "waiting_for_user"
+                        && activeWaitingMessageId === null
+                      }
                       onOpenExecutionPlan={showDagPreview ? openDagPreview : undefined}
                       onAgentExecutionClick={onAgentExecutionClick}
                     />

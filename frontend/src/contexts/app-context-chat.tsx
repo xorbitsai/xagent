@@ -110,6 +110,12 @@ const MAX_TRACKED_TASK_STATE_VERSIONS = 500
 // retained only to reject late frames, so bound this lineage guard separately
 // from the unrelated task-state ordering cache.
 const MAX_RETIRED_SESSION_TASK_IDS = 500
+// Terminal command outcomes and per-round clarification submissions are
+// keyed by ids minted per submit/ask; both grow with session length and get
+// the same insertion-ordered eviction as the version map above (#2126
+// review round 3, finding F8). Task-switch pruning is tracked in #2143.
+const MAX_TRACKED_COMMAND_OUTCOMES = 500
+const MAX_TRACKED_CLARIFICATION_ROUNDS = 500
 const SESSION_RESET_ACK_TIMEOUT_MS = 30_000
 const SESSION_TASK_ADOPTION_TIMEOUT_MS = 30_000
 const MAX_SESSION_PRE_ADOPTION_FRAMES = 64
@@ -1162,6 +1168,30 @@ const normalizeDagExecutionPayload = (raw: Record<string, unknown>): DAGExecutio
   } as DAGExecution
 }
 
+/**
+ * The structured disposition a terminal `agent_error` frame carries for one
+ * durable command (#1500). `resendSafe` is asserted by the backend only when
+ * the failed handoff proved the command never reached the downstream
+ * operation; everything else — including frames from backends that predate
+ * the field — reads as "may be committed or still in flight".
+ */
+export interface TerminalCommandOutcome {
+  resendSafe: boolean
+}
+
+/**
+ * One clarification reply the round is still accountable for. `accepted`
+ * distinguishes a reply the backend durably acknowledged from one recorded
+ * after an ack timeout (outcome unknown): only a confirmed acceptance may
+ * lock a freshly mounted form while no terminal outcome has arrived — an
+ * unconfirmed delivery keeps the advisory retry the composer has always
+ * offered.
+ */
+export interface ClarificationSubmission {
+  commandId: string
+  accepted: boolean
+}
+
 export interface AppState {
   messages: Message[]
   currentTask: Task | null
@@ -1207,6 +1237,29 @@ export interface AppState {
   // Current context-window usage from the latest LLM call, for the usage gauge.
   contextUsage: { tokens: number; threshold: number } | null
   sessionConversation: SessionConversationState
+  // Terminal dispositions keyed by the durable command id (the sender's own
+  // client message id), so a submitter can decide whether its accepted reply
+  // is safe to resend. Command ids are unique, which is what makes exact-id
+  // correlation immune to stale or cross-run outcomes (#1500).
+  commandOutcomes: Record<string, TerminalCommandOutcome>
+  // The reply command each clarification round is still accountable for,
+  // keyed by request id. Context state, not component state: the same round
+  // can render in more than one ClarificationForm instance (virtual waiting
+  // message vs. persisted timeline message), and the retry gate must survive
+  // the submitting instance being replaced (#1500). Rounds without a
+  // request id are deliberately not tracked - with no round identity a
+  // recorded reply could gate a different question.
+  // An ordered list, not a single slot: an ack-timeout entry stays
+  // resubmittable, so one round can accumulate several outstanding replies,
+  // and overwriting the earlier one would orphan its still-pending outcome -
+  // exactly the undetected-duplicate risk this state exists to surface.
+  // Growth is bounded by the user's own resubmits within one round.
+  // Deliberately NOT persisted across reloads: rebuilding the gate from
+  // browser storage without the durable terminal-event replay (#1904) would
+  // turn a missed outcome frame into a permanent, unexplainable lock
+  // (fail-closed with no exit). Reload-during-ambiguity is tracked in
+  // #2142 as server-authoritative reconstruction on the #2135/#1904 arc.
+  clarificationSubmissions: Record<string, ClarificationSubmission[]>
 }
 
 type AppAction =
@@ -1219,6 +1272,9 @@ type AppAction =
   | { type: "SET_CURRENT_TASK"; payload: Task | null }
   | { type: "SET_TASK_RUNTIME_EXTENSIONS"; payload: { taskId: number; extensions: TaskRuntimeExtensions } }
   | { type: "UPDATE_TASK_STATUS"; payload: { status: Task["status"]; waitingQuestion?: string; waitingInteractions?: Interaction[]; waitingRequestId?: string; runId?: string | null; stateVersion?: number; controlState?: TaskControlState; updatedAt?: string } }
+  | { type: "RECORD_COMMAND_OUTCOME"; payload: { commandId: string; outcome: TerminalCommandOutcome } }
+  | { type: "RECORD_CLARIFICATION_SUBMISSION"; payload: { requestId: string; commandId: string; accepted: boolean } }
+  | { type: "CLEAR_CLARIFICATION_SUBMISSION"; payload: { requestId: string; commandIds: string[] } }
   | { type: "TRIGGER_TASK_UPDATE" }
   | { type: "SET_DAG_EXECUTION"; payload: DAGExecution | null }
   | { type: "RESET_DAG_STATE" }
@@ -1291,6 +1347,8 @@ const createInitialState = (): AppState => ({
   isHistoryLoading: false,
   contextUsage: null,
   sessionConversation: { ...initialSessionConversationState },
+  commandOutcomes: {},
+  clarificationSubmissions: {},
 })
 
 function projectAppState(state: AppState, action: AppAction): AppState {
@@ -1307,6 +1365,81 @@ function projectAppState(state: AppState, action: AppAction): AppState {
       }
     case "SET_HISTORY_LOADING":
       return { ...state, isHistoryLoading: action.payload }
+    case "RECORD_COMMAND_OUTCOME": {
+      const existing = state.commandOutcomes[action.payload.commandId]
+      // Monotone in the unsafe direction, mirroring UPDATE_TASK_STATUS's
+      // first-write-wins for terminal values: a duplicate or racing frame
+      // may downgrade a proven-safe reading, but can never upgrade an
+      // unsafe one - the flag gates a resend decision, and the unsafe
+      // reading is the one that must stick.
+      const resendSafe =
+        (existing === undefined || existing.resendSafe)
+        && action.payload.outcome.resendSafe
+      const commandOutcomes = {
+        ...state.commandOutcomes,
+        [action.payload.commandId]: { resendSafe },
+      }
+      // Bounded like the file's version map, but on a plain object, where
+      // canonical-integer keys iterate before insertion order - so eviction
+      // is oldest-out for the UUID-shaped ids this feature mints and merely
+      // approximate for an integer-looking backend id. Never evict the key
+      // just written: self-eviction would turn a fresh outcome into the
+      // exit-less pending lock.
+      const outcomeIds = Object.keys(commandOutcomes)
+      if (outcomeIds.length > MAX_TRACKED_COMMAND_OUTCOMES) {
+        const evictable = outcomeIds.find(
+          (key) => key !== action.payload.commandId,
+        )
+        if (evictable !== undefined) delete commandOutcomes[evictable]
+      }
+      return { ...state, commandOutcomes }
+    }
+    case "RECORD_CLARIFICATION_SUBMISSION": {
+      // Append, never overwrite: the round stays accountable for every
+      // outstanding reply, so an earlier command's late outcome can still
+      // be matched and surfaced.
+      const clarificationSubmissions = {
+        ...state.clarificationSubmissions,
+        [action.payload.requestId]: [
+          ...(state.clarificationSubmissions[action.payload.requestId] ?? []),
+          {
+            commandId: action.payload.commandId,
+            accepted: action.payload.accepted,
+          },
+        ],
+      }
+      const roundIds = Object.keys(clarificationSubmissions)
+      if (roundIds.length > MAX_TRACKED_CLARIFICATION_ROUNDS) {
+        const evictable = roundIds.find(
+          (key) => key !== action.payload.requestId,
+        )
+        if (evictable !== undefined) delete clarificationSubmissions[evictable]
+      }
+      return { ...state, clarificationSubmissions }
+    }
+    case "CLEAR_CLARIFICATION_SUBMISSION": {
+      const tracked = state.clarificationSubmissions[action.payload.requestId]
+      if (!tracked) {
+        return state
+      }
+      // Consume only the commands the effect actually verified: a fresh
+      // submission recorded between that render's snapshot and this
+      // dispatch must survive, or its outcome is orphaned.
+      const consumed = new Set(action.payload.commandIds)
+      const kept = tracked.filter(
+        (submission) => !consumed.has(submission.commandId),
+      )
+      if (kept.length === tracked.length) {
+        return state
+      }
+      const remaining = { ...state.clarificationSubmissions }
+      if (kept.length === 0) {
+        delete remaining[action.payload.requestId]
+      } else {
+        remaining[action.payload.requestId] = kept
+      }
+      return { ...state, clarificationSubmissions: remaining }
+    }
 
     case "SYNC_PROCESSING_STATUS":
       if (shouldStopProcessingForTaskStatus(state.currentTask?.status)) {
@@ -2864,6 +2997,16 @@ export function AppProvider({
     }
 
     const controlEnvelope = extractTaskControlEnvelope(message)
+    // A stale-versioned error frame must not roll task state back, but its
+    // body is not versioned state: it carries the error notice - and, since
+    // #2124, the structured terminal command outcome - which the backend
+    // sends exactly once. Dropping the whole frame silences that notice
+    // forever, so error frames fall through with their control tuple
+    // neutralized (this flag suppresses every status side effect below)
+    // instead of being swallowed. This extends the same reasoning
+    // ``canAcceptTaskControlVersion`` already applies to UNversioned error
+    // frames ("error frames remain informational") to versioned ones.
+    let staleControlErrorFrame = false
     if (controlEnvelope.isStateEvent && controlEnvelope.taskId !== undefined) {
       if (
         !acceptTaskControlVersion(
@@ -2871,13 +3014,16 @@ export function AppProvider({
           controlEnvelope,
           taskStateVersionsRef.current,
         )
-      ) return
+      ) {
+        if (message.type !== "error" && message.type !== "agent_error") return
+        staleControlErrorFrame = true
+      }
 
       // A late event may have an old semantic type (for example
       // ``task_paused``) after a newer run is already RUNNING. The backend
       // rewrites its state tuple to the canonical row; apply only that tuple
       // and skip the stale event-specific side effects.
-      if (!taskEventMatchesControlState(message, controlEnvelope)) {
+      if (!staleControlErrorFrame && !taskEventMatchesControlState(message, controlEnvelope)) {
         if (controlEnvelope.status) {
           dispatch({
             type: "UPDATE_TASK_STATUS",
@@ -3198,9 +3344,17 @@ export function AppProvider({
               return
             }
             const interactions = normalizeInteractions(eventData.metadata?.interactions)
-            const interactionRequestId = typeof eventData.request_id === "string"
-              ? eventData.request_id
-              : undefined
+            // The round identity: no backend emits ``request_id`` today - the
+            // stable per-ask id the runtime mints and every ask frame carries
+            // is ``event_id`` (see core/agent/clarification.py: "event_id is
+            // the clarification's stable identity"). ``request_id`` stays the
+            // preferred field so a backend that later adopts the explicit
+            // name wins over the fallback - but only with a non-empty
+            // string; anything else falls through to the next candidate.
+            const interactionRequestId = [
+              eventData.request_id,
+              eventData.event_id,
+            ].find((id): id is string => typeof id === "string" && id !== "")
             const isAgentMessage = eventType === "agent_message"
             const isAiMessage = eventType === "ai_message"
             const expectsUserResponse =
@@ -5685,10 +5839,17 @@ export function AppProvider({
         const interactions = normalizeInteractions(
           waitingRoot.interactions ?? waitingData.interactions
         )
-        const waitingRequestIdValue = waitingRoot.request_id ?? waitingData.request_id
-        const waitingRequestId = typeof waitingRequestIdValue === "string"
-          ? waitingRequestIdValue
-          : undefined
+        // ``request_id`` first (the explicit name, if a backend ever emits
+        // it), then ``event_id`` - the stable per-ask identity the runtime
+        // actually mints and forwards on ask frames today. First non-empty
+        // string wins: nullish coalescing alone would let an empty or
+        // non-string ``request_id`` block the ``event_id`` fallback.
+        const waitingRequestId = [
+          waitingRoot.request_id,
+          waitingData.request_id,
+          waitingRoot.event_id,
+          waitingData.event_id,
+        ].find((id): id is string => typeof id === "string" && id !== "")
         dispatch({
           type: "UPDATE_TASK_STATUS",
           payload: {
@@ -5747,7 +5908,31 @@ export function AppProvider({
         const agentErrorMessage = agentErrorCode
           ? t(clientErrorTranslationKey(agentErrorCode))
           : getWebSocketErrorMessage(message, trustLegacyErrorProse)
-        const agentErrorTaskStatus = getWebSocketTaskStatus(message)
+        // A stale-versioned frame keeps its notice but asserts nothing about
+        // task state - its control tuple lost to a newer version above.
+        const agentErrorTaskStatus = staleControlErrorFrame
+          ? null
+          : getWebSocketTaskStatus(message)
+
+        // A terminal frame for a durable command carries a structured
+        // disposition (#1500). Record it keyed by command id so the
+        // submitter of that exact command can make its retry decision;
+        // `resend_safe` is trusted only as a literal true, so frames from
+        // backends that predate the field stay in the unsafe reading.
+        const agentErrorData = asMessageRecord(message.data)
+        const terminalCommandId = agentErrorData.command_id
+        if (typeof terminalCommandId === "string" && terminalCommandId
+          && agentErrorData.outcome === "failed") {
+          dispatch({
+            type: "RECORD_COMMAND_OUTCOME",
+            payload: {
+              commandId: terminalCommandId,
+              outcome: {
+                resendSafe: agentErrorData.resend_safe === true,
+              },
+            },
+          })
+        }
 
         if (agentErrorTaskStatus) {
           dispatch({
@@ -5796,11 +5981,17 @@ export function AppProvider({
           controlEnvelope,
         })
 
-        if (errorFrame.taskStatus) {
+        // Stale-versioned "error" frames keep their notice but assert
+        // nothing about task state (see staleControlErrorFrame above).
+        // task_error deliberately stays outside that exemption - its bubble
+        // IS the turn's terminal result, mirroring the unversioned rule in
+        // canAcceptTaskControlVersion - so for task_error this guard is
+        // vacuously true.
+        if (errorFrame.taskStatus && !staleControlErrorFrame) {
           dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: errorFrame.taskStatus } })
           dispatch({ type: "TRIGGER_TASK_UPDATE" })
         }
-        if (errorFrame.stopsProcessing) {
+        if (errorFrame.stopsProcessing && !staleControlErrorFrame) {
           dispatch({ type: "SET_PROCESSING", payload: false })
         }
 

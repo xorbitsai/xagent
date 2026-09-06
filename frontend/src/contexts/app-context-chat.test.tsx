@@ -6722,6 +6722,35 @@ describe("clarification round identity (#1500)", () => {
     })
   })
 
+  it("falls back to event_id when request_id is an empty string", async () => {
+    // Nullish coalescing alone would let an empty request_id block the
+    // event_id fallback and leave the round id-less.
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.({
+        type: "task_waiting_for_user",
+        timestamp: "2026-05-27T05:00:01Z",
+        task_id: 1,
+        task: { id: 1, status: "waiting_for_user" },
+        message: "Which region should I use?",
+        request_id: "",
+        event_id: "evt-round-3",
+      } as TestWebSocketMessage)
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("waiting-request-id").textContent).toBe("evt-round-3")
+    })
+  })
+
   it("keeps a stale-versioned error notice without rolling back task state", async () => {
     // The version guard protects task state, but an error frame's body is
     // not versioned state: it carries a notice (and, since #2124, the

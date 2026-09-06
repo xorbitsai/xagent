@@ -3216,14 +3216,12 @@ export function AppProvider({
             // is ``event_id`` (see core/agent/clarification.py: "event_id is
             // the clarification's stable identity"). ``request_id`` stays the
             // preferred field so a backend that later adopts the explicit
-            // name wins over the fallback.
-            const interactionRequestId =
-              (typeof eventData.request_id === "string" && eventData.request_id
-                ? eventData.request_id
-                : undefined)
-              ?? (typeof eventData.event_id === "string" && eventData.event_id
-                ? eventData.event_id
-                : undefined)
+            // name wins over the fallback - but only with a non-empty
+            // string; anything else falls through to the next candidate.
+            const interactionRequestId = [
+              eventData.request_id,
+              eventData.event_id,
+            ].find((id): id is string => typeof id === "string" && id !== "")
             const isAgentMessage = eventType === "agent_message"
             const isAiMessage = eventType === "ai_message"
             const expectsUserResponse =
@@ -5710,13 +5708,15 @@ export function AppProvider({
         )
         // ``request_id`` first (the explicit name, if a backend ever emits
         // it), then ``event_id`` - the stable per-ask identity the runtime
-        // actually mints and forwards on ask frames today.
-        const waitingRequestIdValue = waitingRoot.request_id ?? waitingData.request_id
-          ?? waitingRoot.event_id ?? waitingData.event_id
-        const waitingRequestId =
-          typeof waitingRequestIdValue === "string" && waitingRequestIdValue
-            ? waitingRequestIdValue
-            : undefined
+        // actually mints and forwards on ask frames today. First non-empty
+        // string wins: nullish coalescing alone would let an empty or
+        // non-string ``request_id`` block the ``event_id`` fallback.
+        const waitingRequestId = [
+          waitingRoot.request_id,
+          waitingData.request_id,
+          waitingRoot.event_id,
+          waitingData.event_id,
+        ].find((id): id is string => typeof id === "string" && id !== "")
         dispatch({
           type: "UPDATE_TASK_STATUS",
           payload: {

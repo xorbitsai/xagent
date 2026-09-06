@@ -505,6 +505,20 @@ jobs:
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 
+      # Placed after every step above that needs the real, fully-migrated shape
+      # of mcp_servers/public_mcp_apps: this test stubs them in a throwaway
+      # schema of its own (search_path), so it cannot touch the shared ones --
+      # but ordering it last keeps that independent of the fixture's details.
+      # Without this step the file's postgres-marked test runs nowhere: the
+      # fast job deselects the marker and provisions no database, so the
+      # backfill's data path would have no PostgreSQL coverage at all.
+      - name: Test legacy OAuth app-identity backfill (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/migrations/test_20260818_backfill_oauth_server_app_identity.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
       - name: Test legacy resume interaction close rowcount grid (Postgres-only)
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |

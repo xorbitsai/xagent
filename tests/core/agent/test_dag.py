@@ -408,10 +408,19 @@ def test_dag_completion_assessment_prompt_includes_grounding_rule() -> None:
 
     system_prompt = messages[0]["content"]
     assert "quantitative data" in system_prompt
-    assert "illustrative placeholders" in system_prompt
+    assert (
+        "a current user request that explicitly asks you to write a template"
+        in system_prompt
+    )
     assert "use an appropriate tool" not in system_prompt
     assert system_prompt.count("## FINAL DELIVERABLE FILE REFERENCES") == 1
     assert "get_workspace_output_files" not in system_prompt
+    # The DAG-local sentence that follows the shared rule must stay in step
+    # with the rule's own gap-reporting wording, not the disclosure wording
+    # the rule no longer uses.
+    assert "name that missing data in reason" in system_prompt
+    assert "illustrative" not in system_prompt
+    assert "report that value as unavailable" not in system_prompt
 
     answer_description = pattern._completion_assessment_tool_schema()["function"][
         "parameters"

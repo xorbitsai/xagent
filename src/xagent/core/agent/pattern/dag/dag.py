@@ -1569,9 +1569,8 @@ class DAGPattern(AgentPattern):
                     "over from candidate_output or step_results: "
                     f"{grounding_rule(can_call_tools=False)}\n\n"
                     f"{final_deliverable_file_reference_instructions(can_lookup=False)}\n\n"
-                    "If the answer presents any figure as an illustrative "
-                    "placeholder because no step produced the underlying data, "
-                    "name that unsourced data in reason even when you choose "
+                    "If the answer leaves out a value because no step produced "
+                    "it, name that missing data in reason even when you choose "
                     "status=completed. "
                     f"{final_answer_language_rule(subject='output language policy')}"
                 ),

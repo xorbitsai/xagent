@@ -1515,16 +1515,16 @@ def test_react_grounding_rule_present_in_both_answer_paths() -> None:
 
     for prompt in (tool_prompt, lookup_tool_prompt, forced_prompt):
         assert "quantitative data" in prompt
-        assert "illustrative placeholders" in prompt
+        assert (
+            "a current user request that explicitly asks you to write a template"
+            in prompt
+        )
+        assert "This does not restrict the wording you compose" in prompt
     assert "use an appropriate tool to verify" in tool_prompt
     assert "use an appropriate tool" not in forced_prompt
     for prompt in (tool_prompt, lookup_tool_prompt):
         assert "tool-call arguments that assert facts" in prompt
         assert "never guess one" in prompt
-        assert (
-            "This does not restrict values you are expected to compose yourself"
-            in prompt
-        )
     assert "tool-call arguments that assert facts" not in forced_prompt
     assert "## FINAL DELIVERABLE FILE REFERENCES" not in tool_prompt
     assert "exact markdown_link" in tool_prompt

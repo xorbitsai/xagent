@@ -1065,7 +1065,9 @@ def test_compact_with_llm_summarizes_history_and_preserves_current_user() -> Non
     assert "completed work from remaining work" in prompt[0]["content"]
     prompt_text = prompt[1]["content"]
     assert "Tool read_file returned" in str(prompt_text)
-    assert "without redoing completed tool calls" in str(prompt_text)
+    assert "so the next call can judge for itself what still needs doing" in str(
+        prompt_text
+    )
 
     result = ctx.compact_with_llm_response(
         {
@@ -1093,6 +1095,171 @@ def test_compact_with_llm_summarizes_history_and_preserves_current_user() -> Non
     assert result.metadata["dropped_tool_result_count"] == 1
     assert ctx.messages[1].role == "user"
     assert ctx.messages[1].content == "current request"
+
+
+def _build_llm_compact_prompt_texts() -> tuple[str, str]:
+    ctx = ExecutionContext()
+    ctx.compact_config.threshold = 1
+    ctx.add_user_message("Build a KPI report")
+    ctx.add_assistant_message(
+        "",
+        tool_calls=[
+            {"id": "call-1", "type": "function", "function": {"name": "read_file"}},
+        ],
+    )
+    ctx.add_tool_result("read_file", {"output": "x" * 200}, tool_call_id="call-1")
+    request = ctx.build_llm_compact_request_if_needed()
+    assert request is not None
+    prompt = request["messages"]
+    return prompt[0]["content"], str(prompt[1]["content"])
+
+
+def test_compact_prompt_forbids_instructing_the_next_call() -> None:
+    """The summary must not tell the next call what to do.
+
+    Both observed fabrication-incident summaries put a "do not call tools
+    again" or "output the final answer" instruction in their own Next
+    Action slot; the next call's tool set is not known to the summarizer.
+    """
+    system, user = _build_llm_compact_prompt_texts()
+
+    assert "Write no instruction to the next call" in system
+    for phrase in (
+        "name the next action needed",
+        "without redoing completed tool calls",
+        "without making additional tool calls",
+        "do not call tools",
+        "produce the final answer",
+    ):
+        assert phrase not in system
+        assert phrase not in user
+
+
+def test_compact_prompt_forbids_unearned_completeness_claims() -> None:
+    """A dataset must not be called complete unless every part still is.
+
+    The fabrication incident's second turn claimed "the complete dataset of
+    443 clients" when four of the nine fetched pages' raw payloads had
+    already been dropped by an earlier compaction; the pages were returned,
+    but were no longer described anywhere in the summary.
+    """
+    system, _ = _build_llm_compact_prompt_texts()
+
+    assert (
+        "never call a dataset complete, fully retrieved, or fully processed" in system
+    )
+    assert (
+        "unless the history shows every item was returned and every one is "
+        "still described here" in system
+    )
+    assert "say which parts survive as prose only" in system
+
+
+def test_compact_prompt_requires_verbatim_values_for_the_requested_records() -> None:
+    """Fact-carrying values for records the request points at must be copied.
+
+    The fabrication incident's second turn dropped every team name, client
+    name, and client code from its summary while still claiming the
+    underlying dataset was complete.
+    """
+    system, _ = _build_llm_compact_prompt_texts()
+
+    assert "character for character" in system
+    assert "for the records the request points at" in system
+    for kind in (
+        "their names",
+        "identifiers and reference codes",
+        "their statuses, dates, counts and totals",
+    ):
+        assert kind in system
+
+
+def test_compact_prompt_excludes_credentials_and_unrelated_personal_data() -> None:
+    """Verbatim retention must not extend to credentials or stray PII."""
+    system, _ = _build_llm_compact_prompt_texts()
+
+    assert "Never copy, in whole or in part" in system
+    for kind in ("credential", "token", "key", "password", "authentication material"):
+        assert kind in system
+    assert "personal information the request does not point at" in system
+    assert "note only that such a value was present and was omitted" in system
+
+
+def test_compact_prompt_excludes_credentials_even_when_also_an_identifier() -> None:
+    """A value that is both a requested identifier and a credential is excluded.
+
+    Verbatim retention (records the request points at) and the credential
+    exclusion can both apply to the same value, e.g. an API key listed
+    alongside a connector's identifier; the prompt must say which one wins.
+    """
+    system, _ = _build_llm_compact_prompt_texts()
+
+    assert (
+        "If a value is both an identifier the request points at and "
+        "authentication material, the exclusion wins: omit it." in system
+    )
+
+
+def test_compact_prompt_forbids_inventing_values_to_complete_a_pattern() -> None:
+    """The summarizer must not pattern-complete a paginated list.
+
+    The fabrication incident's invented rows were patterned: sequential
+    reference codes, alphabetically ordered names. Prohibiting pattern
+    completion at the summarizer addresses the same failure one layer
+    earlier than the answering model.
+    """
+    system, _ = _build_llm_compact_prompt_texts()
+
+    assert "never paraphrase, substitute, or invent one to complete a pattern" in system
+
+
+def test_compact_prompt_subordinates_payload_dropping_to_value_preservation() -> None:
+    """Dropping a raw payload must not be read as licensing dropping its values.
+
+    The instruction to drop "irrelevant raw payloads" and the instruction to
+    preserve fact-carrying values sit two sentences apart; this states which
+    one governs a value the request points at.
+    """
+    system, _ = _build_llm_compact_prompt_texts()
+
+    assert "Dropping a raw payload does not license dropping these values" in system
+    assert "they are not the bulk that instruction covers" in system
+    assert "irrelevant raw payloads" in system
+
+
+def test_compact_prompt_ranks_what_to_keep_when_the_budget_is_short() -> None:
+    """When the budget is too small for everything, priority order is explicit.
+
+    At the smallest fallback budget (``COMPACT_SUMMARY_MIN_TOKENS``), a
+    silent partial summary is the same defect as the incident: a claim of
+    completeness with no signal that anything was left out.
+    """
+    system, _ = _build_llm_compact_prompt_texts()
+
+    assert "keep, in this order:" in system
+    tail = system[system.index("keep, in this order:") :]
+    order = [
+        "first state what is missing and not listed here, with counts",
+        "artifact handles",
+        "the identifiers and names the request points at",
+        "statuses and dates",
+        "then the rest",
+    ]
+    positions = [tail.index(item) for item in order]
+    assert positions == sorted(positions)
+
+
+def test_compact_prompt_stays_within_the_smallest_budget() -> None:
+    """The prompt itself must not be longer than the smallest summary it asks for.
+
+    ``COMPACT_SUMMARY_MIN_TOKENS`` is 256 tokens, roughly 190 English words;
+    310 words already left zero margin for the next required addition, so
+    the cap is 330 -- room for one more sentence before the next change must
+    make an explicit trade-off instead of silently growing the prompt.
+    """
+    system, _ = _build_llm_compact_prompt_texts()
+
+    assert len(system.split()) <= 330
 
 
 def test_compact_with_llm_reports_dropped_tool_results_by_name() -> None:

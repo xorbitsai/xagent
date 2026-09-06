@@ -79,6 +79,10 @@ from ...context.enrichment import (
     enrich_context_with_memory,
     latest_user_text,
 )
+from ...context.execution import (
+    COMPACT_DROPPED_TOOL_NAME_MAX_CHARS,
+    COMPACT_DROPPED_TOOL_NOTICE_MAX_NAMES,
+)
 from ...context.memory_tool import build_memory_tools
 from ...context.skill_tool import build_load_skill_tool
 from ...grounding import grounding_rule
@@ -123,6 +127,47 @@ REACT_DECISION_TOOL_NAME = "react_decision"
 REACT_DECISION_FINAL_ANSWER = "final_answer"
 USER_INTERACTION_CONTROL_TOOL_NAMES = CONTROL_TOOL_NAMES - {REACT_DECISION_FINAL_ANSWER}
 REACT_DECISION_TOOL_CALL = "tool_call"
+# Why a turn was forced back to final_answer. Written at every site that sets
+# ``force_final_answer_next``, so the compaction-recovery gate in the main loop
+# can tell a forcing it may undo from one it must leave alone.
+FORCED_ANSWER_REASON_REPEATED_TOOL_DECISION = "repeated_tool_decision"
+FORCED_ANSWER_REASON_FINALIZE_AFTER_TOOL = "finalize_after_tool_result"
+FORCED_ANSWER_REASON_EMPTY_FINAL_ANSWER = "empty_final_answer"
+FORCED_ANSWER_REASON_CONTROL_TOOL_DISABLED = "control_tool_disabled"
+FORCED_ANSWER_REASON_COMPACTION_RECOVERY = "compaction_recovery"
+FORCED_ANSWER_REASONS = frozenset(
+    {
+        FORCED_ANSWER_REASON_REPEATED_TOOL_DECISION,
+        FORCED_ANSWER_REASON_FINALIZE_AFTER_TOOL,
+        FORCED_ANSWER_REASON_EMPTY_FINAL_ANSWER,
+        FORCED_ANSWER_REASON_CONTROL_TOOL_DISABLED,
+        FORCED_ANSWER_REASON_COMPACTION_RECOVERY,
+    }
+)
+# ``control_tool_disabled`` means nobody is reachable to talk to, so that forced
+# turn means "stop and report blocked" rather than "answer from the evidence you
+# gathered"; reopening work tools would spend a turn without changing that
+# outcome. ``compaction_recovery`` marks the turn a recovery already produced,
+# and undoing that one would let recovery chain into itself.
+FORCED_ANSWER_REASONS_EXEMPT_FROM_RECOVERY = frozenset(
+    {
+        FORCED_ANSWER_REASON_CONTROL_TOOL_DISABLED,
+        FORCED_ANSWER_REASON_COMPACTION_RECOVERY,
+    }
+)
+FORCED_ANSWER_RECOVERY_BUDGET = 1
+# A recovery turn spends the current iteration on re-fetching, so the forced
+# answer needs one more iteration after it. The loop is
+# ``range(self.current_iteration, self.max_iterations)`` and one iteration
+# carries one LLM call plus that call's tool batch, so "this turn plus one" is
+# the exact floor.
+FORCED_ANSWER_RECOVERY_MIN_REMAINING_ITERATIONS = 2
+# How a recovery turn ended, read by the turn immediately after it.
+FORCED_ANSWER_FOLLOWUP_REFETCHED = "refetched"
+FORCED_ANSWER_FOLLOWUP_NO_EVIDENCE = "no_evidence"
+FORCED_ANSWER_FOLLOWUPS = frozenset(
+    {FORCED_ANSWER_FOLLOWUP_REFETCHED, FORCED_ANSWER_FOLLOWUP_NO_EVIDENCE}
+)
 UNGROUPED_TOOL_DECISION_CATEGORIES = frozenset({"basic", "other"})
 # Bounds for the final_answer-strip warning's tool-name list. Tool names come
 # straight from the model, so the log line is shaped like the rest of this
@@ -443,6 +488,11 @@ class ReActPattern(AgentPattern):
         self.pending_tool_call_content: dict[str, str] = {}
         self.tool_ledger: dict[str, ToolCallRecord] = {}
         self.force_final_answer_next = False
+        # Read only while ``force_final_answer_next`` is true; every site that
+        # sets that flag writes this in the same statement block.
+        self.forced_answer_reason: str | None = None
+        self.forced_answer_compaction_recoveries = 0
+        self.forced_answer_recovery_followup: str | None = None
         self.repeated_tool_decision: dict[str, Any] | None = None
         self.waiting_for_user_request: dict[str, Any] | None = None
         self.pending_tool_interaction_responses: list[dict[str, str]] = []
@@ -643,15 +693,42 @@ class ReActPattern(AgentPattern):
                 if decision_result is not None:
                     return decision_result
 
-            force_final_answer_now = self.force_final_answer_next or (
+            # The turn after a recovery turn is always the forced answer turn,
+            # and the marker says whether the re-fetch actually brought the
+            # evidence back. Read without clearing: the marker has to outlive
+            # every checkpoint this turn writes, or a resume would restore the
+            # forcing without the reason for it and fall back to the ordinary
+            # instruction. It is cleared once this turn has run, below. The
+            # gate further down overwrites this local whenever it finds the
+            # evidence gone, so treat it as "what this turn must clear", not a
+            # read-only snapshot of the previous turn.
+            followup = self.forced_answer_recovery_followup
+            if followup is not None:
+                self.force_final_answer_next = True
+                self.forced_answer_reason = FORCED_ANSWER_REASON_COMPACTION_RECOVERY
+
+            if self.force_final_answer_next:
+                force_final_answer_now = True
+                forced_reason = self.forced_answer_reason
+            elif (
                 self.finalize_after_tool_result
                 and not self.pending_tool_calls
                 and self._latest_tool_result_success(context)
-            )
+            ):
+                force_final_answer_now = True
+                # Same source as the site that sets the flag after a
+                # successful tool result; this branch is its inline twin.
+                forced_reason = FORCED_ANSWER_REASON_FINALIZE_AFTER_TOOL
+            else:
+                force_final_answer_now = False
+                forced_reason = None
             tool_schemas = (
                 [self._final_answer_tool_schema()]
                 if force_final_answer_now
                 else base_tool_schemas
+            )
+            evidence_dropped = (
+                followup is not None and followup != FORCED_ANSWER_FOLLOWUP_REFETCHED
             )
             interrupted = await self._interrupt_if_requested(
                 runtime=runtime,
@@ -676,7 +753,7 @@ class ReActPattern(AgentPattern):
                 "iteration": iteration,
                 **resolved_llm_metadata(call_llm),
             }
-            await runtime.compact_context_if_needed(
+            compact_result = await runtime.compact_context_if_needed(
                 context=context,
                 # Fall back to the main model when no compact model is
                 # configured. PatternRuntime skips summarization entirely
@@ -696,10 +773,83 @@ class ReActPattern(AgentPattern):
                 metadata={"iteration": iteration},
             )
 
+            # A forced answer turn that just lost its evidence to compaction is
+            # the turn this whole block exists for: the model already decided
+            # to answer, the observations it decided from are gone, and the
+            # tool set it was about to receive is final_answer alone. Either
+            # undo the forcing and hand back the tools whose results were
+            # dropped, or say plainly that they are unavailable.
+            dropped_count, dropped_names = self._dropped_tool_evidence(compact_result)
+            if force_final_answer_now and dropped_count > 0:
+                # Two halves of one decision. The loop local picks this turn's
+                # instruction; the marker carries the same decision across the
+                # checkpoint written below, so an interrupt between here and
+                # the LLM call resumes into a forced turn that still knows why.
+                # Reuse of the existing marker means the consumption block
+                # above and the clearing below already handle it. Anything that
+                # undoes the forcing has to undo both.
+                evidence_dropped = True
+                self.forced_answer_recovery_followup = (
+                    FORCED_ANSWER_FOLLOWUP_NO_EVIDENCE
+                )
+                followup = FORCED_ANSWER_FOLLOWUP_NO_EVIDENCE
+                base_names = set(self._schema_tool_names(base_tool_schemas))
+                # Subtracting the control names is redundant today -- the
+                # dropped-name mapping already excludes them upstream -- and is
+                # kept because it is the only thing that would stop
+                # send_message from reaching a recovery turn if that upstream
+                # exclusion ever changes.
+                recoverable_work = (
+                    dropped_names & base_names
+                ) - self._control_tool_names()
+                recovery_schemas = (
+                    [
+                        schema
+                        for schema in base_tool_schemas
+                        if (schema.get("function") or {}).get("name")
+                        in (recoverable_work | {"final_answer"})
+                    ]
+                    if recoverable_work
+                    else []
+                )
+                if forced_reason not in FORCED_ANSWER_REASONS:
+                    decline_reason: str | None = "unknown_reason"
+                elif forced_reason in FORCED_ANSWER_REASONS_EXEMPT_FROM_RECOVERY:
+                    decline_reason = "exempt"
+                elif (
+                    self.max_iterations - iteration
+                ) < FORCED_ANSWER_RECOVERY_MIN_REMAINING_ITERATIONS:
+                    decline_reason = "no_iteration_budget"
+                elif (
+                    self.forced_answer_compaction_recoveries
+                    >= FORCED_ANSWER_RECOVERY_BUDGET
+                ):
+                    decline_reason = "budget_spent"
+                elif not recovery_schemas:
+                    decline_reason = "no_recoverable_tools"
+                else:
+                    decline_reason = None
+                if decline_reason is not None:
+                    logger.warning(
+                        "Forced answer turn lost tool evidence to compaction and "
+                        "will report it as unavailable. reason=%s dropped=%d "
+                        "unrecoverable_names=%s execution_id=%s",
+                        decline_reason,
+                        dropped_count,
+                        [
+                            name[:COMPACT_DROPPED_TOOL_NAME_MAX_CHARS]
+                            for name in sorted(dropped_names - base_names)[
+                                :COMPACT_DROPPED_TOOL_NOTICE_MAX_NAMES
+                            ]
+                        ],
+                        getattr(context, "execution_id", None),
+                    )
+
             messages = self._messages_for_llm(
                 context,
                 has_tools=bool(tool_schemas),
                 force_final_answer=force_final_answer_now,
+                evidence_dropped=evidence_dropped,
                 tool_names=self._schema_tool_names(tool_schemas),
             )
             await runtime.checkpoint("before_llm", context=context, pattern=self)
@@ -962,11 +1112,20 @@ class ReActPattern(AgentPattern):
                 )
                 if pending_result is not None:
                     return pending_result
+                # This turn ran to completion, so the marker it was carrying has
+                # been acted on. Clearing it only here, past every checkpoint
+                # this turn writes and every early return, is what makes it
+                # survive an interrupt and still apply exactly once.
+                if followup is not None:
+                    self.forced_answer_recovery_followup = None
                 self.current_iteration = iteration + 1
                 self.status = "thinking"
                 continue
 
             await runtime.checkpoint("after_llm", context=context, pattern=self)
+            # Same one-shot clearing for the turn that called no tools.
+            if followup is not None:
+                self.forced_answer_recovery_followup = None
             if normalized.get("done", True):
                 return await self._finalize_success(
                     context=context,
@@ -1091,17 +1250,42 @@ class ReActPattern(AgentPattern):
         *,
         has_tools: bool,
         force_final_answer: bool = False,
+        evidence_dropped: bool = False,
         tool_names: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         messages = list(context.get_messages_for_llm())
         if force_final_answer:
+            if evidence_dropped:
+                # This turn's compaction removed the observations the answer
+                # was supposed to rest on, and this turn cannot fetch them
+                # back. The ordinary opening below would tell the model to
+                # answer "using the accumulated conversation and tool results"
+                # while those results are gone, which is an instruction to
+                # invent them, so it is replaced rather than appended to.
+                opening = (
+                    "Produce the final user-facing answer by calling the "
+                    "final_answer control tool exactly once, naming the tool "
+                    "observations that were removed from context and are no "
+                    "longer available on this turn. Do not reconstruct, "
+                    "estimate, or illustrate a removed value, and do not "
+                    "present one as an example. Set outcome=partial when part "
+                    "of the request is still answerable from what remains and "
+                    "outcome=blocked when none of it is; outcome=completed is "
+                    "not available on this turn. "
+                )
+            else:
+                opening = (
+                    "Produce the final user-facing answer by calling the "
+                    "final_answer control tool exactly once using the "
+                    "accumulated conversation and tool results. Set "
+                    "outcome=completed only when every requested action or "
+                    "verification succeeded; otherwise set outcome=partial or "
+                    "outcome=blocked and say what remains. "
+                )
             instruction = (
-                "Produce the final user-facing answer by calling the final_answer "
-                "control tool exactly once using the accumulated conversation and "
-                "tool results. Do not call any other tool and do not output "
-                "tool-call markup as plain text. Set outcome=completed only when "
-                "every requested action or verification succeeded; otherwise set "
-                "outcome=partial or outcome=blocked and say what remains. If a "
+                f"{opening}"
+                "Do not call any other tool and do not output "
+                "tool-call markup as plain text. If a "
                 "previous ask_user_question narrowed the request to a selected "
                 "subset of items or resources, the final answer must cover only "
                 "that subset — leave out anything outside it even if an earlier "
@@ -1531,6 +1715,37 @@ class ReActPattern(AgentPattern):
                 names.append(str(function["name"]))
         return names
 
+    def _dropped_tool_evidence(self, compact_result: Any) -> tuple[int, set[str]]:
+        """Read how much tool evidence a compaction just destroyed, and whose.
+
+        ``compacted`` cannot answer this on its own: the message-dropping path
+        reports ``compacted=True`` even when its tail window already held every
+        message and nothing was removed. The two metadata keys read here are
+        written together by both compacting paths and already exclude hidden,
+        superseded, failed and non-evidence observations, so they are the only
+        signal this gate accepts.
+
+        The count and the names defend independently rather than one implying
+        the other. A positive count with an unreadable name mapping is a real
+        state, and it must report "evidence was destroyed, nothing nameable to
+        restore" instead of restoring the wrong tools.
+
+        Raises nothing: reads only attributes and mapping keys. A compaction
+        that itself failed propagates through the caller as it always has.
+        """
+        if compact_result is None or not getattr(compact_result, "compacted", False):
+            return 0, set()
+        metadata = getattr(compact_result, "metadata", None)
+        if not isinstance(metadata, dict):
+            return 0, set()
+        count = metadata.get("dropped_tool_result_count")
+        if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
+            return 0, set()
+        by_name = metadata.get("dropped_tool_results_by_name")
+        if not isinstance(by_name, dict):
+            return count, set()
+        return count, {str(name) for name in by_name}
+
     def _tool_decision_groups_for_tools(self, tools: list[Any]) -> dict[str, str]:
         groups: dict[str, str] = {}
         for tool in tools:
@@ -1588,6 +1803,11 @@ class ReActPattern(AgentPattern):
                 self.repeated_tool_decision_after_consecutive_work_tool_calls
             ),
             "force_final_answer_next": self.force_final_answer_next,
+            "forced_answer_reason": self.forced_answer_reason,
+            "forced_answer_compaction_recoveries": (
+                self.forced_answer_compaction_recoveries
+            ),
+            "forced_answer_recovery_followup": self.forced_answer_recovery_followup,
             "repeated_tool_decision": self.repeated_tool_decision,
             "waiting_for_user_request": self.waiting_for_user_request,
             "pending_tool_interaction_responses": (
@@ -1637,6 +1857,41 @@ class ReActPattern(AgentPattern):
                 int(raw_work_threshold) if raw_work_threshold is not None else None
             )
         self.force_final_answer_next = bool(state.get("force_final_answer_next", False))
+        # The three keys below default in different directions on purpose.
+        # A reason this build cannot name must not be undone, and a follow-up
+        # marker it cannot read must not force a turn -- both fail closed by
+        # doing less. The recovery counter is the opposite: reading a missing
+        # counter as "already spent" would close the recovery path permanently
+        # for every run checkpointed before the counter existed, and that path
+        # is itself the safety net, so a missing counter reads as unspent.
+        raw_forced_answer_reason = state.get("forced_answer_reason")
+        self.forced_answer_reason = (
+            raw_forced_answer_reason
+            if isinstance(raw_forced_answer_reason, str)
+            and raw_forced_answer_reason in FORCED_ANSWER_REASONS
+            else None
+        )
+        if "forced_answer_compaction_recoveries" not in state:
+            self.forced_answer_compaction_recoveries = 0
+        else:
+            raw_recoveries = state["forced_answer_compaction_recoveries"]
+            self.forced_answer_compaction_recoveries = (
+                raw_recoveries
+                if isinstance(raw_recoveries, int)
+                and not isinstance(raw_recoveries, bool)
+                and raw_recoveries >= 0
+                else FORCED_ANSWER_RECOVERY_BUDGET
+            )
+        # ``isinstance`` first because this payload is JSON: a list reaching the
+        # membership test would raise. An unreadable marker reads as ``None``
+        # (an ordinary next turn) and never as "refetched", which would claim
+        # evidence came back.
+        raw_followup = state.get("forced_answer_recovery_followup")
+        self.forced_answer_recovery_followup = (
+            raw_followup
+            if isinstance(raw_followup, str) and raw_followup in FORCED_ANSWER_FOLLOWUPS
+            else None
+        )
         repeated_tool_decision = state.get("repeated_tool_decision")
         self.repeated_tool_decision = (
             dict(repeated_tool_decision)
@@ -2348,6 +2603,7 @@ class ReActPattern(AgentPattern):
             )
             self.status = "thinking"
             self.force_final_answer_next = True
+            self.forced_answer_reason = FORCED_ANSWER_REASON_CONTROL_TOOL_DISABLED
             return None
 
         if name == "final_answer":
@@ -2603,6 +2859,7 @@ class ReActPattern(AgentPattern):
         )
         self.status = "thinking"
         self.force_final_answer_next = True
+        self.forced_answer_reason = FORCED_ANSWER_REASON_EMPTY_FINAL_ANSWER
 
     def _tool_is_concurrency_safe(self, name: str, tools: list[Any]) -> bool:
         """Whether ``name`` may run concurrently with other safe tools.
@@ -3119,6 +3376,7 @@ class ReActPattern(AgentPattern):
             and not self.repeated_tool_decision
         ):
             self.force_final_answer_next = True
+            self.forced_answer_reason = FORCED_ANSWER_REASON_FINALIZE_AFTER_TOOL
         return None
 
     async def _request_repeated_tool_decision_if_needed(
@@ -3211,6 +3469,7 @@ class ReActPattern(AgentPattern):
 
         if decision["action"] == REACT_DECISION_FINAL_ANSWER:
             self.force_final_answer_next = True
+            self.forced_answer_reason = FORCED_ANSWER_REASON_REPEATED_TOOL_DECISION
             await runtime.checkpoint(
                 "repeated_tool_decision_final_requested",
                 context=context,
@@ -3500,6 +3759,10 @@ class ReActPattern(AgentPattern):
         self.waiting_for_user_request = None
         self.pending_tool_interaction_responses = []
         self.force_final_answer_next = False
+        # The run is over, so a follow-up marker left in the final checkpoint
+        # would hand any later resume a forced turn plus an honest instruction
+        # about evidence that no longer matters.
+        self.forced_answer_recovery_followup = None
         self.status = "completed"
         await runtime.checkpoint("final", context=context, pattern=self)
         result = PatternResult(

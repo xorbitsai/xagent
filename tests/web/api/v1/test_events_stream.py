@@ -3212,6 +3212,43 @@ async def test_staged_messages_byte_budget_overflow_closes_with_resync_required(
     assert "resync_required" in frame_text
 
 
+async def test_a_cold_status_frame_leaves_the_staging_drain_no_margin():
+    """The staging list and the outbound queue are capped by the *same*
+    constant, so a lifecycle frame that bypassed staging while the sink
+    was cold makes the warm-up drain one frame too big for the queue.
+
+    Pins that zero margin so the two caps cannot drift apart silently:
+    with the staging cap one lower, the drain would fit and this test's
+    overflow would not happen. What the overflow must not become is a
+    silent truncation -- the client is told to resync, which is the same
+    answer every other over-full queue gets.
+    """
+    sink = _make_sink(task_id=97, warm=False)
+    # A lifecycle frame goes straight into the outbound queue even
+    # though the sink is cold -- it never touches staging.
+    sink.enqueue_status("paused")
+    assert sink.queue.qsize() == 1
+
+    for i in range(es.OUTBOUND_QUEUE_MAX_SIZE):
+        await sink.send_text(
+            _trace_event_frame(
+                "tool_execution_start",
+                task_id=97,
+                data={"tool_call_id": f"call-{i}", "tool_name": "x", "tool_args": {}},
+            )
+        )
+    assert sink.staged_message_count == es.OUTBOUND_QUEUE_MAX_SIZE
+    assert sink.closing is False
+
+    sink.finish_warm_up(es.PublicStepProjector(retain_finished=False))
+
+    # 1 lifecycle frame + 256 drained frames > 256 slots.
+    assert sink.closing is True
+    frame_text, is_close = sink.queue.get_nowait()
+    assert is_close is True
+    assert "resync_required" in frame_text
+
+
 async def test_one_task_info_frame_cannot_overflow_the_staging_budget():
     """A ``task_info`` frame carries the task's ``description`` column
     under ``data["description"]``, and that column is unbounded
@@ -3541,6 +3578,107 @@ async def test_warm_up_replay_is_sorted_by_started_at_not_resolve_order():
     )
     polled_ids = [step["id"] for step in steps_resp.json()["steps"]]
     assert polled_ids == ids_in_order
+
+
+# ===== a step whose serialization raises ends the replay batch there,
+# instead of failing the whole attach =====
+
+
+async def test_warm_up_replay_keeps_the_prefix_before_an_unserializable_step():
+    """``_build_warm_up_frames`` serializes its admitted steps one at a
+    time and stops at the first one that raises, so a persisted step
+    whose ``data`` cannot be turned into JSON costs the client that step
+    and whatever came after it -- not the whole attach.
+
+    The shared budget (``_snapshot_steps_within_wire_budget``) admits
+    such a step on purpose: it cannot be measured, so it cannot be
+    budgeted, and each caller decides what to do when the emit reaches
+    it. The two attach-time fast paths report it and close; this path
+    has no per-step emit loop and no conclusion frame to carry a marker,
+    so it ends the batch quietly and goes live -- reason (6) in the
+    endpoint's best-effort delivery list.
+
+    Three things are asserted, because a fix that only delivers the
+    prefix and then closes anyway would satisfy the first alone: the
+    good step reaches the client, no ``stream.error`` follows it, and a
+    frame broadcast afterwards is delivered -- which is only true if the
+    sink actually finished warm-up and went live.
+    """
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    principal = _principal_for(full_key)
+    snapshot = v1_tasks._load_task_info_snapshot(task_id, principal)
+
+    class _Unserializable:
+        pass
+
+    good_row = v1_tasks._TraceEventSnapshot(
+        id=1,
+        task_id=task_id,
+        event_id="good",
+        event_type="ai_message",
+        timestamp=datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC),
+        step_id=None,
+        data={"content": "this step serializes fine"},
+    )
+    bad_row = v1_tasks._TraceEventSnapshot(
+        id=2,
+        task_id=task_id,
+        event_id="bad",
+        event_type="ai_message",
+        timestamp=datetime(2026, 1, 1, 12, 0, 1, tzinfo=UTC),
+        step_id=None,
+        data={"content": _Unserializable()},
+    )
+
+    def _poisoned_read_task_steps(task_id_, principal_):
+        return SimpleNamespace(events=[good_row, bad_row])
+
+    def _version_reader(task_id_, principal_):
+        return v1_tasks._TaskStepsVersionSnapshot(
+            task_id=task_id, agent_id=agent_id, max_event_id=2
+        )
+
+    resp = await es.build_event_stream_response(
+        task_id=task_id,
+        principal=principal,
+        initial_snapshot=snapshot,
+        read_task_snapshot=v1_tasks._load_task_info_snapshot,
+        read_task_steps=_poisoned_read_task_steps,
+        read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
+        read_task_steps_version=_version_reader,
+        **_long_intervals(),
+    )
+    try:
+        first = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
+        assert "event: task.status" in first
+
+        # The prefix really is delivered -- the step ordered before the
+        # unserializable one is not collateral damage.
+        second = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
+        assert second.startswith("event: step.completed\n")
+        assert "this step serializes fine" in second
+
+        # The stream is live, not closing: a frame broadcast now is
+        # projected and delivered, which only happens after
+        # ``finish_warm_up`` has run.
+        await es.manager.broadcast_to_task(
+            {
+                "type": "final_answer_delta",
+                "message_id": "after_warm_up",
+                "task_id": task_id,
+                "delta": "live",
+            },
+            task_id,
+        )
+        third = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
+        assert third.startswith("event: message.delta\n")
+        assert json.loads(third.split("data: ", 1)[1]) == {
+            "message_id": "after_warm_up",
+            "text": "live",
+        }
+    finally:
+        await resp.body_iterator.aclose()
 
 
 # ===== the replay's second bound: the same wire-byte budget the

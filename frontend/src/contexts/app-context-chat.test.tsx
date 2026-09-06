@@ -153,6 +153,7 @@ import { ChatStartScreen } from "@/components/chat/ChatStartScreen"
 import { MarkdownRenderer } from "@/components/ui/markdown-renderer"
 import { TASK_ERROR_EVENT, type TaskErrorEventDetail } from "@/lib/task-error-events"
 import type { Translate } from "@/contexts/i18n-context"
+import { ClarificationForm } from "@/components/chat/clarification-form"
 
 type TaskControlMessage = Parameters<typeof extractTaskControlEnvelope>[0]
 
@@ -6840,7 +6841,25 @@ function ClarificationSubmissionProbe() {
         onClick={() =>
           dispatch({
             type: "CLEAR_CLARIFICATION_SUBMISSION",
-            payload: { requestId: "req-1" },
+            payload: { requestId: "req-1", commandIds: ["cmd-1"] },
+          })
+        }
+      />
+      <button
+        data-testid="record-unsafe-outcome"
+        onClick={() =>
+          dispatch({
+            type: "RECORD_COMMAND_OUTCOME",
+            payload: { commandId: "cmd-x", outcome: { resendSafe: false } },
+          })
+        }
+      />
+      <button
+        data-testid="record-safe-outcome"
+        onClick={() =>
+          dispatch({
+            type: "RECORD_COMMAND_OUTCOME",
+            payload: { commandId: "cmd-x", outcome: { resendSafe: true } },
           })
         }
       />
@@ -7147,6 +7166,216 @@ describe("terminal command outcomes (#1500)", () => {
         JSON.parse(screen.getByTestId("command-outcomes").textContent || "{}")
       ).toEqual({ "other-task-command": { resendSafe: true } })
     })
+  })
+
+  it("gates the real form through the real reducer across a full round", async () => {
+    // Integration of the production pieces the unit suites mock away from
+    // each other (#2126 review round 3, F9): the real AppProvider reducer,
+    // the real ClarificationForm, one round identified by the ask frame's
+    // event_id. Sequence: waiting -> submit whose ack times out (the reply
+    // may still have been accepted; the round keeps its identity because no
+    // optimistic running flip happens) -> the command's terminal outcome
+    // arrives unproven-safe -> the form locks with the ambiguity notice.
+    // (The accepted-submit variant flips the task to running, which clears
+    // currentTask.waitingRequestId; the conversation panel bridges that via
+    // its ask-trace fallback, covered by the panel suite.)
+    sendChatMessageMock.mockRejectedValueOnce(Object.assign(
+      new Error("ack timed out"),
+      { disposition: "outcome_unknown", userFacing: true },
+    ))
+    function ClarificationRoundHarness() {
+      const { state } = useApp()
+      return (
+        <ClarificationForm
+          interactions={[{ type: "text_input" as const, field: "city", label: "City" }]}
+          requestId={state.currentTask?.waitingRequestId}
+          active={state.currentTask?.status === "waiting_for_user"}
+        />
+      )
+    }
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+        <ClarificationRoundHarness />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.({
+        type: "task_waiting_for_user",
+        timestamp: "2026-05-27T05:00:01Z",
+        task_id: 1,
+        run_id: "run-1",
+        state_version: 6,
+        task: { id: 1, status: "waiting_for_user" },
+        message: "Which city?",
+        event_id: "evt-int-1",
+      } as TestWebSocketMessage)
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("waiting-request-id").textContent).toBe("evt-int-1")
+    })
+
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "Beijing" } })
+    fireEvent.click(
+      screen.getByRole("button", { name: "chatPage.clarification.submit" }),
+    )
+    // The unconfirmed delivery keeps the advisory retry and records the
+    // submission through the real reducer.
+    await waitFor(() => {
+      expect(sendChatMessageMock).toHaveBeenCalledTimes(1)
+    })
+    await waitFor(() => {
+      expect(
+        screen.getByRole("button", { name: "chatPage.clarification.submit" }),
+      ).toBeEnabled()
+    })
+
+    act(() => {
+      onMessage?.({
+        type: "agent_error",
+        timestamp: "2026-05-27T05:00:03Z",
+        task_id: 1,
+        run_id: "run-1",
+        state_version: 6,
+        data: {
+          type: "agent_error",
+          message: "We could not confirm whether this message was applied to the task.",
+          command_id: sendChatMessageMock.mock.calls[0][3],
+          command_kind: "message",
+          outcome: "failed",
+          resend_safe: false,
+          task: { id: 1, status: "waiting_for_user" },
+        },
+      } as TestWebSocketMessage)
+    })
+
+    // The real reducer recorded the outcome for the id the real form
+    // minted, and the gate locks the round with the ambiguity notice.
+    const alert = await screen.findByRole("alert")
+    expect(alert).toHaveTextContent("chatPage.clarification.replyOutcomeUnknown")
+    expect(
+      screen.getByRole("button", { name: "chatPage.clarification.submit" }),
+    ).toBeDisabled()
+    expect(screen.getByRole("textbox")).toHaveValue("Beijing")
+  })
+
+  it("keeps an unsafe outcome unsafe when a later frame claims it safe", async () => {
+    // Monotone in the unsafe direction, mirroring UPDATE_TASK_STATUS's
+    // first-write-wins for terminal values (#2126 review round 3, F4).
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+        <ClarificationSubmissionProbe />
+      </AppProvider>
+    )
+
+    act(() => {
+      screen.getByTestId("record-unsafe-outcome").click()
+    })
+    act(() => {
+      screen.getByTestId("record-safe-outcome").click()
+    })
+
+    await waitFor(() => {
+      expect(
+        JSON.parse(screen.getByTestId("command-outcomes").textContent || "{}")
+      ).toEqual({ "cmd-x": { resendSafe: false } })
+    })
+  })
+
+  it("clears only the named commands, preserving a concurrent submission", async () => {
+    // The CLEAR names the commands the consuming render verified; a
+    // submission recorded between that snapshot and the dispatch survives
+    // (#2126 review round 3, F7).
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <ClarificationSubmissionProbe />
+      </AppProvider>
+    )
+
+    act(() => {
+      screen.getByTestId("record-submission").click()
+    })
+    act(() => {
+      screen.getByTestId("record-second-submission").click()
+    })
+    act(() => {
+      screen.getByTestId("clear-submission").click()
+    })
+
+    await waitFor(() => {
+      expect(
+        JSON.parse(
+          screen.getByTestId("clarification-submissions").textContent || "{}"
+        )
+      ).toEqual({
+        "req-1": [{ commandId: "cmd-2", accepted: false }],
+      })
+    })
+  })
+
+  it("records the outcome from a stale-versioned agent_error frame", async () => {
+    // The version guard neutralizes a stale frame's control tuple but must
+    // not swallow the outcome it carries - the backend sends it exactly
+    // once (#2126 review round 3, F3; guard exemption shipped in the
+    // round-identity PR).
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.({
+        type: "task_waiting_for_user",
+        timestamp: "2026-05-27T05:00:01Z",
+        task_id: 1,
+        run_id: "run-1",
+        state_version: 6,
+        task: { id: 1, status: "waiting_for_user" },
+        message: "Which region should I use?",
+      } as TestWebSocketMessage)
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("waiting_for_user")
+    })
+
+    act(() => {
+      onMessage?.({
+        type: "agent_error",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        run_id: "run-1",
+        state_version: 5,
+        data: {
+          type: "agent_error",
+          message: "This message was not applied to the task.",
+          command_id: "client-msg-stale",
+          command_kind: "message",
+          outcome: "failed",
+          resend_safe: true,
+          task: { id: 1, status: "failed" },
+        },
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      expect(
+        JSON.parse(screen.getByTestId("command-outcomes").textContent || "{}")
+      ).toEqual({ "client-msg-stale": { resendSafe: true } })
+    })
+    expect(screen.getByTestId("task-status").textContent).toBe("waiting_for_user")
   })
 
   it("records and consumes the round's accountable submission", async () => {

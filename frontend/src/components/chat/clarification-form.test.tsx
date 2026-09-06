@@ -1016,10 +1016,12 @@ describe("ClarificationForm terminal command outcomes", () => {
     expect(
       screen.getByText("chatPage.clarification.replyNotApplied"),
     ).toBeInTheDocument()
-    // The record is consumed so the resend is armed exactly once.
+    // The record is consumed so the resend is armed exactly once - and the
+    // CLEAR names exactly the verified command, so a concurrently recorded
+    // submission would survive it.
     expect(appContextMock.dispatch).toHaveBeenCalledWith({
       type: "CLEAR_CLARIFICATION_SUBMISSION",
-      payload: { requestId: ROUND },
+      payload: { requestId: ROUND, commandIds: [commandId] },
     })
   })
 
@@ -1265,6 +1267,40 @@ describe("ClarificationForm terminal command outcomes", () => {
         "chatPage.clarification.replyOutcomeUnknown",
       )
     })
+  })
+
+  it("keeps a visible send-failure alert when another round's submission is recorded", async () => {
+    // The untracked-round fallback must be identity-stable: a fresh [] per
+    // render would rerun the gating effect on ANY round's record and reach
+    // the tail that clears sendFailure. Trigger: this round's delivery
+    // fails visibly, then an older round's ack-timeout promise settles and
+    // records for THAT round (deliberately before the latestRequestIdRef
+    // guard).
+    appContextMock.sendMessage.mockRejectedValueOnce(Object.assign(
+      new Error("Durable storage is temporarily unavailable"),
+      { disposition: "not_sent", userFacing: true },
+    ))
+    const { rerender } = render(form(true, "inputreq_r2"))
+
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "Beijing" } })
+    fireEvent.click(
+      screen.getByRole("button", { name: "chatPage.clarification.submit" }),
+    )
+    await screen.findByRole("alert")
+
+    // An unrelated round's record lands in context state.
+    appContextMock.state = {
+      ...appContextMock.state,
+      clarificationSubmissions: {
+        inputreq_r1: [{ commandId: "older-round-cmd", accepted: false }],
+      },
+    }
+    rerender(form(true, "inputreq_r2"))
+
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Durable storage is temporarily unavailable",
+    )
+    expect(submitButton()).toBeEnabled()
   })
 
   it("records the submission when the delivery outcome is unknown", async () => {

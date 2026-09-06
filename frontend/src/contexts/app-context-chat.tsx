@@ -110,6 +110,12 @@ const MAX_TRACKED_TASK_STATE_VERSIONS = 500
 // retained only to reject late frames, so bound this lineage guard separately
 // from the unrelated task-state ordering cache.
 const MAX_RETIRED_SESSION_TASK_IDS = 500
+// Terminal command outcomes and per-round clarification submissions are
+// keyed by ids minted per submit/ask; both grow with session length and get
+// the same insertion-ordered eviction as the version map above (#2126
+// review round 3, finding F8). Task-switch pruning is tracked in #2143.
+const MAX_TRACKED_COMMAND_OUTCOMES = 500
+const MAX_TRACKED_CLARIFICATION_ROUNDS = 500
 const SESSION_RESET_ACK_TIMEOUT_MS = 30_000
 const SESSION_TASK_ADOPTION_TIMEOUT_MS = 30_000
 const MAX_SESSION_PRE_ADOPTION_FRAMES = 64
@@ -1268,7 +1274,7 @@ type AppAction =
   | { type: "UPDATE_TASK_STATUS"; payload: { status: Task["status"]; waitingQuestion?: string; waitingInteractions?: Interaction[]; waitingRequestId?: string; runId?: string | null; stateVersion?: number; controlState?: TaskControlState; updatedAt?: string } }
   | { type: "RECORD_COMMAND_OUTCOME"; payload: { commandId: string; outcome: TerminalCommandOutcome } }
   | { type: "RECORD_CLARIFICATION_SUBMISSION"; payload: { requestId: string; commandId: string; accepted: boolean } }
-  | { type: "CLEAR_CLARIFICATION_SUBMISSION"; payload: { requestId: string } }
+  | { type: "CLEAR_CLARIFICATION_SUBMISSION"; payload: { requestId: string; commandIds: string[] } }
   | { type: "TRIGGER_TASK_UPDATE" }
   | { type: "SET_DAG_EXECUTION"; payload: DAGExecution | null }
   | { type: "RESET_DAG_STATE" }
@@ -1359,37 +1365,79 @@ function projectAppState(state: AppState, action: AppAction): AppState {
       }
     case "SET_HISTORY_LOADING":
       return { ...state, isHistoryLoading: action.payload }
-    case "RECORD_COMMAND_OUTCOME":
-      return {
-        ...state,
-        commandOutcomes: {
-          ...state.commandOutcomes,
-          [action.payload.commandId]: action.payload.outcome,
-        },
+    case "RECORD_COMMAND_OUTCOME": {
+      const existing = state.commandOutcomes[action.payload.commandId]
+      // Monotone in the unsafe direction, mirroring UPDATE_TASK_STATUS's
+      // first-write-wins for terminal values: a duplicate or racing frame
+      // may downgrade a proven-safe reading, but can never upgrade an
+      // unsafe one - the flag gates a resend decision, and the unsafe
+      // reading is the one that must stick.
+      const resendSafe =
+        (existing === undefined || existing.resendSafe)
+        && action.payload.outcome.resendSafe
+      const commandOutcomes = {
+        ...state.commandOutcomes,
+        [action.payload.commandId]: { resendSafe },
       }
-    case "RECORD_CLARIFICATION_SUBMISSION":
+      // Bounded like the file's version map, but on a plain object, where
+      // canonical-integer keys iterate before insertion order - so eviction
+      // is oldest-out for the UUID-shaped ids this feature mints and merely
+      // approximate for an integer-looking backend id. Never evict the key
+      // just written: self-eviction would turn a fresh outcome into the
+      // exit-less pending lock.
+      const outcomeIds = Object.keys(commandOutcomes)
+      if (outcomeIds.length > MAX_TRACKED_COMMAND_OUTCOMES) {
+        const evictable = outcomeIds.find(
+          (key) => key !== action.payload.commandId,
+        )
+        if (evictable !== undefined) delete commandOutcomes[evictable]
+      }
+      return { ...state, commandOutcomes }
+    }
+    case "RECORD_CLARIFICATION_SUBMISSION": {
       // Append, never overwrite: the round stays accountable for every
       // outstanding reply, so an earlier command's late outcome can still
       // be matched and surfaced.
-      return {
-        ...state,
-        clarificationSubmissions: {
-          ...state.clarificationSubmissions,
-          [action.payload.requestId]: [
-            ...(state.clarificationSubmissions[action.payload.requestId] ?? []),
-            {
-              commandId: action.payload.commandId,
-              accepted: action.payload.accepted,
-            },
-          ],
-        },
+      const clarificationSubmissions = {
+        ...state.clarificationSubmissions,
+        [action.payload.requestId]: [
+          ...(state.clarificationSubmissions[action.payload.requestId] ?? []),
+          {
+            commandId: action.payload.commandId,
+            accepted: action.payload.accepted,
+          },
+        ],
       }
+      const roundIds = Object.keys(clarificationSubmissions)
+      if (roundIds.length > MAX_TRACKED_CLARIFICATION_ROUNDS) {
+        const evictable = roundIds.find(
+          (key) => key !== action.payload.requestId,
+        )
+        if (evictable !== undefined) delete clarificationSubmissions[evictable]
+      }
+      return { ...state, clarificationSubmissions }
+    }
     case "CLEAR_CLARIFICATION_SUBMISSION": {
-      if (!(action.payload.requestId in state.clarificationSubmissions)) {
+      const tracked = state.clarificationSubmissions[action.payload.requestId]
+      if (!tracked) {
+        return state
+      }
+      // Consume only the commands the effect actually verified: a fresh
+      // submission recorded between that render's snapshot and this
+      // dispatch must survive, or its outcome is orphaned.
+      const consumed = new Set(action.payload.commandIds)
+      const kept = tracked.filter(
+        (submission) => !consumed.has(submission.commandId),
+      )
+      if (kept.length === tracked.length) {
         return state
       }
       const remaining = { ...state.clarificationSubmissions }
-      delete remaining[action.payload.requestId]
+      if (kept.length === 0) {
+        delete remaining[action.payload.requestId]
+      } else {
+        remaining[action.payload.requestId] = kept
+      }
       return { ...state, clarificationSubmissions: remaining }
     }
 

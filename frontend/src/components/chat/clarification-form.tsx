@@ -119,6 +119,13 @@ const sendHintKey = (
     ? "chatPage.clarification.sendNotSent"
     : null
 
+// Stable empty fallback for rounds with no tracked submissions: minting a
+// fresh [] per render would change the gating effect's dependency identity
+// on ANY round's record/clear, and a rerun on an active untracked round
+// reaches the tail that clears a visible send-failure alert - the exact
+// regression class the boolean reduction below exists to prevent.
+const NO_SUBMISSIONS: ClarificationSubmission[] = []
+
 // Interaction types that are "live widgets" reflecting external state (e.g.
 // useMcpApps()'s connection state), not a question with an answer to submit
 // - see the comment on isConnectAppsOnly below for why that distinction
@@ -222,7 +229,9 @@ export function ClarificationForm({
   // resubmittable, so a resubmit appends rather than replaces, and every
   // tracked command's outcome still gets matched.
   const outstandingSubmissions = useMemo<ClarificationSubmission[]>(
-    () => (requestId ? clarificationSubmissions?.[requestId] : undefined) ?? [],
+    () =>
+      (requestId ? clarificationSubmissions?.[requestId] : undefined)
+      ?? NO_SUBMISSIONS,
     [requestId, clarificationSubmissions],
   )
   // Reduced to booleans before entering the effect's dependency list: an
@@ -302,10 +311,18 @@ export function ClarificationForm({
       }
       // Every tracked reply is proven not applied: consume the record so
       // the resend is armed once, then reactivate below with the draft
-      // intact.
+      // intact. The CLEAR names exactly the commands this render verified,
+      // so a submission recorded concurrently (another instance's resubmit
+      // landing between this render's snapshot and the dispatch) survives
+      // with its outcome still matchable.
       dispatch?.({
         type: "CLEAR_CLARIFICATION_SUBMISSION",
-        payload: { requestId },
+        payload: {
+          requestId,
+          commandIds: outstandingSubmissions.map(
+            (submission) => submission.commandId,
+          ),
+        },
       })
       setOutcomeNotice("notApplied")
     }
@@ -324,6 +341,7 @@ export function ClarificationForm({
     allProvenNotApplied,
     confirmedPending,
     anyOutcome,
+    outstandingSubmissions,
     requestId,
     dispatch,
   ])

@@ -783,8 +783,35 @@ async def test_heartbeat_requires_exact_run_id() -> None:
         await run_task_lease_heartbeat(lease, asyncio.Event())
 
 
+@pytest.fixture
+def heartbeat_batch_ready(monkeypatch):
+    """Start the shared runner only after both test leases are registered."""
+    manager_type = task_lease_service._TaskLeaseHeartbeatManager
+    register = manager_type.register
+    run = manager_type._run
+    ready = asyncio.Event()
+    registrations = 0
+
+    def register_and_signal(manager, lease):
+        nonlocal registrations
+        registration = register(manager, lease)
+        registrations += 1
+        if registrations == 2:
+            ready.set()
+        return registration
+
+    async def run_when_ready(manager):
+        await asyncio.wait_for(ready.wait(), timeout=GUARD_TIMEOUT)
+        await run(manager)
+
+    monkeypatch.setattr(manager_type, "register", register_and_signal)
+    monkeypatch.setattr(manager_type, "_run", run_when_ready)
+
+
 @pytest.mark.asyncio
-async def test_heartbeat_batches_registered_leases(monkeypatch) -> None:
+async def test_heartbeat_batches_registered_leases(
+    monkeypatch, heartbeat_batch_ready
+) -> None:
     refreshed = threading.Event()
     batches: list[tuple[TaskLease, ...]] = []
 
@@ -825,16 +852,18 @@ async def test_heartbeat_batches_registered_leases(monkeypatch) -> None:
             second_stop,
         )
     )
-    assert await asyncio.to_thread(refreshed.wait, 1)
+    try:
+        assert await asyncio.to_thread(refreshed.wait, GUARD_TIMEOUT)
+    finally:
+        first_stop.set()
+        second_stop.set()
+        await asyncio.gather(
+            stop_task_lease_heartbeat(first_task, first_stop),
+            stop_task_lease_heartbeat(second_task, second_stop),
+        )
+        await task_lease_service.wait_for_heartbeat_manager_idle()
 
-    await stop_task_lease_heartbeat(first_task, first_stop)
-    await stop_task_lease_heartbeat(second_task, second_stop)
-    await task_lease_service.wait_for_heartbeat_manager_idle()
-
-    # The 1 ms test interval may legitimately permit another refresh for the
-    # second lease between the two sequential stop calls.  The batching
-    # invariant is that the first interval refreshes both active leases with
-    # one worker checkout, not that no later interval can run.
+    # Both registered leases must share the first worker checkout.
     assert batches
     assert {(lease.task_id, lease.run_id) for lease in batches[0]} == {
         (1, "run-a"),
@@ -917,7 +946,7 @@ async def test_old_batch_result_does_not_contaminate_replacement_registration(
 
 @pytest.mark.asyncio
 async def test_stop_heartbeat_reports_shared_batch_pool_timeout(
-    monkeypatch, caplog
+    monkeypatch, caplog, heartbeat_batch_ready
 ) -> None:
     refresh_attempted = threading.Event()
     allow_timeout = threading.Event()
@@ -927,7 +956,7 @@ async def test_stop_heartbeat_reports_shared_batch_pool_timeout(
         _leases: tuple[TaskLease, ...],
     ) -> dict[tuple[int, str, str | None], TaskLeaseRefreshState]:
         refresh_attempted.set()
-        assert allow_timeout.wait(timeout=2)
+        assert allow_timeout.wait(timeout=GUARD_TIMEOUT)
         raise heartbeat_timeout
 
     monkeypatch.setattr(
@@ -979,8 +1008,9 @@ async def test_stop_heartbeat_reports_shared_batch_pool_timeout(
                     second_stop_event,
                 )
             )
-            await asyncio.wait_for(
-                asyncio.to_thread(refresh_attempted.wait, 1), timeout=1
+            assert await asyncio.wait_for(
+                asyncio.to_thread(refresh_attempted.wait, GUARD_TIMEOUT),
+                timeout=GUARD_TIMEOUT,
             )
 
             first_stopping = asyncio.create_task(
@@ -996,7 +1026,7 @@ async def test_stop_heartbeat_reports_shared_batch_pool_timeout(
             allow_timeout.set()
             first_outcome, second_outcome = await asyncio.wait_for(
                 asyncio.gather(first_stopping, second_stopping),
-                timeout=1,
+                timeout=GUARD_TIMEOUT,
             )
 
         heartbeat_warnings = [

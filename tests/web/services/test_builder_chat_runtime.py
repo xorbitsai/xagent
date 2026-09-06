@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import threading
-import time
 from types import SimpleNamespace
 from typing import Any
 
@@ -96,11 +95,14 @@ async def test_load_builder_chat_runtime_inputs_uses_worker_owned_session(
 async def test_load_builder_chat_runtime_inputs_keeps_event_loop_responsive(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    event_loop_thread = threading.get_ident()
     worker_started = threading.Event()
+    allow_worker = threading.Event()
 
     def blocking_load(**_kwargs: Any) -> BuilderChatRuntimeInputs:
         worker_started.set()
-        time.sleep(0.05)
+        assert threading.get_ident() != event_loop_thread
+        assert allow_worker.wait(timeout=30)
         return BuilderChatRuntimeInputs(
             authorized_file_ids=(),
             llm=object(),
@@ -121,15 +123,10 @@ async def test_load_builder_chat_runtime_inputs_keeps_event_loop_responsive(
             compact_model_name=None,
         )
     )
-    await asyncio.to_thread(worker_started.wait, 1)
-    ticker_ran = False
-
-    async def ticker() -> None:
-        nonlocal ticker_ran
+    try:
+        assert await asyncio.to_thread(worker_started.wait, 30)
         await asyncio.sleep(0)
-        ticker_ran = True
-
-    await ticker()
-    await load_task
-
-    assert ticker_ran is True
+        assert not load_task.done()
+    finally:
+        allow_worker.set()
+        await asyncio.wait_for(load_task, timeout=30)

@@ -470,27 +470,15 @@ def test_concurrent_actor_flows_for_distinct_apps_preserve_both_credentials(
             ("other", _start_actor_flow(db, user, app_id="drive", provider="other")),
         ]
 
-    monkeypatch.setattr(
-        auth_api.requests,
-        "post",
-        lambda *_args, **_kwargs: _Response(
-            {"access_token": "actor-token", "scope": "profile.read"}
-        ),
-    )
-    delete_accounts = auth_api.delete_scoped_user_oauth_accounts
-    delete_barrier = threading.Barrier(2)
+    exchange_barrier = threading.Barrier(2)
 
-    def synchronize_delete(*args, **kwargs):
-        deleted = delete_accounts(*args, **kwargs)
-        try:
-            delete_barrier.wait(timeout=1)
-        except threading.BrokenBarrierError:
-            pass
-        return deleted
+    def exchange_token(*_args, **_kwargs):
+        # Rendezvous before the callback locks the shared user row; waiting
+        # after credential deletion would deadlock the serialized writers.
+        exchange_barrier.wait(timeout=30)
+        return _Response({"access_token": "actor-token", "scope": "profile.read"})
 
-    monkeypatch.setattr(
-        auth_api, "delete_scoped_user_oauth_accounts", synchronize_delete
-    )
+    monkeypatch.setattr(auth_api.requests, "post", exchange_token)
 
     def callback(provider_name: str, request) -> int:
         with factory() as callback_db:
@@ -500,7 +488,7 @@ def test_concurrent_actor_flows_for_distinct_apps_preserve_both_credentials(
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         statuses = sorted(
-            future.result(timeout=10)
+            future.result(timeout=60)
             for future in [
                 executor.submit(callback, provider_name, request)
                 for provider_name, request in flows

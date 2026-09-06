@@ -284,13 +284,15 @@ async def test_runtime_key_auth_pool_wait_keeps_event_loop_responsive(
         poolclass=QueuePool,
         pool_size=1,
         max_overflow=0,
-        pool_timeout=1,
+        pool_timeout=30,
     )
+    event_loop_thread = threading.get_ident()
     worker_started = threading.Event()
     held_connection = engine.connect()
 
     def waiting_resolve(_credentials):  # type: ignore[no-untyped-def]
         worker_started.set()
+        assert threading.get_ident() != event_loop_thread
         with engine.connect() as connection:
             connection.execute(text("SELECT 1")).scalar_one()
         return deps.ApiKeyPrincipal(
@@ -310,26 +312,18 @@ async def test_runtime_key_auth_pool_wait_keeps_event_loop_responsive(
         waiting_resolve,
     )
     auth = asyncio.create_task(deps.get_principal_from_api_key(None))
-    await asyncio.to_thread(worker_started.wait, 2)
-
-    ticks = 0
-
-    async def ticker() -> None:
-        nonlocal ticks
-        for _ in range(5):
-            await asyncio.sleep(0.01)
-            ticks += 1
-
     try:
-        await ticker()
-        assert ticks == 5
-        assert auth.done() is False
+        assert await asyncio.to_thread(worker_started.wait, 30)
+        await asyncio.sleep(0)
+        assert not auth.done()
     finally:
         held_connection.close()
+        try:
+            principal = await asyncio.wait_for(auth, timeout=30)
+        finally:
+            engine.dispose()
 
-    principal = await auth
     assert principal.agent is not None
-    engine.dispose()
 
 
 @pytest.mark.asyncio

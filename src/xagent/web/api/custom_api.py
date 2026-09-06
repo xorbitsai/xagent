@@ -490,12 +490,16 @@ def update_custom_api(
         )
 
     # is_active lives on the personal association row; a caller with no
-    # personal row (the stand-in) has none to hold it, so a payload carrying
-    # it must be rejected outright -- writing it onto the stand-in would only
-    # set a shadowing instance attribute that persists nothing, and the
-    # response below would then read that shadow back and report a change that
-    # never happened.
-    if is_stand_in and api_data.is_active is not None:
+    # personal row (the stand-in) has none to hold it, so a request that
+    # carries the field at all must be rejected outright -- writing it onto
+    # the stand-in would only set a shadowing instance attribute that
+    # persists nothing, and the response below would then read that shadow
+    # back and report a change that never happened. This checks whether the
+    # field is present, the same test ``writes_definition_row`` below makes
+    # with ``model_fields_set``, not whether its value is ``None``: an
+    # explicit ``{"is_active": null}`` carries the field and must be refused
+    # the same as any other value would be.
+    if is_stand_in and "is_active" in api_data.model_fields_set:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="No personal connection exists to configure is_active for this API",
@@ -713,8 +717,10 @@ def update_custom_api(
         # (see the ``is_stand_in`` check earlier in this route) catches a
         # caller who already had no personal row when the gate ran; this one
         # catches a caller whose personal row existed then and was deleted
-        # while this request waited for the lock.
-        if current_user_api is None and api_data.is_active is not None:
+        # while this request waited for the lock. Same presence test as the
+        # guard above: the field being in the request is what matters, not
+        # its value.
+        if current_user_api is None and "is_active" in api_data.model_fields_set:
             db.rollback()
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,

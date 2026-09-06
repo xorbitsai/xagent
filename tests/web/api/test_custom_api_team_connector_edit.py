@@ -25,7 +25,11 @@ from xagent.web.api.custom_api import (
     get_custom_api,
     update_custom_api,
 )
-from xagent.web.api.mcp import _custom_api_to_mcp_response, _TeamOwnedUserApi
+from xagent.web.api.mcp import (
+    _custom_api_to_mcp_response,
+    _TeamOwnedUserApi,
+    _TeamOwnedUserMCP,
+)
 from xagent.web.models.custom_api import CustomApi, UserCustomApi
 from xagent.web.models.database import Base
 from xagent.web.models.user import User
@@ -385,6 +389,35 @@ class TestIsActiveRejectionForAStandIn:
         refreshed = db.query(CustomApi).filter(CustomApi.id == api_id).one()
         assert refreshed.name == "unchanged-name"
 
+    def test_explicit_null_is_active_from_a_stand_in_caller_is_also_400(self, db):
+        """The guard tests whether ``is_active`` is present in the request,
+        not whether its value is ``None`` -- the same distinction
+        ``writes_definition_row`` draws with ``model_fields_set`` elsewhere
+        in this route. ``CustomApiUpdate(is_active=None)`` carries the field
+        explicitly, so it must be refused exactly like
+        ``CustomApiUpdate(is_active=False)`` above, not treated as if the
+        field were simply absent from the payload.
+        """
+        owner = _make_user(db, 1)
+        editor = _make_user(db, 2)
+        api = _make_owned_api(db, owner.id, name="unchanged-name-null-payload")
+        api_id = api.id
+
+        payload = CustomApiUpdate(is_active=None)
+        assert "is_active" in payload.model_fields_set
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(
+                access=lambda db, user_id, refs: {
+                    ref: ConnectorAccess(team_owned=True, can_edit=True) for ref in refs
+                }
+            )
+            with pytest.raises(HTTPException) as exc:
+                _put(api_id, payload, editor, db)
+
+        assert exc.value.status_code == 400
+        assert "personal connection" in str(exc.value.detail)
+
 
 class TestStandInFlagsAgreeAcrossBothResponseSurfaces:
     def test_a_stand_in_caller_gets_the_same_two_flags_from_both_surfaces(self, db):
@@ -423,6 +456,44 @@ class TestStandInFlagsAgreeAcrossBothResponseSurfaces:
         ), "the caller under test must have no personal link row"
         assert detail.is_active == aggregate.is_active
         assert detail.is_default == aggregate.is_default
+
+
+class TestStandInObjectsRejectAttributeWrites:
+    """``_TeamOwnedUserMCP`` and ``_TeamOwnedUserApi`` stand in for a caller
+    with no personal association row. Neither backs a database row, so
+    nothing about them should ever be writable: a write that reached one of
+    them would only set a shadowing instance attribute that persists
+    nothing and that a later read on the same object would report back as
+    if it had. ``__slots__`` on both classes makes that a hard
+    ``AttributeError`` instead of a silent instance attribute, for every
+    name that is not ``user_id``.
+    """
+
+    def test_writing_is_active_or_can_edit_on_a_stand_in_mcp_raises(self):
+        stand_in = _TeamOwnedUserMCP(7)
+
+        with pytest.raises(AttributeError):
+            stand_in.is_active = False
+        with pytest.raises(AttributeError):
+            stand_in.can_edit = True
+
+        assert _TeamOwnedUserMCP.is_active is True
+        assert _TeamOwnedUserMCP.can_edit is False
+        assert stand_in.is_active is True
+        assert stand_in.can_edit is False
+
+    def test_writing_is_active_or_can_edit_on_a_stand_in_api_raises(self):
+        stand_in = _TeamOwnedUserApi(7)
+
+        with pytest.raises(AttributeError):
+            stand_in.is_active = False
+        with pytest.raises(AttributeError):
+            stand_in.can_edit = True
+
+        assert _TeamOwnedUserApi.is_active is True
+        assert _TeamOwnedUserApi.can_edit is False
+        assert stand_in.is_active is True
+        assert stand_in.can_edit is False
 
 
 class TestTypedErrorArm:

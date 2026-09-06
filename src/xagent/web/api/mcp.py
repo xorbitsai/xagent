@@ -2001,7 +2001,18 @@ def _global_config_tampered(server_data: MCPServerUpdate, server: MCPServer) -> 
 class _TeamOwnedUserMCP:
     """Stand-in for a missing UserMCPServer row: a team connector the user does
     not personally own. Exposes the attributes the response builders read with
-    not-owned defaults (usable, but not editable/deletable)."""
+    not-owned defaults (usable, but not editable/deletable).
+
+    ``__slots__`` declares only ``user_id`` as a real per-instance attribute.
+    Every other name below is a class attribute, not a slot, so assigning to
+    it on an instance -- ``stand_in.is_active = False``, say -- raises
+    ``AttributeError`` instead of silently creating a shadowing instance
+    attribute the caller's own row never backs. A caller admitted through
+    this stand-in has no association row to write, so nothing here should
+    ever be writable.
+    """
+
+    __slots__ = ("user_id",)
 
     is_owner = False
     can_edit = False
@@ -2016,7 +2027,15 @@ class _TeamOwnedUserMCP:
 
 
 class _TeamOwnedUserApi:
-    """Stand-in for a missing UserCustomApi row (team-owned, not user-owned)."""
+    """Stand-in for a missing UserCustomApi row (team-owned, not user-owned).
+
+    Same reasoning as ``_TeamOwnedUserMCP`` above: ``__slots__`` leaves
+    ``user_id`` as the only attribute an instance can hold, so a write to
+    ``can_edit``, ``is_active`` or ``is_default`` raises ``AttributeError``
+    rather than shadowing the class default with a value nothing persists.
+    """
+
+    __slots__ = ("user_id",)
 
     can_edit = False
     is_active = True

@@ -161,6 +161,54 @@ def _add_remote_server(db: Session, user: User) -> MCPServer:
     return server
 
 
+def test_hidden_remote_disconnect(db_session) -> None:
+    db, user = db_session.db, db_session.user
+    server = _add_remote_server(db, user)
+    app = db.query(PublicMCPApp).filter_by(app_id=REMOTE_APP_ID).one()
+    app.is_visible_in_connector = False
+    db.commit()
+
+    with pytest.raises(mcp_apps.RemoteOAuthServerDefinitionError, match="hidden"):
+        mcp_apps.classify_actor_remote_oauth_server(db, server)
+    classified = mcp_apps.classify_actor_remote_oauth_server(
+        db, server, use=mcp_apps.RemoteOAuthUse.DISCONNECT
+    )
+    assert classified["id"] == REMOTE_APP_ID
+    assert classified["is_visible_in_connector"] is False
+    assert app.is_visible_in_connector is False
+
+
+@pytest.mark.parametrize("drift", ["url", "auth", "managed", "ownership", "identity"])
+def test_hidden_disconnect_drift(db_session, drift) -> None:
+    db, user = db_session.db, db_session.user
+    server = _add_remote_server(db, user)
+    db.query(PublicMCPApp).filter_by(
+        app_id=REMOTE_APP_ID
+    ).one().is_visible_in_connector = False
+    if drift == "ownership":
+        db.query(UserMCPServer).filter_by(mcpserver_id=server.id).one().is_owner = True
+    elif drift == "identity":
+        db.add(
+            MCPServer(
+                name="Actor Remote",
+                managed="external",
+                transport="streamable_http",
+                url=server.url,
+                auth={"type": "mcp_oauth"},
+            )
+        )
+    elif drift == "auth":
+        server.auth = {"type": "mcp_oauth", "unexpected": "value"}
+    else:
+        setattr(server, drift, "changed")
+    db.commit()
+
+    with pytest.raises(mcp_apps.RemoteOAuthServerDefinitionError):
+        mcp_apps.classify_actor_remote_oauth_server(
+            db, server, use=mcp_apps.RemoteOAuthUse.DISCONNECT
+        )
+
+
 def _add_remote_grant(
     db: Session,
     user: User,

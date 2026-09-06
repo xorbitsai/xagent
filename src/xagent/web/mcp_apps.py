@@ -245,6 +245,11 @@ class RemoteOAuthDefinitionOwnership(Enum):
     TEAM = "team"
 
 
+class RemoteOAuthUse(Enum):
+    EXECUTION = "execution"
+    DISCONNECT = "disconnect"
+
+
 def _normalized_catalog_key(value: object) -> str | None:
     """Normalize only for collision detection, never for persisted identity."""
     if value is None:
@@ -809,8 +814,9 @@ def classify_actor_remote_oauth_server(
     definition_ownership: RemoteOAuthDefinitionOwnership = (
         RemoteOAuthDefinitionOwnership.UNKNOWN
     ),
+    use: RemoteOAuthUse = RemoteOAuthUse.EXECUTION,
 ) -> Dict[str, Any] | None:
-    """Validate catalog OAuth or preserve a proven custom definition."""
+    """Validate catalog OAuth; disconnect may include hidden canonical apps."""
 
     from .models.mcp import MCPServer, UserMCPServer
     from .services.mcp_runtime import HTTP_MCP_TRANSPORTS
@@ -842,7 +848,10 @@ def classify_actor_remote_oauth_server(
                     "remote OAuth catalog identity is unavailable"
                 )
         return None
-    if not app_info.get("is_visible_in_connector", True):
+    # Hiding an app blocks use, not cleanup of its existing credentials.
+    if use is not RemoteOAuthUse.DISCONNECT and not app_info.get(
+        "is_visible_in_connector", True
+    ):
         raise RemoteOAuthServerDefinitionError("remote OAuth app is hidden")
 
     app_id = str(app_info["id"])

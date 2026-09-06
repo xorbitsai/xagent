@@ -74,6 +74,8 @@ from .chat_history_service import (
 )
 from .client_error_messages import (
     CLIENT_SAFE_TASK_FAILURE,
+    ClientErrorCode,
+    client_error_message,
     connector_runtime_client_code,
     connector_runtime_client_message,
     required_mcp_unavailable_client_message,
@@ -89,6 +91,7 @@ from .external_task_cancel import (
 )
 from .file_turn import bind_turn_files_no_commit
 from .hot_path_cache import invalidate_task_cache
+from .llm_utils import AutoModelUnavailableError
 from .mcp_runtime import (
     MCPBuiltinOAuthActorPolicy,
     MCPBuiltinOAuthActorPolicyRequiredError,
@@ -1965,6 +1968,15 @@ def _schedule_bg(
                                 fallback=CLIENT_SAFE_TASK_FAILURE,
                             )
                         )
+                    elif isinstance(setup_or_run_err, AutoModelUnavailableError):
+                        broadcast_error_code = (
+                            ClientErrorCode.AUTO_MODEL_UNAVAILABLE.value
+                        )
+                        broadcast_error_message = client_error_message(
+                            ClientErrorCode.AUTO_MODEL_UNAVAILABLE
+                        )
+                        settlement_error = broadcast_error_message
+                        client_history_message_type = CLIENT_SAFE_FAILURE_MESSAGE_TYPE
                     elif isinstance(setup_or_run_err, ConnectorRuntimeError):
                         # This exception's message is a curated public-safe
                         # sentence -- it says a runtime input is missing, not

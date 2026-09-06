@@ -354,7 +354,7 @@ def create_terminal_task_error_event(
     failure this path exists to remove. A bad optional argument costs that
     argument and nothing else. The rejection is logged with its stack.
 
-    ``code`` must be a member of ``CONNECTOR_RUNTIME_CLIENT_ERROR_CODES``.
+    ``code`` must be a connector-runtime code or ``AUTO_MODEL_UNAVAILABLE``.
     """
 
     # Python annotations are not enforced at run time, so the mypy gate on the
@@ -370,7 +370,11 @@ def create_terminal_task_error_event(
     # and an unhashable value would raise inside the membership test on a
     # path whose whole point is that it never raises.
     if code is not None and (
-        not isinstance(code, str) or code not in CONNECTOR_RUNTIME_CLIENT_ERROR_CODES
+        not isinstance(code, str)
+        or (
+            code not in CONNECTOR_RUNTIME_CLIENT_ERROR_CODES
+            and code != ClientErrorCode.AUTO_MODEL_UNAVAILABLE.value
+        )
     ):
         logger.error(
             "task_id=%s component=terminal-error-frame dropped=code "

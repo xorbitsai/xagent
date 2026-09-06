@@ -209,6 +209,9 @@ class _AutoChildRuntime:
     async def end_final_answer_stream(self, message_id: str, content: str) -> None:
         await self.parent.end_final_answer_stream(message_id, content)
 
+    async def prepare_final_answer(self, content: str) -> str:
+        return await self.parent.prepare_final_answer(content)
+
     async def fail_final_answer_stream(self, message_id: str, error: str) -> None:
         await self.parent.fail_final_answer_stream(message_id, error)
 

@@ -20,6 +20,7 @@ from ..context_materializer import (
     ContextReferenceResolver,
     materialize_llm_kwargs,
 )
+from ..inline_file_delivery import InlineFileDelivery, InlineFileStreamGuard
 from ..model.chat.basic.base import BaseLLM
 from ..model.chat.error import retry_on
 from ..model.chat.exceptions import LLMToolProtocolError
@@ -222,6 +223,10 @@ class PatternRuntime:
     # relying on step_id or timestamp-adjacency heuristics.
     active_turn_id: str | None = None
     last_final_answer_stream_message_id: str | None = None
+    inline_file_delivery: InlineFileDelivery | None = None
+    _inline_stream_guards: dict[str, InlineFileStreamGuard] = field(
+        default_factory=dict, init=False, repr=False
+    )
     _active_llm_tasks: set[asyncio.Future[Any]] = field(
         default_factory=set,
         init=False,
@@ -343,13 +348,19 @@ class PatternRuntime:
             response = await self.run_streaming_llm_call(
                 llm, on_chunk=emit_text_delta, **kwargs
             )
+            content = self._response_content(response)
+            await stream.finish(content)
+            return response
         except Exception as exc:
-            await stream.fail(str(exc))
+            if self.last_final_answer_stream_message_id != stream.message_id:
+                await stream.fail(str(exc))
             raise
-        content = self._response_content(response)
-
-        await stream.finish(content)
-        return response
+        finally:
+            # Includes cancellation, which is not an Exception on Python 3.11+.
+            # Once end has started broadcasting, it cannot safely be retracted
+            # with a contradictory error frame after partial delivery.
+            if self.last_final_answer_stream_message_id != stream.message_id:
+                await stream.fail("Final answer stream abandoned")
 
     async def run_streaming_llm_call(
         self,
@@ -643,14 +654,20 @@ class PatternRuntime:
         if self.outbound_message_handler is None:
             return None
         message_id = f"final_answer_{uuid4().hex}"
+        if self.inline_file_delivery is not None:
+            self._inline_stream_guards[message_id] = InlineFileStreamGuard()
         self.last_final_answer_stream_message_id = None
-        await self._emit_outbound(
-            {
-                "type": "final_answer_start",
-                "message_id": message_id,
-                "task_id": self.execution_id,
-            }
-        )
+        try:
+            await self._emit_outbound(
+                {
+                    "type": "final_answer_start",
+                    "message_id": message_id,
+                    "task_id": self.execution_id,
+                }
+            )
+        except BaseException:
+            self._inline_stream_guards.pop(message_id, None)
+            raise
         logger.info(
             "final_answer stream opened. task_id=%s step=%s turn=%s message_id=%s",
             self.execution_id,
@@ -661,6 +678,9 @@ class PatternRuntime:
         return message_id
 
     async def emit_final_answer_delta(self, message_id: str, delta: str) -> None:
+        guard = self._inline_stream_guards.get(message_id)
+        if guard is not None:
+            delta = guard.feed(delta)
         if not delta:
             return
         await self._emit_outbound(
@@ -672,7 +692,16 @@ class PatternRuntime:
             }
         )
 
+    async def prepare_final_answer(self, content: str) -> str:
+        if self.inline_file_delivery is None or "base64" not in content.lower():
+            return content
+        return await asyncio.to_thread(self.inline_file_delivery.transform, content)
+
     async def end_final_answer_stream(self, message_id: str, content: str) -> None:
+        guard = self._inline_stream_guards.pop(message_id, None)
+        content = await self.prepare_final_answer(content)
+        if guard is not None:
+            await self.emit_final_answer_delta(message_id, guard.flush())
         self.last_final_answer_stream_message_id = message_id
         await self._emit_outbound(
             {
@@ -692,7 +721,12 @@ class PatternRuntime:
             len(content),
         )
 
+    def discard_inline_file_streams(self) -> None:
+        """Release per-run buffers even if a pattern abandoned a candidate."""
+        self._inline_stream_guards.clear()
+
     async def fail_final_answer_stream(self, message_id: str, error: str) -> None:
+        self._inline_stream_guards.pop(message_id, None)
         if self.last_final_answer_stream_message_id == message_id:
             self.last_final_answer_stream_message_id = None
         await self._emit_outbound(

@@ -75,14 +75,34 @@ def tool_result_succeeded(result: Any) -> bool:
     return not (isinstance(status, str) and status.lower() == "error")
 
 
-def extract_assistant_message(result: dict[str, Any]) -> str | None:
-    """Return the assistant-facing output from a normalized pattern result."""
+FINAL_ANSWER_KEYS = ("response", "answer", "output", "content", "message")
 
-    for key in ("response", "answer", "output", "content", "message"):
+
+def assistant_message_key(result: dict[str, Any]) -> str | None:
+    """Select one canonical answer without treating other strings as aliases."""
+
+    for key in FINAL_ANSWER_KEYS:
         value = result.get(key)
         if isinstance(value, str) and value:
-            return unwrap_final_answer_content(value)
+            return key
     return None
+
+
+def extract_assistant_message(result: dict[str, Any]) -> str | None:
+    """Return the assistant-facing output from a normalized pattern result."""
+    key = assistant_message_key(result)
+    return unwrap_final_answer_content(str(result[key])) if key is not None else None
+
+
+def set_assistant_message(result: dict[str, Any], content: str) -> None:
+    """Replace the canonical answer and exact aliases, preserving other fields."""
+    key = assistant_message_key(result)
+    if key is None:
+        return
+    original = result[key]
+    for candidate in FINAL_ANSWER_KEYS:
+        if result.get(candidate) == original:
+            result[candidate] = content
 
 
 def unwrap_final_answer_content(content: str) -> str:

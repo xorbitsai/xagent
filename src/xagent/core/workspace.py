@@ -391,6 +391,15 @@ class TaskWorkspace:
         )
         return registered[0]
 
+    def register_delivery_file(self, file_path: str) -> str:
+        """Register a host-delivered attachment only with durable task ownership."""
+        if in_sandbox_tool_runner():
+            raise ValueError("User delivery requires host-side registration")
+        with self._registration_lock:
+            return self._register_files_locked(
+                ((file_path, None),), db_session=None, require_persistence=True
+            )[0]
+
     def register_files(
         self,
         files: Sequence[tuple[str, Optional[str]]],
@@ -414,6 +423,7 @@ class TaskWorkspace:
         files: Sequence[tuple[str, Optional[str]]],
         *,
         db_session: Any,
+        require_persistence: bool = False,
     ) -> tuple[str, ...]:
         """Register files through detached read, storage, and metadata phases.
 
@@ -435,6 +445,8 @@ class TaskWorkspace:
             registrations,
             db_session=resolved_db_session,
         )
+        if require_persistence and any(not plan.should_persist for plan in plans):
+            raise ValueError("Attachment registration requires a persisted task owner")
 
         prepared: list[PreparedWorkspaceFileRegistration] = []
         try:

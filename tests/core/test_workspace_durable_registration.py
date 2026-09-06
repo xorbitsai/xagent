@@ -50,6 +50,167 @@ def _seed_workspace_task(db, *, task_id: int, username: str) -> User:
     return user
 
 
+def test_inline_delivery_rejects_registration_without_durable_task_owner(
+    monkeypatch, tmp_path, constrained_workspace_db
+):
+    from xagent.core.inline_file_delivery import InlineFileDelivery
+
+    engine, SessionLocal, db = constrained_workspace_db
+    monkeypatch.setattr(
+        "xagent.web.models.database.get_session_local", lambda: SessionLocal
+    )
+    monkeypatch.setattr("xagent.core.storage.manager.create_db_session", SessionLocal)
+    workspace = TaskWorkspace(id="web_task_9999", base_dir=str(tmp_path))
+    delivery = InlineFileDelivery(workspace)
+    result = delivery.transform("[report.csv](data:text/csv;base64,YSwK)")
+    assert result == "report.csv (attachment unavailable)"
+    assert db.query(UploadedFile).count() == 0
+    db.rollback()
+    assert engine.pool.checkedout() == 0
+    assert not list(workspace.output_dir.iterdir())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("file_kind", ["csv", "xlsx", "png"])
+@pytest.mark.parametrize("delivery_kind", ["link", "fence"])
+async def test_inline_delivery_uses_task_owned_durable_file_registration(
+    monkeypatch, tmp_path, constrained_workspace_db, file_kind, delivery_kind
+):
+    import base64
+    from io import BytesIO
+    from pathlib import Path
+
+    from fastapi import FastAPI
+    from httpx import ASGITransport, AsyncClient
+    from openpyxl import Workbook, load_workbook
+
+    from xagent.core.agent import PatternRuntime
+    from xagent.core.inline_file_delivery import InlineFileDelivery
+    from xagent.web.api.auth import create_access_token
+    from xagent.web.api.files import file_router
+    from xagent.web.models.database import get_db
+
+    engine, SessionLocal, db = constrained_workspace_db
+    user = _seed_workspace_task(db, task_id=9019, username="inline-delivery-owner")
+    user_id = int(user.id)
+    owner_headers = {
+        "Authorization": "Bearer "
+        + create_access_token(data={"sub": user.username, "user_id": user_id})
+    }
+    stranger = _seed_workspace_task(db, task_id=9020, username="inline-delivery-other")
+    other_headers = {
+        "Authorization": "Bearer "
+        + create_access_token(data={"sub": stranger.username, "user_id": stranger.id})
+    }
+    db.rollback()
+    monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
+    monkeypatch.setenv("XAGENT_UPLOADS_DIR", str(tmp_path / "uploads"))
+    monkeypatch.setenv("XAGENT_FILE_DELIVERY_REDIRECT_ENABLED", "false")
+    get_unscoped_file_storage.cache_clear()
+    monkeypatch.setattr(
+        "xagent.web.models.database.get_session_local", lambda: SessionLocal
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.uploaded_file_store.get_session_local",
+        lambda: SessionLocal,
+    )
+    monkeypatch.setattr("xagent.core.storage.manager.create_db_session", SessionLocal)
+    workspace = TaskWorkspace(
+        id="web_task_9019", base_dir=str(tmp_path / "uploads" / f"user_{user_id}")
+    )
+
+    rows = [
+        ["order_id", "reason_code", "remake_rate"],
+        ["A001", "CUST", 0.04],
+        ["A002", "POWER", 0.15],
+        ["A003", "CUST", 0.07],
+        ["A004", "COATING", 0.11],
+    ]
+    if file_kind == "xlsx":
+        workbook = Workbook()
+        sheet = workbook.active
+        for row in rows:
+            sheet.append(row)
+        output = BytesIO()
+        workbook.save(output)
+        workbook.close()
+        data = output.getvalue()
+        mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    elif file_kind == "png":
+        data = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8"
+            "/x8AAwMCAO+aXioAAAAASUVORK5CYII="
+        )
+        mime = "image/png"
+    else:
+        # The four-row replacement used for the original file-delivery smoke
+        # test, not the unavailable original TC5 business attachment.
+        data = "\r\n".join(",".join(map(str, row)) for row in rows).encode() + b"\r\n"
+        mime = "text/csv"
+    name = f"remake_analysis.{file_kind}"
+    encoded = base64.b64encode(data).decode()
+    if delivery_kind == "fence":
+        source = f"```base64 filename={name}\n{encoded}\n```"
+    else:
+        source = f"[{name}](data:{mime};base64,{encoded})"
+        if file_kind == "png":
+            source = "!" + source
+
+    def isolated_db():
+        with SessionLocal() as session:
+            yield session
+
+    app = FastAPI()
+    app.include_router(file_router)
+    app.dependency_overrides[get_db] = isolated_db
+    try:
+        runtime = PatternRuntime(inline_file_delivery=InlineFileDelivery(workspace))
+        answer = await runtime.prepare_final_answer(source)
+        assert "base64" not in answer
+        with SessionLocal() as verify_db:
+            record = verify_db.query(UploadedFile).one()
+            assert record.user_id == user_id
+            assert record.task_id == 9019
+            assert record.storage_status == "available"
+            prefix = "!" if file_kind == "png" and delivery_kind == "link" else ""
+            assert answer == f"{prefix}[{name}](file:{record.file_id})"
+            file_id = record.file_id
+            local_path = Path(record.storage_path)
+            assert local_path.read_bytes() == data
+        assert engine.pool.checkedout() == 0
+        # Exercise production HTTP routes and real Bearer authentication, not
+        # a mocked FileRef or a direct materialize() call. Repeat without the
+        # workspace copy to cover durable-storage recovery on both endpoints.
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://testserver"
+        ) as client:
+            for remove_local in (False, True):
+                for endpoint in ("preview", "download"):
+                    if remove_local:
+                        local_path.unlink(missing_ok=True)
+                    url = f"/api/files/{endpoint}/{file_id}"
+                    response = await client.get(url, headers=owner_headers)
+                    assert response.status_code == 200, response.text
+                    assert response.content == data
+                    assert response.headers["content-type"].split(";")[0] == mime
+                    assert response.headers["x-content-type-options"] == "nosniff"
+                    if endpoint == "preview":
+                        assert response.headers["content-disposition"] == "inline"
+                    else:
+                        assert name in response.headers["content-disposition"]
+                    if file_kind == "xlsx":
+                        downloaded = load_workbook(BytesIO(response.content))
+                        assert list(downloaded.active.values) == list(map(tuple, rows))
+                        downloaded.close()
+                    assert (await client.get(url)).status_code in (401, 403)
+                    assert (
+                        await client.get(url, headers=other_headers)
+                    ).status_code == 403
+            assert engine.pool.checkedout() == 0
+    finally:
+        get_unscoped_file_storage.cache_clear()
+
+
 def _assert_task_output_generation_key(
     storage_key: str,
     *,

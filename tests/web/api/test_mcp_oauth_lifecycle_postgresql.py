@@ -188,7 +188,7 @@ def test_disconnect_first_replacement_cannot_receive_stale_callback_grant(
     disconnect_errors: list[BaseException] = []
     producer_results: list[object] = []
 
-    def gated_team_delete(*args):
+    def gated_team_delete(*args, **kwargs):
         teardown_locked.set()
         assert allow_teardown.wait(timeout=5)
         return SimpleNamespace(
@@ -307,7 +307,7 @@ def test_producer_first_holds_lifecycle_locks_until_grant_commit(
     monkeypatch.setattr(
         connector_team_scope,
         "delete_team_connector",
-        lambda *args: SimpleNamespace(
+        lambda *args, **kwargs: SimpleNamespace(
             blocked_reason=None,
             team_owned=False,
             authorized=False,
@@ -385,7 +385,7 @@ def _allow_app_teardown(monkeypatch) -> None:
     monkeypatch.setattr(
         connector_team_scope,
         "delete_team_connector",
-        lambda *args: SimpleNamespace(
+        lambda *args, **kwargs: SimpleNamespace(
             blocked_reason=None,
             team_owned=False,
             authorized=False,
@@ -623,7 +623,7 @@ def test_real_callback_producer_blocks_disconnect_until_grant_commit(
     monkeypatch.setattr(
         connector_team_scope,
         "delete_team_connector",
-        lambda *args: SimpleNamespace(
+        lambda *args, **kwargs: SimpleNamespace(
             blocked_reason=None,
             team_owned=False,
             authorized=False,
@@ -711,7 +711,7 @@ def test_connect_rejects_delete_during_discovery(
             token_endpoint_auth_method="none",
         )
 
-    def gated_team_delete(*args):
+    def gated_team_delete(*args, **kwargs):
         delete_locked.set()
         assert allow_delete.wait(timeout=5)
         return SimpleNamespace(
@@ -919,7 +919,7 @@ def test_trusted_reconnect_and_disconnect_use_one_lock_order(
             token_endpoint_auth_method="none",
         )
 
-    def gated_team_delete(*args):
+    def gated_team_delete(*args, **kwargs):
         delete_locked.set()
         assert allow_delete.wait(timeout=10)
         return SimpleNamespace(

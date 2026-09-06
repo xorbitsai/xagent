@@ -102,6 +102,64 @@ def _clear_session_flushed(session: Session, transaction: Any) -> None:
         session.info[_MAY_HAVE_WRITTEN_KEY] = False
 
 
+# Hooks installed through ``services/connector_team_scope`` run on the
+# endpoint's own live session, mid-request, often with row locks already
+# held. A hook that ends that transaction releases those locks without the
+# endpoint finding out. Counting how many times the root transaction has
+# ended is what lets the seam notice: the count moving across a hook call
+# is the whole signal.
+#
+# Same ``transaction.parent is None`` test, and for the same reason, as
+# ``_clear_session_flushed`` directly above -- ``after_commit`` and
+# ``after_rollback`` fire for savepoint completion too, and a savepoint
+# completing is not the caller's transaction ending. Separate listener
+# rather than an addition to that one: clearing the write flag and
+# counting transaction ends are two jobs, and a session's write-flag
+# behavior must not change because something else started counting.
+_ROOT_TXN_END_COUNT_KEY = "xagent_root_txn_end_count"
+
+
+@event.listens_for(Session, "after_transaction_end")
+def _count_root_transaction_end(session: Session, transaction: Any) -> None:
+    if transaction.parent is None:
+        current = session.info.get(_ROOT_TXN_END_COUNT_KEY, 0)
+        # The first listener in this module that reads a value back before
+        # writing it, and ``session.info`` is reachable from an installed
+        # hook. Without this, a non-count value left there would raise from
+        # inside a transaction-end event -- including the one ``commit()``
+        # fires, after the write is already durable. ``bool`` is excluded
+        # because ``int(True)`` would otherwise pass as a count of 1;
+        # ``root_transaction_end_count`` rejects it with the same predicate.
+        if not isinstance(current, int) or isinstance(current, bool):
+            current = 0
+        session.info[_ROOT_TXN_END_COUNT_KEY] = current + 1
+
+
+def root_transaction_end_count(db: Any) -> int | None:
+    """How many root transactions have ended on ``db`` since it was created.
+
+    ``None`` means the object cannot report a count at all: a duck-typed
+    session has no ``info`` mapping, and ``web/tools/config.py`` documents
+    that standalone embedders and unit tests supply those. A caller reads
+    ``None`` as "cannot observe" and skips whatever comparison it was
+    about to make, the same way ``_restore_session_after_hook_failure``
+    skips a session with no ``rollback``.
+
+    A value that is present but is not a count is a different thing and
+    raises. The only way one gets there is something writing into
+    ``session.info`` under this key, and a caller that cannot read the
+    count it is about to compare has to refuse rather than quietly skip
+    the comparison -- skipping is indistinguishable from passing.
+    """
+    info = getattr(db, "info", None)
+    if info is None:
+        return None
+    value = info.get(_ROOT_TXN_END_COUNT_KEY, 0)
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError("connector hook session counter holds a non-count value")
+    return value
+
+
 def release_db_connection_if_clean(db: Session | None) -> bool:
     """Return ``db``'s pooled connection by ending its (read-only) transaction.
 

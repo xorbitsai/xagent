@@ -4325,7 +4325,16 @@ def update_mcp_server(
         from ..services.connector_team_scope import rename_team_connector
 
         rename_team_connector(
-            db, int(user_id), "mcp", int(server_id), old_name, str(server.name)
+            db,
+            int(user_id),
+            "mcp",
+            int(server_id),
+            old_name,
+            str(server.name),
+            # This transaction holds the definition row FOR UPDATE ... KEY
+            # SHARE and has not committed anything yet; a hook that ends it
+            # drops that lock with this route none the wiser.
+            caller_holds_lock=True,
         )
 
         db.commit()
@@ -4531,7 +4540,16 @@ async def teardown_mcp_app_server(
 
         from ..services.connector_team_scope import delete_team_connector
 
-        team_delete = delete_team_connector(db, user_id, "mcp", server_id)
+        team_delete = delete_team_connector(
+            db,
+            user_id,
+            "mcp",
+            server_id,
+            # Three row locks are held here -- public_mcp_apps, mcp_servers
+            # and user_mcpservers -- and nothing has been committed. A hook
+            # that ends this transaction releases all three at once.
+            caller_holds_lock=True,
+        )
         if team_delete.blocked_reason:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -4739,7 +4757,18 @@ async def delete_mcp_server(
 
         from ..services.connector_team_scope import delete_team_connector
 
-        team_delete = delete_team_connector(db, int(user_id), "mcp", int(server_id))
+        team_delete = delete_team_connector(
+            db,
+            int(user_id),
+            "mcp",
+            int(server_id),
+            # Two row locks are already held here: _lock_active_mcp_oauth_lifecycle
+            # above takes them on ``mcp_servers`` and ``user_mcpservers`` before
+            # this call, and the same delete work follows as on the two locking
+            # delete call sites. Declaring keeps the three of them answering the
+            # same way.
+            caller_holds_lock=True,
+        )
         if team_delete.blocked_reason:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,

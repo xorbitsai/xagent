@@ -87,6 +87,7 @@ from ..services.chat_history_service import (
     load_task_transcript_window,
     persist_assistant_message_no_commit,
 )
+from ..services.client_error_messages import ClientErrorCode, client_error_message
 from ..services.connector_runtime import (
     bind_connector_runtime_selection_snapshot,
     prepare_connector_runtime_selection_snapshot,
@@ -105,7 +106,7 @@ from ..services.hot_path_cache import (
     web_task_detail_key,
     web_task_status_key,
 )
-from ..services.llm_utils import resolve_llms_from_names
+from ..services.llm_utils import AutoModelUnavailableError, resolve_llms_from_names
 from ..services.managed_file_ref import ensure_uploaded_file_local_path
 from ..services.mcp_runtime import (
     MCPBuiltinOAuthActorPolicy,
@@ -2624,6 +2625,7 @@ class AgentServiceManager:
                             self._sync_execution_scope(task_id, scope)
                             return self._agents[task_id]
                     except (
+                        AutoModelUnavailableError,
                         HTTPException,
                         TaskOwnerMismatchError,
                         _AgentRuntimeSessionBoundaryError,
@@ -2792,6 +2794,7 @@ class AgentServiceManager:
                     task_vision_llm = None
                     task_compact_llm = None
             except (
+                AutoModelUnavailableError,
                 HTTPException,
                 TaskOwnerMismatchError,
                 _AgentRuntimeSessionBoundaryError,
@@ -4672,6 +4675,11 @@ async def create_task(
 
     except HTTPException:
         raise
+    except AutoModelUnavailableError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=client_error_message(ClientErrorCode.AUTO_MODEL_UNAVAILABLE),
+        ) from exc
     except ConnectorRuntimeError as exc:
         raise HTTPException(
             status_code=exc.status_code, detail=exc.safe_message

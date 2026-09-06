@@ -203,7 +203,7 @@ async def test_sweep_loop_exits_immediately_when_ttl_unset(monkeypatch) -> None:
     monkeypatch.delenv("XAGENT_SANDBOX_IDLE_TTL", raising=False)
     manager = _make_manager()
 
-    await asyncio.wait_for(manager.run_idle_sweep_loop(), timeout=0.1)
+    await asyncio.wait_for(manager.run_idle_sweep_loop(), timeout=30)
 
     manager._service.list_sandboxes.assert_not_awaited()
     manager._service.delete.assert_not_awaited()

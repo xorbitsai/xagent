@@ -1,17 +1,15 @@
 """Router LLM: a virtual model that delegates to xrouter-llm for selection.
 
 On every call it asks the xrouter-llm decision library (imported in-process, no
-external service) to pick ONE concrete model for the prompt, then dispatches the
-actual completion through a single OpenAI-compatible backend pointed at
-OpenRouter. Every provider (Claude, DeepSeek, Gemini, GLM, GPT, ...) is reached
-via OpenRouter, so xagent needs only ONE credential pair: `OPENAI_API_KEY` (an
-OpenRouter key) and `OPENAI_BASE_URL` (https://openrouter.ai/api/v1).
+external service) to pick ONE routing profile for the prompt, then dispatches
+the actual completion through the concrete saved model bound to that profile.
+The legacy OpenRouter ``auto`` model remains supported and resolves every
+profile through its own OpenRouter credential pair.
 
 xrouter-llm ships a trained router, the model-profile registry, and the named
 router configs as package data, so the decision runs entirely in-process. The
-registry returns ids that are already canonical OpenRouter slugs (e.g.
-`anthropic/claude-opus-4.8`, `openai/gpt-5.5`), so the chosen id is passed
-straight through as the downstream model name.
+registry returns canonical ids (e.g. `anthropic/claude-opus-4.8`,
+`openai/gpt-5.5`) which configured Auto maps to concrete model records.
 
 Every decision (prompt, candidate models with their predicted completion and
 cost, and the chosen slug) is logged to a SQLite call history via xrouter-llm's
@@ -33,7 +31,7 @@ import inspect
 import logging
 import os
 import threading
-from typing import Any, AsyncIterator, Callable, List, Optional
+from typing import Any, AsyncIterator, Callable, List, Optional, Sequence
 
 from .....config import get_xrouter_excluded_models
 from ....context_ref import CONTEXT_REFS_KEY, normalize_context_references
@@ -159,13 +157,23 @@ class RouterLLM(BaseLLM):
         timeout: float = 180.0,
         abilities: Optional[List[str]] = None,
         downstream_resolver: Optional[Callable[[str], BaseLLM]] = None,
+        candidate_models: Optional[Sequence[str]] = None,
+        fallback_model: Optional[str] = None,
+        use_environment_fallback: bool = True,
     ) -> None:
         # model_name doubles as the xrouter-llm router config name (e.g. "auto").
         self._config_name = model_name or "auto"
-        # Given a chosen OpenRouter slug, build the LLM that runs it. Injected by
-        # the model store so "auto" reuses the user-configured OpenRouter model
-        # (credentials + base_url) instead of any environment variable.
+        # Given a chosen routing profile, build the concrete LLM that runs it.
+        # Configured Auto injects bindings to saved models; legacy OpenRouter
+        # Auto injects a resolver that reuses its own credentials and base URL.
         self._downstream_resolver = downstream_resolver
+        self._candidate_models = (
+            tuple(dict.fromkeys(str(model) for model in candidate_models))
+            if candidate_models is not None
+            else None
+        )
+        if self._candidate_models == ():
+            raise ValueError("A configured Auto model needs at least one candidate")
         # The auto model's own OpenRouter credentials. Routing is in-process (not
         # an HTTP call), but these are used by the fallback resolver below when no
         # downstream OpenRouter model is injected (e.g. test-connection paths), so
@@ -193,7 +201,16 @@ class RouterLLM(BaseLLM):
         # the user actually configured, not this virtual router's
         # deliberately-narrowed advertised abilities.
         self._raw_abilities = configured_abilities
-        self._fallback_model = os.getenv("XAGENT_ROUTER_FALLBACK_MODEL") or None
+        self._fallback_model = fallback_model
+        self._use_environment_fallback = use_environment_fallback
+        if self._fallback_model is None and use_environment_fallback:
+            self._fallback_model = os.getenv("XAGENT_ROUTER_FALLBACK_MODEL") or None
+        if (
+            self._candidate_models is not None
+            and self._fallback_model is not None
+            and self._fallback_model not in self._candidate_models
+        ):
+            raise ValueError("The Auto fallback model must be one of its candidates")
 
     # ---- BaseLLM interface --------------------------------------------------
     @property
@@ -207,6 +224,12 @@ class RouterLLM(BaseLLM):
     @property
     def supports_thinking_mode(self) -> bool:
         return "thinking_mode" in self._abilities
+
+    @property
+    def uses_configured_candidates(self) -> bool:
+        """Whether this router is backed by an explicit Auto candidate set."""
+
+        return self._candidate_models is not None
 
     async def chat(
         self,
@@ -329,13 +352,15 @@ class RouterLLM(BaseLLM):
             preferred_input_modalities=required_input_modalities,
             advisory_input_modalities=advisory_input_modalities,
         )
-        context_window = getattr(self, "context_window", None)
+        # A saved target model describes the endpoint that will actually serve
+        # the request, so its explicit context window wins over catalog data.
+        context_window = getattr(downstream, "context_window", None)
+        if not context_window:
+            context_window = getattr(self, "context_window", None)
         if not context_window:
             context_window = await asyncio.to_thread(
                 self._profile_context_window, model_id
             )
-        if not context_window:
-            context_window = getattr(downstream, "context_window", None)
         input_modalities = (
             self._profile_input_modalities(model_id) if route_input_modalities else ()
         )
@@ -366,9 +391,8 @@ class RouterLLM(BaseLLM):
         if advisory_input_modalities:
             select_kwargs["advisory_input_modalities"] = advisory_input_modalities
         model_id = await self._select_model(prompt, **select_kwargs)
-        logger.info("xrouter selected %s -> openrouter", model_id)
+        logger.info("xrouter selected routing profile %s", model_id)
         if self._downstream_resolver is not None:
-            # Reuse the user-configured OpenRouter model (credentials + base_url).
             return model_id, self._downstream_resolver(model_id)
         # Fallback when no downstream resolver was injected: an OpenAI-compatible
         # client using this model's own OpenRouter credentials (or the ambient
@@ -428,6 +452,22 @@ class RouterLLM(BaseLLM):
             )
         )
 
+    def _compatible_fallback(
+        self, required_input_modalities: tuple[str, ...]
+    ) -> str | None:
+        if self._fallback_model is None:
+            return None
+        if not required_input_modalities:
+            return self._fallback_model
+        supported = set(self._profile_input_modalities(self._fallback_model))
+        missing = sorted(set(required_input_modalities) - supported)
+        if missing:
+            raise RouterModalityRoutingError(
+                f"Auto fallback model {self._fallback_model!r} does not support "
+                f"required input modalities: {', '.join(missing)}"
+            )
+        return self._fallback_model
+
     async def _select_model(
         self,
         prompt: str,
@@ -447,20 +487,26 @@ class RouterLLM(BaseLLM):
         except RouterModalityRoutingError:
             raise
         except Exception as exc:  # noqa: BLE001 - routing must not crash the agent
-            if self._fallback_model:
+            fallback_model = self._compatible_fallback(preferred_input_modalities)
+            if fallback_model:
                 logger.warning(
                     "xrouter route failed (%s); using fallback %s",
                     exc,
-                    self._fallback_model,
+                    fallback_model,
                 )
-                return self._fallback_model
+                return fallback_model
             raise RuntimeError(
                 f"xrouter-llm routing failed: {exc}. "
-                "Set XAGENT_ROUTER_FALLBACK_MODEL to degrade gracefully."
+                + (
+                    "Set XAGENT_ROUTER_FALLBACK_MODEL to degrade gracefully."
+                    if self._use_environment_fallback
+                    else "Configure an Auto fallback model to degrade gracefully."
+                )
             ) from exc
         if not selected:
-            if self._fallback_model:
-                return self._fallback_model
+            fallback_model = self._compatible_fallback(preferred_input_modalities)
+            if fallback_model:
+                return fallback_model
             raise RuntimeError("xrouter-llm returned no selected model")
         return str(selected[0])
 
@@ -516,13 +562,13 @@ class RouterLLM(BaseLLM):
             )
 
         excluded_models = frozenset(get_xrouter_excluded_models())
-        configs = getattr(service, "configs", None) or {}
-        config = configs.get(self._config_name)
-        configured_models = tuple(getattr(config, "models", ()) or ())
+        configured_models = tuple(self._candidate_pool(service))
         eligible_models = [
             model for model in configured_models if model not in excluded_models
         ]
-        if excluded_models and len(eligible_models) != len(configured_models):
+        if self._candidate_models is not None or (
+            excluded_models and len(eligible_models) != len(configured_models)
+        ):
             if not eligible_models:
                 raise RuntimeError(
                     f"{self._config_name!r} has no candidates after applying "
@@ -536,6 +582,13 @@ class RouterLLM(BaseLLM):
             route_kwargs["models"] = eligible_models
         result = service.route(prompt, **route_kwargs)
         return list(result.get("selected") or [])
+
+    def _candidate_pool(self, service: Any) -> list[str]:
+        """Return this Auto model's explicit or preset candidate pool."""
+        if self._candidate_models is not None:
+            return list(self._candidate_models)
+        config = getattr(service, "configs", {}).get(self._config_name)
+        return list(getattr(config, "models", ()) or ())
 
     @staticmethod
     def _preferred_input_modalities(
@@ -601,7 +654,8 @@ class _ResolvedRouterLLM(BaseLLM):
         self._downstream = downstream
         self._selected_model = selected_model
         self.context_window = context_window
-        abilities = list(router.abilities)
+        ability_source = downstream if router.uses_configured_candidates else router
+        abilities = list(getattr(ability_source, "abilities", router.abilities))
         for modality in input_modalities:
             ability = _MODALITY_ABILITIES.get(modality)
             if ability is not None and ability not in abilities:
@@ -614,7 +668,7 @@ class _ResolvedRouterLLM(BaseLLM):
 
     @property
     def timeout(self) -> float:
-        return self._router.timeout
+        return getattr(self._downstream, "timeout", self._router.timeout)
 
     @property
     def abilities(self) -> List[str]:
@@ -626,14 +680,13 @@ class _ResolvedRouterLLM(BaseLLM):
 
     @property
     def supports_thinking_mode(self) -> bool:
-        # Reads the virtual router's own abilities, which always exclude
-        # "thinking_mode" (see ``_UNROUTED_ROUTER_ABILITIES``), so this is
-        # always False even when ``self._downstream`` (the actually resolved
-        # model) does support thinking. No caller in this repository reads
-        # this property today, so the mismatch is latent; if a caller starts
-        # relying on it, read ``self._downstream.supports_thinking_mode``
-        # instead of changing what the router itself reports.
-        return self._router.supports_thinking_mode
+        if not self._router.uses_configured_candidates:
+            return self._router.supports_thinking_mode
+        return getattr(
+            self._downstream,
+            "supports_thinking_mode",
+            self._router.supports_thinking_mode,
+        )
 
     @property
     def supports_json_schema_response_format(self) -> bool:

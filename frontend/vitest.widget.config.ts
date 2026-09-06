@@ -30,6 +30,7 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         "src/lib/api-wrapper.ts",
         "src/lib/auth-cache.ts",
         "src/lib/files-disabled-presentation.ts",
+        "src/lib/remark-currency-safe-math.ts",
         "src/lib/widget-parent-message.ts",
         "src/contexts/presentation-capabilities.tsx",
         "src/app/settings/page.tsx",
@@ -75,6 +76,9 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
           statements: 85, branches: 80, functions: 90, lines: 85,
         },
         "src/lib/auth-cache.ts": { statements: 90, branches: 80, functions: 90, lines: 90 },
+        "src/lib/remark-currency-safe-math.ts": {
+          statements: 100, branches: 100, functions: 100, lines: 100,
+        },
         "src/contexts/presentation-capabilities.tsx": {
           statements: 100, branches: 100, functions: 100, lines: 100,
         },
@@ -166,6 +170,7 @@ export default defineConfig({
       "src/lib/api-wrapper.test.ts",
       "src/lib/auth-cache.test.ts",
       "src/lib/files-disabled-presentation.test.ts",
+      "src/lib/remark-currency-safe-math.test.ts",
     ],
   },
 })

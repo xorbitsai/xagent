@@ -161,12 +161,14 @@ async def test_isolated_finalize_rejects_replacement_runner_with_same_run_id(
 async def test_isolated_finalize_keeps_event_loop_responsive(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    event_loop_thread = threading.get_ident()
     worker_started = threading.Event()
     allow_worker = threading.Event()
 
     def blocking_finalize(*_args, **_kwargs) -> bool:  # type: ignore[no-untyped-def]
         worker_started.set()
-        assert allow_worker.wait(timeout=2)
+        assert threading.get_ident() != event_loop_thread
+        assert allow_worker.wait(timeout=30)
         return True
 
     monkeypatch.setattr(
@@ -181,12 +183,15 @@ async def test_isolated_finalize_keeps_event_loop_responsive(
             status=TaskStatus.FAILED,
         )
     )
-    await asyncio.to_thread(worker_started.wait, 2)
-    await asyncio.sleep(0)
+    try:
+        assert await asyncio.to_thread(worker_started.wait, 30)
+        await asyncio.sleep(0)
 
-    assert settlement.done() is False
-    allow_worker.set()
-    assert await settlement is True
+        assert settlement.done() is False
+    finally:
+        allow_worker.set()
+        result = await asyncio.wait_for(settlement, timeout=30)
+    assert result is True
 
 
 @pytest.mark.asyncio

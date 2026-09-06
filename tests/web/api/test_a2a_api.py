@@ -2148,23 +2148,27 @@ async def test_a2a_poll_pool_wait_does_not_block_event_loop(
             ticks += 1
             await asyncio.sleep(0.01)
 
-    fetch_task = asyncio.create_task(a2a_api._fetch_fresh_a2a_task_isolated(7, 101))
-    ticker_task = asyncio.create_task(ticker())
-    try:
-        await asyncio.sleep(0.08)
-        assert ticks >= 3, "A2A QueuePool checkout blocked the event loop"
-        assert not fetch_task.done()
-    finally:
-        held_connection.close()
+    with gated_pool_checkout(engine) as gate:
+        fetch_task = asyncio.create_task(a2a_api._fetch_fresh_a2a_task_isolated(7, 101))
+        ticker_task = asyncio.create_task(ticker())
+        try:
+            await gate.wait_until_contending()
+            observed = await wait_for_ticks(lambda: ticks)
+            assert observed >= LOOP_LIVENESS_TICKS
+            assert not fetch_task.done()
+        finally:
+            held_connection.close()
+            gate.let_through()
+            ticker_stop.set()
+            await asyncio.wait_for(
+                asyncio.gather(fetch_task, ticker_task, return_exceptions=True),
+                timeout=GUARD_TIMEOUT,
+            )
+            engine.dispose()
 
-    try:
-        snapshot = await asyncio.wait_for(fetch_task, timeout=1.0)
+        snapshot = fetch_task.result()
         assert snapshot is not None
         assert snapshot.id == 101
-    finally:
-        ticker_stop.set()
-        await ticker_task
-        engine.dispose()
 
 
 @pytest.mark.asyncio

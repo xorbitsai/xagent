@@ -325,6 +325,8 @@ def init_db(db_url: str | None = None) -> None:
     """Initialize database, create all tables and default users"""
     # Import all models to ensure they are registered with Base.metadata
     from . import (  # noqa: F401
+        AutoModelCandidate,
+        AutoModelConfig,
         BackgroundJob,
         GmailWatchState,
         KBIngestTarget,

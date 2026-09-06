@@ -97,7 +97,7 @@ import logging
 from collections.abc import Callable, Collection, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeVar
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeVar, cast
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
@@ -202,6 +202,22 @@ ConnectorAccessHook = Callable[
 # Called with the endpoint's live session; see the session contract in this
 # module's docstring for what a hook may and may not do to it.
 ConnectorVisibilityHook = Callable[[Any, int], dict[str, set[int]]]
+TEAM_OWNED_MCP_DEFINITIONS_KEY = "owned_mcp_definitions"
+
+
+@dataclass(frozen=True)
+class TeamConnectorSelection:
+    """Team-visible connector ids plus positive definition ownership."""
+
+    mcp_ids: frozenset[int]
+    custom_api_ids: frozenset[int]
+    owned_mcp_definition_ids: frozenset[int]
+
+    def connector_ids(self) -> dict[str, set[int]]:
+        return {
+            "mcp": set(self.mcp_ids),
+            "custom_api": set(self.custom_api_ids),
+        }
 
 
 class TeamConnectorVisibilityHook(Protocol):
@@ -229,6 +245,10 @@ class TeamConnectorVisibilityHook(Protocol):
     necessarily a member of that team even in deployments whose policy
     layer is otherwise membership-scoped. This is accepted platform
     behavior, not a defect this hook is meant to close.
+
+    The optional ``owned_mcp_definitions`` set marks MCP definitions the team
+    owns. It must be a subset of ``mcp``. Absence means no positive ownership
+    evidence; xagent never infers ownership from visibility alone.
 
     Every connector id a hook returns becomes executable by *any* runner of
     that team's agents, not only members: for stdio and other static-auth
@@ -338,10 +358,8 @@ def _validate_team_connector_answer(answer: Any) -> dict[str, set[int]]:
     ``set`` requirement is exact and deliberate: ``frozenset`` and other
     iterables are rejected too, matching the hook Protocol's declared
     ``set[int]`` rather than duck-typing around it.
-    Extra keys beyond the two required ones are accepted and silently
-    ignored: only ``"mcp"`` and ``"custom_api"`` are ever read by callers,
-    so this function does not iterate the answer's keys at all, only probe
-    the two it needs.
+    Extra keys beyond the two required ones are accepted here. The selection
+    validator separately checks the reserved ``owned_mcp_definitions`` key.
     """
     if not isinstance(answer, dict):
         raise ValueError(
@@ -373,6 +391,50 @@ def _validate_team_connector_answer(answer: Any) -> dict[str, set[int]]:
     return {"mcp": set(answer["mcp"]), "custom_api": set(answer["custom_api"])}
 
 
+def _validate_team_connector_selection(answer: Any) -> TeamConnectorSelection:
+    connector_ids = _validate_team_connector_answer(answer)
+    owned = answer.get(TEAM_OWNED_MCP_DEFINITIONS_KEY, set())
+    if not isinstance(owned, set):
+        raise ValueError(
+            "team visibility hook returned a malformed answer: key "
+            f"{TEAM_OWNED_MCP_DEFINITIONS_KEY!r} must be a set, got "
+            f"{type(owned).__name__}"
+        )
+    for member in owned:
+        if isinstance(member, bool) or not isinstance(member, int):
+            raise ValueError(
+                "team visibility hook returned a malformed answer: key "
+                f"{TEAM_OWNED_MCP_DEFINITIONS_KEY!r} contains a member "
+                f"{member!r} that is not a connector id (must be int, not bool)"
+            )
+    if not owned.issubset(connector_ids["mcp"]):
+        raise ValueError(
+            "team visibility hook returned definition ownership for a hidden MCP connector"
+        )
+    return TeamConnectorSelection(
+        mcp_ids=frozenset(connector_ids["mcp"]),
+        custom_api_ids=frozenset(connector_ids["custom_api"]),
+        owned_mcp_definition_ids=frozenset(owned),
+    )
+
+
+def team_connector_selection(db: Any, *, team_id: int | None) -> TeamConnectorSelection:
+    """Resolve team visibility and positive definition ownership once."""
+    if team_id is None or _team_connector_visibility_hook is None:
+        return TeamConnectorSelection(frozenset(), frozenset(), frozenset())
+    return cast(
+        TeamConnectorSelection,
+        _call_connector_hook_gate(
+            db,
+            _team_connector_visibility_hook,
+            db,
+            team_id=int(team_id),
+            slot="team_visibility",
+            validate=_validate_team_connector_selection,
+        ),
+    )
+
+
 def team_connector_ids(db: Any, *, team_id: int | None) -> dict[str, set[int]]:
     """Connector ids owned by ``team_id``; empty for no team and for standalone.
 
@@ -381,16 +443,7 @@ def team_connector_ids(db: Any, *, team_id: int | None) -> dict[str, set[int]]:
     hook. A non-``None`` answer is shape-validated (see
     ``_validate_team_connector_answer``) before it reaches any caller.
     """
-    if team_id is None or _team_connector_visibility_hook is None:
-        return {"mcp": set(), "custom_api": set()}
-    return _call_connector_hook_gate(
-        db,
-        _team_connector_visibility_hook,
-        db,
-        team_id=int(team_id),
-        slot="team_visibility",
-        validate=_validate_team_connector_answer,
-    )
+    return team_connector_selection(db, team_id=team_id).connector_ids()
 
 
 def team_connector_hook_installed() -> bool:
@@ -835,6 +888,28 @@ def _call_connector_hook_gate(
         raise
 
 
+def resolve_team_connector_selection_or_raise(
+    db: Any, *, team_id: int | None, log_subject: int | None
+) -> TeamConnectorSelection:
+    """Resolve team connector visibility and provenance with a typed failure."""
+    try:
+        return team_connector_selection(db, team_id=team_id)
+    except ConnectorRuntimeError:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "Failed to resolve team connector scope for user %s",
+            log_subject,
+            exc_info=True,
+        )
+        raise ConnectorRuntimeError(
+            ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
+            "Connector team scope is unavailable.",
+            details={"reason": "team_scope_resolution_failed"},
+            status_code=503,
+        ) from exc
+
+
 def resolve_team_connector_ids_or_raise(
     db: Any, *, team_id: int | None, log_subject: int | None
 ) -> dict[str, set[int]]:
@@ -870,22 +945,11 @@ def resolve_team_connector_ids_or_raise(
     rejects. Neither is something the generic-exception arm below could
     own, and both are restored before either arm sees the exception.
     """
-    try:
-        return team_connector_ids(db, team_id=team_id)
-    except ConnectorRuntimeError:
-        raise
-    except Exception as exc:
-        logger.warning(
-            "Failed to resolve team connector scope for user %s",
-            log_subject,
-            exc_info=True,
-        )
-        raise ConnectorRuntimeError(
-            ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
-            "Connector team scope is unavailable.",
-            details={"reason": "team_scope_resolution_failed"},
-            status_code=503,
-        ) from exc
+    return resolve_team_connector_selection_or_raise(
+        db,
+        team_id=team_id,
+        log_subject=log_subject,
+    ).connector_ids()
 
 
 def resolve_connector_access_or_raise(

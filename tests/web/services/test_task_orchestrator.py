@@ -35,6 +35,7 @@ from tests.web.pool_contention_shared import (
     EXHAUSTION_POOL_TIMEOUT,
     GUARD_TIMEOUT,
     LOOP_LIVENESS_TICKS,
+    assert_pool_checkout_off_loop,
     gated_pool_checkout,
     wait_for_ticks,
 )
@@ -1277,13 +1278,17 @@ async def test_begin_turn_schedules_even_when_caller_cancelled(db_session) -> No
     off-loop claim is in flight (which commits RUNNING in a worker thread),
     the owned claim+schedule task must settle before cancellation propagates,
     so a committed RUNNING task is never left with no scheduled worker."""
-    import time as _time
+    import threading
 
     user = _create_user(db_session)
     task = _create_task(db_session, user.id, status=TaskStatus.PENDING)
 
+    claim_started = threading.Event()
+    release_claim = threading.Event()
+
     def slow_claim(task_id, task_owner_user_id, *, payload, kind):
-        _time.sleep(0.15)  # window during which we cancel the caller
+        claim_started.set()
+        assert release_claim.wait(timeout=GUARD_TIMEOUT)
         return _ClaimedTurn(
             task_lease=TaskLease(
                 task_id=task_id,
@@ -1316,10 +1321,16 @@ async def test_begin_turn_schedules_even_when_caller_cancelled(db_session) -> No
                 kind=TurnKind.CREATE,
             )
         )
-        await asyncio.sleep(0.05)  # let it enter the off-loop claim
-        t.cancel()
+        try:
+            assert await asyncio.to_thread(claim_started.wait, GUARD_TIMEOUT)
+            t.cancel()
+        finally:
+            release_claim.set()
+            await asyncio.wait_for(
+                asyncio.gather(t, return_exceptions=True), timeout=GUARD_TIMEOUT
+            )
         with pytest.raises(asyncio.CancelledError):
-            await t
+            t.result()
 
     sched.assert_called_once()  # scheduled despite the cancellation
 
@@ -2151,14 +2162,6 @@ async def test_schedule_bg_pool_timeout_defers_settlement_to_lease_recovery(
         seed_db.commit()
 
     lease = TaskLease(task_id=task_id, runner_id="test-runner", run_id="run-a")
-    ticker_stop = asyncio.Event()
-    ticks = 0
-
-    async def ticker() -> None:
-        nonlocal ticks
-        while not ticker_stop.is_set():
-            ticks += 1
-            await asyncio.sleep(0.01)
 
     def load_snapshot_from_contended_pool(*_args, **_kwargs):
         with SessionLocal() as snapshot_db:
@@ -2170,9 +2173,9 @@ async def test_schedule_bg_pool_timeout_defers_settlement_to_lease_recovery(
         logging.ERROR,
         logger="xagent.web.services.task_orchestrator",
     )
-    ticker_task = asyncio.create_task(ticker())
     try:
         with (
+            assert_pool_checkout_off_loop(engine),
             patch(
                 "xagent.web.services.task_orchestrator.acquire_task_lease_isolated",
                 return_value=lease,
@@ -2215,13 +2218,7 @@ async def test_schedule_bg_pool_timeout_defers_settlement_to_lease_recovery(
         mock_execute.assert_not_awaited()
         mock_stop_heartbeat.assert_awaited_once()
         mock_settle.assert_not_called()
-        assert ticks >= 10, (
-            "setup QueuePool timeout blocked the asyncio event loop; "
-            f"ticker advanced only {ticks} times"
-        )
     finally:
-        ticker_stop.set()
-        await ticker_task
         held_connection.close()
 
     with SessionLocal() as verify_db:

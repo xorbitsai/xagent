@@ -154,6 +154,7 @@ from ..services.hot_path_cache import (
     task_cache_ttl_seconds,
     web_task_history_key,
 )
+from ..services.llm_utils import AutoModelUnavailableError
 from ..services.managed_file_ref import (
     DurableObjectIntegrityError,
     DurableStorageOperationError,
@@ -167,6 +168,7 @@ from ..services.task_command_terminal_events import (
     TerminalTaskEventDraft,
     TerminalTaskEventMessageCode,
     bind_terminal_event_draft,
+    first_party_message_terminal_text,
     is_external_cancel_command,
     terminal_event_draft_for_error,
 )
@@ -506,11 +508,24 @@ def client_safe_task_command_failure(
     picked by what the terminal exception proves -- non-application is
     asserted only when it is established, uncertainty otherwise -- and
     needs no task status, so the caller does not read the task for it.
+
+    A first-party MESSAGE drops the prefix for the same proof rule: its
+    sender is deciding whether to resend a durably accepted reply, so the
+    sentence comes from the bound terminal-event draft instead of the
+    exception text (#1500).
     """
     if is_external_cancel_command(kind=kind.value, scope=scope):
         return external_cancel_exhausted_message(task_status)
     if scope == EXTERNAL_COMMAND_SCOPE and kind == TaskCommandKind.MESSAGE:
         return external_input_terminal_message(error)
+    if kind == TaskCommandKind.MESSAGE:
+        # A first-party MESSAGE follows the external rule above rather than
+        # the generic fallback: restating the deferral's last wait condition
+        # under a "failed" prefix tells the sender nothing about whether the
+        # accepted reply was applied (#1500). The sentence is derived from
+        # the bound terminal-event draft, so it asserts non-application only
+        # when the persisted outcome proves it.
+        return first_party_message_terminal_text(terminal_event_draft_for_error(error))
     # kind.value in the text is safe only while every external-scope kind is
     # handled above; a new external-scope kind needs its own branch first.
     return f"Task command {kind.value} failed: {client_safe_error_message(error)}"
@@ -2962,11 +2977,12 @@ async def execute_task_background(
             raise
 
         error_message = str(e)
-        error_code = (
-            e.error_code
-            if isinstance(e, ClientVisibleError)
-            else ClientErrorCode.TASK_EXECUTION_FAILED
-        )
+        if isinstance(e, AutoModelUnavailableError):
+            error_code = ClientErrorCode.AUTO_MODEL_UNAVAILABLE
+        elif isinstance(e, ClientVisibleError):
+            error_code = e.error_code
+        else:
+            error_code = ClientErrorCode.TASK_EXECUTION_FAILED
         safe_error_message = client_error_message(error_code)
         terminal_payload = await run_db_io_cancellation_safe(
             lambda: _terminal_task_error_payload(
@@ -9811,6 +9827,27 @@ async def _broadcast_terminal_command_error(
             command.task_id,
         )
         return
+    # ``outcome``/``resend_safe``/``message_code`` expose the persisted
+    # terminal disposition structurally (#1500), so the sender can decide
+    # whether resending the command is safe without parsing ``message``.
+    # The field names match the durable terminal-event projection (#1904),
+    # including its two disambiguators: ``task_run_id`` (the acceptance
+    # snapshot's run) and ``outcome_version`` (the attempt count, which the
+    # terminal CAS write pins to this same value), because an operator retry
+    # can send one ``command_id`` through a terminal broadcast twice.
+    # Values come from the draft the dispatcher binds before broadcasting;
+    # a missing draft degrades to the unsafe/unknown reading. Only this
+    # identity-bearing frame carries them: the two external frames above
+    # deliberately expose nothing the anonymous audience cannot act on,
+    # and a retry decision needs the ``command_id`` they withhold.
+    #
+    # ``resend_safe`` is a proof of non-application, not a retryability
+    # rating: the only producer of ``True`` is the MESSAGE contention
+    # deferral. PAUSE/RESUME/CANCEL terminals therefore always carry
+    # ``False`` even though those commands are idempotent by design -- a
+    # consumer deciding whether to offer a retry for them must reason from
+    # ``command_kind``, never from this flag.
+    draft = terminal_event_draft_for_error(error)
     await manager.broadcast_to_task(
         {
             "type": "agent_error",
@@ -9822,9 +9859,16 @@ async def _broadcast_terminal_command_error(
                 error,
                 scope=scope,
             ),
+            "outcome": "failed",
+            "resend_safe": bool(draft and draft.resend_safe),
+            "message_code": (
+                draft.message_code.value if draft and draft.message_code else None
+            ),
             "command_kind": command.kind.value,
             "task_id": command.task_id,
             "command_id": command.command_id,
+            "task_run_id": command.target_run_id,
+            "outcome_version": int(command.attempt_count or 0),
             "timestamp": datetime.now(timezone.utc).timestamp(),
         },
         command.task_id,

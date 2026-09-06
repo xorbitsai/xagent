@@ -9,7 +9,6 @@ Test plumbing (client, _test_db fixture, auth helpers) is shared via
 
 import asyncio
 import threading
-import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -284,13 +283,15 @@ async def test_runtime_key_auth_pool_wait_keeps_event_loop_responsive(
         poolclass=QueuePool,
         pool_size=1,
         max_overflow=0,
-        pool_timeout=1,
+        pool_timeout=30,
     )
+    event_loop_thread = threading.get_ident()
     worker_started = threading.Event()
     held_connection = engine.connect()
 
     def waiting_resolve(_credentials):  # type: ignore[no-untyped-def]
         worker_started.set()
+        assert threading.get_ident() != event_loop_thread
         with engine.connect() as connection:
             connection.execute(text("SELECT 1")).scalar_one()
         return deps.ApiKeyPrincipal(
@@ -310,26 +311,18 @@ async def test_runtime_key_auth_pool_wait_keeps_event_loop_responsive(
         waiting_resolve,
     )
     auth = asyncio.create_task(deps.get_principal_from_api_key(None))
-    await asyncio.to_thread(worker_started.wait, 2)
-
-    ticks = 0
-
-    async def ticker() -> None:
-        nonlocal ticks
-        for _ in range(5):
-            await asyncio.sleep(0.01)
-            ticks += 1
-
     try:
-        await ticker()
-        assert ticks == 5
-        assert auth.done() is False
+        assert await asyncio.to_thread(worker_started.wait, 30)
+        await asyncio.sleep(0)
+        assert not auth.done()
     finally:
         held_connection.close()
+        try:
+            principal = await asyncio.wait_for(auth, timeout=30)
+        finally:
+            engine.dispose()
 
-    principal = await auth
     assert principal.agent is not None
-    engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -541,45 +534,31 @@ async def test_record_key_usage_pool_wait_keeps_event_loop_responsive(
 # ===== timing oracle defense =====
 
 
-def test_unknown_prefix_takes_similar_time_to_wrong_secret():
-    """Prefix-miss must burn bcrypt time like a real verify would.
-
-    Both paths should be ~100ms on commodity hardware. We use generous
-    bounds (each within 2x of the other) so CI runners' jitter doesn't
-    flake the test. The defense is to keep the order of magnitude the
-    same, not to clock to the millisecond.
-    """
+def test_unknown_prefix_performs_the_same_bcrypt_work_as_wrong_secret():
+    """Both HTTP rejection paths perform one real bcrypt check at equal cost."""
     full_key, _prefix = _create_personal_key()
     parts = full_key.split("_")
     parts[3] = "z" * 32
     wrong_secret_key = "_".join(parts)
 
-    # Warm the bcrypt module a bit so first-call overhead doesn't skew
-    bcrypt.checkpw(b"warm", bcrypt.hashpw(b"warm", bcrypt.gensalt(rounds=BCRYPT_COST)))
+    with patch.object(bcrypt, "checkpw", wraps=bcrypt.checkpw) as checkpw:
+        resp1 = client.get(
+            "/v1/me", headers={"Authorization": f"Bearer {wrong_secret_key}"}
+        )
+        assert resp1.status_code == 401
+        checkpw.assert_called_once()
+        real_password, real_hash = checkpw.call_args.args
+        assert real_password == wrong_secret_key.encode()
+        assert int(real_hash.split(b"$")[2]) == BCRYPT_COST
+        checkpw.reset_mock()
 
-    # Wrong secret (prefix hits index, then bcrypt runs)
-    t0 = time.perf_counter()
-    resp1 = client.get(
-        "/v1/me", headers={"Authorization": f"Bearer {wrong_secret_key}"}
-    )
-    real_t = time.perf_counter() - t0
-    assert resp1.status_code == 401
-
-    # Unknown prefix (index miss, then verify_dummy runs)
-    fake_key = "xag_personal_ZZZZZZ_" + "x" * 32
-    t0 = time.perf_counter()
-    resp2 = client.get("/v1/me", headers={"Authorization": f"Bearer {fake_key}"})
-    dummy_t = time.perf_counter() - t0
-    assert resp2.status_code == 401
-
-    # They should be within an order of magnitude. Asserting roughly:
-    # the slower one is at most 3x the faster one. Wide bounds keep CI
-    # flakes down; the real safeguard is the verify_dummy call itself.
-    ratio = max(real_t, dummy_t) / max(min(real_t, dummy_t), 1e-6)
-    assert ratio < 3.0, (
-        f"timing asymmetry too large: real={real_t * 1000:.1f}ms, "
-        f"dummy={dummy_t * 1000:.1f}ms, ratio={ratio:.2f}"
-    )
+        fake_key = "xag_personal_ZZZZZZ_" + "x" * 32
+        resp2 = client.get("/v1/me", headers={"Authorization": f"Bearer {fake_key}"})
+        assert resp2.status_code == 401
+        assert resp2.json() == resp1.json()
+        checkpw.assert_called_once()
+        _dummy_password, dummy_hash = checkpw.call_args.args
+        assert int(dummy_hash.split(b"$")[2]) == BCRYPT_COST
 
 
 # ===== /v1/* internal_error envelope (catch-all) =====

@@ -177,6 +177,24 @@ COUNTER_ANCHOR_ABSENT_LEGACY_CHECKPOINT_TYPE = "anchor.absent_legacy_checkpoint_
 # table this entry belongs to.
 COUNTER_ANCHOR_ABSENT_MISSING_RUN_PARTITION = "anchor.absent_missing_run_partition"
 
+# Incremented by DatabaseTraceHandler._root_checkpoint_read_partition
+# (web/api/trace_handlers.py) each time a lease-bound read widens to the
+# untagged partition because the task has no run-tagged checkpoint yet.
+# That condition also holds for a task with no checkpoint at all, so this
+# is not a clean count of genuine legacy (pre-partitioning) reads -- it
+# mixes them with ordinary tasks that simply have not checkpointed yet.
+# It is also monotonic (never reset) and process-local (see
+# counters_snapshot()'s own docstring), so it can only be read as a rate
+# over a deploy's lifetime, never inspected for "has it reached zero."
+# It deliberately covers a narrower set than the read path's own
+# ``_ResolvedReadPartition.widened`` flag: that flag is also set for the
+# legacy unleased branch's permanent untagged partition
+# (``trace_handlers.py``'s own docstring for it), which this counter does
+# not increment. The two are not meant to agree -- this counter answers
+# "how often does the lease-bound compatibility widening this PR added
+# engage", not "how often does any read widen".
+COUNTER_CHECKPOINT_READ_PARTITION_WIDENED = "checkpoint.read_partition_widened"
+
 # Two constants below are actively incremented, both from
 # task_interaction_service.py: COUNTER_COMPAT_READ_FALLBACK by the
 # compatibility view, COUNTER_LIFECYCLE_RESPONSE_CONFLICT by respond().

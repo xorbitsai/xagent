@@ -135,6 +135,20 @@ def _is_model_visible_to_user(
         return False
 
 
+def _create_default_llm_instance(
+    db: Session, db_model: Any, user_id: Optional[int]
+) -> Optional[BaseLLM]:
+    """Create a default chat model, hydrating configured Auto when needed."""
+    from ...core.model.providers import ROUTER_PROVIDER, is_auto_router_model
+    from .llm_utils import UserAwareModelStorage, _create_llm_instance
+
+    if db_model.model_provider == ROUTER_PROVIDER and is_auto_router_model(
+        db_model.model_provider, db_model.model_name
+    ):
+        return UserAwareModelStorage(db).get_llm_by_id(str(db_model.model_id), user_id)
+    return _create_llm_instance(db_model)
+
+
 def get_default_vision_model(
     user_id: Optional[int] = None,
     *,
@@ -153,7 +167,6 @@ def get_default_vision_model(
         # Try to get from database (requires web context)
         from ..models.model import Model as DBModel
         from ..models.user import UserDefaultModel, UserModel
-        from .llm_utils import _create_llm_instance
 
         # This won't work in non-web contexts, so we'll fallback to environment
         try:
@@ -175,7 +188,9 @@ def get_default_vision_model(
                         if _is_model_visible_to_user(
                             model_db, vision_default.model.id, user_id
                         ):
-                            return _create_llm_instance(vision_default.model)
+                            return _create_default_llm_instance(
+                                model_db, vision_default.model, user_id
+                            )
 
                 # Fallback to visible users' shared defaults
                 admin_vision_defaults = (
@@ -193,7 +208,9 @@ def get_default_vision_model(
                 )
 
                 if admin_vision_defaults:
-                    return _create_llm_instance(admin_vision_defaults[0].model)
+                    return _create_default_llm_instance(
+                        model_db, admin_vision_defaults[0].model, user_id
+                    )
 
         except Exception as e:
             logger.warning(f"Failed to get vision model from database: {e}")
@@ -220,7 +237,6 @@ def get_default_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
         from ..models.database import get_db
         from ..models.model import Model as DBModel
         from ..models.user import UserDefaultModel, UserModel
-        from .llm_utils import _create_llm_instance
 
         try:
             db = next(get_db())
@@ -240,7 +256,9 @@ def get_default_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
 
                 if general_default and general_default.model:
                     if _is_model_visible_to_user(db, general_default.model.id, user_id):
-                        return _create_llm_instance(general_default.model)
+                        return _create_default_llm_instance(
+                            db, general_default.model, user_id
+                        )
 
             # Fallback to visible users' shared defaults
             admin_defaults = (
@@ -256,7 +274,9 @@ def get_default_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
             )
 
             if admin_defaults:
-                return _create_llm_instance(admin_defaults[0].model)
+                return _create_default_llm_instance(
+                    db, admin_defaults[0].model, user_id
+                )
 
         except Exception as e:
             logger.warning(f"Failed to get default model from database: {e}")
@@ -283,7 +303,6 @@ def get_fast_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
         from ..models.database import get_db
         from ..models.model import Model as DBModel
         from ..models.user import UserDefaultModel, UserModel
-        from .llm_utils import _create_llm_instance
 
         try:
             db = next(get_db())
@@ -303,7 +322,9 @@ def get_fast_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
 
                 if fast_default and fast_default.model:
                     if _is_model_visible_to_user(db, fast_default.model.id, user_id):
-                        return _create_llm_instance(fast_default.model)
+                        return _create_default_llm_instance(
+                            db, fast_default.model, user_id
+                        )
 
             # Fallback to visible users' shared defaults
             admin_fast_defaults = (
@@ -319,7 +340,9 @@ def get_fast_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
             )
 
             if admin_fast_defaults:
-                return _create_llm_instance(admin_fast_defaults[0].model)
+                return _create_default_llm_instance(
+                    db, admin_fast_defaults[0].model, user_id
+                )
 
         except Exception as e:
             logger.warning(f"Failed to get fast model from database: {e}")
@@ -346,7 +369,6 @@ def get_compact_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
         from ..models.database import get_db
         from ..models.model import Model as DBModel
         from ..models.user import UserDefaultModel, UserModel
-        from .llm_utils import _create_llm_instance
 
         try:
             db = next(get_db())
@@ -366,7 +388,9 @@ def get_compact_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
 
                 if compact_default and compact_default.model:
                     if _is_model_visible_to_user(db, compact_default.model.id, user_id):
-                        return _create_llm_instance(compact_default.model)
+                        return _create_default_llm_instance(
+                            db, compact_default.model, user_id
+                        )
 
             # Fallback to visible users' shared defaults
             admin_compact_defaults = (
@@ -382,7 +406,9 @@ def get_compact_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
             )
 
             if admin_compact_defaults:
-                return _create_llm_instance(admin_compact_defaults[0].model)
+                return _create_default_llm_instance(
+                    db, admin_compact_defaults[0].model, user_id
+                )
 
         except Exception as e:
             logger.warning(f"Failed to get compact model from database: {e}")

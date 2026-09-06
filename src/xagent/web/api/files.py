@@ -19,6 +19,7 @@ from fastapi import (
 )
 from fastapi.responses import (
     FileResponse,
+    JSONResponse,
     RedirectResponse,
     Response,
 )
@@ -36,6 +37,8 @@ from ...config import (
     get_storage_root,
     get_uploads_dir,
 )
+from ...core.artifact_validation.defaults import default_registry
+from ...core.artifact_validation.service import validate_artifact
 from ...core.execution_scope import resolve_execution_scope
 from ...core.file_storage import get_user_file_storage, normalize_storage_key
 from ...core.tools.adapters.vibe.file_tool import read_file
@@ -233,7 +236,9 @@ async def _inline_preview_response(
     media_type: str,
     file_id: Optional[str] = None,
     extra_headers: Optional[Dict[str, str]] = None,
-) -> FileResponse:
+    validation_only: bool = False,
+    public_validation: bool = False,
+) -> Response:
     """Build the final inline preview FileResponse, rasterizing SVG to PNG.
 
     Raw SVG bytes are never served inline — an embedded ``<script>`` would
@@ -247,6 +252,16 @@ async def _inline_preview_response(
     preview endpoints, and the plain Bearer-authenticated in-app path relies
     on normal browser caching for repeatedly-rendered chat images.
     """
+
+    if validation_only:
+        report = await asyncio.to_thread(
+            validate_artifact, path, filename=filename, public=public_validation
+        )
+        return JSONResponse(
+            {**report.as_dict(), "supported": default_registry().supports(filename)},
+            media_type="application/vnd.xagent.validation+json",
+            headers={"Cache-Control": "no-store"},
+        )
 
     if media_type == "image/svg+xml":
         try:
@@ -1763,6 +1778,7 @@ async def preview_file(
     file_id: str,
     auth: _AuthenticatedFileRequest = Depends(_user_from_bearer_or_stream_ticket),
     db: Session = Depends(get_db),
+    validation_only: bool = False,
 ) -> Any:
     user, via_stream_ticket = auth
     cache_headers = _PUBLIC_PREVIEW_CACHE_HEADERS if via_stream_ticket else None
@@ -1797,7 +1813,7 @@ async def preview_file(
         # hop, signed-URL TTL thereafter), and an operator tuning either
         # XAGENT_*_TTL_SECONDS knob in isolation can unexpectedly cut
         # playback off at the other one.
-        if _preview_can_redirect(full_path, media_type):
+        if not validation_only and _preview_can_redirect(full_path, media_type):
             redirect_response = _durable_redirect_response(
                 file_ref,
                 filename=file_name,
@@ -1830,12 +1846,16 @@ async def preview_file(
             except DurableObjectMissingError:
                 materialized_path = file_ref.local_path
                 _ensure_under_uploads(materialized_path, owner_user_id)
+            if validation_only:
+                release_db_connection_if_clean(db)
             return await _inline_preview_response(
                 materialized_path,
                 filename=file_name,
                 media_type=media_type,
                 file_id=file_id if is_valid_uuid(file_id) else None,
                 extra_headers=cache_headers,
+                validation_only=validation_only,
+                public_validation=via_stream_ticket,
             )
     else:
         # For legacy files without records, check ownership
@@ -1849,7 +1869,7 @@ async def preview_file(
     if not full_path.exists():
         raise HTTPException(status_code=404, detail="File not found")
 
-    if _preview_can_redirect(full_path, media_type):
+    if not validation_only and _preview_can_redirect(full_path, media_type):
         # See the comment on the equivalent branch above: not gated on
         # ticket presence, for the same reason.
         accel_response = _accel_redirect_response(
@@ -1863,12 +1883,16 @@ async def preview_file(
         if accel_response is not None:
             return accel_response
 
+    if validation_only:
+        release_db_connection_if_clean(db)
     return await _inline_preview_response(
         full_path,
         filename=file_name,
         media_type=media_type,
         file_id=file_id if is_valid_uuid(file_id) else None,
         extra_headers=cache_headers,
+        validation_only=validation_only,
+        public_validation=via_stream_ticket,
     )
 
 
@@ -2050,6 +2074,7 @@ async def public_preview_file(
     relative_path: Optional[str] = Query(default=None),
     token: Optional[str] = Query(default=None),
     db: Session = Depends(get_db),
+    validation_only: bool = False,
 ) -> Any:
     # For public preview, we need to handle both file_id and legacy paths
     # Try UUID first
@@ -2081,12 +2106,17 @@ async def public_preview_file(
             except DurableObjectMissingError:
                 target_path = file_ref.local_path
                 _ensure_under_uploads(target_path, owner_user_id)
+            filename = str(file_record.filename)
+            if validation_only:
+                release_db_connection_if_clean(db)
             return await _inline_preview_response(
                 target_path,
-                filename=str(file_record.filename),
-                media_type=guess_media_type(str(file_record.filename)),
+                filename=filename,
+                media_type=guess_media_type(filename),
                 file_id=file_id if is_valid_uuid(file_id) else None,
                 extra_headers=_PUBLIC_PREVIEW_CACHE_HEADERS,
+                validation_only=validation_only,
+                public_validation=True,
             )
     else:
         # Try to resolve as legacy path across all user directories
@@ -2138,12 +2168,16 @@ async def public_preview_file(
     if not target_path.exists() or not target_path.is_file():
         raise HTTPException(status_code=404, detail="File not found")
 
+    if validation_only:
+        release_db_connection_if_clean(db)
     return await _inline_preview_response(
         target_path,
         filename=target_path.name,
         media_type=guess_media_type(target_path.name),
         file_id=file_id if is_valid_uuid(file_id) else None,
         extra_headers=_PUBLIC_PREVIEW_CACHE_HEADERS,
+        validation_only=validation_only,
+        public_validation=True,
     )
 
 

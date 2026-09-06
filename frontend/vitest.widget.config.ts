@@ -15,6 +15,7 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         "src/components/file/file-preview-content.tsx",
         "src/components/file/file-viewer.tsx",
         "src/components/file/inline-file-preview.tsx",
+        "src/components/file/artifact-validation.tsx",
         "src/components/file/pptx-preview-renderer.tsx",
         "src/components/task/task-conversation-panel.tsx",
         "src/components/ui/markdown-renderer.tsx",
@@ -120,6 +121,9 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         "src/components/file/inline-file-preview.tsx": {
           statements: 70, branches: 55, functions: 60, lines: 70,
         },
+        "src/components/file/artifact-validation.tsx": {
+          statements: 90, branches: 80, functions: 90, lines: 90,
+        },
         "src/components/file/pptx-preview-renderer.tsx": {
           statements: 45, branches: 35, functions: 30, lines: 45,
         },
@@ -152,6 +156,7 @@ export default defineConfig({
       "src/components/file/file-preview-content.test.tsx",
       "src/components/file/file-viewer.test.tsx",
       "src/components/file/inline-file-preview.test.tsx",
+      "src/components/file/artifact-validation.test.tsx",
       "src/components/file/pptx-preview-renderer.test.tsx",
       "src/components/layout/sidebar.test.tsx",
       "src/components/pages/login.test.tsx",

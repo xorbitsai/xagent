@@ -364,6 +364,7 @@ class WorkspaceFileOperations:
         file_ref = build_workspace_file_ref(
             workspace=self.workspace,
             file_path=resolved_path,
+            validate=True,
         )
 
         logger.debug(
@@ -381,6 +382,7 @@ class WorkspaceFileOperations:
         file_ref = build_workspace_file_ref(
             workspace=self.workspace,
             file_path=file_path,
+            validate=True,
         )
         return {
             "success": True,

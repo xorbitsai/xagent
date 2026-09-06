@@ -1497,6 +1497,14 @@ const zh = {
       page: "第 {page} 页，共 {pages} 页",
       next: "下一页",
     },
+    validation: {
+      checking: "正在检查文件格式…",
+      valid: "格式可读 · 内容尚未核验",
+      invalid: "文件校验失败 · 需要修复",
+      unchecked: "文件未校验",
+      error: "无法请求文件校验 · 请重试",
+      recheck: "重新检查",
+    },
     previewDialog: {
       buttons: {
         download: "下载",

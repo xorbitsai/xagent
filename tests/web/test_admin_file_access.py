@@ -125,6 +125,135 @@ def create_uploaded_file(
     return uploaded_file
 
 
+@pytest.mark.parametrize("route", ["preview", "public/preview"])
+def test_validation_uses_current_bytes_and_keeps_raw_download(
+    test_db, temp_uploads_dir, route
+):
+    _admin, owner, app, session = test_db
+    task = Task(user_id=owner.id, title="validation", description="validation")
+    session.add(task)
+    session.commit()
+    file = create_uploaded_file(
+        session, temp_uploads_dir, owner.id, task.id, "data.csv", "a,b\n1,2"
+    )
+    file_id = file.file_id
+    path = Path(str(file.storage_path))
+    client = TestClient(app)
+    headers = create_auth_headers(owner)
+    url = f"/api/files/{route}/{file_id}"
+    first = client.get(url, params={"validation_only": "true"}, headers=headers)
+    assert first.status_code == 200, first.text
+    assert first.headers["cache-control"] == "no-store"
+    assert first.headers["content-type"] == "application/vnd.xagent.validation+json"
+    assert first.json()["status"] == "valid"
+    assert first.json()["supported"] is True
+    path.write_text('a,b\n"broken')
+    second = client.get(url, params={"validation_only": "true"}, headers=headers)
+    assert second.json()["status"] == "unchecked"
+    assert second.json()["sha256"] != first.json()["sha256"]
+    raw = client.get(url, headers=headers)
+    assert raw.content == path.read_bytes()
+    assert (
+        client.get(f"/api/files/download/{file_id}", headers=headers).content
+        == path.read_bytes()
+    )
+
+
+def test_validation_preserves_private_and_widget_authority(
+    test_db, temp_uploads_dir, monkeypatch
+):
+    admin, other, app, session = test_db
+    task = Task(
+        user_id=admin.id,
+        title="widget",
+        description="validation",
+        agent_config={"auth_mode": "widget", "guest_id": "guest-1"},
+    )
+    session.add(task)
+    session.commit()
+    file = create_uploaded_file(
+        session, temp_uploads_dir, admin.id, task.id, "private.csv", "secret"
+    )
+    from unittest.mock import Mock
+
+    validator = Mock(side_effect=AssertionError("unauthorized parser call"))
+    monkeypatch.setattr(files_module, "validate_artifact", validator)
+    client = TestClient(app)
+    private = client.get(
+        f"/api/files/preview/{file.file_id}?validation_only=true",
+        headers=create_auth_headers(other),
+    )
+    assert private.status_code == 403
+    public = client.get(
+        f"/api/files/public/preview/{file.file_id}?validation_only=true"
+    )
+    assert public.status_code == 403
+    assert "token" in public.json()["detail"].lower()
+    validator.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "route,public", [("preview", False), ("public/preview", True), ("ticket", True)]
+)
+def test_validation_reports_format_support_and_public_capacity_class(
+    test_db, temp_uploads_dir, monkeypatch, route, public
+):
+    from unittest.mock import Mock
+
+    from xagent.core.artifact_validation.models import unchecked
+
+    _admin, owner, app, session = test_db
+    task = Task(user_id=owner.id, title="unsupported")
+    session.add(task)
+    session.commit()
+    file = create_uploaded_file(
+        session, temp_uploads_dir, owner.id, task.id, "notes.txt", "notes"
+    )
+    validator = Mock(
+        return_value=unchecked("No validator is installed for this format.")
+    )
+    monkeypatch.setattr(files_module, "validate_artifact", validator)
+    client = TestClient(app)
+    headers = create_auth_headers(owner)
+    url = f"/api/files/{route}/{file.file_id}?validation_only=true"
+    if route == "ticket":
+        ticket = client.get(
+            f"/api/files/stream-tickets/{file.file_id}", headers=headers
+        )
+        assert ticket.status_code == 200
+        url = ticket.json()["path"] + "&validation_only=true"
+        headers = {}
+    response = client.get(url, headers=headers)
+    assert response.status_code == 200
+    assert response.json()["supported"] is False
+    assert response.json()["status"] == "unchecked"
+    assert validator.call_args.kwargs["public"] is public
+
+
+def test_validation_does_not_redirect_away_from_checks(
+    test_db, temp_uploads_dir, monkeypatch
+):
+    _admin, owner, app, session = test_db
+    task = Task(user_id=owner.id, title="validation", description="validation")
+    session.add(task)
+    session.commit()
+    file = create_uploaded_file(
+        session, temp_uploads_dir, owner.id, task.id, "data.csv", "a,b"
+    )
+    from unittest.mock import Mock
+
+    redirect = Mock(side_effect=AssertionError("validation must not redirect"))
+    monkeypatch.setattr(files_module, "_accel_redirect_response", redirect)
+    monkeypatch.setattr(files_module, "_durable_redirect_response", redirect)
+    response = TestClient(app).get(
+        f"/api/files/preview/{file.file_id}?validation_only=true",
+        headers=create_auth_headers(owner),
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == "valid"
+    redirect.assert_not_called()
+
+
 class TestAdminFileAccess:
     def test_admin_access_other_user_file(self, test_db, temp_uploads_dir):
         admin_user, regular_user, test_app, session = test_db

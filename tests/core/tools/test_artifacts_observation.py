@@ -6,6 +6,99 @@ from xagent.core.tools.artifacts import (
 )
 
 
+def test_invalid_artifact_is_not_described_as_displayable_or_delivered():
+    observation = format_tool_result_for_observation(
+        "python_executor",
+        {
+            "success": True,
+            "artifacts": [
+                {
+                    "file_id": "repair-id",
+                    "filename": "data.xlsx",
+                    "validation": {"status": "invalid"},
+                }
+            ],
+            "file_refs": [
+                {
+                    "file_id": "repair-id",
+                    "filename": "data.xlsx",
+                    "mime_type": "application/octet-stream",
+                    "validation": {"status": "invalid"},
+                }
+            ],
+        },
+    )
+    assert "Validation: INVALID" in observation
+    assert "produced displayable" not in observation
+    assert "[data.xlsx](file:repair-id)" in observation
+    assert "'validation': {'status': 'invalid'}" in observation
+
+
+def test_missing_validation_report_differs_from_inconclusive_validation():
+    artifact = {"file_id": "image-id", "filename": "image.png"}
+    not_run = format_tool_result_for_observation(
+        "generate_image", {"success": True, "artifacts": [artifact]}
+    )
+    unchecked = format_tool_result_for_observation(
+        "generate_image",
+        {
+            "success": True,
+            "artifacts": [{**artifact, "validation": {"status": "unchecked"}}],
+        },
+    )
+    assert "Validation: NOT RUN" in not_run
+    assert "Validation: UNCHECKED" not in not_run
+    assert "Validation: UNCHECKED" in unchecked
+    assert "Validation: NOT RUN" not in unchecked
+
+
+def test_unchecked_artifact_explains_the_first_inconclusive_check():
+    for reason in (
+        "No format checker is registered.",
+        "Validation capacity is busy; retry later.",
+        "Optional parser dependency is unavailable.",
+    ):
+        observation = format_tool_result_for_observation(
+            "python_executor",
+            {
+                "artifacts": [
+                    {
+                        "file_id": "report-id",
+                        "filename": "report.pdf",
+                        "validation": {
+                            "status": "unchecked",
+                            "checks": [
+                                {"status": "valid", "message": "Preflight passed."},
+                                {"status": "unchecked", "message": reason},
+                            ],
+                        },
+                    }
+                ]
+            },
+        )
+        assert "Validation: UNCHECKED" in observation
+        assert f"Validation reason: {reason}" in observation
+        assert "Validation reason: Preflight passed." not in observation
+
+
+def test_unchecked_artifact_tolerates_legacy_or_malformed_checks():
+    for checks in (None, {}, [None, {"status": "unchecked", "message": None}]):
+        observation = format_tool_result_for_observation(
+            "python_executor",
+            {
+                "artifacts": [
+                    {
+                        "file_id": "report-id",
+                        "filename": "report.pdf",
+                        "validation": {"status": "unchecked", "checks": checks},
+                    }
+                ]
+            },
+        )
+        assert "Validation: UNCHECKED" in observation
+        assert "Validation reason:" not in observation
+
+
 def test_format_tool_result_for_observation_hides_image_path_when_artifact_exists():
     observation = format_tool_result_for_observation(
         "generate_image",

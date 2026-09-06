@@ -1811,6 +1811,29 @@ def get_frontend_dist_dir() -> Path:
     return get_web_dir() / "frontend_dist"
 
 
+ARTIFACT_VALIDATION_MAX_BYTES = "XAGENT_ARTIFACT_VALIDATION_MAX_BYTES"
+ARTIFACT_VALIDATION_TIMEOUT_SECONDS = "XAGENT_ARTIFACT_VALIDATION_TIMEOUT_SECONDS"
+
+
+def get_artifact_validation_max_bytes() -> int:
+    """Maximum snapshot bytes to format-check (larger files remain unchecked)."""
+    return _parse_size_bytes(
+        os.getenv(ARTIFACT_VALIDATION_MAX_BYTES) or "32M", ARTIFACT_VALIDATION_MAX_BYTES
+    )
+
+
+def get_artifact_validation_timeout_seconds() -> float:
+    """Hard timeout for each isolated artifact parser process."""
+    import math
+
+    value = float(os.getenv(ARTIFACT_VALIDATION_TIMEOUT_SECONDS) or "8")
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(
+            f"{ARTIFACT_VALIDATION_TIMEOUT_SECONDS} must be positive and finite"
+        )
+    return value
+
+
 def get_max_upload_size_bytes() -> int:
     """Get the maximum allowed upload size in bytes.
 
@@ -1833,9 +1856,14 @@ def get_max_upload_size_bytes() -> int:
     if not env_value:
         return 100 * 1024 * 1024
 
-    normalized = env_value.strip().upper()
-    if not normalized:
+    if not env_value.strip():
         return 100 * 1024 * 1024
+    return _parse_size_bytes(env_value, MAX_UPLOAD_SIZE)
+
+
+def _parse_size_bytes(env_value: str, setting: str) -> int:
+    """Shared positive byte-size parser for upload and validation budgets."""
+    normalized = env_value.strip().upper()
 
     suffix_multipliers = [
         ("GB", 1024 * 1024 * 1024),
@@ -1853,27 +1881,23 @@ def get_max_upload_size_bytes() -> int:
             number_part = normalized[: -len(suffix)].strip()
             if not number_part:
                 raise ValueError(
-                    f"Invalid {MAX_UPLOAD_SIZE} value: {env_value!r}. Missing numeric value."
+                    f"Invalid {setting} value: {env_value!r}. Missing numeric value."
                 )
             try:
                 result = int(float(number_part) * multiplier)
-            except ValueError as exc:
-                raise ValueError(
-                    f"Invalid {MAX_UPLOAD_SIZE} value: {env_value!r}."
-                ) from exc
+            except (ValueError, OverflowError) as exc:
+                raise ValueError(f"Invalid {setting} value: {env_value!r}.") from exc
             break
 
     if result is None:
         try:
             result = int(float(normalized))
-        except ValueError as exc:
-            raise ValueError(
-                f"Invalid {MAX_UPLOAD_SIZE} value: {env_value!r}."
-            ) from exc
+        except (ValueError, OverflowError) as exc:
+            raise ValueError(f"Invalid {setting} value: {env_value!r}.") from exc
 
     if result <= 0:
         raise ValueError(
-            f"Invalid {MAX_UPLOAD_SIZE} value: {env_value!r}. Value must be positive."
+            f"Invalid {setting} value: {env_value!r}. Value must be positive."
         )
 
     return result

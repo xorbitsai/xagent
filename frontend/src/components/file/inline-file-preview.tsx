@@ -4,6 +4,7 @@ import { FileText, Loader2, Video, Volume2 } from 'lucide-react'
 import { DocxPreviewRenderer } from '@/components/file/docx-preview-renderer'
 import { ExcelPreviewRenderer } from '@/components/file/excel-preview-renderer'
 import { PptxPreviewRenderer } from '@/components/file/pptx-preview-renderer'
+import { ArtifactValidation } from '@/components/file/artifact-validation'
 import { toast } from '@/components/ui/sonner'
 import { cn, getApiUrl } from '@/lib/utils'
 import { useFileAccess, type FileAccessPolicy } from '@/contexts/file-access-context'
@@ -865,7 +866,19 @@ function ExternalPreviewPlaceholder({
   )
 }
 
-export function InlineFilePreview({
+export function InlineFilePreview(props: InlineFilePreviewProps) {
+  const fileAccess = useFileAccess()
+  const fileId = props.source.fileId && resolveInlineFileId(props.source.fileId)
+  const kind = getInlineFilePreviewKind(props.source)
+  const content = <InlineFilePreviewContent {...props} />
+  // External URLs never enter the authenticated validation boundary. Audio and
+  // video keep progressive delivery; their decoders are not covered yet.
+  if (!fileId || !fileAccess.validationUrl || kind === 'audio' || kind === 'video' ||
+      !getPreviewUrlTrust({ ...props.source, fileId }, getApiUrl()).isTrusted) return content
+  return <ArtifactValidation key={fileId} fileId={fileId}>{content}</ArtifactValidation>
+}
+
+function InlineFilePreviewContent({
   source,
   className,
   imageClassName,

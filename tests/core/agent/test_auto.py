@@ -21,6 +21,7 @@ from xagent.core.agent import (
     ReActPattern,
 )
 from xagent.core.agent.context.enrichment import MEMORY_CONTEXT_METADATA_KEY
+from xagent.core.agent.grounding import VALUE_KINDS
 from xagent.core.agent.language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
     OUTPUT_LANGUAGE_SOURCE_METADATA_KEY,
@@ -1067,10 +1068,10 @@ async def test_auto_decision_prompt_includes_grounding_rule() -> None:
         "set existing_context_sufficient=false and choose react, so the agent "
         "can obtain it with tools" in decision_prompt
     )
-    assert (
-        "a number, a name, an identifier, a date, or a table row that no "
-        "source here supports" in decision_prompt
-    )
+    # The value kinds are not auto's own wording: the sibling sentence
+    # interpolates the shared constant, so this pins the reference rather
+    # than restating the list.
+    assert f"{VALUE_KINDS} that no source here supports" in decision_prompt
     assert "such unsupported specifics" not in decision_prompt
     assert "get_workspace_output_files" not in decision_prompt
     assert "You must classify whether" in decision_prompt

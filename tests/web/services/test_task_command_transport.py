@@ -1678,12 +1678,13 @@ async def test_dispatcher_worker_isolates_one_command_error(
         )
     )
     try:
-        await asyncio.wait_for(recovered.wait(), timeout=0.25)
+        await asyncio.wait_for(recovered.wait(), timeout=GUARD_TIMEOUT)
     finally:
         worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
 
     with pytest.raises(asyncio.CancelledError):
-        await worker
+        worker.result()
     assert calls >= 2
     assert "component=task-command-dispatcher" in caplog.text
     assert "single command failure" in caplog.text
@@ -1989,7 +1990,9 @@ async def test_claim_heartbeat_survives_transient_database_error(
         renew,
     )
 
-    await asyncio.wait_for(_claim_heartbeat(7, "runner-a", 3, stop_event), timeout=0.2)
+    await asyncio.wait_for(
+        _claim_heartbeat(7, "runner-a", 3, stop_event), timeout=GUARD_TIMEOUT
+    )
 
     assert attempts == 2
 
@@ -1998,6 +2001,20 @@ async def test_claim_heartbeat_survives_transient_database_error(
 async def test_dispatcher_does_not_erase_wakeup_during_empty_claim(monkeypatch) -> None:
     second_claim = asyncio.Event()
     calls = 0
+    notification_delivered = asyncio.Event()
+    wakeup_at_empty_claim = []
+
+    class ObservedWakeup(asyncio.Event):
+        def set(self):
+            super().set()
+            notification_delivered.set()
+
+        async def wait(self):
+            if calls == 1:
+                wakeup_at_empty_claim.append(self.is_set())
+            return await super().wait()
+
+    wakeup = ObservedWakeup()
 
     async def fake_dispatch(_executor, *, command_db_id=None) -> bool:
         nonlocal calls
@@ -2005,6 +2022,8 @@ async def test_dispatcher_does_not_erase_wakeup_during_empty_claim(monkeypatch) 
         calls += 1
         if calls == 1:
             notify_task_command_dispatcher()
+            # Deliver the notification while the first claim is still in flight.
+            await notification_delivered.wait()
             return False
         second_claim.set()
         return False
@@ -2014,13 +2033,27 @@ async def test_dispatcher_does_not_erase_wakeup_during_empty_claim(monkeypatch) 
         fake_dispatch,
     )
 
-    start_task_command_dispatcher(lambda _command: asyncio.sleep(0))
+    monkeypatch.setattr(task_command_transport_module, "_dispatcher_wakeup", wakeup)
+    monkeypatch.setattr(
+        task_command_transport_module, "_dispatcher_loop", asyncio.get_running_loop()
+    )
+    # One worker must observe the notification; a sibling or the periodic poll
+    # must not make a lost wakeup look like success.
+    worker = asyncio.create_task(
+        task_command_transport_module._run_task_command_dispatcher_worker(
+            lambda _command: asyncio.sleep(0)
+        )
+    )
     try:
-        await asyncio.wait_for(second_claim.wait(), timeout=0.25)
+        await asyncio.wait_for(second_claim.wait(), timeout=GUARD_TIMEOUT)
     finally:
-        await stop_task_command_dispatcher()
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
 
+    with pytest.raises(asyncio.CancelledError):
+        worker.result()
     assert calls >= 2
+    assert wakeup_at_empty_claim == [True]
 
 
 @pytest.mark.asyncio

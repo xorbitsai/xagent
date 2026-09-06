@@ -745,12 +745,17 @@ class TestXinferenceLLM:
         discovery_task = asyncio.create_task(
             XinferenceLLM.list_available_models("http://localhost:9997")
         )
-        await asyncio.wait_for(discovery_started.wait(), timeout=0.1)
-        heartbeat = asyncio.create_task(asyncio.sleep(0))
-        await asyncio.wait_for(heartbeat, timeout=0.1)
-        release_discovery.set()
+        try:
+            # These guards bound a hang, not model-discovery latency.
+            await asyncio.wait_for(discovery_started.wait(), timeout=30)
+            heartbeat = asyncio.create_task(asyncio.sleep(0))
+            await asyncio.wait_for(heartbeat, timeout=30)
+            assert not discovery_task.done()
+        finally:
+            release_discovery.set()
+            models = await asyncio.wait_for(discovery_task, timeout=30)
 
-        assert await discovery_task == []
+        assert models == []
         mock_client.close.assert_awaited_once()
 
     @pytest.mark.asyncio

@@ -31,6 +31,7 @@ from xagent.web.models.database import Base
 from xagent.web.models.user import User
 from xagent.web.services.connector_team_scope import (
     ConnectorAccess,
+    ConnectorHookSessionBoundaryError,
     set_connector_team_hooks,
     snapshot_connector_team_hooks,
 )
@@ -705,3 +706,161 @@ class TestTheRecheckCostsExactlyOneExtraHookCall:
             _put(api_id, CustomApiUpdate(description="owner-edit"), owner, db)
 
         assert len(hook.calls) == 0
+
+
+class TestPostLockRecheckDeclaresTheLock:
+    def test_a_hook_that_commits_on_the_post_lock_call_is_refused_as_a_boundary_violation(
+        self, db
+    ):
+        """The post-lock re-check declares ``caller_holds_lock=True`` on the
+        call it makes through ``_recheck_team_access_under_definition_lock``: a hook
+        that ends this request's own transaction while it holds the
+        definition row's lock must be refused as the seam's own boundary
+        violation, not answered as if the lock were still intact.
+        """
+        owner = _make_user(db, 1)
+        member = _make_user(db, 2)
+        api = _make_owned_api(db, owner.id, name="boundary-probe")
+        api_id = api.id
+        original_description = (
+            str(api.description) if api.description is not None else None
+        )
+
+        calls: list[object] = []
+
+        def hook(db, user_id, refs):
+            calls.append(refs)
+            if len(calls) == 2:
+                db.commit()
+            return {
+                ref: ConnectorAccess(team_owned=True, can_edit=True) for ref in refs
+            }
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(access=hook)
+            with pytest.raises(ConnectorHookSessionBoundaryError):
+                _put(
+                    api_id,
+                    CustomApiUpdate(description="should-not-land"),
+                    member,
+                    db,
+                )
+
+        assert len(calls) == 2
+        db.rollback()
+        refreshed = db.query(CustomApi).filter(CustomApi.id == api_id).one()
+        assert refreshed.description == original_description
+
+
+class TestHookCallCountAcrossPayloadShapes:
+    """How many times a single request calls the access hook, across the
+    two shapes not already covered by ``TestTheRecheckCostsExactlyOneExtraHookCall``
+    above: a payload that writes only ``is_active`` never takes the lock, so
+    a personal row that needs the team verdict to grant the edit asks once,
+    at the gate, and never again; and a deployment with no access hook
+    installed asks nothing at either point, because the hook slot being
+    empty answers ``{}`` without ever reaching the ``hook`` object a test
+    installs. The other two shapes -- an owner's row that already grants
+    the edit, and a stand-in caller who writes the shared definition row --
+    are the same call counts ``TestTheRecheckCostsExactlyOneExtraHookCall``
+    already covers above.
+    """
+
+    def test_is_active_only_payload_from_a_can_edit_false_personal_row_pays_one_call(
+        self, db
+    ):
+        owner = _make_user(db, 1)
+        member = _make_user(db, 2)
+        api = _make_owned_api(db, owner.id, name="count-is-active-only")
+        api_id = api.id
+        db.add(
+            UserCustomApi(
+                user_id=member.id,
+                custom_api_id=api_id,
+                is_owner=False,
+                can_edit=False,
+                is_active=True,
+            )
+        )
+        db.commit()
+        hook = _sequenced_access_hook(ConnectorAccess(team_owned=True, can_edit=True))
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(access=hook)
+            _put(api_id, CustomApiUpdate(is_active=False), member, db)
+
+        assert len(hook.calls) == 1
+
+    def test_no_hook_installed_pays_zero_calls_regardless_of_payload(self, db):
+        owner = _make_user(db, 1)
+        member = _make_user(db, 2)
+        api = _make_owned_api(db, owner.id, name="count-no-hook")
+        api_id = api.id
+        # Never installed through ``set_connector_team_hooks``, so nothing
+        # in the seam can reach it; used only to prove that fact rather
+        # than to answer anything.
+        hook = _sequenced_access_hook(ConnectorAccess(team_owned=True, can_edit=True))
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks()
+            with pytest.raises(HTTPException) as exc:
+                _put(
+                    api_id,
+                    CustomApiUpdate(description="stand-in-write"),
+                    member,
+                    db,
+                )
+
+        # No access hook installed means the caller's team can never be
+        # shown to link this connector, so the pre-lock resolution itself
+        # refuses with the same 404 an unrelated caller with no personal
+        # row has always gotten, before this route's own 403 is reached.
+        assert exc.value.status_code == 404
+        assert len(hook.calls) == 0
+
+
+class TestReachablePathAWritesIsActiveWithoutRetakingTheLock:
+    def test_a_can_edit_false_personal_row_widened_by_the_team_writes_is_active_in_one_call(
+        self, db
+    ):
+        """The reachable reading of the gap this route used to have: a
+        caller with a personal row whose own ``can_edit`` is ``False``, who
+        can still write ``is_active`` because the team verdict grants the
+        edit. The payload sets no field of the shared definition row, so it
+        never takes that row's lock and never runs the post-lock re-check
+        -- there is nothing to re-establish, because nothing that could
+        move under an unbounded wait was ever locked.
+        """
+        owner = _make_user(db, 1)
+        member = _make_user(db, 2)
+        api = _make_owned_api(db, owner.id, name="reachable-path-a")
+        api_id = api.id
+        db.add(
+            UserCustomApi(
+                user_id=member.id,
+                custom_api_id=api_id,
+                is_owner=False,
+                can_edit=False,
+                is_active=True,
+            )
+        )
+        db.commit()
+        hook = _sequenced_access_hook(ConnectorAccess(team_owned=True, can_edit=True))
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(access=hook)
+            response = _put(api_id, CustomApiUpdate(is_active=False), member, db)
+
+        assert response.is_active is False
+        assert len(hook.calls) == 1
+
+        db.rollback()
+        link = (
+            db.query(UserCustomApi)
+            .filter(
+                UserCustomApi.user_id == member.id,
+                UserCustomApi.custom_api_id == api_id,
+            )
+            .one()
+        )
+        assert link.is_active is False

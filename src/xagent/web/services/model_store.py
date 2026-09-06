@@ -470,6 +470,9 @@ class ModelStore:
         return user_default
 
     def refresh_auto_model_abilities(self, config_ids: list[int]) -> None:
+        if not config_ids:
+            return
+
         from ..models.auto_model import AutoModelCandidate, AutoModelConfig
         from .auto_model_service import AutoModelService
 

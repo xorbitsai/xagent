@@ -915,12 +915,86 @@ class TestTheVerdictIsRevalidatedUnderTheDefinitionLock:
         assert refreshed.description == original_description
         assert db.query(UserMCPServer).filter(UserMCPServer.user_id == 2).count() == 0
 
+    def test_a_recheck_hook_that_ends_the_transaction_is_refused_not_trusted(self, db):
+        """The recheck runs under the definition-row lock, so it declares
+        ``caller_holds_lock=True`` and is checked by the seam's session
+        boundary guard (see ``connector_team_scope``'s module docstring).
+        A hook that rolls back this session and still answers normally --
+        rather than raising -- must not be trusted just because it returned
+        a well-formed answer: the route's row lock is already gone by the
+        time it does.
+
+        The route has no dedicated handler for the seam's own
+        ``ConnectorHookSessionBoundaryError``, so it falls through to this
+        route's generic ``except Exception`` and comes back as that
+        handler's own 500, not the application-level boundary handler's
+        message -- a known, accepted divergence from the other five
+        call sites."""
+        hook_calls: list[object] = []
+
+        def hook(hook_db, user_id, refs):
+            del user_id
+            hook_calls.append(refs)
+            if len(hook_calls) == 1:
+                return {
+                    ref: ConnectorAccess(team_owned=True, can_edit=True) for ref in refs
+                }
+            hook_db.rollback()
+            return {
+                ref: ConnectorAccess(team_owned=True, can_edit=True) for ref in refs
+            }
+
+        member = _make_user(db, 2)
+        server = MCPServer(
+            name="recheck-boundary-target",
+            transport="stdio",
+            managed="external",
+            command="true",
+        )
+        db.add(server)
+        db.commit()
+        server_id = server.id
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(access=hook)
+            with pytest.raises(HTTPException) as exc:
+                update_mcp_server(
+                    server_id,
+                    MCPServerUpdate(description="edited-under-boundary-violation"),
+                    current_user=member,
+                    db=db,
+                )
+
+        assert exc.value.status_code == 500
+        assert exc.value.detail == (
+            "Failed to update MCP server: An installed connector hook ended "
+            "the caller's database transaction"
+        )
+        assert len(hook_calls) == 2
+        db.rollback()
+        refreshed = db.query(MCPServer).filter(MCPServer.id == server_id).one()
+        assert refreshed.description is None
+
 
 class TestTheRecheckCostsExactlyOneExtraHookCall:
     """Which populations pay the recheck's extra hook round trip, and which
-    do not, spelled out as call counts. The recheck runs only when the
-    verdict is the caller's authority for a payload that actually writes
-    the shared definition row; every other population pays one call.
+    do not, spelled out as call counts, for a payload that writes the shared
+    definition row:
+
+    - the owner: 0 calls, the owner's own ``is_owner`` decides the edit
+      branch and ``still_can_edit`` is already True;
+    - a stand-in sharing the write with the definition-row payload: 2 calls,
+      one at the gate and one for the recheck;
+    - a stand-in who is a platform admin: 1 call, the gate's -- the recheck
+      is skipped because ``still_can_edit`` is already True on
+      ``is_admin_now``;
+    - a stand-in with an empty payload: 1 call, the gate's -- the recheck
+      still runs, but there is no shared write left to refuse;
+    - a personal row that does not own the server, whose verdict denies
+      edit, on a payload that does carry a definition-row field: 2 calls.
+      The recheck runs here even though the pre-lock verdict already
+      denied edit, because a personal row that gained ``is_owner`` during
+      the wait would otherwise be denied on a stale answer.
     """
 
     def test_a_granting_stand_in_editing_the_shared_config_pays_two_calls(self, db):
@@ -965,10 +1039,10 @@ class TestTheRecheckCostsExactlyOneExtraHookCall:
     def test_a_granting_stand_in_who_is_a_platform_admin_pays_one_call(self, db):
         """A platform admin's write authority never comes from the verdict
         in the first place: ``_check_mcp_permission`` answers True on
-        ``is_admin`` before it ever reads one. The recheck condition's
-        ``and not getattr(current_user, "is_admin", False)`` exists to skip
-        the recheck for exactly this population -- deleting that clause
-        from the condition must turn this red (2 calls instead of 1)."""
+        ``is_admin`` before it ever reads one. ``still_can_edit``'s
+        ``is_admin_now`` clause exists to skip the recheck for exactly this
+        population -- dropping that clause must turn this red (2 calls
+        instead of 1)."""
         owner = _make_user(db, 1)
         admin = _make_user(db, 2, is_admin=True)
         server = _make_owned_server(db, owner.id, name="cost-stand-in-admin")
@@ -1029,6 +1103,45 @@ class TestTheRecheckCostsExactlyOneExtraHookCall:
             )
 
         assert len(hook.calls) == 1
+
+    def test_a_denying_verdict_on_a_personal_row_pays_two_calls_on_a_shared_field(
+        self, db
+    ):
+        """The counterpart of the test above, on a payload that carries a
+        definition-row field instead of only ``is_active``. The pre-lock
+        verdict already denies edit, but the recheck still runs regardless
+        of what that verdict said, because a personal row that gains
+        ``is_owner`` during the wait must still be re-asked. This caller's
+        row does not change, so the second call changes nothing about the
+        outcome -- it just pays for a recheck that a row which stayed
+        exactly as denied still has to go through."""
+        owner = _make_user(db, 1)
+        member = _make_user(db, 2)
+        server = _make_owned_server(db, owner.id, name="cost-personal-denied-shared")
+        server_id = server.id
+        db.add(
+            UserMCPServer(
+                user_id=member.id,
+                mcpserver_id=server_id,
+                is_owner=False,
+                is_active=True,
+            )
+        )
+        db.commit()
+        hook = _sequenced_access_hook(ConnectorAccess(team_owned=True, can_edit=False))
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(access=hook)
+            with pytest.raises(HTTPException) as exc:
+                update_mcp_server(
+                    server_id,
+                    MCPServerUpdate(description="shared-edit-denied"),
+                    current_user=member,
+                    db=db,
+                )
+
+        assert exc.value.status_code == 403
+        assert len(hook.calls) == 2
 
     def test_a_member_with_a_personal_row_pays_one_call_on_a_real_personal_field(
         self, db
@@ -1660,6 +1773,7 @@ _SEAM_REACHING_FUNCTIONS = {
     # the event loop, and would also put the coroutine back in this set and in
     # the offender list.
     "_teardown_mcp_app_server_locally",
+    "_recheck_team_access_under_definition_lock",
     "connect_mcp_app",
     "delete_mcp_server",
     "get_mcp_server",

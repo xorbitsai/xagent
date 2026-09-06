@@ -3738,6 +3738,14 @@ class ReActPattern(AgentPattern):
                 self._record_tool_call(tool_call, status="interrupted", error=str(exc))
                 recorded_terminal = True
             raise
+        except Exception as exc:
+            if (
+                is_control
+                and self.tool_ledger[str(tool_call["id"])].status == "running"
+            ):
+                self._record_tool_call(tool_call, status="failed", error=str(exc))
+                recorded_terminal = True
+            raise
         finally:
             # Final-answer handling can record completion before finalization
             # raises. Preserve that outcome, like an ordinary on_tool_end error.

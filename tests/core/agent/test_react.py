@@ -8909,6 +8909,7 @@ async def test_react_control_send_failure_settles_lifecycle_and_propagates(
         "running",
         status,
     ]
+    assert pattern.tool_ledger["send-1"].error == "send aborted"
     assert pattern.pending_tool_calls == [call]
     assert context.get_messages_by_role("tool") == []
 
@@ -8974,4 +8975,5 @@ async def test_react_final_checkpoint_failure_preserves_completed_call(
         "completed",
     ]
     assert pattern.tool_ledger["final-1"].status == "completed"
+    assert pattern.tool_ledger["final-1"].error is None
     assert len(context.get_messages_by_role("tool")) == 1

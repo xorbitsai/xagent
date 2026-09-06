@@ -671,15 +671,17 @@ async def test_a_declined_turn_still_speaks_honestly_after_a_resume(
 
 
 @pytest.mark.asyncio
-async def test_a_recoverable_turn_still_speaks_honestly_after_a_resume() -> None:
-    """The gate can agree to recover on a build that cannot recover yet.
+async def test_a_recovery_turn_resumes_into_a_recovery_turn() -> None:
+    """A pause inside a recovery turn must not resume into a forced answer.
 
-    Handing the dropped tools back is not implemented here, so a turn the gate
-    cleared for recovery is left exactly where a refused one is: still forced
-    to final_answer, with observations it can no longer read. It must therefore
-    record the same refusal in state. Setup below is the refused summary shape
-    with one line removed -- the spent-budget override -- which is the only
-    thing that separates the two paths on this build.
+    The gate clears this turn for recovery, which undoes the forcing and hands
+    the dropped tool back. Both halves of that decision have to be undone
+    together: the loop local picks this turn's instruction, and the marker is
+    what a resume reads. A marker still saying "answer without the evidence"
+    would restore the forcing this turn had just dropped, and the resumed turn
+    would answer without the values it was on its way to fetch. Setup below is
+    the refused summary shape with one line removed -- the spent-budget
+    override -- which is the only thing that separates the two paths.
     """
     pattern = ReActPattern(max_iterations=6)
     pattern.current_iteration = 1
@@ -705,12 +707,12 @@ async def test_a_recoverable_turn_still_speaks_honestly_after_a_resume() -> None
         runtime=runtime,
     )
 
-    # The live turn was honest, so the checkpoint has to say so too.
-    assert HONEST_PHRASE in instruction_of(interrupting_llm)
+    # The live turn recovered: the forcing is gone and the dropped tool is
+    # back, so the marker that would reinstate the forcing has to be gone too.
+    assert RECOVERY_CHECKPOINT in checkpoint_labels(runtime)
+    assert tool_names_of(interrupting_llm) != ["final_answer"]
     state = pattern.get_state()
-    assert (
-        state["forced_answer_recovery_followup"] == FORCED_ANSWER_FOLLOWUP_NO_EVIDENCE
-    )
+    assert state["forced_answer_recovery_followup"] is None
 
     resumed = ReActPattern(max_iterations=pattern.max_iterations)
     resumed.load_state(state)
@@ -727,11 +729,8 @@ async def test_a_recoverable_turn_still_speaks_honestly_after_a_resume() -> None
         runtime=resumed_runtime,
     )
 
-    assert tool_names_of(resumed_llm) == ["final_answer"]
-    assert resumed_llm.calls[0]["tool_choice"] == "required"
-    assert HONEST_PHRASE in instruction_of(resumed_llm)
-    assert STALE_EVIDENCE_PHRASE not in whole_prompt_of(resumed_llm)
-    assert RECOVERY_CHECKPOINT not in checkpoint_labels(resumed_runtime)
+    # Resuming lands in the turn the pause interrupted, not in a forced answer.
+    assert tool_names_of(resumed_llm) != ["final_answer"]
 
 
 @pytest.mark.asyncio

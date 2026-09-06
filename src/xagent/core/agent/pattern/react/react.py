@@ -861,6 +861,11 @@ class ReActPattern(AgentPattern):
                     ]
                     recovery_turn = True
                     evidence_dropped = False
+                    # Undo the durable half of the same decision. The marker
+                    # set above says this turn answers without the evidence;
+                    # this turn is going to fetch it back instead, so a pause
+                    # here must not resume into a forced answer.
+                    self.forced_answer_recovery_followup = None
                     self.forced_answer_compaction_recoveries += 1
                     context.add_system_message(
                         self._forced_answer_recovery_message(recoverable_work)

@@ -244,3 +244,4 @@ def test_a_non_count_value_does_not_raise_from_inside_the_listener():
     db.commit()
 
     assert db.query(Item).count() == 1
+    assert root_transaction_end_count(db) == 1

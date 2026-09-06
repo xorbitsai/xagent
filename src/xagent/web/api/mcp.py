@@ -4546,7 +4546,7 @@ async def teardown_mcp_app_server(
             "mcp",
             server_id,
             # Three row locks are held here -- public_mcp_apps, mcp_servers
-            # and user_mcp_servers -- and nothing has been committed. A hook
+            # and user_mcpservers -- and nothing has been committed. A hook
             # that ends this transaction releases all three at once.
             caller_holds_lock=True,
         )
@@ -4762,10 +4762,11 @@ async def delete_mcp_server(
             int(user_id),
             "mcp",
             int(server_id),
-            # No row lock here, but the transaction is open with nothing
-            # durable in it and the same delete work follows as on the two
-            # locking delete call sites. Declaring keeps the three of them
-            # answering the same way.
+            # Two row locks are already held here: _lock_active_mcp_oauth_lifecycle
+            # above takes them on ``mcp_servers`` and ``user_mcpservers`` before
+            # this call, and the same delete work follows as on the two locking
+            # delete call sites. Declaring keeps the three of them answering the
+            # same way.
             caller_holds_lock=True,
         )
         if team_delete.blocked_reason:

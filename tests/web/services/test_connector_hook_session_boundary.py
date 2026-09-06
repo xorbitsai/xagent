@@ -21,6 +21,7 @@ from collections.abc import Callable, Iterator
 
 import pytest
 from sqlalchemy import create_engine, select, text
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -32,14 +33,14 @@ from xagent.web.models.database import (
 )
 
 
-def _sqlite_session_factory() -> sessionmaker[Session]:
+def _sqlite_session_factory() -> tuple[sessionmaker[Session], Engine]:
     engine = create_engine(
         "sqlite://",
         poolclass=StaticPool,
         connect_args={"check_same_thread": False},
     )
     Base.metadata.create_all(bind=engine)
-    return sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    return sessionmaker(autocommit=False, autoflush=False, bind=engine), engine
 
 
 @pytest.fixture(
@@ -50,7 +51,11 @@ def _sqlite_session_factory() -> sessionmaker[Session]:
 )
 def session_factory(request: pytest.FixtureRequest) -> Iterator[sessionmaker[Session]]:
     if request.param == "sqlite":
-        yield _sqlite_session_factory()
+        factory, engine = _sqlite_session_factory()
+        try:
+            yield factory
+        finally:
+            engine.dispose()
         return
     with disposable_database_factory("xagent_hook_session_boundary") as make_database:
         engine = make_database("boundary")

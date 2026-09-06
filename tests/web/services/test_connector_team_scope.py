@@ -1912,7 +1912,9 @@ def test_a_non_count_written_after_the_transaction_ended_is_refused(db_session):
     """A hook that ends the transaction and then leaves a non-count value
     in the counter key must still be refused for ending the transaction --
     the read that raises must not be mistaken for "nothing to compare"
-    and skipped."""
+    and skipped. The refusal here travels the read-raises-``TypeError``
+    path rather than the boundary-violation path -- both refuse, but they
+    log differently."""
     server = _create_mcp(db_session, "post-end-bad-value-probe")
     db_session.commit()
 
@@ -2104,6 +2106,39 @@ def test_a_bare_call_site_lets_the_error_escape_unchanged(db_session, route_name
             )
 
 
+def test_a_committing_rename_hook_carries_the_routes_own_field_writes_with_it(
+    db_session,
+):
+    """The route assigns ``api.name`` -- and any other field in the same
+    payload -- well before it calls the rename hook, and does not commit
+    until after the hook returns. A hook that ends the transaction with
+    ``commit()`` instead of raising or rolling back therefore makes those
+    staged assignments durable too, before the request is refused. This
+    pins the known limitation named in this module's docstring: restoring
+    the session after a hook failure recovers only a hook's own
+    uncommitted work, never work the route staged ahead of it."""
+    from xagent.web.api.custom_api import CustomApiUpdate, update_custom_api
+
+    owner = _create_user(db_session, "committing-rename-hook-owner")
+    api = _create_custom_api(db_session, "committing-rename-hook-api", owner=owner)
+    db_session.commit()
+    current_user = SimpleNamespace(id=owner.id, is_admin=False)
+
+    def renamed_hook(db, *_a, **_k):
+        db.commit()
+
+    connector_team_scope.set_connector_team_hooks(renamed=renamed_hook)
+    new_name = "committing-rename-hook-api-renamed"
+    payload = CustomApiUpdate(name=new_name)
+    with pytest.raises(ConnectorHookSessionBoundaryError):
+        update_custom_api(
+            int(api.id), payload, current_user=current_user, db=db_session
+        )
+
+    persisted = db_session.query(CustomApi).filter(CustomApi.id == api.id).one()
+    assert persisted.name == new_name
+
+
 # ---------------------------------------------------------------------------
 # T-15: the call site table in the module docstring and the actual call
 # sites in the two route modules must agree, in both directions.
@@ -2139,9 +2174,20 @@ def _declared_call_sites() -> dict[str, bool]:
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
-            if not isinstance(node.func, ast.Name):
+            # A bare name (``delete_team_connector(...)``) and a qualified
+            # attribute access (``connector_team_scope.delete_team_connector(...)``)
+            # are the same call site under two import styles. Direction two
+            # below -- catching a call the table has no row for -- is the
+            # only mechanical backstop for the "declare per call site,
+            # default off" choice, so missing the qualified form here would
+            # silently defeat it for exactly the call it exists to catch.
+            if isinstance(node.func, ast.Name):
+                func_name = node.func.id
+            elif isinstance(node.func, ast.Attribute):
+                func_name = node.func.attr
+            else:
                 continue
-            if node.func.id not in _HOOK_ENTRY_POINTS:
+            if func_name not in _HOOK_ENTRY_POINTS:
                 continue
             enclosing = parent.get(node)
             while enclosing is not None and not isinstance(

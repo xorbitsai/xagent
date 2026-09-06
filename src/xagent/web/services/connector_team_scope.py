@@ -49,8 +49,8 @@ that declares it is checked; one that does not is not.
 | ``custom_api.update_custom_api`` | the ``custom_apis`` definition row, ``FOR UPDATE``, on the payloads that write that row | no | ``True`` |
 | ``custom_api.delete_custom_api`` | the ``custom_apis`` definition row, ``FOR UPDATE`` | no | ``True`` |
 | ``mcp.update_mcp_server`` | the ``mcp_servers`` definition row, ``FOR UPDATE ... KEY SHARE``, on the payloads that write that row | no | ``True`` |
-| ``mcp.teardown_mcp_app_server`` | three row locks: ``public_mcp_apps``, ``mcp_servers``, ``user_mcp_servers`` | no, within this function -- see the note below | ``True`` |
-| ``mcp.delete_mcp_server`` | no row lock, but an open transaction with nothing durable in it yet | no | ``True`` |
+| ``mcp.teardown_mcp_app_server`` | three row locks: ``public_mcp_apps``, ``mcp_servers``, ``user_mcpservers`` | no, within this function -- see the note below | ``True`` |
+| ``mcp.delete_mcp_server`` | two row locks: ``mcp_servers`` and ``user_mcpservers``, taken by ``_lock_active_mcp_oauth_lifecycle`` before this call | no | ``True`` |
 
 ``mcp.teardown_mcp_app_server`` is a helper, not a route: it has no route
 decorator and no caller in this repository outside tests. "Nothing committed
@@ -579,10 +579,9 @@ def _resolve_normalized_connector_access(
     same answer is what gets used. Reading the global here instead would make
     the ``None`` check every future caller's job to remember.
 
-    ``caller_holds_lock`` turns on the session boundary check for this
-    call and is forwarded down to the hook gate; see
-    ``delete_team_connector`` for what it means and the call site table
-    in this module's docstring for who declares it.
+    ``caller_holds_lock``: see this module's "Call sites and what the
+    caller holds" section and ``delete_team_connector`` for what it means
+    and who must declare it.
     """
     if not requested:
         return {}
@@ -642,10 +641,9 @@ def resolve_connector_access(
     the other omits is not a defect in xagent -- it is what the installed
     answers said.
 
-    ``caller_holds_lock`` turns on the session boundary check for this
-    call and is forwarded down to the hook gate; see
-    ``delete_team_connector`` for what it means and the call site table
-    in this module's docstring for who declares it.
+    ``caller_holds_lock``: see this module's "Call sites and what the
+    caller holds" section and ``delete_team_connector`` for what it means
+    and who must declare it.
     """
     hook = _connector_access_hook
     if hook is None:
@@ -799,7 +797,17 @@ def _call_connector_hook_gate(
             answer = validate(answer)
         if end_count_before is not None:
             end_count_after = root_transaction_end_count(db)
-            if end_count_after is not None and end_count_after > end_count_before:
+            if end_count_after is None:
+                # Symmetric with the pre-hook read above: a skipped check
+                # and a passed check look identical, so say which one this
+                # was rather than falling through silently.
+                logger.debug(
+                    "Connector hook session boundary check skipped after "
+                    "the hook ran: %s cannot report a root transaction end "
+                    "count",
+                    type(db).__name__,
+                )
+            elif end_count_after > end_count_before:
                 _restore_session_after_hook_failure(db)
                 already_restored = True
                 # The hook's identity and its slot go in the log line, not
@@ -890,10 +898,9 @@ def resolve_connector_access_or_raise(
     """``resolve_connector_access(db, user_id, refs)``, with every failure of the
     hook call and of its answer validation converted into the seam's one typed 503.
 
-    ``caller_holds_lock`` turns on the session boundary check for this
-    call and is forwarded down to the hook gate; see
-    ``delete_team_connector`` for what it means and the call site table
-    in this module's docstring for who declares it.
+    ``caller_holds_lock``: see this module's "Call sites and what the
+    caller holds" section and ``delete_team_connector`` for what it means
+    and who must declare it.
 
     Returns ``{}`` without reading ``refs`` at all when no hook is installed,
     before any normalization -- the same first move ``resolve_connector_access``
@@ -1007,10 +1014,9 @@ def resolve_one_connector_access_or_raise(
     same as the batch form. Exists so a caller resolving a single
     connector does not repeat the wrap-then-``.get(ref)`` shape by hand.
 
-    ``caller_holds_lock`` turns on the session boundary check for this
-    call and is forwarded down to the hook gate; see
-    ``delete_team_connector`` for what it means and the call site table
-    in this module's docstring for who declares it.
+    ``caller_holds_lock``: see this module's "Call sites and what the
+    caller holds" section and ``delete_team_connector`` for what it means
+    and who must declare it.
     """
     return resolve_connector_access_or_raise(
         db, user_id, [ref], caller_holds_lock=caller_holds_lock

@@ -61,6 +61,7 @@ from dataclasses import dataclass, replace
 from datetime import timezone
 from enum import Enum
 from typing import Any, cast
+from uuid import uuid4
 
 from ....file_ref import (
     WORKSPACE_OUTPUT_FILES_TOOL_NAME,
@@ -103,6 +104,7 @@ from ...runtime import (
     prepare_llm_for_context,
     resolved_llm_metadata,
 )
+from ...trace import ExecutionEventPersistenceError
 from ..base import AgentPattern, PatternResult, truncate_prompt_preview
 from ..final_answer_stream import ReActFinalAnswerStreamer
 
@@ -926,6 +928,11 @@ class ReActPattern(AgentPattern):
 
             assistant_content = normalized.get("content")
             tool_calls = normalized.get("tool_calls", [])
+            if getattr(runtime.tracer, "records_execution_events", False) is True:
+                batch_id = str(uuid4())
+                for tool_call in tool_calls:
+                    tool_call["assistant_message_id"] = batch_id
+                    tool_call["tool_attempt_id"] = str(uuid4())
             if assistant_content is not None or normalized.get("tool_calls"):
                 # A tool-protocol error response never carries tool_calls (see
                 # tool_protocol_error_response), so this guard never mistakes
@@ -3628,6 +3635,8 @@ class ReActPattern(AgentPattern):
                     error=str(exc),
                 )
                 recorded_terminal = True
+                raise
+            except ExecutionEventPersistenceError:
                 raise
             except Exception as exc:  # noqa: BLE001
                 error_result = {

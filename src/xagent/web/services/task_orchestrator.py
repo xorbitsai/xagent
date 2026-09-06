@@ -1479,6 +1479,11 @@ def settle_task_lease_isolated(
                             content=client_error_message,
                             message_type=client_message_type,
                         )
+                    from .task_execution_event_writer import stage_result_fact_no_commit
+
+                    stage_result_fact_no_commit(
+                        settle_db, task, {"error": error_message}
+                    )
                     settle_db.commit()
                     invalidate_task_cache_best_effort(lease.task_id)
                     return True

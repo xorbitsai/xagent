@@ -1,58 +1,62 @@
-# Execution-event storage: migration stage 3.1
+# Execution-event storage and writers (stages 3.1–3.2)
 
-This stage adds storage primitives only. No Web, channel, runner, checkpoint,
-or historical-reader path writes or reads these events in production yet.
+`task_execution_events` is the fact source for explicitly created version-two
+test tasks. Production task creation still defaults to version `1`; Web,
+channels and existing tasks retain legacy routing. There is no public switch
+or automatic conversion of existing conversations. Production activation waits
+for the event readers in stage 3.3 and the rollout in stage 3.4.
 
-## Version boundary
+## Commit boundaries
 
-`tasks.conversation_storage_version` defaults to `1` (legacy), both in the
-ORM and in SQL. A database CHECK pins it to `1`: the event-backed runtime is
-not available in this release. Activating another version requires a later
-migration **and** the complete writer/reader routing from stages 3.2–3.3.
-This is a conversation-storage version, not an agent runtime version.
+| Boundary | Durable facts | Transaction / compatibility |
+| --- | --- | --- |
+| Web and channel input, live-message claim | `input_accepted` with original text, attachments and turn identity | Existing acceptance transaction; chat row derived from the event |
+| Delivery transition | `input_delivery_changed` | Existing monotonic delivery update, same transaction |
+| Control command / interaction | `command_accepted`, `interaction_requested`, `control_state_changed` | Existing permission checks, command identity, state-version and lease fences |
+| Runner/runtime and delegated execution | Runtime events, tool start/result/error, `recovery_state` | Strict writer before observers; legacy Trace/checkpoint rows derived in the same transaction |
+| First input application | `input_applied`, referring to the proving recovery event | Same transaction as the complete recovery state; acceptance alone does not imply application |
+| Outbound messages and Web streams | Message or stream envelope, including protocol identity | Commit before WebSocket broadcast; protocol shape stays unchanged |
+| Normal, resumed and channel settlement; orchestrator error settlement | `assistant_message`, `execution_settled` | Existing fenced result/lease transaction; rollback also rolls back transcript and events |
 
-Existing rows and inserts from older applications retain legacy behavior.
-The migration adds columns with inline CHECKs, avoiding a SQLite tasks-table
-rebuild and its inbound foreign-key hazards. PostgreSQL still takes an ALTER
-TABLE lock; rollout needs a short lock window, not a zero-lock assumption.
-The new indexes apply only to the new, initially empty event table.
+The runtime bridge consumes events at their producer boundary, before Trace
+observers. It does not import historical Trace rows into the fact log. The
+ordinary database Trace callback becomes a no-op on this path, retaining its
+checkpoint read interface only for the transition. Console, WebSocket and
+exporter failures cannot invalidate a committed fact. A failed fact commit
+raises `ExecutionEventPersistenceError` and stops execution before broadcast.
 
-## Event envelope
+Recovery events contain the complete existing execution snapshot: context,
+messages, adopted summaries, pattern state, planning state and pending work.
+Their payloads are not clipped to Trace display limits. Runtime LLM payloads
+are committed before the observer-side normalization. The JSONB sanitizer
+still applies at the storage boundary; unserializable facts fail rather than
+becoming a successful write of a diagnostic placeholder.
 
-`task_execution_events` records one fact with:
+## Identity and ordering
 
-- A generated stable `event_id` and a task-local `sequence`.
-- An explicit nonempty `scope_id` (`root` or a stable child execution scope).
-- Optional `run_id`, `turn_id`, `assistant_message_id`, and `tool_attempt_id`.
-  An assistant tool-call batch and each tool attempt have distinct identities.
-- A nonempty producer-supplied `idempotency_key`, unique within task and scope.
-  Keys for per-run facts must include the run/attempt identity; user acceptance
-  keys can instead identify the durable input command across delivery retries.
-- A `kind`, positive `payload_version`, JSON payload, and occurrence timestamp.
+The envelope has a generated `event_id`, task-local `sequence`, explicit
+`scope_id` (`root` or the stable delegated execution ID), and optional run,
+turn, assistant-batch and tool-attempt identities. Append requires a producer
+idempotency key unique within task and scope. Reusing it for a different fact
+raises `ExecutionEventConflict`; replay preserves the first ID and timestamp.
 
-The envelope can carry message/attachment data, full tool results, input
-application facts, recovery state and references. Event-specific schemas and
-runtime identity producers belong to stage 3.2; this store does not invent
-missing run state or infer event kinds from existing Trace rows. No history
-backfill is performed here.
+For version-two ReAct execution, each adopted tool batch and each call attempt
+receive separate IDs before the `after_llm` recovery state is committed. Those
+IDs survive restoring pending calls. Provider call IDs and DAG step IDs are
+not treated as globally unique attempt IDs. Tool facts retain full results.
+A previously started attempt is blocked from blind execution: until event
+recovery reconciles its result, an uncertain external side effect must not be
+repeated. This conservative block is intentional during the writer-only stage.
 
-Payloads use the existing JSON sanitizer before persistence, including the
-PostgreSQL JSONB code-point policy. They are not clipped or summarized.
-This normalization is not an authorization or client-disclosure policy.
+Appends and pre-append attempt decisions use the same task-row UPDATE lock,
+including on SQLite. This serializes sequence allocation, replay and rollback.
+Delivery writers acquire the task lock before the message update to preserve
+lock order. Runtime and outbound writes reject a replaced bound lease.
 
-## Transaction contract
-
-`append_task_execution_event_no_commit` stages a fact in the caller's Session;
-the caller commits or rolls back alongside its business state. It first
-locks the task with an UPDATE, then checks idempotency and allocates the next
-`conversation_event_sequence` in the same transaction. Task `updated_at` is
-preserved. No writer can commit a later task sequence past a pending append;
-a rollback rolls back the sequence allocation as well as the event.
-
-A retry with the same key and normalized fact returns the original event ID,
-sequence and first occurrence timestamp. Reusing a key for different content
-or correlation raises `ExecutionEventConflict`. Callers must finish their
-transaction, including on errors; this helper never commits or rolls it back.
+The temporary chat projection has a nullable, unique `execution_event_id`.
+Legacy rows keep NULL; replaying one canonical message produces one compatible
+chat row. Final assistant message keys include run and state-version identity.
+No table independently chooses authoritative message content on the new path.
 
 `load_task_execution_events` requires task and scope, and reads by sequence
 with a page size of 1–100 (default 100). Out-of-range sizes raise `ValueError`
@@ -61,18 +65,28 @@ connection cannot see uncommitted events, while read-your-writes in the same
 Session is intentional. Authorization remains the future calling service's
 responsibility. Neither helper is an externally exposed endpoint.
 
-Only the append interface is provided; there is no edit or pruning API.
-Task deletion cascades at the database foreign key. Stage 3.2 must integrate
-the full application lifecycle before production events are enabled.
+## Migration and rollback
+
+The new migration permits storage versions `1` and `2`, keeping SQL and ORM
+creation defaults at `1`. On SQLite it replaces the version column, whose old
+CHECK guarantees all pre-migration values are `1`; it does not rebuild `tasks`
+or trigger inbound cascade deletes. PostgreSQL replaces the CHECK. Existing
+rows, attachments and public protocol fields remain unchanged.
+
+The legacy readers still consume derived chat / Trace / checkpoint records in
+this stage. Removing those readers and implementing event-based reconstruction
+belongs to 3.3; version-two tasks must remain test-only until then. There is no
+mixed-history fallback or legacy backfill in this change.
+
+Code rollback for legacy production tasks can retain the additive schema.
+Schema downgrade refuses when version-two tasks exist, so it cannot silently
+reclassify authoritative event history as legacy data.
 
 ## Validation
 
-The migration tests cover SQLite and PostgreSQL upgrade/downgrade, old SQL
-inserts, retained chat rows and foreign keys, create_all parity, and offline
-SQL generation. Store tests cover uncommitted visibility, rollback, concurrent
-commit ordering and replay, conflicting identities, scope pagination, JSON
-payload fidelity and database constraints.
-
-Code rollback may retain the additive schema. Alembic downgrade deletes the
-new event table and counter: it is suitable for this unwired stage, not a way
-to revert an event-backed task after later stages have been activated.
+SQLite and PostgreSQL tests cover migration with inbound foreign keys,
+unchanged defaults, downgrade refusal, atomic acceptance/settlement, complete
+recovery payloads, actual ReAct batch identity, failure-before-broadcast,
+observer failures after commit, ownership fences and uncertain-attempt replay.
+Existing runner, checkpoint, channel, command, interaction and Trace tests
+exercise the unchanged legacy path.

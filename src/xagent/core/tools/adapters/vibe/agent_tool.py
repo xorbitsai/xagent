@@ -5,7 +5,7 @@ Agent Tool - Convert published agents into callable tools
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Mapping, Optional, Type
+from typing import TYPE_CHECKING, Any, Mapping, Optional, Type, cast
 from uuid import uuid4
 
 from pydantic import BaseModel, Field, field_validator
@@ -22,6 +22,7 @@ from .....web.services.model_service import (
 # (which also keeps it patchable in tests).
 from .....web.tools.config import WebToolConfig
 from ....agent.result import NO_OUTPUT_PLACEHOLDER, NO_RESPONSE_PLACEHOLDER
+from ....agent.trace import ExecutionEventPersistenceError
 from ....agent.voice_policy import apply_output_voice
 from ....task_runtime import FILE_OPERATION_ACCESS_VERSION_KEY
 from ....tracing import create_agent_tracer
@@ -59,12 +60,12 @@ class _DelegatedAgentDatabaseTraceHandler:
         build_id: str,
         metadata: Mapping[str, Any],
     ) -> None:
-        from .....web.api.trace_handlers import DatabaseTraceHandler
+        from .....web.tracing import task_database_handler
 
         self.task_id = task_id
         self.build_id = build_id
         self.metadata = dict(metadata)
-        self._handler = DatabaseTraceHandler(task_id, build_id=build_id)
+        self._handler = task_database_handler(task_id, build_id=build_id)
 
     async def handle_event(self, event: Any) -> None:
         original_data = event.data
@@ -72,6 +73,14 @@ class _DelegatedAgentDatabaseTraceHandler:
         event.data = {**base_data, **self.metadata}
         try:
             await self._handler.handle_event(event)
+        finally:
+            event.data = original_data
+
+    async def commit_event(self, event: Any) -> None:
+        original_data = event.data
+        event.data = {**(original_data or {}), **self.metadata}
+        try:
+            await cast(Any, self._handler).commit_event(event)
         finally:
             event.data = original_data
 
@@ -1971,7 +1980,7 @@ class AgentTool(AbstractBaseTool):
                 )
             )
 
-        return create_agent_tracer(
+        tracer = create_agent_tracer(
             handlers=handlers,
             task_id=execution_task_id,
             user_id=self._user_id,
@@ -1980,6 +1989,10 @@ class AgentTool(AbstractBaseTool):
             tags=["xagent", "agent-tool", "nested-agent"],
             metadata=metadata,
         )
+
+        if parent_db_task_id is not None and handlers[0]._handler.authoritative:
+            tracer.event_writer = handlers[0].commit_event
+        return tracer
 
     def _resolve_delegated_output_path(self, workspace: Any, raw_path: str) -> Path:
         raw = raw_path.strip()
@@ -2401,6 +2414,8 @@ class AgentTool(AbstractBaseTool):
                 file_outputs=file_outputs,
             ).model_dump(exclude_none=True)
 
+        except ExecutionEventPersistenceError:
+            raise
         except Exception as e:
             error_msg = f"Error executing agent {self._agent_id}: {str(e)}"
             logger.error(error_msg, exc_info=True)

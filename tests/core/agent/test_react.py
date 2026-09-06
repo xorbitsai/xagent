@@ -8824,3 +8824,19 @@ async def test_react_summarizes_with_the_main_model_when_no_compact_model() -> N
     # One routing decision for the whole turn, taken on the conversation.
     assert len(route_prompts) == 1
     assert "Conversation history to compact" not in route_prompts[0]
+
+
+@pytest.mark.asyncio
+async def test_nested_fact_failure_is_not_a_retryable_tool_error() -> None:
+    from xagent.core.agent.trace import ExecutionEventPersistenceError
+
+    class UncertainTool(FakeTool):
+        async def run_json_async(self, args: dict[str, Any]) -> Any:
+            raise ExecutionEventPersistenceError("child event commit failed")
+
+    with pytest.raises(ExecutionEventPersistenceError):
+        await ReActPattern()._execute_tool_safely(
+            {"id": "child1", "name": "calculator", "args": {"expression": "2+2"}},
+            [UncertainTool()],
+            PatternRuntime(),
+        )

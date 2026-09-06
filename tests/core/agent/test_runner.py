@@ -2152,3 +2152,23 @@ def test_resume_migration_reaches_a_nested_auto_pattern_child_context() -> None:
 
     nested = checkpoint["pattern_state"]["dag_state"]["active_step_contexts"]["step_1"]
     assert OUTPUT_LANGUAGE_METADATA_KEY not in nested["metadata"]
+
+
+@pytest.mark.asyncio
+async def test_runner_does_not_try_another_pattern_after_fact_commit_failure() -> None:
+    from xagent.core.agent.trace import ExecutionEventPersistenceError
+
+    class UncertainPattern:
+        async def run(self, **_: Any) -> dict[str, Any]:
+            raise ExecutionEventPersistenceError("tool result commit failed")
+
+    fallback = FakePattern({"success": True, "output": "must not retry"})
+    runner = AgentRunner(
+        agent=Agent(
+            name="fact-failure", patterns=[UncertainPattern(), fallback], llm=None
+        ),
+        workspace_enabled=False,
+    )
+    with pytest.raises(ExecutionEventPersistenceError):
+        await runner.run(task="write once", execution_id="uncertain-effect")
+    assert fallback.calls == []

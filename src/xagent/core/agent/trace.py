@@ -6,7 +6,7 @@ import logging
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Set, cast
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, cast
 from uuid import uuid4
 
 from ..utils.security import redact_sensitive_text
@@ -1223,12 +1223,21 @@ class DatabaseTraceHandler(BaseTraceHandler):
         logger.debug(f"[DB] System event: {event.event_type.value}")
 
 
+class ExecutionEventPersistenceError(RuntimeError):
+    """A conversation fact was not durably committed; execution must stop."""
+
+
 class Tracer:
     """Main tracing class that manages trace events and handlers."""
 
     def __init__(self) -> None:
         self.handlers: List[TraceHandler] = []
+        self.event_writer: Callable[[TraceEvent], Awaitable[None]] | None = None
         # No default handlers - let users add their own
+
+    @property
+    def records_execution_events(self) -> bool:
+        return self.event_writer is not None
 
     def add_handler(self, handler: TraceHandler) -> None:
         """Add a trace handler."""
@@ -1267,6 +1276,15 @@ class Tracer:
             parent_id=parent_id,
             require_persisted=require_persisted,
         )
+
+        # Commit facts before any observer sees them. Observer failures do not
+        # invalidate an already committed fact. Legacy tracers have no writer.
+        if self.event_writer is not None:
+            await self.event_writer(event)
+            require_persisted = False
+            event.require_persisted = False
+            if event.event_type.category == TraceCategory.LLM:
+                event.data = normalize_llm_trace_payload(event.data)
 
         # Notify all handlers
         logger.info(

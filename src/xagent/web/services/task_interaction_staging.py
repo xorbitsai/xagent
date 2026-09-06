@@ -1146,6 +1146,28 @@ def stage_interaction_request(
             "request in a different slot"
         )
     else:
+        from .task_execution_event_writer import (
+            append_fact_no_commit,
+            uses_execution_events,
+        )
+
+        if uses_execution_events(db, resolved_task_id):
+            append_fact_no_commit(
+                db,
+                task_id=resolved_task_id,
+                run_id=run_id,
+                kind="interaction_requested",
+                key=f"interaction:{new_row.id}",
+                payload={
+                    "interaction_id": int(new_row.id),
+                    "kind": kind,
+                    "protocol_version": protocol_version,
+                    "origin": origin,
+                    "request": request_payload,
+                    "request_idempotency_key": normalized_key,
+                    "expires_at": expires_at.isoformat(),
+                },
+            )
         inner.commit()
         return StagedInteractionRequest(
             staged_db_id=int(new_row.id),

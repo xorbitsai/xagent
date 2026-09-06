@@ -278,12 +278,12 @@ class Task(Base):  # type: ignore
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     title = Column(String(200), nullable=False)
     description = Column(Text)
-    # Stage 3.1 only supports legacy routing. Widen this pin together with
-    # the event-backed runtime, never by changing the creation default alone.
+    # Production creation remains legacy; version 2 is exercised by migration
+    # tests until the event readers are ready for production routing.
     conversation_storage_version = Column(
         Integer,
         CheckConstraint(
-            "conversation_storage_version = 1",
+            "conversation_storage_version IN (1, 2)",
             name="ck_tasks_conversation_storage_version",
         ),
         nullable=False,

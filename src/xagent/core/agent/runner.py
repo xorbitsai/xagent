@@ -23,6 +23,7 @@ from .context import ContextManager, ExecutionContext
 from .language import reset_output_language_to_request_context
 from .result import extract_assistant_message
 from .runtime import ExecutionInterrupted, PatternRuntime, load_pattern_checkpoint
+from .trace import ExecutionEventPersistenceError
 
 logger = logging.getLogger(__name__)
 
@@ -320,6 +321,10 @@ class AgentRunner:
                             result=normalized,
                         )
                         return normalized
+                    except ExecutionEventPersistenceError:
+                        # A storage failure cannot authorize another pattern to
+                        # repeat potentially completed external work.
+                        raise
                     except Exception as exc:  # noqa: BLE001
                         teardown_status = "failed"
                         logger.exception(

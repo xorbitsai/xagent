@@ -42,6 +42,8 @@ class TaskChatMessage(Base):  # type: ignore
     # the original file metadata (file_id, name, size, type) is available for
     # historical replay without having to re-derive it from the message body.
     attachments = Column(JSON, nullable=True)
+    # Transitional projection identity; NULL for legacy transcript rows.
+    execution_event_id = Column(String(36), nullable=True, unique=True, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     task = relationship("Task", back_populates="chat_messages")

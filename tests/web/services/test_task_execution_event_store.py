@@ -76,7 +76,7 @@ def test_defaults_pin_legacy_without_events(engine, task_id):
         assert task.conversation_storage_version == 1
         assert task.conversation_event_sequence == 0
         assert load_task_execution_events(db, task_id=task_id, scope_id="root") == []
-        task.conversation_storage_version = 2
+        task.conversation_storage_version = 3
         with pytest.raises(IntegrityError):
             db.flush()
 

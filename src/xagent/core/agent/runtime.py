@@ -10,6 +10,7 @@ from uuid import uuid4
 
 from ...config import get_compact_threshold_ratio
 from ..agent.trace import (
+    ExecutionEventPersistenceError,
     TraceAction,
     TraceCategory,
     TraceEventType,
@@ -894,6 +895,11 @@ class PatternRuntime:
             "tool_name": tool_call.get("name"),
             "tool_params": tool_call.get("args", {}),
             "tool_call_id": tool_call.get("id"),
+            **{
+                key: tool_call[key]
+                for key in ("assistant_message_id", "tool_attempt_id")
+                if key in tool_call
+            },
         }
         assistant_content = tool_call.get("assistant_content")
         if isinstance(assistant_content, str) and assistant_content.strip():
@@ -927,6 +933,11 @@ class PatternRuntime:
                 "tool_name": tool_call.get("name"),
                 "tool_params": tool_call.get("args", {}),
                 "tool_call_id": tool_call.get("id"),
+                **{
+                    key: tool_call[key]
+                    for key in ("assistant_message_id", "tool_attempt_id")
+                    if key in tool_call
+                },
                 "result": result,
                 "success": False,
                 "status": WAITING_FOR_USER_STATUS,
@@ -964,6 +975,11 @@ class PatternRuntime:
             "tool_name": tool_call.get("name"),
             "tool_params": tool_call.get("args", {}),
             "tool_call_id": tool_call.get("id"),
+            **{
+                key: tool_call[key]
+                for key in ("assistant_message_id", "tool_attempt_id")
+                if key in tool_call
+            },
             "result": result,
             "success": True,
         }
@@ -994,6 +1010,11 @@ class PatternRuntime:
             "error_message": str(error),
             "tool_name": tool_call.get("name"),
             "tool_call_id": tool_call.get("id"),
+            **{
+                key: tool_call[key]
+                for key in ("assistant_message_id", "tool_attempt_id")
+                if key in tool_call
+            },
         }
         if result is not None:
             data["result"] = result
@@ -1031,6 +1052,11 @@ class PatternRuntime:
             "tool_name": tool_call.get("name"),
             "tool_params": tool_call.get("args", {}),
             "tool_call_id": tool_call.get("id"),
+            **{
+                key: tool_call[key]
+                for key in ("assistant_message_id", "tool_attempt_id")
+                if key in tool_call
+            },
             "success": False,
             "interrupted": True,
             "interrupt_reason": cancellation_reason,
@@ -1632,7 +1658,11 @@ class PatternRuntime:
         # truncates bulky content (messages, response, tool_calls, ...).
         # Non-LLM categories (TOOL / DAG / REACT / COMPACT / GENERAL)
         # pass through unchanged.
-        if data and getattr(event_type, "category", None) == TraceCategory.LLM:
+        if (
+            data
+            and getattr(event_type, "category", None) == TraceCategory.LLM
+            and getattr(self.tracer, "records_execution_events", False) is not True
+        ):
             data = normalize_llm_trace_payload(data)
         try:
             await self._maybe_await(
@@ -1643,6 +1673,8 @@ class PatternRuntime:
                     data=data or {},
                 )
             )
+        except ExecutionEventPersistenceError:
+            raise
         except Exception:
             # UI trace events are best-effort; checkpoint persistence remains strict.
             return

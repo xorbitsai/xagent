@@ -6023,17 +6023,18 @@ def _capture_statement_sequence(
     return [_leading_keyword(s) for s in statements]
 
 
-def test_statement_sequence_is_unchanged_by_the_receipt_widening(
+def test_statement_sequence_includes_execution_event_version_check(
     _db: Session, _system_call_ctx: dict[str, Any]
 ) -> None:
-    """Widening _identity_lookup_stmt's column list (this delivery's own
-    change) adds no new statement and reorders nothing: a fresh insert
-    still runs exactly this sequence -- the SQLite-only dummy UPDATE, the
+    """A fresh insert includes the storage-version query added by event writers.
+
+    It runs exactly this sequence -- the SQLite-only dummy UPDATE, the
     outer savepoint interaction_handoff opens, the identity SELECT
     stage_interaction_request's step 3 runs (now widened, same statement),
     the reclaim UPDATE (step 4), the inner savepoint
     stage_interaction_request opens for its own INSERT (step 5), the
-    INSERT itself, and the two savepoints releasing in reverse order.
+    INSERT itself, the execution-event storage version SELECT, and the two
+    savepoints releasing in reverse order.
     Asserted by leading-keyword shape, in order -- not just a count --
     against a real, captured sequence, not an estimate."""
 
@@ -6047,6 +6048,7 @@ def test_statement_sequence_is_unchanged_by_the_receipt_widening(
         "UPDATE",  # reclaim stale/superseded slot, step 4
         "SAVEPOINT",  # inner savepoint, step 5
         "INSERT",  # the new row, step 5
+        "SELECT",  # choose legacy or execution-event persistence
         "RELEASE SAVEPOINT",  # inner savepoint commits
         "RELEASE SAVEPOINT",  # outer savepoint commits
     ]

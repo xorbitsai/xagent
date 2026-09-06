@@ -13,7 +13,7 @@ import enum
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, cast
 from uuid import uuid4
 
 from sqlalchemy import func, update
@@ -187,7 +187,19 @@ def apply_task_control_transition(
                     f"at state version {expected_state_version}"
                 )
             session.refresh(task)
-        return task_control_snapshot(task)
+        snapshot = task_control_snapshot(task)
+        if task.conversation_storage_version == 2:
+            from .task_execution_event_writer import append_fact_no_commit
+
+            append_fact_no_commit(
+                session,
+                task_id=int(task.id),
+                kind="control_state_changed",
+                key=f"control:{task.state_version}",
+                run_id=cast(str | None, task.run_id),
+                payload=snapshot.as_dict(),
+            )
+        return snapshot
 
     # Fallback for detached/transient objects. Persistent task rows use the
     # atomic UPDATE above so concurrent lifecycle writers cannot reuse a

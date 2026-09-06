@@ -24,6 +24,15 @@ from xagent.web.services.task_setup_snapshot import (
 )
 
 
+@pytest.fixture(autouse=True)
+def legacy_task_selection(monkeypatch):
+    from xagent.web.api.trace_handlers import DatabaseTraceHandler
+
+    monkeypatch.setattr(
+        "xagent.web.tracing.task_database_handler", DatabaseTraceHandler
+    )
+
+
 def _build_reconstruction_snapshot(
     task: Task,
     user: User,

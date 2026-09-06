@@ -134,6 +134,10 @@ class TraceCheckpointStore:
     tracer: Any
     require_persisted: bool = True
 
+    @property
+    def records_execution_events(self) -> bool:
+        return getattr(self.tracer, "records_execution_events", False) is True
+
     async def checkpoint(self, **payload: Any) -> str | None:
         return await self.save(payload)
 

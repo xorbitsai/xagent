@@ -38,6 +38,15 @@ from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 
 
+@pytest.fixture
+def legacy_task_selection(monkeypatch):
+    from xagent.web.api.trace_handlers import DatabaseTraceHandler
+
+    monkeypatch.setattr(
+        "xagent.web.tracing.task_database_handler", DatabaseTraceHandler
+    )
+
+
 def _create_session() -> tuple[Session, str, Any]:
     """Create a temporary database session for testing.
 
@@ -91,7 +100,7 @@ async def test_delegated_agent_websocket_handler_adds_worker_metadata() -> None:
     assert event.data is original_data
 
 
-def test_agent_tool_child_tracer_persists_and_broadcasts() -> None:
+def test_agent_tool_child_tracer_persists_and_broadcasts(legacy_task_selection) -> None:
     tool = AgentTool(
         agent_id=17,
         agent_name="Video Generation Agent",
@@ -645,6 +654,7 @@ class TestCreateAgentTool:
     @pytest.mark.asyncio
     async def test_agent_tool_returns_parent_owned_file_refs_for_worker_outputs(
         self,
+        legacy_task_selection,
     ) -> None:
         db, db_path, SessionLocal = _create_session()
         try:
@@ -857,6 +867,7 @@ class TestCreateAgentTool:
     @pytest.mark.asyncio
     async def test_agent_tool_classified_failure_does_not_register_file_outputs(
         self,
+        legacy_task_selection,
     ) -> None:
         db, db_path, SessionLocal = _create_session()
         try:

@@ -471,6 +471,26 @@ def stage_task_command(
     )
     db.add(command)
     db.flush()
+    from .task_execution_event_writer import (
+        append_fact_no_commit,
+        uses_execution_events,
+    )
+
+    if uses_execution_events(db, resolved_task_id):
+        append_fact_no_commit(
+            db,
+            task_id=resolved_task_id,
+            kind="command_accepted",
+            key=f"command:{normalized_id}",
+            run_id=snapshot.run_id,
+            payload={
+                "command_id": normalized_id,
+                "kind": kind.value,
+                "payload": payload,
+                "actor_user_id": actor_user_id,
+                "target_state_version": int(snapshot.state_version or 0),
+            },
+        )
     return StagedTaskCommand(
         staged_db_id=int(command.id),
         client_command_id=normalized_id,

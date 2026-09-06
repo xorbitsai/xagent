@@ -31,6 +31,7 @@ from ...runtime import (
     PatternRuntime,
     prepare_llm_for_context,
 )
+from ...trace import ExecutionEventPersistenceError
 from ..base import AgentPattern, PatternResult, RequiredToolCallError
 from ..final_answer_stream import FinalAnswerStreamSession, ToolCallStringFieldStreamer
 from ..react import ReActPattern, ReActReasoningMode
@@ -524,6 +525,8 @@ class DAGPattern(AgentPattern):
             raise
         except RequiredToolCallError:
             raise
+        except ExecutionEventPersistenceError:
+            raise
         except Exception as exc:  # noqa: BLE001
             return await self._fail(
                 context=context,
@@ -566,6 +569,8 @@ class DAGPattern(AgentPattern):
                             return interrupted
                         raise
                     except RequiredToolCallError:
+                        raise
+                    except ExecutionEventPersistenceError:
                         raise
                     except Exception as exc:  # noqa: BLE001
                         return await self._fail(
@@ -1044,6 +1049,8 @@ class DAGPattern(AgentPattern):
             )
         except ExecutionInterrupted:
             raise
+        except ExecutionEventPersistenceError:
+            raise
         except Exception as exc:
             step.status = "failed"
             step.error = str(exc)
@@ -1372,6 +1379,8 @@ class DAGPattern(AgentPattern):
             if interrupted is not None:
                 return interrupted
             raise
+        except ExecutionEventPersistenceError:
+            raise
         except Exception as exc:  # noqa: BLE001
             return await self._fail(
                 context=context,
@@ -1449,6 +1458,8 @@ class DAGPattern(AgentPattern):
                 return interrupted
             raise
         except RequiredToolCallError:
+            raise
+        except ExecutionEventPersistenceError:
             raise
         except Exception as exc:  # noqa: BLE001
             return await self._fail(

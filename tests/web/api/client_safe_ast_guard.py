@@ -154,6 +154,38 @@ def _is_known_non_error_event_type(
             and not _has_local_binding(candidate, candidate.func.id, parents)
         )
 
+    if isinstance(expr, ast.Name):
+        # A literal non-error type set narrows this name only when it has no
+        # stores anywhere in the guarded body (including nested branches).
+        current = reference
+        while current in parents:
+            parent = parents[current]
+            if isinstance(parent, ast.If) and current in parent.body:
+                test = parent.test
+                if (
+                    isinstance(test, ast.Compare)
+                    and isinstance(test.left, ast.Name)
+                    and test.left.id == expr.id
+                    and len(test.ops) == 1
+                    and isinstance(test.ops[0], ast.In)
+                    and isinstance(test.comparators[0], (ast.Set, ast.Tuple, ast.List))
+                    and all(
+                        isinstance(value, ast.Constant)
+                        and isinstance(value.value, str)
+                        and value.value not in ERROR_PAYLOAD_TYPES
+                        for value in test.comparators[0].elts
+                    )
+                    and not any(
+                        isinstance(node, ast.Name)
+                        and node.id == expr.id
+                        and isinstance(node.ctx, (ast.Store, ast.Del))
+                        for statement in parent.body
+                        for node in ast.walk(statement)
+                    )
+                ):
+                    return True
+            current = parent
+
     if not isinstance(expr, ast.Name):
         return isinstance(expr, ast.expr) and trusted_builder(expr, None)
 
@@ -203,7 +235,7 @@ def _dict_variants(
     if (
         isinstance(expr, ast.Call)
         and isinstance(expr.func, ast.Name)
-        and expr.func.id == "create_stream_event"
+        and expr.func.id in {"create_stream_event", "create_final_answer_stream_event"}
         and expr.func.id in module_helpers
         and not _has_local_binding(expr, expr.func.id, parents)
     ):
@@ -320,7 +352,7 @@ def _error_payload_messages(
                 return [argument]
             message = _call_argument(argument, 1, "message")
             return [message if message is not None else argument]
-        if helper != "create_stream_event":
+        if helper not in {"create_stream_event", "create_final_answer_stream_event"}:
             return []
     if not isinstance(argument, (ast.Call, ast.Dict, ast.Name, ast.Await)):
         return []
@@ -1080,6 +1112,7 @@ def _trusted_module_helpers(tree: ast.Module) -> set[str]:
         *DICT_ERROR_PAYLOAD_BUILDERS,
         *NON_ERROR_STREAM_EVENT_BUILDERS,
         "create_stream_event",
+        "create_final_answer_stream_event",
     }
     overload_bindings = [
         (node, alias)

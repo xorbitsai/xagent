@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Optional
 
 from ..core.agent.checkpoint import READABLE_CHECKPOINT_TYPES
 from ..core.agent.trace import (
     BaseTraceHandler,
     ConsoleTraceHandler,
+    ExecutionEventPersistenceError,
 )
 from ..core.agent.trace import TraceEvent as CoreTraceEvent
 from ..core.agent.trace import (
@@ -52,6 +54,45 @@ class EphemeralCheckpointTraceHandler(BaseTraceHandler):
         return dict(snapshot) if isinstance(snapshot, dict) else None
 
 
+class ExecutionEventTraceAdapter(DatabaseTraceHandler):
+    """Strict fact writer plus the transitional checkpoint reader.
+
+    Normal observer dispatch must never write the same event a second time.
+    """
+
+    def __init__(self, task_id: int, build_id: str | None = None) -> None:
+        super().__init__(task_id, build_id=build_id)
+        self.authoritative = True
+
+    async def handle_event(self, event: CoreTraceEvent) -> None:
+        pass
+
+    async def commit_event(self, event: CoreTraceEvent) -> None:
+        required = event.require_persisted
+        event.require_persisted = True
+        try:
+            await asyncio.to_thread(self._sync_save_to_database, event)
+        except Exception as exc:
+            raise ExecutionEventPersistenceError(
+                "Conversation event commit failed"
+            ) from exc
+        finally:
+            event.require_persisted = required
+
+
+def task_database_handler(
+    task_id: int, build_id: str | None = None
+) -> DatabaseTraceHandler:
+    from .models.database import get_session_local
+    from .services.task_execution_event_writer import uses_execution_events
+
+    with get_session_local()() as db:
+        canonical = uses_execution_events(db, task_id)
+    if canonical:
+        return ExecutionEventTraceAdapter(task_id, build_id=build_id)
+    return DatabaseTraceHandler(task_id, build_id=build_id)
+
+
 def create_task_tracer(
     task_id: int,
     user: Optional[User] = None,
@@ -64,10 +105,11 @@ def create_task_tracer(
     if user is not None and user.id is not None:
         resolved_user_id = int(user.id)
 
-    return create_agent_tracer(
+    database_handler = task_database_handler(task_id)
+    tracer = create_agent_tracer(
         handlers=[
             ConsoleTraceHandler(),
-            DatabaseTraceHandler(task_id),
+            database_handler,
             WebSocketTraceHandler(task_id),
         ],
         task_id=str(task_id),
@@ -81,6 +123,10 @@ def create_task_tracer(
             "is_preview": False,
         },
     )
+
+    if isinstance(database_handler, ExecutionEventTraceAdapter):
+        tracer.event_writer = database_handler.commit_event
+    return tracer
 
 
 def create_ephemeral_tracer(

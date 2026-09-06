@@ -425,6 +425,15 @@ def _finalize_external_cancel_sync(
             )
         _persist_interruption_transcript_no_commit(db, updated)
         _mark_cancelled_turn_delivery_dispatched(db, task_id, turn_id=turn_id)
+        if updated.conversation_storage_version == 2:
+            from .task_execution_event_writer import stage_result_fact_no_commit
+
+            db.refresh(updated)
+            stage_result_fact_no_commit(
+                db,
+                updated,
+                {"status": "cancelled", "error": EXTERNAL_CANCEL_ERROR_MESSAGE},
+            )
         db.commit()
         _invalidate_task_cache_after_commit(task_id)
 

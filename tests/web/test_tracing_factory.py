@@ -4,12 +4,23 @@ from __future__ import annotations
 
 from typing import cast
 
+import pytest
+
 from tests.utils.mock_helpers import create_langfuse_mock
 from xagent.core.agent.trace import TraceEvent, TraceHandler
 from xagent.core.tracing.langfuse.client import get_langfuse_client
 from xagent.core.tracing.langfuse.handler import LangfuseTraceHandler
 from xagent.web.models.user import User
 from xagent.web.tracing import create_ephemeral_tracer, create_task_tracer
+
+
+@pytest.fixture(autouse=True)
+def legacy_task_selection(monkeypatch):
+    from xagent.web.api.trace_handlers import DatabaseTraceHandler
+
+    monkeypatch.setattr(
+        "xagent.web.tracing.task_database_handler", DatabaseTraceHandler
+    )
 
 
 class DummyTraceHandler(TraceHandler):

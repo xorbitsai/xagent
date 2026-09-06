@@ -36,6 +36,10 @@ from .ops_signals import (
     clear_degradation,
     register_degradation,
 )
+from .task_execution_event_writer import (
+    stage_chat_message_no_commit,
+    stage_delivery_fact_no_commit,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -202,7 +206,7 @@ def claim_user_message_delivery(
         delivery_status=DELIVERY_PENDING,
         attachments=attachments,
     )
-    db.add(message)
+    message = stage_chat_message_no_commit(db, message)
     try:
         db.commit()
         db.refresh(message)
@@ -257,7 +261,7 @@ def claim_user_message_delivery_no_commit(
         delivery_status=DELIVERY_PENDING,
         attachments=attachments,
     )
-    db.add(message)
+    message = stage_chat_message_no_commit(db, message)
     db.flush()
     return UserMessageDeliveryClaim(
         message=message,
@@ -282,6 +286,12 @@ def mark_user_message_delivery(
         DELIVERY_FAILED,
     }:
         raise ValueError(f"Unknown delivery status: {status}")
+    from .task_execution_event_store import lock_task_execution_events_no_commit
+    from .task_execution_event_writer import uses_execution_events
+
+    if uses_execution_events(db, task_id):
+        # Use the same task-before-message lock order as acceptance/finalization.
+        lock_task_execution_events_no_commit(db, task_id)
     query = db.query(TaskChatMessage).filter(
         TaskChatMessage.task_id == task_id,
         TaskChatMessage.role == "user",
@@ -310,6 +320,9 @@ def mark_user_message_delivery(
         synchronize_session=False,
     )
     if updated:
+        stage_delivery_fact_no_commit(
+            db, task_id=task_id, turn_id=turn_id, status=status
+        )
         return UserMessageDeliveryTransition(status=status, outcome="updated")
 
     # A concurrent terminal transition won after the read. Reload the durable
@@ -646,7 +659,7 @@ def persist_user_message_no_commit(
         # "attachments key was set, just empty".
         attachments=attachments,
     )
-    db.add(message)
+    message = stage_chat_message_no_commit(db, message)
     return message
 
 
@@ -725,7 +738,7 @@ def persist_assistant_message_no_commit(
         turn_id=turn_id,
         attachments=None,
     )
-    db.add(message)
+    message = stage_chat_message_no_commit(db, message)
     return message
 
 
@@ -1061,7 +1074,7 @@ def _persist_message(
         # round-trips as ``[]`` rather than being coerced to ``NULL``.
         attachments=attachments,
     )
-    db.add(message)
+    message = stage_chat_message_no_commit(db, message)
     db.commit()
     db.refresh(message)
     return message

@@ -67,6 +67,7 @@ from ....file_ref import (
     final_deliverable_file_reference_instructions,
 )
 from ....model.chat.exceptions import LLMToolProtocolError
+from ....model.chat.response_shape import classify_chat_response
 from ....model.chat.tool_protocol import get_tool_protocol_error
 from ....tools.adapters.vibe.interaction_types import INTERACTION_TYPES
 from ....tools.user_interaction import (
@@ -968,10 +969,18 @@ class ReActPattern(AgentPattern):
 
             await runtime.checkpoint("after_llm", context=context, pattern=self)
             if normalized.get("done", True):
+                # Fall back to the raw response's usable *text*, never the
+                # raw value itself: for envelope adapters the raw is the
+                # whole envelope dict, and stringifying it downstream would
+                # leak an internal repr into the user-visible transcript.
+                response = assistant_content
+                if not response:
+                    raw_shape = classify_chat_response(normalized.get("raw"))
+                    response = raw_shape.text if raw_shape.kind == "text" else ""
                 return await self._finalize_success(
                     context=context,
                     runtime=runtime,
-                    response=assistant_content or normalized.get("raw"),
+                    response=response,
                 )
 
         self.status = "max_iterations"

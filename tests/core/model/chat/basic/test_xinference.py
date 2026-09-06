@@ -1022,3 +1022,45 @@ class TestXinferencePromptCacheUsage:
         assert usage.input_tokens == 100
         inp = next(d for d in usage.details if d["type"] == "input")
         assert inp["cached_tokens"] == 60
+
+
+class TestXinferenceUsageStamp:
+    """D2: ``_process_chat_response`` stamps the provider usage onto every
+    envelope branch, so consumers never need to dig through ``raw``."""
+
+    def _payload(self) -> dict:
+        return {
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+        }
+
+    def test_text_envelope_stamps_usage(self) -> None:
+        llm = XinferenceLLM(model_name="qwen3.8")
+        result = llm._process_chat_response(self._payload())
+        assert result["usage"] == {"prompt_tokens": 10, "completion_tokens": 5}
+
+    def test_tool_call_envelope_stamps_usage(self) -> None:
+        llm = XinferenceLLM(model_name="qwen3.8")
+        payload = self._payload()
+        payload["choices"][0]["message"]["tool_calls"] = [
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "search", "arguments": "{}"},
+            }
+        ]
+        result = llm._process_chat_response(payload)
+        assert result["type"] == "tool_call"
+        assert result["usage"] == {"prompt_tokens": 10, "completion_tokens": 5}
+
+    def test_no_usage_no_stamp(self) -> None:
+        llm = XinferenceLLM(model_name="qwen3.8")
+        payload = self._payload()
+        del payload["usage"]
+        result = llm._process_chat_response(payload)
+        assert "usage" not in result

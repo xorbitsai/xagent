@@ -224,25 +224,29 @@ class BaseLLM(ABC):
             **kwargs: Additional parameters specific to the underlying model (e.g. top_p, user, stop).
 
         Returns:
-            The return type is a union; the concrete shape depends on the
-            implementation:
-                -> str: some implementations (e.g. Zhipu, Claude, Gemini)
-                   return the assistant reply content as a bare string.
-                -> dict: other implementations (e.g. the OpenAI family --
-                   OpenAI, OpenRouter, DashScope -- and Xinference) wrap
-                   the reply in an envelope instead:
-                     - {"type": "text", "content": <str>, ...} for a
-                       natural language response
-                     - {"type": "tool_call", "tool_calls": [...], ...} for a
-                       tool call
-                   A "raw" key carrying the provider's full response is
-                   present on some implementations' envelopes and absent on
-                   others, so callers must not require it. Neither list is
-                   exhaustive, and an implementation listed above as
-                   returning a bare string for ordinary replies can still
-                   return a tool-call envelope -- Gemini does exactly that.
-                   Callers that must accept more than one implementation need
-                   to branch on the shape rather than assume a bare string.
+            If the model returns a natural language response:
+                -> dict envelope with fields:
+                    - "type": "text"
+                    - "content": the assistant reply content
+                    - "usage": top-level provider usage stamp, when the provider
+                      reported one (e.g. {"prompt_tokens": ..., "completion_tokens": ...})
+                    - "raw": the provider's full response payload. Present on
+                      some implementations' envelopes and absent on others,
+                      so callers must not require it.
+                (Legacy adapters may still return a plain string reply.)
+
+            If the model triggers a tool call:
+                -> dict envelope with fields:
+                    - "type": "tool_call"
+                    - "tool_calls": list of tool call objects
+                    - "raw": the provider's full response payload -- optional,
+                      provider-dependent (e.g. Gemini's envelope omits it);
+                      callers must not require it
+                    - "usage": top-level provider usage stamp, when reported
+
+            Consumers needing the reply text must classify the envelope
+            structurally (``classify_chat_response`` / ``unwrap_chat_text``)
+            rather than stringifying it.
 
         Raises:
             RuntimeError if the model call fails or returns an unexpected format.
@@ -279,25 +283,13 @@ class BaseLLM(ABC):
             **kwargs: Additional parameters specific to the underlying model.
 
         Returns:
-            The return type is a union; the concrete shape depends on the
-            implementation:
-                -> str: some implementations (e.g. Zhipu, Claude, Gemini)
-                   return the assistant reply content as a bare string.
-                -> dict: other implementations (e.g. the OpenAI family --
-                   OpenAI, OpenRouter, DashScope -- and Xinference) wrap
-                   the reply in an envelope instead:
-                     - {"type": "text", "content": <str>, ...} for a
-                       natural language response
-                     - {"type": "tool_call", "tool_calls": [...], ...} for a
-                       tool call
-                   A "raw" key carrying the provider's full response is
-                   present on some implementations' envelopes and absent on
-                   others, so callers must not require it. Neither list is
-                   exhaustive, and an implementation listed above as
-                   returning a bare string for ordinary replies can still
-                   return a tool-call envelope -- Gemini does exactly that.
-                   Callers that must accept more than one implementation need
-                   to branch on the shape rather than assume a bare string.
+            Same envelope contract as ``chat()``: a text envelope
+            (``{"type": "text", "content": ...}``, optionally with ``usage``
+            and ``raw``) for a natural language response, a tool_call
+            envelope (``{"type": "tool_call", "tool_calls": [...]}``) when
+            the model triggers a tool call, or -- for legacy adapters -- a
+            plain string reply. Never stringify the envelope to get the
+            text; use ``classify_chat_response`` / ``unwrap_chat_text``.
 
         Raises:
             RuntimeError if the model doesn't support vision or the call fails.

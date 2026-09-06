@@ -17,6 +17,7 @@ from ...core.agent.language import (
     response_language_rules,
 )
 from ...core.agent.service import AgentService
+from ...core.agent.utils.llm_utils import unwrap_chat_text
 from ...core.agent.voice_policy import _VOICE_INSTRUCTIONS as _core_voice_instructions
 from ...core.agent.voice_policy import apply_output_voice, voice_from_preferences
 from ...core.memory.in_memory import InMemoryMemoryStore
@@ -575,10 +576,10 @@ async def optimize_instructions(
             ]
         )
 
-        if isinstance(response, dict) and "content" in response:
-            content = str(response["content"])
-        else:
-            content = response if isinstance(response, str) else str(response)
+        # Raises LLMNoTextContentError on a tool_call envelope or any other
+        # text-less shape rather than repr()ing it into a 200 response
+        # (#1714); the outer except turns that into a clear 500.
+        content = unwrap_chat_text(response)
 
         mismatch = detect_prose_script_mismatch(request.instructions, content)
         if mismatch is not None:

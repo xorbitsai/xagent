@@ -78,6 +78,20 @@ class LLMInvalidResponseError(LLMRetryableError):
     pass
 
 
+class LLMNoTextContentError(LLMInvalidResponseError):
+    """Raised when a chat response carries no usable text content.
+
+    Distinct from ``LLMEmptyContentError`` (the provider answered with an
+    empty string): this means the response has a non-text shape -- a
+    tool_call envelope or an unrecognized payload -- where the caller
+    required text. Stringifying such a response would leak an internal
+    dict repr into compacted context or API responses as if it were model
+    output (#1714), so consumers must fail explicitly instead.
+    """
+
+    pass
+
+
 class LLMTimeoutError(LLMRetryableError):
     """Raised when LLM request times out.
 

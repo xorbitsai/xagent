@@ -10,8 +10,12 @@ import pyarrow as pa  # type: ignore
 import pytest
 
 from xagent.core.memory.schema_migration import (
+    LEGACY_DASHSCOPE_IDENTITY,
     MemoryMismatchKind,
+    VECTOR_SPACE_METADATA_KEY,
+    VectorSpaceCompatibility,
     classify_memory_schema_mismatch,
+    inspect_vector_space,
     migrate_table_swap,
 )
 from xagent.core.tools.core.RAG_tools.LanceDB.schema_manager import _safe_close_table
@@ -47,6 +51,45 @@ def _vector_schema(dim: int) -> pa.Schema:
             pa.field("metadata", pa.string()),
             pa.field("vector", pa.list_(pa.float32(), list_size=dim)),
         ]
+    )
+
+
+def _identity(**overrides):
+    return {
+        **LEGACY_DASHSCOPE_IDENTITY,
+        "dimension": 64,
+        **overrides,
+    }
+
+
+@pytest.mark.parametrize(
+    ("schema", "identity", "expected"),
+    [
+        (_vector_schema(64), _identity(), VectorSpaceCompatibility.LEGACY_COMPATIBLE),
+        (
+            _vector_schema(64),
+            _identity(model="other"),
+            VectorSpaceCompatibility.MISMATCHING,
+        ),
+        (_vector_schema(32), _identity(), VectorSpaceCompatibility.MISMATCHING),
+        (_vector_schema(64), {"dimension": 64}, VectorSpaceCompatibility.MISMATCHING),
+    ],
+)
+def test_vector_space_legacy_contract_requires_more_than_dimension(
+    schema, identity, expected
+):
+    assert inspect_vector_space(schema, identity) is expected
+
+
+def test_vector_space_persisted_identity_matches_exactly():
+    identity = _identity()
+    metadata = {VECTOR_SPACE_METADATA_KEY: __import__("json").dumps(identity).encode()}
+    schema = _vector_schema(64).with_metadata(metadata)
+
+    assert inspect_vector_space(schema, identity) is VectorSpaceCompatibility.MATCHING
+    assert (
+        inspect_vector_space(schema, _identity(endpoint="https://other"))
+        is VectorSpaceCompatibility.MISMATCHING
     )
 
 

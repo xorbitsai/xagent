@@ -24,10 +24,11 @@ discarding data on failure.
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Mapping, Optional
 
 import pyarrow as pa  # type: ignore
 from lancedb.db import DBConnection
@@ -41,13 +42,31 @@ __all__ = [
     "MEMORY_VECTOR_COLUMN",
     "MemoryMismatchKind",
     "MemorySchemaMismatch",
+    "VectorSpaceCompatibility",
     "classify_memory_schema_mismatch",
+    "inspect_vector_space",
     "migrate_table_swap",
 ]
 
 # The memory schema is fixed: the only variable is the vector column's width.
 MEMORY_NON_VECTOR_COLUMNS = ("id", "text", "metadata")
 MEMORY_VECTOR_COLUMN = "vector"
+VECTOR_SPACE_METADATA_KEY = b"xagent.memory.vector_space"
+LEGACY_DASHSCOPE_IDENTITY = {
+    "provider": "dashscope",
+    "model": "text-embedding-v4",
+    "endpoint": "https://dashscope.aliyuncs.com/api/v1/services/embeddings/"
+    "text-embedding/text-embedding",
+    "instruct": None,
+}
+
+
+class VectorSpaceCompatibility(str, Enum):
+    """Read-only compatibility state for a shared memory table."""
+
+    LEGACY_COMPATIBLE = "legacy_compatible"
+    MATCHING = "matching"
+    MISMATCHING = "mismatching"
 
 
 class MemoryMismatchKind(str, Enum):
@@ -87,6 +106,53 @@ def _vector_width(schema: Any) -> Optional[int]:
         return int(vector_type.list_size)
     # A variable-length list has no fixed width to compare against.
     return None
+
+
+def inspect_vector_space(
+    schema: Any, expected_identity: Mapping[str, Any]
+) -> VectorSpaceCompatibility:
+    """Classify persisted vectors using schema metadata only.
+
+    Scope projection columns are ordinary maintenance, not vector identity.
+    """
+    expected = dict(expected_identity)
+    if set(expected) != {*LEGACY_DASHSCOPE_IDENTITY, "dimension"}:
+        return VectorSpaceCompatibility.MISMATCHING
+    try:
+        dimension = int(expected["dimension"])
+        vector_type = schema.field(MEMORY_VECTOR_COLUMN).type
+        strings_match = all(
+            schema.field(name).type == pa.string() for name in MEMORY_NON_VECTOR_COLUMNS
+        )
+    except (KeyError, TypeError, ValueError):
+        return VectorSpaceCompatibility.MISMATCHING
+    if not (
+        strings_match
+        and pa.types.is_fixed_size_list(vector_type)
+        and vector_type.value_type == pa.float32()
+        and int(vector_type.list_size) == dimension
+    ):
+        return VectorSpaceCompatibility.MISMATCHING
+
+    encoded = (schema.metadata or {}).get(VECTOR_SPACE_METADATA_KEY)
+    if encoded is None:
+        legacy = {key: expected[key] for key in LEGACY_DASHSCOPE_IDENTITY}
+        return (
+            VectorSpaceCompatibility.LEGACY_COMPATIBLE
+            if legacy == LEGACY_DASHSCOPE_IDENTITY
+            else VectorSpaceCompatibility.MISMATCHING
+        )
+    try:
+        stored = json.loads(encoded.decode())
+    except (AttributeError, UnicodeDecodeError, json.JSONDecodeError):
+        return VectorSpaceCompatibility.MISMATCHING
+    if not isinstance(stored, dict):
+        return VectorSpaceCompatibility.MISMATCHING
+    return (
+        VectorSpaceCompatibility.MATCHING
+        if stored == expected
+        else VectorSpaceCompatibility.MISMATCHING
+    )
 
 
 def classify_memory_schema_mismatch(

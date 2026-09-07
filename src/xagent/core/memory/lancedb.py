@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from typing import Any, List, Optional, Union
 from uuid import uuid4
 
@@ -20,7 +21,10 @@ from .base import MemoryStore
 from .core import MemoryNote, MemoryResponse
 from .schema_migration import (
     MemoryMismatchKind,
+    VECTOR_SPACE_METADATA_KEY,
+    VectorSpaceCompatibility,
     classify_memory_schema_mismatch,
+    inspect_vector_space,
     migrate_table_swap,
 )
 from .scope_columns import (
@@ -34,10 +38,11 @@ from .scope_columns import (
 )
 
 logger = logging.getLogger(__name__)
+_SCHEMA_MAINTENANCE_LOCK = threading.Lock()
 
 
 class LanceDBMemoryStore(MemoryStore):
-    """LanceDB-based memory store implementation with vector search capabilities."""
+    """Persistent memory store with one authoritative vector space per table."""
 
     _embedding_model: Optional[BaseEmbedding]
 
@@ -47,6 +52,8 @@ class LanceDBMemoryStore(MemoryStore):
         collection_name: str = "memories",
         embedding_model: Optional[Union[BaseEmbedding, EmbeddingModelConfig]] = None,
         similarity_threshold: float = 1.0,
+        vector_space_identity: Optional[dict[str, Any]] = None,
+        run_schema_maintenance: bool = False,
         **embedding_kwargs: Any,
     ):
         """
@@ -60,6 +67,8 @@ class LanceDBMemoryStore(MemoryStore):
             **embedding_kwargs: Additional arguments for embedding model
         """
         self._collection_name = collection_name
+        self._vector_space_identity = vector_space_identity
+        self._run_schema_maintenance = run_schema_maintenance
 
         # Handle different types of embedding_model input
         if embedding_model is None:
@@ -86,22 +95,107 @@ class LanceDBMemoryStore(MemoryStore):
             raise ValueError(
                 f"Unsupported embedding model type: {type(embedding_model)}"
             )
+        if vector_space_identity is None and isinstance(
+            self._embedding_model, DashScopeEmbedding
+        ):
+            self._vector_space_identity = {
+                "provider": "dashscope",
+                "model": self._embedding_model.model,
+                "endpoint": self._embedding_model.base_url,
+                "dimension": self._embedding_model.dimension or 1024,
+                "instruct": self._embedding_model.instruct,
+            }
         self._similarity_threshold = similarity_threshold
-        self._vector_store = LanceDBVectorStore(db_dir, collection_name)
         self._conn_manager = LanceDBConnectionManager()
-        self._ensure_table_schema()
+        self._vector_store = LanceDBVectorStore(
+            db_dir,
+            collection_name,
+            connection_manager=self._conn_manager,
+            initial_data=self._initial_table_data(),
+        )
+        if run_schema_maintenance:
+            self.maintain_schema()
+
+    def _configured_embedding_dim(self) -> Optional[int]:
+        if self._vector_space_identity is not None:
+            try:
+                return int(self._vector_space_identity["dimension"])
+            except (KeyError, TypeError, ValueError):
+                return None
+        if self._embedding_model is None:
+            return None
+        try:
+            dimension = self._embedding_model.get_dimension()
+        except Exception:
+            return None
+        return int(dimension) if dimension else None
+
+    def _initial_table_data(self) -> Any:
+        """Build a typed empty-table seed without calling the embedding service."""
+        data: dict[str, Any] = {
+            "id": ["sample"],
+            "text": ["sample"],
+            "metadata": ["{}"],
+            USER_ID_COLUMN: pa.array([0], pa.int64()),
+            SCOPE_DIMS_COLUMN: pa.array([["sample"]], pa.list_(pa.string())),
+        }
+        dimension = self._configured_embedding_dim()
+        if dimension is not None:
+            data["vector"] = pa.array(
+                [[0.0] * dimension], pa.list_(pa.float32(), dimension)
+            )
+        table = pa.table(data)
+        if self._vector_space_identity is not None:
+            metadata = dict(table.schema.metadata or {})
+            metadata[VECTOR_SPACE_METADATA_KEY] = json.dumps(
+                self._vector_space_identity, sort_keys=True, separators=(",", ":")
+            ).encode()
+            table = table.replace_schema_metadata(metadata)
+        return table
+
+    def inspect_vector_space(self) -> VectorSpaceCompatibility:
+        """Inspect compatibility without embeddings, scans, or mutations."""
+        if self._vector_space_identity is None:
+            return VectorSpaceCompatibility.MISMATCHING
+        table = self._vector_store.get_raw_connection().open_table(
+            self._collection_name
+        )
+        try:
+            return inspect_vector_space(table.schema, self._vector_space_identity)
+        finally:
+            _safe_close_table(table)
+
+    def _vectors_are_compatible(self) -> bool:
+        dimension = self._configured_embedding_dim()
+        if dimension is None:
+            return False
+        table = self._vector_store.get_raw_connection().open_table(
+            self._collection_name
+        )
+        try:
+            vector_type = table.schema.field("vector").type
+            dimension_matches = (
+                pa.types.is_fixed_size_list(vector_type)
+                and int(vector_type.list_size) == dimension
+            )
+        except (KeyError, ValueError):
+            dimension_matches = False
+        finally:
+            _safe_close_table(table)
+        if not dimension_matches:
+            return False
+        return (
+            self._vector_space_identity is None
+            or self.inspect_vector_space() is not VectorSpaceCompatibility.MISMATCHING
+        )
+
+    def maintain_schema(self) -> None:
+        """Run ordinary schema maintenance at a serialized lifecycle boundary."""
+        with _SCHEMA_MAINTENANCE_LOCK:
+            self._ensure_table_schema()
 
     def _ensure_table_schema(self) -> None:
-        """Ensure the table has the correct schema for memory storage.
-
-        If the table is missing a required column, migrate it in place
-        (preserving all rows) instead of dropping and recreating it. This path
-        runs on every store construction, so a wipe here would destroy data with
-        no write in flight. On any migration failure the original table is left
-        intact and the error propagates (out of ``__init__``); we never fall back
-        to a wipe. Note the migration branch may perform a batched re-embed when
-        a table is both missing a base column and vector-mismatched.
-        """
+        """Maintain non-vector columns without changing the vector space."""
         conn = self._vector_store.get_raw_connection()
 
         # Determine whether the table already exists and read its columns.
@@ -117,18 +211,15 @@ class LanceDBMemoryStore(MemoryStore):
         finally:
             _safe_close_table(table)
 
-        # Table exists. Init's trigger is a missing required non-vector column;
-        # a vector-dimension mismatch is detected and migrated lazily on the
-        # add() path instead. Route the resolution through the shared classifier
-        # and transform-then-swap primitive so we migrate rather than wipe.
-        if not {"id", "text", "metadata"} <= column_names:
+        missing = tuple(
+            name for name in ("id", "text", "metadata") if name not in column_names
+        )
+        if missing:
             logger.warning(
                 f"Table {self._collection_name} has incompatible schema, "
-                "migrating in place"
+                "backfilling non-vector columns"
             )
-            self._resolve_schema_mismatch(
-                conn, self._current_embedding_dim(), raise_when_compatible=False
-            )
+            self._backfill_missing_columns(conn, missing)
 
         # #822: promote user_id + scope_dims to real columns so scope filters
         # can be pushed into a `where` prefilter (slice 001). Idempotent and
@@ -179,6 +270,12 @@ class LanceDBMemoryStore(MemoryStore):
     def _get_embedding(self, text: str) -> Optional[list[float]]:
         """Get embedding for text using the configured embedding model."""
         if not self._embedding_model or not text.strip():
+            return None
+        if not self._vectors_are_compatible():
+            logger.warning(
+                "Configured embedding does not match the table vector space; "
+                "using text-only fallback"
+            )
             return None
 
         try:
@@ -317,7 +414,7 @@ class LanceDBMemoryStore(MemoryStore):
         user_ids, scope_dims = self._derive_scope_arrays(metadata_column)
         columns[USER_ID_COLUMN] = user_ids
         columns[SCOPE_DIMS_COLUMN] = scope_dims
-        return pa.table(columns)
+        return pa.table(columns).replace_schema_metadata(existing.schema.metadata)
 
     def _ensure_scope_columns(self, conn: Any) -> None:
         """Promote user_id + scope_dims to real columns on an existing table (#822).
@@ -358,10 +455,9 @@ class LanceDBMemoryStore(MemoryStore):
     ) -> None:
         """Classify and safely resolve a schema mismatch (shared by add/init).
 
-        Missing non-vector columns are backfilled in place; a vector
-        dimension/presence change rebuilds the table via transform-then-swap.
-        On any failure the original table is left intact and the error
-        propagates; no path drops or empties the table.
+        Missing non-vector columns are backfilled in place. Vector-space changes
+        require a dedicated offline administrative workflow; this ordinary schema
+        maintenance path never re-embeds or replaces persisted vectors.
 
         When the schema is classified compatible, ``raise_when_compatible``
         controls behavior: the ``add()`` path passes ``True`` (its insert failed,
@@ -379,11 +475,8 @@ class LanceDBMemoryStore(MemoryStore):
         if mismatch.kind is MemoryMismatchKind.MISSING_NON_VECTOR_COLUMN:
             self._backfill_missing_columns(conn, mismatch.missing_columns)
         elif mismatch.kind is MemoryMismatchKind.VECTOR_REBUILD:
-            target_dim = expected_dim
-            migrate_table_swap(
-                conn,
-                self._collection_name,
-                lambda existing: self._build_migrated_table(existing, target_dim),
+            raise RuntimeError(
+                "vector-space migration requires an offline administrative workflow"
             )
         elif raise_when_compatible:
             # add() failed but the schema looks compatible: do NOT drop the
@@ -393,23 +486,16 @@ class LanceDBMemoryStore(MemoryStore):
             )
 
     def _migrate_schema_mismatch(self, conn: Any, record: dict[str, Any]) -> None:
-        """Resolve the schema mismatch that made an ``add()`` insert fail."""
-        # The dimension we are trying to store now determines the target schema.
-        if record.get("vector"):
-            expected_dim: Optional[int] = len(record["vector"])
-        elif self._embedding_model:
-            expected_dim = self._current_embedding_dim()
-        else:
-            expected_dim = None
-
+        """Compatibility shim for explicit administrative callers only."""
+        expected_dim = len(record["vector"]) if record.get("vector") else None
         self._resolve_schema_mismatch(conn, expected_dim, raise_when_compatible=True)
 
     def _insert_record(self, table: Any, record: dict[str, Any]) -> None:
-        """Insert a record, adapting it to the (possibly migrated) table schema."""
+        """Insert a record while tolerating pre-upgrade internal columns."""
         schema_names = set(table.schema.names)
-        if "vector" in record and "vector" not in schema_names:
-            record = {k: v for k, v in record.items() if k != "vector"}
-        table.add([record])
+        table.add(
+            [{key: value for key, value in record.items() if key in schema_names}]
+        )
 
     def _memory_note_to_dict(self, note: MemoryNote) -> dict[str, Any]:
         """Convert MemoryNote to dictionary for storage."""
@@ -507,25 +593,23 @@ class LanceDBMemoryStore(MemoryStore):
                 if data["vector"]:
                     record["vector"] = data["vector"]
 
-                # Try to add the record. On a schema mismatch, migrate the
-                # existing table in place (preserving all rows) instead of
-                # dropping and recreating it.
+                # Explicit maintenance-mode callers may backfill additive columns.
                 try:
-                    table.add([record])
+                    self._insert_record(table, record)
                 except Exception as add_error:
+                    if not self._run_schema_maintenance:
+                        raise
                     logger.warning(
                         f"add() failed on possible schema mismatch: {add_error}; "
-                        "attempting safe in-place migration"
+                        "attempting additive schema maintenance"
                     )
                     _safe_close_table(table)
                     table = None
-                    # Migrate safely; on any failure the original table is left
-                    # intact and we surface an error WITHOUT dropping data.
                     try:
                         self._migrate_schema_mismatch(conn, record)
                     except Exception as migrate_error:
                         logger.error(
-                            "Safe schema migration failed; table left intact: %s",
+                            "Schema maintenance failed; table left intact: %s",
                             migrate_error,
                         )
                         return MemoryResponse(
@@ -533,7 +617,6 @@ class LanceDBMemoryStore(MemoryStore):
                             error=f"Failed to add memory: {migrate_error}",
                             memory_id=data["id"],
                         )
-                    # Retry the insert against the migrated schema.
                     table = conn.open_table(self._collection_name)
                     self._insert_record(table, record)
             finally:

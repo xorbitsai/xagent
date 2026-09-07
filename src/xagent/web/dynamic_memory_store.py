@@ -174,6 +174,9 @@ class DynamicMemoryStoreManager:
                         dimension=int(embedding_model.dimension or 1024),
                     ),
                     similarity_threshold=self._similarity_threshold or 1.5,
+                    # Store acquisition happens on request paths. Schema
+                    # maintenance belongs to an explicit startup/admin phase.
+                    run_schema_maintenance=False,
                 )
                 logger.info("Created LanceDB store with DashScope embedding model")
                 return UserIsolatedMemoryStore(lancedb_store)

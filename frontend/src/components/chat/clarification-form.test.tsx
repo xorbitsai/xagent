@@ -137,6 +137,7 @@ describe("ClarificationForm Session file capability", () => {
         "Note: Continue without a file",
         [],
         {},
+        { clientMessageId: expect.any(String) },
       )
     })
   })
@@ -195,7 +196,12 @@ describe("ClarificationForm Session file capability", () => {
     )
 
     await waitFor(() => {
-      expect(onSend).toHaveBeenCalledWith("Source: Skip upload", [], {})
+      expect(onSend).toHaveBeenCalledWith(
+        "Source: Skip upload",
+        [],
+        {},
+        { clientMessageId: expect.any(String) },
+      )
     })
   })
 
@@ -230,6 +236,7 @@ describe("ClarificationForm Session file capability", () => {
         "chatPage.clarification.uploadedFiles",
         [file],
         {},
+        { clientMessageId: expect.any(String) },
       )
     })
   })
@@ -352,6 +359,7 @@ describe("ClarificationForm connect_apps interaction", () => {
         "chatPage.clarification.connectApps.skip",
         [],
         {},
+        { clientMessageId: expect.any(String) },
       )
     })
   })
@@ -372,6 +380,7 @@ describe("ClarificationForm connect_apps interaction", () => {
         {
           force: true,
           metadata: { request_id: "inputreq_0011223344556677889900aabbccddee" },
+          clientMessageId: expect.any(String),
         },
         [],
       )
@@ -507,8 +516,9 @@ describe("ClarificationForm delivery failures", () => {
   })
 
   it("warns before a resubmit when the delivery outcome is unknown", async () => {
-    // No resubmit guard exists in this component (a retry mints a fresh
-    // client message id today), so the copy must warn - not promise safety.
+    // An unchanged resubmit reuses the delivery identity, but only the
+    // internal path is known to dedup on it - an onSend provider may not -
+    // so the copy must warn, not promise safety.
     const onSend = vi.fn().mockRejectedValue(deliveryError(
       "The task is busy applying an earlier answer.",
       "outcome_unknown",
@@ -745,7 +755,183 @@ describe("ClarificationForm interaction identity", () => {
       "City: Sydney",
       [],
       { request_id: "inputreq_0011223344556677889900aabbccddee" },
+      { clientMessageId: expect.any(String) },
     ))
+  })
+})
+
+describe("ClarificationForm delivery identity", () => {
+  beforeEach(() => {
+    appContextMock.dispatch.mockReset()
+    appContextMock.filesDisabled = false
+    appContextMock.providerAvailable = true
+    appContextMock.sendMessage.mockReset()
+    toastErrorMock.mockReset()
+  })
+
+  afterEach(() => {
+    cleanup()
+  })
+
+  // Structural, not a MessageDeliveryError instance: the contract is probed
+  // off whatever a provider throws (see clarification-delivery.ts).
+  const deliveryFailure = (
+    disposition: string,
+    options: Record<string, unknown> = {},
+  ) => Object.assign(new Error("delivery failed"), { disposition, ...options })
+
+  const interactions = [
+    { type: "text_input" as const, field: "city", label: "City" },
+  ]
+
+  const submit = () =>
+    fireEvent.click(
+      screen.getByRole("button", { name: "chatPage.clarification.submit" }),
+    )
+
+  const typeAndSubmit = (value = "Beijing") => {
+    fireEvent.change(screen.getByRole("textbox"), { target: { value } })
+    submit()
+  }
+
+  const sentClientMessageIds = () =>
+    appContextMock.sendMessage.mock.calls.map((call) => call[1]?.clientMessageId)
+
+  it("reuses one clientMessageId when the unchanged draft is resubmitted", async () => {
+    // The duplicate-turn guarantee: a resubmit of the same unresolved answer
+    // must present the same delivery identity, so the internal path's
+    // server-side dedup can recognize it instead of answering twice.
+    appContextMock.sendMessage
+      .mockRejectedValueOnce(deliveryFailure("outcome_unknown"))
+      .mockResolvedValueOnce(undefined)
+    render(<ClarificationForm interactions={interactions} />)
+
+    typeAndSubmit()
+    await screen.findByRole("alert")
+    submit()
+    await waitFor(() => expect(appContextMock.sendMessage).toHaveBeenCalledTimes(2))
+
+    const [first, second] = sentClientMessageIds()
+    expect(first).toEqual(expect.any(String))
+    expect(first).not.toBe("")
+    expect(second).toBe(first)
+  })
+
+  it("mints a fresh clientMessageId when the failure demands a new id", async () => {
+    // `retryWithNewId` is the server saying the old identity is burned - the
+    // same semantics ChatInput already honours.
+    appContextMock.sendMessage
+      .mockRejectedValueOnce(deliveryFailure("rejected", { retryWithNewId: true }))
+      .mockResolvedValueOnce(undefined)
+    render(<ClarificationForm interactions={interactions} />)
+
+    typeAndSubmit()
+    await screen.findByRole("alert")
+    submit()
+    await waitFor(() => expect(appContextMock.sendMessage).toHaveBeenCalledTimes(2))
+
+    const [first, second] = sentClientMessageIds()
+    expect(second).toEqual(expect.any(String))
+    expect(second).not.toBe(first)
+  })
+
+  it("mints a fresh clientMessageId when the draft changes between attempts", async () => {
+    // A different answer is a different turn, not a retry of the failed one.
+    appContextMock.sendMessage
+      .mockRejectedValueOnce(deliveryFailure("not_sent"))
+      .mockResolvedValueOnce(undefined)
+    render(<ClarificationForm interactions={interactions} />)
+
+    typeAndSubmit("Beijing")
+    await waitFor(() => expect(appContextMock.sendMessage).toHaveBeenCalledTimes(1))
+    typeAndSubmit("Shanghai")
+    await waitFor(() => expect(appContextMock.sendMessage).toHaveBeenCalledTimes(2))
+
+    const [first, second] = sentClientMessageIds()
+    expect(second).not.toBe(first)
+  })
+
+  it("hands onSend a delivery attempt and keeps it across an unchanged resubmit", async () => {
+    // The injected path receives the same identity the internal path sends,
+    // so a provider that can dedup gets the chance to (#1485).
+    const onSend = vi.fn()
+      .mockRejectedValueOnce(deliveryFailure("outcome_unknown"))
+      .mockResolvedValueOnce(undefined)
+    render(<ClarificationForm interactions={interactions} onSend={onSend} />)
+
+    typeAndSubmit()
+    await screen.findByRole("alert")
+    submit()
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(2))
+
+    const attempts = onSend.mock.calls.map((call) => call[3])
+    expect(attempts[0]).toEqual({ clientMessageId: expect.any(String) })
+    expect(attempts[1]).toEqual(attempts[0])
+  })
+
+  it("keeps the submit attempt alive across an interleaved connect-apps skip", async () => {
+    // A mixed interaction list renders the skip button beside Submit, so a
+    // skip can land between two submits of the same unresolved draft. The
+    // skip is its own submission - it must not burn the submit's identity.
+    mcpAppsMock.apps = [
+      {
+        id: "gmail",
+        name: "Gmail",
+        description: "",
+        icon: "",
+        users: "",
+        transport: "builtin",
+        provider: "google",
+        category: "Communication",
+        is_connected: false,
+      },
+    ]
+    mcpAppsMock.refresh.mockReset().mockResolvedValue(undefined)
+    const mixedInteractions = [
+      { type: "connect_apps" as const, field: "apps", label: "Connect", apps: ["Gmail"] },
+      { type: "text_input" as const, field: "city", label: "City" },
+    ]
+    appContextMock.sendMessage
+      .mockRejectedValueOnce(deliveryFailure("outcome_unknown"))
+      .mockResolvedValue(undefined)
+    render(<ClarificationForm interactions={mixedInteractions} />)
+
+    typeAndSubmit()
+    await screen.findByRole("alert")
+    fireEvent.click(screen.getByText("chatPage.clarification.connectApps.skip"))
+    await waitFor(() => expect(appContextMock.sendMessage).toHaveBeenCalledTimes(2))
+    submit()
+    await waitFor(() => expect(appContextMock.sendMessage).toHaveBeenCalledTimes(3))
+
+    const submitIds = appContextMock.sendMessage.mock.calls
+      .filter((call) => call[0] === "City: Beijing")
+      .map((call) => call[1]?.clientMessageId)
+    const skipIds = appContextMock.sendMessage.mock.calls
+      .filter((call) => call[0] === "chatPage.clarification.connectApps.skip")
+      .map((call) => call[1]?.clientMessageId)
+    expect(submitIds).toHaveLength(2)
+    expect(skipIds).toHaveLength(1)
+    expect(submitIds[1]).toBe(submitIds[0])
+    expect(skipIds[0]).not.toBe(submitIds[0])
+  })
+
+  it("scopes the delivery attempt to the rendered request", async () => {
+    // A new clarification round is a new question; its answer must never
+    // reuse the identity of the previous round's unresolved attempt.
+    appContextMock.sendMessage.mockRejectedValue(deliveryFailure("outcome_unknown"))
+    const form = (requestId: string) => (
+      <ClarificationForm interactions={interactions} requestId={requestId} />
+    )
+    const { rerender } = render(form("inputreq_r1"))
+
+    typeAndSubmit()
+    await waitFor(() => expect(appContextMock.sendMessage).toHaveBeenCalledTimes(1))
+    rerender(form("inputreq_r2"))
+    typeAndSubmit()
+    await waitFor(() => expect(appContextMock.sendMessage).toHaveBeenCalledTimes(2))
+
+    const [first, second] = sentClientMessageIds()
+    expect(second).not.toBe(first)
   })
 })
 

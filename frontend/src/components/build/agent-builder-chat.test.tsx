@@ -135,8 +135,13 @@ vi.mock("@/components/chat/ChatMessage", () => ({
                 new File(["data"], "data.txt", { type: "text/plain" }),
               ])
               setStatus("resolved")
-            } catch {
-              setStatus("rejected")
+            } catch (error) {
+              // Surface the declared delivery contract (#1485): the form
+              // probes `disposition` off whatever this callback rejects with.
+              const disposition = (error as { disposition?: unknown })?.disposition
+              setStatus(
+                `rejected:${typeof disposition === "string" ? disposition : "untyped"}`,
+              )
             }
           }}
         >
@@ -279,8 +284,39 @@ describe("AgentBuilderChat", () => {
     })
 
     await waitFor(() => {
-      expect(screen.getByText("rejected")).toBeInTheDocument()
+      // The upload failed before anything reached the agent, and the typed
+      // failure must say so - "not_sent" is what lets ClarificationForm tell
+      // the visitor a resubmit is safe.
+      expect(screen.getByText("rejected:not_sent")).toBeInTheDocument()
     })
+    // The resubmit that hint invites must not stack a duplicate answer: both
+    // optimistic bubbles (user + assistant placeholder) are rolled back,
+    // leaving only the initial greeting.
+    expect(screen.getAllByTestId("chat-message")).toHaveLength(1)
+  })
+
+  it("rolls back both optimistic bubbles when the connection setup throws", async () => {
+    apiRequestMock.mockResolvedValueOnce(
+      successfulUploadResponse([{ file_id: "file-1", filename: "data.txt" }])
+    )
+    class ThrowingWebSocket {
+      static OPEN = 1
+      constructor(_url: string) {
+        throw new Error("SecurityError: insecure WebSocket")
+      }
+    }
+    globalThis.WebSocket = ThrowingWebSocket as unknown as typeof WebSocket
+
+    renderBuilderChat()
+    fireEvent.click(await screen.findByText("send-file-interaction"))
+
+    // Nothing reached the wire, so the interaction rejects as not_sent and
+    // the transcript returns to just the greeting - a hinted resubmit must
+    // not find a stranded answer bubble or blank placeholder.
+    await waitFor(() => {
+      expect(screen.getByText("rejected:not_sent")).toBeInTheDocument()
+    })
+    expect(screen.getAllByTestId("chat-message")).toHaveLength(1)
   })
 
   it.each([

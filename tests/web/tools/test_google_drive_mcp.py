@@ -137,6 +137,90 @@ def test_id_taking_tools_resolve_full_drive_urls(monkeypatch, mock_target, invok
     assert mock_target(service).call_args.kwargs["fileId"] == "abc123"
 
 
+def test_search_passes_shared_drive_support_and_clamps_max_results(monkeypatch):
+    service = _mock_drive_service(monkeypatch)
+    service.files.return_value.list.return_value.execute.return_value = {
+        "files": [{"id": "f1", "name": "notes.txt"}]
+    }
+
+    result = json.loads(google_drive.google_drive_search("notes", max_results=999999))
+
+    assert result["status"] == "success"
+    assert result["files"][0]["id"] == "f1"
+    assert result["truncated"] is False
+    kwargs = service.files.return_value.list.call_args.kwargs
+    assert kwargs["supportsAllDrives"] is True
+    assert kwargs["includeItemsFromAllDrives"] is True
+    assert kwargs["pageSize"] == 1000  # clamped, not the raw 999999
+
+
+def test_search_caps_oversized_output(monkeypatch):
+    service = _mock_drive_service(monkeypatch)
+    huge_files = [
+        {"id": f"f{i}", "name": "x" * 200, "mimeType": "text/plain"}
+        for i in range(2000)
+    ]
+    service.files.return_value.list.return_value.execute.return_value = {
+        "files": huge_files
+    }
+
+    result = json.loads(google_drive.google_drive_search("x"))
+
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert 0 < len(result["files"]) < len(huge_files)
+
+
+def test_search_returns_error_payload_on_failure(monkeypatch):
+    service = _mock_drive_service(monkeypatch)
+    service.files.return_value.list.return_value.execute.side_effect = RuntimeError(
+        "quota exceeded"
+    )
+
+    result = json.loads(google_drive.google_drive_search("x"))
+
+    assert result["status"] == "error"
+    assert "quota exceeded" in result["message"]
+
+
+def test_create_file_resolves_parent_id_url_and_supports_shared_drives(monkeypatch):
+    service = _mock_drive_service(monkeypatch)
+    service.files.return_value.create.return_value.execute.return_value = {
+        "id": "new1",
+        "name": "notes.txt",
+    }
+
+    result = json.loads(
+        google_drive.google_drive_create_file(
+            "notes.txt", "hello", parent_id=_FOLDER_URL_WITH_ID
+        )
+    )
+
+    assert result["status"] == "success"
+    kwargs = service.files.return_value.create.call_args.kwargs
+    assert kwargs["body"]["parents"] == ["abc123"]
+    assert kwargs["supportsAllDrives"] is True
+
+
+def test_create_folder_resolves_parent_id_url_and_supports_shared_drives(monkeypatch):
+    service = _mock_drive_service(monkeypatch)
+    service.files.return_value.create.return_value.execute.return_value = {
+        "id": "new1",
+        "name": "Subfolder",
+    }
+
+    result = json.loads(
+        google_drive.google_drive_create_folder(
+            "Subfolder", parent_id=_FOLDER_URL_WITH_ID
+        )
+    )
+
+    assert result["status"] == "success"
+    kwargs = service.files.return_value.create.call_args.kwargs
+    assert kwargs["body"]["parents"] == ["abc123"]
+    assert kwargs["supportsAllDrives"] is True
+
+
 def test_get_file_content_resolves_full_drive_url(monkeypatch):
     service = _mock_drive_service(monkeypatch)
     service.files.return_value.get.return_value.execute.return_value = {
@@ -217,6 +301,30 @@ def test_list_permissions_caps_oversized_output(monkeypatch):
     assert result["status"] == "success"
     assert result["truncated"] is True
     assert 0 < len(result["permissions"]) < len(huge_permissions)
+
+
+def test_list_permissions_follows_next_page_token(monkeypatch):
+    """A Shared Drive item returns at most 100 permissions per page when
+    pageSize isn't set; without following nextPageToken, a heavily-shared
+    Shared Drive folder would silently under-report collaborators."""
+    service = _mock_drive_service(monkeypatch)
+    service.permissions.return_value.list.return_value.execute.side_effect = [
+        {
+            "permissions": [{"id": "perm1"}],
+            "nextPageToken": "page2",
+        },
+        {
+            "permissions": [{"id": "perm2"}],
+        },
+    ]
+
+    result = json.loads(google_drive.google_drive_list_permissions("fid"))
+
+    assert result["status"] == "success"
+    assert [p["id"] for p in result["permissions"]] == ["perm1", "perm2"]
+    calls = service.permissions.return_value.list.call_args_list
+    assert calls[0].kwargs["pageToken"] is None
+    assert calls[1].kwargs["pageToken"] == "page2"
 
 
 def test_list_permissions_defaults_missing_key(monkeypatch):

@@ -15,7 +15,12 @@ from googleapiclient.http import (  # type: ignore[import-not-found]
 from mcp.server.fastmcp import FastMCP
 
 from ....config import get_tool_max_output_length
-from .utils import require_clean_identifier, resolve_id_from_url, setup_proxy_env
+from .utils import (
+    clamp_limit,
+    require_clean_identifier,
+    resolve_id_from_url,
+    setup_proxy_env,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("google-drive-mcp")
@@ -59,23 +64,26 @@ def _require_share_role(role: str) -> str:
     return role
 
 
-def _capped_permissions_response(permissions: list[Any]) -> str:
-    """Build the success payload, halving ``permissions`` until it fits the
+def _capped_list_response(field_name: str, items: list[Any]) -> str:
+    """Build the success payload, halving ``items`` until it fits the
     platform's output limit -- mirrors deputy.py's/salesforce.py's
     _success_with_capped_list. There is no cursor to resume from here, so
     entries dropped this way are gone for this call, not just this page.
     """
     max_output_length = get_tool_max_output_length()
-    truncated = False
-    response = json.dumps(
-        {"status": "success", "permissions": permissions, "truncated": truncated}
-    )
-    while len(response) > max_output_length and permissions:
-        permissions = permissions[: len(permissions) // 2]
-        truncated = True
-        response = json.dumps(
-            {"status": "success", "permissions": permissions, "truncated": truncated}
+
+    def _build(items: list[Any], truncated: bool) -> str:
+        return json.dumps(
+            {"status": "success", field_name: items, "truncated": truncated},
+            ensure_ascii=False,
         )
+
+    truncated = False
+    response = _build(items, truncated)
+    while len(response) > max_output_length and items:
+        items = items[: len(items) // 2]
+        truncated = True
+        response = _build(items, truncated)
     return response
 
 
@@ -115,17 +123,19 @@ def google_drive_search(query: str = "", max_results: int = 10) -> str:
             service.files()
             .list(
                 q=query if query else None,
-                pageSize=max_results,
+                pageSize=clamp_limit(max_results, max_limit=1000),
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
                 fields="nextPageToken, files(id, name, mimeType, modifiedTime)",
             )
             .execute()
         )
         items = results.get("files", [])
 
-        return json.dumps({"status": "success", "files": items})
+        return _capped_list_response("files", items)
     except Exception as e:
         logger.error(f"Error searching drive: {e}")
-        return json.dumps({"status": "error", "message": str(e)})
+        return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -139,7 +149,11 @@ def google_drive_get_file_content(file_id: str, mime_type: str = "text/plain") -
         service = get_drive_service()
         file_metadata = (
             service.files()
-            .get(fileId=resolved_file_id, fields="id, name, mimeType")
+            .get(
+                fileId=resolved_file_id,
+                supportsAllDrives=True,
+                fields="id, name, mimeType",
+            )
             .execute()
         )
         file_mime_type = file_metadata.get("mimeType", "")
@@ -151,24 +165,27 @@ def google_drive_get_file_content(file_id: str, mime_type: str = "text/plain") -
             )
         else:
             # Download regular file
-            request = service.files().get_media(fileId=resolved_file_id)
+            request = service.files().get_media(
+                fileId=resolved_file_id, supportsAllDrives=True
+            )
 
         fh = io.BytesIO()
         downloader = MediaIoBaseDownload(fh, request)
         done = False
         while done is False:
-            status, done = downloader.next_chunk()
+            _, done = downloader.next_chunk()
 
         return json.dumps(
             {
                 "status": "success",
                 "file": file_metadata,
                 "content": fh.getvalue().decode("utf-8", errors="replace"),
-            }
+            },
+            ensure_ascii=False,
         )
     except Exception as e:
         logger.error(f"Error getting file content: {e}")
-        return json.dumps({"status": "error", "message": str(e)})
+        return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -184,7 +201,7 @@ def google_drive_create_file(
         service = get_drive_service()
         file_metadata: dict[str, Any] = {"name": name, "mimeType": mime_type}
         if parent_id:
-            file_metadata["parents"] = [parent_id]
+            file_metadata["parents"] = [_resolve_file_id(parent_id)]
 
         fh = io.BytesIO(content.encode("utf-8"))
 
@@ -197,15 +214,16 @@ def google_drive_create_file(
             .create(
                 body=file_metadata,
                 media_body=media,
+                supportsAllDrives=True,
                 fields="id, name, webViewLink, mimeType",
             )
             .execute()
         )
 
-        return json.dumps({"status": "success", "file": file})
+        return json.dumps({"status": "success", "file": file}, ensure_ascii=False)
     except Exception as e:
         logger.error(f"Error creating file: {e}")
-        return json.dumps({"status": "error", "message": str(e)})
+        return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -220,18 +238,22 @@ def google_drive_create_folder(name: str, parent_id: str | None = None) -> str:
             "mimeType": "application/vnd.google-apps.folder",
         }
         if parent_id:
-            file_metadata["parents"] = [parent_id]
+            file_metadata["parents"] = [_resolve_file_id(parent_id)]
 
         folder = (
             service.files()
-            .create(body=file_metadata, fields="id, name, webViewLink")
+            .create(
+                body=file_metadata,
+                supportsAllDrives=True,
+                fields="id, name, webViewLink",
+            )
             .execute()
         )
 
-        return json.dumps({"status": "success", "folder": folder})
+        return json.dumps({"status": "success", "folder": folder}, ensure_ascii=False)
     except Exception as e:
         logger.error(f"Error creating folder: {e}")
-        return json.dumps({"status": "error", "message": str(e)})
+        return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -249,15 +271,18 @@ def google_drive_rename_file(file_id: str, new_name: str) -> str:
             .update(
                 fileId=resolved_file_id,
                 body=file_metadata,
+                supportsAllDrives=True,
                 fields="id, name, webViewLink, mimeType",
             )
             .execute()
         )
 
-        return json.dumps({"status": "success", "file": updated_file})
+        return json.dumps(
+            {"status": "success", "file": updated_file}, ensure_ascii=False
+        )
     except Exception as e:
         logger.error(f"Error renaming file: {e}")
-        return json.dumps({"status": "error", "message": str(e)})
+        return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
 
 
 def _execute_ignoring_204_ssl_eof(
@@ -320,11 +345,12 @@ def google_drive_delete_file(file_id: str) -> str:
             {
                 "status": "success",
                 "message": f"File/Folder {resolved_file_id} successfully deleted.",
-            }
+            },
+            ensure_ascii=False,
         )
     except Exception as e:
         logger.error(f"Error deleting file: {e}")
-        return json.dumps({"status": "error", "message": str(e)})
+        return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -336,21 +362,39 @@ def google_drive_list_permissions(file_id: str) -> str:
     google_drive_remove_permission.
     """
     try:
+        resolved_file_id = _resolve_file_id(file_id)
         service = get_drive_service()
-        results = (
-            service.permissions()
-            .list(
-                fileId=_resolve_file_id(file_id),
-                supportsAllDrives=True,
-                fields="permissions(id, type, role, emailAddress, displayName)",
+        permissions: list[Any] = []
+        page_token: str | None = None
+        # For an item in a Shared Drive, Drive returns at most 100
+        # permissions per page when pageSize isn't set (a non-Shared-Drive
+        # item always returns everything in one page); follow
+        # nextPageToken so a heavily-shared Shared Drive folder isn't
+        # silently under-reported. Bounded so a misbehaving API response
+        # can't turn this into an infinite loop.
+        for _ in range(1000):
+            results = (
+                service.permissions()
+                .list(
+                    fileId=resolved_file_id,
+                    supportsAllDrives=True,
+                    pageToken=page_token,
+                    fields=(
+                        "nextPageToken, "
+                        "permissions(id, type, role, emailAddress, displayName)"
+                    ),
+                )
+                .execute()
             )
-            .execute()
-        )
+            permissions.extend(results.get("permissions", []))
+            page_token = results.get("nextPageToken")
+            if not page_token:
+                break
 
-        return _capped_permissions_response(results.get("permissions", []))
+        return _capped_list_response("permissions", permissions)
     except Exception as e:
         logger.error(f"Error listing permissions: {e}")
-        return json.dumps({"status": "error", "message": str(e)})
+        return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -393,10 +437,12 @@ def google_drive_share_file(
 
         permission = service.permissions().create(**create_kwargs).execute()
 
-        return json.dumps({"status": "success", "permission": permission})
+        return json.dumps(
+            {"status": "success", "permission": permission}, ensure_ascii=False
+        )
     except Exception as e:
         logger.error(f"Error sharing file: {e}")
-        return json.dumps({"status": "error", "message": str(e)})
+        return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -428,10 +474,12 @@ def google_drive_update_permission(file_id: str, permission_id: str, role: str) 
             .execute()
         )
 
-        return json.dumps({"status": "success", "permission": permission})
+        return json.dumps(
+            {"status": "success", "permission": permission}, ensure_ascii=False
+        )
     except Exception as e:
         logger.error(f"Error updating permission: {e}")
-        return json.dumps({"status": "error", "message": str(e)})
+        return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -472,11 +520,12 @@ def google_drive_remove_permission(file_id: str, permission_id: str) -> str:
             {
                 "status": "success",
                 "message": f"Permission {resolved_permission_id} successfully removed.",
-            }
+            },
+            ensure_ascii=False,
         )
     except Exception as e:
         logger.error(f"Error removing permission: {e}")
-        return json.dumps({"status": "error", "message": str(e)})
+        return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
 
 
 if __name__ == "__main__":

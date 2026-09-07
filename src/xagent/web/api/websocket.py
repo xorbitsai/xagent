@@ -232,6 +232,13 @@ from ..services.uploaded_file_store import (
     snapshot_uploaded_file_version,
     stage_uploaded_file_from_local_path,
 )
+from ..services.websocket_writer import (
+    WebSocketWriterRetiredError,
+    activate_websocket_writer,
+    fanout_websocket_text,
+    retire_websocket_writer,
+    send_websocket_text,
+)
 from ..services.workforce_runtime import (
     sync_workforce_run_status,
 )
@@ -5136,6 +5143,7 @@ class ConnectionManager:
 
     def register_connection(self, websocket: WebSocket, task_id: int) -> None:
         """Register an already-accepted websocket for task broadcasts."""
+        activate_websocket_writer(websocket)
         current_task_id = self._connection_task_ids.get(websocket)
         if current_task_id is not None and current_task_id != task_id:
             self._remove_from_task(websocket, current_task_id)
@@ -5155,6 +5163,12 @@ class ConnectionManager:
                 pass
 
     def disconnect(self, websocket: WebSocket) -> None:
+        self.unregister_connection(websocket)
+        retire_websocket_writer(websocket)
+
+    def unregister_connection(self, websocket: WebSocket) -> None:
+        """Detach task routing while keeping the accepted socket usable."""
+
         task_id = self._connection_task_ids.pop(websocket, None)
         if task_id is not None:
             self._remove_from_task(websocket, task_id)
@@ -5167,6 +5181,7 @@ class ConnectionManager:
             if self._connection_task_ids.get(connection) == task_id:
                 del self._connection_task_ids[connection]
             _command_origins.discard_socket(connection)
+            retire_websocket_writer(connection)
         return connections
 
     def connections_for_task(self, task_id: int) -> List[WebSocket]:
@@ -5187,37 +5202,56 @@ class ConnectionManager:
 
     async def send_personal_message(self, message: dict, websocket: WebSocket) -> None:
         versioned_message = await _with_current_task_control_state(message)
-        await websocket.send_text(json.dumps(versioned_message))
+        await send_websocket_text(websocket, json.dumps(versioned_message))
 
     async def broadcast_to_task(self, message: dict, task_id: int) -> None:
-        if self.connections_for_task(task_id):
-            versioned_message = await _with_current_task_control_state(
-                message,
-                fallback_task_id=task_id,
-            )
-            for connection in self.connections_for_task(task_id):
-                if not self.is_connection_registered(connection, task_id):
-                    continue
-                try:
-                    await connection.send_text(json.dumps(versioned_message))
-                except (
+        if not self.connections_for_task(task_id):
+            return
+        versioned_message = await _with_current_task_control_state(
+            message,
+            fallback_task_id=task_id,
+        )
+        # Enrichment awaits a task-control snapshot, which is long enough for a
+        # client to finish its handshake and register. Take the membership
+        # snapshot that decides delivery after that await, not before it.
+        connections = self.connections_for_task(task_id)
+        if not connections:
+            return
+        failures = await fanout_websocket_text(
+            connections,
+            json.dumps(versioned_message),
+            is_active=lambda connection: self.is_connection_registered(
+                connection,
+                task_id,
+            ),
+        )
+        unexpected: Exception | None = None
+        for connection, error in failures:
+            if isinstance(error, WebSocketWriterRetiredError):
+                # The connection was retired while its frame waited its turn,
+                # so its own teardown is already running. That is the ordered
+                # writer's equivalent of the membership recheck skipping a
+                # departed connection, not a transport failure worth a warning.
+                continue
+            if isinstance(
+                error,
+                (
                     BrokenResourceError,
                     ClosedResourceError,
                     ConnectionError,
                     WebSocketDisconnect,
                     RuntimeError,
-                ) as e:
-                    # Network connection error, remove disconnected connection
-                    logger.warning(f"Connection error for task {task_id}: {e}")
-                    self.disconnect(connection)
-                except Exception as e:
-                    # Other errors should not be silently handled, log and re-raise
-                    logger.error(
-                        f"Unexpected error broadcasting to task {task_id}: {e}"
-                    )
-                    # Remove disconnected connection but preserve error propagation
-                    self.disconnect(connection)
-                    raise
+                ),
+            ):
+                logger.warning(f"Connection error for task {task_id}: {error}")
+            else:
+                logger.error(
+                    f"Unexpected error broadcasting to task {task_id}: {error}"
+                )
+                unexpected = unexpected or error
+            self.disconnect(connection)
+        if unexpected is not None:
+            raise unexpected
 
 
 # Global connection manager
@@ -10598,7 +10632,7 @@ async def websocket_build_preview_endpoint(
                         )
                     )
             elif message_type == "clear_context":
-                manager.disconnect(websocket)
+                manager.unregister_connection(websocket)
                 websocket.state.preview_task_id = None
                 await websocket.send_text(
                     json.dumps(

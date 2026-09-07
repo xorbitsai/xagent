@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -17,6 +18,7 @@ from xagent.web.api.websocket import (
 from xagent.web.models.database import Base, get_db, get_engine, init_db
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
+from xagent.web.services.websocket_writer import retire_websocket_writer
 
 
 class _BlockingWebSocket:
@@ -517,7 +519,58 @@ async def test_broadcast_rechecks_membership_after_message_enrichment(
 
 
 @pytest.mark.asyncio
-async def test_broadcast_skips_connection_moved_during_fanout() -> None:
+async def test_broadcast_reaches_a_connection_registered_during_enrichment(
+    monkeypatch,
+) -> None:
+    task_id = 42
+    early_websocket = _RecordingWebSocket()
+    latecomer_websocket = _RecordingWebSocket()
+    connection_manager = ConnectionManager()
+    connection_manager.register_connection(early_websocket, task_id)
+
+    async def register_during_enrichment(message, **kwargs):
+        connection_manager.register_connection(latecomer_websocket, task_id)
+        return message
+
+    monkeypatch.setattr(
+        websocket_api,
+        "_with_current_task_control_state",
+        register_during_enrichment,
+    )
+
+    await connection_manager.broadcast_to_task({"type": "diagnostic"}, task_id)
+
+    # Enrichment awaits a task-control snapshot, which is long enough for a
+    # client to finish its handshake. The membership that decides delivery is
+    # the one that holds once the payload is ready, not the one sampled before.
+    frame = json.dumps({"type": "diagnostic"})
+    assert early_websocket.messages == [frame]
+    assert latecomer_websocket.messages == [frame]
+
+
+@pytest.mark.asyncio
+async def test_broadcast_does_not_log_a_retired_connection_as_a_transport_failure(
+    caplog,
+) -> None:
+    task_id = 42
+    websocket = _RecordingWebSocket()
+    connection_manager = ConnectionManager()
+    connection_manager.register_connection(websocket, task_id)
+    # The socket's own teardown retires its writer before the task membership
+    # is dropped, so an overlapping broadcast observes a retired generation.
+    retire_websocket_writer(websocket)
+
+    with caplog.at_level(logging.WARNING, logger=websocket_api.logger.name):
+        await connection_manager.broadcast_to_task({"type": "diagnostic"}, task_id)
+
+    assert websocket.messages == []
+    assert "Connection error for task" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_broadcast_uses_membership_snapshot_without_cross_socket_blocking() -> (
+    None
+):
     task_id = 42
     moved_task_id = 99
     blocking_websocket = _BlockingSendWebSocket()
@@ -534,7 +587,10 @@ async def test_broadcast_skips_connection_moved_during_fanout() -> None:
     blocking_websocket.release_send.set()
     await broadcast
 
-    assert moved_websocket.messages == []
+    # The socket was authorized when fan-out began. Per-connection sends now
+    # progress independently, so moving another socket cannot retroactively
+    # cancel a frame that was already scheduled for this connection.
+    assert moved_websocket.messages == [json.dumps({"type": "diagnostic"})]
     assert connection_manager.active_connections == {
         task_id: [blocking_websocket],
         moved_task_id: [moved_websocket],

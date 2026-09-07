@@ -105,13 +105,15 @@ def google_calendar_create_events(
     description: str | None = None,
     location: str | None = None,
     attendees: list[str] | None = None,
+    notify_attendees: bool = False,
     add_google_meet: bool = False,
 ) -> str:
     """
     Create a new event in Google Calendar.
     start_time and end_time must be RFC3339 formatted (e.g., '2024-01-01T10:00:00Z' or '2024-01-01T10:00:00-07:00').
-    attendees is a list of email addresses to invite; passing any attendees makes Google Calendar
-    email them a native invite immediately, so confirm the recipient list with the user first.
+    attendees is a list of email addresses to add to the event. Adding attendees does not, by
+    itself, email them; set notify_attendees=True to have Google Calendar send them a native
+    invite immediately. Confirm the recipient list with the user before setting notify_attendees=True.
     Set add_google_meet=True to attach a real Google Meet video-conference link to the event
     (the link is returned as hangout_link); a plain "Google Meet" string in location does not do this.
     """
@@ -141,7 +143,7 @@ def google_calendar_create_events(
             calendarId="primary",
             body=event,
             conferenceDataVersion=1 if add_google_meet else 0,
-            sendUpdates="all" if attendees else "none",
+            sendUpdates="all" if (attendees and notify_attendees) else "none",
         )
         created_event = request.execute()
         return json.dumps(_event_response(created_event))
@@ -174,13 +176,15 @@ def google_calendar_update_events(
     description: str | None = None,
     location: str | None = None,
     attendees: list[str] | None = None,
+    notify_attendees: bool = False,
     add_google_meet: bool = False,
 ) -> str:
     """
     Update an existing event in Google Calendar.
     start_time and end_time must be RFC3339 formatted if provided.
-    attendees is a list of email addresses to invite; passing any attendees makes Google Calendar
-    email them a native invite immediately, so confirm the recipient list with the user first.
+    attendees is a list of email addresses to add to the event. Adding attendees does not, by
+    itself, email them; set notify_attendees=True to have Google Calendar send them a native
+    invite immediately. Confirm the recipient list with the user before setting notify_attendees=True.
     Set add_google_meet=True to attach a real Google Meet video-conference link to the event
     (the link is returned as hangout_link); a plain "Google Meet" string in location does not do this.
     """
@@ -210,7 +214,7 @@ def google_calendar_update_events(
             eventId=event_id,
             body=event,
             conferenceDataVersion=1 if add_google_meet else 0,
-            sendUpdates="all" if attendees else "none",
+            sendUpdates="all" if (attendees and notify_attendees) else "none",
         )
         updated_event = request.execute()
         return json.dumps(_event_response(updated_event))

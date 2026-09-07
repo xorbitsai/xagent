@@ -95,13 +95,14 @@ def _merge_attendees(event: dict[str, Any], attendees: list[str] | None) -> None
         return
     existing = event.get("attendees") or []
     existing_emails = {a.get("email") for a in existing if isinstance(a, dict)}
-    new_attendees = []
-    seen = set()
-    for email in attendees:
-        if email not in existing_emails and email not in seen:
-            new_attendees.append({"email": email})
-            seen.add(email)
-    event["attendees"] = existing + new_attendees
+
+    # dict.fromkeys dedupes attendees while preserving order (Python 3.7+).
+    unique_new_emails = dict.fromkeys(attendees)
+    new_attendees = [
+        {"email": email} for email in unique_new_emails if email not in existing_emails
+    ]
+    if new_attendees:
+        event["attendees"] = existing + new_attendees
 
 
 def _conference_and_notify_kwargs(
@@ -120,9 +121,7 @@ def _conference_and_notify_kwargs(
         _add_conference_request(event)
     return {
         "conferenceDataVersion": 1,
-        "sendUpdates": "all"
-        if (event.get("attendees") and notify_attendees)
-        else "none",
+        "sendUpdates": "all" if notify_attendees and event.get("attendees") else "none",
     }
 
 

@@ -505,6 +505,16 @@ jobs:
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 
+      # The MCP transport backfill's only dialect-specific branch is the
+      # padding-character function (PostgreSQL chr() vs SQLite char()); the
+      # SQLite half of this file runs in the ordinary suite.
+      - name: Test MCP transport backfill migration (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/migrations/test_20260828_normalize_mcp_transport_case.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
       - name: Test legacy resume interaction close rowcount grid (Postgres-only)
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |

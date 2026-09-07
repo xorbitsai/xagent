@@ -3,8 +3,8 @@
 Covers registration, the sink's frame filter and exception discipline,
 the watchdog, the 1-hour cap, concurrency caps, and the ``step.*`` /
 ``message.*`` content projection layered on top of that transport
-(classification, filtering, and the fast paths' cached step
-snapshot). Tests either drive ``_events_stream`` directly (fast,
+(classification, filtering, warm-up replay, and the fast paths' cached
+step snapshot). Tests either drive ``_events_stream`` directly (fast,
 deterministic -- used whenever a test needs injected short intervals or
 precise control over the race between the watchdog and the deadline) or
 go through the real HTTP endpoint (used for the 401/404/429/terminal-
@@ -182,10 +182,38 @@ def _key_prefix_for_agent(agent_id: int) -> str:
         db.close()
 
 
-def _make_sink(task_id: int = 1, status: str = "running") -> es.V1EventStreamSink:
-    return es.V1EventStreamSink(
+def _current_watermark(task_id: int, principal: ApiKeyPrincipal) -> int:
+    """The replay watermark a real attach captures right after
+    registration, read the same way ``_generate`` reads it.
+
+    ``_build_warm_up_frames`` requires one -- there is no "replay
+    everything" mode -- so a test that wants the task's whole history
+    admitted asks for the current cursor rather than inventing a
+    sentinel that could drift from what the endpoint would have used.
+    """
+    return int(
+        v1_tasks._load_task_steps_version_snapshot(task_id, principal).max_event_id
+    )
+
+
+def _make_sink(
+    task_id: int = 1, status: str = "running", *, warm: bool = True
+) -> es.V1EventStreamSink:
+    """``warm=True`` (the default) finishes warm-up immediately with an
+    empty projector, so a bare ``send_text`` call projects content
+    frames right away instead of staging them -- what every content-
+    projection test here wants except the ones that specifically test
+    staging/warm-up itself (``warm=False``, see the warm-up section).
+
+    ``retain_finished=False`` because ``finish_warm_up`` requires it --
+    a live sink never reads a timeline back, so a retaining projector is
+    rejected rather than left to accumulate one (see that method)."""
+    sink = es.V1EventStreamSink(
         task_id=task_id, principal_key_prefix="pfx-test", initial_status=status
     )
+    if warm:
+        sink.finish_warm_up(es.PublicStepProjector(retain_finished=False))
+    return sink
 
 
 def _insert_trace_event(
@@ -493,6 +521,7 @@ async def test_events_paused_attach_does_not_take_a_fast_path():
         principal=principal,
         initial_snapshot=snapshot,
         read_task_snapshot=v1_tasks._load_task_info_snapshot,
+        read_task_steps=v1_tasks._load_task_steps_snapshot,
         read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
         read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
         **_long_intervals(),
@@ -535,6 +564,7 @@ async def test_sse_responses_disable_proxy_buffering(task_state):
         principal=principal,
         initial_snapshot=snapshot,
         read_task_snapshot=v1_tasks._load_task_info_snapshot,
+        read_task_steps=v1_tasks._load_task_steps_snapshot,
         read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
         read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
         **_long_intervals(),
@@ -592,6 +622,7 @@ async def test_fast_path_failure_sends_the_response_start_before_its_close_frame
         principal=principal,
         initial_snapshot=snapshot,
         read_task_snapshot=_unreachable_read_task_snapshot,
+        read_task_steps=v1_tasks._load_task_steps_snapshot,
         read_task_steps_response=_broken_read_task_steps_response,
         read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
     )
@@ -734,6 +765,7 @@ async def test_generator_read_path_keeps_queued_wire_bytes_at_zero_between_frame
         principal=principal,
         initial_snapshot=snapshot,
         read_task_snapshot=v1_tasks._load_task_info_snapshot,
+        read_task_steps=v1_tasks._load_task_steps_snapshot,
         read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
         read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
         **_long_intervals(),
@@ -783,6 +815,7 @@ async def test_watchdog_closes_within_one_cycle_on_key_invalidation(field):
     )
     assert closed is True
     assert sink.closing is True
+    assert sink.abortive_close is True
     assert sink.queue.get_nowait() == (es.error_frame("unauthorized"), True)
 
 
@@ -916,6 +949,7 @@ async def test_watchdog_terminal_task_row_closes_with_completed():
         sink, task_id, principal, read_task_snapshot=v1_tasks._load_task_info_snapshot
     )
     assert closed is True
+    assert sink.abortive_close is False
     assert sink.queue.get_nowait() == (
         es.completed_frame(status="failed", output=None, error="boom"),
         True,
@@ -944,6 +978,7 @@ async def test_watchdog_missing_task_row_closes_with_task_deleted():
         sink, task_id, principal, read_task_snapshot=v1_tasks._load_task_info_snapshot
     )
     assert closed is True
+    assert sink.abortive_close is True
     assert sink.queue.get_nowait() == (es.error_frame("task_deleted"), True)
 
 
@@ -963,6 +998,7 @@ async def test_real_delete_route_closes_stream_with_task_deleted():
         principal=principal,
         initial_snapshot=snapshot,
         read_task_snapshot=v1_tasks._load_task_info_snapshot,
+        read_task_steps=v1_tasks._load_task_steps_snapshot,
         read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
         read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
         **_long_intervals(watchdog_interval_seconds=0.01),
@@ -1017,6 +1053,7 @@ async def test_watchdog_survives_transient_check_failure_and_still_closes():
         principal=principal,
         initial_snapshot=snapshot,
         read_task_snapshot=flaky_reader,
+        read_task_steps=v1_tasks._load_task_steps_snapshot,
         read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
         read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
         **_long_intervals(watchdog_interval_seconds=0.01),
@@ -1106,6 +1143,7 @@ async def test_sink_unregistered_after_generator_teardown():
         principal=principal,
         initial_snapshot=snapshot,
         read_task_snapshot=v1_tasks._load_task_info_snapshot,
+        read_task_steps=v1_tasks._load_task_steps_snapshot,
         read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
         read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
         **_long_intervals(),
@@ -1145,6 +1183,7 @@ async def test_unstarted_generator_leaves_no_registration_or_reservation():
         principal=principal,
         initial_snapshot=snapshot,
         read_task_snapshot=v1_tasks._load_task_info_snapshot,
+        read_task_steps=v1_tasks._load_task_steps_snapshot,
         read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
         read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
         **_long_intervals(),
@@ -1202,6 +1241,7 @@ async def test_principal_slot_released_after_real_stream_teardown():
         principal=principal,
         initial_snapshot=snapshot,
         read_task_snapshot=v1_tasks._load_task_info_snapshot,
+        read_task_steps=v1_tasks._load_task_steps_snapshot,
         read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
         read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
         **_long_intervals(),
@@ -1249,6 +1289,8 @@ async def test_generate_serves_stream_when_reservation_race_lost(caplog):
             key_prefix=key_prefix,
             initial_status=snapshot.status.value,
             read_task_snapshot=v1_tasks._load_task_info_snapshot,
+            read_task_steps=v1_tasks._load_task_steps_snapshot,
+            read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
             **_long_intervals(),
         )
         first = await agen.__anext__()
@@ -1290,6 +1332,7 @@ async def test_absolute_deadline_emits_expired_then_closes():
         principal=principal,
         initial_snapshot=snapshot,
         read_task_snapshot=v1_tasks._load_task_info_snapshot,
+        read_task_steps=v1_tasks._load_task_steps_snapshot,
         read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
         read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
         **_long_intervals(
@@ -1325,6 +1368,7 @@ async def test_deadline_wait_budget_shrinks_below_the_heartbeat():
         principal=principal,
         initial_snapshot=snapshot,
         read_task_snapshot=v1_tasks._load_task_info_snapshot,
+        read_task_steps=v1_tasks._load_task_steps_snapshot,
         read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
         read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
         **_long_intervals(
@@ -1370,6 +1414,21 @@ async def test_close_frame_delivered_when_enqueued_between_two_yields():
     async def _never_read(task_id, principal):  # pragma: no cover
         raise AssertionError("watchdog must not run in this test")
 
+    def _empty_steps(task_id, principal):
+        # Real, working (unlike ``_never_read`` above) -- the warm-up
+        # read in ``_generate`` always runs, unconditionally, right
+        # after the first yield. No history for this sentinel task_id,
+        # so warm-up completes with zero replay frames and the test's
+        # hand-driven ``asend`` sequence below still lands on the next
+        # ``yield`` being the while loop's first dequeue, as before.
+        return SimpleNamespace(events=())
+
+    def _steps_cursor(task_id, principal):
+        # Also real and working, for the same reason: the watermark read
+        # runs unconditionally at registration, and a failure there would
+        # close the stream for resync before the sequence below starts.
+        return SimpleNamespace(max_event_id=0)
+
     task_id = 987_654_321  # sentinel, not a real DB row -- unused by this test
     gen = es._generate(
         task_id,
@@ -1377,6 +1436,8 @@ async def test_close_frame_delivered_when_enqueued_between_two_yields():
         key_prefix="pfx-close-frame-race-test",
         initial_status="running",
         read_task_snapshot=_never_read,
+        read_task_steps=_empty_steps,
+        read_task_steps_version=_steps_cursor,
         watchdog_interval_seconds=10_000,
         stream_max_duration_seconds=10_000,
         heartbeat_interval_seconds=10_000,
@@ -1419,6 +1480,371 @@ async def test_close_frame_delivered_when_enqueued_between_two_yields():
         await gen.aclose()
 
 
+# ===== an abortive close (unauthorized / task_deleted) cuts the warm-up
+# replay short; every other close reason lets it finish first =====
+
+
+async def _three_step_task() -> tuple[int, ApiKeyPrincipal]:
+    """A real task with three independent, still-``running`` steps (no
+    end event for any of them), so ``_build_warm_up_frames`` replays
+    exactly three ``step.started`` frames in a deterministic
+    ``started_at`` order -- enough to inject a close after the first one
+    and still have at least one more that must (or must not) follow it."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    principal = _principal_for(full_key)
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    for index in range(3):
+        _insert_trace_event(
+            task_id=task_id,
+            event_type="tool_execution_start",
+            event_id=f"hist-{index}",
+            timestamp=base.replace(second=index),
+            step_id=f"step-{index}",
+            data={
+                "tool_call_id": f"call-{index}",
+                "tool_name": "search",
+                "tool_args": {},
+            },
+        )
+    return task_id, principal
+
+
+def _revoke_key_for(principal: ApiKeyPrincipal) -> None:
+    """Revoke the API key this principal authenticated with -- the same
+    row edit ``test_watchdog_closes_within_one_cycle_on_key_invalidation``
+    makes, reachable from a principal alone."""
+    db = _direct_db_session()
+    try:
+        key_row = (
+            db.query(AgentApiKey)
+            .filter(AgentApiKey.key_prefix == principal.key.key_prefix)
+            .one()
+        )
+        key_row.revoked_at = datetime.now(UTC)
+        db.commit()
+    finally:
+        db.close()
+
+
+async def _poll_until(predicate) -> None:
+    """Wait for a state the watchdog reaches on its own cadence.
+
+    Bounded and re-checked rather than one sleep sized to a guessed
+    number of cycles: each cycle does two real database reads through
+    the shared thread pool, so a fixed sleep is a timing bet that gets
+    thinner the more loaded the machine is.
+    """
+    for _ in range(200):
+        if predicate():
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError("the watchdog did not reach the expected state in 4s")
+
+
+async def test_abortive_close_during_replay_stops_further_history_frames():
+    """An abortive close landing between two replayed history frames
+    must stop the replay right there -- the client must never see
+    history frames queued up after the point its authorization was
+    revoked. This drives the close directly via ``sink.enqueue_close(...,
+    abortive=True)`` -- the same frame shape (``unauthorized``) the
+    watchdog would enqueue, but not through ``watchdog_check_once``
+    itself; that production call site is covered separately by
+    ``test_watchdog_closes_within_one_cycle_on_key_invalidation``'s own
+    ``sink.abortive_close is True`` assertion. Driven by hand via
+    ``__anext__`` so the close can be injected deterministically after
+    exactly one history frame, the same technique
+    ``test_close_frame_delivered_when_enqueued_between_two_yields`` uses
+    for the non-replay case."""
+    task_id, principal = await _three_step_task()
+    snapshot = v1_tasks._load_task_info_snapshot(task_id, principal)
+    resp = await es.build_event_stream_response(
+        task_id=task_id,
+        principal=principal,
+        initial_snapshot=snapshot,
+        read_task_snapshot=v1_tasks._load_task_info_snapshot,
+        read_task_steps=v1_tasks._load_task_steps_snapshot,
+        read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
+        read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
+        **_long_intervals(),
+    )
+    try:
+        status = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
+        assert "event: task.status" in status
+
+        first_step = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
+        assert first_step.startswith("event: step.started\n")
+
+        sink = next(
+            c
+            for c in es.manager.connections_for_task(task_id)
+            if isinstance(c, es.V1EventStreamSink)
+        )
+        won = sink.enqueue_close(es.error_frame("unauthorized"), abortive=True)
+        assert won is True
+
+        remaining_frames = []
+        async for chunk in resp.body_iterator:
+            remaining_frames.append(chunk)
+        remaining_body = "".join(remaining_frames)
+        assert "event: step.started" not in remaining_body
+        assert remaining_body.count("event: stream.error") == 1
+        assert "unauthorized" in remaining_body
+    finally:
+        await resp.body_iterator.aclose()
+
+
+async def test_abortive_close_after_a_non_abortive_one_still_stops_the_replay():
+    """The revocation an abortive close carries is not first-caller-wins,
+    even though the close frame is.
+
+    A non-abortive close (here ``resync_required``, the reason a staging
+    overflow enqueues) can land during the replay and claim the close
+    frame. If a watchdog ``unauthorized`` close then arrives, its early
+    return must not swallow the suppression: the client just lost the
+    right to see this task's content, and the frames still queued behind
+    the replay cursor are exactly the content that revocation covers.
+
+    The client reads the earlier close reason on the wire -- that part
+    stays first-caller-wins -- and re-attaches, where authentication
+    refuses it. What it must not read is the rest of the history."""
+    task_id, principal = await _three_step_task()
+    snapshot = v1_tasks._load_task_info_snapshot(task_id, principal)
+    resp = await es.build_event_stream_response(
+        task_id=task_id,
+        principal=principal,
+        initial_snapshot=snapshot,
+        read_task_snapshot=v1_tasks._load_task_info_snapshot,
+        read_task_steps=v1_tasks._load_task_steps_snapshot,
+        read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
+        read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
+        **_long_intervals(),
+    )
+    try:
+        status = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
+        assert "event: task.status" in status
+
+        first_step = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
+        assert first_step.startswith("event: step.started\n")
+
+        sink = next(
+            c
+            for c in es.manager.connections_for_task(task_id)
+            if isinstance(c, es.V1EventStreamSink)
+        )
+        first_won = sink.enqueue_close(es.error_frame("resync_required"))
+        assert first_won is True
+        assert sink.abortive_close is False
+
+        second_won = sink.enqueue_close(es.error_frame("unauthorized"), abortive=True)
+        assert second_won is False
+        assert sink.abortive_close is True
+
+        remaining_frames = []
+        async for chunk in resp.body_iterator:
+            remaining_frames.append(chunk)
+        remaining_body = "".join(remaining_frames)
+        assert "event: step.started" not in remaining_body
+        assert "event: step.completed" not in remaining_body
+        assert remaining_body.count("event: stream.error") == 1
+        assert "resync_required" in remaining_body
+    finally:
+        await resp.body_iterator.aclose()
+
+
+@pytest.mark.parametrize(
+    ("close_claimed_by_watchdog", "expected_close_event"),
+    [
+        pytest.param(False, "event: stream.error", id="close-claimed-elsewhere"),
+        pytest.param(True, "event: task.completed", id="close-claimed-by-the-watchdog"),
+    ],
+)
+async def test_watchdog_keeps_checking_authorization_across_an_ordinary_close(
+    close_claimed_by_watchdog, expected_close_event
+):
+    """An ordinary close must not end authorization coverage.
+
+    The warm-up replay hands its frames to the client directly, bypassing
+    the outbound queue's closing guard, so a close that is not abortive
+    stops nothing on that path -- only ``abortive_close`` does, set here
+    by ``watchdog_check_once`` (and, on a different path, by
+    ``_generate``'s own two pre-loop read failures). A watchdog that
+    stops at a close therefore never observes a key revoked afterwards,
+    and the replay hands that key the task's persisted history.
+
+    The two legs differ in one variable, who claims the close, because
+    the loop had two separate exits that both ended coverage: one on
+    seeing ``closing`` before running a check, and one on a check of its
+    own having closed the stream. A terminal task found while the
+    warm-up read is still in flight reaches the second one without any
+    staging overflow at all.
+    """
+    task_id, principal = await _three_step_task()
+    snapshot = v1_tasks._load_task_info_snapshot(task_id, principal)
+    resp = await es.build_event_stream_response(
+        task_id=task_id,
+        principal=principal,
+        initial_snapshot=snapshot,
+        read_task_snapshot=v1_tasks._load_task_info_snapshot,
+        read_task_steps=v1_tasks._load_task_steps_snapshot,
+        read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
+        read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
+        watchdog_interval_seconds=0.05,
+        stream_max_duration_seconds=600.0,
+        heartbeat_interval_seconds=600.0,
+    )
+    try:
+        status = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
+        assert "event: task.status" in status
+        # Suspended on the initial status yield, which runs before the
+        # warm-up read: the sink is registered and still cold, the
+        # watchdog is running, and no history has been read or handed
+        # out yet.
+        sink = next(
+            c
+            for c in es.manager.connections_for_task(task_id)
+            if isinstance(c, es.V1EventStreamSink)
+        )
+        assert sink.warm is False
+
+        if close_claimed_by_watchdog:
+            _set_task_status(task_id, TaskStatus.COMPLETED, output="done")
+            await _poll_until(lambda: sink.closing)
+        else:
+            assert sink.enqueue_close(es.error_frame("resync_required")) is True
+        assert sink.abortive_close is False
+
+        _revoke_key_for(principal)
+        await _poll_until(lambda: sink.abortive_close)
+
+        frames = []
+        async for chunk in resp.body_iterator:
+            frames.append(chunk)
+        body = "".join(frames)
+        assert "event: step.started" not in body
+        assert frames[-1].startswith(expected_close_event)
+    finally:
+        await resp.body_iterator.aclose()
+
+
+async def test_watchdog_stops_once_the_warm_up_handoff_is_over():
+    """The warm-side mirror of the test above: once the warm-up handoff
+    is over, an ordinary close really does end watchdog coverage,
+    because every emission from that point on goes through
+    ``_put_or_overflow``'s closing guard -- there is no longer a direct
+    replay path left for the watchdog to keep guarding against.
+
+    Pulls frames until ``sink.warm`` is True. ``sink.warm`` flips inside
+    the generator, between the last replayed frame and whatever it
+    yields next, so the pull that observes it can block briefly on the
+    generator's own wait loop -- a short ``heartbeat_interval_seconds``
+    bounds that to one ``: ping`` cycle instead of the fixture's usual
+    minutes-long interval.
+
+    Then closes non-abortively and asserts the watchdog loop's actual
+    exit, not only the predicate flipping: ``_watchdog_coverage_done``
+    reading True proves nothing about whether the loop's own ``while``
+    re-checked it, so this awaits the watchdog task itself with a
+    timeout too -- a predicate that goes true without the task
+    finishing would still fail this test."""
+    task_id, principal = await _three_step_task()
+    snapshot = v1_tasks._load_task_info_snapshot(task_id, principal)
+    resp = await es.build_event_stream_response(
+        task_id=task_id,
+        principal=principal,
+        initial_snapshot=snapshot,
+        read_task_snapshot=v1_tasks._load_task_info_snapshot,
+        read_task_steps=v1_tasks._load_task_steps_snapshot,
+        read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
+        read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
+        watchdog_interval_seconds=0.05,
+        stream_max_duration_seconds=600.0,
+        heartbeat_interval_seconds=0.05,
+    )
+    try:
+        status = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
+        assert "event: task.status" in status
+        sink = next(
+            c
+            for c in es.manager.connections_for_task(task_id)
+            if isinstance(c, es.V1EventStreamSink)
+        )
+        assert sink.warm is False
+
+        watchdog_task = next(
+            t
+            for t in asyncio.all_tasks()
+            if t.get_coro().cr_code.co_name == "_watchdog_loop"
+        )
+
+        for _ in range(10):
+            if sink.warm:
+                break
+            await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
+        assert sink.warm is True
+
+        assert sink.enqueue_close(es.error_frame("resync_required")) is True
+        await _poll_until(lambda: es._watchdog_coverage_done(sink))
+        await asyncio.wait_for(watchdog_task, timeout=2)
+        assert watchdog_task.done()
+    finally:
+        await resp.body_iterator.aclose()
+
+
+async def test_normal_terminal_close_during_replay_lets_replay_finish_first():
+    """A non-abortive close landing between two replayed history frames
+    must NOT cut the replay short -- that history describes the task's
+    own past and stays valid even though the stream is about to end;
+    only the close frame itself is deferred to arrive after it, via the
+    normal queue path. Drives the close directly via
+    ``sink.enqueue_close`` with the same frame shape
+    (``task.completed``) the watchdog would enqueue for a terminal task
+    -- not through ``watchdog_check_once`` itself; that production call
+    site is covered separately by
+    ``test_watchdog_terminal_task_row_closes_with_completed``'s own
+    ``sink.abortive_close is False`` assertion. Same injection point as
+    the abortive test above, opposite close reason."""
+    task_id, principal = await _three_step_task()
+    snapshot = v1_tasks._load_task_info_snapshot(task_id, principal)
+    resp = await es.build_event_stream_response(
+        task_id=task_id,
+        principal=principal,
+        initial_snapshot=snapshot,
+        read_task_snapshot=v1_tasks._load_task_info_snapshot,
+        read_task_steps=v1_tasks._load_task_steps_snapshot,
+        read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
+        read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
+        **_long_intervals(),
+    )
+    try:
+        status = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
+        assert "event: task.status" in status
+
+        first_step = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
+        assert first_step.startswith("event: step.started\n")
+
+        sink = next(
+            c
+            for c in es.manager.connections_for_task(task_id)
+            if isinstance(c, es.V1EventStreamSink)
+        )
+        won = sink.enqueue_close(
+            es.completed_frame(status="completed", output="done", error=None)
+        )
+        assert won is True
+
+        remaining_frames = []
+        async for chunk in resp.body_iterator:
+            remaining_frames.append(chunk)
+        remaining_body = "".join(remaining_frames)
+        assert remaining_body.count("event: step.started") == 2  # the other two
+        assert remaining_body.count("event: task.completed") == 1
+        # The close frame is the very last thing delivered.
+        assert remaining_frames[-1].startswith("event: task.completed\n")
+    finally:
+        await resp.body_iterator.aclose()
+
+
 async def test_close_exactly_once_under_watchdog_deadline_race():
     agent_id, full_key = _create_agent_with_key()
     task_id = _create_task(full_key, agent_id)  # non-terminal at attach
@@ -1430,6 +1856,7 @@ async def test_close_exactly_once_under_watchdog_deadline_race():
         principal=principal,
         initial_snapshot=snapshot,
         read_task_snapshot=v1_tasks._load_task_info_snapshot,
+        read_task_steps=v1_tasks._load_task_steps_snapshot,
         read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
         read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
         watchdog_interval_seconds=0.001,
@@ -1468,6 +1895,7 @@ async def test_events_per_task_cap_third_stream_429():
             principal=principal,
             initial_snapshot=snapshot,
             read_task_snapshot=v1_tasks._load_task_info_snapshot,
+            read_task_steps=v1_tasks._load_task_steps_snapshot,
             read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
             read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
             **_long_intervals(),
@@ -1485,6 +1913,7 @@ async def test_events_per_task_cap_third_stream_429():
             principal=principal,
             initial_snapshot=snapshot,
             read_task_snapshot=v1_tasks._load_task_info_snapshot,
+            read_task_steps=v1_tasks._load_task_steps_snapshot,
             read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
             read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
         )
@@ -1520,9 +1949,14 @@ async def test_fast_path_attach_exempt_from_both_caps(fast_path_status, closing_
     there is no way to fill that cap through it. Only after both caps
     are full does the task row flip to the fast-path status under test.
 
-    Also asserts one step frame goes out, so a regression that dropped
-    the snapshot could not hide behind the frame counts this test is
-    really about.
+    Also covers two properties of the fast path's step snapshot that a
+    frame-count-only assertion would miss entirely: it actually emits a
+    ``step.*`` frame for pre-existing history (not just the two
+    lifecycle frames alone -- a regression here would have
+    left ``PER_TASK_STREAM_CAP``-saturating cap coverage green while
+    silently dropping the snapshot), and a second fast-path attach on
+    the same task reuses the ``steps()`` cache instead of repeating the
+    full trace read.
     """
     set_cache_backend_for_testing(InMemoryTTLCache())
     try:
@@ -1557,6 +1991,7 @@ async def test_fast_path_attach_exempt_from_both_caps(fast_path_status, closing_
                 principal=principal,
                 initial_snapshot=running_snapshot,
                 read_task_snapshot=v1_tasks._load_task_info_snapshot,
+                read_task_steps=v1_tasks._load_task_steps_snapshot,
                 read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
                 read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
                 **_long_intervals(),
@@ -1678,6 +2113,7 @@ async def test_heartbeat_actually_sent_when_idle():
         principal=principal,
         initial_snapshot=snapshot,
         read_task_snapshot=v1_tasks._load_task_info_snapshot,
+        read_task_steps=v1_tasks._load_task_steps_snapshot,
         read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
         read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
         **_long_intervals(heartbeat_interval_seconds=0.01),
@@ -1732,6 +2168,7 @@ async def test_broadcast_frame_reaches_generator_output_as_task_status():
         principal=principal,
         initial_snapshot=snapshot,
         read_task_snapshot=v1_tasks._load_task_info_snapshot,
+        read_task_steps=v1_tasks._load_task_steps_snapshot,
         read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
         read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
         **_long_intervals(),
@@ -1787,6 +2224,7 @@ async def test_broadcast_content_frames_reach_generator_output_as_step_and_messa
         principal=principal,
         initial_snapshot=snapshot,
         read_task_snapshot=v1_tasks._load_task_info_snapshot,
+        read_task_steps=v1_tasks._load_task_steps_snapshot,
         read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
         read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
         **_long_intervals(),
@@ -1934,6 +2372,7 @@ async def test_completion_hint_wakes_watchdog_before_its_next_periodic_tick():
         principal=principal,
         initial_snapshot=snapshot,
         read_task_snapshot=v1_tasks._load_task_info_snapshot,
+        read_task_steps=v1_tasks._load_task_steps_snapshot,
         read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
         read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
         **_long_intervals(),
@@ -2106,10 +2545,11 @@ async def test_trace_event_ai_message_projects_a_completed_message_step(
     stream already delivered live as ``message.delta`` /
     ``message.completed``, so folding it too duplicates that content as a
     second delivery rather than losing it. Dropping it here -- the old
-    behavior -- had no persisted counterpart: ``steps()`` shows this exact
-    row as a ``message`` step regardless, so filtering only the live path
-    made an already-attached stream disagree with ``steps()`` about whether
-    the step exists. See
+    behavior -- had no persisted counterpart: ``steps()`` and a fresh
+    attach's warm-up replay both show this exact row as a ``message``
+    step regardless, so filtering only the live path made an
+    already-attached stream disagree with those two about whether the
+    step exists. See
     ``test_live_projection_matches_steps_for_a_streamed_final_answer``
     below for the two-path parity this restores.
     """
@@ -2346,8 +2786,65 @@ async def test_step_started_frame_text_is_unaffected_by_the_step_s_later_complet
     assert json.loads(started_text.split("data: ", 1)[1])["step"]["status"] == "running"
 
 
+# ===== warm-up staging: a step whose start is only in history and whose
+# end arrives during the warm-up window still resolves on this stream =====
+
+
+async def test_orphan_end_during_warm_up_is_rescued_by_staging():
+    """The scenario ``finish_warm_up`` exists for: a step's *start* event
+    is only in trace history (it happened before this connection
+    attached), and its *end* event happens to broadcast live while the
+    sink is still cold (registered, but the history read/replay hasn't
+    finished). Fed straight to an empty projector, that end event would
+    be a plain orphan end and get silently dropped -- there'd never be a
+    ``step.completed`` for it on this stream. Staging it and replaying
+    it through the *warmed* projector instead (which has the start
+    pending, from history) rescues it."""
+    sink = _make_sink(task_id=41, warm=False)
+
+    # Arrives while the sink is still cold -- gets staged, not projected.
+    await sink.send_text(
+        _trace_event_frame(
+            "tool_execution_end",
+            task_id=41,
+            data={"tool_call_id": "call-1", "success": True, "result": "sunny"},
+        )
+    )
+    assert sink.staged_message_count == 1
+    assert sink.queue.empty()
+
+    # What a real warm-up read would have produced: a projector that has
+    # already replayed the matching start event from history.
+    history_start_event = {
+        "id": 1,
+        "task_id": 41,
+        "event_id": "hist-1",
+        "event_type": "tool_execution_start",
+        "timestamp": 0,
+        "step_id": "step-1",
+        "data": {"tool_call_id": "call-1", "tool_name": "search", "tool_args": {}},
+    }
+    warmed = es.PublicStepProjector.from_history([history_start_event])
+    # The same two calls, in the same order, that ``_build_warm_up_frames``
+    # makes: read the replayed timeline out, which is also what releases
+    # retention, then hand the projector over.
+    warmed.take_materialized_steps()
+
+    sink.finish_warm_up(warmed)
+
+    assert sink.warm is True
+    assert sink.staged_message_count == 0
+    frame_text, is_close = sink.queue.get_nowait()
+    assert is_close is False
+    assert frame_text.startswith("event: step.completed\n")
+    step = json.loads(frame_text.split("data: ", 1)[1])["step"]
+    assert step["id"] == "tool_call:call-1"
+    assert step["status"] == "completed"
+    assert step["data"]["result"] == "sunny"
+
+
 # ===== raw-frame size pre-check: an oversized content frame is dropped
-# before it's projected =====
+# before it's projected, on both the warm and the staging path =====
 
 
 def _sized_content_frame(task_id: int, total_chars: int) -> str:
@@ -2644,6 +3141,253 @@ async def test_oversized_non_dict_json_frame_is_ignored_without_counting():
     assert sink.queue.empty()
 
 
+# ===== the warm-up staging buffer's two bounds, and the one quantity
+# that must never enter either: the task's own description stamp =====
+
+
+async def test_staged_messages_overflow_closes_with_resync_required():
+    """The staging list reuses the outbound queue's own count cap and
+    overflow policy (``resync_required`` then close) instead of a second
+    one -- this pins that reuse rather than assuming it."""
+    sink = _make_sink(task_id=43, warm=False)
+    for i in range(es.OUTBOUND_QUEUE_MAX_SIZE):
+        await sink.send_text(
+            _trace_event_frame(
+                "tool_execution_start",
+                task_id=43,
+                data={"tool_call_id": f"call-{i}", "tool_name": "x", "tool_args": {}},
+            )
+        )
+    assert sink.staged_message_count == es.OUTBOUND_QUEUE_MAX_SIZE
+    assert sink.closing is False
+
+    await sink.send_text(
+        _trace_event_frame(
+            "tool_execution_start",
+            task_id=43,
+            data={"tool_call_id": "overflow", "tool_name": "x", "tool_args": {}},
+        )
+    )
+
+    assert sink.closing is True
+    frame_text, is_close = sink.queue.get_nowait()
+    assert is_close is True
+    assert "resync_required" in frame_text
+
+
+async def test_staged_messages_byte_budget_overflow_closes_with_resync_required():
+    """``_staged_messages`` is bounded by cumulative character count on
+    top of its count cap -- a run of large-but-individually-legal
+    messages (each under ``MAX_RAW_FRAME_TEXT_CHARS``, so none is dropped
+    by the pre-check) can still overflow the cumulative budget well
+    before the count cap binds. Uses a payload just under the per-frame
+    raw-size limit so few enough messages are needed to keep the test
+    fast, and asserts the count cap did not bind instead."""
+    sink = _make_sink(task_id=95, warm=False)
+    near_cap_delta = "x" * (es.MAX_RAW_FRAME_TEXT_CHARS - 200)
+    messages_needed = (es.STAGED_MESSAGES_MAX_TEXT_CHARS // len(near_cap_delta)) + 2
+    assert messages_needed < es.OUTBOUND_QUEUE_MAX_SIZE, (
+        "fixture assumption: the byte budget must overflow before the "
+        "count cap does, or this test would re-pin the count cap instead"
+    )
+
+    for i in range(messages_needed):
+        await sink.send_text(
+            json.dumps(
+                {
+                    "type": "final_answer_delta",
+                    "message_id": f"final_answer_{i}",
+                    "task_id": 95,
+                    "delta": near_cap_delta,
+                }
+            )
+        )
+        if sink.closing:
+            break
+
+    assert sink.closing is True
+    assert sink.staged_message_count < es.OUTBOUND_QUEUE_MAX_SIZE
+    frame_text, is_close = sink.queue.get_nowait()
+    assert is_close is True
+    assert "resync_required" in frame_text
+
+
+async def test_a_cold_status_frame_leaves_the_staging_drain_no_margin():
+    """The staging list and the outbound queue are capped by the *same*
+    constant, so a lifecycle frame that bypassed staging while the sink
+    was cold makes the warm-up drain one frame too big for the queue.
+
+    Pins that zero margin so the two caps cannot drift apart silently:
+    with the staging cap one lower, the drain would fit and this test's
+    overflow would not happen. What the overflow must not become is a
+    silent truncation -- the client is told to resync, which is the same
+    answer every other over-full queue gets.
+    """
+    sink = _make_sink(task_id=97, warm=False)
+    # A lifecycle frame goes straight into the outbound queue even
+    # though the sink is cold -- it never touches staging.
+    sink.enqueue_status("paused")
+    assert sink.queue.qsize() == 1
+
+    for i in range(es.OUTBOUND_QUEUE_MAX_SIZE):
+        await sink.send_text(
+            _trace_event_frame(
+                "tool_execution_start",
+                task_id=97,
+                data={"tool_call_id": f"call-{i}", "tool_name": "x", "tool_args": {}},
+            )
+        )
+    assert sink.staged_message_count == es.OUTBOUND_QUEUE_MAX_SIZE
+    assert sink.closing is False
+
+    sink.finish_warm_up(es.PublicStepProjector(retain_finished=False))
+
+    # 1 lifecycle frame + 256 drained frames > 256 slots.
+    assert sink.closing is True
+    frame_text, is_close = sink.queue.get_nowait()
+    assert is_close is True
+    assert "resync_required" in frame_text
+
+
+async def test_one_task_info_frame_cannot_overflow_the_staging_budget():
+    """A ``task_info`` frame carries the task's ``description`` column
+    under ``data["description"]``, and that column is unbounded
+    (``Column(Text)``). Charged raw, one such frame crosses
+    ``STAGED_MESSAGES_MAX_TEXT_CHARS`` by itself and closes the attach
+    with ``resync_required`` -- and because the trigger is a property of
+    the task rather than the load on it, the re-attach the close asks for
+    fails at exactly the same frame, forever. The description is
+    therefore excluded from the charge, which leaves this frame costing
+    the few hundred characters its actual lifecycle fields occupy.
+
+    ``task_info`` is also the family with nothing to lose by it:
+    ``_feed_trace_event`` returns ``[]`` for it, so the description is
+    charged against a budget it could never spend.
+
+    The sink starts at ``status="pending"`` rather than the frame's own
+    ``"running"``: ``enqueue_status`` no-ops when a status repeats the
+    sink's last one, and a ``task_info`` frame's ``status`` would
+    otherwise be deduped away, leaving nothing to assert on the
+    lifecycle half below. ``"running"`` is not in
+    ``_EARLY_WAKE_STATUS_VALUES`` either way, so nothing about the
+    content half's handling changes."""
+    sink = _make_sink(task_id=105, status="pending", warm=False)
+    huge_description = "d" * (es.STAGED_MESSAGES_MAX_TEXT_CHARS + 1000)
+    raw = json.dumps(
+        {
+            "type": "trace_event",
+            "event_id": "ev-105",
+            "event_type": "task_info",
+            "task_id": 105,
+            "timestamp": 0,
+            "status": "running",
+            "data": {
+                "id": 105,
+                "title": "t",
+                "description": huge_description,
+                "status": "running",
+            },
+        }
+    )
+    assert len(raw) > es.STAGED_MESSAGES_MAX_TEXT_CHARS
+
+    await sink.send_text(raw)
+
+    assert sink.closing is False
+    assert sink.dropped_frame_count == 0
+    assert sink.staged_message_count == 1
+    assert sink._staged_text_chars < 1000
+    assert "description" not in sink._staged_messages[0]["data"]
+    # The lifecycle half still went out: task_info is a versioned task
+    # event, and its status is enqueued before the content branch runs.
+    frame_text, _ = sink.queue.get_nowait()
+    assert frame_text.startswith("event: task.status\n")
+
+
+async def test_a_long_task_description_cannot_overflow_the_staging_budget():
+    """The same defect on the ordinary path, which is the half a
+    ``task_info``-only fix does not reach.
+    ``ws_trace_handlers.py``'s converter stamps the same unbounded column
+    onto *every* trace event as ``data["task_description"]``, and a frame
+    at or under ``MAX_RAW_FRAME_TEXT_CHARS`` used to be charged its full
+    ``len(text)``. A description a little under that per-frame cap
+    therefore crossed the 4 MiB staging budget after ~17 frames of a
+    warm-up window, again identically on every re-attach.
+
+    Sends more frames than the old code survived and asserts the stream
+    is still open, then asserts the accumulated charge is the frames'
+    own content rather than the description repeated per frame."""
+    sink = _make_sink(task_id=106, status="running", warm=False)
+    description = "d" * (200 * 1024)
+    frames = 40
+
+    for i in range(frames):
+        await sink.send_text(
+            _trace_event_frame(
+                "tool_execution_start",
+                task_id=106,
+                step_id=f"step-{i}",
+                data={
+                    "tool_call_id": f"call-{i}",
+                    "tool_name": "search",
+                    "tool_args": {},
+                    "task_description": description,
+                },
+            )
+        )
+
+    assert sink.closing is False
+    assert sink.dropped_frame_count == 0
+    assert sink.staged_message_count == frames
+    assert sink._staged_text_chars < frames * 1000
+    assert all(
+        "task_description" not in staged["data"] for staged in sink._staged_messages
+    )
+
+
+async def test_the_raw_frame_drop_boundary_is_unchanged_by_the_description_exclusion():
+    """Excluding the description from the *measure* must not move the
+    per-frame drop boundary, which is a settled contract with tests on
+    both sides of it: pruning can only lower a frame's measured length,
+    and a frame already at or under the cap stays under it.
+
+    Near-duplicate of ``test_a_frame_still_over_the_cap_without_its_description_is_dropped``
+    (above): that test already pins the end-to-end drop for a frame
+    whose own content -- not its description -- is what pushes it over
+    the cap. What this test adds is a direct call into
+    ``_measured_content_frame`` that pins the *ordering* inside it --
+    prune, then compare -- rather than only the ``send_text``-level
+    outcome. The complementary mutation (the drop check reading the
+    *unpruned* length instead of the pruned one) is not caught here:
+    this frame is over the cap on its own tool arguments regardless of
+    pruning, so that mutation leaves this test green. It is caught by
+    the existing
+    ``test_a_huge_task_description_does_not_drop_a_small_content_frame``,
+    whose frame is under the cap without its description and over it
+    with -- the only shape that can tell the two checks apart."""
+    sink = _make_sink(task_id=107)
+    filler = "y" * (es.MAX_RAW_FRAME_TEXT_CHARS + 1000)
+    raw = _trace_event_frame(
+        "tool_execution_start",
+        task_id=107,
+        step_id="step-1",
+        data={
+            "tool_call_id": "call-1",
+            "tool_name": "search",
+            "tool_args": {"query": filler},
+            "task_description": "d" * (200 * 1024),
+        },
+    )
+    measured, pruned = es._measured_content_frame(raw, json.loads(raw))
+    assert "task_description" not in pruned["data"]
+    assert measured > es.MAX_RAW_FRAME_TEXT_CHARS
+
+    await sink.send_text(raw)
+
+    assert sink.dropped_frame_count == 1
+    assert sink.queue.empty()
+
+
 # ===== a frame that fails to project is dropped, not fatal, and never
 # double-counted between the sink's two except layers
 # (see _project_and_queue) =====
@@ -2652,11 +3396,11 @@ async def test_oversized_non_dict_json_frame_is_ignored_without_counting():
 async def test_poisoned_live_frame_increments_dropped_frame_count_only_once(
     monkeypatch,
 ):
-    """A projection failure on the live path is
+    """A projection failure on the live path (sink already warm) is
     caught inside ``_project_and_queue`` and never re-raises -- if it
     did, ``send_text``'s own outer ``except`` would catch it too and
     count the same dropped frame twice."""
-    sink = _make_sink(task_id=73)
+    sink = _make_sink(task_id=73)  # warm=True default -- the live path
 
     def _boom(message, projector):
         raise RuntimeError("boom live")
@@ -2673,6 +3417,798 @@ async def test_poisoned_live_frame_increments_dropped_frame_count_only_once(
 
     assert sink.dropped_frame_count == 1
     assert sink.queue.empty()
+
+
+async def test_warm_up_hands_the_sink_a_projector_that_stops_retaining():
+    """The live sink must never be handed a retaining projector.
+
+    ``_build_warm_up_frames`` reads the replayed timeline out with
+    ``take_materialized_steps``, which is also what releases retention,
+    so the projector it returns keeps nothing from that point on. This
+    pins the property on the real builder's real output rather than on a
+    hand-built projector, because the release lives in the builder, not
+    in the projector's constructor.
+
+    ``finish_warm_up`` then rejects a retaining projector outright. Both
+    are asserted here: what the builder produces, and what the sink
+    refuses. Without the release the stream still behaves correctly --
+    it just accumulates every finished step's untruncated ``data`` for
+    up to an hour in a list nothing reads, which is invisible to every
+    other assertion in this file."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    principal = _principal_for(full_key)
+    _insert_trace_event(
+        task_id=task_id,
+        event_type="ai_message",
+        event_id="message-0",
+        timestamp=datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC),
+        data={"content": "already finished"},
+    )
+
+    warmed, warm_up_frames = es._build_warm_up_frames(
+        task_id,
+        principal,
+        v1_tasks._load_task_steps_snapshot,
+        _current_watermark(task_id, principal),
+    )
+
+    # The history really was read out -- otherwise "retains nothing"
+    # would be trivially true of a projector that folded nothing.
+    assert len(warm_up_frames) == 1
+    assert warmed.retains_finished is False
+    with pytest.raises(RuntimeError):
+        warmed.materialized_steps()
+
+    sink = _make_sink(task_id=task_id, warm=False)
+    sink.finish_warm_up(warmed)
+    assert sink.warm is True
+
+    with pytest.raises(RuntimeError):
+        _make_sink(task_id=task_id, warm=False).finish_warm_up(
+            es.PublicStepProjector(retain_finished=True)
+        )
+
+
+async def test_attach_replays_history_before_live_frames():
+    """End-to-end warm-up through the real generator: a step that
+    started before attach is replayed as a ``step.started`` frame,
+    directly after the initial ``task.status`` and before anything else
+    -- the two frames a real client sees first, in order."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    principal = _principal_for(full_key)
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    _insert_trace_event(
+        task_id=task_id,
+        event_type="tool_execution_start",
+        event_id="hist-1",
+        timestamp=base,
+        step_id="step-1",
+        data={"tool_call_id": "call-1", "tool_name": "search", "tool_args": {}},
+    )
+
+    snapshot = v1_tasks._load_task_info_snapshot(task_id, principal)
+    resp = await es.build_event_stream_response(
+        task_id=task_id,
+        principal=principal,
+        initial_snapshot=snapshot,
+        read_task_snapshot=v1_tasks._load_task_info_snapshot,
+        read_task_steps=v1_tasks._load_task_steps_snapshot,
+        read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
+        read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
+        **_long_intervals(),
+    )
+    try:
+        first = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
+        assert "event: task.status" in first
+        second = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
+        assert second.startswith("event: step.started\n")
+        step = json.loads(second.split("data: ", 1)[1])["step"]
+        assert step["id"] == "tool_call:call-1"
+        assert step["status"] == "running"
+    finally:
+        await resp.body_iterator.aclose()
+
+
+async def test_warm_up_replay_is_sorted_by_started_at_not_resolve_order():
+    """``_build_warm_up_frames`` sorts its replay by ``started_at`` to
+    match ``steps()``'s own ordering -- ``PublicStepProjector.
+    materialized_steps()`` on its own returns *resolve* order, which
+    diverges when a later-started step finishes before an earlier one.
+    Step A starts first (t0) but finishes last (t3); step B starts
+    second (t1) but finishes first (t2) -- resolve order is [B, A],
+    started_at order is [A, B]. This pins the replay uses the latter."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    principal = _principal_for(full_key)
+    t0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    t1 = datetime(2026, 1, 1, 12, 0, 1, tzinfo=UTC)
+    t2 = datetime(2026, 1, 1, 12, 0, 2, tzinfo=UTC)
+    t3 = datetime(2026, 1, 1, 12, 0, 3, tzinfo=UTC)
+    _insert_trace_event(
+        task_id=task_id,
+        event_type="tool_execution_start",
+        event_id="a-start",
+        timestamp=t0,
+        step_id="step-a",
+        data={"tool_call_id": "call-a", "tool_name": "x", "tool_args": {}},
+    )
+    _insert_trace_event(
+        task_id=task_id,
+        event_type="tool_execution_start",
+        event_id="b-start",
+        timestamp=t1,
+        step_id="step-b",
+        data={"tool_call_id": "call-b", "tool_name": "x", "tool_args": {}},
+    )
+    _insert_trace_event(
+        task_id=task_id,
+        event_type="tool_execution_end",
+        event_id="b-end",
+        timestamp=t2,
+        step_id="step-b",
+        data={"tool_call_id": "call-b", "success": True, "result": "b done"},
+    )
+    _insert_trace_event(
+        task_id=task_id,
+        event_type="tool_execution_end",
+        event_id="a-end",
+        timestamp=t3,
+        step_id="step-a",
+        data={"tool_call_id": "call-a", "success": True, "result": "a done"},
+    )
+
+    _, warm_up_frames = es._build_warm_up_frames(
+        task_id,
+        principal,
+        v1_tasks._load_task_steps_snapshot,
+        _current_watermark(task_id, principal),
+    )
+    ids_in_order = [
+        json.loads(frame.split("data: ", 1)[1])["step"]["id"]
+        for frame in warm_up_frames
+    ]
+    assert ids_in_order == ["tool_call:call-a", "tool_call:call-b"]
+
+    # And this is what steps() itself returns for the same history --
+    # the replay now agrees with it instead of the resolve-order [B, A].
+    steps_resp = client.get(
+        f"/v1/chat/tasks/{task_id}/steps", headers=_bearer(full_key)
+    )
+    polled_ids = [step["id"] for step in steps_resp.json()["steps"]]
+    assert polled_ids == ids_in_order
+
+
+# ===== a step whose serialization raises ends the replay batch there,
+# instead of failing the whole attach =====
+
+
+async def test_warm_up_replay_keeps_the_prefix_before_an_unserializable_step():
+    """``_build_warm_up_frames`` serializes its admitted steps one at a
+    time and stops at the first one that raises, so a persisted step
+    whose ``data`` cannot be turned into JSON costs the client that step
+    and whatever came after it -- not the whole attach.
+
+    The shared budget (``_snapshot_steps_within_wire_budget``) admits
+    such a step on purpose: it cannot be measured, so it cannot be
+    budgeted, and each caller decides what to do when the emit reaches
+    it. The two attach-time fast paths report it and close; this path
+    has no per-step emit loop and no conclusion frame to carry a marker,
+    so it ends the batch quietly and goes live -- reason (6) in the
+    endpoint's best-effort delivery list.
+
+    Three things are asserted, because a fix that only delivers the
+    prefix and then closes anyway would satisfy the first alone: the
+    good step reaches the client, no ``stream.error`` follows it, and a
+    frame broadcast afterwards is delivered -- which is only true if the
+    sink actually finished warm-up and went live.
+    """
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    principal = _principal_for(full_key)
+    snapshot = v1_tasks._load_task_info_snapshot(task_id, principal)
+
+    class _Unserializable:
+        pass
+
+    good_row = v1_tasks._TraceEventSnapshot(
+        id=1,
+        task_id=task_id,
+        event_id="good",
+        event_type="ai_message",
+        timestamp=datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC),
+        step_id=None,
+        data={"content": "this step serializes fine"},
+    )
+    bad_row = v1_tasks._TraceEventSnapshot(
+        id=2,
+        task_id=task_id,
+        event_id="bad",
+        event_type="ai_message",
+        timestamp=datetime(2026, 1, 1, 12, 0, 1, tzinfo=UTC),
+        step_id=None,
+        data={"content": _Unserializable()},
+    )
+
+    def _poisoned_read_task_steps(task_id_, principal_):
+        return SimpleNamespace(events=[good_row, bad_row])
+
+    def _version_reader(task_id_, principal_):
+        return v1_tasks._TaskStepsVersionSnapshot(
+            task_id=task_id, agent_id=agent_id, max_event_id=2
+        )
+
+    resp = await es.build_event_stream_response(
+        task_id=task_id,
+        principal=principal,
+        initial_snapshot=snapshot,
+        read_task_snapshot=v1_tasks._load_task_info_snapshot,
+        read_task_steps=_poisoned_read_task_steps,
+        read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
+        read_task_steps_version=_version_reader,
+        **_long_intervals(),
+    )
+    try:
+        first = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
+        assert "event: task.status" in first
+
+        # The prefix really is delivered -- the step ordered before the
+        # unserializable one is not collateral damage.
+        second = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
+        assert second.startswith("event: step.completed\n")
+        assert "this step serializes fine" in second
+
+        # The stream is live, not closing: a frame broadcast now is
+        # projected and delivered, which only happens after
+        # ``finish_warm_up`` has run.
+        await es.manager.broadcast_to_task(
+            {
+                "type": "final_answer_delta",
+                "message_id": "after_warm_up",
+                "task_id": task_id,
+                "delta": "live",
+            },
+            task_id,
+        )
+        third = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
+        assert third.startswith("event: message.delta\n")
+        assert json.loads(third.split("data: ", 1)[1]) == {
+            "message_id": "after_warm_up",
+            "text": "live",
+        }
+    finally:
+        await resp.body_iterator.aclose()
+
+
+# ===== the replay's second bound: the same wire-byte budget the
+# attach-time fast paths' snapshot uses =====
+
+
+# ===== registration watermark: an event that lands in the gap between
+# `register_connection` and the warm-up read must not be folded into
+# the projector twice (once via replay, once via staged-drain) =====
+
+
+async def test_replay_watermark_excludes_a_row_committed_after_registration():
+    """Direct pin on ``_build_warm_up_frames``'s ``replay_watermark``
+    parameter, at the same sink level ``test_orphan_end_during_warm_up_is_rescued_by_staging``
+    uses for the cold-sink staging window: a trace row committed (and
+    broadcast) *after* the watermark was captured -- exactly the
+    registration-to-warm-up-read gap ``_generate`` now bounds replay to
+    -- must be excluded from this replay entirely, since it's already
+    covered by staging + ``finish_warm_up``'s drain. Without the bound
+    (``replay_watermark=None``, pinned by the mutation note below), the
+    same row would be replayed here AND drained from staging, producing
+    two ``step.started`` frames for the same step id instead of one."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    principal = _principal_for(full_key)
+
+    # What ``_generate`` would have captured immediately after
+    # ``register_connection``, before any of this task's history exists.
+    watermark_at_registration = v1_tasks._load_task_steps_version_snapshot(
+        task_id, principal
+    ).max_event_id
+
+    # Lands *after* that watermark -- the gap-window event -- and its
+    # broadcast reaches the still-cold sink in the same window, so it's
+    # staged rather than fed to a live projector.
+    _insert_trace_event(
+        task_id=task_id,
+        event_type="tool_execution_start",
+        event_id="gap-event",
+        timestamp=datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC),
+        step_id="step-1",
+        data={"tool_call_id": "call-1", "tool_name": "search", "tool_args": {}},
+    )
+    sink = _make_sink(task_id=task_id, warm=False)
+    await sink.send_text(
+        _trace_event_frame(
+            "tool_execution_start",
+            task_id=task_id,
+            step_id="step-1",
+            data={"tool_call_id": "call-1", "tool_name": "search", "tool_args": {}},
+        )
+    )
+    assert sink.staged_message_count == 1
+
+    warmed_projector, warm_up_frames = es._build_warm_up_frames(
+        task_id,
+        principal,
+        v1_tasks._load_task_steps_snapshot,
+        watermark_at_registration,
+    )
+    # The gap event's row id is > the watermark -- excluded from this
+    # replay entirely, nothing to replay for a task with no history
+    # before the watermark.
+    assert warm_up_frames == []
+
+    sink.finish_warm_up(warmed_projector)
+    # The staged broadcast is the only source of this step's frame.
+    frame_text, is_close = sink.queue.get_nowait()
+    assert is_close is False
+    assert frame_text.startswith("event: step.started\n")
+    step = json.loads(frame_text.split("data: ", 1)[1])["step"]
+    assert step["id"] == "tool_call:call-1"
+    assert sink.queue.empty()  # exactly once -- no duplicate from replay
+
+
+async def test_a_planning_row_folded_twice_in_the_residual_window_leaves_one_step_running():
+    """Pins the accepted residual of registering before reading the
+    watermark, so it cannot drift silently. Tracked as #1776.
+
+    A row that commits inside the registration-to-watermark gap is both
+    at or below the watermark (so the replay folds it) and already
+    staged (so ``finish_warm_up``'s drain folds it again). This test
+    builds that same end state directly: insert the row, capture a
+    watermark above it, then hand the sink the row's broadcast while it
+    is still cold.
+
+    The planning family is the one that cannot absorb it. Its public
+    step id comes from an in-memory counter rather than from a key the
+    event carries, so two folds mint two different ids, and the row's
+    single end event -- arriving live, after the handoff -- closes only
+    the later one. The earlier step stays ``running`` for the rest of
+    the connection.
+
+    Asserting the duplicate is deliberate. Exactly one start with its
+    matching completion is the acceptance test for #1776, and it
+    belongs with the fix that carries a persisted identity onto
+    broadcast frames.
+    """
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    principal = _principal_for(full_key)
+
+    _insert_trace_event(
+        task_id=task_id,
+        event_type="dag_plan_start",
+        event_id="gap-plan",
+        timestamp=datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC),
+        data={},
+    )
+    watermark = v1_tasks._load_task_steps_version_snapshot(
+        task_id, principal
+    ).max_event_id
+
+    sink = _make_sink(task_id=task_id, warm=False)
+    await sink.send_text(_trace_event_frame("dag_plan_start", task_id=task_id, data={}))
+    assert sink.staged_message_count == 1
+
+    warmed_projector, warm_up_frames = es._build_warm_up_frames(
+        task_id, principal, v1_tasks._load_task_steps_snapshot, watermark
+    )
+    replayed = json.loads(warm_up_frames[0].split("data: ", 1)[1])["step"]
+
+    sink.finish_warm_up(warmed_projector)
+    drained_text, _ = sink.queue.get_nowait()
+    drained = json.loads(drained_text.split("data: ", 1)[1])["step"]
+
+    # One row, two public ids: the counter advanced on each fold.
+    assert drained["id"] != replayed["id"]
+    assert drained["status"] == "running"
+
+    await sink.send_text(_trace_event_frame("dag_plan_end", task_id=task_id, data={}))
+    completed_text, _ = sink.queue.get_nowait()
+    completed = json.loads(completed_text.split("data: ", 1)[1])["step"]
+    # The single end event closes only the later id; the replayed one is
+    # never finalized.
+    assert completed["id"] == drained["id"]
+    assert completed["status"] == "completed"
+    assert sink.queue.empty()
+
+
+async def test_generate_wires_read_task_steps_version_into_the_watermark(monkeypatch):
+    """Wiring smoke test through the real generator (not just the
+    ``_build_warm_up_frames`` unit above): ``read_task_steps_version``
+    passed into ``_generate`` is actually called exactly once, and by
+    the time it runs the sink is already visible in ``manager`` --
+    proof that registration happened first, not just that the reader
+    ran once -- and its result reaches ``_build_warm_up_frames`` as
+    ``replay_watermark`` -- catches a signature/plumbing regression the
+    sink-level test above wouldn't (it calls ``_build_warm_up_frames``
+    directly, bypassing ``_generate`` entirely)."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    principal = _principal_for(full_key)
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    _insert_trace_event(
+        task_id=task_id,
+        event_type="tool_execution_start",
+        event_id="hist-1",
+        timestamp=base,
+        step_id="step-1",
+        data={"tool_call_id": "call-1", "tool_name": "search", "tool_args": {}},
+    )
+
+    calls: list[str] = []
+    original = v1_tasks._load_task_steps_version_snapshot
+
+    def _tracking_version_reader(task_id_, principal_):
+        # Ordering-sensitive on purpose: the sink only becomes visible
+        # in the manager once ``register_connection`` has run, so a
+        # reader moved ahead of registration records "unregistered"
+        # here and fails the assertion below. A count alone cannot see
+        # that, and the order is load-bearing -- registering second
+        # turns the gap this reader bounds from a duplicated row into a
+        # lost one.
+        calls.append(
+            "registered"
+            if any(
+                isinstance(c, es.V1EventStreamSink)
+                for c in es.manager.connections_for_task(task_id_)
+            )
+            else "unregistered"
+        )
+        return original(task_id_, principal_)
+
+    snapshot = v1_tasks._load_task_info_snapshot(task_id, principal)
+    resp = await es.build_event_stream_response(
+        task_id=task_id,
+        principal=principal,
+        initial_snapshot=snapshot,
+        read_task_snapshot=v1_tasks._load_task_info_snapshot,
+        read_task_steps=v1_tasks._load_task_steps_snapshot,
+        read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
+        read_task_steps_version=_tracking_version_reader,
+        **_long_intervals(),
+    )
+    try:
+        first = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
+        assert "event: task.status" in first
+        second = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
+        assert second.startswith("event: step.started\n")
+        assert calls == ["registered"]  # ran exactly once, and after registration
+    finally:
+        await resp.body_iterator.aclose()
+
+
+def _delete_the_task_then_read_the_watermark(task_id_, principal_):
+    """The race this split exists for: a supported DELETE removes the
+    row while this read is in flight, so the production reader's own
+    ``_resolve_task_or_404`` raises ``V1ApiError(TASK_NOT_FOUND)``. The
+    delete is real and the reader is the production one -- nothing
+    about the ``TASK_NOT_FOUND`` reaching the handler is synthesized."""
+    db = _direct_db_session()
+    try:
+        db.query(Task).filter(Task.id == task_id_).delete()
+        db.commit()
+    finally:
+        db.close()
+    return v1_tasks._load_task_steps_version_snapshot(task_id_, principal_)
+
+
+def _fail_the_watermark_read_transiently(task_id_, principal_):
+    """A failure that is not the task being gone.
+
+    A bare ``RuntimeError`` rather than a ``V1ApiError`` carrying some
+    other code, deliberately. The guard being pinned is
+    ``isinstance(exc, V1ApiError) and exc.code is TASK_NOT_FOUND``, and
+    this exercises the ``isinstance`` half: it is the shape a
+    driver-level or connection-level database failure actually reaches
+    this handler as, and the shape the comment above the handler names
+    when it says "a transient DB error". The task row is untouched and
+    still readable, which is exactly why ``resync_required`` -- call
+    ``steps()``, re-attach -- is the recovery that works here and
+    ``task_deleted`` is not."""
+    raise RuntimeError("transient database failure")
+
+
+def _fail_the_watermark_read_with_a_different_v1_api_error(task_id_, principal_):
+    """A ``V1ApiError`` that is not ``TASK_NOT_FOUND``.
+
+    Pins the other half of the guard: ``isinstance(exc, V1ApiError) and
+    exc.code is TASK_NOT_FOUND``. The two legs above only exercise the
+    ``isinstance`` half -- a bare ``RuntimeError`` is never a
+    ``V1ApiError`` in the first place, so a guard loosened to just
+    ``isinstance(exc, V1ApiError)`` would still pass both of them. This
+    leg is the one that would catch that: a rate-limited read is a real
+    ``V1ApiError``, but its code is not ``TASK_NOT_FOUND``, so this
+    close must still be ``resync_required`` -- the task itself is fine,
+    only this one read was throttled."""
+    raise V1ApiError(V1ErrorCode.RATE_LIMITED, 429)
+
+
+@pytest.mark.parametrize(
+    ("read_task_steps_version", "expected_code"),
+    [
+        pytest.param(
+            _delete_the_task_then_read_the_watermark,
+            "task_deleted",
+            id="task-deleted",
+        ),
+        pytest.param(
+            _fail_the_watermark_read_transiently,
+            "resync_required",
+            id="transient-read-failure",
+        ),
+        pytest.param(
+            _fail_the_watermark_read_with_a_different_v1_api_error,
+            "resync_required",
+            id="other-v1-api-error",
+        ),
+    ],
+)
+async def test_the_watermark_read_splits_task_deleted_from_every_other_failure(
+    read_task_steps_version, expected_code
+):
+    """The watermark read's handler classifies by cause, and every half
+    of that split is load-bearing.
+
+    This read re-resolves the task in its own session, so a delete
+    landing while it is in flight raises ``TASK_NOT_FOUND`` into the
+    handler. That close is claimed before the watchdog exists, so
+    nothing later can correct the code, and a client told to call
+    ``steps()`` and re-attach for a row that no longer exists only gets
+    a 404 back.
+
+    The other two legs matter just as much, and are the ones a
+    collapsed or loosened guard breaks silently: a failure that is not
+    the task being gone must still close with ``resync_required``,
+    because the task is there and resynchronizing does work -- whether
+    that failure is not a ``V1ApiError`` at all, or is a ``V1ApiError``
+    whose code is not ``TASK_NOT_FOUND``.
+
+    ``_long_intervals()`` keeps the watchdog asleep for the whole test,
+    so the close frame any leg observes can only be the one this
+    handler queued -- not the watchdog independently discovering the
+    same deleted row. Either way the warm-up block is skipped
+    (``replay_watermark`` stays ``None``), so no history reaches the
+    client from this attach; that is what the ``step.started``
+    assertion pins."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    principal = _principal_for(full_key)
+    snapshot = v1_tasks._load_task_info_snapshot(task_id, principal)
+
+    resp = await es.build_event_stream_response(
+        task_id=task_id,
+        principal=principal,
+        initial_snapshot=snapshot,
+        read_task_snapshot=v1_tasks._load_task_info_snapshot,
+        read_task_steps=v1_tasks._load_task_steps_snapshot,
+        read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
+        read_task_steps_version=read_task_steps_version,
+        **_long_intervals(),
+    )
+    frames = []
+    async for chunk in asyncio_timeout_iter(resp.body_iterator, timeout=2):
+        frames.append(chunk)
+    body = "".join(frames)
+    assert "event: task.status" in body
+    assert _parse_error_frame(body)["code"] == expected_code
+    assert "event: step.started" not in body
+
+
+async def test_absolute_deadline_stops_the_warm_up_replay_early():
+    """The warm-up replay loop re-checks the connection's own absolute
+    deadline before every yield, not only the main loop below it.
+
+    ``stream_max_duration_seconds`` is negative, so the deadline bound
+    at generator start (``monotonic() + stream_max_duration_seconds``)
+    is already in the past by the time the replay loop reaches its
+    first frame, regardless of how long the watermark read and the
+    history read themselves took. The task has three known steps
+    (``_three_step_task``), so a replay that ran to completion would
+    yield three ``step.started`` frames; this pins that none of them
+    make it out, and that the stream instead closes with
+    ``stream_expired`` once the main loop's own deadline check runs on
+    its very next pass -- the deadline break needs no close of its
+    own."""
+    task_id, principal = await _three_step_task()
+    snapshot = v1_tasks._load_task_info_snapshot(task_id, principal)
+    resp = await es.build_event_stream_response(
+        task_id=task_id,
+        principal=principal,
+        initial_snapshot=snapshot,
+        read_task_snapshot=v1_tasks._load_task_info_snapshot,
+        read_task_steps=v1_tasks._load_task_steps_snapshot,
+        read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
+        read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
+        **_long_intervals(stream_max_duration_seconds=-1.0),
+    )
+    try:
+        frames = []
+        async for chunk in asyncio_timeout_iter(resp.body_iterator, timeout=2):
+            frames.append(chunk)
+        body = "".join(frames)
+        assert "event: task.status" in body
+        assert "event: step.started" not in body
+        assert _parse_error_frame(body)["code"] == "stream_expired"
+        assert frames[-1].startswith("event: stream.error")
+    finally:
+        await resp.body_iterator.aclose()
+
+
+def _fail_the_history_read_because_the_task_is_gone(task_id_, principal_):
+    """The second, narrower ``TASK_NOT_FOUND`` race window
+    ``_build_warm_up_frames``'s own read covers -- the task is deleted
+    after the watermark read already succeeded, but before this read
+    runs. Distinct from ``_delete_the_task_then_read_the_watermark``
+    above, which covers the watermark read's own race instead."""
+    raise V1ApiError(V1ErrorCode.TASK_NOT_FOUND, 404)
+
+
+@pytest.mark.parametrize(
+    ("read_task_steps_version", "read_task_steps"),
+    [
+        pytest.param(
+            _delete_the_task_then_read_the_watermark,
+            v1_tasks._load_task_steps_snapshot,
+            id="watermark-read",
+        ),
+        pytest.param(
+            v1_tasks._load_task_steps_version_snapshot,
+            _fail_the_history_read_because_the_task_is_gone,
+            id="history-read",
+        ),
+    ],
+)
+async def test_generates_own_task_not_found_reads_are_abortive_and_end_watchdog_coverage(
+    read_task_steps_version, read_task_steps
+):
+    """Both of ``_generate``'s own pre-loop reads -- the replay
+    watermark and the warm-up history -- close ``task_deleted`` the
+    same way ``watchdog_check_once`` does when the task row is gone,
+    and on neither leg does the warm-up handoff ever run
+    (``sink.warm`` stays ``False``), so only ``abortive_close`` can end
+    the watchdog's own coverage on this path (see
+    ``_watchdog_coverage_done``). Pins the wire-level close code, pins
+    ``sink.abortive_close`` directly, and confirms the watchdog loop
+    actually exits on its own -- not just that the predicate flips --
+    by awaiting the watchdog task itself with a timeout. A short
+    ``watchdog_interval_seconds`` is what lets that task notice and
+    exit within the timeout, independent of the generator's own
+    teardown (which would cancel it regardless, masking a broken
+    ``abortive=True``)."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    principal = _principal_for(full_key)
+    snapshot = v1_tasks._load_task_info_snapshot(task_id, principal)
+
+    resp = await es.build_event_stream_response(
+        task_id=task_id,
+        principal=principal,
+        initial_snapshot=snapshot,
+        read_task_snapshot=v1_tasks._load_task_info_snapshot,
+        read_task_steps=read_task_steps,
+        read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
+        read_task_steps_version=read_task_steps_version,
+        **_long_intervals(watchdog_interval_seconds=0.05),
+    )
+    try:
+        first = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
+        assert "event: task.status" in first
+        sink = next(
+            c
+            for c in es.manager.connections_for_task(task_id)
+            if isinstance(c, es.V1EventStreamSink)
+        )
+        watchdog_task = next(
+            t
+            for t in asyncio.all_tasks()
+            if t.get_coro().cr_code.co_name == "_watchdog_loop"
+        )
+
+        second = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
+        assert _parse_error_frame(second)["code"] == "task_deleted"
+        assert sink.abortive_close is True
+        assert sink.warm is False
+
+        await asyncio.wait_for(watchdog_task, timeout=2)
+        assert watchdog_task.done()
+    finally:
+        await resp.body_iterator.aclose()
+
+
+def test_fast_paths_without_a_steps_version_reader_is_a_call_error():
+    """``read_task_steps_version`` is a required argument on all three
+    attach-time fast-path entry points -- ``_terminal_snapshot_stream``,
+    ``_input_required_snapshot_stream``, and the
+    ``_fast_path_snapshot_stream`` body they share -- not one carrying a
+    default.
+
+    ``build_event_stream_response`` always forwards its own reader into
+    whichever of the three it picks, so no caller inside this module can
+    reach one of them without a reader in hand. Requiredness is what
+    keeps that true for a caller outside it: the cursor baseline read
+    and its recheck are the only signal that catches a trace row landing
+    between the steps read and the fence, and a reader-less call would
+    otherwise run the fast path with that signal silently absent. This
+    pins the call itself as the failure point -- a ``TypeError`` naming
+    the argument, raised before any reader runs.
+
+    ``build_event_stream_response`` is pinned the same way. It is the
+    only entry point a caller outside this module reaches, so a default
+    restored there would accept reader-less attaches even with all three
+    inner entry points still required. Its own missing-argument
+    ``TypeError`` is raised at the call, not at the await: binding
+    happens before the coroutine object exists, so nothing is left
+    un-awaited by the assertion below."""
+
+    def _unused(task_id_, principal_):
+        raise AssertionError("must not run before the missing-argument TypeError")
+
+    terminal_snapshot = SimpleNamespace(
+        task_id=1, agent_id=1, status=TaskStatus.COMPLETED, output="done", error=None
+    )
+    with pytest.raises(TypeError, match="read_task_steps_version"):
+        es._terminal_snapshot_stream(
+            terminal_snapshot,
+            principal=None,
+            read_task_steps_response=_unused,
+            read_task_snapshot=_unused,
+        )
+
+    waiting_snapshot = SimpleNamespace(
+        task_id=1,
+        agent_id=1,
+        status=TaskStatus.WAITING_FOR_USER,
+        pending_question="what next?",
+    )
+    with pytest.raises(TypeError, match="read_task_steps_version"):
+        es._input_required_snapshot_stream(
+            waiting_snapshot,
+            principal=None,
+            read_task_steps_response=_unused,
+            read_task_snapshot=_unused,
+        )
+
+    with pytest.raises(TypeError, match="read_task_steps_version"):
+        es._fast_path_snapshot_stream(
+            terminal_snapshot,
+            principal=None,
+            read_task_steps_response=_unused,
+            read_task_snapshot=_unused,
+            build_conclusion=lambda snapshot_total_steps: "",
+            path_name="terminal",
+        )
+
+    with pytest.raises(TypeError, match="read_task_steps_version"):
+        es.build_event_stream_response(
+            task_id=1,
+            principal=None,
+            initial_snapshot=terminal_snapshot,
+            read_task_snapshot=_unused,
+            read_task_steps_response=_unused,
+        )
+
+
+async def asyncio_timeout_iter(aiter, *, timeout: float):
+    """Drive an async iterator to exhaustion with a per-item timeout, so
+    a regression that makes the generator hang instead of closing fails
+    this test outright rather than stalling the whole suite."""
+    while True:
+        try:
+            item = await asyncio.wait_for(aiter.__anext__(), timeout=timeout)
+        except StopAsyncIteration:
+            return
+        yield item
+
+
+# ===== a staged frame that fails to project during warm-up doesn't
+# turn an otherwise-normal stream close into a resync_required one =====
 
 
 def test_fast_path_terminal_attach_includes_current_steps():
@@ -2768,7 +4304,10 @@ def test_fast_path_step_snapshot_hits_the_steps_cache(monkeypatch):
 
 async def test_fast_path_step_read_failure_closes_with_resync_required_not_a_bare_disconnect():
     """Both attach-time fast paths now catch a snapshot-read failure and
-    close with ``stream.error {resync_required}``
+    close with ``stream.error {resync_required}``, matching the
+    invariant ``_generate`` already enforces around its own watermark
+    read (see
+    ``test_the_watermark_read_splits_task_deleted_from_every_other_failure``)
     -- not a bare exception out of the generator. That distinction
     matters here specifically because ``StreamingResponse`` sends the
     HTTP response start (200, headers) before ever pulling a chunk from
@@ -2776,10 +4315,11 @@ async def test_fast_path_step_read_failure_closes_with_resync_required_not_a_bar
     HTTP status, it just ends an already-started 200 response with no
     bytes and no close frame, indistinguishable from the client's side
     from the connection merely dropping. ``task.status`` is emitted
-    first either way.
+    first either way, the same order ``_generate`` uses around its own
+    warm-up failure.
 
-    A step-read failure on either fast path does not cancel that path's
-    own lifecycle conclusion: the snapshot
+    Unlike the warm-up path, a step-read failure on either fast path
+    does not cancel that path's own lifecycle conclusion: the snapshot
     that picked the fast path was already read, successfully, before
     either generator started, so ``task.completed``/``task.input_required``
     is known-good independent of the steps read below it. Both bodies
@@ -2872,9 +4412,10 @@ async def test_fast_path_task_not_found_closes_with_task_deleted_not_resync_requ
     the task (see ``TaskStepsResponseReader``) after
     ``build_event_stream_response`` already resolved it once to pick
     this fast path, so a task deleted in that exact gap surfaces here as
-    ``V1ApiError(TASK_NOT_FOUND)`` -- the same condition the watchdog
-    already reports as ``task_deleted``, not ``resync_required``.
-    Asking a client to ``steps()`` and reattach
+    ``V1ApiError(TASK_NOT_FOUND)`` -- the same condition the warm-up read
+    and the watchdog already report as ``task_deleted`` (see
+    ``test_generates_own_task_not_found_reads_are_abortive_and_end_watchdog_coverage``),
+    not ``resync_required``. Asking a client to ``steps()`` and reattach
     for a task that's gone would just 404 instead of resyncing anything.
 
     The conclusion frame still goes out first in this case too: the
@@ -2882,8 +4423,8 @@ async def test_fast_path_task_not_found_closes_with_task_deleted_not_resync_requ
     it's already in hand and does not depend on the re-resolve that
     just 404ed.
 
-    ``principal`` is ``None`` here too -- see the companion read-failure
-    test above for why the key check is patched to succeed."""
+    ``principal`` is ``None`` here too, the same as the companion
+    read-failure test above."""
 
     def _deleted_read_task_steps_response(task_id_, principal_):
         raise V1ApiError(V1ErrorCode.TASK_NOT_FOUND, 404)
@@ -2940,17 +4481,37 @@ async def test_fast_path_task_not_found_closes_with_task_deleted_not_resync_requ
     )
 
 
-def test_fast_path_snapshot_bounds_match_the_documented_endpoint_contract():
-    """Pins the two literal values the attach-time snapshot is bounded
-    by. These aren't free internal tuning: ``tasks.py``'s endpoint
-    docstring documents ``REPLAY_MAX_STEPS`` as the literal number 512
-    (not a symbolic reference to this module) for API consumers reading
-    the ``GET /v1/chat/tasks/{task_id}/events`` contract, so a change to
-    either constant here has to be paired with updating that docstring
-    -- this test exists so such a change doesn't slip through silently.
+def test_attach_step_batch_bounds_match_the_documented_endpoint_contract():
+    """Pins the two literal values every attach-time batch of steps is
+    bounded by -- the fast paths' one-shot snapshot and the normal
+    path's history replay alike. These aren't free internal tuning:
+    ``tasks.py``'s ``stream_chat_task_events`` endpoint docstring
+    documents them as the literal numbers 512 and 4 MiB (not symbolic
+    references to this module) for API consumers reading the ``GET
+    /v1/chat/tasks/{task_id}/events`` contract, so a change to either
+    constant here has to be paired with updating that docstring -- this
+    test exists so such a change doesn't slip through silently.
+
+    Pinning the two module constants alone does not do that: a constant
+    can drift out of sync with the docstring's own hardcoded numbers
+    without either assertion below ever noticing, since neither reads
+    the docstring. The assertions on ``__doc__`` close that gap by
+    pinning the authoritative passage's exact wording and requiring
+    each number to appear exactly once across the whole docstring, so a
+    second copy reappearing elsewhere -- the failure mode a bare
+    membership check cannot see -- fails the count.
     """
     assert es.REPLAY_MAX_STEPS == 512
     assert es.MAX_SNAPSHOT_WIRE_BYTES == 4 * 1024 * 1024
+
+    endpoint_doc = v1_tasks.stream_chat_task_events.__doc__ or ""
+    assert "a step-count cap (512) keeps the most recent steps" in endpoint_doc
+    assert "total-wire-bytes budget (4 MiB)" in endpoint_doc
+    # Exactly one passage carries each number. A second copy is what
+    # lets one of them drift while the other stays right, so the count
+    # is part of the contract this test pins, not incidental.
+    assert endpoint_doc.count("512") == 1
+    assert endpoint_doc.count("4 MiB") == 1
 
 
 @pytest.mark.parametrize(
@@ -3184,7 +4745,7 @@ async def test_fast_path_step_snapshot_replay_max_steps_boundary(
     literal 512/513 so this test keeps pinning the boundary itself even
     if the constant's value ever changes -- that value is pinned
     separately, by
-    ``test_fast_path_snapshot_bounds_match_the_documented_endpoint_contract``.
+    ``test_attach_step_batch_bounds_match_the_documented_endpoint_contract``.
     """
     base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
     steps = [
@@ -4597,79 +6158,6 @@ async def test_fast_path_unserializable_step_concludes_then_closes_for_resync(
     assert "moved to a new run" not in body
 
 
-def test_fast_paths_without_a_steps_version_reader_is_a_call_error():
-    """``read_task_steps_version`` is a required argument on all three
-    attach-time fast-path entry points -- ``_terminal_snapshot_stream``,
-    ``_input_required_snapshot_stream``, and the
-    ``_fast_path_snapshot_stream`` body they share -- not one carrying a
-    default.
-
-    ``build_event_stream_response`` always forwards its own reader into
-    whichever of the three it picks, so no caller inside this module can
-    reach one of them without a reader in hand. Requiredness is what
-    keeps that true for a caller outside it: the cursor baseline read
-    and its recheck are the only signal that catches a trace row landing
-    between the steps read and the fence, and a reader-less call would
-    otherwise run the fast path with that signal silently absent. This
-    pins the call itself as the failure point -- a ``TypeError`` naming
-    the argument, raised before any reader runs.
-
-    ``build_event_stream_response`` is pinned the same way. It is the
-    only entry point a caller outside this module reaches, so a default
-    restored there would accept reader-less attaches even with all three
-    inner entry points still required. Its own missing-argument
-    ``TypeError`` is raised at the call, not at the await: binding
-    happens before the coroutine object exists, so nothing is left
-    un-awaited by the assertion below."""
-
-    def _unused(task_id_, principal_):
-        raise AssertionError("must not run before the missing-argument TypeError")
-
-    terminal_snapshot = SimpleNamespace(
-        task_id=1, agent_id=1, status=TaskStatus.COMPLETED, output="done", error=None
-    )
-    with pytest.raises(TypeError, match="read_task_steps_version"):
-        es._terminal_snapshot_stream(
-            terminal_snapshot,
-            principal=None,
-            read_task_steps_response=_unused,
-            read_task_snapshot=_unused,
-        )
-
-    waiting_snapshot = SimpleNamespace(
-        task_id=1,
-        agent_id=1,
-        status=TaskStatus.WAITING_FOR_USER,
-        pending_question="what next?",
-    )
-    with pytest.raises(TypeError, match="read_task_steps_version"):
-        es._input_required_snapshot_stream(
-            waiting_snapshot,
-            principal=None,
-            read_task_steps_response=_unused,
-            read_task_snapshot=_unused,
-        )
-
-    with pytest.raises(TypeError, match="read_task_steps_version"):
-        es._fast_path_snapshot_stream(
-            terminal_snapshot,
-            principal=None,
-            read_task_steps_response=_unused,
-            read_task_snapshot=_unused,
-            build_conclusion=lambda snapshot_total_steps: "",
-            path_name="terminal",
-        )
-
-    with pytest.raises(TypeError, match="read_task_steps_version"):
-        es.build_event_stream_response(
-            task_id=1,
-            principal=None,
-            initial_snapshot=terminal_snapshot,
-            read_task_snapshot=_unused,
-            read_task_steps_response=_unused,
-        )
-
-
 # ===== single-frame content byte cap =====
 
 
@@ -5041,9 +6529,11 @@ async def test_nonfinite_step_data_values_are_normalized_to_null_on_the_wire():
     ``NaN``/``Infinity``/``-Infinity``, which a strict ``JSON.parse``
     client rejects outright.
 
-    Both producers of a ``step.*`` frame -- live projection
-    (``_step_content_frame``) and the attach-time fast paths' cached
-    snapshot -- funnel through ``_step_wire_frame``, and that function
+    All three producers of a ``step.*`` frame -- live projection
+    (``_step_content_frame``), the attach-time fast paths' cached
+    snapshot, and the normal path's history replay
+    (``_build_warm_up_frames``) -- funnel through
+    ``_step_wire_frame``, and that function
     is where the single ``model_dump(mode="json")`` runs: it takes the
     ``PublicStep`` model, not an already-dumped dict, so neither
     producer can reach a frame builder with un-normalized values.
@@ -5059,9 +6549,10 @@ async def test_nonfinite_step_data_values_are_normalized_to_null_on_the_wire():
     produces it; normalizing it in test setup first would have left the
     assertions green even if the normalization regressed to passing the
     raw dict straight through. Because that normalization sits in
-    ``_step_wire_frame``, which both producers must go through to build
-    a frame at all, this one assertion covers the fast paths too. It
-    changes no production code -- if that regression ever happens, this
+    ``_step_wire_frame``, which every producer must go through to build
+    a frame at all, this one assertion covers the fast paths and the
+    replay too. It changes no production code -- if that regression
+    ever happens, this
     test is the tripwire.
     """
     nested_nonfinite_data = {

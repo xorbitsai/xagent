@@ -733,8 +733,18 @@ class _TaskStepsVersionSnapshot:
 
 @dataclass(frozen=True)
 class _TraceEventSnapshot:
-    """Trace fields consumed by the pure public-step mapper."""
+    """Trace fields consumed by the pure public-step mapper.
 
+    ``id`` is the row's numeric primary key (``TraceEvent.id``) --
+    distinct from ``event_id`` below (the row's own string identifier,
+    exposed to SDK clients as part of a public step's derived id).
+    Kept here specifically so ``v1/_events_stream.py``'s warm-up replay
+    can bound itself to a watermark (``id <= some max_event_id``,
+    the same column ``_load_task_steps_version_snapshot`` reads) without
+    a second, id-only read of the same rows.
+    """
+
+    id: int
     task_id: int
     event_id: str
     event_type: str
@@ -886,6 +896,7 @@ def _load_task_steps_snapshot(
         )
         events = tuple(
             _TraceEventSnapshot(
+                id=int(row.id),
                 task_id=int(row.task_id),
                 event_id=str(row.event_id),
                 event_type=str(row.event_type),
@@ -1290,16 +1301,28 @@ async def stream_chat_task_events(
       - ``step.started``: ``{step}``, a running ``PublicStep``.
       - ``step.completed``: ``{step}``, the same step once its end event
         (or failure) resolves it -- ``status`` is ``"completed"`` or
-        ``"failed"``. On the two attach-time fast paths below (the task
-        is already finished, or already waiting on user input), these
-        frames are that attach's one-shot step snapshot: in
-        ``started_at`` order, drawn from the task's most recent steps
-        up to a step-count cap (512) and a total-wire-bytes budget over the
-        snapshot's serialized frames. When the byte budget is what binds,
-        it keeps that window's oldest contiguous run, so the very latest
-        steps may be the ones missing. Whether the snapshot was cut short
-        is reported on the conclusion frame, not on these -- ``GET
-        .../steps`` is the authoritative full history either way.
+        ``"failed"``. Every attach opens with a batch of these frames
+        describing the steps the task already has, in ``started_at``
+        order: a replay of the task's history on the normal path, and a
+        one-shot snapshot on the two attach-time fast paths below (the
+        task is already finished, or already waiting on user input).
+        Both batches are drawn from the task's most recent steps and are
+        bounded by two caps applied in series, not whichever binds first:
+        a step-count cap (512) keeps the most recent steps, then a
+        total-wire-bytes budget (4 MiB) over that window's serialized
+        frames trims it further. Either cap can be the one that actually
+        removes something, and both can fire on the same batch. When the
+        byte budget is what trims, it keeps that window's oldest
+        contiguous run, so the very latest steps may be the ones missing;
+        a batch can also come out empty. Whether the batch was cut short
+        is reported on the conclusion frame on the fast paths, and is not
+        reported at all on the normal path, which has no conclusion frame
+        at attach time -- these ``step.*`` frames carry no **batch-level**
+        truncation field of their own on either path (a step's own
+        ``data`` can still carry its own ``truncated: true`` when that
+        step's content overflows the per-frame cap -- see below). ``GET
+        .../steps`` is the authoritative full history either way, and is
+        where a client that needs every step reconciles.
       - ``message.delta``: ``{message_id, text}``, one chunk of a
         streamed final answer as the agent generates it.
       - ``message.completed``: ``{message_id, content}``, that same
@@ -1313,26 +1336,55 @@ async def stream_chat_task_events(
         over them: prefer the accumulated deltas, or ``steps()`` for the
         full persisted text.
       A ``message`` ``PublicStep``'s ``id`` cannot be correlated between
-      this stream and ``GET .../steps``: the live frame mints a fresh id
-      per broadcast, while ``steps()`` returns the persisted trace
-      event's own id as that step's id.
+      this stream and ``GET .../steps`` for a step this connection
+      projects *live*: the live frame mints a fresh id per broadcast,
+      while ``steps()`` returns the persisted trace event's own id as
+      that step's id. This does not hold for the attach-time replay
+      batch above: a replayed step is folded from the same persisted
+      ``TraceEvent`` rows ``steps()`` reads, through the same
+      ``PublicStepProjector`` fold, so its id is that same row's own id
+      and matches ``steps()`` exactly.
       A ``thinking`` step whose id begins with ``thinking:plan:`` or
-      ``thinking:planning:`` cannot be correlated either, and is the one
-      case where trying to actively corrupts client state. Both ids end
-      in a count of the planning cycles the projection has seen, and
-      this stream's projection starts empty at attach: it numbers the
-      first planning cycle it observes ``:1`` however many already
-      happened, while ``steps()`` counts from the start of the task's
-      persisted history. A client attaching during a task's second
-      planning cycle is therefore sent ``thinking:plan:{task_id}:1`` for
-      a step ``steps()`` calls ``thinking:plan:{task_id}:2`` -- and
-      ``thinking:plan:{task_id}:1`` already exists in ``steps()`` as the
-      first cycle, a different step. Merging the two surfaces by id
-      overwrites one with the other. These ids are stable within one
-      connection and nowhere else: a re-attach after ``stream_expired``
-      (the 1-hour cap) or ``resync_required`` (queue overflow) opens a
-      new connection whose count starts over. Reconcile planning steps
-      against ``steps()`` by ``started_at`` and content, not by id.
+      ``thinking:planning:`` is correlated the same way: the replay
+      batch's ids match ``steps()`` exactly, because the projector that
+      builds that batch is warmed by replaying the task's full
+      persisted history rather than starting empty, so the planning-
+      cycle count it lands on is the same one ``steps()`` computes from
+      the same rows.
+      A client library may carry a stricter rule than this contract. The
+      Python SDK's ``events()`` guidance tells callers to reconcile a
+      planning step by ``started_at`` plus content, "never by id", with
+      no exception for a replayed step -- wording that predates the
+      attach-time replay batch. A caller that follows it is safe rather
+      than wrong: it forgoes a correlation this endpoint does offer for
+      replayed steps instead of making one this endpoint does not
+      support. Narrowing that guidance to the live-projected case is
+      SDK-side work, not a difference in what this endpoint sends.
+      The gap that remains is narrower than the replay batch, and is
+      real in two cases. First, a ``thinking:plan:``/``thinking:planning:``
+      id minted for a live frame *after* the replay batch: its count
+      continues from whatever this connection's own projector had
+      observed by then, and a client must not assume that always equals
+      ``steps()``'s own count. Second, the narrow race window between
+      this connection's registration with the broadcast manager and the
+      watermark read that bounds the replay (see ``_build_warm_up_frames``):
+      a row landing inside that window is folded in twice -- once by the
+      replay, and once more as a live broadcast that carries no
+      persisted id to dedupe it against -- which can push a live
+      planning-cycle count out of step with ``steps()`` from that point
+      on. A planning step opened inside that window can also be left at
+      ``status: "running"`` for the rest of the connection: the row is
+      folded twice, so it produces two public step ids, and the row's
+      single end event closes only the later one. Tracked as #1776.
+      This is a defect, unlike the final-answer duplication described
+      below, which is deliberate.
+      Trying to actively correlate a step id across either of these
+      two live cases corrupts client state rather than merely missing a
+      match. These live ids are stable within one connection and nowhere
+      else: a re-attach after ``stream_expired`` (the 1-hour cap) or
+      ``resync_required`` (queue overflow) opens a new connection whose
+      count starts over. Reconcile a live planning step against
+      ``steps()`` by ``started_at`` and content, not by id.
       Every other public step type -- ``tool_call``,
       ``agent_delegation``, and ``thinking`` steps whose id carries the
       originating step id rather than a count -- keeps the same id
@@ -1348,11 +1400,14 @@ async def stream_chat_task_events(
       this stream: once as its ``message.delta``/``message.completed``
       sequence, and again as a ``message``-type ``step.completed`` once
       the underlying ``ai_message`` trace event folds in -- the same
-      step ``steps()`` already shows for that row. This is duplication,
-      not loss: a client that already rendered the delta/completed
-      sequence can ignore the matching step, or use it as the
-      authoritative record instead, but should not expect the two to be
-      mutually exclusive.
+      step ``steps()`` and a fresh attach's replay already show for
+      that row. This is duplication, not loss: a client that already
+      rendered the delta/completed sequence can ignore the matching
+      step, or use it as the authoritative record instead, but should
+      not expect the two to be mutually exclusive. Unlike the
+      race-window duplication described above (tracked as #1776),
+      this one is by design on every attach, not a narrow-window
+      defect.
       A ``step.*``/``message.*`` frame whose content-bearing field would
       exceed a per-frame byte cap has that field truncated (or, for a
       step's structured ``data``, replaced) and flagged with
@@ -1368,8 +1423,9 @@ async def stream_chat_task_events(
       ``message.delta``/``message.completed`` carries the shortened text
       itself plus ``truncated: true`` and no ``original_bytes``. A raw
       broadcast frame that runs past 256 KiB -- measured without the
-      internal task-description stamp such frames carry -- is dropped
-      whole instead of truncated (see Behavior below): no marker, no
+      task's own description column, which such frames carry under one
+      of two keys depending on the frame family -- is dropped whole
+      instead of truncated (see Behavior below): no marker, no
       content.
       This cap is specific to this stream -- ``GET .../steps`` applies
       no such cap and always returns a step's full, untruncated
@@ -1378,33 +1434,49 @@ async def stream_chat_task_events(
 
     Behavior:
       - Normal attach: opens the stream, emits ``task.status`` for the
-        task's current state, then goes live -- a status update each
-        time the task's status changes (consecutive duplicates are
-        suppressed), ``step.*``/``message.*`` frames as new trace
-        events and streamed answer chunks arrive, and
-        ``task.completed`` when the task finishes. A ``: ping`` comment
-        line is sent whenever 15s pass without any other frame going
-        out, to keep the connection alive -- not on a fixed 15s
-        cadence regardless of activity.
-      - A stream that goes live carries only what happens after the
-        connection opens; it never resends the steps that already
-        happened. (The two attach-time fast paths below are the
-        exception: they send a one-shot snapshot of the task's steps
-        and close, rather than going live at all.) That has one
-        consequence a client must handle: a step that was already
-        running at attach time does not appear on this stream at all.
-        Its ``step.started`` was broadcast before this connection
-        existed, and its end event arrives here with no matching
-        start, so that end is dropped rather than sent -- the client
-        sees neither half of the step. ``GET .../steps`` reads the
-        database and is unaffected by when the stream was opened, so a
-        client attaching to an already-running task reconciles there
-        rather than expecting this stream to fill the gap.
+        task's current state, then replays the task's already-known
+        steps as ``step.started``/``step.completed`` frames in
+        ``started_at`` order -- the same order ``steps()`` returns them
+        in -- then goes live: a status update each time the task's
+        status changes (consecutive duplicates are suppressed), further
+        ``step.*``/``message.*`` frames as new trace events and streamed
+        answer chunks arrive, and ``task.completed`` when the task
+        finishes. A ``: ping`` comment line is sent whenever 15s pass
+        without any other frame going out, to keep the connection
+        alive -- not on a fixed 15s cadence regardless of activity.
+      - The replay is what lets a client attach to a task that is
+        already running and still see that task's in-flight steps
+        resolve: a step whose ``step.started`` was broadcast before the
+        connection existed is replayed here, so its end event arriving
+        later has a start to pair with and reaches the client as
+        ``step.completed`` rather than being dropped as an orphan --
+        unless the replay's byte budget trimmed that step out of the
+        batch, or the batch ended early at a step this stream could not
+        serialize -- reasons (5) and (6) below.
+      - The replay is bounded, and a client must not treat it as the
+        task's complete history. It carries the same two caps, applied
+        in the same order, that ``step.started``/``step.completed``
+        above states for every attach-time batch, including which end
+        of the window each one drops. A task with
+        more history than that gets a partial replay, with no marker
+        frame saying so, and a replay can legitimately be empty. This is
+        a bound, not a failure:
+        nothing about it closes the stream or emits ``stream.error``.
+        A step whose data this stream
+        cannot serialize ends the batch at that step, which shortens the
+        replay the same way without closing the stream either; that one
+        is reason (6) below.
+        ``GET .../steps`` reads the database, is unaffected by when the
+        stream was opened or by what the replay admitted, and is the
+        authoritative full history -- a client that needs every step
+        reconciles there. That is true of a replay shortened by either
+        cap. It is not unconditionally true of a replay shortened by a
+        step it could not serialize: reason (6) below says why.
       - Frame sequence into ``task.completed``: a task that fails emits
         ``task.status`` (``"failed"``) from the failure broadcast first,
         then the watchdog's authoritative ``task.completed`` close
         frame. Delivery of every ``step.*``/``message.*`` content frame
-        on this stream is best-effort, not guaranteed, for four
+        on this stream is best-effort, not guaranteed, for six
         separate reasons: (1) closing a stream for any reason drains its
         queued backlog before inserting the close frame, so any
         already-queued frame -- a ``task.status``, a ``step.*``, a
@@ -1419,11 +1491,12 @@ async def stream_chat_task_events(
         so its content never reaches the per-field truncation cap
         described above and leaves no ``"truncated": true`` marker --
         this is a full drop, not a truncation. The size measured
-        excludes the task description that the broadcast conversion
-        stamps onto every trace event, so a task's description alone
-        can no longer blank out its step stream this way -- a frame is
-        only dropped here when its content, apart from that field, is
-        still over the cap. (4) a planning step can be left unresolved:
+        excludes the task's own description column -- which arrives
+        under one of two keys depending on the frame family -- so a
+        task's description alone can no longer blank out its step
+        stream this way -- a frame is only dropped here when its
+        content, apart from that column, is still over the cap. (4) a
+        planning step can be left unresolved:
         when a planning round ends without emitting its own terminal
         event (a plan-generation error escaping before it), the next
         round clears the pairing key that step was waiting on, so the
@@ -1432,7 +1505,27 @@ async def stream_chat_task_events(
         stream's life (``_step_mapping.py``'s ``dag_execute_start``
         branch). This one is not a stream-only artifact: ``GET
         .../steps`` folds the same events and shows that step the same
-        way. (2), (3) and (4) are silent: none of them ever produces a
+        way. (5) the replay's byte budget can trim a still-running step
+        out of the batch it sends at attach time: the projector that
+        feeds the live view is still warmed from the task's whole
+        history regardless, so that step's ``step.completed`` still
+        arrives once it resolves, but this stream never sent the
+        ``step.started`` the replay would otherwise have given it, so
+        the end arrives with no start on this stream to pair with. This
+        one is a stream-only artifact, unlike (4): ``GET .../steps``
+        reads the task's full history directly and is unaffected by
+        what one stream attach's replay admitted. (6) a step whose data
+        cannot be turned into JSON ends the replay batch at that step:
+        the steps serialized before it still go out and the stream
+        still goes live, but that step and anything the batch had not
+        reached are missing from the replay, leaving the same
+        start-without-end shape reason (5) describes. Reconciling this
+        one against ``GET .../steps`` is not guaranteed to work the way
+        it does for (5): that endpoint serializes the same step data on
+        its own read path, so data that defeats the replay can make
+        that read fail as well. That is a property of the data, not of
+        this stream, and it is tracked separately. (2), (3), (4), (5)
+        and (6) are silent: none of them ever produces a
         ``stream.error`` frame or any other signal on the wire. (1) is
         not silent in the same way -- the
         close frame that follows a queue-drain is often itself a
@@ -1442,7 +1535,13 @@ async def stream_chat_task_events(
         presence or absence proves nothing about whether a content frame
         was lost this way: a ``stream.error`` does not mean content was
         dropped, and its absence does not mean nothing was. Only
-        reconciling against ``steps()`` answers that. No failure
+        reconciling against ``steps()`` answers that. A related but
+        separate mechanism is the warm-up staging buffer (used only
+        during a fresh attach's replay window, before this sink goes
+        live): if it overflows, the still-unfed staged messages are
+        dropped and the stream closes with ``resync_required`` for that
+        specific reason -- a bound on that buffer, not the outbound
+        queue (1) describes. No failure
         information is lost when a status frame is dropped this way --
         ``task.completed`` still carries ``status: "failed"`` and a
         populated ``error`` -- but a dropped content frame has no such
@@ -1512,9 +1611,17 @@ async def stream_chat_task_events(
       - No ``task.status`` frame is guaranteed to be fresh or in order,
         at any point in the stream's life, not only at attach: this
         endpoint never buffers or reconciles ``task.status`` frame
-        order against anything. Accepted because only the three close
-        frames above are treated as authoritative; each comes from a
-        direct read of the task row, never from frame ordering.
+        order against anything (``step.*``/``message.*`` frames are a
+        separate story -- attaching mid-task replays known steps before
+        going live specifically so a step's end event isn't misread as
+        an orphan, unless the replay's byte budget trimmed that step
+        out of the batch, or the batch ended early at a step this
+        stream could not serialize -- reasons (5) and (6) below; that
+        ordering
+        guarantee doesn't extend to ``task.status``). Accepted because
+        only the three close frames
+        above are treated as authoritative; each comes from a direct
+        read of the task row, never from frame ordering.
 
     Args:
         task_id: Path parameter; the target task's primary key.
@@ -1546,10 +1653,11 @@ async def stream_chat_task_events(
             registers a sink at all, so it never counts toward either
             cap -- its step snapshot read goes through the same
             ``max_event_id``-keyed cache ``GET .../steps`` uses. That
-            snapshot is bounded by a step-count cap and a
-            total-wire-bytes budget; a snapshot cut short by either
-            carries the ``snapshot_truncated``/``snapshot_total_steps``
-            marker on its conclusion frame as described above. When a
+            snapshot is bounded by the same step-count cap and
+            total-wire-bytes budget the normal streaming path's own
+            history replay is; a snapshot cut short by either carries
+            the ``snapshot_truncated``/``snapshot_total_steps`` marker
+            on its conclusion frame as described above. When a
             shared cache backend is configured (Redis; see
             ``hot_path_cache.get_cache_backend``), a burst of fast-path
             attaches on one task (or repeated attaches after it's
@@ -1568,11 +1676,12 @@ async def stream_chat_task_events(
             watchdog's 30s database poll picks it up, not via broadcast.
             That poll only ever reads task status, though, never step
             content: an attach routed to a different worker than the one
-            executing the task still gets the authoritative close frame
-            (the watchdog reads the task row), but receives none of the
-            live ``step.*``/``message.*`` frames produced in between --
-            there is no equivalent fallback delivery for content the way
-            there is for a status transition, so such an attach
+            executing the task still gets a correct history replay (it
+            reads the database) and the authoritative close frame (the
+            watchdog reads the task row), but receives none of the live
+            ``step.*``/``message.*`` frames produced in between -- there
+            is no equivalent fallback delivery for content the way there
+            is for a status transition, so such an attach's live portion
             degrades to the lifecycle-only shape. Some transitions --
             lease-expiry recovery among them -- never broadcast at all,
             in any deployment shape, so the watchdog poll is their only
@@ -1586,6 +1695,7 @@ async def stream_chat_task_events(
         principal=principal,
         initial_snapshot=snapshot,
         read_task_snapshot=_load_task_info_snapshot,
+        read_task_steps=_load_task_steps_snapshot,
         read_task_steps_response=_get_chat_task_steps_sync,
         read_task_steps_version=_load_task_steps_version_snapshot,
     )

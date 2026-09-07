@@ -13,24 +13,37 @@ client without polling. Four more events are lifecycle-only and
 carry no step/message content of their own -- ``task.status``,
 ``task.completed``, ``task.input_required``, and ``stream.error``.
 
-Each connection gets its own projector, and that projector is fed only
-the frames broadcast after the connection registered. A step that was
-already running at that moment therefore has no matching start in it,
-so the step's eventual end event folds in as an orphan and is dropped:
-that step never appears on this stream at all, since its start was
-broadcast before this connection existed.
-Clients attaching mid-task reconcile against
-``GET /v1/chat/tasks/{task_id}/steps``, which reads the database and
-so is unaffected by when the stream was opened. The two attach-time
-fast paths are the exception to all of this: an attach that finds the
-task already terminal, or already waiting on user input, closes without
-ever registering a projector, and sends a bounded one-shot snapshot of
-the task's steps between ``task.status`` and its conclusion frame (see
-``_fast_path_step_snapshot``) instead of projecting anything live.
+Attaching mid-task -- after a step has already started -- doesn't drop
+that step's eventual end event: ``_generate`` replays trace history into
+a fresh projector before entering its main loop, yields the resulting
+steps directly (same as the initial ``task.status`` frame), then hands
+that pre-warmed projector to the sink (``V1EventStreamSink.finish_warm_up``).
+Anything broadcast between registration and that hand-off is staged,
+not fed to an empty projector, and replayed through the warm one in
+arrival order once it's ready -- see ``V1EventStreamSink._warm`` /
+``_staged_messages`` for why an empty projector would otherwise fold a
+step's end event in as an orphan and silently drop it. That replay is
+bounded (``REPLAY_MAX_STEPS`` steps and ``MAX_SNAPSHOT_WIRE_BYTES`` of
+serialized frames, see ``_build_warm_up_frames``), and it also ends
+early at a step whose ``data`` cannot be serialized, so a client that
+needs a task's complete history reconciles against
+``GET /v1/chat/tasks/{task_id}/steps``, which reads the database rather
+than this stream's batch. That read does not depend on when the stream
+was opened or on what this stream's bounds admitted; it is not, however,
+an unconditional fallback -- see the endpoint docstring's best-effort
+delivery reasons in ``tasks.py`` for the full list of ways a replay can
+come up short, and for the one case where the reconciling read can fail
+on the same data. The two attach-time fast paths are the exception to
+all of this: an attach that finds the task already terminal, or already
+waiting on user input, closes without ever registering a projector, and
+sends a bounded one-shot snapshot of the task's steps between
+``task.status`` and its conclusion frame (see
+``_fast_path_step_snapshot``) instead of replaying or projecting
+anything live.
 
 No ``task.status`` frame is
 ever guaranteed to be fresh or in order, at any point in the stream's
-life: ``ConnectionManager.broadcast_to_task``
+life, independent of the above: ``ConnectionManager.broadcast_to_task``
 stamps each event with whatever ``run_id`` / ``state_version`` tuple
 its producer captured, falling back to a fresh read of the task row
 (status included) when the producer didn't capture one, and this sink
@@ -68,7 +81,8 @@ values it deliberately leaves unbounded, in one place:
     string to cut (see ``_capped_step_data``).
   - One inbound broadcast frame, before it is projected at all:
     ``MAX_RAW_FRAME_TEXT_CHARS`` (256 KiB), measured excluding the
-    ``task_description`` stamp every converted trace event carries (see
+    task's own description column, which every converted trace event
+    and every ``task_info`` frame carries under one of two keys (see
     ``_measured_content_frame``). Over the cap is a silent drop --
     counted and logged, never a close, and never applied to a
     lifecycle frame.
@@ -86,18 +100,37 @@ values it deliberately leaves unbounded, in one place:
     inside ordinary backlog territory, so 4 MiB is the tightest value
     that leaves ordinary traffic alone -- against the ~16 MiB a full
     element-capped queue of maximum frames would otherwise hold.
-  - One attach-time fast-path step snapshot: ``REPLAY_MAX_STEPS`` (512
-    steps) *and* ``MAX_SNAPSHOT_WIRE_BYTES`` (4 MiB of serialized frame
-    text). Whichever binds first cuts the snapshot short: the step cap
-    binds on a long history of ordinary steps, the byte budget on a
-    short history of large ones -- 512 steps each carrying a ``data``
-    sub-object right at the 64 KiB cap is ~32 MiB generated into one
-    response, and these paths are exempt from the concurrency caps
-    below, so nothing else bounds how many such responses run at once.
-    The step cap keeps the most recent steps (in ``started_at`` order);
-    the byte budget then admits that window from its oldest end, so the
-    snapshot stays a contiguous run in wire order. Either way the
-    conclusion frame (``task.completed`` / ``task.input_required``)
+  - One sink's warm-up staging buffer
+    (``V1EventStreamSink._staged_messages``, held only between
+    registration and ``finish_warm_up`` draining it): ``OUTBOUND_QUEUE_MAX_SIZE``
+    (256 messages -- the same count cap the outbound queue above reuses)
+    *and* ``STAGED_MESSAGES_MAX_TEXT_CHARS`` (4 MiB, summed across staged
+    messages). Overflowing either closes the connection for
+    ``resync_required`` the same way the outbound queue's own overflow
+    does. Sized off the same 4 MiB factor as the queue's byte budget and
+    the snapshot budget below, but counted on a different unit: this
+    total is the description-free measure of a staged message (see
+    ``_measured_content_frame``), before projection, not serialized wire
+    bytes -- a staged message is not a frame yet.
+  - One attach-time batch of steps -- the two fast-path snapshots
+    (``_fast_path_step_snapshot``) and the normal streaming path's
+    warm-up replay (``_build_warm_up_frames``) alike:
+    ``REPLAY_MAX_STEPS`` (512 steps) *and* ``MAX_SNAPSHOT_WIRE_BYTES``
+    (4 MiB of serialized frame text). The step cap is written inline
+    at each of the three call sites; ``_snapshot_steps_within_wire_budget``
+    applies the byte cap alone, to whichever window the step cap
+    already produced. The two are applied in series, step cap first:
+    the step cap binds on a long history of ordinary steps, the byte
+    budget (applied to that already-capped window) on a short history
+    of large ones -- 512 steps each carrying a ``data`` sub-object right
+    at the 64 KiB cap is ~32 MiB generated into one response, and these
+    paths are exempt from the concurrency caps below, so nothing else
+    bounds how many such responses run at once. The step cap keeps the
+    most recent steps (in ``started_at`` order); the byte budget then
+    admits that window from its oldest end, so the batch stays a
+    contiguous run in wire order. The two fast paths and the warm-up
+    replay part ways on how a cut batch is reported, though: the fast
+    paths' conclusion frame (``task.completed`` / ``task.input_required``)
     carries ``snapshot_truncated`` (``true``) and ``snapshot_total_steps``
     (the task's full public step count), so the client can tell a bounded
     snapshot from a complete one and knows how much of it is missing --
@@ -105,15 +138,33 @@ values it deliberately leaves unbounded, in one place:
     carries it, not a ``step.*`` frame, because the conclusion is the one
     frame every exit of these paths emits: a snapshot the byte budget cut
     to zero steps still has to be reportable, and a ``step.*`` frame that
-    does not exist cannot report it. ``MAX_SNAPSHOT_WIRE_BYTES`` measures
-    only the step frames' own wire bytes -- the marker riding the
-    conclusion is not part of what it bounds. These bound how much one
-    response may hold, not how much backlog may accumulate: the fast
-    paths ``yield`` their frames straight from the generator, so no sink
-    and no outbound queue exist
-    on those paths and neither queue bound above applies to them. Each
-    of those frames is still subject to the 64 KiB per-step ``data``
-    cap, which is applied per frame wherever the frame is built.
+    does not exist cannot report it. The warm-up replay has no conclusion
+    frame at attach time to carry an equivalent marker, and reports
+    nothing: its bounds are part of the endpoint's documented contract
+    instead of a per-attach signal, with ``GET .../steps`` as the
+    client's reconciliation path either way. ``MAX_SNAPSHOT_WIRE_BYTES``
+    measures only the step frames' own wire bytes -- the marker riding
+    the fast paths' conclusion is not part of what it bounds. These bound
+    how much one response may hold, not how much backlog may accumulate:
+    the fast paths ``yield`` their frames straight from the generator, so
+    no sink and no outbound queue exist on those paths and neither queue
+    bound above applies to them; the warm-up replay yields its frames the
+    same way, before the sink starts feeding live frames from its own
+    queue. Each of those frames is still subject to the 64 KiB per-step
+    ``data`` cap, which is applied per frame wherever the frame is built.
+    Deliberately uncapped: the *read* that feeds the warm-up replay
+    (``TaskStepsReader`` / ``tasks.py``'s ``_load_task_steps_snapshot``)
+    is a plain ``.all()`` over every one of the task's trace rows, no
+    ``LIMIT`` -- the same unbounded read ``GET .../steps`` itself does.
+    ``REPLAY_MAX_STEPS`` / ``MAX_SNAPSHOT_WIRE_BYTES`` bound only the
+    batch of already-folded steps this endpoint *sends*, after that full
+    read and fold have already happened; they do not bound how many rows
+    get read or folded to produce it. This read also bypasses the
+    fast paths' ``max_event_id``-keyed cache on purpose, not as an
+    oversight: the cache holds already-folded ``PublicStep`` objects,
+    while the warm-up replay needs the raw trace rows themselves to
+    build a projector that keeps folding live events afterward (see
+    ``TaskStepsReader``'s own comment above for the same distinction).
   - Concurrent streams: ``PER_TASK_STREAM_CAP`` (2) and
     ``PER_PRINCIPAL_STREAM_CAP`` (32), both rejected with 429 at
     attach, before any sink exists.
@@ -228,8 +279,9 @@ MAX_FRAME_CONTENT_BYTES = 64 * 1024
 # is ~10 KiB against a 4 MiB budget.
 MAX_QUEUED_WIRE_BYTES = 64 * MAX_FRAME_CONTENT_BYTES
 # Check on a raw broadcast frame's text length -- measured excluding
-# the internal task-description stamp broadcast frames carry (see
-# ``_measured_content_frame``) -- run after ``json.loads`` parses it,
+# the task's own description column, which arrives under one of two
+# keys depending on the frame family (see ``_measured_content_frame``)
+# -- run after ``json.loads`` parses it,
 # gating only the call into the projection pass -- ``MAX_FRAME_CONTENT_BYTES`` only bounds the *projected*
 # content that ends up on the wire, so without this a multi-megabyte raw
 # frame still pays for a full ``serialize_trace_data`` walk + projection
@@ -248,25 +300,60 @@ MAX_QUEUED_WIRE_BYTES = 64 * MAX_FRAME_CONTENT_BYTES
 # delay the completion signal to the watchdog's next cycle instead of
 # firing it immediately.
 MAX_RAW_FRAME_TEXT_CHARS = 4 * MAX_FRAME_CONTENT_BYTES
-# Upper bound on how many steps either attach-time fast path
-# (already-terminal / already-waiting-for-user) puts on the wire in its
-# one-shot response. Those paths emit their whole step snapshot in a
-# single burst and then close, so they have no admission / deadline /
-# heartbeat loop and no per-attach outbound queue of their own to
-# otherwise bound how much one response can hold. Exceeding it keeps
-# only the most recent ``REPLAY_MAX_STEPS`` steps (in ``started_at``
-# order, same as everywhere else) and marks the response's conclusion
-# frame as truncated -- see ``_fast_path_step_snapshot``. Bounds the
-# count only; ``MAX_SNAPSHOT_WIRE_BYTES`` below bounds the size.
+# Cumulative cap on the text length of every message held in
+# ``V1EventStreamSink._staged_messages`` at once, on top of that list's
+# existing count cap (``OUTBOUND_QUEUE_MAX_SIZE``). The staging buffer is
+# the warm-up window's analogue of the outbound queue -- both hold one
+# connection's frames while something else is busy -- so it is sized from
+# the same factor as ``MAX_QUEUED_WIRE_BYTES`` and
+# ``MAX_SNAPSHOT_WIRE_BYTES`` below, and carries the same magnitude:
+# giving one connection a 4 MiB queue budget and a larger staging budget
+# would be two different answers to the same question. The unit differs
+# and that is deliberate -- this counts the description-free measure of
+# a staged message, before projection, because a staged message is not
+# a frame yet, whereas the other two count wire bytes. Without this,
+# worst case under the raw pre-check alone is ``OUTBOUND_QUEUE_MAX_SIZE``
+# staged messages each just under ``MAX_RAW_FRAME_TEXT_CHARS``, so a
+# warm-up window full of near-cap (rather than over-cap) staged frames
+# could hold far more than the connection's own queue ever may.
+STAGED_MESSAGES_MAX_TEXT_CHARS = 64 * MAX_FRAME_CONTENT_BYTES
+# The two keys a task's own ``description`` column arrives under, per
+# frame family -- see ``_measured_content_frame``, which strips them
+# before this module measures or projects anything. Kept as two tuples
+# rather than one union so a content frame that legitimately carries a
+# ``data["description"]`` of its own keeps it: only ``task_info``, whose
+# projection output is empty by construction, has that key overwritten
+# by the task column.
+_TRACE_DESCRIPTION_STAMPS = ("task_description",)
+_TASK_INFO_DESCRIPTION_STAMPS = ("task_description", "description")
+# Upper bound on how many steps one attach puts on the wire in a single
+# burst, shared by the three producers that emit a batch of steps with
+# no pacing of their own: the two attach-time fast paths
+# (already-terminal / already-waiting-for-user), which emit their whole
+# step snapshot and then close, and the normal streaming path's warm-up
+# replay (``_build_warm_up_frames``), which emits the task's known steps
+# before going live. None of them passes through the admission /
+# deadline / heartbeat loop or the per-attach outbound queue that bounds
+# everything else this module sends. Exceeding it keeps only the most
+# recent ``REPLAY_MAX_STEPS`` steps (in ``started_at`` order, same as
+# everywhere else). Bounds the count only; ``MAX_SNAPSHOT_WIRE_BYTES``
+# below bounds the size. The fast paths report a cut snapshot on their
+# conclusion frame (see ``_snapshot_marker_fields``); the replay path has
+# no conclusion frame at attach time and reports nothing -- its bounds
+# are part of the endpoint's documented contract instead, with
+# ``GET .../steps`` as the client's reconciliation path.
 REPLAY_MAX_STEPS = 512
-# The attach-time snapshot's second bound, on the total wire bytes one
-# response may hold rather than on its step count -- the fast paths'
+# The second bound on one attach's batch of steps, on the total wire
+# bytes it may hold rather than on its step count -- the batch paths'
 # analogue of the queue's ``MAX_QUEUED_WIRE_BYTES``, sized the same way
-# and measured the same way. Why this value, and why the step-count cap
-# alone leaves the response unbounded, is argued once in the module
-# docstring's size-bounds section, not repeated here. Strictly over the
-# budget stops the snapshot, exactly on it does not -- the same boundary
-# rule the queue budget and ``MAX_RAW_FRAME_TEXT_CHARS`` use.
+# and measured the same way. Applied by
+# ``_snapshot_steps_within_wire_budget``, which both the fast paths and
+# the warm-up replay call so the two share one rule rather than each
+# bounding itself. Why this value, and why the step-count cap alone
+# leaves a batch unbounded, is argued once in the module docstring's
+# size-bounds section, not repeated here. Strictly over the budget stops
+# the batch, exactly on it does not -- the same boundary rule the queue
+# budget and ``MAX_RAW_FRAME_TEXT_CHARS`` use.
 MAX_SNAPSHOT_WIRE_BYTES = 64 * MAX_FRAME_CONTENT_BYTES
 # Floor for the final wait when the 1-hour deadline is close: keeps the
 # queue wait from being called with a near-zero timeout, which would spin
@@ -315,6 +402,17 @@ def _stream_close_reason(status: TaskStatus, control_state: str | None) -> str |
 # -- never called directly.
 TaskSnapshotReader = Callable[[int, "ApiKeyPrincipal"], Any]
 
+# A sync callable: (task_id, principal) -> ``_TaskStepsSnapshot``-shaped
+# object (duck-typed: ``.events``, an ordered sequence of
+# ``_TraceEventSnapshot``-shaped rows, oldest first -- exactly what
+# ``PublicStepProjector.from_history`` expects), raising the same
+# ``V1ApiError(TASK_NOT_FOUND, 404)`` on a deleted/unowned task. This is
+# an *uncached*, full read -- unlike ``TaskStepsResponseReader`` below,
+# the normal streaming path needs raw trace rows to build a projector
+# that keeps folding live events afterward, not an already-finalized
+# step list. Always run through ``run_db_io_cancellation_safe``.
+TaskStepsReader = Callable[[int, "ApiKeyPrincipal"], Any]
+
 # A sync callable: (task_id, principal) -> ``StepsResponse``-shaped
 # object (duck-typed: ``.steps``, a list of already-validated
 # ``PublicStep``), backed by the *same cache* the polling
@@ -331,12 +429,29 @@ TaskStepsResponseReader = Callable[[int, "ApiKeyPrincipal"], Any]
 # shaped object (duck-typed: ``.task_id`` / ``.agent_id`` /
 # ``.max_event_id``) -- the same cheap ``max(TraceEvent.id)`` read
 # ``tasks.py``'s ``_load_task_steps_version_snapshot`` runs for the
-# ``GET .../steps`` cache key. Distinct from ``TaskSnapshotReader``
-# because the two readers return different shapes: this one carries
-# ``max_event_id``, not ``run_id``/``state_version``. Used only by the
-# attach-time fast paths' steps-cursor fence (see
-# ``_fast_path_steps_cursor_changed``) to catch a trace row landing
-# between the steps read and the fence's recheck.
+# ``GET .../steps`` cache key, raising ``V1ApiError(TASK_NOT_FOUND, 404)``
+# on a deleted/unowned task. Distinct from ``TaskSnapshotReader`` because
+# the two readers return different shapes: this one carries
+# ``max_event_id``, not ``run_id``/``state_version``. Two consumers, both
+# needing that cursor and nothing else:
+#
+#   - the attach-time fast paths' steps-cursor fence (see
+#     ``_fast_path_steps_cursor_changed``), to catch a trace row landing
+#     between the steps read and the fence's recheck;
+#   - the normal streaming path, read once per attach immediately after
+#     ``register_connection``, to bound the warm-up replay to events
+#     committed at or before that point (see ``_generate``'s
+#     ``replay_watermark`` and ``_build_warm_up_frames``).
+#
+# The second is a distinct read from ``TaskStepsReader`` above because it
+# only needs ``SELECT max(TraceEvent.id)``, not the full row set, and has
+# to run as close to registration as possible rather than being folded
+# into the (potentially much slower) full trace read. Required, not
+# optional, at both public entry points (``build_event_stream_response``
+# and ``_generate``): without a cursor there is no bound on which rows
+# the replay folds in, and an attach that silently replayed the whole
+# history would contradict this module's own rule that a *failed*
+# watermark read closes the stream rather than replaying unbounded.
 TaskStepsVersionReader = Callable[[int, "ApiKeyPrincipal"], Any]
 
 # A callable of one argument -- ``snapshot_total_steps`` -- returning the
@@ -482,10 +597,10 @@ def error_frame(code: str, *, message: str | None = None) -> str:
 
 # The broadcast ``type`` values that can ever produce a content frame --
 # shared between ``project_content_frames``'s own dispatch and the sink's
-# live routing decision (``send_text``) so the two can't drift: the set
-# ``send_text`` hands to the projector must be exactly the set this
-# dispatch acts on, or a type present in one but absent from the other
-# silently drops content on one side.
+# warm-up staging decision (``send_text``) so the two can't drift: a
+# frame type staging would hold onto during warm-up must be exactly the
+# set this dispatch actually acts on, or a type absent from one but
+# present in the other silently drops content on one side.
 _CONTENT_FRAME_TYPES = ("trace_event", "final_answer_delta", "final_answer_end")
 
 
@@ -669,6 +784,15 @@ def _snapshot_marker_fields(snapshot_total_steps: int | None) -> dict[str, Any]:
     every exit of these paths emits -- a snapshot the byte budget cut to
     zero steps still has to be reportable, and a ``step.*`` frame that
     does not exist cannot report it.
+
+    Scoped to the two attach-time fast paths, and only they call it. The
+    normal streaming path's warm-up replay is bounded by the same two
+    caps but emits no marker at all: it has no conclusion frame at attach
+    time to carry one, and hanging the marker on the first replayed
+    ``step.*`` frame instead would put it on a frame that a replay cut to
+    zero steps never emits -- reporting the mild case and staying silent
+    on the severe one. Its bounds are documented on the endpoint instead,
+    with ``GET .../steps`` as the reconciliation path.
     """
     if snapshot_total_steps is None:
         return {}
@@ -709,15 +833,18 @@ def _step_wire_frame(step: "PublicStep") -> str:
     event name from its status.
 
     This is the only place step content is normalized for this stream.
-    Both producers route through here -- live folding
-    (``_step_content_frame``, below) and the attach-time fast paths'
-    cached snapshot (``_fast_path_step_snapshot``, consumed frame-by-frame
-    in each fast path's own yield loop) -- so there is one
-    ``model_dump(mode="json")`` call site, one size cap, and one status ->
-    event-name rule, rather than a copy per producer that could drift
-    apart. Taking the model rather than an already-dumped dict is what
-    makes that structural: a caller cannot supply un-normalized values
-    without going around the type.
+    Three producers route through here -- live folding
+    (``_step_content_frame``, below), the attach-time fast paths' cached
+    snapshot (``_fast_path_step_snapshot``, consumed frame-by-frame in
+    each fast path's own yield loop), and the normal streaming path's
+    warm-up replay (``_build_warm_up_frames``, which serializes its
+    admitted steps with this function directly, having already validated
+    them to ``PublicStep`` so the shared byte budget could measure them)
+    -- so there is one ``model_dump(mode="json")`` call site, one size
+    cap, and one status -> event-name rule, rather than a copy per
+    producer that could drift apart. Taking the model rather than an
+    already-dumped dict is what makes that structural: a caller cannot
+    supply un-normalized values without going around the type.
     """
     public_step_json = step.model_dump(mode="json")
     capped = {**public_step_json, "data": _capped_step_data(public_step_json["data"])}
@@ -742,9 +869,10 @@ def _step_content_frame(step: dict[str, Any]) -> str:
     same public step-type list, zero second copy of either. The JSON
     coercion that goes with it (``started_at``/``completed_at`` in
     particular) happens one level down, in ``_step_wire_frame``, which
-    both producers of step content share; this function's own job is
+    every producer of step content shares; this function's own job is
     the raw-dict-to-model validation that only the live path needs,
-    because the fast paths read ``PublicStep`` objects already.
+    because the fast paths read ``PublicStep`` objects already and the
+    warm-up replay validates its own batch up front.
     """
     return _step_wire_frame(PublicStep(**step))
 
@@ -795,14 +923,15 @@ def _feed_trace_event(
     token-by-token via ``message.delta``/``message.completed`` -- is
     deliberately NOT filtered here: it folds into a ``message`` step
     the same way any other ``ai_message`` does, exactly matching what
-    ``steps()`` already shows for the same persisted row. A client that
-    already rendered the delta/completed sequence sees this step as a
-    duplicate of content it has, not as new information -- duplication,
-    not loss, is the accepted trade-off. The alternative -- dropping it
-    here -- has no persisted counterpart: ``steps()`` surfaces this same
-    row as a ``message`` step regardless, so filtering it only on the
-    live path would make the stream disagree with ``steps()`` about
-    whether the step exists.
+    ``steps()`` and warm-up replay already show for the same persisted
+    row. A client that already rendered the delta/completed sequence
+    sees this step as a duplicate of content it has, not as new
+    information -- duplication, not loss, is the accepted trade-off.
+    The alternative -- dropping it on the live path -- has no persisted
+    counterpart: ``steps()`` and a fresh attach's warm-up replay both
+    surface this same row as a ``message`` step regardless, so filtering
+    it only here would make an already-running attach disagree with
+    those two about whether the step exists.
     """
     data = message.get("data")
     if not isinstance(data, dict):
@@ -894,55 +1023,72 @@ def project_content_frames(
 def _measured_content_frame(
     text: str, message: dict[str, Any]
 ) -> tuple[int, dict[str, Any]]:
-    """Return ``(chars, frame)`` -- the length the drop check below
-    compares against the cap, and the frame projection should consume.
+    """Return ``(chars, frame)`` -- the frame's length with the task's
+    own description stamp removed, and the frame every consumer past
+    this point should use in place of the raw one.
 
+    The task's ``description`` column reaches a broadcast frame under
+    two different keys, from two different producers, and is unbounded
+    in both (``Column(Text)``, filled from the task's first user
+    message, which has no ``max_length`` of its own):
     ``ws_trace_handlers.py``'s ``_convert_trace_event_to_stream_event``
-    copies the task's ``description`` column onto
-    ``data["task_description"]`` for *every* trace event it converts,
-    with no event-type gate. That column has no length bound
-    (``Column(Text)``, filled from the task's first user message, which
-    has no ``max_length`` of its own), and it is re-stamped on each
-    frame -- so counting it would let one long description push every
-    subsequent ``step.*`` frame of that task past
-    ``MAX_RAW_FRAME_TEXT_CHARS`` and drop the task's whole content
-    stream for the life of the connection.
+    stamps it as ``data["task_description"]`` on *every* trace event it
+    converts, with no event-type gate, and every ``task_info`` producer
+    in ``websocket.py`` puts the same column on ``data["description"]``.
+    Both are re-stamped per frame, so counting either one would let one
+    long description spend a budget on a field that cannot reach the
+    wire -- pushing frames past ``MAX_RAW_FRAME_TEXT_CHARS`` (a silent
+    content drop for the life of the connection) or past
+    ``STAGED_MESSAGES_MAX_TEXT_CHARS`` (a ``resync_required`` close that
+    re-fails identically on every re-attach, since the trigger is a
+    property of the task rather than the load on it).
 
-    Excluding it costs the client nothing, because no content this
-    module puts on the wire can contain it: each of the four producers
-    builds its ``data`` from explicitly named keys (``_step_mapping``'s
-    ``_build_thinking_start`` / ``_build_tool_start`` /
-    ``_build_message_step`` and the ``extra_data_fn`` patches, then
-    ``message_delta_frame`` / ``message_completed_frame``), so the
-    description was consuming a budget it could never spend.
+    Excluding both costs the client nothing, because no content this
+    module puts on the wire can contain either: each of the four
+    producers builds its ``data`` from explicitly named keys
+    (``_step_mapping``'s ``_build_thinking_start`` /
+    ``_build_tool_start`` / ``_build_message_step`` and the
+    ``extra_data_fn`` patches, then ``message_delta_frame`` /
+    ``message_completed_frame``), and ``_feed_trace_event`` returns
+    ``[]`` for ``task_info`` outright.
 
-    An under-cap frame is returned unchanged, description and all --
-    the walk that projection pays over it is already bounded by the
-    cap. An over-cap frame carrying a description is pruned *before*
-    both measuring and projecting, not just before measuring: the raw
-    frame check was this field's only per-frame CPU bound (a
-    synchronous, unbounded ``clean_string`` walk during projection), so
-    a frame that survives the check must not still be paying for the
-    field the check just excused it from. Measured by re-serializing
-    the parsed frame without that one field rather than by subtracting
-    an estimate of the field's serialized length: an estimate would
-    have to reproduce the producer's separators and escaping, while a
-    re-dump is exact in the same character domain ``len(text)`` is
-    measured in (``broadcast_to_task`` serializes with a default
-    ``json.dumps``, and so does this). It runs only for a frame that is
-    both over the cap and carrying a description -- the frame that
-    would otherwise be dropped outright -- so an ordinary frame still
-    costs one ``len()``, and the re-dump's own cost scales with the
-    frame *without* the description, not with the description.
-    ``json.dumps`` cannot fail here: ``message`` came out of
-    ``json.loads`` in the caller.
+    Pruning is unconditional -- not, as it once was, only for a frame
+    already over the raw cap. Both of this value's consumers need the
+    description gone, not just the drop check: the staging buffer
+    accumulates it across frames. The drop check's own decision is
+    unaffected by the change (pruning can only lower the number, and a
+    frame already under the cap stays under it), so the boundary it
+    enforces is exactly the one it enforced before. Removing the field
+    before projection rather than after is what keeps a surviving
+    frame from paying the synchronous, unbounded ``clean_string`` walk
+    ``serialize_trace_data`` would otherwise run over it. That is a
+    clear saving when the description is the bulk of the frame; when
+    the payload is the bulk and the description is small, the extra
+    ``json.dumps`` this function adds costs on the order of 0.2 ms on a
+    200 KiB frame more than skipping it would. Accepted because one
+    number has to serve both the drop check and the staging budget
+    below, and the alternative -- two numbers kept in step by hand --
+    is the class of failure this function exists to close. Measured by
+    re-serializing the parsed frame without those keys rather than by
+    subtracting an estimate of their serialized length: an estimate
+    would have to reproduce the producer's separators and escaping,
+    while a re-dump is exact in the same character domain ``len(text)``
+    is measured in (``broadcast_to_task`` serializes with a default
+    ``json.dumps``, and so does this). ``json.dumps`` cannot fail here:
+    ``message`` came out of ``json.loads`` in the caller.
     """
-    if len(text) <= MAX_RAW_FRAME_TEXT_CHARS:
-        return len(text), message
     data = message.get("data")
-    if not isinstance(data, dict) or "task_description" not in data:
+    if not isinstance(data, dict):
         return len(text), message
-    pruned = {key: value for key, value in data.items() if key != "task_description"}
+    stamps = (
+        _TASK_INFO_DESCRIPTION_STAMPS
+        if message.get("event_type") == "task_info"
+        else _TRACE_DESCRIPTION_STAMPS
+    )
+    present = [key for key in stamps if key in data]
+    if not present:
+        return len(text), message
+    pruned = {key: value for key, value in data.items() if key not in present}
     frame = {**message, "data": pruned}
     return len(json.dumps(frame)), frame
 
@@ -994,24 +1140,71 @@ class V1EventStreamSink:
             maxsize=OUTBOUND_QUEUE_MAX_SIZE
         )
         self._closing = False
+        # Set by ``enqueue_close(abortive=True)``. Distinguishes *why*
+        # the sink is closing for callers that must react before the
+        # close frame itself is dequeued -- two places read it that way
+        # today: ``_generate``'s warm-up replay loop (see its own
+        # comment), where a revoked key or a deleted task must stop
+        # that loop from handing out any more history, while every
+        # other close reason (a normal terminal/input-required
+        # conclusion, a resync signal) is exactly the case that loop
+        # exists to finish serving first; and ``_watchdog_coverage_done``,
+        # which uses it to keep the watchdog alive past an ordinary
+        # close on a sink that never became warm. See ``enqueue_close``
+        # for which reasons set this.
+        self._abortive_close = False
         self._last_status = initial_status
         # One incremental folding state machine per connection (never
         # shared across sinks -- see ``PublicStepProjector``'s own
-        # preconditions). Starts empty, and every content-bearing frame
-        # broadcast from then on is fed straight into it by ``send_text``.
-        # Because it starts empty, a step already running at attach time
-        # has no matching start here, so that step's end event folds in
-        # as an orphan and is dropped -- see the module docstring.
-        # ``retain_finished=False``: this sink acts on each ``feed()``
-        # result immediately (``_step_content_frame`` serializes it on
-        # the spot) and never calls ``materialized_steps()``, so
-        # retaining every finalized step would hold each one's
-        # untruncated ``data`` -- tool args and results, delegation
-        # input/output, message content -- for as long as the connection
-        # lives (up to ``STREAM_MAX_DURATION_SECONDS``) in a list nothing
-        # on this path reads. The pending table the pairing rules need is
-        # kept either way.
+        # preconditions). Starts empty and *unwarmed*: nothing is fed
+        # into it directly until ``finish_warm_up`` swaps in a projector
+        # pre-warmed by replaying trace history (wired in ``_generate``).
+        # Content-bearing frames that arrive before that point are
+        # staged, not fed -- see ``_warm`` / ``_staged_messages`` below.
+        # ``retain_finished=False`` on both this placeholder and the
+        # warmed replacement (``finish_warm_up`` requires it of what it
+        # is handed): this sink acts on each ``feed()`` result
+        # immediately (``_step_content_frame`` serializes it on the spot)
+        # and never calls ``materialized_steps()``, so retaining every
+        # finalized step would hold each one's untruncated ``data`` --
+        # tool args and results, delegation input/output, message content
+        # -- for as long as the connection lives (up to
+        # ``STREAM_MAX_DURATION_SECONDS``) in a list nothing on this path
+        # reads. The pending table the pairing rules need is kept either
+        # way.
         self._projector = PublicStepProjector(retain_finished=False)
+        # Becomes True exactly once, when ``finish_warm_up`` runs. While
+        # False, ``send_text`` diverts every content-bearing frame (see
+        # ``_CONTENT_FRAME_TYPES``) into ``_staged_messages`` instead of
+        # feeding ``_projector`` directly -- feeding a live *end* event
+        # into a projector that hasn't seen the matching *start* (because
+        # that start is only in trace history, not yet replayed) would
+        # fold it in as a plain orphan end and silently drop that
+        # step.completed for this stream. Lifecycle handling elsewhere in
+        # ``send_text`` (task.status, the completion hint) doesn't use
+        # the projector at all and runs unconditionally regardless of
+        # this flag.
+        self._warm = False
+        # Raw broadcast dicts held during the unwarmed window above, in
+        # arrival order, until ``finish_warm_up`` drains them through the
+        # projector it just warmed. Bounded the same way the outbound
+        # queue is bounded, and for the same reason: an attach can't be
+        # allowed to accumulate unbounded memory for a slow warm-up read
+        # under a burst of live traffic. Reuses ``_put_or_overflow``'s
+        # overflow policy (``resync_required`` then close) rather than a
+        # second one -- see ``_stage_content_message``.
+        self._staged_messages: list[dict[str, Any]] = []
+        # Cumulative text length of everything currently in
+        # ``_staged_messages`` -- the description-free measure
+        # ``_measured_content_frame`` returns, not a raw ``len(text)``,
+        # and the same value ``send_text``'s pre-check already
+        # computed, so nothing here is re-serialized a second time.
+        # Kept in lockstep with that list rather than recomputed -- see
+        # ``STAGED_MESSAGES_MAX_TEXT_CHARS``. Cheap (an O(1) ``len()``)
+        # only for a frame with no description key to prune; one that
+        # does carry one pays a ``json.dumps`` there, whose cost scales
+        # with the frame's own size.
+        self._staged_text_chars = 0
         # Recorded at construction time (always inside the endpoint's own
         # request coroutine) so later state-mutating calls -- however they
         # got here -- can be asserted to run on the same loop.
@@ -1038,6 +1231,30 @@ class V1EventStreamSink:
         """Total wire bytes of the frames currently queued."""
         return self._queued_bytes
 
+    @property
+    def warm(self) -> bool:
+        return self._warm
+
+    @property
+    def abortive_close(self) -> bool:
+        """True once any ``enqueue_close(..., abortive=True)`` has run,
+        including one that arrived after a non-abortive close had
+        already claimed the close frame. This is a data-suppression
+        switch, not a record of which caller won: a close that lost
+        that race still revoked the client's standing to see the rest
+        of the buffered history. Implies ``closing`` -- ``enqueue_close``
+        latches this before its already-closing early return -- so a
+        check that only cares about revocation can read this alone; a
+        check that also cares about an ordinary close still needs
+        ``closing`` too, since this alone says nothing about whether a
+        close happened at all; see ``_watchdog_coverage_done``. Also
+        decides how long the watchdog keeps checking."""
+        return self._abortive_close
+
+    @property
+    def staged_message_count(self) -> int:
+        return len(self._staged_messages)
+
     def _assert_owner_loop(self) -> None:
         if asyncio.get_running_loop() is not self._owner_loop:
             raise RuntimeError("v1 SSE sink touched from a foreign event loop")
@@ -1050,7 +1267,7 @@ class V1EventStreamSink:
         self._last_status = status
         self._put_or_overflow(status_frame(status))
 
-    def enqueue_close(self, frame_text: str) -> bool:
+    def enqueue_close(self, frame_text: str, *, abortive: bool = False) -> bool:
         """Close exactly once; the first caller wins.
 
         Drains any queued backlog before inserting the close frame so
@@ -1059,8 +1276,39 @@ class V1EventStreamSink:
         intentional: every close reason tells the client to resync
         (``steps()`` + re-attach) rather than trust the tail of the
         stream.
+
+        ``abortive`` (default False) records *why* on ``abortive_close``,
+        for the two readers that need it before this close frame is
+        even dequeued: ``_generate``'s warm-up replay loop, which
+        checks it between each already-built history frame it yields,
+        and ``_watchdog_coverage_done``, which uses it to decide
+        whether this stream still needs an authorization check at all.
+        An abortive close means the client has lost the right to see
+        *any* further data, including history that predates the close:
+        today that's the watchdog's ``unauthorized`` (key
+        revoked/paused) and ``task_deleted`` (row gone) reasons, plus
+        the same ``task_deleted`` reason from ``_generate``'s own two
+        pre-loop reads (the replay watermark and the warm-up history),
+        each of which abandons the warm-up on a deleted task before it
+        can ever set ``sink.warm``. A
+        non-abortive reason -- a normal terminal/input-required
+        conclusion, ``resync_required``, ``stream_expired`` -- never
+        sets it, so on its own the replay loop keeps handing out the
+        history it already read; those close the stream, but they don't
+        retroactively revoke the client's standing to see what already
+        happened.
+
+        ``abortive`` is latched before the already-closing early return,
+        so an abortive close still suppresses the rest of the replay
+        even when a non-abortive close got here first. Only the close
+        *frame* is first-caller-wins; the revocation is not. A client
+        whose key was revoked mid-replay therefore reads the earlier
+        reason on the wire and re-attaches, and that re-attach is
+        refused at authentication.
         """
         self._assert_owner_loop()
+        if abortive:
+            self._abortive_close = True
         if self._closing:
             return False
         self._closing = True
@@ -1128,6 +1376,123 @@ class V1EventStreamSink:
         except asyncio.QueueFull:
             self.enqueue_close(error_frame("resync_required"))
 
+    def _stage_content_message(self, message: dict[str, Any], text_chars: int) -> None:
+        """Hold one content-bearing broadcast frame's raw dict until
+        ``finish_warm_up`` can feed it through a projector that actually
+        has the pairing state to fold it correctly.
+
+        Reuses ``_put_or_overflow``'s own count cap and overflow policy
+        -- ``OUTBOUND_QUEUE_MAX_SIZE``, then ``resync_required`` -- for
+        the constant and the rationale, not the implementation: this
+        list is a plain Python list with its own check here, not a
+        call into ``_put_or_overflow`` (which enforces the outbound
+        queue's own separate ``MAX_QUEUED_WIRE_BYTES`` bound, not this
+        one). In practice this list only
+        ever holds what arrives during one warm-up read plus however
+        many replay frames get yielded afterward, both bounded by how
+        long that takes; hitting the cap here means the same thing
+        hitting it on the outbound queue means -- the client can't keep
+        up (or something is broadcasting far faster than normal) and
+        needs to resync. A second, cumulative bound on top of the count
+        cap: ``text_chars`` (the frame's length with the task's own
+        description stamp removed, already computed once by
+        ``send_text``'s pre-check via ``_measured_content_frame`` --
+        never re-serialized here) is tracked against
+        ``STAGED_MESSAGES_MAX_TEXT_CHARS`` so a run of large-but-under-
+        the-single-frame-cap messages during a slow warm-up read can't
+        hold unbounded memory just because it stayed under the count
+        cap. Charging the description here instead would make this
+        overflow a property of the task rather than of the load on it:
+        one long description, re-stamped per frame, crosses the budget
+        on its own and closes every attach to that task identically.
+
+        The count cap is exactly ``OUTBOUND_QUEUE_MAX_SIZE``, not one
+        less, which leaves the hand-off no margin: lifecycle frames
+        (``task.status``) skip staging and go straight into the
+        outbound queue while this sink is still cold, so a staging list
+        at its cap plus one such frame is one item more than the queue
+        can hold, and ``finish_warm_up``'s drain overflows into the same
+        ``resync_required`` close an over-full queue always takes. That
+        overflow is the documented outcome for this case, not an
+        unhandled edge. Reserving a slot here instead would buy one
+        frame of headroom against a backlog that is already at the
+        "this client cannot keep up" threshold, at the cost of a
+        second, differently-sized cap to keep in step with the first.
+        Pinned by
+        ``test_a_cold_status_frame_leaves_the_staging_drain_no_margin``.
+        """
+        if self._closing:
+            return
+        if (
+            len(self._staged_messages) >= OUTBOUND_QUEUE_MAX_SIZE
+            or self._staged_text_chars + text_chars > STAGED_MESSAGES_MAX_TEXT_CHARS
+        ):
+            self.enqueue_close(
+                error_frame(
+                    "resync_required",
+                    message=(
+                        "The warm-up staging buffer overflowed; call "
+                        "steps() to resync, then re-attach."
+                    ),
+                )
+            )
+            return
+        self._staged_messages.append(message)
+        self._staged_text_chars += text_chars
+
+    def finish_warm_up(self, projector: "PublicStepProjector") -> None:
+        """Switch from staging content-bearing frames to feeding them
+        live, now that ``projector``'s pairing state reflects a full
+        replay of trace history.
+
+        Adopts ``projector`` in place of this sink's original empty one
+        (nothing was ever fed into that one -- see ``_warm``), then
+        drains every frame staged since registration through the exact
+        same classification a live frame gets, in the order it actually
+        arrived, and queues the result. This is what rescues a step
+        whose start event is only in history but whose end event
+        happened to arrive during the warm-up window: replayed here
+        against a projector that already has the start pending, instead
+        of being fed to an empty one and dropped as an orphan end.
+        Called at most once per connection, synchronously, with no
+        ``await`` in between reassigning ``_projector`` and draining --
+        so no frame arriving after this call starts can be staged
+        instead of fed live, and no frame staged before it is missed.
+
+        Each staged message is projected through ``_project_and_queue``,
+        so one bad staged message (a malformed field the projector can't
+        fold) only drops that one frame and bumps ``dropped_frame_count``
+        -- it doesn't abort the rest of the drain or close the stream.
+        Closing the stream over a warm-up failure is reserved for a
+        failure that corrupts the whole replayed baseline instead --
+        the trace-history *read* failing before this method is even
+        called (see the read-failure test), not one staged frame among
+        many failing to project.
+
+        ``projector`` must already have released its finished-step
+        retention (``PublicStepProjector.take_materialized_steps``, which
+        is how ``_build_warm_up_frames`` reads the history out). This
+        sink never calls ``materialized_steps()``, so a retaining
+        projector adopted here would hold every step's untruncated
+        ``data`` for the connection's whole life in a list nothing reads
+        -- the same defect ``retain_finished=False`` exists to prevent,
+        reintroduced through the back door. Asserted rather than
+        documented because the leak is invisible at the call site: the
+        stream behaves correctly either way, it just grows.
+        """
+        self._assert_owner_loop()
+        if projector.retains_finished:
+            raise RuntimeError(
+                "v1 SSE sink was handed a projector that still retains "
+                "finished steps; warm-up must release retention first"
+            )
+        self._projector = projector
+        self._warm = True
+        staged, self._staged_messages = self._staged_messages, []
+        self._staged_text_chars = 0
+        for staged_message in staged:
+            self._project_and_queue(staged_message)
+
     def _project_and_queue(self, message: dict[str, Any]) -> None:
         """Project one content frame and enqueue its output. Never raises --
         a frame that fails to project is dropped and counted, exactly like a
@@ -1168,14 +1533,18 @@ class V1EventStreamSink:
         it -- ``project_content_frames`` returns an empty list for every
         frame shape this method already handles on its own
         (``task_completed``, the versioned lifecycle types, ``task_info``),
-        so the two never fight over the same frame. A content frame is
-        projected and queued via ``_project_and_queue``, which always
-        routes successfully-projected output through ``_put_or_overflow``
-        like any other queued frame -- never a direct
-        ``queue.put_nowait`` -- so it gets the same closed guard and the
-        same overflow-to-``resync_required`` handling status frames
-        already get, on both of the queue's bounds: its element count
-        and its total queued wire bytes.
+        so the two never fight over the same frame. Until this sink is
+        warm (see ``_warm``), a content-bearing frame is staged rather
+        than projected immediately -- ``finish_warm_up`` replays staged
+        frames through the projector it just warmed. Once warm, a live
+        content frame is projected and queued via the same
+        ``_project_and_queue`` helper ``finish_warm_up`` uses for its
+        replay, which always routes successfully-projected output
+        through ``_put_or_overflow`` like any other queued frame --
+        never a direct ``queue.put_nowait`` -- so it gets the same
+        closed guard and the same overflow-to-``resync_required``
+        handling status frames already get, on both of the queue's
+        bounds: its element count and its total queued wire bytes.
 
         The raw-size check itself runs after ``json.loads`` and the
         lifecycle handling above, guarding only the call into
@@ -1184,11 +1553,12 @@ class V1EventStreamSink:
         ``type`` is in ``_CONTENT_FRAME_TYPES``; dispatch into the
         projector is unchanged for that whole set regardless. What it
         compares against ``MAX_RAW_FRAME_TEXT_CHARS`` (256 KiB) is the
-        frame's own character count minus the ``task_description``
-        field the broadcast conversion stamps onto every trace event --
-        see ``_measured_content_frame`` for why that subtraction exists
-        and why it costs nothing on the ordinary path. Strictly greater
-        than the cap is a drop, exactly equal is kept. On a drop,
+        frame's own character count minus whichever key the task's own
+        description column arrived under -- see
+        ``_measured_content_frame`` for the two keys, why that
+        subtraction exists, and why it lowers rather than raises this
+        method's per-frame cost. Strictly greater than the cap is a
+        drop, exactly equal is kept. On a drop,
         ``dropped_frame_count`` is incremented, one ``logger.warning``
         fires, and the method returns -- no queued frame, no close, no
         ``stream.error``: a dropped frame is invisible to the client.
@@ -1217,23 +1587,29 @@ class V1EventStreamSink:
             an oversized ``task_info`` increments
             ``dropped_frame_count`` and logs a drop warning. It is not
             what protects ``task.status``/``completion_hint``
-            delivery. It is there because such a frame carries the
-            task description with no size bound of its own, so
-            counting it as a dropped content frame would be counting a
-            drop that had no content to lose.
+            delivery. It is there because ``_feed_trace_event`` returns
+            ``[]`` for ``task_info``: counting it as a dropped content
+            frame would be counting a drop that had no content to lose.
 
         The parse is not extra cost on the fan-out path:
         ``ConnectionManager.broadcast_to_task`` serializes the frame
         with ``json.dumps`` once per connection, inside its own send
-        loop, before this method is called at all. What happens to the
-        expensive half here -- ``serialize_trace_data`` plus the
-        projection fold -- depends on where the frame lands: a frame
-        under the cap pays it in full; a frame over the cap only
-        because of its task description is pruned by
-        ``_measured_content_frame`` before projection runs, not just
-        before the comparison, so it pays that cost against the frame
-        without the description instead; and a frame still over the
-        cap after pruning is dropped outright and pays none of it.
+        loop, before this method is called at all. Pruning is now
+        unconditional rather than only for a frame over the cap, so
+        the expensive half here -- ``serialize_trace_data`` plus the
+        projection fold -- never runs over the description at all, for
+        every frame this method admits. That is a clear net saving
+        when the description is the bulk of the frame (about -0.11 ms
+        at a 64 KiB description, -0.34 ms at 200 KiB); when the
+        payload is the bulk and the description is small, the extra
+        ``json.dumps`` ``_measured_content_frame`` now always pays
+        costs up to about +0.21 ms per frame on a 200 KiB frame,
+        roughly +38% of that frame's processing. Accepted because it
+        is what lets one number serve both the drop check and the
+        staging budget below; the alternative -- two numbers kept in
+        step by hand -- is the failure mode this fix exists to close.
+        A frame still over the cap after pruning is dropped outright
+        and pays none of it.
         """
         try:
             self._assert_owner_loop()
@@ -1268,21 +1644,36 @@ class V1EventStreamSink:
                         # read wouldn't have closed anyway.
                         self.completion_hint.set()
             if str(message.get("type") or "") in _CONTENT_FRAME_TYPES:
-                frame = message
-                if message.get("event_type") != "task_info":
-                    measured_chars, frame = _measured_content_frame(text, message)
-                    if measured_chars > MAX_RAW_FRAME_TEXT_CHARS:
-                        self.dropped_frame_count += 1
-                        logger.warning(
-                            "v1 SSE sink dropped an oversized broadcast frame "
-                            "(%d chars, %d excluding the task description) for "
-                            "task %s before projecting it",
-                            len(text),
-                            measured_chars,
-                            self.task_id,
-                        )
-                        return
-                self._project_and_queue(frame)
+                measured_chars, frame = _measured_content_frame(text, message)
+                if (
+                    message.get("event_type") != "task_info"
+                    and measured_chars > MAX_RAW_FRAME_TEXT_CHARS
+                ):
+                    self.dropped_frame_count += 1
+                    logger.warning(
+                        "v1 SSE sink dropped an oversized broadcast frame "
+                        "(%d chars, %d excluding the task description) for "
+                        "task %s before projecting it",
+                        len(text),
+                        measured_chars,
+                        self.task_id,
+                    )
+                    return
+                # The raw-size check runs before the warm/staged split, so
+                # a frame too large to project is dropped whether this
+                # sink is warm or not -- staging an oversized frame would
+                # only defer the same drop to ``finish_warm_up`` while
+                # holding its bytes in the meantime. What gets staged is
+                # the same measured frame the warm path projects, counted
+                # in the same unit the check above used (the task's own
+                # description column excluded, whichever of the two keys
+                # it arrived under -- see ``_measured_content_frame``), so
+                # the staging budget and the raw-frame cap measure one
+                # thing rather than two.
+                if self._warm:
+                    self._project_and_queue(frame)
+                else:
+                    self._stage_content_message(frame, measured_chars)
         except Exception:
             self.dropped_frame_count += 1
             logger.exception(
@@ -1381,7 +1772,11 @@ async def watchdog_check_once(
         lambda: _is_runtime_key_active(sink.principal_key_prefix)
     )
     if not key_active:
-        return sink.enqueue_close(error_frame("unauthorized"))
+        # Abortive: the key that authorized this attach no longer does,
+        # so any history still queued up for direct replay (see
+        # ``_generate``'s warm-up loop) must stop going out too, not
+        # just future live frames.
+        return sink.enqueue_close(error_frame("unauthorized"), abortive=True)
 
     try:
         snapshot = await run_db_io_cancellation_safe(
@@ -1389,7 +1784,10 @@ async def watchdog_check_once(
         )
     except V1ApiError as exc:
         if exc.code is V1ErrorCode.TASK_NOT_FOUND:
-            return sink.enqueue_close(error_frame("task_deleted"))
+            # Abortive for the same reason: the task row this stream is
+            # replaying history for is gone, so that history shouldn't
+            # keep going out either.
+            return sink.enqueue_close(error_frame("task_deleted"), abortive=True)
         raise
 
     status = snapshot.status
@@ -1416,10 +1814,39 @@ async def watchdog_check_once(
         # so they only measure how long ago the pause happened, not
         # whether anyone is still managing it. Closing on that signal
         # would kill legitimately paused streams too. The 1-hour absolute
-        # cap is what actually bounds an orphaned paused stream's lifetime.
+        # cap is what actually bounds an orphaned paused stream's
+        # lifetime while a client is still reading it -- it closes
+        # non-abortively (``stream_expired``), so it ends this
+        # watchdog's own coverage only once the warm-up handoff has
+        # completed (``sink.warm``); on a stream whose warm-up read
+        # never got that far, this watchdog runs on to the connection's
+        # own teardown as before. See ``_watchdog_coverage_done``.
         sink.enqueue_status(status.value)
         return False
     return False  # pending/running: keep streaming
+
+
+def _watchdog_coverage_done(sink: V1EventStreamSink) -> bool:
+    """Whether this watchdog has anything left to protect.
+
+    A close on its own is not enough while the sink is still cold.
+    ``_generate`` hands the initial status frame and every warm-up
+    replay frame straight to the client, bypassing
+    ``_put_or_overflow``'s closing guard, so on a cold sink an ordinary
+    close -- a staging overflow's ``resync_required``, a terminal
+    ``task.completed`` -- stops nothing on that path. Coverage
+    therefore ends on either of two conditions: the warm-up handoff is
+    over (``sink.warm``), after which every emission goes through
+    ``_put_or_overflow``'s closing guard and an ordinary close really
+    does stop the stream; or a revocation is already latched
+    (``sink.abortive_close``), set both by this loop's own
+    ``watchdog_check_once`` and by the two read failures in
+    ``_generate`` that abandon the warm-up on a deleted task before it
+    can ever set ``warm`` (see ``enqueue_close``). Otherwise coverage
+    ends with the connection, when ``_generate``'s ``finally`` cancels
+    this task.
+    """
+    return sink.closing and (sink.warm or sink.abortive_close)
 
 
 async def _watchdog_loop(
@@ -1438,10 +1865,27 @@ async def _watchdog_loop(
     watchdog coverage for the rest of the stream's lifetime -- that
     would leave an orphaned stream open until the 1-hour absolute cap
     with nobody watching it. So every per-cycle check is wrapped and
-    logged; only cancellation (this loop's own teardown, not a check
-    failure) ends the loop early.
+    logged and the loop keeps going.
+
+    The exit rule is coverage, not closing: this loop only returns once
+    ``_watchdog_coverage_done`` is true -- the revocation is already
+    latched, or the warm-up handoff is over -- or it is cancelled
+    during ``_generate``'s teardown. A close by itself does not end the
+    loop on a sink that is still cold, because ``_generate``'s warm-up
+    replay yields its frames directly to the client, bypassing the
+    outbound queue's closing guard; an ordinary close (a staging
+    overflow, a terminal state this loop itself just found) leaves that
+    direct path free to keep emitting until the handoff completes, so
+    this loop has to stay alive to catch a revocation that lands before
+    then. Once the handoff is over, every emission goes through
+    ``_put_or_overflow``'s closing guard instead, and an ordinary close
+    really does stop the stream. A consumer that stops reading gives
+    this loop no way to observe that closing ever happened, so it keeps
+    polling on its normal cadence until the generator's teardown
+    cancels it -- there is no time bound on that other than the
+    connection's own.
     """
-    while not sink.closing:
+    while not _watchdog_coverage_done(sink):
         try:
             await asyncio.wait_for(
                 sink.completion_hint.wait(), timeout=interval_seconds
@@ -1450,13 +1894,19 @@ async def _watchdog_loop(
             pass
         else:
             sink.completion_hint.clear()
-        if sink.closing:
+        if _watchdog_coverage_done(sink):
             return
         try:
-            if await watchdog_check_once(
+            # The return value is deliberately not an exit condition. A
+            # check that closes the stream non-abortively -- a terminal
+            # task found while the warm-up read is still in flight,
+            # sink still cold -- leaves the direct replay free to keep
+            # emitting, so this loop must stay alive to observe a
+            # revocation that lands after it. Only the condition above
+            # ends it.
+            await watchdog_check_once(
                 sink, task_id, principal, read_task_snapshot=read_task_snapshot
-            ):
-                return
+            )
         except Exception:
             logger.exception(
                 "v1 SSE watchdog check failed for task %s; retrying next cycle",
@@ -1497,18 +1947,39 @@ def _snapshot_steps_within_wire_budget(
 
     A prefix, not a suffix, even though ``REPLAY_MAX_STEPS`` keeps the
     most recent steps: a step whose ``data`` cannot be serialized cannot
-    be measured either, and admitting it here is what keeps the emit loop
-    reaching it and reporting it through
-    ``_fast_path_step_serialize_error_frame`` -- with the steps before it
-    already on the wire, which is the behavior
-    ``GET /v1/chat/tasks/{task_id}/events`` documents. Dropping from the
-    oldest end instead would put an unserializable step at the head of
-    the window, where it suppresses every good step behind it, or force
-    the failure to be folded into "snapshot truncated" and never
-    reported. The budget only binds on a window averaging more than 8 KiB
-    per step, and a client whose snapshot was cut is told so by the
-    conclusion frame's ``snapshot_truncated`` and sent to
-    ``GET .../steps`` either way.
+    be measured either, and admitting it here is what leaves the
+    decision with each caller -- the fast paths' emit loop reaches it
+    and reports it, the warm-up replay ends its batch at it. Dropping
+    from the oldest end instead would put an
+    unserializable step at the head of the window, where it suppresses
+    every good step behind it. The budget only binds on a window
+    averaging more than 8 KiB per step.
+
+    The two callers do not fail the same way once an admitted-but-
+    unserializable step is actually reached, and that asymmetry is not
+    this function's concern -- it only decides which steps to admit:
+
+      - On the two attach-time fast paths, the emit loop reaches the bad
+        step with every step before it already on the wire, reports it
+        through ``_fast_path_step_serialize_error_frame``, and a client
+        whose snapshot was cut this way is told so by the conclusion
+        frame's ``snapshot_truncated`` -- the behavior
+        ``GET /v1/chat/tasks/{task_id}/events`` documents. Folding the
+        failure into "snapshot truncated" instead, with no error frame,
+        would silently misreport a serialize failure as an ordinary size
+        cut.
+      - On the normal streaming path's warm-up replay
+        (``_build_warm_up_frames``), there is no per-step emit loop and
+        no conclusion frame to carry a marker. That caller serializes
+        the admitted steps one at a time and stops at the first one
+        that raises, so every step ahead of it is still replayed and
+        the connection still goes live -- the bad step, and whatever
+        the measuring pass stopped short of, are simply not in the
+        batch. There is no marker frame for this either way; a client
+        reconciles against ``GET .../steps``, same as any other bounded
+        or empty replay batch, and the endpoint's sixth best-effort
+        delivery reason in ``tasks.py`` states what that endpoint can
+        and cannot do for this particular case.
     """
     budget_remaining = MAX_SNAPSHOT_WIRE_BYTES
     admitted = 0
@@ -1516,8 +1987,10 @@ def _snapshot_steps_within_wire_budget(
         try:
             frame_bytes = len(_step_wire_frame(step))
         except Exception:
-            # Unmeasurable: admit it so the emit loop fails on it -- see
-            # the docstring above.
+            # Unmeasurable: admit it so the caller decides what to do
+            # about it -- the fast paths' emit loop reports it, the
+            # warm-up replay ends its batch there. See the docstring
+            # above.
             admitted += 1
             break
         if frame_bytes > budget_remaining:
@@ -1538,9 +2011,14 @@ async def _fast_path_step_snapshot(
     burst of fast-path attaches on one task collapses into a cache hit
     instead of each one re-reading and re-projecting independently.
 
-    Bounded by two caps, whichever binds first: ``REPLAY_MAX_STEPS``
-    (step count) and ``MAX_SNAPSHOT_WIRE_BYTES`` (serialized size, via
-    ``_snapshot_steps_within_wire_budget``). Without them, a fast-path
+    Bounded by two caps applied in series: ``REPLAY_MAX_STEPS`` (step
+    count) first, written inline here the same way the normal
+    streaming path's warm-up replay writes it (see
+    ``_build_warm_up_frames``); then ``MAX_SNAPSHOT_WIRE_BYTES``
+    (serialized size) over that already-capped window, applied by the
+    same ``_snapshot_steps_within_wire_budget`` that replay path
+    shares too.
+    Without them, a fast-path
     attach to a task with an unusually long or heavy step history
     returned every step from this cached list in one shot, with no
     admission / deadline / heartbeat loop to pace it, unlike everything
@@ -1549,12 +2027,14 @@ async def _fast_path_step_snapshot(
     documents (``schemas/v1.py``'s ``StepsResponse``: "Steps are
     returned in monotonic started_at order") and
     ``map_trace_events_to_public_steps`` enforces with an explicit final
-    sort (``_step_mapping.py:640-643``), not a property its projection's
-    own fold order already guarantees on its own -- that sort is exactly
-    why it's needed. ``steps[-REPLAY_MAX_STEPS:]`` keeps the most recent
-    steps and drops the oldest; the byte budget is then applied to that
-    window from its oldest end (see ``_snapshot_steps_within_wire_budget`` for why a
-    prefix, not a suffix, is what it keeps). Returns the validated
+    sort (``_step_mapping.py``'s ``output.sort(key=lambda s:
+    s["started_at"])``, right before it returns), not a property its
+    projection's own fold order already guarantees on its own -- that
+    sort is exactly why it's needed. ``steps[-REPLAY_MAX_STEPS:]`` keeps
+    the most recent steps and drops the oldest; the byte budget is then
+    applied to that window from its oldest end (see
+    ``_snapshot_steps_within_wire_budget`` for why a prefix, not a
+    suffix, is what it keeps). Returns the validated
     ``PublicStep`` objects themselves, not their serialized frame text
     -- serialization happens one frame at a time in each fast path's own
     yield loop below instead, so a large step list is never fully
@@ -1595,15 +2075,15 @@ def _fast_path_steps_read_error_frame(
     ``TaskStepsVersionReader``) after ``build_event_stream_response``
     already resolved it once to pick this fast path -- a task deleted in
     that gap surfaces here as ``V1ApiError(TASK_NOT_FOUND)`` from
-    whichever one ran, same as it does to the watchdog (which already
-    emits ``task_deleted`` for it, not ``resync_required``): the task is
-    gone, not merely unreadable, so ``steps()`` + reattach would just
-    404 instead of resyncing anything. Only that specific shape gets
-    ``task_deleted``; every other failure (a transient DB error, a bug
-    in projection) keeps the existing ``resync_required`` handling and
-    is logged -- ``task_deleted`` isn't logged here for the same reason
-    the watchdog path doesn't log it: a deleted task racing the attach
-    isn't a bug in this stream.
+    whichever one ran, same as it does to the warm-up read and the
+    watchdog (both already emit ``task_deleted`` for it, not
+    ``resync_required``): the task is gone, not merely unreadable, so
+    ``steps()`` + reattach would just 404 instead of resyncing anything.
+    Only that specific shape gets ``task_deleted``; every other failure
+    (a transient DB error, a bug in projection) keeps the existing
+    ``resync_required`` handling and is logged -- ``task_deleted`` isn't
+    logged here for the same reason the warm-up and watchdog paths don't
+    log it: a deleted task racing the attach isn't a bug in this stream.
 
     Must be called from inside the ``except`` block it serves -- the
     ``logger.exception`` call below relies on the caller's still-active
@@ -1853,8 +2333,11 @@ async def _fast_path_snapshot_stream(
 
     ``task.status`` is emitted first, then the steps read runs inside a
     ``try``/``except`` that also covers the cursor baseline capture
-    below -- both reads have to succeed before any step content is trusted,
-    so a failure in either is handled identically. A bare exception here
+    below -- both reads have to succeed before any step content is
+    trusted, so a failure in either is handled identically. That is the
+    same order and the same failure handling ``_generate`` uses around
+    its own warm-up read (see that function's docstring). A bare
+    exception here
     would not produce a different HTTP status: ``StreamingResponse``
     sends the response start (200, headers) before ever pulling a chunk
     from this generator, so letting the read's exception propagate
@@ -2091,6 +2574,147 @@ def _input_required_snapshot_stream(
     )
 
 
+def _event_row_id(event: Any) -> int:
+    """The trace row's numeric primary key, for watermark filtering.
+
+    Distinct from ``event_id`` (the row's own string identifier,
+    exposed to clients as part of a public step's derived id) --
+    ``id`` is ``TraceEvent.id``, the same column
+    ``_load_task_steps_version_snapshot``'s ``SELECT max(...)`` reads.
+    """
+    return int(event.id)
+
+
+def _build_warm_up_frames(
+    task_id: int,
+    principal: "ApiKeyPrincipal",
+    read_task_steps: TaskStepsReader,
+    replay_watermark: int,
+) -> "tuple[PublicStepProjector, list[str]]":
+    """Read trace history and fold + serialize it to SSE frame text, all
+    synchronously, so the whole warm-up read runs in one worker thread
+    (via ``run_db_io_cancellation_safe``). Folding and JSON
+    serialization stay off the event loop together with the DB read:
+    a long trace history projected on the loop would stall every other
+    stream this process is serving, not just this one attach.
+
+    ``replay_watermark`` (see ``TaskStepsVersionReader``, and
+    ``_generate``'s call site) bounds which rows this replay folds in:
+    any row with ``id > replay_watermark`` is excluded here -- it was
+    committed after the watermark was captured, so it's exclusively
+    covered by staging + ``finish_warm_up``'s drain instead. Without
+    this bound, a row committed in the gap between registration and this
+    read would be folded in twice: once here (this read sees it, since
+    it's already committed) and once more via the staged drain (its
+    broadcast reached the still-cold sink in that same gap) -- a
+    duplicate ``step.started``/``step.completed`` for the same step.
+    Required, not optional: an attach with no watermark to bound itself
+    to is exactly the unbounded replay ``_generate`` refuses to fall back
+    to when the watermark read *fails*.
+
+    The materialized steps are sorted by ``started_at`` (stable, so
+    same-timestamp ties keep resolve order) to match ``steps()``'s own
+    ordering -- ``PublicStepProjector``'s own output is in resolve order,
+    which can differ from started_at order when a later-started step
+    finishes first.
+
+    That sorted list is then bounded by the same two caps that bound
+    the attach-time fast paths' one-shot snapshot, in the same order:
+    ``REPLAY_MAX_STEPS`` keeps the most recent steps, written inline
+    here just as it is at the fast path's own call site; then
+    ``_snapshot_steps_within_wire_budget`` -- the one function both
+    paths share -- trims that window to ``MAX_SNAPSHOT_WIRE_BYTES`` of
+    serialized frames. Sharing that function is the point -- both
+    paths emit a batch of steps with no pacing of their own, so the
+    byte cap gets one rule rather than each inventing its own. Two
+    consequences follow from that shared rule and are deliberate:
+
+      - The byte budget keeps a *prefix* of the count-capped window (see
+        ``_snapshot_steps_within_wire_budget``), so a window too heavy
+        for the budget loses its newest steps, not its oldest. The
+        projector below is still warmed from the *whole* history
+        regardless of what this batch admitted, so a still-running step
+        trimmed here still gets its ``step.completed`` live -- but this
+        stream never sent that step's ``step.started``, so on this
+        stream that end arrives with no start to pair with. See the
+        endpoint's fifth best-effort delivery reason in ``tasks.py``.
+      - The budget cutting the batch to zero steps is a legal outcome,
+        not an error: the stream simply goes live with no replay. There
+        is no marker frame for it and no ``stream.error``. Which steps a
+        replay contains is bounded by contract, and a client that needs
+        the task's full history reconciles against ``GET .../steps`` --
+        see the endpoint docstring in ``tasks.py``.
+      - A step whose serialization raises ends the batch at that step
+        rather than failing the whole attach: the frames already built
+        are returned, the stream goes live, and nothing on the wire
+        marks the cut. The shared budget admits such a step on purpose
+        -- it cannot be measured, so it cannot be budgeted -- which
+        makes it always the *last* admitted step, so "stop here" and
+        "skip it" produce the same batch today; stopping is what
+        matches the prefix the byte budget already produces. See the
+        endpoint's sixth best-effort delivery reason in ``tasks.py``.
+
+    Validating to ``PublicStep`` up front is what lets the shared budget
+    measure these steps at all (it takes the model, not a raw dict), and
+    it means the admitted steps are serialized here by ``_step_wire_frame``
+    directly rather than through ``_step_content_frame``'s
+    validate-then-serialize wrapper.
+
+    Serializing each step here rather than deferring it (see
+    ``_step_content_frame``'s own docstring on why that ordering
+    matters in general) is still safe: this projector is exclusively
+    owned by this function's caller at this point -- nothing feeds it
+    live events until ``finish_warm_up`` runs, back on the event loop,
+    strictly after this returns.
+
+    The projector returned here has already released its finished-step
+    retention (``take_materialized_steps``), so the sink that keeps
+    feeding it for the rest of the connection's life does not accumulate
+    a timeline nothing reads -- see ``PublicStepProjector``'s class
+    docstring on the two retention modes.
+    """
+    steps_snapshot = read_task_steps(task_id, principal)
+    events = [
+        event
+        for event in steps_snapshot.events
+        if _event_row_id(event) <= replay_watermark
+    ]
+    # ``from_history`` feeds every event straight into a fresh
+    # projector with none of ``_feed_trace_event``'s three guards (the
+    # delegated-child-agent source check, the ``task_info``
+    # short-circuit, the audit-only-data drop) -- the same
+    # live-vs-batch equivalence gap already tracked as #1405.
+    warmed_projector = PublicStepProjector.from_history(events)
+    steps = warmed_projector.take_materialized_steps()
+    steps.sort(key=lambda step: step["started_at"])
+    admitted = _snapshot_steps_within_wire_budget(
+        [PublicStep(**step) for step in steps[-REPLAY_MAX_STEPS:]]
+    )
+    frames: list[str] = []
+    for step in admitted:
+        try:
+            frames.append(_step_wire_frame(step))
+        except Exception:
+            # One step whose ``data`` cannot be serialized ends this
+            # batch instead of taking the whole attach down with it:
+            # every step already serialized is still replayed and the
+            # stream still goes live. The shared budget admits such a
+            # step on purpose (unmeasurable, so unbudgetable) -- this
+            # loop is what keeps that decision from costing this attach
+            # the steps ahead of it. See the endpoint's sixth
+            # best-effort delivery reason in ``tasks.py``.
+            logger.exception(
+                "v1 SSE warm-up replay stopped at an unserializable step "
+                "for task %s; replaying the %d step(s) before it and "
+                "dropping %d admitted step(s)",
+                task_id,
+                len(frames),
+                len(admitted) - len(frames),
+            )
+            break
+    return warmed_projector, frames
+
+
 async def _generate(
     task_id: int,
     principal: ApiKeyPrincipal,
@@ -2098,6 +2722,8 @@ async def _generate(
     key_prefix: str,
     initial_status: str,
     read_task_snapshot: TaskSnapshotReader,
+    read_task_steps: TaskStepsReader,
+    read_task_steps_version: TaskStepsVersionReader,
     watchdog_interval_seconds: float,
     stream_max_duration_seconds: float,
     heartbeat_interval_seconds: float,
@@ -2121,6 +2747,15 @@ async def _generate(
     ``build_event_stream_response`` (read-only, no mutation) -- so a
     rejected attach still fails before any stream bytes are sent; only
     the actual counter mutation and registration move here.
+
+    ``read_task_steps_version`` is read once right after registration to
+    capture the watermark the warm-up replay bounds itself to (see
+    ``_build_warm_up_frames``). It is required: a failed read of that
+    watermark closes the stream -- with ``resync_required``, or with
+    ``task_deleted`` when the failure is the task itself being gone --
+    rather than replaying the task's history unbounded, and an absent
+    *reader* would produce that same unbounded replay silently, which
+    is the one outcome this path refuses.
     """
     deadline = monotonic() + stream_max_duration_seconds
     sink = V1EventStreamSink(
@@ -2156,6 +2791,96 @@ async def _generate(
                 key_prefix,
             )
         manager.register_connection(cast(WebSocket, sink), task_id)
+        # Registering before the watermark read below is deliberate, and
+        # it leans on an ordering this file cannot enforce on its own: a
+        # trace row is committed by ``DatabaseTraceHandler`` before
+        # ``WebSocketTraceHandler`` broadcasts it, because
+        # ``create_task_tracer`` (``web/tracing.py``) lists them in that
+        # order and the tracer awaits each handler in turn rather than
+        # dispatching them concurrently (``Tracer``'s notify loop in
+        # ``core/agent/trace.py``). That is what makes "already
+        # committed" imply "its broadcast has not gone out yet, or went
+        # out to a sink that was already registered" -- so registering
+        # first costs at most a duplicate frame, never a lost one.
+        # Handler order has its own test; the sequential dispatch does
+        # not, and lives outside this module.
+        # Capture the replay watermark as close to registration as this
+        # generator can manage -- see ``TaskStepsVersionReader`` and
+        # ``_build_warm_up_frames``'s docstring for what it bounds and
+        # why. A failure here never falls back to an unbounded
+        # replay; it closes the stream, and the close reason splits
+        # by cause: a transient DB error gets ``resync_required``,
+        # while a task deleted in the instant after registration gets
+        # ``task_deleted`` (see the handler below for why those are
+        # not the same recovery for a client).
+        # The watermark is what bounds the warm-up replay's duplicate
+        # window to "registration to this one ``max(id)`` query" (see
+        # ``_build_warm_up_frames``'s docstring); falling back to an
+        # unbounded replay on a failed read removes that bound
+        # entirely, widening the same duplicate window to
+        # "registration to the end of reading the task's entire trace
+        # history" -- worse in proportion to how much history the task
+        # has. ``sink.enqueue_close`` here just queues the frame --
+        # the sink isn't warm yet and nothing has been yielded from
+        # its queue at this point, so the frame is actually delivered
+        # once the ``while True`` loop below reaches it, after the
+        # warm-up build below is skipped. ``replay_watermark`` staying
+        # ``None`` is exactly that skip signal, and the only way it can
+        # stay ``None``: the reader itself is a required argument, so
+        # "no watermark" always means "the read failed", never "nobody
+        # wired one up".
+        replay_watermark: int | None = None
+        try:
+            version_snapshot = await run_db_io_cancellation_safe(
+                lambda: read_task_steps_version(task_id, principal)
+            )
+            # Converted here rather than in an ``else`` clause: a
+            # reader handing back a ``max_event_id`` that is not an
+            # integer is a failed read like any other, and the comment
+            # above promises every failure at this step closes the
+            # stream rather than propagating out of this generator --
+            # with ``resync_required`` for exactly this kind of
+            # failure, since the task itself is fine. In an ``else``
+            # the conversion sits outside that promise.
+            replay_watermark = int(version_snapshot.max_event_id)
+            # Nothing else in this generator reads ``version_snapshot`` --
+            # the one field it carries is already copied into
+            # ``replay_watermark`` above. Same reasoning as releasing
+            # ``warm_up_frames`` below: don't leave it pinned in this
+            # frame's locals for the rest of a connection that can live
+            # an hour.
+            del version_snapshot
+        except Exception as exc:
+            if isinstance(exc, V1ApiError) and exc.code is V1ErrorCode.TASK_NOT_FOUND:
+                # Same split, and the same reason, as the history-read
+                # branch below: the task is gone, not merely unreadable,
+                # so telling the client to call steps() and re-attach
+                # would send it to a 404. Not logged, for the same
+                # reason that branch and the watchdog don't log it -- a
+                # task deleted while an attach is in flight is a race,
+                # not a bug in this stream. ``abortive=True`` for the
+                # same reason ``watchdog_check_once`` sets it on this
+                # same task_deleted reason: the row is gone, and this
+                # read fails before the warm-up handoff can ever set
+                # ``sink.warm``, so it's also what ends watchdog
+                # coverage on this path.
+                sink.enqueue_close(error_frame("task_deleted"), abortive=True)
+            else:
+                logger.exception(
+                    "v1 SSE replay watermark read failed for task %s; "
+                    "closing for resync instead of falling back to an "
+                    "unbounded warm-up replay",
+                    task_id,
+                )
+                sink.enqueue_close(
+                    error_frame(
+                        "resync_required",
+                        message=(
+                            "Reading the replay watermark failed; call "
+                            "steps() to resync, then re-attach."
+                        ),
+                    )
+                )
         watchdog_task = asyncio.create_task(
             _watchdog_loop(
                 sink,
@@ -2169,6 +2894,157 @@ async def _generate(
         # closed (``aclose()``, e.g. on client disconnect) while suspended
         # here still has to unregister the sink and cancel the watchdog.
         yield status_frame(initial_status)
+        # Warm-up: replay trace history into a fresh projector, yield its
+        # materialized steps directly (bypassing the outbound queue, same
+        # as the initial status frame above), then hand that projector to
+        # the sink so it starts feeding live frames instead of staging
+        # them. Registration (above) already happened before this read,
+        # so nothing broadcast between then and now is lost -- it's
+        # either already staged (``sink.staged_message_count``) or, for
+        # ``task.status``, already queued (that path doesn't go through
+        # the projector or staging at all). Bounding this replay to
+        # ``replay_watermark`` (captured just above) narrows the window
+        # in which a row can be folded in *twice*: a row committed after
+        # the watermark is excluded from this read and reaches the
+        # client exactly once, through staging + the drain
+        # ``finish_warm_up`` runs below -- without that bound, every row
+        # committed between registration and the end of this read would
+        # be replayed here AND drained from staging, producing a duplicate
+        # ``step.started``/``step.completed``. The residual window is the
+        # gap between registration and the watermark read (one
+        # ``SELECT max(id)``): a row committed inside it is both at or
+        # below the watermark and already staged, so it is delivered
+        # twice. That ordering is deliberate -- reading the watermark
+        # before registering would turn the same gap into a *lost* row
+        # (excluded from replay, broadcast before the sink existed), and
+        # this transport prefers a duplicate over a loss; clients dedupe
+        # by step id for the step families keyed by a persisted execution
+        # id (``tool_call``/``agent_delegation``, and the ``action``/``step``
+        # phases of ``thinking``, keyed by ``tool_call_id``/``step_id`` --
+        # stable across replay and live delivery of the same row). Two
+        # families are not covered by that dedupe, for two different
+        # reasons. A ``message`` step's id is minted fresh per broadcast
+        # (``create_stream_event``'s ``event_id``, a new uuid4 every call --
+        # see this module's docstring and
+        # ``test_known_divergence_message_step_id_differs_between_the_two_paths``),
+        # so a message step delivered twice in this residual window
+        # reaches the client as two differently-id'd steps, not one a
+        # step-id dedup collapses -- but harmlessly, since each copy is
+        # itself a complete, terminal step. The ``planning`` phase of
+        # ``thinking`` (``dag_plan_*``/``dag_execution``, see
+        # ``_step_mapping.py``'s ``feed``) has no persisted-key id at all --
+        # it pairs on an in-memory replan counter -- so a row folded in
+        # twice in this window (once by the replay, once by the staged
+        # drain) advances that counter twice and synthesizes two different
+        # step ids from the one row: the first reaches the client as
+        # ``step.started`` and is never finalized, because the row's
+        # single end event can only close the second, later id. That step
+        # is left stuck at ``status="running"`` for the rest of the
+        # connection -- the same symptom this warm-up replay exists to
+        # eliminate, reintroduced in this one residual window.
+        # Tracked as #1776: removing this window needs the broadcast
+        # producer to carry the originating trace event's persisted
+        # identity onto live frames, which is a change in
+        # ``api/websocket.py`` and visible to every consumer of that
+        # broadcast, not just this stream.
+        # A task deleted in the gap between attach and this read closes
+        # the stream the same way the watchdog would for the same race,
+        # instead of raising out of the generator. Any other failure
+        # here -- a transient DB error, a bug in the projector fold --
+        # gets the same ``resync_required`` close every other
+        # overload/backlog condition in this module gets, instead of
+        # letting the exception propagate out of the generator and
+        # leave the client with a response that just stops, no close
+        # frame at all: that would break this module's own invariant
+        # that a close frame is always how a client tells "the task
+        # ended" apart from "the stream ended".
+        # Skipped when the watermark read above already failed and
+        # closed the stream (for resync, or as ``task_deleted``):
+        # there is no watermark to bound this read to, and the close
+        # frame it queued is what the loop below will deliver.
+        if replay_watermark is not None:
+            watermark = replay_watermark
+            try:
+                warmed_projector, warm_up_frames = await run_db_io_cancellation_safe(
+                    lambda: _build_warm_up_frames(
+                        task_id, principal, read_task_steps, watermark
+                    )
+                )
+            except Exception as exc:
+                if (
+                    isinstance(exc, V1ApiError)
+                    and exc.code is V1ErrorCode.TASK_NOT_FOUND
+                ):
+                    # abortive=True for the same reason as the
+                    # watermark-read branch above: the row is gone, and
+                    # this read fails before the warm-up handoff can
+                    # ever set ``sink.warm``, so it's also what ends
+                    # watchdog coverage on this path.
+                    sink.enqueue_close(error_frame("task_deleted"), abortive=True)
+                else:
+                    logger.exception(
+                        "v1 SSE warm-up failed for task %s; closing for resync "
+                        "instead of leaving the client with a truncated stream "
+                        "and no close frame",
+                        task_id,
+                    )
+                    sink.enqueue_close(
+                        error_frame(
+                            "resync_required",
+                            message=(
+                                "Reading trace history failed; call steps() "
+                                "to resync, then re-attach."
+                            ),
+                        )
+                    )
+            else:
+                # ``warm_up_frames`` is already fully read and serialized
+                # by this point (see ``_build_warm_up_frames``); this loop
+                # only yields it, one frame at a time, on the event loop.
+                # The watchdog runs concurrently (``watchdog_task``,
+                # created above) and can call ``sink.enqueue_close`` while
+                # this loop is still mid-yield -- most closes should let
+                # this loop finish handing out history it already read
+                # before the close frame follows behind it in the queue,
+                # since that history describes the task's own past and
+                # doesn't become invalid just because the stream is now
+                # ending (a normal terminal/input-required conclusion, a
+                # resync signal). An *abortive* close is different: it
+                # means the client's standing to see this task's content
+                # at all was just revoked (key deauthorized) or the task
+                # itself is gone (row deleted) -- continuing to hand out
+                # buffered history after that would leak content the
+                # client is no longer authorized to see, or content for a
+                # task that no longer exists. An abortive close and the
+                # connection's absolute deadline are the two conditions
+                # that break this loop early; every *other* close reason
+                # is still left to arrive after replay finishes, via the
+                # queue, same as it always did. See ``enqueue_close`` and
+                # ``abortive_close`` for which reasons set it.
+                for frame_text in warm_up_frames:
+                    if sink.abortive_close:
+                        break
+                    if monotonic() >= deadline:
+                        # No close of our own needed here: the main loop
+                        # below re-evaluates the deadline on its very
+                        # first pass and enqueues ``stream_expired`` then.
+                        break
+                    yield frame_text
+                # Every frame this batch holds has now either been handed
+                # off or abandoned by one of the two breaks above --
+                # either way nothing in this generator reads
+                # ``warm_up_frames`` again, but the name stays bound in
+                # this frame's locals for as long as the generator itself
+                # is suspended, which for an idle stream is up to
+                # ``stream_max_duration_seconds`` (an hour in production).
+                # Left alone, a large replay batch would sit there for the
+                # rest of the connection's life pinning memory nothing
+                # will ever look at again. Same "don't hold what nothing
+                # reads" reasoning as ``PublicStepProjector.
+                # take_materialized_steps`` releasing ``_finished`` once
+                # the warm-up replay that needed it is over.
+                del warm_up_frames
+                sink.finish_warm_up(warmed_projector)
         while True:
             remaining = deadline - monotonic()
             if remaining <= 0:
@@ -2241,6 +3117,7 @@ async def build_event_stream_response(
     principal: ApiKeyPrincipal,
     initial_snapshot: "_TaskInfoSnapshot",
     read_task_snapshot: TaskSnapshotReader,
+    read_task_steps: TaskStepsReader,
     read_task_steps_response: TaskStepsResponseReader,
     read_task_steps_version: TaskStepsVersionReader,
     watchdog_interval_seconds: float = WATCHDOG_INTERVAL_SECONDS,
@@ -2256,21 +3133,29 @@ async def build_event_stream_response(
     per-principal reservation) ever exists, so a rejected attach never
     touches ``manager`` or the per-principal counter. Both fast paths
     below read their step content through ``read_task_steps_response``
-    (see ``TaskStepsResponseReader``), a cache-backed read of the
-    task's current step list -- they're one-shot and don't need a
-    live-foldable projector. They also take ``read_task_snapshot``
-    directly, the same reader that authorized ``initial_snapshot``, to
-    reread the task row once their own steps read returns non-empty
-    content and confirm nothing restarted the task in between (see
-    ``_fast_path_generation_changed``), and ``read_task_steps_version``
-    to reread the steps cursor (``max_event_id``) the same way -- a
-    trace row can land in that same window, and even the commits that
-    write the task row itself (a checkpoint-pointer ``UPDATE``, see
-    ``_fast_path_steps_cursor_changed``) never touch ``run_id`` or
-    ``state_version``, so the run_id/state_version reread alone cannot
-    see it either way. ``read_task_steps_version`` is required rather
-    than defaulted: a caller with no way to check the cursor would have
-    no way to catch a row landing in that window.
+    instead of the normal streaming path's ``read_task_steps`` (see
+    ``TaskStepsResponseReader``) -- a different, cache-backed shape,
+    since they're one-shot and don't need a live-foldable projector,
+    only the task's current step list. They also take
+    ``read_task_snapshot`` directly, the same reader that authorized
+    ``initial_snapshot``, to reread the task row once their own steps
+    read returns non-empty content and confirm nothing restarted the
+    task in between (see ``_fast_path_generation_changed``).
+
+    ``read_task_steps_version`` serves both shapes of attach, which is
+    why it is required here rather than defaulted: the fast paths use it
+    to reread the steps cursor (``max_event_id``) the same way they
+    reread the task row -- a trace row can land in that same window, and
+    even the commits that write the task row itself (a checkpoint-pointer
+    ``UPDATE``, see ``_fast_path_steps_cursor_changed``) never touch
+    ``run_id`` or ``state_version``, so the run_id/state_version reread
+    alone cannot see it either way -- while the normal streaming path
+    reads it once at registration to bound its warm-up replay (see
+    ``_generate``). The reader is required rather than defaulted:
+    without a watermark the replay would fold the task's whole history,
+    which contradicts this module's own rule that a *failed* watermark
+    read closes the stream rather than replaying unbounded. A caller
+    that cannot supply the reader fails at the call.
     """
     close_reason = _stream_close_reason(
         initial_snapshot.status, initial_snapshot.control_state
@@ -2311,6 +3196,8 @@ async def build_event_stream_response(
             key_prefix=key_prefix,
             initial_status=initial_snapshot.status.value,
             read_task_snapshot=read_task_snapshot,
+            read_task_steps=read_task_steps,
+            read_task_steps_version=read_task_steps_version,
             watchdog_interval_seconds=watchdog_interval_seconds,
             stream_max_duration_seconds=stream_max_duration_seconds,
             heartbeat_interval_seconds=heartbeat_interval_seconds,

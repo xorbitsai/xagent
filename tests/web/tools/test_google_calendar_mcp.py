@@ -212,6 +212,19 @@ def test_update_event_does_not_duplicate_an_already_invited_attendee(monkeypatch
     ]
 
 
+def test_update_event_dedupes_repeated_emails_in_the_same_attendees_call(monkeypatch):
+    service = _fake_service({"id": "evt1"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_update_events(
+        event_id="evt1",
+        attendees=["bob@example.com", "bob@example.com"],
+    )
+
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["body"]["attendees"] == [{"email": "bob@example.com"}]
+
+
 def test_update_event_with_no_new_attendees_leaves_existing_attendees_untouched(
     monkeypatch,
 ):
@@ -336,3 +349,22 @@ def test_response_surfaces_pending_conference_status_instead_of_hangout_link(
 
     assert "hangout_link" not in result
     assert result["conference_status"] == "pending"
+
+
+def test_response_handles_null_conference_data_without_crashing(monkeypatch):
+    """Guard against event["conferenceData"] (or nested keys) being present but
+    explicitly null in the API response, not just absent."""
+    service = _fake_service({"id": "evt1", "conferenceData": None})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="1:1",
+            start_time="2026-09-07T15:00:00+08:00",
+            end_time="2026-09-07T16:00:00+08:00",
+        )
+    )
+
+    assert result["status"] == "success"
+    assert "hangout_link" not in result
+    assert "conference_status" not in result

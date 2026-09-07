@@ -95,9 +95,13 @@ def _merge_attendees(event: dict[str, Any], attendees: list[str] | None) -> None
         return
     existing = event.get("attendees") or []
     existing_emails = {a.get("email") for a in existing if isinstance(a, dict)}
-    event["attendees"] = existing + [
-        {"email": email} for email in attendees if email not in existing_emails
-    ]
+    new_attendees = []
+    seen = set()
+    for email in attendees:
+        if email not in existing_emails and email not in seen:
+            new_attendees.append({"email": email})
+            seen.add(email)
+    event["attendees"] = existing + new_attendees
 
 
 def _conference_and_notify_kwargs(
@@ -128,8 +132,9 @@ def _event_response(event: dict[str, Any]) -> dict[str, Any]:
     if hangout_link:
         response["hangout_link"] = hangout_link
     else:
-        create_request = event.get("conferenceData", {}).get("createRequest", {})
-        status_code = create_request.get("status", {}).get("statusCode")
+        conference_data = event.get("conferenceData") or {}
+        create_request = conference_data.get("createRequest") or {}
+        status_code = (create_request.get("status") or {}).get("statusCode")
         if status_code:
             # Meet link creation is asynchronous; surface the status instead of
             # implying failure when hangoutLink isn't populated yet.

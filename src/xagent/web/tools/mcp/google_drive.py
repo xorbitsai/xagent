@@ -2,6 +2,8 @@ import io
 import json
 import logging
 import os
+import re
+from collections.abc import Callable
 from typing import Any
 
 from google.oauth2.credentials import Credentials
@@ -12,7 +14,7 @@ from googleapiclient.http import (  # type: ignore[import-not-found]
 )
 from mcp.server.fastmcp import FastMCP
 
-from .utils import setup_proxy_env
+from .utils import require_clean_identifier, resolve_id_from_url, setup_proxy_env
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("google-drive-mcp")
@@ -21,6 +23,24 @@ logger = logging.getLogger("google-drive-mcp")
 setup_proxy_env()
 
 mcp = FastMCP("google-drive-mcp")
+
+# Matches the id segment out of any of the common Drive/Docs/Sheets/Slides
+# share-link shapes, since a user (and therefore a model relaying the user's
+# words) is far more likely to hand over the URL they see in the browser
+# than the bare id.
+_DRIVE_URL_ID_PATTERN = re.compile(
+    r"/(?:file/d|folders|document/d|spreadsheets/d|presentation/d)/([a-zA-Z0-9_-]+)"
+)
+
+# "owner" is deliberately excluded: ownership transfer needs
+# transferOwnership=True, is not reversible the way a role change is, and is
+# a distinct product decision from "share this with someone" -- one this
+# connector doesn't make on the model's behalf.
+_SHARE_ROLES = ("reader", "commenter", "writer")
+
+
+def _resolve_file_id(file_id: str) -> str:
+    return resolve_id_from_url(file_id, _DRIVE_URL_ID_PATTERN, "file_id")
 
 
 def get_drive_service() -> Any:
@@ -198,6 +218,38 @@ def google_drive_rename_file(file_id: str, new_name: str) -> str:
         return json.dumps({"status": "error", "message": str(e)})
 
 
+def _execute_ignoring_204_ssl_eof(
+    execute: Callable[[], Any], verify_done: Callable[[], None]
+) -> None:
+    """Run a Drive delete-style call that returns 204 No Content, tolerating
+    the SSL EOF error a proxy can raise on that empty response.
+
+    httplib2 (via a proxy) can turn a 204 response into
+    ``UNEXPECTED_EOF_WHILE_READING`` even though the delete already
+    succeeded server-side. When that happens, confirm the object is
+    actually gone (``verify_done`` should raise a 404-shaped error once it
+    is) before treating the call as successful; any other error propagates
+    unchanged.
+    """
+    try:
+        execute()
+    except Exception as e:
+        if "UNEXPECTED_EOF_WHILE_READING" not in str(e):
+            raise
+        logger.warning(
+            f"Ignored SSL EOF error (often caused by proxy on 204 response): {e}"
+        )
+        try:
+            verify_done()
+            raise Exception(
+                f"Operation did not complete, SSL error occurred: {e}"
+            ) from e
+        except Exception as verify_err:
+            if "404" in str(verify_err) or "not found" in str(verify_err).lower():
+                return  # Successfully completed
+            raise e from verify_err
+
+
 @mcp.tool()
 def google_drive_delete_file(file_id: str) -> str:
     """
@@ -206,35 +258,167 @@ def google_drive_delete_file(file_id: str) -> str:
     Otherwise, you may want to use google_drive_trash_file if needed, but this permanently deletes.
     """
     try:
+        resolved_file_id = _resolve_file_id(file_id)
         service = get_drive_service()
-        try:
-            service.files().delete(fileId=file_id).execute()
-        except Exception as e:
-            # Handle httplib2 proxy issue with 204 No Content responses causing SSL EOF
-            if "UNEXPECTED_EOF_WHILE_READING" in str(e):
-                logger.warning(
-                    f"Ignored SSL EOF error during delete (often caused by proxy on 204 response): {e}"
-                )
-                # Verify if it was actually deleted
-                try:
-                    service.files().get(fileId=file_id).execute()
-                    raise Exception(f"File was not deleted, SSL error occurred: {e}")
-                except Exception as get_err:
-                    if "404" in str(get_err) or "not found" in str(get_err).lower():
-                        pass  # Successfully deleted
-                    else:
-                        raise e
-            else:
-                raise e
+        _execute_ignoring_204_ssl_eof(
+            lambda: service.files().delete(fileId=resolved_file_id).execute(),
+            lambda: service.files().get(fileId=resolved_file_id).execute(),
+        )
 
         return json.dumps(
             {
                 "status": "success",
-                "message": f"File/Folder {file_id} successfully deleted.",
+                "message": f"File/Folder {resolved_file_id} successfully deleted.",
             }
         )
     except Exception as e:
         logger.error(f"Error deleting file: {e}")
+        return json.dumps({"status": "error", "message": str(e)})
+
+
+@mcp.tool()
+def google_drive_list_permissions(file_id: str) -> str:
+    """
+    List who currently has access to a Drive file or folder (owner,
+    editors, commenters, viewers) and their permission ids. Use the
+    returned permission ids with google_drive_update_permission or
+    google_drive_remove_permission.
+    """
+    try:
+        service = get_drive_service()
+        results = (
+            service.permissions()
+            .list(
+                fileId=_resolve_file_id(file_id),
+                supportsAllDrives=True,
+                fields="permissions(id, type, role, emailAddress, displayName)",
+            )
+            .execute()
+        )
+
+        return json.dumps(
+            {"status": "success", "permissions": results.get("permissions", [])}
+        )
+    except Exception as e:
+        logger.error(f"Error listing permissions: {e}")
+        return json.dumps({"status": "error", "message": str(e)})
+
+
+@mcp.tool()
+def google_drive_share_file(
+    file_id: str,
+    email: str,
+    role: str = "reader",
+    send_notification: bool = True,
+    message: str | None = None,
+) -> str:
+    """
+    Grant a user (by email) access to a Drive file or folder, making it
+    visible to someone outside this conversation. This is an external
+    action -- confirm the target file, the email, and the role with the
+    user before calling it.
+    role: "reader" (can view), "commenter" (can view and comment), or
+    "writer" (can edit). Sharing a folder gives that access to everything
+    inside it. When send_notification is True, Google emails the person
+    being added; message is included in that email if given.
+    """
+    try:
+        if role not in _SHARE_ROLES:
+            raise ValueError(f"role must be one of {_SHARE_ROLES}")
+        require_clean_identifier(email, "email")
+        if "@" not in email:
+            raise ValueError("email must be a valid email address")
+
+        service = get_drive_service()
+        permission = (
+            service.permissions()
+            .create(
+                fileId=_resolve_file_id(file_id),
+                body={"type": "user", "role": role, "emailAddress": email},
+                sendNotificationEmail=send_notification,
+                emailMessage=message,
+                supportsAllDrives=True,
+                fields="id, type, role, emailAddress, displayName",
+            )
+            .execute()
+        )
+
+        return json.dumps({"status": "success", "permission": permission})
+    except Exception as e:
+        logger.error(f"Error sharing file: {e}")
+        return json.dumps({"status": "error", "message": str(e)})
+
+
+@mcp.tool()
+def google_drive_update_permission(file_id: str, permission_id: str, role: str) -> str:
+    """
+    Change an existing collaborator's role on a Drive file or folder (e.g.
+    upgrade a viewer to an editor). Get permission_id from
+    google_drive_list_permissions. This is an external action -- confirm
+    the change with the user before calling it.
+    role: "reader", "commenter", or "writer".
+    """
+    try:
+        if role not in _SHARE_ROLES:
+            raise ValueError(f"role must be one of {_SHARE_ROLES}")
+
+        service = get_drive_service()
+        permission = (
+            service.permissions()
+            .update(
+                fileId=_resolve_file_id(file_id),
+                permissionId=require_clean_identifier(permission_id, "permission_id"),
+                body={"role": role},
+                supportsAllDrives=True,
+                fields="id, type, role, emailAddress, displayName",
+            )
+            .execute()
+        )
+
+        return json.dumps({"status": "success", "permission": permission})
+    except Exception as e:
+        logger.error(f"Error updating permission: {e}")
+        return json.dumps({"status": "error", "message": str(e)})
+
+
+@mcp.tool()
+def google_drive_remove_permission(file_id: str, permission_id: str) -> str:
+    """
+    Revoke a collaborator's access to a Drive file or folder. Get
+    permission_id from google_drive_list_permissions. This is an external
+    action -- confirm who is losing access with the user before calling it.
+    """
+    try:
+        resolved_file_id = _resolve_file_id(file_id)
+        resolved_permission_id = require_clean_identifier(
+            permission_id, "permission_id"
+        )
+        service = get_drive_service()
+        _execute_ignoring_204_ssl_eof(
+            lambda: (
+                service.permissions()
+                .delete(
+                    fileId=resolved_file_id,
+                    permissionId=resolved_permission_id,
+                    supportsAllDrives=True,
+                )
+                .execute()
+            ),
+            lambda: (
+                service.permissions()
+                .get(fileId=resolved_file_id, permissionId=resolved_permission_id)
+                .execute()
+            ),
+        )
+
+        return json.dumps(
+            {
+                "status": "success",
+                "message": f"Permission {resolved_permission_id} successfully removed.",
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error removing permission: {e}")
         return json.dumps({"status": "error", "message": str(e)})
 
 

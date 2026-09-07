@@ -241,13 +241,14 @@ def _execute_ignoring_204_ssl_eof(
         )
         try:
             verify_done()
-            raise Exception(
-                f"Operation did not complete, SSL error occurred: {e}"
-            ) from e
         except Exception as verify_err:
             if "404" in str(verify_err) or "not found" in str(verify_err).lower():
                 return  # Successfully completed
             raise e from verify_err
+
+        # verify_done() didn't raise, so the object is still there -- the
+        # delete/permission removal genuinely did not happen.
+        raise Exception(f"Operation did not complete, SSL error occurred: {e}") from e
 
 
 @mcp.tool()

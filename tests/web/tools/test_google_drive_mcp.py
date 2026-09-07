@@ -355,6 +355,23 @@ class TestExecuteIgnoring204SslEof:
         with pytest.raises(Exception, match="UNEXPECTED_EOF_WHILE_READING"):
             google_drive._execute_ignoring_204_ssl_eof(execute, verify_done)
 
+    def test_raises_even_when_original_error_text_contains_not_found(self):
+        """The "not complete" exception raised when verify_done() shows the
+        object is still there must never be caught by the except clause that
+        is meant to interpret *verify_done's own* exception -- if it were,
+        an original SSL error whose text happens to mention "not found" or
+        "404" (plausible in a proxy's wrapped error message) would make a
+        genuine failure-to-delete look like a success."""
+        execute = Mock(
+            side_effect=Exception(
+                "UNEXPECTED_EOF_WHILE_READING: upstream returned 404 not found"
+            )
+        )
+        verify_done = Mock(return_value=None)  # object is still there
+
+        with pytest.raises(Exception, match="did not complete"):
+            google_drive._execute_ignoring_204_ssl_eof(execute, verify_done)
+
 
 def test_delete_file_tolerates_ssl_eof_on_204_response(monkeypatch):
     """End-to-end regression for the pre-existing SSL EOF tolerance that

@@ -159,9 +159,18 @@ def google_drive_get_file_content(file_id: str, mime_type: str = "text/plain") -
         file_mime_type = file_metadata.get("mimeType", "")
 
         if "application/vnd.google-apps" in file_mime_type:
-            # Export Google Workspace document
+            # Export Google Workspace document. Sheets has no text/plain
+            # export format (only Docs/Slides do) and 400s on it, so the
+            # "text/plain" default -- reasonable for the far more common
+            # Docs/Slides case -- needs a per-type fallback for Sheets.
+            export_mime_type = mime_type
+            if (
+                file_mime_type == "application/vnd.google-apps.spreadsheet"
+                and mime_type == "text/plain"
+            ):
+                export_mime_type = "text/csv"
             request = service.files().export_media(
-                fileId=resolved_file_id, mimeType=mime_type
+                fileId=resolved_file_id, mimeType=export_mime_type
             )
         else:
             # Download regular file

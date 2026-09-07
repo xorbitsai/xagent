@@ -246,6 +246,96 @@ def test_get_file_content_resolves_full_drive_url(monkeypatch):
     assert service.files.return_value.get_media.call_args.kwargs["fileId"] == "abc123"
 
 
+def test_get_file_content_defaults_spreadsheet_export_to_csv(monkeypatch):
+    """Google Sheets has no text/plain export format and 400s on it, so the
+    tool's own "text/plain" default -- fine for the far more common Docs
+    case -- must not be sent as-is when the target turns out to be a Sheet."""
+    service = _mock_drive_service(monkeypatch)
+    service.files.return_value.get.return_value.execute.return_value = {
+        "id": "sheet1",
+        "name": "Budget",
+        "mimeType": "application/vnd.google-apps.spreadsheet",
+    }
+
+    class _FakeDownloader:
+        def __init__(self, fh, _request):
+            self._fh = fh
+
+        def next_chunk(self):
+            self._fh.write(b"a,b\n1,2")
+            return None, True
+
+    monkeypatch.setattr(google_drive, "MediaIoBaseDownload", _FakeDownloader)
+
+    result = json.loads(google_drive.google_drive_get_file_content("sheet1"))
+
+    assert result["status"] == "success"
+    assert (
+        service.files.return_value.export_media.call_args.kwargs["mimeType"]
+        == "text/csv"
+    )
+
+
+def test_get_file_content_respects_explicit_mime_type_for_spreadsheet(monkeypatch):
+    service = _mock_drive_service(monkeypatch)
+    service.files.return_value.get.return_value.execute.return_value = {
+        "id": "sheet1",
+        "name": "Budget",
+        "mimeType": "application/vnd.google-apps.spreadsheet",
+    }
+
+    class _FakeDownloader:
+        def __init__(self, fh, _request):
+            self._fh = fh
+
+        def next_chunk(self):
+            self._fh.write(b"<html></html>")
+            return None, True
+
+    monkeypatch.setattr(google_drive, "MediaIoBaseDownload", _FakeDownloader)
+
+    result = json.loads(
+        google_drive.google_drive_get_file_content(
+            "sheet1", mime_type="application/pdf"
+        )
+    )
+
+    assert result["status"] == "success"
+    assert (
+        service.files.return_value.export_media.call_args.kwargs["mimeType"]
+        == "application/pdf"
+    )
+
+
+def test_get_file_content_keeps_text_plain_default_for_docs(monkeypatch):
+    """The text/csv fallback is specific to spreadsheets -- Docs supports
+    text/plain export natively and must not be redirected to csv too."""
+    service = _mock_drive_service(monkeypatch)
+    service.files.return_value.get.return_value.execute.return_value = {
+        "id": "doc1",
+        "name": "Notes",
+        "mimeType": "application/vnd.google-apps.document",
+    }
+
+    class _FakeDownloader:
+        def __init__(self, fh, _request):
+            self._fh = fh
+
+        def next_chunk(self):
+            self._fh.write(b"hello")
+            return None, True
+
+    monkeypatch.setattr(google_drive, "MediaIoBaseDownload", _FakeDownloader)
+
+    result = json.loads(google_drive.google_drive_get_file_content("doc1"))
+
+    assert result["status"] == "success"
+    assert (
+        service.files.return_value.export_media.call_args.kwargs["mimeType"]
+        == "text/plain"
+    )
+
+
 def test_rename_file_resolves_full_drive_url(monkeypatch):
     service = _mock_drive_service(monkeypatch)
     service.files.return_value.update.return_value.execute.return_value = {

@@ -7,6 +7,7 @@ from .chat_message import TaskChatMessage
 from .custom_api import CustomApi, UserCustomApi
 from .database import Base, get_db, get_engine, get_session_local
 from .deployment import Deployment, DeploymentOwnerType
+from .frozen_tool_call import FROZEN_CALL_STATUSES, FrozenToolCall
 from .gmail_watch import GmailWatchState
 from .kb_ingest_target import KBIngestTarget
 from .mcp import MCPServer, UserMCPServer
@@ -43,6 +44,8 @@ from .user_oauth import UserOAuth
 from .workforce import Workforce, WorkforceAgent, WorkforceBuilderMessage, WorkforceRun
 
 __all__ = [
+    "FROZEN_CALL_STATUSES",
+    "FrozenToolCall",
     "Base",
     "ActorOAuthFlowState",
     "get_engine",

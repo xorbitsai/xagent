@@ -1064,16 +1064,24 @@ def test_table_is_registered_in_metadata() -> None:
 
 
 def test_none_as_null_is_confined_to_this_table() -> None:
-    """Pins the class docstring's claim that JSON(none_as_null=True) is
-    confined to this table, carried by both of its JSON columns.
+    """Pins which columns carry JSON(none_as_null=True), and why each does.
 
     Imports xagent.web.models first (same reason as
     test_table_is_registered_in_metadata above) so every model's table is
     actually registered on Base.metadata before this walks it. Only JSON
     type instances carry a none_as_null attribute at all, so the getattr
     default guards every other column type instead of assuming JSON. This is
-    a guard, not a preference: no OTHER table may quietly adopt the flag
-    without this test catching it.
+    a guard, not a preference: no table may quietly adopt the flag without
+    this test catching it, and each entry below owes a reason.
+
+    ``task_interaction_requests.response_payload`` needs it so "answered"
+    is testable with SQL ``IS NULL`` while a legitimate JSON ``null`` answer
+    still reads as answered. Its ``request_payload`` and
+    ``frozen_tool_calls.arguments`` need it for the other reason: without
+    the flag, serialization runs before binding and a Python ``None``
+    reaches the column as the JSON text ``null``, which ``NOT NULL`` does
+    not reject. Verified by construction -- dropping the flag from
+    ``arguments`` lets a ``None`` insert commit.
     """
     import xagent.web.models as models
 
@@ -1084,6 +1092,7 @@ def test_none_as_null_is_confined_to_this_table() -> None:
         if getattr(column.type, "none_as_null", False)
     }
     assert none_as_null_columns == {
+        ("frozen_tool_calls", "arguments"),
         ("task_interaction_requests", "request_payload"),
         ("task_interaction_requests", "response_payload"),
     }

@@ -37,6 +37,7 @@ from ..... import config as _root_config
 from .....sandbox.base import Sandbox
 from ...core.mcp.sessions import Connection, create_session
 from ...core.mcp.tools import load_mcp_tools, raw_annotations_for
+from ...user_interaction import WAITING_FOR_USER_STATUS
 from .base import AbstractBaseTool, ToolVisibility
 from .connector_runtime import (
     ERROR_DELEGATED_AUTHORIZATION_FAILED,
@@ -54,6 +55,12 @@ from .sandboxed_tool.sandboxed_mcp_tool_helper import (
     should_sandbox_mcp_connection,
 )
 from .tool_naming_limits import MAX_AGENT_TOOL_NAME_LENGTH
+from .write_gate import (
+    GatedCall,
+    _approval_response_is_grant,
+    consult_write_gate,
+    get_write_gate_resume_hook,
+)
 
 
 class MCPFailurePhase(str, Enum):
@@ -1336,6 +1343,42 @@ class MCPToolAdapter(AbstractBaseTool):
                 current_user_id,
             )
 
+            # Placed here on purpose: after ``tool_args`` is complete --
+            # schema-normalized and carrying the runtime-bound arguments the
+            # model is not allowed to supply -- and before any execution
+            # attempt. What the gate freezes is therefore exactly what would
+            # have run, and the retry paths below inherit the decision
+            # instead of each needing their own gate.
+            decision = consult_write_gate(
+                GatedCall(
+                    tool_name=self.name,
+                    server_name=str(self.source_server or ""),
+                    arguments=tool_args,
+                    write_hint=self.write_hint.value,
+                )
+            )
+            if decision is not None and decision.approval_required:
+                # The one confirm interaction Toby's approval buttons already
+                # render. ``interaction_id`` is what ties this pause to the
+                # frozen payload: the pattern carries it into the checkpoint
+                # and hands it back to ``resume_user_interaction``.
+                return {
+                    "status": WAITING_FOR_USER_STATUS,
+                    "interaction_id": decision.interaction_id,
+                    "message": decision.message or f"Approve running {self.name}?",
+                    "interactions": [
+                        {
+                            "type": "confirm",
+                            "field": "approve",
+                            "label": "Approve",
+                            "options": [
+                                {"label": "Approve", "value": "approve"},
+                                {"label": "Reject", "value": "reject"},
+                            ],
+                        }
+                    ],
+                }
+
             # Set user context for execution
             # Lazy import to avoid core → web layer dependency at module level.
             from .....web.user_context import UserContext
@@ -1621,6 +1664,64 @@ class MCPToolAdapter(AbstractBaseTool):
     def return_value_as_string(self, value: Any) -> str:
         """Convert return value to string representation."""
         return _mcp_return_value_as_string(value)
+
+    async def resume_user_interaction(
+        self,
+        *,
+        interaction_id: str,
+        response: str,
+    ) -> Any:
+        """Execute the frozen call this interaction paused, or void it.
+
+        The model is not consulted. Approving replays the arguments that
+        were frozen when the pause was created, which is the entire point:
+        an approval that let the model re-derive its arguments would
+        publish something nobody agreed to, which is the incident this
+        mechanism exists to prevent.
+
+        Reached only through the pattern's resume delivery, which resolves a
+        tool **by name**. MCP runtime names embed a renameable display name,
+        so a tool renamed while an approval was pending is not found and
+        delivery is skipped -- the frozen row then expires unexecuted rather
+        than running against a tool the approver did not see. That is the
+        intended failure direction, not an oversight.
+
+        Any outcome other than an explicit approval voids the row. A
+        response this method does not recognize is a rejection, not a
+        reason to guess.
+        """
+        hook = get_write_gate_resume_hook()
+        if hook is None:
+            # The gate that minted this interaction is gone -- a host that
+            # unregistered mid-flight, or a process that never had one.
+            # There is no frozen payload to run and nothing to void.
+            return {
+                "success": False,
+                "status": "error",
+                "error": "This approval can no longer be completed.",
+            }
+        approved = _approval_response_is_grant(response)
+        return await hook(
+            interaction_id=interaction_id,
+            approved=approved,
+            executor=self._execute_frozen_call,
+        )
+
+    async def _execute_frozen_call(self, arguments: Mapping[str, Any]) -> Any:
+        """Run one previously frozen argument set through the normal path.
+
+        Deliberately re-enters ``_execute_mcp_call`` rather than
+        ``run_json_async``: the arguments are already normalized and
+        runtime-bound, and re-running the gate would pause the resumed call
+        a second time. Everything else about the call -- connection, meta,
+        user context -- is rebuilt exactly as an ungated call would.
+        """
+        from .....web.user_context import UserContext
+
+        with UserContext(self._get_current_user_id()).set_context():
+            return await self._execute_mcp_call(
+                self.connection, dict(arguments), self._runtime_mcp_meta()
+            )
 
 
 class _UnavailableMCPToolResult(BaseModel):

@@ -136,8 +136,13 @@ def _needs_conference_request(event: dict[str, Any]) -> bool:
     request". Read status.statusCode directly instead (the same field
     _event_response already reads for the opposite purpose). A conference
     that has already resolved (has entryPoints or a conferenceSolution --
-    Meet or otherwise) also returns False, so it isn't clobbered either.
+    Meet or otherwise) also returns False, so it isn't clobbered either. A
+    legacy event carrying `hangoutLink` with no `conferenceData` at all (pre-
+    dates the conferenceData API) is also treated as already resolved, or
+    add_google_meet=True would request a second, duplicate conference for it.
     """
+    if event.get("hangoutLink"):
+        return False
     conference_data = event.get("conferenceData") or {}
     if not conference_data:
         return True
@@ -179,8 +184,8 @@ def _event_response(event: dict[str, Any]) -> dict[str, Any]:
         # third-party conference would otherwise get mislabeled as a
         # "hangout_link" (a name callers reasonably read as "this is Meet").
         solution_type = (
-            (conference_data.get("conferenceSolution") or {}).get("key", {}).get("type")
-        )
+            (conference_data.get("conferenceSolution") or {}).get("key") or {}
+        ).get("type")
         if solution_type == "hangoutsMeet":
             for entry_point in conference_data.get("entryPoints") or []:
                 if entry_point.get("entryPointType") == "video" and entry_point.get(

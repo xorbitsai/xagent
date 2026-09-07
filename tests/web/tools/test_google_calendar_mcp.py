@@ -346,6 +346,27 @@ def test_update_event_add_google_meet_creates_conference_when_none_exists(
     ] == {"type": "hangoutsMeet"}
 
 
+def test_update_event_add_google_meet_does_not_duplicate_a_legacy_hangout_link(
+    monkeypatch,
+):
+    """Regression test: a legacy event can carry hangoutLink with no
+    conferenceData at all (it predates the conferenceData API). Without a
+    hangoutLink check, add_google_meet=True would see "no conferenceData" and
+    request a second, duplicate conference for an event that already has
+    one."""
+    existing_event = {
+        "id": "evt1",
+        "hangoutLink": "https://meet.google.com/abc-defg-hij",
+    }
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_update_events(event_id="evt1", add_google_meet=True)
+
+    _, kwargs = service.events.return_value.update.call_args
+    assert "conferenceData" not in kwargs["body"]
+
+
 def test_update_event_add_google_meet_does_not_replace_existing_conference(
     monkeypatch,
 ):
@@ -533,6 +554,30 @@ def test_response_handles_null_conference_data_without_crashing(monkeypatch):
     assert result["status"] == "success"
     assert "hangout_link" not in result
     assert "conference_status" not in result
+
+
+def test_response_handles_null_conference_solution_key_without_crashing(monkeypatch):
+    """Guard against conferenceData.conferenceSolution.key being present but
+    explicitly null, not just absent -- .get("key", {}) only defaults for a
+    missing key, not a present-but-null one."""
+    service = _fake_service(
+        {
+            "id": "evt1",
+            "conferenceData": {"conferenceSolution": {"key": None}},
+        }
+    )
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="1:1",
+            start_time="2026-09-07T15:00:00+08:00",
+            end_time="2026-09-07T16:00:00+08:00",
+        )
+    )
+
+    assert result["status"] == "success"
+    assert "hangout_link" not in result
 
 
 def test_get_event_surfaces_hangout_link_like_create_and_update_do(monkeypatch):

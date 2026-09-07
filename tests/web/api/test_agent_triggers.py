@@ -47,6 +47,8 @@ from xagent.web.services.trigger_providers import sign_webhook_payload
 from xagent.web.services.triggers import (
     _coerce_utc,
     _compute_next_run_at,
+    _finish_trigger_run_after_task,
+    _PreparedTriggerStart,
     _start_prepared_trigger_run_id,
     dispatch_pending_trigger_runs,
     scan_due_scheduled_triggers,
@@ -448,6 +450,11 @@ def test_trigger_test_run_mcp_setup_failure_marks_run_failed() -> None:
                 )
             finally:
                 db.close()
+            if final_state[4] is not None:
+                assert final_state[0] in {
+                    TriggerRunStatus.COMPLETED.value,
+                    TriggerRunStatus.FAILED.value,
+                }, f"finished_at set on a non-terminal run: {final_state}"
             if final_state[0] == TriggerRunStatus.FAILED.value:
                 break
             time.sleep(0.01)
@@ -464,6 +471,109 @@ def test_trigger_test_run_mcp_setup_failure_marks_run_failed() -> None:
     assert task_error == safe_error
     assert run_finished_at is not None
     assert private_detail not in str(final_state)
+
+
+def _fire_test_run(headers: dict[str, str]) -> _PreparedTriggerStart:
+    agent_id = _create_agent(headers)
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={"type": "webhook", "name": "Finalizer invariant"},
+    )
+    assert created.status_code == 200, created.text
+    trigger_id = int(created.json()["id"])
+    fired = client.post(
+        f"/api/agents/{agent_id}/triggers/{trigger_id}/test",
+        headers=headers,
+        json={"payload": {"subject": "finalize"}},
+    )
+    assert fired.status_code == 200, fired.text
+    run_body = fired.json()["trigger_run"]
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == run_body["task_id"]).one()
+        owner_user_id = int(task.user_id)
+    finally:
+        db.close()
+    return _PreparedTriggerStart(
+        run_id=int(run_body["id"]),
+        trigger_id=trigger_id,
+        task_id=int(run_body["task_id"]),
+        task_owner_user_id=owner_user_id,
+        prompt="finalize",
+        trigger_type="webhook",
+        test=True,
+    )
+
+
+def _set_task_status(
+    task_id: int, status: TaskStatus, error_message: str | None = None
+) -> None:
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        task.status = status
+        task.error_message = error_message
+        db.add(task)
+        db.commit()
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    "non_terminal",
+    [
+        TaskStatus.PENDING,
+        TaskStatus.RUNNING,
+        TaskStatus.PAUSED,
+        TaskStatus.WAITING_FOR_USER,
+    ],
+)
+def test_finish_trigger_run_after_task_leaves_non_terminal_run_alone(
+    non_terminal: TaskStatus,
+) -> None:
+    headers = _admin_headers()
+    start = _fire_test_run(headers)
+    _set_task_status(start.task_id, non_terminal)
+
+    _finish_trigger_run_after_task(start)
+
+    db = _direct_db_session()
+    try:
+        run = db.query(TriggerRun).filter(TriggerRun.id == start.run_id).one()
+        assert run.status == TriggerRunStatus.RUNNING.value
+        assert run.error_message is None
+        assert run.finished_at is None
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    ("terminal", "expected_run_status", "expected_error"),
+    [
+        (TaskStatus.COMPLETED, TriggerRunStatus.COMPLETED.value, None),
+        (TaskStatus.FAILED, TriggerRunStatus.FAILED.value, "boom"),
+    ],
+)
+def test_finish_trigger_run_after_task_finalizes_terminal_run(
+    terminal: TaskStatus,
+    expected_run_status: str,
+    expected_error: str | None,
+) -> None:
+    headers = _admin_headers()
+    start = _fire_test_run(headers)
+    _set_task_status(start.task_id, terminal, error_message=expected_error)
+
+    _finish_trigger_run_after_task(start)
+
+    db = _direct_db_session()
+    try:
+        run = db.query(TriggerRun).filter(TriggerRun.id == start.run_id).one()
+        assert run.status == expected_run_status
+        assert run.error_message == expected_error
+        assert run.finished_at is not None
+    finally:
+        db.close()
 
 
 def test_trigger_run_preparation_wraps_raising_team_hook_without_leaking_message() -> (

@@ -14,6 +14,7 @@ from googleapiclient.http import (  # type: ignore[import-not-found]
 )
 from mcp.server.fastmcp import FastMCP
 
+from ....config import get_tool_max_output_length
 from .utils import require_clean_identifier, resolve_id_from_url, setup_proxy_env
 
 logging.basicConfig(level=logging.INFO)
@@ -27,9 +28,18 @@ mcp = FastMCP("google-drive-mcp")
 # Matches the id segment out of any of the common Drive/Docs/Sheets/Slides
 # share-link shapes, since a user (and therefore a model relaying the user's
 # words) is far more likely to hand over the URL they see in the browser
-# than the bare id.
+# than the bare id. The optional "u/<n>/" branch tolerates the account-index
+# segment Google inserts (e.g. ".../file/u/1/d/<id>/view") whenever more than
+# one Google account is signed into the browser -- see google_sheets.py's
+# identical (?:u/\d+/)? tolerance for the spreadsheets URL shape. The
+# "[?&]id=" branch matches the older `drive.google.com/open?id=<id>` /
+# `docs.google.com/open?id=<id>` share-link format, still emitted by
+# DriveApp.getUrl() in Apps Script and some third-party integrations, which
+# has no "/d/<id>" path segment for the first branch to match at all.
 _DRIVE_URL_ID_PATTERN = re.compile(
-    r"/(?:file/d|folders|document/d|spreadsheets/d|presentation/d)/([a-zA-Z0-9_-]+)"
+    r"(?:/(?:file/(?:u/\d+/)?d|folders|document/(?:u/\d+/)?d"
+    r"|spreadsheets/(?:u/\d+/)?d|presentation/(?:u/\d+/)?d)/|[?&]id=)"
+    r"([a-zA-Z0-9_-]+)"
 )
 
 # "owner" is deliberately excluded: ownership transfer needs
@@ -41,6 +51,32 @@ _SHARE_ROLES = ("reader", "commenter", "writer")
 
 def _resolve_file_id(file_id: str) -> str:
     return resolve_id_from_url(file_id, _DRIVE_URL_ID_PATTERN, "file_id")
+
+
+def _require_share_role(role: str) -> str:
+    if role not in _SHARE_ROLES:
+        raise ValueError(f"role must be one of {_SHARE_ROLES}")
+    return role
+
+
+def _capped_permissions_response(permissions: list[Any]) -> str:
+    """Build the success payload, halving ``permissions`` until it fits the
+    platform's output limit -- mirrors deputy.py's/salesforce.py's
+    _success_with_capped_list. There is no cursor to resume from here, so
+    entries dropped this way are gone for this call, not just this page.
+    """
+    max_output_length = get_tool_max_output_length()
+    truncated = False
+    response = json.dumps(
+        {"status": "success", "permissions": permissions, "truncated": truncated}
+    )
+    while len(response) > max_output_length and permissions:
+        permissions = permissions[: len(permissions) // 2]
+        truncated = True
+        response = json.dumps(
+            {"status": "success", "permissions": permissions, "truncated": truncated}
+        )
+    return response
 
 
 def get_drive_service() -> Any:
@@ -99,18 +135,23 @@ def google_drive_get_file_content(file_id: str, mime_type: str = "text/plain") -
     If it's a Google Workspace document (Docs, Sheets), it will be exported to the requested mime_type.
     """
     try:
+        resolved_file_id = _resolve_file_id(file_id)
         service = get_drive_service()
         file_metadata = (
-            service.files().get(fileId=file_id, fields="id, name, mimeType").execute()
+            service.files()
+            .get(fileId=resolved_file_id, fields="id, name, mimeType")
+            .execute()
         )
         file_mime_type = file_metadata.get("mimeType", "")
 
         if "application/vnd.google-apps" in file_mime_type:
             # Export Google Workspace document
-            request = service.files().export_media(fileId=file_id, mimeType=mime_type)
+            request = service.files().export_media(
+                fileId=resolved_file_id, mimeType=mime_type
+            )
         else:
             # Download regular file
-            request = service.files().get_media(fileId=file_id)
+            request = service.files().get_media(fileId=resolved_file_id)
 
         fh = io.BytesIO()
         downloader = MediaIoBaseDownload(fh, request)
@@ -199,13 +240,14 @@ def google_drive_rename_file(file_id: str, new_name: str) -> str:
     Rename an existing file or folder in Google Drive.
     """
     try:
+        resolved_file_id = _resolve_file_id(file_id)
         service = get_drive_service()
         file_metadata = {"name": new_name}
 
         updated_file = (
             service.files()
             .update(
-                fileId=file_id,
+                fileId=resolved_file_id,
                 body=file_metadata,
                 fields="id, name, webViewLink, mimeType",
             )
@@ -305,9 +347,7 @@ def google_drive_list_permissions(file_id: str) -> str:
             .execute()
         )
 
-        return json.dumps(
-            {"status": "success", "permissions": results.get("permissions", [])}
-        )
+        return _capped_permissions_response(results.get("permissions", []))
     except Exception as e:
         logger.error(f"Error listing permissions: {e}")
         return json.dumps({"status": "error", "message": str(e)})
@@ -332,17 +372,17 @@ def google_drive_share_file(
     being added; message is included in that email if given.
     """
     try:
-        if role not in _SHARE_ROLES:
-            raise ValueError(f"role must be one of {_SHARE_ROLES}")
+        _require_share_role(role)
         require_clean_identifier(email, "email")
         if "@" not in email:
             raise ValueError("email must be a valid email address")
+        resolved_file_id = _resolve_file_id(file_id)
 
         service = get_drive_service()
         # The API rejects emailMessage outright when sendNotificationEmail is
         # false, so it's only included when a notification is actually going out.
         create_kwargs: dict[str, Any] = {
-            "fileId": _resolve_file_id(file_id),
+            "fileId": resolved_file_id,
             "body": {"type": "user", "role": role, "emailAddress": email},
             "sendNotificationEmail": send_notification,
             "supportsAllDrives": True,
@@ -369,15 +409,18 @@ def google_drive_update_permission(file_id: str, permission_id: str, role: str) 
     role: "reader", "commenter", or "writer".
     """
     try:
-        if role not in _SHARE_ROLES:
-            raise ValueError(f"role must be one of {_SHARE_ROLES}")
+        _require_share_role(role)
+        resolved_file_id = _resolve_file_id(file_id)
+        resolved_permission_id = require_clean_identifier(
+            permission_id, "permission_id"
+        )
 
         service = get_drive_service()
         permission = (
             service.permissions()
             .update(
-                fileId=_resolve_file_id(file_id),
-                permissionId=require_clean_identifier(permission_id, "permission_id"),
+                fileId=resolved_file_id,
+                permissionId=resolved_permission_id,
                 body={"role": role},
                 supportsAllDrives=True,
                 fields="id, type, role, emailAddress, displayName",

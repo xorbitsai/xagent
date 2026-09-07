@@ -39,10 +39,32 @@ def test_get_drive_service_requires_access_token(monkeypatch):
         ("https://docs.google.com/document/d/abc123/edit", "abc123"),
         ("https://docs.google.com/spreadsheets/d/abc123/edit#gid=0", "abc123"),
         ("https://docs.google.com/presentation/d/abc123/edit", "abc123"),
+        # Google inserts this account-index segment into a copied share link
+        # whenever more than one Google account is signed into the browser.
+        ("https://drive.google.com/file/u/1/d/abc123/view", "abc123"),
+        ("https://drive.google.com/drive/u/1/folders/abc123", "abc123"),
+        ("https://docs.google.com/document/u/2/d/abc123/edit", "abc123"),
+        ("https://docs.google.com/spreadsheets/u/0/d/abc123/edit#gid=0", "abc123"),
+        ("https://docs.google.com/presentation/u/1/d/abc123/edit", "abc123"),
+        # Legacy share-link format with no "/d/<id>" path segment at all,
+        # still emitted by DriveApp.getUrl() in Apps Script.
+        ("https://drive.google.com/open?id=abc123", "abc123"),
+        ("https://docs.google.com/open?id=abc123&authuser=0", "abc123"),
     ],
 )
 def test_resolve_file_id_accepts_bare_id_and_url_forms(value, expected):
     assert google_drive._resolve_file_id(value) == expected
+
+
+@pytest.mark.parametrize("bad_role", ["owner", "organizer", ""])
+def test_require_share_role_rejects_roles_outside_the_allowed_set(bad_role):
+    with pytest.raises(ValueError, match="role"):
+        google_drive._require_share_role(bad_role)
+
+
+@pytest.mark.parametrize("good_role", ["reader", "commenter", "writer"])
+def test_require_share_role_accepts_allowed_roles(good_role):
+    assert google_drive._require_share_role(good_role) == good_role
 
 
 _FOLDER_URL_WITH_ID = "https://drive.google.com/drive/folders/abc123"
@@ -115,6 +137,46 @@ def test_id_taking_tools_resolve_full_drive_urls(monkeypatch, mock_target, invok
     assert mock_target(service).call_args.kwargs["fileId"] == "abc123"
 
 
+def test_get_file_content_resolves_full_drive_url(monkeypatch):
+    service = _mock_drive_service(monkeypatch)
+    service.files.return_value.get.return_value.execute.return_value = {
+        "id": "abc123",
+        "name": "notes.txt",
+        "mimeType": "text/plain",
+    }
+
+    class _FakeDownloader:
+        def __init__(self, fh, _request):
+            self._fh = fh
+
+        def next_chunk(self):
+            self._fh.write(b"hello")
+            return None, True
+
+    monkeypatch.setattr(google_drive, "MediaIoBaseDownload", _FakeDownloader)
+
+    result = json.loads(google_drive.google_drive_get_file_content(_FOLDER_URL_WITH_ID))
+
+    assert result["status"] == "success"
+    assert service.files.return_value.get.call_args.kwargs["fileId"] == "abc123"
+    assert service.files.return_value.get_media.call_args.kwargs["fileId"] == "abc123"
+
+
+def test_rename_file_resolves_full_drive_url(monkeypatch):
+    service = _mock_drive_service(monkeypatch)
+    service.files.return_value.update.return_value.execute.return_value = {
+        "id": "abc123",
+        "name": "renamed",
+    }
+
+    result = json.loads(
+        google_drive.google_drive_rename_file(_FOLDER_URL_WITH_ID, "renamed")
+    )
+
+    assert result["status"] == "success"
+    assert service.files.return_value.update.call_args.kwargs["fileId"] == "abc123"
+
+
 def test_list_permissions_returns_permissions(monkeypatch):
     service = _mock_drive_service(monkeypatch)
     service.permissions.return_value.list.return_value.execute.return_value = {
@@ -127,10 +189,34 @@ def test_list_permissions_returns_permissions(monkeypatch):
 
     assert result["status"] == "success"
     assert result["permissions"][0]["id"] == "perm1"
+    assert result["truncated"] is False
     assert (
         service.permissions.return_value.list.call_args.kwargs["supportsAllDrives"]
         is True
     )
+
+
+def test_list_permissions_caps_oversized_output(monkeypatch):
+    service = _mock_drive_service(monkeypatch)
+    huge_permissions = [
+        {
+            "id": f"perm{i}",
+            "type": "user",
+            "role": "reader",
+            "emailAddress": f"user{i}@example.com",
+            "displayName": "x" * 200,
+        }
+        for i in range(2000)
+    ]
+    service.permissions.return_value.list.return_value.execute.return_value = {
+        "permissions": huge_permissions
+    }
+
+    result = json.loads(google_drive.google_drive_list_permissions("fid"))
+
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert 0 < len(result["permissions"]) < len(huge_permissions)
 
 
 def test_list_permissions_defaults_missing_key(monkeypatch):
@@ -268,14 +354,16 @@ def test_update_permission_changes_role(monkeypatch):
     assert kwargs["body"] == {"role": "writer"}
 
 
-def test_update_permission_rejects_invalid_role(monkeypatch):
+@pytest.mark.parametrize("bad_role", ["owner", "organizer", ""])
+def test_update_permission_rejects_role_outside_the_share_roles(monkeypatch, bad_role):
     service = _mock_drive_service(monkeypatch)
 
     result = json.loads(
-        google_drive.google_drive_update_permission("fid", "perm1", "owner")
+        google_drive.google_drive_update_permission("fid", "perm1", bad_role)
     )
 
     assert result["status"] == "error"
+    assert "role" in result["message"]
     service.permissions.return_value.update.assert_not_called()
 
 

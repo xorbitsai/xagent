@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import uuid
 from typing import Any
 
 from google.oauth2.credentials import Credentials
@@ -79,6 +80,23 @@ def google_calendar_search_events(
         return json.dumps({"status": "error", "message": str(e)})
 
 
+def _add_conference_request(event: dict[str, Any]) -> None:
+    event["conferenceData"] = {
+        "createRequest": {
+            "requestId": uuid.uuid4().hex,
+            "conferenceSolutionKey": {"type": "hangoutsMeet"},
+        }
+    }
+
+
+def _event_response(event: dict[str, Any]) -> dict[str, Any]:
+    response = {"status": "success", "event": event}
+    hangout_link = event.get("hangoutLink")
+    if hangout_link:
+        response["hangout_link"] = hangout_link
+    return response
+
+
 @mcp.tool()
 def google_calendar_create_events(
     summary: str,
@@ -86,15 +104,21 @@ def google_calendar_create_events(
     end_time: str,
     description: str | None = None,
     location: str | None = None,
+    attendees: list[str] | None = None,
+    add_google_meet: bool = False,
 ) -> str:
     """
     Create a new event in Google Calendar.
     start_time and end_time must be RFC3339 formatted (e.g., '2024-01-01T10:00:00Z' or '2024-01-01T10:00:00-07:00').
+    attendees is a list of email addresses to invite; passing any attendees makes Google Calendar
+    email them a native invite immediately, so confirm the recipient list with the user first.
+    Set add_google_meet=True to attach a real Google Meet video-conference link to the event
+    (the link is returned as hangout_link); a plain "Google Meet" string in location does not do this.
     """
     try:
         service = get_calendar_service()
 
-        event = {
+        event: dict[str, Any] = {
             "summary": summary,
             "start": {
                 "dateTime": start_time,
@@ -108,11 +132,19 @@ def google_calendar_create_events(
             event["description"] = description
         if location:
             event["location"] = location
+        if attendees:
+            event["attendees"] = [{"email": email} for email in attendees]
+        if add_google_meet:
+            _add_conference_request(event)
 
-        created_event = (
-            service.events().insert(calendarId="primary", body=event).execute()
+        request = service.events().insert(
+            calendarId="primary",
+            body=event,
+            conferenceDataVersion=1 if add_google_meet else 0,
+            sendUpdates="all" if attendees else "none",
         )
-        return json.dumps({"status": "success", "event": created_event})
+        created_event = request.execute()
+        return json.dumps(_event_response(created_event))
 
     except Exception as e:
         logger.error(f"Error creating event: {e}")
@@ -141,10 +173,16 @@ def google_calendar_update_events(
     end_time: str | None = None,
     description: str | None = None,
     location: str | None = None,
+    attendees: list[str] | None = None,
+    add_google_meet: bool = False,
 ) -> str:
     """
     Update an existing event in Google Calendar.
     start_time and end_time must be RFC3339 formatted if provided.
+    attendees is a list of email addresses to invite; passing any attendees makes Google Calendar
+    email them a native invite immediately, so confirm the recipient list with the user first.
+    Set add_google_meet=True to attach a real Google Meet video-conference link to the event
+    (the link is returned as hangout_link); a plain "Google Meet" string in location does not do this.
     """
     try:
         service = get_calendar_service()
@@ -162,13 +200,20 @@ def google_calendar_update_events(
             event["description"] = description
         if location:
             event["location"] = location
+        if attendees:
+            event["attendees"] = [{"email": email} for email in attendees]
+        if add_google_meet:
+            _add_conference_request(event)
 
-        updated_event = (
-            service.events()
-            .update(calendarId="primary", eventId=event_id, body=event)
-            .execute()
+        request = service.events().update(
+            calendarId="primary",
+            eventId=event_id,
+            body=event,
+            conferenceDataVersion=1 if add_google_meet else 0,
+            sendUpdates="all" if attendees else "none",
         )
-        return json.dumps({"status": "success", "event": updated_event})
+        updated_event = request.execute()
+        return json.dumps(_event_response(updated_event))
 
     except Exception as e:
         logger.error(f"Error updating event: {e}")

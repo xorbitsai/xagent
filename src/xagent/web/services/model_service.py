@@ -599,12 +599,19 @@ def get_image_models(db: Session, user_id: Optional[int] = None) -> Dict[str, An
                     db_model.abilities
                     or default_image_abilities(model_provider, model_name)
                 )
+                # Passed at construction, not only stamped afterwards by
+                # _add_image_model_with_id: the provider is what records image
+                # usage, and the aggregator groups on `model_id or model`, so a
+                # provider left without one bills under the non-unique
+                # provider-facing name.
+                configured_id = str(db_model.model_id)
                 if model_provider == "dashscope":
                     image_model = DashScopeImageModel(
                         model_name=model_name,
                         api_key=api_key,
                         base_url=base_url,
                         abilities=abilities,
+                        model_id=configured_id,
                     )
                     _add_image_model_with_id(image_models, image_model, db_model)
                 elif model_provider == "gemini":
@@ -613,6 +620,7 @@ def get_image_models(db: Session, user_id: Optional[int] = None) -> Dict[str, An
                         api_key=api_key,
                         base_url=base_url,
                         abilities=abilities,
+                        model_id=configured_id,
                     )
                     _add_image_model_with_id(image_models, image_model, db_model)
                 elif model_provider == "openai":
@@ -621,6 +629,7 @@ def get_image_models(db: Session, user_id: Optional[int] = None) -> Dict[str, An
                         api_key=api_key,
                         base_url=base_url,
                         abilities=abilities,
+                        model_id=configured_id,
                     )
                     _add_image_model_with_id(image_models, image_model, db_model)
                 elif model_provider == "xinference":
@@ -629,6 +638,7 @@ def get_image_models(db: Session, user_id: Optional[int] = None) -> Dict[str, An
                         api_key=api_key,
                         base_url=base_url,
                         abilities=abilities,
+                        model_id=configured_id,
                     )
                     _add_image_model_with_id(image_models, image_model, db_model)
             except Exception as e:

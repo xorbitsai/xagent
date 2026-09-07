@@ -39,6 +39,44 @@ def default_image_abilities(provider: str, model_name: str) -> List[str]:
     return ["generate"]
 
 
+class InvalidImageResponseError(RuntimeError):
+    """A provider returned a billed 200 whose body carries no usable image.
+
+    Subclasses RuntimeError so existing `except RuntimeError` callers and the
+    documented `Raises: RuntimeError` contract of every provider method are
+    unchanged; the distinct type exists so the retry policy can tell it apart.
+
+    Retrying this is strictly harmful: the provider already billed the response
+    and the metering row was already written (recorded before validation
+    precisely because the charge is real), so each retry buys another charge and
+    another billing row for a request whose outcome will not change -- a
+    safety-blocked prompt is refused just as deterministically on attempt ten.
+    Transport and status failures stay plain/typed errors so they remain
+    retryable, where per-attempt accounting is correct because each attempt
+    really was a separate billed call.
+    """
+
+
+def invalid_response_from(
+    error: BaseException, context: str
+) -> InvalidImageResponseError:
+    """Reclassify a body-walking failure as an already-billed invalid response.
+
+    Explicitly raising the typed error at every structural check is not enough:
+    walking a malformed body also fails *implicitly*. ``content[0]`` on a list
+    of nulls, ``candidates[0].get(...)`` on a list of strings, or a ``parts``
+    entry that is not a dict raise ``TypeError``/``AttributeError``/
+    ``KeyError``/``IndexError`` -- and those land in the blanket handler, get
+    rewrapped as a plain ``RuntimeError``, and are retried, re-billing and
+    re-recording a call whose body will be exactly as malformed next time.
+
+    Enumerating every shape a provider could send is a losing game, so the
+    classification is positional instead: anything that fails while walking a
+    200 body, after usage was already recorded, is an invalid response.
+    """
+    return InvalidImageResponseError(f"{context}: {type(error).__name__}: {error}")
+
+
 class BaseImageModel(ABC):
     """
     Abstract base class for image generation models.

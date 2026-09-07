@@ -14,6 +14,7 @@ from xagent.core.agent.context import (
     Message,
 )
 from xagent.core.agent.context import enrichment as enrichment_module
+from xagent.core.agent.context import execution as execution_module
 from xagent.core.agent.context.enrichment import (
     MEMORY_CONTEXT_METADATA_KEY,
     SKILL_CONTEXT_METADATA_KEY,
@@ -1055,7 +1056,7 @@ def test_compact_with_llm_summarizes_history_and_preserves_current_user() -> Non
     ctx.add_tool_result("read_file", {"output": "x" * 200}, tool_call_id="call-1")
     llm = CompactLLM()
 
-    request = ctx.build_llm_compact_request_if_needed()
+    request = ctx.build_llm_compact_request_if_needed(context_window=32_000)
     assert request is not None
     assert request["max_tokens"] == 256
     prompt = request["messages"]
@@ -1446,7 +1447,7 @@ def test_compact_with_llm_preserves_waiting_for_user_response() -> None:
         },
     )
 
-    request = ctx.build_llm_compact_request_if_needed()
+    request = ctx.build_llm_compact_request_if_needed(context_window=32_000)
     assert request is not None
 
     result = ctx.compact_with_llm_response(
@@ -1537,7 +1538,7 @@ def test_reconstructed_context_above_threshold_triggers_llm_summary() -> None:
     assert read_file_message.metadata["raw_result"] == {"output": "kpi table"}
 
     llm = CompactLLM()
-    request = ctx.build_llm_compact_request_if_needed()
+    request = ctx.build_llm_compact_request_if_needed(context_window=32_000)
     assert request is not None
 
     result = ctx.compact_with_llm_response(
@@ -2013,7 +2014,9 @@ def test_llm_compact_budget_scales_with_the_threshold() -> None:
     The old ceiling of 1024 bound at every realistic window, leaving a
     reasoning model no room -- its reasoning comes out of this same allowance.
     """
-    request = _context_over_threshold(20_000).build_llm_compact_request_if_needed()
+    request = _context_over_threshold(20_000).build_llm_compact_request_if_needed(
+        context_window=32_000
+    )
 
     assert request is not None
     assert request["max_tokens"] == 5_000
@@ -2030,7 +2033,7 @@ def test_llm_compact_budget_stays_under_provider_output_limits() -> None:
     for window_threshold in (96_000, 150_000, 750_000):
         request = _context_over_threshold(
             window_threshold
-        ).build_llm_compact_request_if_needed()
+        ).build_llm_compact_request_if_needed(context_window=window_threshold * 2)
 
         assert request is not None
         assert request["max_tokens"] == 8192
@@ -2097,3 +2100,255 @@ def test_compact_config_round_trip_drops_the_retired_strategy_key() -> None:
     assert restored.compact_config.threshold == 1234
     assert restored.compact_config.max_messages == 7
     assert not hasattr(restored.compact_config, "strategy")
+
+
+def test_compact_request_omits_a_message_too_large_to_read() -> None:
+    """A single oversized result must not make compaction impossible.
+
+    Compaction writes its summary by reading the history, so one message big
+    enough to exhaust the window on its own cannot be summarized at all --
+    and the backstop cannot help either, because a context that short has a
+    tail window wide enough to keep every message, so nothing is dropped and
+    the context stays over budget with no way out.
+    """
+    context = ExecutionContext(execution_id="oversized")
+    context.compact_config.threshold = 24000
+    context.add_user_message("summarize the repo")
+    context.add_assistant_message(
+        "",
+        tool_calls=[
+            {
+                "id": "call-1",
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "arguments": '{"path":"large.txt"}',
+                },
+            }
+        ],
+    )
+    context.add_tool_result(
+        "read_file", {"output": "x" * 900_000}, tool_call_id="call-1"
+    )
+
+    request = context.build_llm_compact_request_if_needed(context_window=32_000)
+
+    assert request is not None
+    assert request["original_tokens"] > 200_000
+    prompt_tokens = sum(len(m["content"]) for m in request["messages"]) // 4
+    # The point of the cap: the request is now sendable at all.
+    assert prompt_tokens < context.compact_config.threshold
+    omitted = request["metadata"]["omitted_messages"]
+    assert [entry["tool_name"] for entry in omitted] == ["read_file"]
+    assert request["metadata"]["omitted_message_count"] == 1
+
+
+def test_compact_request_keeps_messages_under_the_cap_verbatim() -> None:
+    """The cap is for outliers. Ordinary history must reach the summary
+    whole, or every summary silently degrades."""
+    context = ExecutionContext(execution_id="ordinary")
+    context.compact_config.threshold = 24000
+    for index in range(7):
+        context.add_user_message(f"ordinary-{index}:" + "y" * 16_000)
+
+    request = context.build_llm_compact_request_if_needed(context_window=32_000)
+
+    assert request is not None
+    transcript = request["messages"][-1]["content"]
+    for index in range(7):
+        assert f"ordinary-{index}:" in transcript
+    assert "omitted_messages" not in request["metadata"]
+
+
+def test_compact_request_never_omits_an_oversized_user_requirement() -> None:
+    context = ExecutionContext(execution_id="user-requirement")
+    context.compact_config.threshold = 24000
+    marker = "ORIGINAL_REQUIREMENT_MUST_SURVIVE"
+    context.add_user_message(marker + ":" + "u" * 28_000)
+    context.add_assistant_message("a" * 70_000)
+    context.add_user_message("continue")
+
+    request = context.build_llm_compact_request_if_needed(context_window=32_000)
+
+    assert request is not None
+    assert not request.get("blocked")
+    assert marker in request["messages"][-1]["content"]
+    assert "omitted_messages" not in request["metadata"]
+
+
+def test_compact_request_preserves_an_unrecoverable_tool_result_when_blocked() -> None:
+    context = ExecutionContext(execution_id="write-receipt")
+    context.compact_config.threshold = 24000
+    marker = "ONE_TIME_WRITE_RECEIPT"
+    context.add_user_message("create the remote resource")
+    context.add_assistant_message(
+        "",
+        tool_calls=[
+            {
+                "id": "call-1",
+                "type": "function",
+                "function": {
+                    "name": "create_resource",
+                    "arguments": '{"name":"report"}',
+                },
+            }
+        ],
+    )
+    context.add_tool_result(
+        "create_resource",
+        {"output": marker + ":" + "r" * 120_000},
+        tool_call_id="call-1",
+    )
+
+    request = context.build_llm_compact_request_if_needed(context_window=32_000)
+
+    assert request is not None
+    assert request["blocked"] is True
+    assert marker in request["messages"][-1]["content"]
+    assert "omitted_messages" not in request["metadata"]
+    assert request["metadata"]["llm_compact_request_too_large"] is True
+
+
+def test_compact_request_budgets_the_complete_rendered_prompt() -> None:
+    context = ExecutionContext(execution_id="complete-budget")
+    context.compact_config.threshold = 24000
+    for index in range(5):
+        context.add_user_message(f"message-{index}:" + "word " * 4_500)
+    context.add_user_message("tail " * 5_000)
+
+    request = context.build_llm_compact_request_if_needed(context_window=32_000)
+
+    assert request is not None
+    assert not request.get("blocked")
+    input_tokens = request["metadata"]["compact_request_input_tokens"]
+    safety_tokens = request["metadata"]["compact_request_safety_tokens"]
+    assert input_tokens + request["max_tokens"] + safety_tokens <= 32_000
+    assert request["max_tokens"] < 6_000
+
+
+def test_compact_request_counts_cjk_tokens_before_sending() -> None:
+    context = ExecutionContext(execution_id="cjk-budget")
+    context.compact_config.threshold = 24_000
+    marker = "重要约束必须保留"
+    context.add_user_message(marker + "重要约束" * 25_000)
+    context.add_assistant_message("继续处理")
+
+    request = context.build_llm_compact_request_if_needed(context_window=32_000)
+
+    assert request is not None
+    assert request["blocked"] is True
+    assert request["metadata"]["compact_request_input_tokens"] > 32_000
+    assert request["metadata"]["compact_request_tokenizer"] == "cl100k_base"
+    assert marker in request["messages"][-1]["content"]
+
+
+def test_compact_request_blocks_when_context_window_is_unknown() -> None:
+    context = ExecutionContext(execution_id="unknown-window")
+    context.compact_config.threshold = 1
+    context.add_user_message("requirement that must survive")
+    context.add_assistant_message("work in progress")
+
+    request = context.build_llm_compact_request_if_needed()
+
+    assert request is not None
+    assert request["blocked"] is True
+    assert request["metadata"]["llm_compact_context_window_unknown"] is True
+    assert request["max_tokens"] == 0
+
+
+def test_compact_request_blocks_when_tokenizer_cannot_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = ExecutionContext(execution_id="offline-tokenizer")
+    context.compact_config.threshold = 1
+    context.add_user_message("requirement that must survive")
+    original_messages = list(context.messages)
+
+    execution_module._compact_token_encoding.cache_clear()
+
+    def fail_to_load(_: str) -> None:
+        raise OSError("offline")
+
+    monkeypatch.setattr(execution_module.tiktoken, "get_encoding", fail_to_load)
+    try:
+        request = context.build_llm_compact_request_if_needed(context_window=32_000)
+    finally:
+        execution_module._compact_token_encoding.cache_clear()
+
+    assert request is not None
+    assert request["blocked"] is True
+    assert request["metadata"]["llm_compact_tokenizer_unavailable"] is True
+    assert request["metadata"]["compact_tokenizer_error_type"] == "OSError"
+    assert request["max_tokens"] == 0
+    assert context.messages == original_messages
+
+
+def test_compact_request_blocks_when_tool_calls_overflow_the_window() -> None:
+    context = ExecutionContext(execution_id="tool-call-budget")
+    context.compact_config.threshold = 24000
+    for _ in range(6):
+        context.add_user_message("z" * 17_000)
+    context.add_assistant_message(
+        "",
+        tool_calls=[
+            {
+                "id": "call-1",
+                "type": "function",
+                "function": {
+                    "name": "large_call",
+                    "arguments": "v" * 200_000,
+                },
+            }
+        ],
+    )
+
+    request = context.build_llm_compact_request_if_needed(context_window=32_000)
+
+    assert request is not None
+    assert request["blocked"] is True
+    assert request["metadata"]["llm_compact_request_too_large"] is True
+    assert request["max_tokens"] == 0
+
+
+def test_oversized_content_is_replaced_whole_not_sliced() -> None:
+    """Never a half field. A byte-slice can land inside a structured value
+    and the model completes the severed token by guessing, which reads as
+    data and is silently wrong -- the failure this replacement exists to
+    avoid. The stand-in must also be free of any per-turn value, so retrying
+    the same compaction at a lower output budget sends an identical request.
+    """
+    context = ExecutionContext(execution_id="whole-not-sliced")
+    context.compact_config.threshold = 24000
+    context.add_user_message("go")
+    context.add_assistant_message(
+        "",
+        tool_calls=[
+            {
+                "id": "call-1",
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "arguments": '{"path":"large.json"}',
+                },
+            }
+        ],
+    )
+    context.add_tool_result(
+        "read_file",
+        {
+            "output": '{"handle": {"workspace": "4b33784773d5", "branch": "main"}}'
+            * 5000
+        },
+        tool_call_id="call-1",
+    )
+
+    first = context.build_llm_compact_request_if_needed(context_window=32_000)
+    second = context.build_llm_compact_request_if_needed(context_window=32_000)
+
+    assert first is not None and second is not None
+    transcript = first["messages"][-1]["content"]
+    assert "4b33784773d5" not in transcript
+    assert "read_file result" in transcript
+    # Byte-identical across builds: nothing in the notice comes from the
+    # clock or a request id.
+    assert transcript == second["messages"][-1]["content"]

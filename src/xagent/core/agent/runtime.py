@@ -22,8 +22,8 @@ from ..context_materializer import (
 )
 from ..inline_file_delivery import InlineFileDelivery, InlineFileStreamGuard
 from ..model.chat.basic.base import BaseLLM
-from ..model.chat.error import retry_on
-from ..model.chat.exceptions import LLMToolProtocolError
+from ..model.chat.error import is_context_length_error, retry_on
+from ..model.chat.exceptions import LLMContextLengthError, LLMToolProtocolError
 from ..model.chat.token_context import extract_cached_input_tokens
 from ..model.chat.tool_protocol import TOOL_PROTOCOL_ERROR_KEY
 from ..model.chat.types import ChunkType
@@ -35,7 +35,7 @@ from ..tools.user_interaction import (
     WAITING_FOR_USER_STATUS,
     tool_result_waits_for_user,
 )
-from .context.execution import COMPACT_SUMMARY_FALLBACK_BUDGETS
+from .context.execution import COMPACT_SUMMARY_FALLBACK_BUDGETS, CompactResult
 from .result import normalize_tool_failure_code, tool_result_succeeded
 from .streaming import merge_streamed_tool_call_arguments
 
@@ -294,6 +294,12 @@ class PatternRuntime:
                 raise LLMCallInterrupted(
                     self.interrupt_reason or "interrupted during LLM call"
                 ) from exc
+            raise
+        except Exception as exc:  # noqa: BLE001
+            if is_context_length_error(exc):
+                if isinstance(exc, LLMContextLengthError):
+                    raise
+                raise LLMContextLengthError(str(exc)) from exc
             raise
         finally:
             self._active_llm_tasks.discard(task)
@@ -1310,6 +1316,8 @@ class PatternRuntime:
         except LLMCallInterrupted:
             raise
         except Exception as exc:  # noqa: BLE001
+            if is_context_length_error(exc):
+                raise
             budgets = [
                 budget
                 for budget in COMPACT_SUMMARY_FALLBACK_BUDGETS
@@ -1343,7 +1351,11 @@ class PatternRuntime:
                     raise
                 except Exception as retry_exc:  # noqa: BLE001
                     exc = retry_exc
-                    if retry_on(retry_exc) or self._interrupt_requested:
+                    if (
+                        is_context_length_error(retry_exc)
+                        or retry_on(retry_exc)
+                        or self._interrupt_requested
+                    ):
                         break
                     continue
                 metadata["compact_budget_reduced_to"] = budget
@@ -1389,6 +1401,7 @@ class PatternRuntime:
         # budget, so the compact trace event can say so alongside the other
         # degrade markers.
         compact_outcome: dict[str, Any] = {}
+        compaction_blocked = False
         if (
             llm is not None
             and callable(getattr(llm, "chat", None))
@@ -1396,65 +1409,108 @@ class PatternRuntime:
             and callable(compact_with_llm_response)
         ):
             summary_unavailable_metadata = None
-            request = llm_compact_request_if_needed()
+            context_window = getattr(llm, "context_window", None)
+            request = llm_compact_request_if_needed(context_window=context_window)
             if request is not None:
                 request_metadata = request.get("metadata") or {}
-                llm_metadata = {**request_metadata, "purpose": "context_compaction"}
-                try:
-                    await self.on_llm_start(
-                        context=context,
-                        messages=request["messages"],
-                        metadata=llm_metadata,
-                    )
-                    response = await self._run_compact_llm_call(
-                        llm,
-                        messages=request["messages"],
-                        max_tokens=request["max_tokens"],
-                        metadata=llm_metadata,
-                        outcome=compact_outcome,
-                    )
-                    await self.on_llm_end(
-                        context=context,
-                        response=response,
-                        metadata=llm_metadata,
-                    )
-                    result = compact_with_llm_response(
-                        response,
-                        llm=llm,
-                        original_tokens=request.get("original_tokens"),
-                    )
-                    for key, value in request_metadata.items():
-                        result.metadata.setdefault(key, value)
-                    result.metadata.update(compact_outcome)
-                    if not getattr(result, "compacted", False):
-                        logger.warning(
-                            "Context compaction summary was unusable; falling "
-                            "back to dropping messages. execution_id=%s",
-                            getattr(context, "execution_id", None),
-                        )
-                        unusable_summary_metadata = {
-                            "llm_summary_unusable": True,
+                if request.get("blocked"):
+                    compaction_blocked = True
+                    message_count = len(getattr(context, "messages", ()))
+                    result = CompactResult(
+                        compacted=False,
+                        original_count=message_count,
+                        final_count=message_count,
+                        strategy="none",
+                        metadata={
                             **request_metadata,
-                        }
-                except LLMCallInterrupted:
-                    raise
-                except Exception as exc:  # noqa: BLE001
-                    await self.on_llm_error(
-                        context=context,
-                        error=exc,
-                        metadata=llm_metadata,
+                            "fallback_suppressed": True,
+                        },
                     )
-                    if not callable(compact_if_needed):
+                    logger.warning(
+                        "Context compaction request cannot fit the compact "
+                        "model window without discarding unrecoverable "
+                        "messages; preserving the original context. "
+                        "execution_id=%s",
+                        getattr(context, "execution_id", None),
+                    )
+                else:
+                    llm_metadata = {
+                        **request_metadata,
+                        "purpose": "context_compaction",
+                    }
+                    try:
+                        await self.on_llm_start(
+                            context=context,
+                            messages=request["messages"],
+                            metadata=llm_metadata,
+                        )
+                        response = await self._run_compact_llm_call(
+                            llm,
+                            messages=request["messages"],
+                            max_tokens=request["max_tokens"],
+                            metadata=llm_metadata,
+                            outcome=compact_outcome,
+                        )
+                        await self.on_llm_end(
+                            context=context,
+                            response=response,
+                            metadata=llm_metadata,
+                        )
+                        result = compact_with_llm_response(
+                            response,
+                            llm=llm,
+                            original_tokens=request.get("original_tokens"),
+                        )
+                        for key, value in request_metadata.items():
+                            result.metadata.setdefault(key, value)
+                        result.metadata.update(compact_outcome)
+                        if not getattr(result, "compacted", False):
+                            logger.warning(
+                                "Context compaction summary was unusable; falling "
+                                "back to dropping messages. execution_id=%s",
+                                getattr(context, "execution_id", None),
+                            )
+                            unusable_summary_metadata = {
+                                "llm_summary_unusable": True,
+                                **request_metadata,
+                            }
+                    except LLMCallInterrupted:
                         raise
-                    result = compact_if_needed()
-                    result.metadata["llm_compact_error"] = str(exc)
-                    result.metadata["fallback_strategy"] = result.strategy
-                    result.metadata.update(request_metadata)
+                    except Exception as exc:  # noqa: BLE001
+                        await self.on_llm_error(
+                            context=context,
+                            error=exc,
+                            metadata=llm_metadata,
+                        )
+                        if not callable(compact_if_needed):
+                            raise
+                        if is_context_length_error(exc):
+                            compaction_blocked = True
+                            message_count = len(getattr(context, "messages", ()))
+                            result = CompactResult(
+                                compacted=False,
+                                original_count=message_count,
+                                final_count=message_count,
+                                strategy="none",
+                                metadata={
+                                    **request_metadata,
+                                    "llm_compact_error": str(exc),
+                                    "llm_compact_context_length_error": True,
+                                    "fallback_suppressed": True,
+                                },
+                            )
+                        else:
+                            result = compact_if_needed()
+                            result.metadata["llm_compact_error"] = str(exc)
+                            result.metadata["fallback_strategy"] = result.strategy
+                            result.metadata.update(request_metadata)
 
         # Backstop. ``compact_if_needed`` drops the oldest messages outright,
         # so it runs only after summarization was skipped, errored, or came
         # back unusable -- never as an alternative worth choosing.
-        if result is None or not getattr(result, "compacted", False):
+        if not compaction_blocked and (
+            result is None or not getattr(result, "compacted", False)
+        ):
             if not callable(compact_if_needed):
                 return result
             result = compact_if_needed()

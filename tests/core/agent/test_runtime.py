@@ -1317,6 +1317,7 @@ class RaisingCompactLLM:
     fallback in ``PatternRuntime.compact_context_if_needed``."""
 
     model_name = "raising-compact-llm"
+    context_window = 32_000
 
     async def chat(self, **_: Any) -> Any:
         raise RuntimeError("compact llm exploded")
@@ -1459,6 +1460,7 @@ async def test_compaction_records_that_an_unusable_summary_was_discarded() -> No
 
     class EmptySummaryLLM:
         model_name = "compact-test"
+        context_window = 32_000
 
         async def chat(self, **_: Any) -> Any:
             return {"content": ""}
@@ -1501,6 +1503,7 @@ async def test_compaction_retries_with_a_smaller_budget_before_truncating() -> N
 
     class OutputCappedLLM:
         model_name = "compact-test"
+        context_window = 64_000
 
         def __init__(self) -> None:
             self.budgets: list[int] = []
@@ -1547,6 +1550,7 @@ async def test_compaction_ladder_skips_a_budget_the_model_cannot_use() -> None:
 
     class CappedReasoningLLM:
         model_name = "compact-test"
+        context_window = 64_000
 
         def __init__(self) -> None:
             self.budgets: list[int] = []
@@ -1596,6 +1600,7 @@ async def test_compaction_stops_descending_once_a_budget_is_accepted() -> None:
 
     class AlwaysReasoningLLM:
         model_name = "compact-test"
+        context_window = 64_000
 
         def __init__(self) -> None:
             self.budgets: list[int] = []
@@ -1694,6 +1699,7 @@ async def test_compaction_does_not_blame_the_model_when_nothing_is_summarizable(
 
     class UnusedCompactLLM:
         model_name = "compact-test"
+        context_window = 32_000
 
         async def chat(self, **_: Any) -> Any:  # pragma: no cover - never called
             raise AssertionError("no request should have been built")
@@ -1716,9 +1722,85 @@ async def test_compaction_does_not_blame_the_model_when_nothing_is_summarizable(
 
 class _SummarizingLLM:
     model_name = "compact-test"
+    context_window = 32_000
 
     async def chat(self, **_: Any) -> Any:
         return {"content": "what happened earlier"}
+
+
+@pytest.mark.asyncio
+async def test_compaction_does_not_truncate_an_unsendable_safe_request() -> None:
+    context = ExecutionContext(execution_id="unsafe-to-truncate")
+    context.compact_config.threshold = 24000
+    context.compact_config.max_messages = 2
+    for _ in range(6):
+        context.add_user_message("z" * 17_000)
+    context.add_assistant_message(
+        "",
+        tool_calls=[
+            {
+                "id": "call-1",
+                "type": "function",
+                "function": {
+                    "name": "large_call",
+                    "arguments": "v" * 200_000,
+                },
+            }
+        ],
+    )
+    original_messages = list(context.messages)
+
+    class UnusedLLM:
+        context_window = 32_000
+
+        async def chat(self, **_: Any) -> Any:  # pragma: no cover - must not run
+            raise AssertionError("an oversized compact request must not be sent")
+
+    result = await PatternRuntime().compact_context_if_needed(
+        context=context,
+        llm=UnusedLLM(),
+    )
+
+    assert not result.compacted
+    assert result.metadata["llm_compact_request_too_large"] is True
+    assert result.metadata["fallback_suppressed"] is True
+    assert context.messages == original_messages
+
+
+@pytest.mark.asyncio
+async def test_compaction_preserves_context_after_provider_rejects_its_length() -> None:
+    context = ExecutionContext(execution_id="provider-context-rejection")
+    context.compact_config.threshold = 1
+    context.compact_config.max_messages = 2
+    marker = "ORIGINAL_REQUIREMENT_MUST_SURVIVE"
+    context.add_user_message(marker)
+    for index in range(4):
+        context.add_assistant_message(f"work-{index}")
+    original_messages = list(context.messages)
+
+    class RejectingLLM:
+        context_window = 32_000
+
+        def __init__(self) -> None:
+            self.budgets: list[int] = []
+
+        async def chat(self, **kwargs: Any) -> Any:
+            self.budgets.append(kwargs["max_tokens"])
+            raise RuntimeError(
+                "The input token count (461428) exceeds the maximum number "
+                "of tokens allowed (131072)."
+            )
+
+    llm = RejectingLLM()
+    result = await PatternRuntime().compact_context_if_needed(context=context, llm=llm)
+
+    assert llm.budgets == [256]
+    assert not result.compacted
+    assert result.strategy == "none"
+    assert result.metadata["llm_compact_context_length_error"] is True
+    assert result.metadata["fallback_suppressed"] is True
+    assert context.messages == original_messages
+    assert marker in context.messages[0].content
 
 
 def _oversized_context(execution_id: str) -> ExecutionContext:

@@ -5748,6 +5748,8 @@ async def test_react_pattern_traces_context_compaction() -> None:
     context.compact_config.threshold = 1
     for index in range(3):
         context.add_user_message(f"message {index}")
+    llm = FakeLLM([{"content": "summary"}, {"content": "done"}])
+    llm.context_window = 32_000
 
     result = await ReActPattern(max_iterations=1).run(
         context=context,
@@ -5755,7 +5757,7 @@ async def test_react_pattern_traces_context_compaction() -> None:
         # Two responses: compaction now summarizes with the main model when no
         # compact model is configured, so it consumes one before the turn's
         # own call.
-        llm=FakeLLM([{"content": "summary"}, {"content": "done"}]),
+        llm=llm,
         runtime=runtime,
     )
 
@@ -5795,6 +5797,7 @@ async def test_react_pattern_uses_compact_llm_for_context_compaction() -> None:
             }
         ]
     )
+    compact_llm.context_window = 32_000
 
     result = await ReActPattern(max_iterations=1).run(
         context=context,
@@ -8753,15 +8756,15 @@ class RoutedDownstreamLLM:
 
 
 def _routing_router(
-    downstream: Any, route_prompts: list[str], *, context_window: int = 4
+    downstream: Any, route_prompts: list[str], *, context_window: int = 32_000
 ) -> RouterLLM:
     """A real ``RouterLLM`` whose selection is stubbed to record its prompt.
 
     ``context_window`` is deliberately set, matching production: ``adapter.py``
     always stamps it from the model row, and ``prepare_llm_for_context``
     recomputes the compaction threshold from it. Leaving it unset would put the
-    fixture in a state a real router never reaches. A window of 4 yields a
-    threshold of 3, small enough that any context compacts.
+    fixture in a state a real router never reaches. The fixture uses a realistic
+    32k window and enough history below to trigger compaction.
     """
     router = RouterLLM(downstream_resolver=lambda _model_id: downstream)
     router.context_window = context_window
@@ -8780,10 +8783,19 @@ def _react_context_with_tool_history(execution_id: str) -> ExecutionContext:
     context.add_assistant_message(
         "",
         tool_calls=[
-            {"id": "call-1", "type": "function", "function": {"name": "read_file"}},
+            {
+                "id": "call-1",
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "arguments": '{"path":"large.txt"}',
+                },
+            },
         ],
     )
-    context.add_tool_result("read_file", {"output": "x" * 200}, tool_call_id="call-1")
+    context.add_tool_result(
+        "read_file", {"output": "x" * 120_000}, tool_call_id="call-1"
+    )
     return context
 
 

@@ -1321,6 +1321,7 @@ async def test_auto_pattern_falls_back_to_the_main_llm_for_compaction() -> None:
             "react done",
         ]
     )
+    llm.context_window = 32_000
     pattern = AutoPattern()
     context = ExecutionContext()
     context.compact_config.threshold = 1
@@ -2368,11 +2369,12 @@ class RoutedDecisionLLM:
 def _auto_routing_router(downstream: Any, route_prompts: list[str]) -> RouterLLM:
     """A real ``RouterLLM`` with its selection stubbed to record the prompt.
 
-    ``context_window`` is set, as production always does via ``adapter.py``;
-    4 gives a compaction threshold of 3, so any context compacts.
+    ``context_window`` is set, as production always does via ``adapter.py``.
+    The fixture uses a realistic 32k window and enough history below to trigger
+    compaction.
     """
     router = RouterLLM(downstream_resolver=lambda _model_id: downstream)
-    router.context_window = 4
+    router.context_window = 32_000
 
     async def select_model(prompt: str) -> str:
         route_prompts.append(prompt)
@@ -2401,7 +2403,22 @@ async def test_auto_summarizes_with_the_main_model_when_no_compact_model() -> No
     router = _auto_routing_router(downstream, route_prompts)
     context = ExecutionContext()
     context.add_user_message("hi")
-    context.add_tool_result("read_file", {"output": "x" * 200}, tool_call_id="call-1")
+    context.add_assistant_message(
+        "",
+        tool_calls=[
+            {
+                "id": "call-1",
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "arguments": '{"path":"large.txt"}',
+                },
+            }
+        ],
+    )
+    context.add_tool_result(
+        "read_file", {"output": "x" * 120_000}, tool_call_id="call-1"
+    )
 
     result = await AutoPattern().run(
         context=context,

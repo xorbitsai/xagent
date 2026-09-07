@@ -1072,6 +1072,7 @@ async def test_dag_pattern_returns_terminal_step_result_as_output() -> None:
 async def test_dag_pattern_passes_compact_llm_to_step_react_compaction() -> None:
     llm = SequenceLLM([{"content": "step done", "done": True}])
     compact_llm = SequenceLLM([{"content": "compacted dag step context"}])
+    compact_llm.context_window = 32_000
     plan = build_plan(PlanStep(id="answer", task="Answer with DAG"))
     pattern = DAGPattern(lambda **_: plan)
     context = ExecutionContext(execution_id="dag-step-compact-llm")

@@ -1,28 +1,36 @@
+import copy
 import json
 from unittest.mock import Mock
 
-import pytest
-
 from xagent.web.tools.mcp import calendar
-
-
-@pytest.fixture(autouse=True)
-def _credentials(monkeypatch):
-    monkeypatch.setenv("GOOGLE_ACCESS_TOKEN", "access-token")
 
 
 def _fake_service(execute_result: dict, existing_event: dict | None = None):
     """A stand-in for the googleapiclient Calendar service that records the
     kwargs passed to events().insert()/update() and returns execute_result.
     existing_event is what events().get() returns, simulating an event that
-    already has state (attendees, conferenceData) before this call."""
+    already has state (attendees, conferenceData) before this call.
+
+    A deep copy is handed to the code under test (rather than the caller's
+    own existing_event object): calendar.py mutates the dict it gets back
+    from events().get().execute() in place before resending it as the update
+    body, so returning the original object would let that mutation leak back
+    into the test's "expected" value and make before/after comparisons a
+    tautology.
+    """
     events = Mock()
     request = Mock()
     request.execute.return_value = execute_result
     events.insert = Mock(return_value=request)
     events.update = Mock(return_value=request)
     events.get = Mock(
-        return_value=Mock(execute=Mock(return_value=existing_event or {"id": "evt1"}))
+        return_value=Mock(
+            execute=Mock(
+                return_value=copy.deepcopy(existing_event)
+                if existing_event
+                else {"id": "evt1"}
+            )
+        )
     )
     service = Mock()
     service.events.return_value = events
@@ -225,6 +233,32 @@ def test_update_event_dedupes_repeated_emails_in_the_same_attendees_call(monkeyp
     assert kwargs["body"]["attendees"] == [{"email": "bob@example.com"}]
 
 
+def test_update_event_attendee_matching_is_case_and_whitespace_insensitive(
+    monkeypatch,
+):
+    """Regression test: `Alice@Example.com` and `alice@example.com ` are the
+    same mailbox and must not produce a duplicate attendee entry."""
+    existing_event = {
+        "id": "evt1",
+        "attendees": [{"email": "alice@example.com", "responseStatus": "accepted"}],
+    }
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_update_events(
+        event_id="evt1",
+        attendees=["Alice@Example.com ", " BOB@example.com", "bob@example.com"],
+    )
+
+    _, kwargs = service.events.return_value.update.call_args
+    # Alice's existing entry is kept as-is (not duplicated under different
+    # casing), and Bob is added once despite two differently-cased spellings.
+    assert kwargs["body"]["attendees"] == [
+        {"email": "alice@example.com", "responseStatus": "accepted"},
+        {"email": "BOB@example.com"},
+    ]
+
+
 def test_update_event_with_no_new_attendees_leaves_existing_attendees_untouched(
     monkeypatch,
 ):
@@ -319,6 +353,65 @@ def test_update_event_add_google_meet_does_not_replace_existing_conference(
     _, kwargs = service.events.return_value.update.call_args
     assert kwargs["body"]["conferenceData"] == existing_event["conferenceData"]
     assert "createRequest" not in kwargs["body"]["conferenceData"]
+
+
+def test_update_event_add_google_meet_retries_after_a_failed_create_request(
+    monkeypatch,
+):
+    """Regression test: a failed createRequest leaves conferenceData set but
+    with no entryPoints/conferenceSolution. add_google_meet=True must treat
+    that as "no conference yet" and retry, not as an existing conference to
+    preserve -- otherwise the event is permanently stuck with no Meet link."""
+    existing_event = {
+        "id": "evt1",
+        "conferenceData": {
+            "createRequest": {
+                "requestId": "abc123",
+                "status": {"statusCode": "failure"},
+            }
+        },
+    }
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_update_events(event_id="evt1", add_google_meet=True)
+
+    _, kwargs = service.events.return_value.update.call_args
+    new_create_request = kwargs["body"]["conferenceData"]["createRequest"]
+    assert new_create_request["requestId"] != "abc123"
+    assert new_create_request["conferenceSolutionKey"] == {"type": "hangoutsMeet"}
+
+
+def test_event_response_falls_back_to_entry_points_when_hangout_link_is_absent(
+    monkeypatch,
+):
+    """hangoutLink is only reliably populated for Meet conferences; fall back
+    to the canonical conferenceData.entryPoints when it's missing."""
+    execute_result = {
+        "id": "evt1",
+        "conferenceData": {
+            "entryPoints": [
+                {"entryPointType": "phone", "uri": "tel:+1-234-567-8900"},
+                {
+                    "entryPointType": "video",
+                    "uri": "https://meet.google.com/abc-defg-hij",
+                },
+            ]
+        },
+    }
+    service = _fake_service(execute_result)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="1:1",
+            start_time="2026-09-07T15:00:00+08:00",
+            end_time="2026-09-07T16:00:00+08:00",
+            add_google_meet=True,
+        )
+    )
+
+    assert result["hangout_link"] == "https://meet.google.com/abc-defg-hij"
 
 
 def test_response_surfaces_pending_conference_status_instead_of_hangout_link(

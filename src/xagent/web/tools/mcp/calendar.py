@@ -90,19 +90,48 @@ def _add_conference_request(event: dict[str, Any]) -> None:
 
 
 def _merge_attendees(event: dict[str, Any], attendees: list[str] | None) -> None:
-    """Add attendees to the event without dropping ones already on it."""
+    """Add attendees to the event without dropping ones already on it.
+
+    Matching against existing attendees (and within the new list) is
+    case-/whitespace-insensitive, since `Alice@Example.com` and
+    `alice@example.com` are the same mailbox and would otherwise be added
+    as a redundant duplicate.
+    """
     if not attendees:
         return
     existing = event.get("attendees") or []
-    existing_emails = {a.get("email") for a in existing if isinstance(a, dict)}
+    existing_emails = {
+        email.strip().lower()
+        for a in existing
+        if isinstance(a, dict) and (email := a.get("email"))
+    }
 
-    # dict.fromkeys dedupes attendees while preserving order (Python 3.7+).
-    unique_new_emails = dict.fromkeys(attendees)
-    new_attendees = [
-        {"email": email} for email in unique_new_emails if email not in existing_emails
-    ]
+    seen = set()
+    new_attendees = []
+    for email in attendees:
+        if not email:
+            continue
+        normalized = email.strip()
+        key = normalized.lower()
+        if key in existing_emails or key in seen:
+            continue
+        seen.add(key)
+        new_attendees.append({"email": normalized})
+
     if new_attendees:
         event["attendees"] = existing + new_attendees
+
+
+def _has_resolved_conference(event: dict[str, Any]) -> bool:
+    """True if the event has a conference Google actually created (it has
+    entry points or a resolved conference solution) -- as opposed to
+    conferenceData left over from a *failed* createRequest (status.statusCode
+    == "failure"), which has neither and must not block a retry.
+    """
+    conference_data = event.get("conferenceData") or {}
+    return bool(
+        conference_data.get("entryPoints") or conference_data.get("conferenceSolution")
+    )
 
 
 def _conference_and_notify_kwargs(
@@ -117,7 +146,7 @@ def _conference_and_notify_kwargs(
     which would silently drop an event's existing Meet link on every update that
     doesn't also pass add_google_meet=True.
     """
-    if add_google_meet and not event.get("conferenceData"):
+    if add_google_meet and not _has_resolved_conference(event):
         _add_conference_request(event)
     return {
         "conferenceDataVersion": 1,
@@ -127,11 +156,21 @@ def _conference_and_notify_kwargs(
 
 def _event_response(event: dict[str, Any]) -> dict[str, Any]:
     response = {"status": "success", "event": event}
+    conference_data = event.get("conferenceData") or {}
+
     hangout_link = event.get("hangoutLink")
+    if not hangout_link:
+        # hangoutLink is a legacy convenience field that's only reliably
+        # populated for Meet conferences; entryPoints is the canonical,
+        # solution-agnostic source, so fall back to it when present.
+        for entry_point in conference_data.get("entryPoints") or []:
+            if entry_point.get("entryPointType") == "video" and entry_point.get("uri"):
+                hangout_link = entry_point["uri"]
+                break
+
     if hangout_link:
         response["hangout_link"] = hangout_link
     else:
-        conference_data = event.get("conferenceData") or {}
         create_request = conference_data.get("createRequest") or {}
         status_code = (create_request.get("status") or {}).get("statusCode")
         if status_code:

@@ -6,6 +6,10 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 from ..core.schemas import (
     SparseSearchResponse,
 )
+from ..utils.validation_utils import (
+    validate_search_common_inputs,
+    validate_search_query_text,
+)
 
 if TYPE_CHECKING:
     from ..kb import KBLegacyStepCompatibilityFacade
@@ -33,7 +37,13 @@ def search_sparse(
     user_id: Optional[int] = None,
     is_admin: bool = False,
 ) -> SparseSearchResponse:
-    """Performs sparse (Full-Text Search) retrieval on the specified collection."""
+    """Perform sparse (Full-Text Search) retrieval on the specified collection.
+
+    Raises:
+        DocumentValidationError: If collection, model_tag, query_text, or top_k is invalid.
+    """
+    validate_search_common_inputs(collection, model_tag, top_k)
+    validate_search_query_text(query_text)
     return _get_legacy_step_compatibility_facade().search_sparse(
         collection=collection,
         model_tag=model_tag,
@@ -64,7 +74,13 @@ async def search_sparse_async(
     user_id: Optional[int] = None,
     is_admin: bool = False,
 ) -> SparseSearchResponse:
-    """Perform sparse retrieval using async vector store abstraction."""
+    """Perform sparse retrieval using async vector store abstraction.
+
+    Raises:
+        DocumentValidationError: If collection, model_tag, query_text, or top_k is invalid.
+    """
+    validate_search_common_inputs(collection, model_tag, top_k)
+    validate_search_query_text(query_text)
     return await _get_legacy_step_compatibility_facade().search_sparse_async(
         collection=collection,
         model_tag=model_tag,

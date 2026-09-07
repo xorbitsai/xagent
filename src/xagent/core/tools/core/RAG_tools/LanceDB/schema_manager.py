@@ -16,6 +16,7 @@ __all__ = [
     "ensure_parses_table",
     "ensure_chunks_table",
     "ensure_embeddings_table",
+    "ensure_active_generations_table",
     "ensure_main_pointers_table",
     "ensure_prompt_templates_table",
     "ensure_ingestion_runs_table",
@@ -32,6 +33,27 @@ def _safe_close_table(table: Any) -> None:
             table.close()
         except Exception:
             pass
+
+
+def _add_nullable_string_columns(
+    conn: DBConnection, table_name: str, columns: dict[str, str]
+) -> None:
+    """Add missing nullable string columns to an existing LanceDB table."""
+    if not _table_exists(conn, table_name):
+        return
+    table = conn.open_table(table_name)
+    try:
+        existing = set(table.schema.names)
+        to_add = {name: expr for name, expr in columns.items() if name not in existing}
+        if to_add:
+            logger.info(
+                "Migrating '%s' table: adding columns %s",
+                table_name,
+                list(to_add.keys()),
+            )
+            table.add_columns(to_add)
+    finally:
+        _safe_close_table(table)
 
 
 def _table_exists(conn: DBConnection, name: str) -> bool:
@@ -352,6 +374,9 @@ def ensure_chunks_table(conn: DBConnection) -> None:
     _validate_schema_fields(conn, "chunks", required_fields)
     if _table_exists(conn, "chunks"):
         _migrate_table_user_id_to_int64(conn, "chunks")
+        _add_nullable_string_columns(
+            conn, "chunks", {"generation_id": "cast(null as string)"}
+        )
 
         val_table = conn.open_table("chunks")
         try:
@@ -373,6 +398,7 @@ def ensure_chunks_table(conn: DBConnection) -> None:
             pa.field("json_path", pa.string()),
             pa.field("chunk_hash", pa.string()),
             pa.field("config_hash", pa.string()),
+            pa.field("generation_id", pa.string()),
             pa.field("created_at", pa.timestamp("us")),
             pa.field("metadata", pa.string()),
             pa.field("user_id", pa.int64()),
@@ -417,6 +443,14 @@ def ensure_embeddings_table(
     _validate_schema_fields(conn, table_name, required_fields)
     if _table_exists(conn, table_name):
         _migrate_table_user_id_to_int64(conn, table_name)
+        _add_nullable_string_columns(
+            conn,
+            table_name,
+            {
+                "generation_id": "cast(null as string)",
+                "config_hash": "cast(null as string)",
+            },
+        )
 
         val_table = conn.open_table(table_name)
         try:
@@ -441,6 +475,8 @@ def ensure_embeddings_table(
             pa.field("vector_dimension", pa.int32()),
             pa.field("text", pa.large_string()),
             pa.field("chunk_hash", pa.string()),
+            pa.field("config_hash", pa.string()),
+            pa.field("generation_id", pa.string()),
             pa.field("created_at", pa.timestamp("us")),
             pa.field("metadata", pa.string()),
             pa.field("user_id", pa.int64()),
@@ -451,6 +487,30 @@ def ensure_embeddings_table(
         table_name,
         schema=schema,
     )
+
+
+def ensure_active_generations_table(conn: DBConnection) -> None:
+    """Ensure the active_generations table exists with proper schema.
+
+    Tracks the published searchable generation per document scope:
+    (collection, doc_id, parse_hash, user_id, model_tag).
+    """
+    schema = pa.schema(
+        [
+            pa.field("collection", pa.string()),
+            pa.field("doc_id", pa.string()),
+            pa.field("parse_hash", pa.string()),
+            pa.field("user_id", pa.int64()),
+            pa.field("model_tag", pa.string()),
+            pa.field("generation_id", pa.string()),
+            pa.field("config_hash", pa.string()),
+            pa.field("created_at", pa.timestamp("us")),
+            pa.field("updated_at", pa.timestamp("us")),
+            pa.field("published_at", pa.timestamp("us")),
+            pa.field("operator", pa.string()),
+        ]
+    )
+    _create_table(conn, "active_generations", schema=schema)
 
 
 def ensure_main_pointers_table(conn: DBConnection) -> None:

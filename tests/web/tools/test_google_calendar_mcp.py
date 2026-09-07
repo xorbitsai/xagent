@@ -426,17 +426,20 @@ def test_event_response_falls_back_to_entry_points_when_hangout_link_is_absent(
     monkeypatch,
 ):
     """hangoutLink is only reliably populated for Meet conferences; fall back
-    to the canonical conferenceData.entryPoints when it's missing."""
+    to the canonical conferenceData.entryPoints when it's missing, but only
+    for an actual Meet conference (conferenceSolution.key.type ==
+    "hangoutsMeet") -- see the sibling test below for the non-Meet case."""
     execute_result = {
         "id": "evt1",
         "conferenceData": {
+            "conferenceSolution": {"key": {"type": "hangoutsMeet"}},
             "entryPoints": [
                 {"entryPointType": "phone", "uri": "tel:+1-234-567-8900"},
                 {
                     "entryPointType": "video",
                     "uri": "https://meet.google.com/abc-defg-hij",
                 },
-            ]
+            ],
         },
     }
     service = _fake_service(execute_result)
@@ -452,6 +455,35 @@ def test_event_response_falls_back_to_entry_points_when_hangout_link_is_absent(
     )
 
     assert result["hangout_link"] == "https://meet.google.com/abc-defg-hij"
+
+
+def test_event_response_does_not_label_a_non_meet_conference_as_hangout_link(
+    monkeypatch,
+):
+    """Regression test: a third-party conference (e.g. Zoom's Calendar add-on)
+    also registers its join URL under entryPointType "video". Surfacing that
+    as hangout_link would mislead a caller into thinking it's a Meet link."""
+    execute_result = {
+        "id": "evt1",
+        "conferenceData": {
+            "conferenceSolution": {"key": {"type": "addOn"}, "name": "Zoom Meeting"},
+            "entryPoints": [
+                {"entryPointType": "video", "uri": "https://zoom.us/j/123456789"},
+            ],
+        },
+    }
+    service = _fake_service(execute_result)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="1:1",
+            start_time="2026-09-07T15:00:00+08:00",
+            end_time="2026-09-07T16:00:00+08:00",
+        )
+    )
+
+    assert "hangout_link" not in result
 
 
 def test_response_surfaces_pending_conference_status_instead_of_hangout_link(
@@ -501,3 +533,21 @@ def test_response_handles_null_conference_data_without_crashing(monkeypatch):
     assert result["status"] == "success"
     assert "hangout_link" not in result
     assert "conference_status" not in result
+
+
+def test_get_event_surfaces_hangout_link_like_create_and_update_do(monkeypatch):
+    """Regression test: both tool docstrings tell callers to fall back to
+    google_calendar_get_event to pick up a Meet link that wasn't ready yet
+    at create/update time -- it must honor that by using the same
+    hangout_link/conference_status convention, not return the raw event."""
+    fetched_event = {
+        "id": "evt1",
+        "hangoutLink": "https://meet.google.com/abc-defg-hij",
+    }
+    service = _fake_service({"id": "evt1"}, existing_event=fetched_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(calendar.google_calendar_get_event(event_id="evt1"))
+
+    assert result["status"] == "success"
+    assert result["hangout_link"] == "https://meet.google.com/abc-defg-hij"

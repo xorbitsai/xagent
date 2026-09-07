@@ -173,12 +173,21 @@ def _event_response(event: dict[str, Any]) -> dict[str, Any]:
     hangout_link = event.get("hangoutLink")
     if not hangout_link:
         # hangoutLink is a legacy convenience field that's only reliably
-        # populated for Meet conferences; entryPoints is the canonical,
-        # solution-agnostic source, so fall back to it when present.
-        for entry_point in conference_data.get("entryPoints") or []:
-            if entry_point.get("entryPointType") == "video" and entry_point.get("uri"):
-                hangout_link = entry_point["uri"]
-                break
+        # populated for Meet conferences. Only fall back to entryPoints when
+        # the conference actually IS a Meet conference -- entryPoints with
+        # entryPointType "video" is solution-agnostic, so a Zoom/Teams/other
+        # third-party conference would otherwise get mislabeled as a
+        # "hangout_link" (a name callers reasonably read as "this is Meet").
+        solution_type = (
+            (conference_data.get("conferenceSolution") or {}).get("key", {}).get("type")
+        )
+        if solution_type == "hangoutsMeet":
+            for entry_point in conference_data.get("entryPoints") or []:
+                if entry_point.get("entryPointType") == "video" and entry_point.get(
+                    "uri"
+                ):
+                    hangout_link = entry_point["uri"]
+                    break
 
     if hangout_link:
         response["hangout_link"] = hangout_link
@@ -252,12 +261,15 @@ def google_calendar_create_events(
 @mcp.tool()
 def google_calendar_get_event(event_id: str) -> str:
     """
-    Get a specific event from Google Calendar.
+    Get a specific event from Google Calendar. If the event has a Google Meet
+    link, it's returned as hangout_link (or as conference_status if it's
+    still being provisioned) -- this is the tool to call to pick up a link
+    that wasn't ready yet right after create/update.
     """
     try:
         service = get_calendar_service()
         event = service.events().get(calendarId="primary", eventId=event_id).execute()
-        return json.dumps({"status": "success", "event": event})
+        return json.dumps(_event_response(event))
     except Exception as e:
         logger.error(f"Error getting event: {e}")
         return json.dumps({"status": "error", "message": str(e)})

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from threading import RLock
@@ -45,6 +46,7 @@ from ..models.agent import Agent
 from ..models.custom_api import CustomApi, UserCustomApi
 from ..models.mcp import MCPServer, UserMCPServer
 from ..models.task import Task, TaskConnectorRuntimeContext
+from .task_interaction_service import _MAX_INTERACTION_TTL_SECONDS
 
 logger = logging.getLogger(__name__)
 
@@ -112,8 +114,56 @@ class _ConnectorRuntimeResolverRegistration:
 # through the resolver hook or a deployment-owned distributed secret store.
 _EPHEMERAL_RUNTIME_VALUES: dict[str, dict[str, Any]] = {}
 _EPHEMERAL_RUNTIME_MANIFESTS: dict[str, dict[str, dict[str, set[str]]]] = {}
+_EPHEMERAL_RUNTIME_STORED_AT: dict[str, float] = {}
 _EPHEMERAL_RUNTIME_VALUES_LOCK = RLock()
 _RUNTIME_RESOLVER_REGISTRATION: _ConnectorRuntimeResolverRegistration | None = None
+
+# Not a real interaction deadline - matches task_interaction_service.py's
+# _MAX_INTERACTION_TTL_SECONDS by reference (not by copying the value) so
+# this can never silently drift shorter than the longest pause production
+# already allows a native waiting-for-user interaction to stay open for.
+# Its only job is to turn what would otherwise be a permanent leak into a
+# bounded one: task_orchestrator.py's and websocket.py's deferred-to-TTL-
+# recovery branches (lease lost, DB pool exhaustion, unhealthy heartbeat at
+# shutdown) cannot safely pop a turn's secrets themselves, because at the
+# point they bail out they genuinely do not know whether the task will land
+# on a terminal status or resume again under the same turn_id - and
+# task_lease_recovery.py's batch sweep, which does later decide that,
+# has no way to look up which turn_id belongs to which recovered task_id.
+_EPHEMERAL_RUNTIME_TTL_SECONDS = _MAX_INTERACTION_TTL_SECONDS
+
+
+def _prune_expired_ephemeral_runtime_values_locked() -> None:
+    """Evict every stale entry. Caller must hold _EPHEMERAL_RUNTIME_VALUES_LOCK."""
+
+    now = time.monotonic()
+    stale_turn_ids = [
+        turn_id
+        for turn_id, stored_at in _EPHEMERAL_RUNTIME_STORED_AT.items()
+        if now - stored_at > _EPHEMERAL_RUNTIME_TTL_SECONDS
+    ]
+    for turn_id in stale_turn_ids:
+        _evict_if_expired_locked(turn_id)
+
+
+def _evict_if_expired_locked(turn_id: str) -> None:
+    """Evict one entry if it has aged past the TTL. Caller must hold the lock.
+
+    The opportunistic reaper in ``store_ephemeral_runtime_values`` only runs
+    when *some* turn writes - a quiet process (no new turns starting) never
+    calls it, so an entry whose owning turn stalled out would otherwise stay
+    readable forever past its advertised TTL. Every read/pop path below
+    checks age itself first, so "expired" is enforced as an observable
+    property of this store, not merely a future cleanup side effect.
+    """
+
+    stored_at = _EPHEMERAL_RUNTIME_STORED_AT.get(turn_id)
+    if stored_at is not None and time.monotonic() - stored_at > (
+        _EPHEMERAL_RUNTIME_TTL_SECONDS
+    ):
+        _EPHEMERAL_RUNTIME_VALUES.pop(turn_id, None)
+        _EPHEMERAL_RUNTIME_MANIFESTS.pop(turn_id, None)
+        _EPHEMERAL_RUNTIME_STORED_AT.pop(turn_id, None)
 
 
 def set_connector_runtime_resolver(
@@ -200,14 +250,40 @@ def store_ephemeral_runtime_values(
         for ref, sections in values_by_ref.items()
     }
     with _EPHEMERAL_RUNTIME_VALUES_LOCK:
+        # Opportunistic reaper: there is no dedicated background sweep for
+        # this process-local store, so each new store is what eventually
+        # reclaims an entry a settlement path could never safely pop (see
+        # _EPHEMERAL_RUNTIME_TTL_SECONDS above).
+        _prune_expired_ephemeral_runtime_values_locked()
         _EPHEMERAL_RUNTIME_VALUES[turn_id] = encoded
         _EPHEMERAL_RUNTIME_MANIFESTS[turn_id] = manifest
+        _EPHEMERAL_RUNTIME_STORED_AT[turn_id] = time.monotonic()
 
 
 def pop_ephemeral_runtime_values(turn_id: str) -> dict[str, Any] | None:
     with _EPHEMERAL_RUNTIME_VALUES_LOCK:
+        _evict_if_expired_locked(turn_id)
         _EPHEMERAL_RUNTIME_MANIFESTS.pop(turn_id, None)
+        _EPHEMERAL_RUNTIME_STORED_AT.pop(turn_id, None)
         return _EPHEMERAL_RUNTIME_VALUES.pop(turn_id, None)
+
+
+def renew_ephemeral_runtime_values(turn_id: str) -> None:
+    """Refresh a still-live turn's stored-at timestamp, extending its TTL.
+
+    Called when a turn is confirmed to be re-pausing under the same
+    ``turn_id`` (see ``task_orchestrator.finish_turn`` and
+    ``websocket._finalize_resumed_task``'s matching non-terminal branches):
+    a fresh pause carries its own new interaction lifetime, so the secrets
+    it may still need must not expire on the *original* pause's clock. A
+    no-op when the turn has nothing stored (never used ephemeral secrets, or
+    already reaped) - there is nothing to keep alive either way.
+    """
+
+    with _EPHEMERAL_RUNTIME_VALUES_LOCK:
+        _evict_if_expired_locked(turn_id)
+        if turn_id in _EPHEMERAL_RUNTIME_VALUES:
+            _EPHEMERAL_RUNTIME_STORED_AT[turn_id] = time.monotonic()
 
 
 def drop_ephemeral_runtime_values_for_testing(turn_id: str) -> None:
@@ -219,6 +295,7 @@ def drop_ephemeral_runtime_values_for_testing(turn_id: str) -> None:
 
 def get_ephemeral_runtime_values(turn_id: str) -> dict[str, Any] | None:
     with _EPHEMERAL_RUNTIME_VALUES_LOCK:
+        _evict_if_expired_locked(turn_id)
         values = _EPHEMERAL_RUNTIME_VALUES.get(turn_id)
         return dict(values) if isinstance(values, dict) else None
 
@@ -227,6 +304,7 @@ def get_ephemeral_runtime_manifest(
     turn_id: str,
 ) -> dict[str, dict[str, set[str]]] | None:
     with _EPHEMERAL_RUNTIME_VALUES_LOCK:
+        _evict_if_expired_locked(turn_id)
         manifest = _EPHEMERAL_RUNTIME_MANIFESTS.get(turn_id)
         if not isinstance(manifest, dict):
             return None

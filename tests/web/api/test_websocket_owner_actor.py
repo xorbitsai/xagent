@@ -34,6 +34,7 @@ from xagent.core.agent.runner import UserMessageInjectionOutcome
 from xagent.core.execution_scope import (
     ExecutionScope,
 )
+from xagent.core.tools.adapters.vibe.connector_runtime import ConnectorRef
 from xagent.web.api import websocket as websocket_api
 from xagent.web.api.websocket import (
     ResumeReservationOutcome,
@@ -58,8 +59,14 @@ from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
+from xagent.web.services import connector_runtime as connector_runtime_module
 from xagent.web.services import task_orchestrator
 from xagent.web.services.chat_history_service import DELIVERY_FAILED, DELIVERY_PENDING
+from xagent.web.services.connector_runtime import (
+    get_ephemeral_runtime_values,
+    pop_ephemeral_runtime_values,
+    store_ephemeral_runtime_values,
+)
 from xagent.web.services.managed_file_ref import (
     DurableObjectIntegrityError,
     DurableStorageOperationError,
@@ -3743,6 +3750,147 @@ async def test_execute_resume_background_persists_assistant_for_live_turn(
     db_session.refresh(task)
     assert task.status == TaskStatus.COMPLETED
     assert task.output == "Guidance applied"
+
+
+@pytest.mark.asyncio
+async def test_execute_resume_background_pops_ephemeral_secrets_after_completion(
+    db_session,
+) -> None:
+    """execute_resume_background settles through its own _finalize_resumed_task,
+    a completely separate finalizer from task_orchestrator.finish_turn - so a
+    turn that paused on waiting_for_user and then genuinely completes on
+    resume must pop its ephemeral secrets from THIS finalizer too, under the
+    original pausing turn's id; otherwise they'd sit until the TTL reaper
+    eventually reclaims them instead of being freed at the terminal outcome."""
+    owner = _user(db_session, "owner")
+    task = _task(db_session, owner.id, status=TaskStatus.WAITING_FOR_USER)
+    turn_id = "resume-secrets-turn-completes"
+    store_ephemeral_runtime_values(
+        turn_id,
+        {ConnectorRef("mcp", 1): {"secrets": {"authorization": "Bearer resume-token"}}},
+    )
+    assert get_ephemeral_runtime_values(turn_id) is not None
+
+    tool_config = MagicMock()
+    tool_config.get_connector_runtime_turn_id.return_value = turn_id
+    agent = MagicMock(tool_config=tool_config)
+    agent.resume_execution_by_id = AsyncMock(
+        return_value={
+            "status": "completed",
+            "success": True,
+            "output": "done",
+            "agent_result": {},
+        }
+    )
+    ws_manager = MagicMock(broadcast_to_task=AsyncMock())
+
+    with patch("xagent.web.api.websocket.manager", ws_manager):
+        _register_current_resume(int(task.id))
+        await execute_resume_background(
+            task_id=int(task.id),
+            agent_service=agent,
+            task_owner_user_id=int(owner.id),
+        )
+
+    db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    assert get_ephemeral_runtime_values(turn_id) is None
+    assert pop_ephemeral_runtime_values(turn_id) is None
+
+
+@pytest.mark.asyncio
+async def test_execute_resume_background_keeps_ephemeral_secrets_when_resume_pauses_again(
+    db_session,
+) -> None:
+    """A resume that itself pauses again on waiting_for_user is the same turn
+    continuing under the same turn_id, not a finished one - popping here
+    would strand that next resume with nothing to look up its own secrets
+    under."""
+    owner = _user(db_session, "owner")
+    task = _task(db_session, owner.id, status=TaskStatus.WAITING_FOR_USER)
+    turn_id = "resume-secrets-turn-repauses"
+    store_ephemeral_runtime_values(
+        turn_id,
+        {ConnectorRef("mcp", 1): {"secrets": {"authorization": "Bearer resume-token"}}},
+    )
+    assert get_ephemeral_runtime_values(turn_id) is not None
+
+    tool_config = MagicMock()
+    tool_config.get_connector_runtime_turn_id.return_value = turn_id
+    agent = MagicMock(tool_config=tool_config)
+    agent.resume_execution_by_id = AsyncMock(
+        return_value={
+            "status": "waiting_for_user",
+            "success": False,
+            "output": "Please connect another app.",
+            "agent_result": {},
+        }
+    )
+    ws_manager = MagicMock(broadcast_to_task=AsyncMock())
+
+    with patch("xagent.web.api.websocket.manager", ws_manager):
+        _register_current_resume(int(task.id))
+        await execute_resume_background(
+            task_id=int(task.id),
+            agent_service=agent,
+            task_owner_user_id=int(owner.id),
+        )
+
+    db_session.refresh(task)
+    assert task.status == TaskStatus.WAITING_FOR_USER
+    assert get_ephemeral_runtime_values(turn_id) is not None
+    assert pop_ephemeral_runtime_values(turn_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_execute_resume_background_renews_ephemeral_secrets_when_resume_pauses_again(
+    db_session, monkeypatch
+) -> None:
+    """A resume that re-pauses carries a fresh interaction lifetime of its
+    own - _finalize_resumed_task must actually renew the secrets' TTL, not
+    merely leave them alone, or they'd still expire on the ORIGINAL pause's
+    clock even though this one is still active."""
+    owner = _user(db_session, "owner")
+    task = _task(db_session, owner.id, status=TaskStatus.WAITING_FOR_USER)
+    turn_id = "resume-secrets-turn-renews"
+    store_ephemeral_runtime_values(
+        turn_id,
+        {ConnectorRef("mcp", 1): {"secrets": {"authorization": "Bearer resume-token"}}},
+    )
+
+    real_monotonic = connector_runtime_module.time.monotonic
+    offset = {"value": connector_runtime_module._EPHEMERAL_RUNTIME_TTL_SECONDS - 1}
+    monkeypatch.setattr(
+        connector_runtime_module.time,
+        "monotonic",
+        lambda: real_monotonic() + offset["value"],
+    )
+
+    tool_config = MagicMock()
+    tool_config.get_connector_runtime_turn_id.return_value = turn_id
+    agent = MagicMock(tool_config=tool_config)
+    agent.resume_execution_by_id = AsyncMock(
+        return_value={
+            "status": "waiting_for_user",
+            "success": False,
+            "output": "Please connect another app.",
+            "agent_result": {},
+        }
+    )
+    ws_manager = MagicMock(broadcast_to_task=AsyncMock())
+
+    with patch("xagent.web.api.websocket.manager", ws_manager):
+        _register_current_resume(int(task.id))
+        await execute_resume_background(
+            task_id=int(task.id),
+            agent_service=agent,
+            task_owner_user_id=int(owner.id),
+        )
+
+    # Past the ORIGINAL store's TTL window, but well within the renewed one.
+    offset["value"] += connector_runtime_module._EPHEMERAL_RUNTIME_TTL_SECONDS - 1
+    assert get_ephemeral_runtime_values(turn_id) is not None
+    assert pop_ephemeral_runtime_values(turn_id) is not None
 
 
 @pytest.mark.asyncio

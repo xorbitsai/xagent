@@ -3189,10 +3189,22 @@ def _finalize_resumed_task(
     result: Dict[str, Any],
     task_lease: TaskLease,
     prepared_outputs: _PreparedTaskFileOutputs,
+    turn_id: str | None = None,
 ) -> dict[str, Any]:
-    """Persist one fenced resumed result in a single worker transaction."""
+    """Persist one fenced resumed result in a single worker transaction.
+
+    ``turn_id``, when given, pops that turn's ephemeral connector secrets
+    (see ``task_orchestrator.finish_turn``'s matching handling) once this
+    exact call has committed a genuine COMPLETED/FAILED transition - not
+    when the lease release below is fenced out and the whole transaction
+    rolls back. A committed WAITING_FOR_USER/PAUSED transition instead
+    renews those secrets' TTL: it is the same turn resuming again later
+    under this same turn_id, now carrying a fresh interaction lifetime of
+    its own.
+    """
     from ..models.agent import Agent
     from ..services.chat_history_service import persist_assistant_message_no_commit
+    from ..services.task_orchestrator import TERMINAL_TASK_STATUSES
 
     finalized: dict[str, Any] = {
         "task_title": None,
@@ -3329,6 +3341,40 @@ def _finalize_resumed_task(
         finalized["lease_released"] = True
         finalized["final_status"] = final_task_status.value
         finalized["control_event_state"] = control_snapshot.as_dict()
+        if turn_id is not None:
+            if final_task_status in TERMINAL_TASK_STATUSES:
+                try:
+                    from ..services.connector_runtime import (
+                        pop_ephemeral_runtime_values,
+                    )
+
+                    pop_ephemeral_runtime_values(turn_id)
+                except Exception:
+                    logger.warning(
+                        "connector runtime cleanup failed for task %s turn %s",
+                        task_id,
+                        turn_id,
+                        exc_info=True,
+                    )
+            else:
+                # WAITING_FOR_USER/PAUSED: the same turn resuming again later
+                # under this same turn_id, with a fresh interaction lifetime -
+                # keep whatever ephemeral secrets it may still need from
+                # expiring on the original pause's clock (see
+                # connector_runtime.renew_ephemeral_runtime_values).
+                try:
+                    from ..services.connector_runtime import (
+                        renew_ephemeral_runtime_values,
+                    )
+
+                    renew_ephemeral_runtime_values(turn_id)
+                except Exception:
+                    logger.warning(
+                        "connector runtime secret renewal failed for task %s turn %s",
+                        task_id,
+                        turn_id,
+                        exc_info=True,
+                    )
         return finalized
     finally:
         try:
@@ -3345,11 +3391,14 @@ def _settle_resumed_task_lease(
     lease: TaskLease,
     *,
     error_message: str | None,
+    turn_id: str | None = None,
 ) -> bool:
     """Delegate resume cleanup to the shared run/runner-fenced lifecycle."""
     from ..services.task_orchestrator import settle_task_lease_isolated
 
-    return settle_task_lease_isolated(lease, error_message=error_message)
+    return settle_task_lease_isolated(
+        lease, error_message=error_message, turn_id=turn_id
+    )
 
 
 async def execute_resume_background(
@@ -3384,6 +3433,22 @@ async def execute_resume_background(
     resume_owner_task = asyncio.current_task()
     if resume_owner_task is None:
         raise RuntimeError(f"Task {task_id} resume has no asyncio task")
+
+    # The turn id this task's ephemeral connector secrets (if any were ever
+    # stored) live under. A resume deliberately never rebinds this on the
+    # cached agent's tool_config (see WebToolConfig.invalidate_connector_
+    # runtime_cache's docstring), so it is still the original pausing
+    # turn's id here - exactly what a terminal settlement below must pop
+    # under to actually free those secrets.
+    connector_runtime_turn_id: str | None = None
+    _resume_tool_config = getattr(agent_service, "tool_config", None)
+    _turn_id_getter = getattr(
+        _resume_tool_config, "get_connector_runtime_turn_id", None
+    )
+    if callable(_turn_id_getter):
+        _candidate_turn_id = _turn_id_getter()
+        if isinstance(_candidate_turn_id, str):
+            connector_runtime_turn_id = _candidate_turn_id
 
     lease_stop_event = preacquired_heartbeat_stop
     lease_heartbeat_task = preacquired_heartbeat_task
@@ -3538,6 +3603,7 @@ async def execute_resume_background(
                 lambda acquired: _settle_resumed_task_lease(
                     acquired,
                     error_message="resume cancelled during lease acquisition",
+                    turn_id=connector_runtime_turn_id,
                 ),
             )
             if prior_status_box:
@@ -3838,6 +3904,7 @@ async def execute_resume_background(
                     result=result,
                     task_lease=lease,
                     prepared_outputs=outputs_for_finalizer,
+                    turn_id=connector_runtime_turn_id,
                 )
             )
         finally:
@@ -4211,11 +4278,20 @@ async def execute_resume_background(
                     and not lease_released
                     and not defer_db_cleanup_to_ttl_recovery
                 ):
+                    # When this IS deferred, _finalize_resumed_task's
+                    # turn_id-scoped pop never runs for this turn - and
+                    # cannot safely run here either, for the same reason as
+                    # task_orchestrator.py's matching branch: this coroutine
+                    # does not know whether the task will land on a terminal
+                    # status or resume again under this same turn_id.
+                    # connector_runtime.py's _EPHEMERAL_RUNTIME_TTL_SECONDS
+                    # bounds that leak instead.
                     try:
                         settled = await run_db_io_cancellation_safe(
                             lambda: _settle_resumed_task_lease(
                                 lease,
                                 error_message=settlement_error,
+                                turn_id=connector_runtime_turn_id,
                             )
                         )
                         if settled:

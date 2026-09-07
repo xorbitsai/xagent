@@ -233,6 +233,19 @@ def test_update_event_dedupes_repeated_emails_in_the_same_attendees_call(monkeyp
     assert kwargs["body"]["attendees"] == [{"email": "bob@example.com"}]
 
 
+def test_update_event_ignores_a_whitespace_only_attendee_entry(monkeypatch):
+    service = _fake_service({"id": "evt1"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_update_events(
+        event_id="evt1",
+        attendees=["   ", "bob@example.com"],
+    )
+
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["body"]["attendees"] == [{"email": "bob@example.com"}]
+
+
 def test_update_event_attendee_matching_is_case_and_whitespace_insensitive(
     monkeypatch,
 ):
@@ -380,6 +393,33 @@ def test_update_event_add_google_meet_retries_after_a_failed_create_request(
     new_create_request = kwargs["body"]["conferenceData"]["createRequest"]
     assert new_create_request["requestId"] != "abc123"
     assert new_create_request["conferenceSolutionKey"] == {"type": "hangoutsMeet"}
+
+
+def test_update_event_add_google_meet_does_not_clobber_a_pending_create_request(
+    monkeypatch,
+):
+    """Regression test: a *pending* createRequest has no entryPoints/
+    conferenceSolution yet either -- the same shape as a failed one. It must
+    not be treated as retryable, or a second add_google_meet=True call (e.g.
+    while also changing the time) abandons the in-flight request and starts
+    a new, unrelated one."""
+    existing_event = {
+        "id": "evt1",
+        "conferenceData": {
+            "createRequest": {
+                "requestId": "abc123",
+                "status": {"statusCode": "pending"},
+            }
+        },
+    }
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_update_events(event_id="evt1", add_google_meet=True)
+
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["body"]["conferenceData"] == existing_event["conferenceData"]
+    assert kwargs["body"]["conferenceData"]["createRequest"]["requestId"] == "abc123"
 
 
 def test_event_response_falls_back_to_entry_points_when_hangout_link_is_absent(

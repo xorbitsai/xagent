@@ -112,6 +112,8 @@ def _merge_attendees(event: dict[str, Any], attendees: list[str] | None) -> None
         if not email:
             continue
         normalized = email.strip()
+        if not normalized:
+            continue
         key = normalized.lower()
         if key in existing_emails or key in seen:
             continue
@@ -122,16 +124,26 @@ def _merge_attendees(event: dict[str, Any], attendees: list[str] | None) -> None
         event["attendees"] = existing + new_attendees
 
 
-def _has_resolved_conference(event: dict[str, Any]) -> bool:
-    """True if the event has a conference Google actually created (it has
-    entry points or a resolved conference solution) -- as opposed to
-    conferenceData left over from a *failed* createRequest (status.statusCode
-    == "failure"), which has neither and must not block a retry.
+def _needs_conference_request(event: dict[str, Any]) -> bool:
+    """True if add_google_meet should (re)send a createRequest: the event has
+    no conferenceData yet, or its only conferenceData is a *failed*
+    createRequest (status.statusCode == "failure").
+
+    A conference that's still *pending* must not be treated the same as a
+    failed one -- both lack entryPoints/conferenceSolution while Google is
+    still provisioning them, so checking for those fields can't tell "failed,
+    safe to retry" apart from "pending, do not clobber the in-flight
+    request". Read status.statusCode directly instead (the same field
+    _event_response already reads for the opposite purpose). A conference
+    that has already resolved (has entryPoints or a conferenceSolution --
+    Meet or otherwise) also returns False, so it isn't clobbered either.
     """
     conference_data = event.get("conferenceData") or {}
-    return bool(
-        conference_data.get("entryPoints") or conference_data.get("conferenceSolution")
-    )
+    if not conference_data:
+        return True
+    create_request = conference_data.get("createRequest") or {}
+    status_code = (create_request.get("status") or {}).get("statusCode")
+    return status_code == "failure"
 
 
 def _conference_and_notify_kwargs(
@@ -146,7 +158,7 @@ def _conference_and_notify_kwargs(
     which would silently drop an event's existing Meet link on every update that
     doesn't also pass add_google_meet=True.
     """
-    if add_google_meet and not _has_resolved_conference(event):
+    if add_google_meet and _needs_conference_request(event):
         _add_conference_request(event)
     return {
         "conferenceDataVersion": 1,

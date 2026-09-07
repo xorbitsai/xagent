@@ -82,6 +82,8 @@ def test_builder_prompt_requires_multi_agent_react_and_language_harness() -> Non
     assert "one transaction" in normalized_prompt
     assert "Simplified Chinese" in prompt
     assert "Traditional Chinese" in prompt
+    assert "DAG step" not in prompt
+    assert "dependencies" not in prompt
 
 
 def test_builder_state_requires_all_agents_before_finalization() -> None:

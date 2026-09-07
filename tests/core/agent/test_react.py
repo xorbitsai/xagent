@@ -4215,7 +4215,7 @@ async def test_react_pattern_reserves_control_tool_names_in_schema() -> None:
         if schema["function"]["name"] == "final_answer"
     )["function"]
     assert (
-        "same natural language as the current user request"
+        "canonical language contract provided by the system context"
         in final_answer_schema["description"]
     )
     assert (
@@ -4237,7 +4237,7 @@ async def test_react_pattern_reserves_control_tool_names_in_schema() -> None:
     assert "generic Chinese" in response_language_schema["description"]
     answer_schema = final_answer_schema["parameters"]["properties"]["answer"]
     assert "response_language" in answer_schema["description"]
-    assert "tool results, source documents" in answer_schema["description"]
+    assert "canonical language contract" in answer_schema["description"]
     assert "## FINAL DELIVERABLE FILE REFERENCES" not in answer_schema["description"]
     assert "exact markdown_link" in answer_schema["description"]
     assert "get_workspace_output_files" not in answer_schema["description"]
@@ -5275,7 +5275,7 @@ async def test_react_pattern_resume_waiting_after_user_response_continues() -> N
     first = await pattern.run(context=context, tools=[], llm=llm)
 
     assert first["status"] == "waiting_for_user"
-    context.add_user_message("B")
+    context.add_user_message("B", metadata={"response_to_waiting_for_user": "legacy"})
 
     resumed_pattern = ReActPattern(max_iterations=2)
     resumed_pattern.load_state(pattern.get_state())
@@ -5290,8 +5290,7 @@ async def test_react_pattern_resume_waiting_after_user_response_continues() -> N
     resumed_messages = resumed_llm.calls[0]["messages"]
     assert resumed_messages[-1]["role"] == "user"
     assert "answer to a pending agent question" in resumed_messages[-1]["content"]
-    assert "Pending question: Choose A or B" in resumed_messages[-1]["content"]
-    assert "User answer: B" in resumed_messages[-1]["content"]
+    assert resumed_messages[-1]["content"].endswith("B")
 
 
 @pytest.mark.asyncio
@@ -6747,7 +6746,10 @@ async def test_callback_less_tool_interaction_resumes_by_replanning() -> None:
         if message.role == "user" and message.content == "Use 42"
     )
     waiting_metadata = response_message.metadata["response_to_waiting_for_user"]
-    assert waiting_metadata["requests"][0]["tool_name"] == "clarification_gate"
+    assert waiting_metadata == {
+        "question": "Which value should be used?",
+        "message_type": "question",
+    }
 
 
 @pytest.mark.asyncio

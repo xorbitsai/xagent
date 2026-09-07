@@ -1134,12 +1134,11 @@ class PatternRuntime:
             **event_metadata,
         }
         # Surface current context size vs. the compaction threshold so the UI
-        # can show a context-usage gauge. Uses the same estimate that drives the
-        # compaction decision, so the gauge fills exactly when compaction fires.
+        # can show final provider-payload usage, including dynamic system content.
         estimate = getattr(context, "estimate_context_tokens", None)
         if callable(estimate):
             try:
-                context_data["context_tokens"] = estimate()
+                context_data["context_tokens"] = estimate(messages, tools)
             except Exception:  # noqa: BLE001 - gauge metadata must never break the call
                 pass
         compact_config = getattr(context, "compact_config", None)

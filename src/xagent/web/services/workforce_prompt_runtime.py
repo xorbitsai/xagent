@@ -10,8 +10,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from ...core.agent.language import (
     detect_prose_script_mismatch,
-    output_language_policy,
-    response_language_rules,
+    render_dag_step_language_reference,
 )
 from ...core.agent.result import extract_assistant_message
 from ...core.agent.service import AgentService
@@ -568,8 +567,7 @@ success when finalization did not happen.
 All persisted user-facing prose passed to tools, including {_WORKFORCE_BUILDER_PERSISTED_FIELDS},
 must follow the user's request language. English tool names, schemas, and tool
 results do not authorize changing it.
-{output_language_policy()}
-{response_language_rules(subject="current user request")}
+{render_dag_step_language_reference()}
 """
 
 

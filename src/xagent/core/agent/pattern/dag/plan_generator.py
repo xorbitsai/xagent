@@ -7,7 +7,10 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from ...context.enrichment import latest_user_text
+from ...context.enrichment import (
+    latest_pending_user_response,
+    top_level_user_request,
+)
 from ...language import (
     OUTPUT_LANGUAGE_SOURCE_METADATA_KEY,
     OUTPUT_LANGUAGE_SOURCE_PLAN,
@@ -15,9 +18,10 @@ from ...language import (
     detect_response_language_script_mismatch,
     effective_output_language,
     normalize_response_language_label,
-    output_language_directives,
     plan_language_rules,
+    render_structured_request_language_policy,
     request_context_output_language,
+    serialize_pending_user_response,
 )
 from ..base import (
     RequiredToolCallError,
@@ -319,7 +323,8 @@ class LLMPlanGenerator(PlanGenerator):
                     "follow it exactly and make response_language match it. "
                     "Emit response_language before steps in the tool arguments so "
                     "it anchors every plan field generated after it. Determine it "
-                    "from latest_user_request, not from the surrounding context. "
+                    "from latest_user_request and pending_response, not from "
+                    "the surrounding context. "
                     "For Chinese requests, response_language must be Simplified "
                     "Chinese or Traditional Chinese to match the request script; "
                     "do not use generic Chinese. "
@@ -484,8 +489,8 @@ class LLMPlanGenerator(PlanGenerator):
                                 "persisted tool-argument prose produced by the plan, "
                                 "for example English, Simplified Chinese, Traditional "
                                 "Chinese, or Spanish. Determine it only from "
-                                "latest_user_request and any explicit target-language "
-                                "instruction in that request. For Chinese requests, "
+                                "latest_user_request, pending_response, and "
+                                "output_language_policy. For Chinese requests, "
                                 "choose Simplified Chinese or Traditional Chinese to "
                                 "match the request script; do not use generic Chinese. "
                                 "If output_language_policy names a language, match it."
@@ -561,7 +566,8 @@ class LLMPlanGenerator(PlanGenerator):
         }
 
     def _build_prompt(self, request: PlanGenerationRequest) -> str:
-        latest_request = latest_user_text(request.context, prefer_display=True) or ""
+        canonical_request = top_level_user_request(request.context)
+        pending_response = latest_pending_user_response(request.context)
         expected_language, language_source = self._language_authority(request.context)
         latest_messages = [
             {"role": message.role, "content": message.content}
@@ -573,12 +579,20 @@ class LLMPlanGenerator(PlanGenerator):
             "replan": request.replan,
             # Quoted whole: the planner picks response_language from this field,
             # and "messages" below already carries the full text anyway.
-            "latest_user_request": latest_request.strip(),
-            "output_language_policy": output_language_directives(
-                None
-                if language_source == OUTPUT_LANGUAGE_SOURCE_PLAN
-                else expected_language,
-                section="plan_payload",
+            "latest_user_request": canonical_request.language_text,
+            "pending_response": (
+                serialize_pending_user_response(pending_response)
+                if pending_response is not None
+                else None
+            ),
+            "output_language_policy": render_structured_request_language_policy(
+                request_field="latest_user_request",
+                pending_field="pending_response",
+                output_language=(
+                    None
+                    if language_source == OUTPUT_LANGUAGE_SOURCE_PLAN
+                    else expected_language
+                ),
             ),
             "messages": latest_messages,
             "retrieved_memory_context": request.context.metadata.get(
@@ -687,7 +701,7 @@ class LLMPlanGenerator(PlanGenerator):
         Script comparison cannot tell a biased plan from a request that legitimately
         asks for another language, so it may only nudge once, never reject a plan.
         """
-        request = latest_user_text(context, prefer_display=True) or ""
+        request = top_level_user_request(context).language_text
         for step in plan.steps:
             mismatch = detect_prose_script_mismatch(
                 request, LLMPlanGenerator._step_prose(step)
@@ -698,6 +712,7 @@ class LLMPlanGenerator(PlanGenerator):
                 f"Plan step {step.id!r} is written in predominantly "
                 f"{mismatch.observed_script} script, which does not match the "
                 "script of the latest user request. Re-read latest_user_request "
+                "and pending_response "
                 "above and decide the output language from that request alone, "
                 "including any language change it asks for explicitly or "
                 f"implicitly. Call {LLMPlanGenerator.PLAN_TOOL_NAME} again exactly "

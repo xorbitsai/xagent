@@ -50,17 +50,20 @@ that declares it is checked; one that does not is not.
 | ``custom_api._recheck_team_access_under_definition_lock`` | the ``custom_apis`` definition row, ``FOR UPDATE``, taken by ``update_custom_api`` before this call | no | ``True`` |
 | ``custom_api.delete_custom_api`` | the ``custom_apis`` definition row, ``FOR UPDATE`` | no | ``True`` |
 | ``mcp.update_mcp_server`` | the ``mcp_servers`` definition row, ``FOR UPDATE ... KEY SHARE``, on the payloads that write that row | no | ``True`` |
-| ``mcp.teardown_mcp_app_server`` | three row locks: ``public_mcp_apps``, ``mcp_servers``, ``user_mcpservers`` | no, within this function -- see the note below | ``True`` |
+| ``mcp._teardown_mcp_app_server_locally`` | three row locks: ``public_mcp_apps``, ``mcp_servers``, ``user_mcpservers`` | no, within this function -- see the note below | ``True`` |
 | ``mcp.delete_mcp_server`` | two row locks: ``mcp_servers`` and ``user_mcpservers``, taken by ``_lock_active_mcp_oauth_lifecycle`` before this call | no | ``True`` |
 | ``custom_api._resolve_custom_api_for_request`` | nothing -- this resolution runs before either of its two routes takes any lock | no | ``False`` |
 
-``mcp.teardown_mcp_app_server`` is a helper, not a route: it has no route
-decorator and no caller in this repository outside tests. "Nothing committed
-before asking" therefore holds inside its own body only. A future caller that
-commits and then calls it would turn its declaration into a report of failure
-for work that already succeeded, and nothing here would notice -- the check
-that keeps this table honest compares declarations against call sites, not
-against a caller's commit history.
+``mcp._teardown_mcp_app_server_locally`` is a helper, not a route: it has no
+route decorator and no caller in this repository outside tests (the async
+``teardown_mcp_app_server`` route only dispatches to it with
+``asyncio.to_thread`` and, after it returns, runs the external revocation that
+must not itself hold any of the three row locks). "Nothing committed before
+asking" therefore holds inside its own body only. A future caller that commits
+and then calls it would turn its declaration into a report of failure for work
+that already succeeded, and nothing here would notice -- the check that keeps
+this table honest compares declarations against call sites, not against a
+caller's commit history.
 
 While a hook runs at any of the row-locking call sites above, every
 concurrent request touching that connector is queued behind it. Keep the

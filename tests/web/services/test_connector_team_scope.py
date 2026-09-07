@@ -2159,8 +2159,8 @@ def _declared_call_sites() -> dict[str, bool]:
 
     Read off the source of both route modules. A call is attributed to the
     nearest enclosing function definition, and both ``def`` and ``async def``
-    count -- two of the five call sites today sit in coroutines, and a scan
-    that only walks ``ast.FunctionDef`` silently misses them.
+    count, because some call sites live in coroutines and a scan that only
+    walks ``ast.FunctionDef`` silently misses them.
     """
     import ast
     import inspect

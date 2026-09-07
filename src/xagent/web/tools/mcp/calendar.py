@@ -89,11 +89,51 @@ def _add_conference_request(event: dict[str, Any]) -> None:
     }
 
 
+def _merge_attendees(event: dict[str, Any], attendees: list[str] | None) -> None:
+    """Add attendees to the event without dropping ones already on it."""
+    if not attendees:
+        return
+    existing = event.get("attendees") or []
+    existing_emails = {a.get("email") for a in existing if isinstance(a, dict)}
+    event["attendees"] = existing + [
+        {"email": email} for email in attendees if email not in existing_emails
+    ]
+
+
+def _conference_and_notify_kwargs(
+    event: dict[str, Any], notify_attendees: bool, add_google_meet: bool
+) -> dict[str, Any]:
+    """Apply add_google_meet to event in place, and build the insert()/update() kwargs.
+
+    conferenceDataVersion is always sent as 1: it only declares that the caller
+    understands conference data, it does not request or remove a conference by
+    itself (that's driven by whether `body` carries a createRequest). Omitting it
+    (or sending 0) makes Google ignore any conferenceData already in the body,
+    which would silently drop an event's existing Meet link on every update that
+    doesn't also pass add_google_meet=True.
+    """
+    if add_google_meet and not event.get("conferenceData"):
+        _add_conference_request(event)
+    return {
+        "conferenceDataVersion": 1,
+        "sendUpdates": "all"
+        if (event.get("attendees") and notify_attendees)
+        else "none",
+    }
+
+
 def _event_response(event: dict[str, Any]) -> dict[str, Any]:
     response = {"status": "success", "event": event}
     hangout_link = event.get("hangoutLink")
     if hangout_link:
         response["hangout_link"] = hangout_link
+    else:
+        create_request = event.get("conferenceData", {}).get("createRequest", {})
+        status_code = create_request.get("status", {}).get("statusCode")
+        if status_code:
+            # Meet link creation is asynchronous; surface the status instead of
+            # implying failure when hangoutLink isn't populated yet.
+            response["conference_status"] = status_code
     return response
 
 
@@ -114,8 +154,10 @@ def google_calendar_create_events(
     attendees is a list of email addresses to add to the event. Adding attendees does not, by
     itself, email them; set notify_attendees=True to have Google Calendar send them a native
     invite immediately. Confirm the recipient list with the user before setting notify_attendees=True.
-    Set add_google_meet=True to attach a real Google Meet video-conference link to the event
-    (the link is returned as hangout_link); a plain "Google Meet" string in location does not do this.
+    Set add_google_meet=True to attach a real Google Meet video-conference link to the event. The
+    link is returned as hangout_link once Google finishes provisioning it; if it isn't ready yet the
+    response includes conference_status instead (e.g. "pending") — call google_calendar_get_event
+    shortly after to fetch the link. A plain "Google Meet" string in location does not create a link.
     """
     try:
         service = get_calendar_service()
@@ -134,16 +176,15 @@ def google_calendar_create_events(
             event["description"] = description
         if location:
             event["location"] = location
-        if attendees:
-            event["attendees"] = [{"email": email} for email in attendees]
-        if add_google_meet:
-            _add_conference_request(event)
+        _merge_attendees(event, attendees)
 
+        request_kwargs = _conference_and_notify_kwargs(
+            event, notify_attendees, add_google_meet
+        )
         request = service.events().insert(
             calendarId="primary",
             body=event,
-            conferenceDataVersion=1 if add_google_meet else 0,
-            sendUpdates="all" if (attendees and notify_attendees) else "none",
+            **request_kwargs,
         )
         created_event = request.execute()
         return json.dumps(_event_response(created_event))
@@ -182,11 +223,15 @@ def google_calendar_update_events(
     """
     Update an existing event in Google Calendar.
     start_time and end_time must be RFC3339 formatted if provided.
-    attendees is a list of email addresses to add to the event. Adding attendees does not, by
-    itself, email them; set notify_attendees=True to have Google Calendar send them a native
-    invite immediately. Confirm the recipient list with the user before setting notify_attendees=True.
-    Set add_google_meet=True to attach a real Google Meet video-conference link to the event
-    (the link is returned as hangout_link); a plain "Google Meet" string in location does not do this.
+    attendees is a list of email addresses to add to the event; attendees already on the event are
+    kept. Adding attendees does not, by itself, email anyone; set notify_attendees=True to have
+    Google Calendar send a native invite/update immediately to every attendee on the event (existing
+    and newly added). Confirm the recipient list with the user before setting notify_attendees=True.
+    Set add_google_meet=True to attach a real Google Meet video-conference link to the event if it
+    doesn't already have a conference (an existing conference is left untouched). The link is
+    returned as hangout_link once Google finishes provisioning it; if it isn't ready yet the response
+    includes conference_status instead (e.g. "pending") — call google_calendar_get_event shortly
+    after to fetch the link. A plain "Google Meet" string in location does not create a link.
     """
     try:
         service = get_calendar_service()
@@ -204,17 +249,16 @@ def google_calendar_update_events(
             event["description"] = description
         if location:
             event["location"] = location
-        if attendees:
-            event["attendees"] = [{"email": email} for email in attendees]
-        if add_google_meet:
-            _add_conference_request(event)
+        _merge_attendees(event, attendees)
 
+        request_kwargs = _conference_and_notify_kwargs(
+            event, notify_attendees, add_google_meet
+        )
         request = service.events().update(
             calendarId="primary",
             eventId=event_id,
             body=event,
-            conferenceDataVersion=1 if add_google_meet else 0,
-            sendUpdates="all" if (attendees and notify_attendees) else "none",
+            **request_kwargs,
         )
         updated_event = request.execute()
         return json.dumps(_event_response(updated_event))

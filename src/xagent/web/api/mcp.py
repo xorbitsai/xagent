@@ -76,6 +76,7 @@ from ..services.mcp_oauth import (
     validate_mcp_oauth_persisted_value,
 )
 from ..services.mcp_runtime import HTTP_MCP_TRANSPORTS
+from ..services.oauth_persistence import require_oauth_owner_active
 from ..services.user_oauth import (
     delete_scoped_user_oauth_accounts,
     list_scoped_user_oauth_accounts,
@@ -898,6 +899,7 @@ def _lock_active_mcp_oauth_lifecycle(
     *,
     association_identity: _MCPOAuthAssociationIdentity,
     flow_identity: _MCPOAuthFlowIdentity | None = None,
+    resource_owner_key: str | None = None,
     association_must_be_active: bool = True,
 ) -> tuple[MCPServer, UserMCPServer, MCPOAuthFlowState | None] | None:
     """Lock server, exact association generation, then exact flow if supplied."""
@@ -933,6 +935,15 @@ def _lock_active_mcp_oauth_lifecycle(
             != association_identity.lifecycle_generation
         ):
             return None
+        # Match connect's association-before-host-lock order, but acquire the
+        # host lock before the flow/grant locks used by suspension cleanup.
+        if resource_owner_key is not None:
+            try:
+                require_oauth_owner_active(
+                    db, association_identity.user_id, resource_owner_key
+                )
+            except ValueError:
+                return None
         flow_state = (
             db.query(MCPOAuthFlowState)
             .filter(
@@ -5350,6 +5361,8 @@ async def mcp_oauth_callback(
     callback_redirect_after = (
         str(flow_state.redirect_after) if flow_state.redirect_after else None
     )
+    callback_user_id = int(flow_state.user_id)
+    callback_owner_key = str(flow_state.resource_owner_key)
     try:
         _validate_mcp_oauth_state_cookie(request, state_value)
     except HTTPException as exc:
@@ -5465,6 +5478,11 @@ async def mcp_oauth_callback(
             db,
             association_identity=association_identity,
             flow_identity=flow_identity,
+            resource_owner_key=(
+                callback_owner_key
+                if callback_owner_key != _default_resource_owner_key(callback_user_id)
+                else None
+            ),
         )
         if lifecycle is None:
             await _rollback_and_revoke_mcp_oauth_issued_token(db, issued_token)

@@ -166,7 +166,7 @@ def test_share_file_grants_role_to_email(monkeypatch):
 
     result = json.loads(
         google_drive.google_drive_share_file(
-            "fid", "a@x.com", role="writer", send_notification=False, message="hi"
+            "fid", "a@x.com", role="writer", send_notification=True, message="hi"
         )
     )
 
@@ -178,7 +178,7 @@ def test_share_file_grants_role_to_email(monkeypatch):
         "role": "writer",
         "emailAddress": "a@x.com",
     }
-    assert kwargs["sendNotificationEmail"] is False
+    assert kwargs["sendNotificationEmail"] is True
     assert kwargs["emailMessage"] == "hi"
     assert kwargs["supportsAllDrives"] is True
 
@@ -192,6 +192,25 @@ def test_share_file_defaults_to_reader_with_notification(monkeypatch):
     kwargs = service.permissions.return_value.create.call_args.kwargs
     assert kwargs["body"]["role"] == "reader"
     assert kwargs["sendNotificationEmail"] is True
+
+
+def test_share_file_omits_email_message_when_notification_disabled(monkeypatch):
+    """The Drive API rejects emailMessage outright when sendNotificationEmail
+    is false, so a message passed alongside send_notification=False must not
+    reach the request -- regardless of whether the caller also wanted a
+    message, suppressing the notification wins."""
+    service = _mock_drive_service(monkeypatch)
+    service.permissions.return_value.create.return_value.execute.return_value = {}
+
+    json.loads(
+        google_drive.google_drive_share_file(
+            "fid", "a@x.com", send_notification=False, message="hi"
+        )
+    )
+
+    kwargs = service.permissions.return_value.create.call_args.kwargs
+    assert kwargs["sendNotificationEmail"] is False
+    assert "emailMessage" not in kwargs
 
 
 @pytest.mark.parametrize("bad_role", ["owner", "organizer", ""])

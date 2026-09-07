@@ -261,8 +261,16 @@ def google_drive_delete_file(file_id: str) -> str:
         resolved_file_id = _resolve_file_id(file_id)
         service = get_drive_service()
         _execute_ignoring_204_ssl_eof(
-            lambda: service.files().delete(fileId=resolved_file_id).execute(),
-            lambda: service.files().get(fileId=resolved_file_id).execute(),
+            lambda: (
+                service.files()
+                .delete(fileId=resolved_file_id, supportsAllDrives=True)
+                .execute()
+            ),
+            lambda: (
+                service.files()
+                .get(fileId=resolved_file_id, supportsAllDrives=True)
+                .execute()
+            ),
         )
 
         return json.dumps(
@@ -330,18 +338,19 @@ def google_drive_share_file(
             raise ValueError("email must be a valid email address")
 
         service = get_drive_service()
-        permission = (
-            service.permissions()
-            .create(
-                fileId=_resolve_file_id(file_id),
-                body={"type": "user", "role": role, "emailAddress": email},
-                sendNotificationEmail=send_notification,
-                emailMessage=message,
-                supportsAllDrives=True,
-                fields="id, type, role, emailAddress, displayName",
-            )
-            .execute()
-        )
+        # The API rejects emailMessage outright when sendNotificationEmail is
+        # false, so it's only included when a notification is actually going out.
+        create_kwargs: dict[str, Any] = {
+            "fileId": _resolve_file_id(file_id),
+            "body": {"type": "user", "role": role, "emailAddress": email},
+            "sendNotificationEmail": send_notification,
+            "supportsAllDrives": True,
+            "fields": "id, type, role, emailAddress, displayName",
+        }
+        if send_notification and message is not None:
+            create_kwargs["emailMessage"] = message
+
+        permission = service.permissions().create(**create_kwargs).execute()
 
         return json.dumps({"status": "success", "permission": permission})
     except Exception as e:
@@ -406,7 +415,11 @@ def google_drive_remove_permission(file_id: str, permission_id: str) -> str:
             ),
             lambda: (
                 service.permissions()
-                .get(fileId=resolved_file_id, permissionId=resolved_permission_id)
+                .get(
+                    fileId=resolved_file_id,
+                    permissionId=resolved_permission_id,
+                    supportsAllDrives=True,
+                )
                 .execute()
             ),
         )

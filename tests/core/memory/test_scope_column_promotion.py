@@ -38,6 +38,7 @@ def _store(temp_db_dir, name="mem", embedding=None):
         db_dir=temp_db_dir,
         collection_name=name,
         embedding_model=embedding if embedding is not None else ConstantEmbedding(64),
+        run_schema_maintenance=True,
     )
 
 
@@ -117,7 +118,6 @@ def _create_legacy_table(temp_db_dir, name="mem"):
 def test_legacy_table_is_migrated_and_backfilled(temp_db_dir):
     _create_legacy_table(temp_db_dir)
 
-    # Constructing the store triggers _ensure_scope_columns during init.
     store = _store(temp_db_dir)
 
     arrow = _arrow(store)

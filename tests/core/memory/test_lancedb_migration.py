@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shutil
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 
 import lancedb  # type: ignore
 import pyarrow as pa  # type: ignore
@@ -11,6 +12,10 @@ import pytest
 
 from xagent.core.memory.core import MemoryNote
 from xagent.core.memory.lancedb import LanceDBMemoryStore
+from xagent.core.memory.schema_migration import (
+    LEGACY_DASHSCOPE_IDENTITY,
+    VectorSpaceCompatibility,
+)
 from xagent.core.model.embedding import BaseEmbedding
 from xagent.core.tools.core.RAG_tools.LanceDB.schema_manager import _safe_close_table
 
@@ -21,8 +26,10 @@ class MockEmbedding(BaseEmbedding):
     def __init__(self, dim: int = 64, value: float = 0.1):
         self._dimension = dim
         self._value = value
+        self.inputs = []
 
     def encode(self, text, dimension=None, instruct=None):
+        self.inputs.append(text)
         if isinstance(text, str):
             return [self._value] * self._dimension
         return [[self._value] * self._dimension for _ in text]
@@ -66,16 +73,64 @@ def temp_db_dir():
     shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-def _store(temp_db_dir, embedding_model, name="mem"):
+def _store(temp_db_dir, embedding_model, name="mem", identity=None, maintain=True):
     return LanceDBMemoryStore(
         db_dir=temp_db_dir,
         collection_name=name,
         embedding_model=embedding_model,
+        vector_space_identity=identity,
+        run_schema_maintenance=maintain,
     )
 
 
-def test_add_preserves_rows_on_dimension_change(temp_db_dir):
-    """Writing at dim A, switching to dim B, then add() keeps A-rows and stores B."""
+def _identity(model="text-embedding-v4", dimension=64):
+    return {**LEGACY_DASHSCOPE_IDENTITY, "model": model, "dimension": dimension}
+
+
+def test_real_legacy_inspection_is_read_only_and_scope_columns_are_optional(
+    temp_db_dir,
+):
+    _seed_table_missing_scope = lancedb.connect(temp_db_dir)
+    table = _seed_table_missing_scope.create_table(
+        "legacy",
+        data=pa.table(
+            {
+                "id": ["old"],
+                "text": ["alpha"],
+                "metadata": ["{}"],
+                "vector": pa.array([[0.1] * 64], pa.list_(pa.float32(), 64)),
+            }
+        ),
+    )
+    _safe_close_table(table)
+    embedding = MockEmbedding(64)
+    store = _store(temp_db_dir, embedding, "legacy", _identity(), False)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        inspections = pool.submit(
+            lambda: [store.inspect_vector_space() for _ in range(8)]
+        )
+        write = pool.submit(store.add, MemoryNote(id="new", content="beta"))
+        states, added = inspections.result(), write.result()
+
+    assert states == [VectorSpaceCompatibility.LEGACY_COMPATIBLE] * 8
+    assert added.success and embedding.inputs == ["beta"]
+    arrow = _seed_table_missing_scope.open_table("legacy").to_arrow()
+    assert set(arrow.column("id").to_pylist()) == {"old", "new"}
+    assert {"user_id", "scope_dims"}.isdisjoint(arrow.schema.names)
+
+
+def test_real_persisted_identity_match_and_mismatch(temp_db_dir):
+    matching = _store(temp_db_dir, MockEmbedding(64), "identified", _identity(), False)
+    mismatch = _store(
+        temp_db_dir, MockEmbedding(64), "identified", _identity(model="other"), False
+    )
+    assert matching.inspect_vector_space() is VectorSpaceCompatibility.MATCHING
+    assert mismatch.inspect_vector_space() is VectorSpaceCompatibility.MISMATCHING
+
+
+def test_add_dimension_change_falls_back_without_replacing_vectors(temp_db_dir):
+    """A new vector space writes text-only and leaves existing vectors intact."""
     store_a = _store(temp_db_dir, MockEmbedding(64))
     added = store_a.add(MemoryNote(content="alpha"))
     assert added.success
@@ -86,15 +141,15 @@ def test_add_preserves_rows_on_dimension_change(temp_db_dir):
     new = store_b.add(MemoryNote(content="beta"))
     assert new.success
 
-    # The dimension-A row survived the migration...
+    # Both rows survive, while the authoritative vector schema remains at A.
     got_alpha = store_b.get(alpha_id)
     assert got_alpha.success
     assert got_alpha.content.content == "alpha"
-    # ...and the new dimension-B row was stored.
     assert store_b.get(new.memory_id).success
-    # Both are retrievable via search at the new dimension.
-    contents = {n.content for n in store_b.search("beta", k=10)}
-    assert {"alpha", "beta"} <= contents
+    table = store_b._vector_store.get_raw_connection().open_table("mem")
+    arrow = table.to_arrow()
+    assert arrow.schema.field("vector").type.list_size == 64
+    assert arrow.column("vector").to_pylist()[1] is None
 
 
 def test_add_backfills_missing_non_vector_column(temp_db_dir):
@@ -110,7 +165,8 @@ def test_add_backfills_missing_non_vector_column(temp_db_dir):
     finally:
         _safe_close_table(table)
 
-    # add() must backfill metadata in place (no rebuild) and preserve rows.
+    # Maintenance is explicit; request-time add never rewrites the table.
+    store.maintain_schema()
     assert store.add(MemoryNote(id="y", content="new")).success
 
     table = conn.open_table("mem")
@@ -125,8 +181,8 @@ def test_add_backfills_missing_non_vector_column(temp_db_dir):
     assert store.get("y").success
 
 
-def test_add_migration_failure_leaves_table_intact(temp_db_dir):
-    """If re-embedding fails mid-migration, no data is lost and add() fails."""
+def test_dimension_mismatch_never_attempts_batch_reembedding(temp_db_dir):
+    """A mismatching requester cannot re-embed the shared table."""
     store_a = _store(temp_db_dir, MockEmbedding(64))
     added = store_a.add(MemoryNote(content="alpha"))
     assert added.success
@@ -135,14 +191,13 @@ def test_add_migration_failure_leaves_table_intact(temp_db_dir):
     # Switch to a model that fails the batched re-embed at a new dimension.
     store_fail = _store(temp_db_dir, BatchFailEmbedding(128))
     result = store_fail.add(MemoryNote(content="beta"))
-    assert not result.success
+    assert result.success
 
     # The original row is untouched and still retrievable via the dim-64 store.
     got_alpha = store_a.get(alpha_id)
     assert got_alpha.success
     assert got_alpha.content.content == "alpha"
-    # No partial state: only the original row exists.
-    assert len(store_a.list_all()) == 1
+    assert len(store_a.list_all()) == 2
 
 
 def test_build_migrated_table_vectorless_when_no_model(temp_db_dir):
@@ -205,6 +260,7 @@ def test_init_backfills_missing_column_without_wipe(temp_db_dir):
 
     # Constructing the store runs _ensure_table_schema, which must migrate.
     store = _store(temp_db_dir, MockEmbedding(64))
+    store.maintain_schema()
 
     conn = store._vector_store.get_raw_connection()
     table = conn.open_table("mem")
@@ -234,14 +290,12 @@ def test_init_does_not_wipe_on_dimension_change(temp_db_dir):
     assert added.memory_id in ids
 
 
-def test_init_migration_failure_leaves_table_intact(temp_db_dir):
-    """If init migration fails, the original table is left intact (no wipe)."""
+def test_init_maintenance_never_rebuilds_mismatching_vectors(temp_db_dir):
+    """Ordinary maintenance backfills columns without vector migration."""
     _seed_table_missing_metadata(temp_db_dir)
 
-    # Missing metadata + a vector-dimension change whose batched re-embed fails
-    # forces a rebuild that aborts; init must surface the error, not wipe.
-    with pytest.raises(Exception):
-        _store(temp_db_dir, BatchFailEmbedding(128))
+    store = _store(temp_db_dir, BatchFailEmbedding(128))
+    store.maintain_schema()
 
     conn = lancedb.connect(temp_db_dir)
     table = conn.open_table("mem")
@@ -250,9 +304,10 @@ def test_init_migration_failure_leaves_table_intact(temp_db_dir):
     finally:
         _safe_close_table(table)
     assert arrow.column("id").to_pylist() == ["a"]
-    # The vector column was not rebuilt; the table is untouched.
+    # The vector column was not rebuilt; only ordinary columns were maintained.
     assert "vector" in arrow.schema.names
-    assert "metadata" not in arrow.schema.names
+    assert arrow.schema.field("vector").type.list_size == 64
+    assert "metadata" in arrow.schema.names
 
 
 def test_add_record_without_embedding_into_vector_table(temp_db_dir):

@@ -230,6 +230,7 @@ class LanceDBVectorStore(VectorStore):
         db_dir: str,
         collection_name: str = "vectors",
         connection_manager: Optional[LanceDBConnectionManager] = None,
+        initial_data: Optional[Any] = None,
     ):
         """
         Initialize LanceDB vector store.
@@ -243,9 +244,9 @@ class LanceDBVectorStore(VectorStore):
         self._collection_name = collection_name
         self._conn_manager = connection_manager or LanceDBConnectionManager()
         self._conn = self._conn_manager.get_connection(db_dir)
-        self._ensure_table()
+        self._ensure_table(initial_data)
 
-    def _ensure_table(self) -> None:
+    def _ensure_table(self, initial_data: Optional[Any] = None) -> None:
         """Ensure the vector table exists."""
         table = None
         try:
@@ -266,7 +267,14 @@ class LanceDBVectorStore(VectorStore):
                     "metadata": "{}",
                 }
             ]
-            table = self._conn.create_table(self._collection_name, data=sample_data)
+            if initial_data is not None:
+                sample_data = initial_data
+            try:
+                table = self._conn.create_table(self._collection_name, data=sample_data)
+            except Exception:
+                # A concurrent constructor may have created the shared table.
+                # Open its winner; never overwrite it during acquisition.
+                table = self._conn.open_table(self._collection_name)
             # Remove sample data
             table.delete("id = 'sample'")
         finally:

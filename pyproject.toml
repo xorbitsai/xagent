@@ -43,6 +43,7 @@ dependencies = [
   "asyncssh>=2.14.0",  # SSH MCP runner (production runtime, not just tests)
   "requests >= 2.32.0",
   "idna >= 3.7",  # magento.py's non-ASCII MAGENTO_BASE_URL handling; currently only pulled in transitively via requests
+  "python-dateutil >= 2.8.2",  # calendar.py/outlook.py RRULE validation (utils.parse_rrule); currently only pulled in transitively
   "boto3 >= 1.34.0",  # AWS built-in MCP connector (CloudWatch/DynamoDB/SQS, read-only)
   "celery[redis]>=5.4.0,<6.0.0",
   "redis>=5.0.0",

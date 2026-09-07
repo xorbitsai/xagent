@@ -102,6 +102,54 @@ def test_resolve_id_from_url_rejects_non_string():
         utils.resolve_id_from_url(12345, _TEST_URL_ID_PATTERN, "document_id")
 
 
+def test_parse_rrule_extracts_components():
+    parts = utils.parse_rrule(
+        "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;UNTIL=20260911T235959Z",
+        "2026-08-26T07:00:00+08:00",
+    )
+    assert parts == {
+        "FREQ": "WEEKLY",
+        "BYDAY": "MO,TU,WE,TH,FR",
+        "UNTIL": "20260911T235959Z",
+    }
+
+
+def test_parse_rrule_accepts_and_strips_rrule_prefix():
+    parts = utils.parse_rrule("RRULE:FREQ=DAILY;COUNT=5", "2026-08-26T07:00:00+08:00")
+    assert parts == {"FREQ": "DAILY", "COUNT": "5"}
+
+
+def test_parse_rrule_rejects_empty_string():
+    with pytest.raises(ValueError, match="must not be empty"):
+        utils.parse_rrule("", "2026-08-26T07:00:00+08:00")
+    with pytest.raises(ValueError, match="must not be empty"):
+        utils.parse_rrule("RRULE:", "2026-08-26T07:00:00+08:00")
+
+
+def test_parse_rrule_rejects_missing_freq():
+    with pytest.raises(ValueError, match="FREQ"):
+        utils.parse_rrule("BYDAY=MO,TU", "2026-08-26T07:00:00+08:00")
+
+
+def test_parse_rrule_rejects_malformed_component():
+    with pytest.raises(ValueError, match="invalid recurrence rule component"):
+        utils.parse_rrule("FREQ=DAILY;BOGUS", "2026-08-26T07:00:00+08:00")
+
+
+def test_parse_rrule_rejects_unparseable_rule():
+    """A syntactically plausible but semantically invalid rule (an unknown
+    FREQ value) must be rejected, not silently accepted as valid RFC 5545
+    - this is exactly the class of bug the connector shipped with before:
+    a recurrence rule that only ever looks valid, never actually works."""
+    with pytest.raises(ValueError, match="invalid recurrence rule"):
+        utils.parse_rrule("FREQ=FORTNIGHTLY", "2026-08-26T07:00:00+08:00")
+
+
+def test_parse_rrule_rejects_bad_dtstart():
+    with pytest.raises(ValueError, match="invalid start time"):
+        utils.parse_rrule("FREQ=DAILY", "not-a-date")
+
+
 def test_url_path_id_output_survives_requests_url_normalization():
     """Confirms the actual exploit this guards against: a naively
     interpolated ".." collapses the path via requests' own URL

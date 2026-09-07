@@ -5,6 +5,9 @@ import urllib.request
 from typing import Any
 from urllib.parse import quote
 
+from dateutil import parser as _date_parser
+from dateutil.rrule import rrulestr as _rrulestr
+
 from ....config import get_tool_max_output_length
 
 
@@ -116,6 +119,68 @@ def success_with_capped_dict(field_name: str, data: Any) -> str:
         truncated = True
         response = _build(working, truncated)
     return response
+
+
+def ensure_rrule_prefix(rrule_text: str) -> str:
+    """Return `rrule_text` with a leading "RRULE:" if it doesn't already
+    have one, matching the prefix `parse_rrule` strips - kept in one place
+    so the two don't drift out of sync."""
+    body = rrule_text.strip()
+    return body if body.upper().startswith("RRULE:") else f"RRULE:{body}"
+
+
+def parse_rrule(rrule_text: str, dtstart: str) -> dict[str, str]:
+    """Validate an RFC 5545 RRULE string and return its components (FREQ,
+    INTERVAL, BYDAY, UNTIL, COUNT, ...) as a plain dict of upper-cased keys
+    to raw string values.
+
+    ``dtstart`` (an RFC3339/ISO8601 datetime, matching what these calendar
+    tools already require for start_time/start_datetime) anchors a
+    validation pass through ``dateutil.rrule.rrulestr`` so a rule that's
+    syntactically plausible but semantically broken (e.g. an UNTIL before
+    dtstart, or a nonsense FREQ) is rejected here rather than being sent to
+    Google/Outlook and either erroring opaquely or - worse - only ever
+    landing as inert description text, which is exactly the failure mode
+    reported against this connector before recurrence support existed.
+
+    The returned dict (rather than the parsed rrule object) is what
+    callers actually build a provider payload from: Google takes the RRULE
+    text close to verbatim, while Outlook needs these components
+    translated into Graph's own pattern/range structure - neither needs
+    dateutil's internal representation, just confirmation that the text is
+    valid RFC 5545.
+    """
+    body = rrule_text.strip()
+    if body.upper().startswith("RRULE:"):
+        body = body[len("RRULE:") :]
+    if not body:
+        raise ValueError("recurrence rule must not be empty")
+
+    parts: dict[str, str] = {}
+    for chunk in body.split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if "=" not in chunk:
+            raise ValueError(f"invalid recurrence rule component: {chunk!r}")
+        key, _, value = chunk.partition("=")
+        parts[key.strip().upper()] = value.strip()
+    if "FREQ" not in parts:
+        raise ValueError(
+            "recurrence rule must include FREQ, e.g. "
+            "'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;UNTIL=20260911T235959Z'"
+        )
+
+    try:
+        anchor = _date_parser.isoparse(dtstart)
+    except ValueError as exc:
+        raise ValueError(f"invalid start time for recurrence rule: {dtstart}") from exc
+    try:
+        _rrulestr(f"RRULE:{body}", dtstart=anchor)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"invalid recurrence rule {rrule_text!r}: {exc}") from exc
+
+    return parts
 
 
 def clamp_limit(limit: int, *, max_limit: int) -> int:

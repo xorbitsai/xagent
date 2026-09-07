@@ -7,7 +7,7 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build  # type: ignore
 from mcp.server.fastmcp import FastMCP
 
-from .utils import setup_proxy_env
+from .utils import ensure_rrule_prefix, parse_rrule, setup_proxy_env
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("calendar-mcp")
@@ -16,6 +16,14 @@ logger = logging.getLogger("calendar-mcp")
 setup_proxy_env()
 
 mcp = FastMCP("calendar-mcp")
+
+
+def _normalize_rrule(recurrence: str, dtstart: str) -> list[str]:
+    """Validate `recurrence` and return it as the single-item RRULE list
+    Google's `events` resource expects, with the "RRULE:" prefix added if
+    the caller omitted it."""
+    parse_rrule(recurrence, dtstart)
+    return [ensure_rrule_prefix(recurrence)]
 
 
 def get_calendar_service() -> Any:
@@ -86,15 +94,22 @@ def google_calendar_create_events(
     end_time: str,
     description: str | None = None,
     location: str | None = None,
+    recurrence: str | None = None,
 ) -> str:
     """
     Create a new event in Google Calendar.
     start_time and end_time must be RFC3339 formatted (e.g., '2024-01-01T10:00:00Z' or '2024-01-01T10:00:00-07:00').
+    recurrence, if given, is a single RFC 5545 RRULE string describing a
+    repeating series for this event (the "RRULE:" prefix is optional), e.g.
+    'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;UNTIL=20260911T235959Z' for "every
+    weekday until Sep 11, 2026". It's validated before being sent to
+    Google and rejected with a clear error if it can't be parsed, rather
+    than silently landing as inert text with no actual recurrence.
     """
     try:
         service = get_calendar_service()
 
-        event = {
+        event: dict[str, Any] = {
             "summary": summary,
             "start": {
                 "dateTime": start_time,
@@ -108,6 +123,8 @@ def google_calendar_create_events(
             event["description"] = description
         if location:
             event["location"] = location
+        if recurrence:
+            event["recurrence"] = _normalize_rrule(recurrence, start_time)
 
         created_event = (
             service.events().insert(calendarId="primary", body=event).execute()
@@ -141,10 +158,14 @@ def google_calendar_update_events(
     end_time: str | None = None,
     description: str | None = None,
     location: str | None = None,
+    recurrence: str | None = None,
 ) -> str:
     """
     Update an existing event in Google Calendar.
     start_time and end_time must be RFC3339 formatted if provided.
+    recurrence works like it does in google_calendar_create_events: a
+    single RFC 5545 RRULE string turns this event into a repeating series,
+    or replaces its existing one.
     """
     try:
         service = get_calendar_service()
@@ -162,6 +183,15 @@ def google_calendar_update_events(
             event["description"] = description
         if location:
             event["location"] = location
+        if recurrence:
+            effective_start = start_time or event.get("start", {}).get("dateTime")
+            if not effective_start:
+                raise ValueError(
+                    "could not determine the event's start time to validate "
+                    "the recurrence rule (it may be an all-day event); pass "
+                    "start_time explicitly"
+                )
+            event["recurrence"] = _normalize_rrule(recurrence, effective_start)
 
         updated_event = (
             service.events()

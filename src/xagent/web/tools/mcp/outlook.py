@@ -1,13 +1,23 @@
 import json
 import logging
 import os
+from datetime import date
 from typing import Any
 from urllib.parse import quote
 
 import requests
+from dateutil import parser as _date_parser
+from dateutil import tz as _tz
+from dateutil.rrule import FR as _FR
+from dateutil.rrule import MO as _MO
+from dateutil.rrule import SA as _SA
+from dateutil.rrule import SU as _SU
+from dateutil.rrule import TH as _TH
+from dateutil.rrule import TU as _TU
+from dateutil.rrule import WE as _WE
 from mcp.server.fastmcp import FastMCP
 
-from .utils import setup_proxy_env
+from .utils import parse_rrule, setup_proxy_env
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("outlook-mcp")
@@ -104,6 +114,127 @@ def _message_body(content: str, content_type: str) -> dict[str, str]:
     if normalized not in {"text", "html"}:
         raise ValueError("content_type must be either 'text' or 'html'")
     return {"contentType": normalized, "content": content}
+
+
+_RRULE_WEEKDAYS = [_MO, _TU, _WE, _TH, _FR, _SA, _SU]
+
+_RRULE_DAY_TO_GRAPH = {
+    "MO": "monday",
+    "TU": "tuesday",
+    "WE": "wednesday",
+    "TH": "thursday",
+    "FR": "friday",
+    "SA": "saturday",
+    "SU": "sunday",
+}
+
+
+def _rrule_until_to_date(until: str) -> str:
+    """Convert an RRULE UNTIL value ('20260911T235959Z' or a bare
+    '20260911') into the 'YYYY-MM-DD' form Graph's recurrenceRange wants."""
+    try:
+        return _date_parser.isoparse(until.strip()).date().isoformat()
+    except ValueError as exc:
+        raise ValueError(f"invalid UNTIL value in recurrence rule: {until}") from exc
+
+
+def _weekday_code_from_date(date_str: str) -> str:
+    """The RRULE two-letter day code (MO/TU/.../SU) for a 'YYYY-MM-DD' date."""
+    year, month, day = (int(part) for part in date_str.split("-"))
+    return str(_RRULE_WEEKDAYS[date(year, month, day).weekday()])
+
+
+def _build_graph_recurrence(
+    recurrence: str, start_datetime: str, timezone: str = "UTC"
+) -> dict[str, Any]:
+    """Translate an RFC 5545 RRULE string into the pattern/range object
+    Microsoft Graph's event.recurrence expects.
+
+    Graph has no "just take this RRULE text" input the way Google Calendar
+    does, so this maps the common cases Toby is expected to produce
+    (daily, weekly, absolute monthly, absolute yearly) and fails loudly on
+    anything else - a relative pattern like "second Tuesday of the month"
+    needs an index (first/second/.../last) Graph requires but an RRULE
+    without a numeric BYDAY prefix doesn't carry, so guessing here would
+    silently produce the wrong days rather than the ones actually asked
+    for.
+
+    start_datetime here is Outlook's own convention: a naive local
+    dateTime paired with a separate timeZone field, unlike Google's
+    RFC3339-with-offset. RFC 5545 requires a recurrence's UNTIL to be a
+    UTC value whenever DTSTART carries a timezone reference - which this
+    one does, just not embedded in the string - so it's localized with
+    `timezone` before validation; passing the bare naive string through
+    would make dateutil see a floating time and reject a (correct) UTC
+    UNTIL as a mismatch.
+    """
+    anchor = _date_parser.isoparse(start_datetime)
+    if anchor.tzinfo is None:
+        zone = _tz.gettz(timezone)
+        if zone is None:
+            raise ValueError(f"unknown timezone for recurrence rule: {timezone}")
+        anchor = anchor.replace(tzinfo=zone)
+    parts = parse_rrule(recurrence, anchor.isoformat())
+    freq = parts["FREQ"].upper()
+    interval = int(parts.get("INTERVAL", "1"))
+    start_date = start_datetime.split("T", 1)[0]
+
+    pattern: dict[str, Any]
+    if freq == "DAILY":
+        pattern = {"type": "daily", "interval": interval}
+    elif freq == "WEEKLY":
+        byday = parts.get("BYDAY")
+        days = (
+            [_RRULE_DAY_TO_GRAPH[code] for code in byday.split(",")]
+            if byday
+            else [_RRULE_DAY_TO_GRAPH[_weekday_code_from_date(start_date)]]
+        )
+        pattern = {"type": "weekly", "interval": interval, "daysOfWeek": days}
+    elif freq == "MONTHLY" and "BYMONTHDAY" in parts:
+        pattern = {
+            "type": "absoluteMonthly",
+            "interval": interval,
+            "dayOfMonth": int(parts["BYMONTHDAY"]),
+        }
+    elif freq == "YEARLY" and "BYMONTH" in parts and "BYMONTHDAY" in parts:
+        pattern = {
+            "type": "absoluteYearly",
+            "interval": interval,
+            "dayOfMonth": int(parts["BYMONTHDAY"]),
+            "month": int(parts["BYMONTH"]),
+        }
+    else:
+        raise ValueError(
+            f"unsupported recurrence pattern (FREQ={freq}); this connector "
+            "only translates DAILY, WEEKLY, MONTHLY with BYMONTHDAY, and "
+            "YEARLY with BYMONTH/BYMONTHDAY into an Outlook recurrence"
+        )
+
+    if "UNTIL" in parts:
+        range_: dict[str, Any] = {
+            "type": "endDate",
+            "startDate": start_date,
+            "endDate": _rrule_until_to_date(parts["UNTIL"]),
+        }
+    elif "COUNT" in parts:
+        range_ = {
+            "type": "numbered",
+            "startDate": start_date,
+            "numberOfOccurrences": int(parts["COUNT"]),
+        }
+    else:
+        range_ = {"type": "noEnd", "startDate": start_date}
+
+    # Graph otherwise defaults recurrenceTimeZone to the event's own
+    # already-configured start time zone, which this function has no way
+    # to know when start_datetime/timezone came from an update's fallback
+    # GET rather than the caller. Stamping it explicitly to the same
+    # `timezone` start_date/start_datetime were derived from keeps the
+    # range self-consistent with the pattern, instead of leaving it to an
+    # implicit default that may not match.
+    range_["recurrenceTimeZone"] = timezone
+
+    return {"pattern": pattern, "range": range_}
 
 
 @mcp.tool()
@@ -282,8 +413,18 @@ def outlook_create_event(
     location: str | None = None,
     attendees: list[str] | str | None = None,
     is_all_day: bool = False,
+    recurrence: str | None = None,
 ) -> str:
-    """Create an Outlook calendar event."""
+    """Create an Outlook calendar event.
+    recurrence, if given, is a single RFC 5545 RRULE string describing a
+    repeating series for this event (the "RRULE:" prefix is optional),
+    e.g. 'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;UNTIL=20260911T235959Z' for
+    "every weekday until Sep 11, 2026". Graph has no direct RRULE input,
+    so this is translated into its own structured recurrence - only
+    DAILY, WEEKLY, MONTHLY (with BYMONTHDAY), and YEARLY (with BYMONTH/
+    BYMONTHDAY) rules are supported; anything else is rejected with a
+    clear error rather than silently producing the wrong pattern.
+    """
     try:
         payload: dict[str, Any] = {
             "subject": subject,
@@ -297,6 +438,10 @@ def outlook_create_event(
             payload["location"] = {"displayName": location}
         if attendees:
             payload["attendees"] = _attendee_list(attendees)
+        if recurrence:
+            payload["recurrence"] = _build_graph_recurrence(
+                recurrence, start_datetime, timezone
+            )
 
         result = _graph_request("POST", "/me/events", body=payload)
         return _success(event=result)
@@ -316,8 +461,13 @@ def outlook_update_event(
     location: str | None = None,
     attendees: list[str] | str | None = None,
     is_all_day: bool | None = None,
+    recurrence: str | None = None,
 ) -> str:
-    """Update an existing Outlook calendar event."""
+    """Update an existing Outlook calendar event.
+    recurrence works like it does in outlook_create_event: a single RFC
+    5545 RRULE string turns this event into a repeating series, or
+    replaces its existing one.
+    """
     try:
         payload: dict[str, Any] = {}
         if subject is not None:
@@ -334,6 +484,30 @@ def outlook_update_event(
             payload["attendees"] = _attendee_list(attendees)
         if is_all_day is not None:
             payload["isAllDay"] = is_all_day
+        if recurrence:
+            effective_start = start_datetime
+            effective_timezone = timezone
+            if effective_start is None:
+                existing = _graph_request(
+                    "GET",
+                    f"/me/events/{quote(event_id, safe='')}",
+                    params={"$select": "start"},
+                )
+                effective_start = (existing.get("start") or {}).get("dateTime")
+                if not effective_start:
+                    raise ValueError(
+                        "could not determine the event's start time to "
+                        "validate the recurrence rule; pass start_datetime "
+                        "explicitly"
+                    )
+                # This GET sent no Prefer header, so Graph returned the
+                # value in UTC regardless of what `timezone` the caller
+                # passed - that parameter only pairs with a start_datetime
+                # the caller is ALSO providing, which isn't the case here.
+                effective_timezone = "UTC"
+            payload["recurrence"] = _build_graph_recurrence(
+                recurrence, effective_start, effective_timezone
+            )
 
         if not payload:
             raise ValueError("at least one field must be provided to update the event")

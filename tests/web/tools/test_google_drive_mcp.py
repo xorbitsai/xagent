@@ -205,6 +205,21 @@ def test_resolve_file_id_rejects_dot_segments_from_query_fallback(url):
     assert google_drive._resolve_file_id(url) == url
 
 
+@pytest.mark.parametrize("value", ["..", ".", "...", "~", "%2e%2e"])
+def test_resolve_file_id_rejects_dot_segments_from_bare_input(value):
+    """The bare-id fast path (no "/" or "?" at all, so it never reaches the
+    URL-handling code, or the query-fallback validation above) is the most
+    common call shape -- every caller normally passes a plain id, not a
+    URL -- and was left completely unvalidated. A literal file_id=".."
+    reaches google_drive_delete_file (which "skips the trash and
+    permanently deletes") as fileId=".." verbatim, which dot-segment
+    normalization can collapse into an unrelated endpoint -- the exact risk
+    the query-fallback case above is already guarded against, just
+    reachable more directly here."""
+    with pytest.raises(ValueError, match="file_id must look like a Drive id"):
+        google_drive._resolve_file_id(value)
+
+
 def test_resolve_file_id_query_fallback_respects_published_link_exclusion():
     """The path pattern's "(?!e/)" exclusion for published-to-web links
     must not be bypassable by simply appending "?id=<anything>": the query
@@ -1093,6 +1108,20 @@ def test_delete_file_tolerates_ssl_eof_on_204_response(monkeypatch):
     result = json.loads(google_drive.google_drive_delete_file("fid"))
 
     assert result["status"] == "success"
+
+
+def test_delete_file_rejects_dot_segment_file_id_before_calling_the_api(monkeypatch):
+    """google_drive_delete_file "skips the trash and permanently deletes" --
+    a literal file_id=".." reaching the API as a dot-segment fileId is the
+    highest-stakes reachable case of the bare-input validation gap."""
+    get_service = Mock()
+    monkeypatch.setattr(google_drive, "get_drive_service", get_service)
+
+    result = json.loads(google_drive.google_drive_delete_file(".."))
+
+    assert result["status"] == "error"
+    assert "file_id must look like a Drive id" in result["message"]
+    get_service.assert_not_called()
 
 
 def test_remove_permission_tolerates_ssl_eof_on_204_response(monkeypatch):

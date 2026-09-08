@@ -29,14 +29,29 @@ mcp = FastMCP("google-drive-mcp")
 # A Drive/Docs/Sheets/Slides/Forms/Drawings id is always [a-zA-Z0-9_-]+.
 _DRIVE_ID_CHARS = re.compile(r"[a-zA-Z0-9_-]+")
 
-# Matches the id segment out of any of the common share-link shapes, since a
-# user (and therefore a model relaying the user's words) is far more likely
-# to hand over the URL they see in the browser than the bare id. The
-# optional "u/<n>/" branch tolerates the account-index segment Google
+# The share-link path prefixes _resolve_file_id recognizes, as one source
+# of truth for both patterns below -- so adding a new Drive-family surface
+# (this PR already added forms/drawings once) means editing this tuple
+# once, not two hand-copied regex literals that could silently drift apart.
+# The optional "u/<n>/" branch tolerates the account-index segment Google
 # inserts (e.g. ".../file/u/1/d/<id>/view") whenever more than one Google
 # account is signed into the browser -- see google_sheets.py's identical
-# (?:u/\d+/)? tolerance for the spreadsheets URL shape. "(?!e/)" after each
-# "d/" excludes the "published to web" link shape
+# (?:u/\d+/)? tolerance for the spreadsheets URL shape.
+_DRIVE_PATH_PREFIXES = (
+    r"file/(?:u/\d+/)?d",
+    r"folders",
+    r"document/(?:u/\d+/)?d",
+    r"spreadsheets/(?:u/\d+/)?d",
+    r"presentation/(?:u/\d+/)?d",
+    r"forms/(?:u/\d+/)?d",
+    r"drawings/(?:u/\d+/)?d",
+)
+_DRIVE_PATH_ALTERNATION = "|".join(_DRIVE_PATH_PREFIXES)
+
+# Matches the id segment out of any of the common share-link shapes, since a
+# user (and therefore a model relaying the user's words) is far more likely
+# to hand over the URL they see in the browser than the bare id. "(?!e/)"
+# after each "d/" excludes the "published to web" link shape
 # (".../d/e/<publish-id>/pubhtml"): that "e" is a literal path segment, not
 # part of the id, and the real Drive file id isn't present in that URL at
 # all -- the published-to-web token isn't a valid fileId, so this must not
@@ -45,25 +60,20 @@ _DRIVE_ID_CHARS = re.compile(r"[a-zA-Z0-9_-]+")
 # the whole raw string, so a match can't come from an unrelated substring
 # elsewhere in the URL (e.g. a query value).
 _DRIVE_PATH_ID_PATTERN = re.compile(
-    r"/(?:file/(?:u/\d+/)?d|folders|document/(?:u/\d+/)?d"
-    r"|spreadsheets/(?:u/\d+/)?d|presentation/(?:u/\d+/)?d"
-    r"|forms/(?:u/\d+/)?d|drawings/(?:u/\d+/)?d)/(?!e/)"
-    rf"({_DRIVE_ID_CHARS.pattern})"
+    rf"/(?:{_DRIVE_PATH_ALTERNATION})/(?!e/)({_DRIVE_ID_CHARS.pattern})"
 )
 
-# Same alternation as _DRIVE_PATH_ID_PATTERN but without the id-capturing
-# group or the "(?!e/)" exclusion -- used only to recognize that a path *is*
-# one of these share-link shapes at all, including the shapes deliberately
-# excluded above (e.g. the published-to-web "/d/e/" form). See
-# _resolve_file_id: a path matching this but not _DRIVE_PATH_ID_PATTERN was
-# recognized-and-rejected, not merely unrecognized, and must not fall
-# through to the "?id=" query fallback below -- otherwise the fallback would
-# re-derive an id from the very link shape the exclusion above refused.
-_DRIVE_PATH_SHAPE_PATTERN = re.compile(
-    r"/(?:file/(?:u/\d+/)?d|folders|document/(?:u/\d+/)?d"
-    r"|spreadsheets/(?:u/\d+/)?d|presentation/(?:u/\d+/)?d"
-    r"|forms/(?:u/\d+/)?d|drawings/(?:u/\d+/)?d)/"
-)
+# Same alternation as _DRIVE_PATH_ID_PATTERN, built from the same
+# _DRIVE_PATH_ALTERNATION so the two can't drift apart, but without the
+# id-capturing group or the "(?!e/)" exclusion -- used only to recognize
+# that a path *is* one of these share-link shapes at all, including the
+# shapes deliberately excluded above (e.g. the published-to-web "/d/e/"
+# form). See _resolve_file_id: a path matching this but not
+# _DRIVE_PATH_ID_PATTERN was recognized-and-rejected, not merely
+# unrecognized, and must not fall through to the "?id=" query fallback
+# below -- otherwise the fallback would re-derive an id from the very link
+# shape the exclusion above refused.
+_DRIVE_PATH_SHAPE_PATTERN = re.compile(rf"/(?:{_DRIVE_PATH_ALTERNATION})/")
 
 # Hosts _resolve_file_id treats as an authoritative Drive/Docs/Sheets/Slides
 # share link. Without this check, an untrusted URL (e.g. quoted inside a
@@ -114,8 +124,15 @@ def _resolve_file_id(file_id: str, field_name: str = "file_id") -> str:
 
     A real Drive id is always ``[a-zA-Z0-9_-]+`` (``_DRIVE_ID_CHARS``) and
     never contains "/" or "?", so only a value containing one of those
-    characters is even considered URL-shaped; a bare id short-circuits
-    immediately. Empty/whitespace-only input is rejected outright (matching
+    characters is even considered URL-shaped; anything else is the bare-id
+    case and is validated against that same character class before being
+    accepted (not returned unvalidated) -- otherwise a literal ``".."``
+    (no "/" or "?", so it never reaches the URL-handling code below at all)
+    would reach the Drive API as a request whose fileId is a dot-segment,
+    which normalization can collapse into an unrelated endpoint; this is
+    the same risk the "?id=" query fallback further down is validated
+    against, just reachable directly instead of via a URL. Empty/
+    whitespace-only input is rejected outright (matching
     ``require_clean_identifier``'s treatment of ``email``/``permission_id``
     elsewhere in this file) rather than silently resolving to ``""``, which
     would otherwise reach the Drive API as a request against the bare
@@ -154,6 +171,8 @@ def _resolve_file_id(file_id: str, field_name: str = "file_id") -> str:
     if not stripped:
         raise ValueError(f"{field_name} must be a non-empty id")
     if not re.search(r"[/?]", stripped):
+        if not _DRIVE_ID_CHARS.fullmatch(stripped):
+            raise ValueError(f"{field_name} must look like a Drive id")
         return stripped
     try:
         parsed = urlparse(stripped)

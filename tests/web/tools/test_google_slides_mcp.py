@@ -690,6 +690,33 @@ async def test_add_slide_rejects_unknown_layout_via_mcp_layer(monkeypatch):
     presentations.batchUpdate.assert_not_called()
 
 
+async def test_add_slide_normalizes_layout_via_mcp_layer(monkeypatch):
+    """Regression guard: `layout`'s Literal type is validated by FastMCP's
+    Pydantic layer *before* the function body runs — a naive Literal
+    annotation would reject a differently-cased/spaced value there,
+    making the function's own layout.strip().upper() dead code for every
+    real (non-test, non-direct-call) caller. `_normalize_layout` must run
+    as a BeforeValidator so normalization happens ahead of the Literal
+    check, not after it."""
+    presentations = Mock()
+    presentations.batchUpdate.return_value.execute.return_value = {}
+    _mock_slides_service(monkeypatch, presentations)
+
+    content, _ = await google_slides.mcp.call_tool(
+        "google_slides_add_slide",
+        {
+            "presentation_id": "pres1",
+            "title": "T",
+            "body": "detail",
+            "layout": " title_and_body ",
+        },
+    )
+
+    result = json.loads(content[0].text)
+    assert result["status"] == "success"
+    assert result["layout"] == "TITLE_AND_BODY"
+
+
 def test_get_presentation_returns_slide_summaries(monkeypatch):
     presentations = Mock()
     presentations.get.return_value.execute.return_value = {

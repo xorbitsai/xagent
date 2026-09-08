@@ -3,11 +3,12 @@ import logging
 import os
 import re
 import uuid
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build  # type: ignore[import-not-found]
 from mcp.server.fastmcp import FastMCP
+from pydantic import BeforeValidator
 
 from .utils import resolve_id_from_url, setup_proxy_env
 
@@ -22,7 +23,22 @@ mcp = FastMCP("google-slides-mcp")
 _PRESENTATION_URL_ID_PATTERN = re.compile(r"/presentation/d/([a-zA-Z0-9_-]+)")
 
 
-_Layout = Literal["TITLE", "TITLE_AND_BODY", "TITLE_ONLY", "SECTION_HEADER", "BLANK"]
+def _normalize_layout(value: object) -> object:
+    """Case/whitespace-normalize `layout` before FastMCP's Pydantic layer
+    validates it against the Literal below. Without this, an MCP tool
+    call (the only way a real agent ever invokes this tool — direct
+    Python calls, used by this file's own tests, bypass FastMCP
+    validation entirely) with e.g. "title_and_body" would be rejected by
+    Pydantic's case-sensitive Literal check *before* the function body's
+    own normalization ever ran, making that normalization dead code for
+    every real caller."""
+    return value.strip().upper() if isinstance(value, str) else value
+
+
+_Layout = Annotated[
+    Literal["TITLE", "TITLE_AND_BODY", "TITLE_ONLY", "SECTION_HEADER", "BLANK"],
+    BeforeValidator(_normalize_layout),
+]
 
 # Predefined layouts we know how to fill in, mapped to the (title_placeholder,
 # body_placeholder) types Slides creates for each one. `None` means that slot

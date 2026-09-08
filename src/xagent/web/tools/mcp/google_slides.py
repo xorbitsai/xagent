@@ -3,7 +3,7 @@ import logging
 import os
 import re
 import uuid
-from typing import Any, NamedTuple
+from typing import Any, Literal
 
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build  # type: ignore[import-not-found]
@@ -22,23 +22,14 @@ mcp = FastMCP("google-slides-mcp")
 _PRESENTATION_URL_ID_PATTERN = re.compile(r"/presentation/d/([a-zA-Z0-9_-]+)")
 
 
-class _LayoutSpec(NamedTuple):
-    """(title_placeholder, body_placeholder) types Slides creates for a
-    predefined layout, plus the two policies that depend on that shape:
-    `bulleted` (does body land in a real list-style BODY placeholder?) and
-    `body_required` (must body be non-empty?). Kept as explicit fields
-    instead of comparing `body_placeholder == "BODY"` at each call site, so
-    a future layout can't silently pick up the wrong policy just because
-    its body placeholder happens to be named "BODY"."""
+_Layout = Literal["TITLE", "TITLE_AND_BODY", "TITLE_ONLY", "SECTION_HEADER", "BLANK"]
 
-    title_placeholder: str | None
-    body_placeholder: str | None
-    bulleted: bool
-    body_required: bool
-
-
-# Predefined layouts we know how to fill in. `None` means that slot doesn't
-# exist on the layout at all.
+# Predefined layouts we know how to fill in, mapped to the (title_placeholder,
+# body_placeholder) types Slides creates for each one. `None` means that slot
+# doesn't exist on the layout at all. This table only records that factual
+# placeholder shape; `is_bulleted`/`body_required` policy is derived from it
+# once in google_slides_add_slide (both happen to be True only for
+# TITLE_AND_BODY today, i.e. exactly when body_placeholder == "BODY").
 #
 # Deliberately limited to the layouts whose placeholder composition is well
 # established (matching Google's official Apps Script PredefinedLayout docs
@@ -48,55 +39,79 @@ class _LayoutSpec(NamedTuple):
 # (SECTION_TITLE_AND_DESCRIPTION, ONE_COLUMN_TEXT, MAIN_POINT, BIG_NUMBER)
 # are intentionally left out rather than guessed at — use
 # google_slides_batch_update for those until verified against a live API.
-_LAYOUT_PLACEHOLDERS: dict[str, _LayoutSpec] = {
-    "TITLE": _LayoutSpec(
-        "CENTERED_TITLE", "SUBTITLE", bulleted=False, body_required=False
-    ),
-    "TITLE_AND_BODY": _LayoutSpec("TITLE", "BODY", bulleted=True, body_required=True),
-    "TITLE_ONLY": _LayoutSpec("TITLE", None, bulleted=False, body_required=False),
-    "SECTION_HEADER": _LayoutSpec("TITLE", None, bulleted=False, body_required=False),
-    "BLANK": _LayoutSpec(None, None, bulleted=False, body_required=False),
+_LAYOUT_PLACEHOLDERS: dict[str, tuple[str | None, str | None]] = {
+    "TITLE": ("CENTERED_TITLE", "SUBTITLE"),
+    "TITLE_AND_BODY": ("TITLE", "BODY"),
+    "TITLE_ONLY": ("TITLE", None),
+    "SECTION_HEADER": ("TITLE", None),
+    "BLANK": (None, None),
 }
 
 # Leading "•"/"-"/"*" marker at the start of a line, with or without a
-# following space so a marker glued to a word (e.g. "•First") is still
-# recognized. Captures any leading whitespace so it survives the
-# substitution — Slides' createParagraphBullets infers nesting level from
-# leading tab characters in the inserted text, so stripping only the
-# marker (not the indentation in front of it) keeps multi-level bullets
-# intact.
+# following space (so a marker glued to a word, e.g. "•First", or with
+# nothing after it at all, e.g. a bare "•" on its own line, is still
+# recognized). Captures any leading Unicode whitespace so it can be
+# converted to nesting-level tabs by _leading_whitespace_to_tabs below.
 #
 # "-" and "*" also have common non-bullet meanings, so the "glued, no
 # space" case is deliberately narrower for them than for "•" (which has no
 # other meaning in plain text):
-#   - "-" glued to a digit ("-5% growth") or another "-" ("-- Author") is
-#     left alone entirely, so a negative number's sign or an em-dash
-#     convention is never silently eaten.
+#   - "-" is only glued-recognized when followed directly by a letter
+#     ("-Nospace"); anything else — a digit, another "-", a currency
+#     symbol, a decimal point — is left alone, so a negative number's
+#     sign ("-5%", "-$5m", "-.5%") or an em-dash/en-dash convention
+#     ("-- Author", "-– Author") is never silently eaten.
 #   - "*" is only treated as a marker when followed by real whitespace
-#     ("* item"); a bare glued "*" ("*emphasis* text") is left alone so
-#     markdown-style emphasis isn't corrupted.
+#     ("* item") or nothing; a bare glued "*" ("*emphasis* text") is left
+#     alone so markdown-style emphasis isn't corrupted.
 _BULLET_PREFIX_PATTERN = re.compile(
-    r"^([ \t]*)(?:"
-    r"•(?:[ \t]+|(?=\S))"
-    r"|-(?:[ \t]+|(?=[^\s\d\-]))"
-    r"|\*[ \t]+"
+    r"^(\s*)(?:"
+    r"•(?:[ \t]+|(?=\S)|$)"
+    r"|-(?:[ \t]+|(?=[^\W\d_])|$)"
+    r"|\*(?:[ \t]+|$)"
     r")"
 )
 
 
+def _leading_whitespace_to_tabs(leading: str) -> str:
+    """Convert captured leading whitespace into the literal tab
+    characters Slides' createParagraphBullets actually uses to infer
+    nesting level (plain spaces are otherwise inserted as literal,
+    non-nesting text). Each literal tab in the input counts as one level;
+    otherwise every 2 spaces — the typical hand-typed nested-bullet
+    convention — counts as one level, with any non-empty indentation
+    counting as at least one level."""
+    if not leading:
+        return ""
+    level = leading.count("\t") or max(1, len(leading) // 2)
+    return "\t" * level
+
+
 def _strip_bullet_prefixes(text: str) -> str:
-    """Drop a leading "•"/"-"/"*" marker from each line, preserving any
-    leading whitespace before it. See _BULLET_PREFIX_PATTERN for the
-    narrower rules that keep this from corrupting non-bullet content.
+    """Drop a leading "•"/"-"/"*" marker from each line — repeatedly, so a
+    line with more than one leading marker (e.g. "• - nested") is fully
+    unwrapped rather than leaving a residual marker as literal text — and
+    convert any leading indentation into nesting-level tabs. See
+    _BULLET_PREFIX_PATTERN for the narrower rules that keep this from
+    corrupting non-bullet content.
 
     The public docstrings tell callers not to type literal bullet glyphs,
     but callers may do so anyway; once we ask Slides to render real
     bulleted paragraphs (see createParagraphBullets below) those glyphs
     would double up with Slides' own bullet, so strip them first.
     """
-    return "\n".join(
-        _BULLET_PREFIX_PATTERN.sub(r"\1", line) for line in text.split("\n")
-    )
+
+    def _strip_line(line: str) -> str:
+        while True:
+            match = _BULLET_PREFIX_PATTERN.match(line)
+            if match is None:
+                return line
+            stripped = _leading_whitespace_to_tabs(match.group(1)) + line[match.end() :]
+            if stripped == line:
+                return line
+            line = stripped
+
+    return "\n".join(_strip_line(line) for line in text.split("\n"))
 
 
 def _error(message: str) -> str:
@@ -215,7 +230,7 @@ def google_slides_add_slide(
     presentation_id: str,
     title: str = "",
     body: str = "",
-    layout: str = "TITLE_AND_BODY",
+    layout: _Layout = "TITLE_AND_BODY",
 ) -> str:
     """
     Append a slide with a title and body text to a Google Slides presentation.
@@ -235,42 +250,53 @@ def google_slides_add_slide(
       - "BLANK": no placeholders at all; use google_slides_batch_update to
         add free-form text boxes/images instead.
 
-    Layouts that don't already require a body (i.e. everything except
-    TITLE_AND_BODY) still need at least a non-empty title — or, for
+    Layouts with a title placeholder that don't already require a body
+    (TITLE, TITLE_ONLY, SECTION_HEADER — not TITLE_AND_BODY, whose own
+    body-required rule above already covers it, and not BLANK, which has
+    no title placeholder) still need at least a non-empty title — or, for
     "TITLE", a non-empty body/subtitle instead — since otherwise the call
     would produce a completely empty slide; that combination is rejected.
     """
     try:
-        if layout not in _LAYOUT_PLACEHOLDERS:
+        title = title.replace("\r\n", "\n").replace("\r", "\n")
+        body = body.replace("\r\n", "\n").replace("\r", "\n")
+        normalized_layout = layout.strip().upper()
+
+        if normalized_layout not in _LAYOUT_PLACEHOLDERS:
             return _error(
                 f"Unknown layout '{layout}'. Supported layouts: "
                 f"{', '.join(sorted(_LAYOUT_PLACEHOLDERS))}"
             )
 
-        title_placeholder, body_placeholder, is_bulleted, body_required = (
-            _LAYOUT_PLACEHOLDERS[layout]
-        )
+        title_placeholder, body_placeholder = _LAYOUT_PLACEHOLDERS[normalized_layout]
+        is_bulleted = body_required = body_placeholder == "BODY"
         if is_bulleted and body:
             body = _strip_bullet_prefixes(body)
+            # Drop lines left blank by stripping a bare marker, or blank
+            # lines/a trailing newline already in the input — otherwise
+            # createParagraphBullets (applied to the whole text range
+            # below) puts a bullet glyph on an empty paragraph, a visibly
+            # floating bullet point.
+            body = "\n".join(line for line in body.split("\n") if line.strip())
 
         if title and title_placeholder is None:
             return _error(
-                f"layout '{layout}' has no title placeholder, so "
-                "'title' would be silently dropped. Use a different "
+                f"layout '{normalized_layout}' has no title placeholder, "
+                "so 'title' would be silently dropped. Use a different "
                 "layout, or google_slides_batch_update for a custom "
                 "text box."
             )
         if body and body_placeholder is None:
             return _error(
-                f"layout '{layout}' has no body placeholder, so "
-                "'body' would be silently dropped. Use a layout "
+                f"layout '{normalized_layout}' has no body placeholder, "
+                "so 'body' would be silently dropped. Use a layout "
                 "with a body/subtitle placeholder (e.g. "
                 "TITLE_AND_BODY, TITLE) or omit body."
             )
         if body_required and not body.strip():
             return _error(
-                f"layout '{layout}' expects body content but none "
-                "was provided. Include this slide's full bullet/"
+                f"layout '{normalized_layout}' expects body content but "
+                "none was provided. Include this slide's full bullet/"
                 "detail text in 'body' — don't create the slide "
                 "with just a title."
             )
@@ -281,7 +307,8 @@ def google_slides_add_slide(
             and not body.strip()
         ):
             return _error(
-                f"layout '{layout}' needs at least a non-empty 'title'"
+                f"layout '{normalized_layout}' needs at least a non-empty "
+                "'title'"
                 + (" or 'body'" if body_placeholder is not None else "")
                 + " — as given, this call would create a completely "
                 "empty slide."
@@ -312,14 +339,16 @@ def google_slides_add_slide(
 
         create_slide: dict[str, Any] = {
             "objectId": slide_id,
-            "slideLayoutReference": {"predefinedLayout": layout},
+            "slideLayoutReference": {"predefinedLayout": normalized_layout},
         }
         if placeholder_mappings:
             create_slide["placeholderIdMappings"] = placeholder_mappings
 
         requests: list[dict[str, Any]] = [{"createSlide": create_slide}]
         if title.strip():
-            requests.append({"insertText": {"objectId": title_id, "text": title}})
+            requests.append(
+                {"insertText": {"objectId": title_id, "text": title.strip()}}
+            )
         if body.strip():
             requests.append({"insertText": {"objectId": body_id, "text": body}})
             if is_bulleted:
@@ -342,6 +371,7 @@ def google_slides_add_slide(
                 "status": "success",
                 "presentation_id": pres_id,
                 "slide_id": slide_id,
+                "layout": normalized_layout,
             },
             ensure_ascii=False,
         )

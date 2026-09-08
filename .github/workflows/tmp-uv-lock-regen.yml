@@ -8,7 +8,14 @@ name: TEMP - regenerate uv.lock (manual, one-off)
 # Delete this file once that's done - it's not meant to be merged.
 
 on:
-  workflow_dispatch:
+  # workflow_dispatch would be simpler, but GitHub refuses to dispatch a
+  # workflow that isn't already present on the repo's default branch - and
+  # this one is deliberately scoped to this feature branch only. `push`
+  # doesn't have that restriction, so it fires as soon as this file lands
+  # here (and again on every subsequent push, harmlessly re-running).
+  push:
+    branches:
+      - fix/recurring-calendar-events
 
 jobs:
   regen:

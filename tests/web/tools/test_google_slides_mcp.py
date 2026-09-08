@@ -76,6 +76,7 @@ def test_add_slide_default_layout_creates_title_and_body_with_bullets(monkeypatc
     )
     assert bullets_req["objectId"] == mappings["BODY"]
     assert bullets_req["textRange"] == {"type": "ALL"}
+    assert bullets_req["bulletPreset"] == "BULLET_DISC_CIRCLE_SQUARE"
 
     # createParagraphBullets must come after the insertText that populates
     # the body — applying it to an empty range fails against the real API.
@@ -96,13 +97,17 @@ def test_add_slide_strips_literal_bullet_markers_before_inserting(monkeypatch):
     _mock_slides_service(monkeypatch, presentations)
 
     body = "• First point\n- Second point\n* Third point\nFourth point (no marker)"
-    google_slides.google_slides_add_slide("pres1", title="T", body=body)
+    result = json.loads(
+        google_slides.google_slides_add_slide("pres1", title="T", body=body)
+    )
 
+    assert result["status"] == "success"
     requests = _batch_update_requests(presentations)
+    body_object_id = _placeholder_object_id(requests[0]["createSlide"], "BODY")
     body_text = next(
         r["insertText"]["text"]
         for r in requests
-        if "insertText" in r and "First point" in r["insertText"]["text"]
+        if "insertText" in r and r["insertText"]["objectId"] == body_object_id
     )
     assert body_text == (
         "First point\nSecond point\nThird point\nFourth point (no marker)"
@@ -117,15 +122,19 @@ def test_add_slide_strips_marker_glued_to_text_without_trailing_space(monkeypatc
     presentations.batchUpdate.return_value.execute.return_value = {}
     _mock_slides_service(monkeypatch, presentations)
 
-    google_slides.google_slides_add_slide(
-        "pres1", title="T", body="•First point\n-Nospace"
+    result = json.loads(
+        google_slides.google_slides_add_slide(
+            "pres1", title="T", body="•First point\n-Nospace"
+        )
     )
 
+    assert result["status"] == "success"
     requests = _batch_update_requests(presentations)
+    body_object_id = _placeholder_object_id(requests[0]["createSlide"], "BODY")
     body_text = next(
         r["insertText"]["text"]
         for r in requests
-        if "insertText" in r and "First point" in r["insertText"]["text"]
+        if "insertText" in r and r["insertText"]["objectId"] == body_object_id
     )
     assert body_text == "First point\nNospace"
 
@@ -140,19 +149,71 @@ def test_add_slide_preserves_nested_bullet_indentation(monkeypatch):
     _mock_slides_service(monkeypatch, presentations)
 
     body = "- Top\n  - Nested\n    - Deeper"
-    google_slides.google_slides_add_slide("pres1", title="T", body=body)
+    result = json.loads(
+        google_slides.google_slides_add_slide("pres1", title="T", body=body)
+    )
 
+    assert result["status"] == "success"
     requests = _batch_update_requests(presentations)
+    body_object_id = _placeholder_object_id(requests[0]["createSlide"], "BODY")
     body_text = next(
         r["insertText"]["text"]
         for r in requests
-        if "insertText" in r and "Top" in r["insertText"]["text"]
+        if "insertText" in r and r["insertText"]["objectId"] == body_object_id
     )
     # Slides infers nesting level from leading *tabs*, not spaces — plain
     # spaces would just be inserted as literal, non-nesting text — so
     # 2-space indentation must be converted to real tab characters, one
     # tab per level, for the nesting to actually render in Slides.
     assert body_text == "Top\n\tNested\n\t\tDeeper"
+
+
+def test_add_slide_preserves_literal_tab_indentation(monkeypatch):
+    """A caller who already typed real tab characters (rather than
+    spaces) for nesting must have them preserved 1:1 — this is the input
+    shape Slides' createParagraphBullets actually keys off."""
+    presentations = Mock()
+    presentations.batchUpdate.return_value.execute.return_value = {}
+    _mock_slides_service(monkeypatch, presentations)
+
+    body = "- Top\n\t- Nested\n\t\t- Deeper"
+    result = json.loads(
+        google_slides.google_slides_add_slide("pres1", title="T", body=body)
+    )
+
+    assert result["status"] == "success"
+    requests = _batch_update_requests(presentations)
+    body_object_id = _placeholder_object_id(requests[0]["createSlide"], "BODY")
+    body_text = next(
+        r["insertText"]["text"]
+        for r in requests
+        if "insertText" in r and r["insertText"]["objectId"] == body_object_id
+    )
+    assert body_text == "Top\n\tNested\n\t\tDeeper"
+
+
+def test_add_slide_mixed_tab_and_space_indentation_uses_tab_count_only(monkeypatch):
+    """Documented limitation: mixing tabs and spaces in one line's leading
+    whitespace is not combined — if any tab is present, the tab count
+    wins and spaces in that same run are ignored."""
+    presentations = Mock()
+    presentations.batchUpdate.return_value.execute.return_value = {}
+    _mock_slides_service(monkeypatch, presentations)
+
+    body = "- Top\n\t  - Mixed"
+    result = json.loads(
+        google_slides.google_slides_add_slide("pres1", title="T", body=body)
+    )
+
+    assert result["status"] == "success"
+    requests = _batch_update_requests(presentations)
+    body_object_id = _placeholder_object_id(requests[0]["createSlide"], "BODY")
+    body_text = next(
+        r["insertText"]["text"]
+        for r in requests
+        if "insertText" in r and r["insertText"]["objectId"] == body_object_id
+    )
+    assert body_text == "Top\n\tMixed"
 
 
 def test_add_slide_does_not_corrupt_non_bullet_content_starting_with_marker_chars(
@@ -173,13 +234,17 @@ def test_add_slide_does_not_corrupt_non_bullet_content_starting_with_marker_char
         "-5% growth\n-$5m loss\n-.5% decline\n-- Author Name\n-– Author\n"
         "**Note\n*emphasis* not a bullet"
     )
-    google_slides.google_slides_add_slide("pres1", title="T", body=body)
+    result = json.loads(
+        google_slides.google_slides_add_slide("pres1", title="T", body=body)
+    )
 
+    assert result["status"] == "success"
     requests = _batch_update_requests(presentations)
+    body_object_id = _placeholder_object_id(requests[0]["createSlide"], "BODY")
     body_text = next(
         r["insertText"]["text"]
         for r in requests
-        if "insertText" in r and "growth" in r["insertText"]["text"]
+        if "insertText" in r and r["insertText"]["objectId"] == body_object_id
     )
     assert body_text == body
 
@@ -194,15 +259,19 @@ def test_add_slide_strips_bare_marker_with_nothing_after_it(monkeypatch):
     presentations.batchUpdate.return_value.execute.return_value = {}
     _mock_slides_service(monkeypatch, presentations)
 
-    google_slides.google_slides_add_slide(
-        "pres1", title="T", body="Point one\n•\nPoint two"
+    result = json.loads(
+        google_slides.google_slides_add_slide(
+            "pres1", title="T", body="Point one\n•\nPoint two"
+        )
     )
 
+    assert result["status"] == "success"
     requests = _batch_update_requests(presentations)
+    body_object_id = _placeholder_object_id(requests[0]["createSlide"], "BODY")
     body_text = next(
         r["insertText"]["text"]
         for r in requests
-        if "insertText" in r and "Point one" in r["insertText"]["text"]
+        if "insertText" in r and r["insertText"]["objectId"] == body_object_id
     )
     assert body_text == "Point one\nPoint two"
 
@@ -385,6 +454,23 @@ def test_add_slide_rejects_unknown_layout(monkeypatch):
     presentations.batchUpdate.assert_not_called()
 
 
+def test_add_slide_rejects_non_string_layout_from_direct_call(monkeypatch):
+    """layout's Literal typing is only enforced by FastMCP's validation
+    layer, which a direct Python call bypasses entirely — a non-string
+    value (e.g. an int) must still surface as a clean error rather than
+    an unhandled AttributeError from calling .strip() on it."""
+    presentations = Mock()
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(
+        google_slides.google_slides_add_slide("pres1", title="T", layout=123)
+    )
+
+    assert result["status"] == "error"
+    assert "'layout' must be a string" in result["message"]
+    presentations.batchUpdate.assert_not_called()
+
+
 @pytest.mark.parametrize("layout", ["TITLE_ONLY", "SECTION_HEADER"])
 def test_add_slide_rejects_body_on_layout_without_body_placeholder(monkeypatch, layout):
     """Regression guard: these layouts have no body placeholder, so silently
@@ -402,6 +488,42 @@ def test_add_slide_rejects_body_on_layout_without_body_placeholder(monkeypatch, 
     assert result["status"] == "error"
     assert "has no body placeholder" in result["message"]
     presentations.batchUpdate.assert_not_called()
+
+
+@pytest.mark.parametrize("layout", ["TITLE_ONLY", "SECTION_HEADER"])
+def test_add_slide_allows_whitespace_only_body_on_layout_without_body_placeholder(
+    monkeypatch, layout
+):
+    """Regression guard: the "no body placeholder" rejection must key off
+    stripped content, matching insertion (which already treats a
+    whitespace-only body as absent) — otherwise body="\\n" is hard-rejected
+    even though nothing would actually have been dropped."""
+    presentations = Mock()
+    presentations.batchUpdate.return_value.execute.return_value = {}
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(
+        google_slides.google_slides_add_slide(
+            "pres1", title="T", body="\n", layout=layout
+        )
+    )
+
+    assert result["status"] == "success"
+
+
+def test_add_slide_allows_whitespace_only_title_on_blank_layout(monkeypatch):
+    """Regression guard, symmetric with the above: BLANK has no title
+    placeholder either, and a whitespace-only title must not be
+    hard-rejected when it would be treated as absent anyway."""
+    presentations = Mock()
+    presentations.batchUpdate.return_value.execute.return_value = {}
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(
+        google_slides.google_slides_add_slide("pres1", title="   ", layout="BLANK")
+    )
+
+    assert result["status"] == "success"
 
 
 def test_add_slide_rejects_missing_body_for_content_layout(monkeypatch):
@@ -451,17 +573,47 @@ def test_add_slide_title_layout_preserves_literal_dash_in_subtitle(monkeypatch):
     presentations.batchUpdate.return_value.execute.return_value = {}
     _mock_slides_service(monkeypatch, presentations)
 
-    google_slides.google_slides_add_slide(
-        "pres1", title="Guide", body="- The Complete Guide", layout="TITLE"
+    result = json.loads(
+        google_slides.google_slides_add_slide(
+            "pres1", title="Guide", body="- The Complete Guide", layout="TITLE"
+        )
     )
 
+    assert result["status"] == "success"
     requests = _batch_update_requests(presentations)
+    subtitle_object_id = _placeholder_object_id(requests[0]["createSlide"], "SUBTITLE")
     body_text = next(
         r["insertText"]["text"]
         for r in requests
-        if "insertText" in r and "Complete Guide" in r["insertText"]["text"]
+        if "insertText" in r and r["insertText"]["objectId"] == subtitle_object_id
     )
     assert body_text == "- The Complete Guide"
+
+
+def test_add_slide_drops_blank_lines_on_non_bulleted_body(monkeypatch):
+    """Blank-line filtering must not be limited to bulleted content — a
+    blank line or trailing newline in a non-bulleted body (e.g. TITLE's
+    subtitle) would otherwise leave stray blank paragraphs in the
+    placeholder even though there's no floating-bullet symptom to notice."""
+    presentations = Mock()
+    presentations.batchUpdate.return_value.execute.return_value = {}
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(
+        google_slides.google_slides_add_slide(
+            "pres1", title="Guide", body="\n\nSubtitle\n", layout="TITLE"
+        )
+    )
+
+    assert result["status"] == "success"
+    requests = _batch_update_requests(presentations)
+    subtitle_object_id = _placeholder_object_id(requests[0]["createSlide"], "SUBTITLE")
+    body_text = next(
+        r["insertText"]["text"]
+        for r in requests
+        if "insertText" in r and r["insertText"]["objectId"] == subtitle_object_id
+    )
+    assert body_text == "Subtitle"
 
 
 def test_add_slide_skips_whitespace_only_body_insertion_on_title_layout(monkeypatch):
@@ -591,14 +743,16 @@ def test_add_slide_returns_error_payload_without_ascii_escaping(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("layout", "kwargs"),
+    ("layout", "kwargs", "expected_layout"),
     [
-        ("title_and_body", {"body": "detail"}),
-        (" TITLE ", {}),
-        ("Title_Only", {}),
+        ("title_and_body", {"body": "detail"}, "TITLE_AND_BODY"),
+        (" TITLE ", {}, "TITLE"),
+        ("Title_Only", {}, "TITLE_ONLY"),
     ],
 )
-def test_add_slide_normalizes_layout_case_and_whitespace(monkeypatch, layout, kwargs):
+def test_add_slide_normalizes_layout_case_and_whitespace(
+    monkeypatch, layout, kwargs, expected_layout
+):
     """An LLM caller may not reproduce the exact enum casing/spacing —
     normalize before rejecting as unknown."""
     presentations = Mock()
@@ -612,7 +766,7 @@ def test_add_slide_normalizes_layout_case_and_whitespace(monkeypatch, layout, kw
     )
 
     assert result["status"] == "success"
-    assert result["layout"] == layout.strip().upper()
+    assert result["layout"] == expected_layout
 
 
 def test_add_slide_echoes_the_effective_layout_on_success(monkeypatch):
@@ -638,6 +792,27 @@ def test_add_slide_strips_padding_whitespace_from_title_before_inserting(monkeyp
     _mock_slides_service(monkeypatch, presentations)
 
     google_slides.google_slides_add_slide("pres1", title="  Q3 Review  ", body="detail")
+
+    requests = _batch_update_requests(presentations)
+    title_object_id = _placeholder_object_id(requests[0]["createSlide"], "TITLE")
+    title_text = next(
+        r["insertText"]["text"]
+        for r in requests
+        if "insertText" in r and r["insertText"]["objectId"] == title_object_id
+    )
+    assert title_text == "Q3 Review"
+
+
+def test_add_slide_collapses_embedded_newline_in_title(monkeypatch):
+    """A title is expected to be a single line — an embedded newline
+    (e.g. from a caller accidentally pasting multi-line content into
+    title) must be collapsed to a space rather than silently producing a
+    multi-paragraph title placeholder."""
+    presentations = Mock()
+    presentations.batchUpdate.return_value.execute.return_value = {}
+    _mock_slides_service(monkeypatch, presentations)
+
+    google_slides.google_slides_add_slide("pres1", title="Q3\nReview", body="detail")
 
     requests = _batch_update_requests(presentations)
     title_object_id = _placeholder_object_id(requests[0]["createSlide"], "TITLE")
@@ -748,6 +923,22 @@ def test_get_presentation_returns_slide_summaries(monkeypatch):
     assert result["slides"][0]["text"] == ["Hello"]
 
 
+def test_get_presentation_resolves_full_presentation_url(monkeypatch):
+    presentations = Mock()
+    presentations.get.return_value.execute.return_value = {
+        "presentationId": "abc123",
+        "title": "My Deck",
+        "slides": [],
+    }
+    _mock_slides_service(monkeypatch, presentations)
+
+    url = "https://docs.google.com/presentation/d/abc123/edit#slide=id.p"
+    result = json.loads(google_slides.google_slides_get_presentation(url))
+
+    assert result["status"] == "success"
+    assert presentations.get.call_args.kwargs["presentationId"] == "abc123"
+
+
 def test_get_presentation_returns_error_payload_on_api_failure(monkeypatch):
     presentations = Mock()
     presentations.get.return_value.execute.side_effect = RuntimeError("boom")
@@ -815,6 +1006,36 @@ def test_batch_update_rejects_non_list_json(monkeypatch):
 
     assert result["status"] == "error"
     presentations.batchUpdate.assert_not_called()
+
+
+def test_batch_update_rejects_malformed_json(monkeypatch):
+    """Not merely wrong-shaped JSON (a dict instead of a list, covered
+    above) but genuinely invalid JSON syntax — must surface as a clean
+    error payload rather than an unhandled JSONDecodeError."""
+    presentations = Mock()
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(
+        google_slides.google_slides_batch_update("pres1", "{not valid json")
+    )
+
+    assert result["status"] == "error"
+    presentations.batchUpdate.assert_not_called()
+
+
+def test_batch_update_resolves_full_presentation_url(monkeypatch):
+    presentations = Mock()
+    presentations.batchUpdate.return_value.execute.return_value = {
+        "presentationId": "abc123",
+        "replies": [],
+    }
+    _mock_slides_service(monkeypatch, presentations)
+
+    url = "https://docs.google.com/presentation/d/abc123/edit#slide=id.p"
+    result = json.loads(google_slides.google_slides_batch_update(url, "[]"))
+
+    assert result["status"] == "success"
+    assert presentations.batchUpdate.call_args.kwargs["presentationId"] == "abc123"
 
 
 def test_batch_update_returns_error_payload_on_api_failure(monkeypatch):

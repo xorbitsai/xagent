@@ -80,6 +80,15 @@ _LAYOUT_PLACEHOLDERS: dict[str, tuple[str | None, str | None]] = {
 #   - "*" is only treated as a marker when followed by real whitespace
 #     ("* item") or nothing; a bare glued "*" ("*emphasis* text") is left
 #     alone so markdown-style emphasis isn't corrupted.
+#
+# The "glued to a letter" lookahead is Unicode-aware (Python's default
+# \w), so e.g. "-中文条目" is recognized and stripped the same way
+# "-Nospace" is — intentional, not an ASCII-only oversight.
+#
+# Only "•"/"-"/"*" are recognized. Other list conventions (numbered lists
+# like "1.", or other dash/arrow glyphs like "–"/"—"/"→") are left as
+# literal text and will visually double up with Slides' own bullet glyph
+# once createParagraphBullets is applied.
 _BULLET_PREFIX_PATTERN = re.compile(
     r"^(\s*)(?:"
     r"•(?:[ \t]+|(?=\S)|$)"
@@ -96,7 +105,9 @@ def _leading_whitespace_to_tabs(leading: str) -> str:
     non-nesting text). Each literal tab in the input counts as one level;
     otherwise every 2 spaces — the typical hand-typed nested-bullet
     convention — counts as one level, with any non-empty indentation
-    counting as at least one level."""
+    counting as at least one level. Mixing tabs and spaces in the same
+    run is not combined: if any tab is present, only the tabs are
+    counted and any spaces in that same leading run are ignored."""
     if not leading:
         return ""
     level = leading.count("\t") or max(1, len(leading) // 2)
@@ -252,13 +263,18 @@ def google_slides_add_slide(
     Append a slide with a title and body text to a Google Slides presentation.
     The body supports plain text; use newlines to separate bullet lines — each
     line is rendered as its own bulleted paragraph (don't type literal "•"/"-"
-    markers, Slides adds the bullet glyph itself).
+    markers, Slides adds the bullet glyph itself — only "•"/"-"/"*" are
+    recognized as markers to strip; other conventions like numbered lists
+    ("1.") or other dash/arrow glyphs ("–"/"—"/"→") are inserted as
+    literal text and will visually double up with Slides' own bullet).
 
     layout picks the slide's predefined layout, which decides which of
     title/body actually have a placeholder to land in:
       - "TITLE_AND_BODY" (default): title + full bulleted body content.
         body is required here — this layout rejects an empty body rather
-        than silently creating a title-only slide.
+        than silently creating a title-only slide. An empty title is
+        still allowed as long as body has content (e.g. a title-less
+        continuation slide) — this is intentional, not a gap.
       - "TITLE": a cover/section-opening slide — title is the big centered
         title, body (optional) becomes the subtitle line (not bulleted).
       - "TITLE_ONLY", "SECTION_HEADER": title only, no body placeholder —
@@ -272,10 +288,24 @@ def google_slides_add_slide(
     no title placeholder) still need at least a non-empty title — or, for
     "TITLE", a non-empty body/subtitle instead — since otherwise the call
     would produce a completely empty slide; that combination is rejected.
+
+    This assumes the presentation uses a standard/default theme. A custom
+    theme whose master doesn't expose the placeholder types listed above
+    for a given layout will fail with a raw Slides API error from the
+    underlying batchUpdate call rather than a friendly one — use
+    google_slides_batch_update directly for presentations with a
+    non-standard theme.
     """
     try:
+        if not isinstance(layout, str):
+            return _error(f"'layout' must be a string, got {type(layout).__name__}.")
+
         title = title.replace("\r\n", "\n").replace("\r", "\n")
         body = body.replace("\r\n", "\n").replace("\r", "\n")
+        # A title is expected to be a single line; collapse any embedded
+        # newline (and surrounding whitespace) into a space rather than
+        # silently producing a multi-paragraph title placeholder.
+        title = re.sub(r"\s*\n\s*", " ", title)
         normalized_layout = layout.strip().upper()
 
         if normalized_layout not in _LAYOUT_PLACEHOLDERS:
@@ -288,21 +318,24 @@ def google_slides_add_slide(
         is_bulleted = body_required = body_placeholder == "BODY"
         if is_bulleted and body:
             body = _strip_bullet_prefixes(body)
-            # Drop lines left blank by stripping a bare marker, or blank
-            # lines/a trailing newline already in the input — otherwise
-            # createParagraphBullets (applied to the whole text range
-            # below) puts a bullet glyph on an empty paragraph, a visibly
-            # floating bullet point.
+        if body:
+            # Drop blank lines (a bare marker stripped down to nothing,
+            # blank lines already in the input, or a trailing newline) so
+            # no empty paragraph survives — for bulleted content this
+            # avoids createParagraphBullets putting a bullet glyph on an
+            # empty paragraph (a visibly floating bullet point); for
+            # non-bulleted content (e.g. TITLE's subtitle) it avoids
+            # stray blank lines in the placeholder.
             body = "\n".join(line for line in body.split("\n") if line.strip())
 
-        if title and title_placeholder is None:
+        if title.strip() and title_placeholder is None:
             return _error(
                 f"layout '{normalized_layout}' has no title placeholder, "
                 "so 'title' would be silently dropped. Use a different "
                 "layout, or google_slides_batch_update for a custom "
                 "text box."
             )
-        if body and body_placeholder is None:
+        if body.strip() and body_placeholder is None:
             return _error(
                 f"layout '{normalized_layout}' has no body placeholder, "
                 "so 'body' would be silently dropped. Use a layout "

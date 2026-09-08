@@ -1193,10 +1193,14 @@ def zendesk_delete_ticket(ticket_id: int | str) -> str:
         path_id = _resolve_path_id(ticket_id, _TICKET_URL_ID_PATTERN, "ticket_id")
         _request("DELETE", f"/tickets/{path_id}.json")
         # DELETE returns no body for Zendesk to echo an integer id from, but
-        # every other tool's ticket_id field is a real int -- path_id is
-        # percent-encoded (a no-op for a genuine numeric id, the only value
-        # that ever reaches this point without _resolve_path_id already
-        # raising), so it converts back cleanly.
+        # every other tool's ticket_id field is a real int. _resolve_path_id
+        # doesn't itself validate that path_id is numeric (it only rejects
+        # blank/whitespace-padded input) -- but the DELETE above already
+        # succeeded against a real Zendesk ticket, and Zendesk's own
+        # /tickets/{id}.json route 404s on a non-numeric id before this line
+        # is ever reached, so int() here can't raise in practice. It's also
+        # inside this same try block, so even a hypothetical failure here
+        # would route through the normal error path below, not crash.
         return _success(ticket_id=int(path_id))
     except Exception as e:
         logger.error(f"Error deleting Zendesk ticket {ticket_id}: {e}")

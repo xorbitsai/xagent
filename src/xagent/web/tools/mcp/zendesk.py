@@ -320,14 +320,36 @@ def _unwrap(result: Any, key: str) -> Any:
     return result.get(key, result) if isinstance(result, dict) else result
 
 
+def _extract_field_reasons(details: Any) -> str | None:
+    """Join RecordInvalid's per-field reasons into one readable string.
+
+    A 422 RecordInvalid body's "description" is a generic
+    "Record validation errors" -- the actual reason (e.g. "Status: closed
+    is not valid for ticket update", or a duplicate-email message) lives in
+    "details", keyed by field name (or "base") with a list of
+    {"description": ...} entries.
+    """
+    if not isinstance(details, dict):
+        return None
+    reasons: list[str] = []
+    for entries in details.values():
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            text = entry.get("description") if isinstance(entry, dict) else entry
+            if isinstance(text, str) and text:
+                reasons.append(text)
+    return "; ".join(reasons) if reasons else None
+
+
 def _extract_error_detail(response: requests.Response) -> str | None:
     """Pull the human-readable message out of a Zendesk error body.
 
     Zendesk's error shape is inconsistent across endpoints: a plain string
     "error" with a separate "description" (e.g. RecordNotFound), or a
     nested {"error": {"title", "message"}} object (e.g. some auth
-    failures). Returns None so the caller falls back to the raw response
-    text in that case.
+    failures). Falls back to the raw response text when neither a message
+    nor field-level details are present.
     """
     try:
         payload = response.json()
@@ -335,17 +357,23 @@ def _extract_error_detail(response: requests.Response) -> str | None:
         return None
     if not isinstance(payload, dict):
         return None
+    message = None
     description = payload.get("description")
     if isinstance(description, str) and description:
-        return description
-    error = payload.get("error")
-    if isinstance(error, str) and error:
-        return error
-    if isinstance(error, dict):
-        message = error.get("message") or error.get("title")
-        if isinstance(message, str) and message:
-            return message
-    return None
+        message = description
+    else:
+        error = payload.get("error")
+        if isinstance(error, str) and error:
+            message = error
+        elif isinstance(error, dict):
+            nested = error.get("message") or error.get("title")
+            if isinstance(nested, str) and nested:
+                message = nested
+
+    field_reasons = _extract_field_reasons(payload.get("details"))
+    if message and field_reasons:
+        return f"{message}: {field_reasons}"
+    return field_reasons or message
 
 
 def _request(

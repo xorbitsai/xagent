@@ -306,6 +306,42 @@ def test_extract_error_detail_returns_none_for_non_json_body():
     assert zendesk._extract_error_detail(response) is None
 
 
+def test_extract_error_detail_appends_record_invalid_field_reasons():
+    # RecordInvalid's "description" is a generic "Record validation
+    # errors" -- the actual reason lives in "details", keyed by field.
+    response = MockResponse(
+        json_data={
+            "error": "RecordInvalid",
+            "description": "Record validation errors",
+            "details": {"base": [{"description": "Status: closed is not valid"}]},
+        }
+    )
+
+    assert (
+        zendesk._extract_error_detail(response)
+        == "Record validation errors: Status: closed is not valid"
+    )
+
+
+def test_extract_error_detail_falls_back_to_field_reasons_without_description():
+    response = MockResponse(
+        json_data={
+            "details": {
+                "email": [
+                    {
+                        "description": "Email: a@example.com already in use",
+                        "error": "DuplicateValue",
+                    }
+                ]
+            }
+        }
+    )
+
+    assert (
+        zendesk._extract_error_detail(response) == "Email: a@example.com already in use"
+    )
+
+
 def test_cursor_page_returns_next_cursor_when_has_more():
     page, has_more, after_cursor = zendesk._cursor_page(
         {

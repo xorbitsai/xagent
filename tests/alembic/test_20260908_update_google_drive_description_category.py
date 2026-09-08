@@ -1,4 +1,4 @@
-"""Tests for updating the Google Drive connector's description and category."""
+"""Tests for updating the Google Drive connector's description."""
 
 import importlib.util
 from pathlib import Path
@@ -27,15 +27,8 @@ def _operations(connection):
     return Operations(MigrationContext.configure(connection))
 
 
-def _create_table(
-    connection,
-    description: str,
-    category: str,
-    with_description_column: bool = True,
-    with_category_column: bool = True,
-):
+def _create_table(connection, description: str, with_description_column: bool = True):
     description_column = "description TEXT," if with_description_column else ""
-    category_column = "category VARCHAR(100)," if with_category_column else ""
     connection.execute(
         text(
             f"""
@@ -43,108 +36,70 @@ def _create_table(
                 id INTEGER PRIMARY KEY,
                 app_id VARCHAR(100) NOT NULL UNIQUE,
                 {description_column}
-                {category_column}
                 oauth_scopes JSON
             )
             """
         )
     )
-    columns = ["app_id"]
-    values = {"app_id": "google-drive"}
-    params = [":app_id"]
-    if with_description_column:
-        columns.append("description")
-        params.append(":description")
-        values["description"] = description
-    if with_category_column:
-        columns.append("category")
-        params.append(":category")
-        values["category"] = category
+    description_col = ", description" if with_description_column else ""
+    description_val = ", :description" if with_description_column else ""
     connection.execute(
         text(
-            f"INSERT INTO public_mcp_apps ({', '.join(columns)}) "
-            f"VALUES ({', '.join(params)})"
+            f"INSERT INTO public_mcp_apps (app_id{description_col}) "
+            f"VALUES ('google-drive'{description_val})"
         ),
-        values,
+        {"description": description},
     )
 
 
-def _row(connection):
-    row = connection.execute(
-        text(
-            "SELECT description, category FROM public_mcp_apps "
-            "WHERE app_id='google-drive'"
-        )
-    ).first()
-    return row[0], row[1]
+def _description(connection):
+    return connection.execute(
+        text("SELECT description FROM public_mcp_apps WHERE app_id='google-drive'")
+    ).scalar()
 
 
-def test_upgrade_updates_description_and_category(tmp_path):
+def test_upgrade_updates_description(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
     with engine.begin() as connection:
-        _create_table(
-            connection,
-            description=migration.PREVIOUS_DESCRIPTION,
-            category=migration.PREVIOUS_CATEGORY,
-        )
+        _create_table(connection, description=migration.PREVIOUS_DESCRIPTION)
         with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()
-        description, category = _row(connection)
-        assert description == migration.CURRENT_DESCRIPTION
-        assert category == migration.CURRENT_CATEGORY
+        assert _description(connection) == migration.CURRENT_DESCRIPTION
 
 
 def test_upgrade_is_idempotent(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
     with engine.begin() as connection:
-        _create_table(
-            connection,
-            description=migration.PREVIOUS_DESCRIPTION,
-            category=migration.PREVIOUS_CATEGORY,
-        )
+        _create_table(connection, description=migration.PREVIOUS_DESCRIPTION)
         with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()
             migration.upgrade()
-        description, category = _row(connection)
-        assert description == migration.CURRENT_DESCRIPTION
-        assert category == migration.CURRENT_CATEGORY
+        assert _description(connection) == migration.CURRENT_DESCRIPTION
 
 
-def test_downgrade_restores_previous_description_and_category(tmp_path):
+def test_downgrade_restores_previous_description(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
     with engine.begin() as connection:
-        _create_table(
-            connection,
-            description=migration.PREVIOUS_DESCRIPTION,
-            category=migration.PREVIOUS_CATEGORY,
-        )
+        _create_table(connection, description=migration.PREVIOUS_DESCRIPTION)
         with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()
             migration.downgrade()
-        description, category = _row(connection)
-        assert description == migration.PREVIOUS_DESCRIPTION
-        assert category == migration.PREVIOUS_CATEGORY
+        assert _description(connection) == migration.PREVIOUS_DESCRIPTION
 
 
 def test_upgrade_downgrade_upgrade_round_trip(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
     with engine.begin() as connection:
-        _create_table(
-            connection,
-            description=migration.PREVIOUS_DESCRIPTION,
-            category=migration.PREVIOUS_CATEGORY,
-        )
+        _create_table(connection, description=migration.PREVIOUS_DESCRIPTION)
         with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()
             migration.downgrade()
             migration.upgrade()
-        description, category = _row(connection)
-        assert description == migration.CURRENT_DESCRIPTION
-        assert category == migration.CURRENT_CATEGORY
+        assert _description(connection) == migration.CURRENT_DESCRIPTION
 
 
 def test_upgrade_preserves_admin_customized_description(tmp_path):
@@ -155,43 +110,17 @@ def test_upgrade_preserves_admin_customized_description(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
     with engine.begin() as connection:
-        _create_table(
-            connection,
-            description="Our internal Drive connector",
-            category=migration.PREVIOUS_CATEGORY,
-        )
+        _create_table(connection, description="Our internal Drive connector")
         with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()
-        description, category = _row(connection)
-        assert description == "Our internal Drive connector"
-        assert category == migration.CURRENT_CATEGORY
-
-
-def test_upgrade_preserves_admin_customized_category(tmp_path):
-    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
-    migration = _load_migration_module()
-    with engine.begin() as connection:
-        _create_table(
-            connection,
-            description=migration.PREVIOUS_DESCRIPTION,
-            category="Productivity",
-        )
-        with patch.object(migration, "op", _operations(connection)):
-            migration.upgrade()
-        description, category = _row(connection)
-        assert description == migration.CURRENT_DESCRIPTION
-        assert category == "Productivity"
+        assert _description(connection) == "Our internal Drive connector"
 
 
 def test_downgrade_preserves_admin_customized_description(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
     with engine.begin() as connection:
-        _create_table(
-            connection,
-            description=migration.PREVIOUS_DESCRIPTION,
-            category=migration.PREVIOUS_CATEGORY,
-        )
+        _create_table(connection, description=migration.PREVIOUS_DESCRIPTION)
         with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()
             connection.execute(
@@ -202,69 +131,20 @@ def test_downgrade_preserves_admin_customized_description(tmp_path):
                 {"d": "Our internal Drive connector"},
             )
             migration.downgrade()
-        description, category = _row(connection)
-        assert description == "Our internal Drive connector"
-        assert category == migration.PREVIOUS_CATEGORY
+        assert _description(connection) == "Our internal Drive connector"
 
 
-def test_downgrade_preserves_admin_customized_category(tmp_path):
+def test_upgrade_without_description_column_is_a_noop(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
     with engine.begin() as connection:
         _create_table(
             connection,
             description=migration.PREVIOUS_DESCRIPTION,
-            category=migration.PREVIOUS_CATEGORY,
-        )
-        with patch.object(migration, "op", _operations(connection)):
-            migration.upgrade()
-            connection.execute(
-                text(
-                    "UPDATE public_mcp_apps SET category = :c "
-                    "WHERE app_id = 'google-drive'"
-                ),
-                {"c": "Productivity"},
-            )
-            migration.downgrade()
-        description, category = _row(connection)
-        assert description == migration.PREVIOUS_DESCRIPTION
-        assert category == "Productivity"
-
-
-def test_upgrade_without_description_column_still_updates_category(tmp_path):
-    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
-    migration = _load_migration_module()
-    with engine.begin() as connection:
-        _create_table(
-            connection,
-            description=migration.PREVIOUS_DESCRIPTION,
-            category=migration.PREVIOUS_CATEGORY,
             with_description_column=False,
         )
         with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()  # must not raise when description is missing
-        category = connection.execute(
-            text("SELECT category FROM public_mcp_apps WHERE app_id='google-drive'")
-        ).scalar()
-        assert category == migration.CURRENT_CATEGORY
-
-
-def test_upgrade_without_category_column_still_updates_description(tmp_path):
-    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
-    migration = _load_migration_module()
-    with engine.begin() as connection:
-        _create_table(
-            connection,
-            description=migration.PREVIOUS_DESCRIPTION,
-            category=migration.PREVIOUS_CATEGORY,
-            with_category_column=False,
-        )
-        with patch.object(migration, "op", _operations(connection)):
-            migration.upgrade()  # must not raise when category is missing
-        description = connection.execute(
-            text("SELECT description FROM public_mcp_apps WHERE app_id='google-drive'")
-        ).scalar()
-        assert description == migration.CURRENT_DESCRIPTION
 
 
 def test_upgrade_without_table_is_a_noop(tmp_path):
@@ -288,7 +168,6 @@ def test_upgrade_without_matching_row_is_a_noop(tmp_path):
                     id INTEGER PRIMARY KEY,
                     app_id VARCHAR(100) NOT NULL UNIQUE,
                     description TEXT,
-                    category VARCHAR(100),
                     oauth_scopes JSON
                 )
                 """
@@ -296,20 +175,16 @@ def test_upgrade_without_matching_row_is_a_noop(tmp_path):
         )
         connection.execute(
             text(
-                "INSERT INTO public_mcp_apps (app_id, description, category) "
-                "VALUES ('onedrive', 'unrelated', 'Storage')"
+                "INSERT INTO public_mcp_apps (app_id, description) "
+                "VALUES ('onedrive', 'unrelated')"
             )
         )
         with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()
-        row = connection.execute(
-            text(
-                "SELECT description, category FROM public_mcp_apps "
-                "WHERE app_id='onedrive'"
-            )
-        ).first()
-        assert row[0] == "unrelated"
-        assert row[1] == "Storage"
+        description = connection.execute(
+            text("SELECT description FROM public_mcp_apps WHERE app_id='onedrive'")
+        ).scalar()
+        assert description == "unrelated"
 
 
 def test_migration_fields_match_registry():
@@ -320,4 +195,4 @@ def test_migration_fields_match_registry():
         r for r in get_builtin_public_mcp_app_rows() if r["app_id"] == "google-drive"
     )
     assert registry_row["description"] == migration.CURRENT_DESCRIPTION
-    assert registry_row["category"] == migration.CURRENT_CATEGORY
+    assert registry_row["category"] == "Support"

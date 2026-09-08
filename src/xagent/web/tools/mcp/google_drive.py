@@ -91,9 +91,28 @@ _EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 def _resolve_file_id(file_id: str) -> str:
     if isinstance(file_id, str):
-        parsed = urlparse(file_id.strip())
-        if parsed.scheme and parsed.hostname not in _DRIVE_URL_HOSTS:
-            return file_id.strip()
+        stripped = file_id.strip()
+        # A real Drive id is always [a-zA-Z0-9_-]+ and never contains "/"
+        # or "?", so only a value containing one of those characters can be
+        # a URL shape in the first place -- only those go through the host
+        # check. This matters because urlparse only populates
+        # .scheme/.hostname for a string with an explicit "scheme://" (or a
+        # leading "//") prefix: a scheme-less "evil.com/file/d/<id>/view"
+        # (at least as natural a shape for an attacker to plant in text an
+        # agent reads as a full https:// URL) would otherwise report an
+        # empty scheme/hostname and slip straight past a bare
+        # urlparse(stripped) check into the host-agnostic pattern match
+        # below -- exactly the bypass the host allowlist exists to close.
+        # Prepending "//" when there's no "//" already present makes
+        # urlparse treat a bare "host/path" or "host?query" the same way
+        # it treats an explicit "//host/path" protocol-relative URL.
+        if re.search(r"[/?]", stripped):
+            try:
+                parsed = urlparse(stripped if "//" in stripped else f"//{stripped}")
+            except ValueError:
+                return stripped
+            if parsed.hostname not in _DRIVE_URL_HOSTS:
+                return stripped
     return resolve_id_from_url(file_id, _DRIVE_URL_ID_PATTERN, "file_id")
 
 
@@ -103,36 +122,39 @@ def _require_share_role(role: str) -> str:
     return role
 
 
-def _capped_list_response(field_name: str, items: list[Any]) -> str:
-    """Build the success payload, halving ``items`` until it fits the
-    platform's output limit -- mirrors deputy.py's/salesforce.py's
+def _capped_response(build: Callable[[Any, bool], str], value: Any) -> str:
+    """Halve ``value`` (a list or a string) until ``build(value, truncated)``
+    fits the platform's output limit -- mirrors deputy.py's/salesforce.py's
     _success_with_capped_list. There is no cursor to resume from here, so
-    entries dropped this way are gone for this call, not just this page.
+    entries/content dropped this way are gone for this call, not just this
+    page. Shared by _capped_list_response and _capped_content_response so a
+    future change to the halving strategy only has one loop to update.
     """
     max_output_length = get_tool_max_output_length()
+    truncated = False
+    response = build(value, truncated)
+    while len(response) > max_output_length and value:
+        value = value[: len(value) // 2]
+        truncated = True
+        response = build(value, truncated)
+    return response
 
+
+def _capped_list_response(field_name: str, items: list[Any]) -> str:
     def _build(items: list[Any], truncated: bool) -> str:
         return json.dumps(
             {"status": "success", field_name: items, "truncated": truncated},
             ensure_ascii=False,
         )
 
-    truncated = False
-    response = _build(items, truncated)
-    while len(response) > max_output_length and items:
-        items = items[: len(items) // 2]
-        truncated = True
-        response = _build(items, truncated)
-    return response
+    return _capped_response(_build, items)
 
 
 def _capped_content_response(file_metadata: dict[str, Any], content: str) -> str:
-    """Build the success payload, halving ``content`` until it fits the
-    platform's output limit -- same halving idea as _capped_list_response,
-    applied to a single string instead of a list since downloaded/exported
-    file content has no natural list of records to shrink.
+    """Same halving idea as _capped_list_response, applied to a single
+    string instead of a list since downloaded/exported file content has no
+    natural list of records to shrink.
     """
-    max_output_length = get_tool_max_output_length()
 
     def _build(content: str, truncated: bool) -> str:
         return json.dumps(
@@ -145,13 +167,7 @@ def _capped_content_response(file_metadata: dict[str, Any], content: str) -> str
             ensure_ascii=False,
         )
 
-    truncated = False
-    response = _build(content, truncated)
-    while len(response) > max_output_length and content:
-        content = content[: len(content) // 2]
-        truncated = True
-        response = _build(content, truncated)
-    return response
+    return _capped_response(_build, content)
 
 
 def get_drive_service() -> Any:
@@ -456,6 +472,7 @@ def google_drive_list_permissions(file_id: str) -> str:
     try:
         resolved_file_id = _resolve_file_id(file_id)
         service = get_drive_service()
+        max_output_length = get_tool_max_output_length()
         permissions: list[Any] = []
         page_token: str | None = None
         # For an item in a Shared Drive, Drive returns at most 100
@@ -481,6 +498,13 @@ def google_drive_list_permissions(file_id: str) -> str:
             permissions.extend(results.get("permissions", []))
             page_token = results.get("nextPageToken")
             if not page_token:
+                break
+            # _capped_list_response below will halve this back down to fit
+            # the output limit regardless, so once there's already enough
+            # data to exceed it, fetching further pages is pure waste: more
+            # blocking network round-trips for permissions that get thrown
+            # away immediately after.
+            if len(json.dumps(permissions)) > max_output_length:
                 break
 
         return _capped_list_response("permissions", permissions)

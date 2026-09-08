@@ -450,7 +450,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "icon": "https://www.google.com/s2/favicons?domain=drive.google.com&sz=128",
             "transport": "oauth",
             "provider_name": "google",
-            "category": "Storage",
+            "category": "Support",
             "oauth_scopes": ["https://www.googleapis.com/auth/drive"],
             "is_visible_in_connector": True,
             "launch_config": {

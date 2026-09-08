@@ -69,6 +69,15 @@ def test_resolve_file_id_accepts_bare_id_and_url_forms(value, expected):
         # non-Google URL can be made to match the same path shape.
         "https://evil.com/file/d/ATTACKER_ID/view",
         "https://evil.com/drive/folders/ATTACKER_ID",
+        # Scheme-less and protocol-relative variants of the same attack --
+        # urlparse only populates .scheme/.hostname for an explicit
+        # "scheme://" or leading "//" prefix, so these are at least as
+        # natural a shape for an attacker to plant in text an agent reads
+        # as the full https:// form, and must be rejected identically.
+        "evil.com/file/d/ATTACKER_ID/view",
+        "//evil.com/file/d/ATTACKER_ID/view",
+        "evil.com/x?id=ATTACKER_CHOSEN_ID",
+        "evil.com/drive/folders/ATTACKER_ID",
     ],
 )
 def test_resolve_file_id_does_not_extract_id_from_untrusted_hosts(url):
@@ -78,6 +87,21 @@ def test_resolve_file_id_does_not_extract_id_from_untrusted_hosts(url):
     URL happens to name -- it should fail as an obviously-invalid fileId
     instead, by returning the URL unresolved."""
     assert google_drive._resolve_file_id(url) == url
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "drive.google.com/file/d/abc123/view",
+        "drive.google.com/drive/folders/abc123",
+        "docs.google.com/open?id=abc123",
+    ],
+)
+def test_resolve_file_id_resolves_scheme_less_trusted_host_urls(url):
+    """The scheme-less-URL check above must reject untrusted hosts without
+    also rejecting a legitimate Drive/Docs URL a user pasted without its
+    "https://" prefix."""
+    assert google_drive._resolve_file_id(url) == "abc123"
 
 
 @pytest.mark.parametrize(
@@ -497,6 +521,36 @@ def test_list_permissions_follows_next_page_token(monkeypatch):
     calls = service.permissions.return_value.list.call_args_list
     assert calls[0].kwargs["pageToken"] is None
     assert calls[1].kwargs["pageToken"] == "page2"
+
+
+def test_list_permissions_stops_paginating_once_over_the_output_limit(monkeypatch):
+    """_capped_list_response will halve an oversized permissions list back
+    down anyway, so once accumulated permissions already exceed the output
+    limit, fetching further pages is pure waste -- more blocking API calls
+    for data that gets thrown away immediately after."""
+    service = _mock_drive_service(monkeypatch)
+    huge_page = [
+        {
+            "id": f"perm{i}",
+            "type": "user",
+            "role": "reader",
+            "emailAddress": f"user{i}@example.com",
+            "displayName": "x" * 200,
+        }
+        for i in range(2000)
+    ]
+    service.permissions.return_value.list.return_value.execute.return_value = {
+        "permissions": huge_page,
+        "nextPageToken": "page2",  # would keep going forever if not stopped
+    }
+
+    result = json.loads(google_drive.google_drive_list_permissions("fid"))
+
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    # Stopped after the first oversized page rather than following
+    # nextPageToken indefinitely.
+    assert service.permissions.return_value.list.call_count == 1
 
 
 def test_list_permissions_defaults_missing_key(monkeypatch):

@@ -1,4 +1,4 @@
-"""update Google Drive description and category for the sharing tools
+"""update Google Drive description for the sharing tools
 
 Revision ID: 20260908_update_google_drive_description_category
 Revises: 20260904_add_auto_model_config
@@ -21,7 +21,6 @@ PUBLIC_MCP_APPS_TABLE = sa.table(
     "public_mcp_apps",
     sa.column("app_id", sa.String),
     sa.column("description", sa.Text),
-    sa.column("category", sa.String),
 )
 
 APP_ID = "google-drive"
@@ -34,9 +33,6 @@ CURRENT_DESCRIPTION = (
     "Access Google Drive to search for files, read documents, manage your "
     "cloud storage, and share files or folders with others."
 )
-
-PREVIOUS_CATEGORY = "Support"
-CURRENT_CATEGORY = "Storage"
 
 
 def _columns_present(
@@ -55,51 +51,55 @@ def _columns_present(
     return required_columns.issubset(columns)
 
 
-def _set_field_if_unchanged(
-    bind: sa.engine.Connection, column: str, expected_current: str, new_value: str
+def _set_description_if_unchanged(
+    bind: sa.engine.Connection, expected_current: str, new_value: str
 ) -> None:
-    """Refresh a stale registry field on an already-seeded row, without
-    clobbering a customization.
+    """Refresh the stale registry description on an already-seeded row,
+    without clobbering a customization.
 
-    Neither ``description`` nor ``category`` is in admin_mcp's
-    _BUILTIN_PROTECTED_FIELDS, so an operator can legitimately have edited
-    either via the admin PATCH endpoint. Only overwrite when the persisted
-    value still equals the last-known canonical value (i.e. it was never
-    customized); an edited value matches neither the previous nor the
-    current canonical value and is left alone in either direction.
+    ``description`` is not in admin_mcp's _BUILTIN_PROTECTED_FIELDS, so an
+    operator can legitimately have edited it via the admin PATCH endpoint.
+    Only overwrite when the persisted value still equals the last-known
+    canonical value (i.e. it was never customized); an edited value matches
+    neither the previous nor the current canonical value and is left alone
+    in either direction.
 
-    Both fields are also excluded from builtin_mcp_registry.py's own
+    ``description`` is also excluded from builtin_mcp_registry.py's own
     _BUILTIN_EXECUTION_FIELD_NAMES drift sync (unlike oauth_scopes/
     launch_config/etc., which self-heal on every read), and the seed
     migration only ever inserts a row once -- so without this migration, an
-    already-provisioned install's google-drive row would keep showing
-    "Support"/the pre-sharing description forever, even after upgrading to
-    a build whose source registry has moved on.
+    already-provisioned install's google-drive row would keep showing the
+    pre-sharing description forever, even after upgrading to a build whose
+    source registry has moved on.
+
+    (This migration originally also updated ``category`` from "Support" to
+    "Storage", matching OneDrive's category -- but neither "Storage" nor
+    "Productivity" (used by several other Google connectors) is an actual
+    filter button in frontend/src/components/mcp/connect-mcp-dialog.tsx,
+    whose sidebar only has All/CRM/Communication/Support/Marketing/
+    Scheduling/Payments/Analytics/Operations. "Support" is the one that's
+    genuinely clickable, so the category change was reverted rather than
+    shipped as a change that made Google Drive harder to find in the
+    connect-apps dialog.)
     """
-    if not _columns_present(bind, "public_mcp_apps", {"app_id", column}):
+    if not _columns_present(bind, "public_mcp_apps", {"app_id", "description"}):
         return
 
     bind.execute(
         sa.update(PUBLIC_MCP_APPS_TABLE)
         .where(
             PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID,
-            getattr(PUBLIC_MCP_APPS_TABLE.c, column) == expected_current,
+            PUBLIC_MCP_APPS_TABLE.c.description == expected_current,
         )
-        .values(**{column: new_value})
+        .values(description=new_value)
     )
 
 
 def upgrade() -> None:
     bind = op.get_bind()
-    _set_field_if_unchanged(
-        bind, "description", PREVIOUS_DESCRIPTION, CURRENT_DESCRIPTION
-    )
-    _set_field_if_unchanged(bind, "category", PREVIOUS_CATEGORY, CURRENT_CATEGORY)
+    _set_description_if_unchanged(bind, PREVIOUS_DESCRIPTION, CURRENT_DESCRIPTION)
 
 
 def downgrade() -> None:
     bind = op.get_bind()
-    _set_field_if_unchanged(
-        bind, "description", CURRENT_DESCRIPTION, PREVIOUS_DESCRIPTION
-    )
-    _set_field_if_unchanged(bind, "category", CURRENT_CATEGORY, PREVIOUS_CATEGORY)
+    _set_description_if_unchanged(bind, CURRENT_DESCRIPTION, PREVIOUS_DESCRIPTION)

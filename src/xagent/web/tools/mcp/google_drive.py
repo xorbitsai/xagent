@@ -1,7 +1,10 @@
 import io
 import json
 import logging
+import mimetypes
 import os
+import re
+from pathlib import Path
 from typing import Any
 
 from google.oauth2.credentials import Credentials
@@ -21,6 +24,55 @@ logger = logging.getLogger("google-drive-mcp")
 setup_proxy_env()
 
 mcp = FastMCP("google-drive-mcp")
+
+# mime types safe to decode as UTF-8 text and return inline. Anything else
+# (PDFs, Office/OOXML formats, images, etc.) must go through
+# google_drive_download_file instead — decoding arbitrary binary content as
+# UTF-8 with errors="replace" silently corrupts it into unusable garbage.
+_TEXT_MIME_TYPES = {"application/json", "application/xml"}
+
+
+def _is_text_mime_type(mime_type: str) -> bool:
+    return mime_type.startswith("text/") or mime_type in _TEXT_MIME_TYPES
+
+
+_UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.() -]")
+
+
+def _output_dir() -> Path:
+    """Root directory google_drive_download_file writes into: the current
+    task's workspace output/ subdirectory, mirroring TaskWorkspace.output_dir
+    so downloaded files show up alongside other generated deliverables."""
+    raw_dirs = os.environ.get("XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS", "")
+    base = next((d for raw in raw_dirs.split(",") if (d := raw.strip())), "") or str(
+        Path.cwd()
+    )
+    output_dir = (Path(base).expanduser().resolve()) / "output"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir
+
+
+def _safe_output_filename(name: str) -> str:
+    """Collapse a Drive file name into a single path segment so it can't
+    escape the output directory (e.g. via ".." or embedded "/") — the name
+    comes from user/Drive data, not a trusted constant."""
+    candidate = _UNSAFE_FILENAME_CHARS.sub("_", Path(name).name).strip("._") or "file"
+    return candidate
+
+
+def _unique_output_path(output_dir: Path, filename: str) -> Path:
+    """Avoid silently overwriting a same-named file already in the output
+    dir (e.g. downloading the same deck twice) by appending " (1)", " (2)",
+    etc. — mirrors common download-manager behavior rather than either
+    clobbering data or forcing the caller to pick a unique name upfront."""
+    candidate = output_dir / filename
+    if not candidate.exists():
+        return candidate
+    stem, suffix = Path(filename).stem, Path(filename).suffix
+    counter = 1
+    while (candidate := output_dir / f"{stem} ({counter}){suffix}").exists():
+        counter += 1
+    return candidate
 
 
 def get_drive_service() -> Any:
@@ -75,10 +127,31 @@ def google_drive_search(query: str = "", max_results: int = 10) -> str:
 @mcp.tool()
 def google_drive_get_file_content(file_id: str, mime_type: str = "text/plain") -> str:
     """
-    Download or export file content from Google Drive by file_id.
-    If it's a Google Workspace document (Docs, Sheets), it will be exported to the requested mime_type.
+    Download or export a text file's content from Google Drive by file_id,
+    returned inline as a string. If it's a Google Workspace document (Docs,
+    Sheets), it will be exported to the requested mime_type.
+
+    mime_type must be a text format (e.g. "text/plain", "text/csv",
+    "application/json") — this tool decodes the result as UTF-8 text, which
+    would corrupt a binary format like a PDF or image into garbage. For a
+    PDF, an Office format, an image, or any other binary content, use
+    google_drive_download_file instead, which writes the real bytes to a
+    file instead of decoding them as text.
     """
     try:
+        if not _is_text_mime_type(mime_type):
+            return json.dumps(
+                {
+                    "status": "error",
+                    "message": (
+                        f"mime_type '{mime_type}' is not a text format — this "
+                        "tool would corrupt binary content by decoding it as "
+                        "UTF-8. Use google_drive_download_file instead to "
+                        "get the real bytes as a file."
+                    ),
+                }
+            )
+
         service = get_drive_service()
         file_metadata = (
             service.files().get(fileId=file_id, fields="id, name, mimeType").execute()
@@ -107,6 +180,88 @@ def google_drive_get_file_content(file_id: str, mime_type: str = "text/plain") -
         )
     except Exception as e:
         logger.error(f"Error getting file content: {e}")
+        return json.dumps({"status": "error", "message": str(e)})
+
+
+@mcp.tool()
+def google_drive_download_file(
+    file_id: str, mime_type: str = "", filename: str = ""
+) -> str:
+    """
+    Download or export a Google Drive file to a real file in the task
+    workspace, returning its path — use this for any binary content (PDF,
+    image, Office format, etc.) that google_drive_get_file_content would
+    otherwise corrupt by decoding as text. The returned path can be passed
+    directly to another tool that reads local files, e.g. gmail_send_messages's
+    'attachments'.
+
+    mime_type: required when file_id is a Google Workspace document (Docs,
+    Sheets, Slides) — the format to export to (e.g. "application/pdf").
+    Ignored for a file that already has real binary content of its own
+    (mime_type is not required and has no effect there).
+    filename: optional name for the written file; defaults to the Drive
+    file's own name (with an extension appended if exporting to a mime_type
+    whose extension doesn't already match).
+    """
+    try:
+        service = get_drive_service()
+        file_metadata = (
+            service.files().get(fileId=file_id, fields="id, name, mimeType").execute()
+        )
+        file_mime_type = file_metadata.get("mimeType", "")
+        drive_name = file_metadata.get("name") or file_id
+
+        if "application/vnd.google-apps" in file_mime_type:
+            if not mime_type:
+                return json.dumps(
+                    {
+                        "status": "error",
+                        "message": (
+                            f"'{drive_name}' is a Google Workspace document "
+                            "(mimeType "
+                            f"'{file_mime_type}'); specify mime_type to "
+                            'export it to (e.g. "application/pdf").'
+                        ),
+                    }
+                )
+            request = service.files().export_media(fileId=file_id, mimeType=mime_type)
+            extension = mimetypes.guess_extension(mime_type) or ""
+            # Sanitize the base name *before* appending the extension: doing
+            # it after would let a degenerate name (e.g. all dots/spaces,
+            # which _safe_output_filename's trailing ".strip('._')" removes)
+            # eat into the extension's leading dot too, producing a bare
+            # "pdf" instead of "file.pdf".
+            safe_drive_name = _safe_output_filename(drive_name)
+            default_name = (
+                safe_drive_name
+                if safe_drive_name.endswith(extension)
+                else safe_drive_name + extension
+            )
+        else:
+            request = service.files().get_media(fileId=file_id)
+            default_name = _safe_output_filename(drive_name)
+
+        fh = io.BytesIO()
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        while done is False:
+            status, done = downloader.next_chunk()
+        data = fh.getvalue()
+
+        chosen_name = _safe_output_filename(filename) if filename else default_name
+        output_path = _unique_output_path(_output_dir(), chosen_name)
+        output_path.write_bytes(data)
+
+        return json.dumps(
+            {
+                "status": "success",
+                "file": file_metadata,
+                "path": str(output_path),
+                "size": len(data),
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error downloading file: {e}")
         return json.dumps({"status": "error", "message": str(e)})
 
 

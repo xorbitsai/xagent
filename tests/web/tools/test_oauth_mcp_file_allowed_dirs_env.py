@@ -1,6 +1,6 @@
 """Tests for injecting the file-upload allowlist directory into OAuth-transport
 MCP subprocess environments (LinkedIn's image upload, Slack's file upload,
-Gmail's message attachments)."""
+Gmail's message attachments, Google Drive's download output directory)."""
 
 from types import SimpleNamespace
 
@@ -37,6 +37,9 @@ def test_transport_config_sets_both_allowlist_vars_when_workspace_has_a_task(
     assert transport_config["env"]["XAGENT_SLACK_FILE_ALLOWED_DIRS"] == expected_dir
     assert transport_config["env"]["XAGENT_LINKEDIN_IMAGE_ALLOWED_DIRS"] == expected_dir
     assert transport_config["env"]["XAGENT_GMAIL_FILE_ALLOWED_DIRS"] == expected_dir
+    assert (
+        transport_config["env"]["XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS"] == expected_dir
+    )
 
 
 def test_transport_config_omits_allowlist_vars_without_a_task_id():
@@ -55,3 +58,4 @@ def test_transport_config_omits_allowlist_vars_without_a_task_id():
     assert "XAGENT_SLACK_FILE_ALLOWED_DIRS" not in transport_config["env"]
     assert "XAGENT_LINKEDIN_IMAGE_ALLOWED_DIRS" not in transport_config["env"]
     assert "XAGENT_GMAIL_FILE_ALLOWED_DIRS" not in transport_config["env"]
+    assert "XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS" not in transport_config["env"]

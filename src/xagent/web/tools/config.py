@@ -3663,6 +3663,12 @@ class WebToolConfig(BaseToolConfig):
                 env["XAGENT_LINKEDIN_IMAGE_ALLOWED_DIRS"] = allowed_file_dirs
                 env["XAGENT_SLACK_FILE_ALLOWED_DIRS"] = allowed_file_dirs
                 env["XAGENT_GMAIL_FILE_ALLOWED_DIRS"] = allowed_file_dirs
+                # Unlike the three above (read-only upload allowlists), Google
+                # Drive uses this as a write target root for
+                # google_drive_download_file — it downloads/exports into
+                # <this dir>/output/, mirroring TaskWorkspace.output_dir so
+                # the result shows up alongside other generated deliverables.
+                env["XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS"] = allowed_file_dirs
             transport_config["env"] = env
             return transport_config
 

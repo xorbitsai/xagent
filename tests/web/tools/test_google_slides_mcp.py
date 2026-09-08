@@ -8,10 +8,11 @@ from xagent.web.tools.mcp import google_slides
 
 @pytest.fixture(autouse=True)
 def _credentials(monkeypatch):
+    # Every test below replaces get_slides_service() wholesale via
+    # _mock_slides_service, so nothing here exercises real credential
+    # building — this just guards against a stray, unmocked call blowing up
+    # with a confusing "missing env var" error instead of the actual assertion.
     monkeypatch.setenv("GOOGLE_ACCESS_TOKEN", "access-token")
-    monkeypatch.delenv("GOOGLE_REFRESH_TOKEN", raising=False)
-    monkeypatch.delenv("GOOGLE_CLIENT_ID", raising=False)
-    monkeypatch.delenv("GOOGLE_CLIENT_SECRET", raising=False)
 
 
 def _mock_slides_service(monkeypatch, presentations_mock):
@@ -68,6 +69,18 @@ def test_add_slide_default_layout_creates_title_and_body_with_bullets(monkeypatc
     assert bullets_req["objectId"] == mappings["BODY"]
     assert bullets_req["textRange"] == {"type": "ALL"}
 
+    # createParagraphBullets must come after the insertText that populates
+    # the body — applying it to an empty range fails against the real API.
+    body_insert_index = next(
+        i
+        for i, r in enumerate(requests)
+        if "insertText" in r and r["insertText"]["objectId"] == mappings["BODY"]
+    )
+    bullets_index = next(
+        i for i, r in enumerate(requests) if "createParagraphBullets" in r
+    )
+    assert bullets_index > body_insert_index
+
 
 def test_add_slide_strips_literal_bullet_markers_before_inserting(monkeypatch):
     presentations = Mock()
@@ -86,6 +99,67 @@ def test_add_slide_strips_literal_bullet_markers_before_inserting(monkeypatch):
     assert body_text == (
         "First point\nSecond point\nThird point\nFourth point (no marker)"
     )
+
+
+def test_add_slide_strips_marker_glued_to_text_without_trailing_space(monkeypatch):
+    """A marker with no space after it (e.g. "•First", "-Nospace") must
+    still be recognized — otherwise the literal marker survives next to
+    Slides' own bullet glyph, a visible double bullet."""
+    presentations = Mock()
+    presentations.batchUpdate.return_value.execute.return_value = {}
+    _mock_slides_service(monkeypatch, presentations)
+
+    google_slides.google_slides_add_slide(
+        "pres1", title="T", body="•First point\n-Nospace"
+    )
+
+    requests = _batch_update_requests(presentations)
+    body_text = next(
+        r["insertText"]["text"]
+        for r in requests
+        if "insertText" in r and "First point" in r["insertText"]["text"]
+    )
+    assert body_text == "First point\nNospace"
+
+
+def test_add_slide_preserves_nested_bullet_indentation(monkeypatch):
+    """Slides infers bullet nesting level from leading whitespace/tabs in
+    the inserted text; stripping the marker must not also strip the
+    indentation in front of it, or multi-level bullets flatten to one
+    level."""
+    presentations = Mock()
+    presentations.batchUpdate.return_value.execute.return_value = {}
+    _mock_slides_service(monkeypatch, presentations)
+
+    body = "- Top\n  - Nested\n    - Deeper"
+    google_slides.google_slides_add_slide("pres1", title="T", body=body)
+
+    requests = _batch_update_requests(presentations)
+    body_text = next(
+        r["insertText"]["text"]
+        for r in requests
+        if "insertText" in r and "Top" in r["insertText"]["text"]
+    )
+    assert body_text == "Top\n  Nested\n    Deeper"
+
+
+def test_add_slide_rejects_marker_only_body_for_content_layout(monkeypatch):
+    """A body that's only a bullet marker ("•   ") strips to an empty
+    string before insertion — the body-required guard must check the
+    post-stripping text, not the raw string, or this recreates the
+    content-less-slide bug via a different input shape."""
+    presentations = Mock()
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(
+        google_slides.google_slides_add_slide(
+            "pres1", title="T", body="•   ", layout="TITLE_AND_BODY"
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "body" in result["message"]
+    presentations.batchUpdate.assert_not_called()
 
 
 def test_add_slide_title_layout_uses_subtitle_and_skips_bullets(monkeypatch):
@@ -132,9 +206,59 @@ def test_add_slide_title_only_layouts_need_no_body(monkeypatch, layout):
 
     assert result["status"] == "success"
     requests = _batch_update_requests(presentations)
-    assert requests[0]["createSlide"]["slideLayoutReference"] == {
-        "predefinedLayout": layout
+    create_slide = requests[0]["createSlide"]
+    assert create_slide["slideLayoutReference"] == {"predefinedLayout": layout}
+    mappings = {
+        m["layoutPlaceholder"]["type"] for m in create_slide["placeholderIdMappings"]
     }
+    assert mappings == {"TITLE"}
+
+
+@pytest.mark.parametrize("layout", ["TITLE_ONLY", "SECTION_HEADER"])
+def test_add_slide_rejects_empty_title_for_title_only_layout(monkeypatch, layout):
+    """Regression guard, symmetric with the body-required check: a layout
+    whose only content slot is the title must not silently create a fully
+    empty slide when title is also omitted."""
+    presentations = Mock()
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(google_slides.google_slides_add_slide("pres1", layout=layout))
+
+    assert result["status"] == "error"
+    presentations.batchUpdate.assert_not_called()
+
+
+def test_add_slide_rejects_completely_empty_title_layout(monkeypatch):
+    """The TITLE (cover) layout accepts an empty body (subtitle is
+    optional), but title and body can't both be empty — that's a
+    completely blank cover slide."""
+    presentations = Mock()
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(google_slides.google_slides_add_slide("pres1", layout="TITLE"))
+
+    assert result["status"] == "error"
+    presentations.batchUpdate.assert_not_called()
+
+
+def test_add_slide_skips_whitespace_only_title_insertion(monkeypatch):
+    """A whitespace-only title on a content layout (where body carries the
+    real content) must not be inserted verbatim — leave the placeholder
+    empty instead of filling it with whitespace."""
+    presentations = Mock()
+    presentations.batchUpdate.return_value.execute.return_value = {}
+    _mock_slides_service(monkeypatch, presentations)
+
+    google_slides.google_slides_add_slide(
+        "pres1", title="   ", body="Real content", layout="TITLE_AND_BODY"
+    )
+
+    requests = _batch_update_requests(presentations)
+    title_object_id = requests[0]["createSlide"]["placeholderIdMappings"][0]["objectId"]
+    assert not any(
+        "insertText" in r and r["insertText"]["objectId"] == title_object_id
+        for r in requests
+    )
 
 
 def test_add_slide_rejects_unknown_layout(monkeypatch):
@@ -242,18 +366,46 @@ def test_add_slide_title_layout_allows_missing_body(monkeypatch):
     assert result["status"] == "success"
 
 
-def test_add_slide_blank_layout_rejects_title_and_body(monkeypatch):
+def test_add_slide_blank_layout_rejects_title_alone(monkeypatch):
     presentations = Mock()
     _mock_slides_service(monkeypatch, presentations)
 
     result = json.loads(
-        google_slides.google_slides_add_slide(
-            "pres1", title="T", body="B", layout="BLANK"
-        )
+        google_slides.google_slides_add_slide("pres1", title="T", layout="BLANK")
     )
 
     assert result["status"] == "error"
     presentations.batchUpdate.assert_not_called()
+
+
+def test_add_slide_blank_layout_rejects_body_alone(monkeypatch):
+    presentations = Mock()
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(
+        google_slides.google_slides_add_slide("pres1", body="B", layout="BLANK")
+    )
+
+    assert result["status"] == "error"
+    presentations.batchUpdate.assert_not_called()
+
+
+def test_add_slide_blank_layout_allows_empty_and_omits_placeholder_mappings(
+    monkeypatch,
+):
+    """BLANK is meant to be empty (custom content is added afterwards via
+    google_slides_batch_update); the empty-slide guard must not reject it,
+    and createSlide should omit placeholderIdMappings rather than sending
+    an empty list."""
+    presentations = Mock()
+    presentations.batchUpdate.return_value.execute.return_value = {}
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(google_slides.google_slides_add_slide("pres1", layout="BLANK"))
+
+    assert result["status"] == "success"
+    requests = _batch_update_requests(presentations)
+    assert "placeholderIdMappings" not in requests[0]["createSlide"]
 
 
 def test_add_slide_resolves_full_presentation_url(monkeypatch):

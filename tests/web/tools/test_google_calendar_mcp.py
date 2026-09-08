@@ -1,8 +1,10 @@
 import copy
 import json
+import re
 from unittest.mock import Mock
 
 from xagent.web.tools.mcp import calendar
+from xagent.web.tools.mcp import utils as mcp_utils
 
 
 def _fake_service(execute_result: dict, existing_event: dict | None = None):
@@ -272,6 +274,31 @@ def test_update_event_attendee_matching_is_case_and_whitespace_insensitive(
     ]
 
 
+def test_update_event_tolerates_a_malformed_existing_attendee_list(monkeypatch):
+    """Regression test: an existing attendee entry with no "email" key (e.g.
+    a resource/room attendee), or a non-dict item, must not crash the merge
+    or get treated as a real email to match/duplicate against."""
+    existing_event = {
+        "id": "evt1",
+        "attendees": [
+            {"displayName": "Conference Room A"},
+            "not-a-dict",
+            {"email": "alice@example.com"},
+        ],
+    }
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_update_events(
+        event_id="evt1", attendees=["bob@example.com"]
+    )
+
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["body"]["attendees"] == existing_event["attendees"] + [
+        {"email": "bob@example.com"}
+    ]
+
+
 def test_update_event_with_no_new_attendees_leaves_existing_attendees_untouched(
     monkeypatch,
 ):
@@ -412,6 +439,10 @@ def test_update_event_add_google_meet_retries_after_a_failed_create_request(
 
     _, kwargs = service.events.return_value.update.call_args
     new_create_request = kwargs["body"]["conferenceData"]["createRequest"]
+    # A hardcoded different literal would also satisfy `!= "abc123"`; check
+    # it's actually a fresh uuid4().hex (32 lowercase hex chars), not just
+    # any old different string.
+    assert re.fullmatch(r"[0-9a-f]{32}", new_create_request["requestId"])
     assert new_create_request["requestId"] != "abc123"
     assert new_create_request["conferenceSolutionKey"] == {"type": "hangoutsMeet"}
 
@@ -596,3 +627,106 @@ def test_get_event_surfaces_hangout_link_like_create_and_update_do(monkeypatch):
 
     assert result["status"] == "success"
     assert result["hangout_link"] == "https://meet.google.com/abc-defg-hij"
+
+
+def test_create_event_error_message_hints_at_add_google_meet_on_failure(monkeypatch):
+    """Regression test: if the whole insert() call fails while add_google_meet
+    was requested (e.g. the account/domain can't create Meet conferences at
+    all), the error should point at add_google_meet as the likely cause --
+    it's otherwise indistinguishable from any other request-level failure."""
+    service = _fake_service({"id": "evt1"})
+    service.events.return_value.insert.return_value.execute.side_effect = RuntimeError(
+        "Bad Request"
+    )
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="1:1",
+            start_time="2026-09-07T15:00:00+08:00",
+            end_time="2026-09-07T16:00:00+08:00",
+            add_google_meet=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "Bad Request" in result["message"]
+    assert "add_google_meet" in result["message"]
+
+
+def test_update_event_error_message_hints_at_add_google_meet_on_failure(monkeypatch):
+    service = _fake_service({"id": "evt1"})
+    service.events.return_value.update.return_value.execute.side_effect = RuntimeError(
+        "Bad Request"
+    )
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(event_id="evt1", add_google_meet=True)
+    )
+
+    assert result["status"] == "error"
+    assert "Bad Request" in result["message"]
+    assert "add_google_meet" in result["message"]
+
+
+def test_create_event_error_message_has_no_hint_without_add_google_meet(monkeypatch):
+    service = _fake_service({"id": "evt1"})
+    service.events.return_value.insert.return_value.execute.side_effect = RuntimeError(
+        "Bad Request"
+    )
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="1:1",
+            start_time="2026-09-07T15:00:00+08:00",
+            end_time="2026-09-07T16:00:00+08:00",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert result["message"] == "Bad Request"
+
+
+def test_event_response_caps_a_large_event_like_other_tools_in_this_package(
+    monkeypatch,
+):
+    """Regression test: the raw Google event (description, attendees,
+    recurrence rules, ...) can be large enough to blow past the platform's
+    output-length budget; this package's other tools already guard against
+    that with success_with_capped_dict, and this response builder must too."""
+    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 300)
+    execute_result = {
+        "id": "evt1",
+        "attendees": [{"email": f"person{i}@example.com"} for i in range(200)],
+    }
+    service = _fake_service(execute_result)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    raw = calendar.google_calendar_create_events(
+        summary="1:1",
+        start_time="2026-09-07T15:00:00+08:00",
+        end_time="2026-09-07T16:00:00+08:00",
+    )
+    result = json.loads(raw)
+
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert len(result["event"]["attendees"]) < 200
+
+
+def test_event_response_does_not_truncate_a_small_event(monkeypatch):
+    service = _fake_service({"id": "evt1", "summary": "1:1"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="1:1",
+            start_time="2026-09-07T15:00:00+08:00",
+            end_time="2026-09-07T16:00:00+08:00",
+        )
+    )
+
+    assert result["status"] == "success"
+    assert result["truncated"] is False

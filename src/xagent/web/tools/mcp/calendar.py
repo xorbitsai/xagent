@@ -8,7 +8,7 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build  # type: ignore
 from mcp.server.fastmcp import FastMCP
 
-from .utils import setup_proxy_env
+from .utils import setup_proxy_env, success_with_capped_dict
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("calendar-mcp")
@@ -125,21 +125,21 @@ def _merge_attendees(event: dict[str, Any], attendees: list[str] | None) -> None
 
 
 def _needs_conference_request(event: dict[str, Any]) -> bool:
-    """True if add_google_meet should (re)send a createRequest: the event has
-    no conferenceData yet, or its only conferenceData is a *failed*
-    createRequest (status.statusCode == "failure").
+    """True if add_google_meet should (re)send a createRequest.
 
-    A conference that's still *pending* must not be treated the same as a
-    failed one -- both lack entryPoints/conferenceSolution while Google is
-    still provisioning them, so checking for those fields can't tell "failed,
-    safe to retry" apart from "pending, do not clobber the in-flight
-    request". Read status.statusCode directly instead (the same field
-    _event_response already reads for the opposite purpose). A conference
-    that has already resolved (has entryPoints or a conferenceSolution --
-    Meet or otherwise) also returns False, so it isn't clobbered either. A
-    legacy event carrying `hangoutLink` with no `conferenceData` at all (pre-
-    dates the conferenceData API) is also treated as already resolved, or
-    add_google_meet=True would request a second, duplicate conference for it.
+    The only signal this reads is createRequest.status.statusCode: it
+    returns True when the event has no conferenceData at all, or when the
+    only conferenceData present is a createRequest whose status.statusCode
+    is "failure". Everything else returns False, so it's left untouched:
+    a still-*pending* createRequest (status.statusCode == "pending" --
+    which, like a failed one, has no entryPoints/conferenceSolution yet,
+    so those fields can't be used to tell "safe to retry" apart from "do
+    not clobber the in-flight request"); an already-resolved conference
+    (its createRequest, if it went through one at all, carries
+    status.statusCode == "success", or there's no createRequest key at all
+    for a conference attached some other way -- e.g. a Zoom add-on);
+    a legacy event carrying `hangoutLink` with no `conferenceData` at all
+    (predates the conferenceData API).
     """
     if event.get("hangoutLink"):
         return False
@@ -151,10 +151,19 @@ def _needs_conference_request(event: dict[str, Any]) -> bool:
     return status_code == "failure"
 
 
-def _conference_and_notify_kwargs(
-    event: dict[str, Any], notify_attendees: bool, add_google_meet: bool
-) -> dict[str, Any]:
-    """Apply add_google_meet to event in place, and build the insert()/update() kwargs.
+def _apply_conference_request(event: dict[str, Any], add_google_meet: bool) -> None:
+    """Mutates event in place: attaches a fresh Meet createRequest when
+    add_google_meet=True and _needs_conference_request(event) says one isn't
+    already in flight or resolved. A no-op (no error, no signal in the
+    response) if the event already has a *non*-Meet conference (e.g. Zoom) --
+    see the add_google_meet docstring on the public tools.
+    """
+    if add_google_meet and _needs_conference_request(event):
+        _add_conference_request(event)
+
+
+def _api_call_kwargs(event: dict[str, Any], notify_attendees: bool) -> dict[str, Any]:
+    """Build the conferenceDataVersion/sendUpdates kwargs for insert()/update().
 
     conferenceDataVersion is always sent as 1: it only declares that the caller
     understands conference data, it does not request or remove a conference by
@@ -163,16 +172,33 @@ def _conference_and_notify_kwargs(
     which would silently drop an event's existing Meet link on every update that
     doesn't also pass add_google_meet=True.
     """
-    if add_google_meet and _needs_conference_request(event):
-        _add_conference_request(event)
     return {
         "conferenceDataVersion": 1,
         "sendUpdates": "all" if notify_attendees and event.get("attendees") else "none",
     }
 
 
-def _event_response(event: dict[str, Any]) -> dict[str, Any]:
-    response = {"status": "success", "event": event}
+def _error_message(exc: Exception, add_google_meet: bool) -> str:
+    """Append an actionable hint when a request that asked for a Google Meet
+    conference fails outright (as opposed to the conference itself merely
+    failing to provision -- see _needs_conference_request/conference_status
+    for that path). If the account/domain can't create Meet conferences at
+    all, Google can reject the whole insert()/update() call, taking the
+    entire event create/update down with it; that's indistinguishable here
+    from any other request-level failure, so at least point the caller at
+    the one thing in this request that's most likely to be the cause.
+    """
+    message = str(exc)
+    if add_google_meet:
+        message += (
+            " (this request included a Google Meet conference request; if this"
+            " Google account/domain cannot create Meet conferences, retry with"
+            " add_google_meet=False)"
+        )
+    return message
+
+
+def _event_response(event: dict[str, Any]) -> str:
     conference_data = event.get("conferenceData") or {}
 
     hangout_link = event.get("hangoutLink")
@@ -194,16 +220,28 @@ def _event_response(event: dict[str, Any]) -> dict[str, Any]:
                     hangout_link = entry_point["uri"]
                     break
 
+    extra: dict[str, Any] = {}
     if hangout_link:
-        response["hangout_link"] = hangout_link
+        extra["hangout_link"] = hangout_link
     else:
         create_request = conference_data.get("createRequest") or {}
         status_code = (create_request.get("status") or {}).get("statusCode")
         if status_code:
             # Meet link creation is asynchronous; surface the status instead of
-            # implying failure when hangoutLink isn't populated yet.
-            response["conference_status"] = status_code
-    return response
+            # implying failure when hangoutLink isn't populated yet. A status
+            # other than "pending" (e.g. "failure") won't resolve on its own --
+            # call create/update again with add_google_meet=True to retry,
+            # rather than polling google_calendar_get_event for it to change.
+            extra["conference_status"] = status_code
+
+    # The event itself (description, attendees, recurrence rules, ...) can be
+    # large enough to blow past the platform's output-length budget; cap it
+    # the same way the rest of this package caps large single-record
+    # responses, then splice the convenience fields back in afterwards so
+    # capping never has to reason about them.
+    response = json.loads(success_with_capped_dict("event", event))
+    response.update(extra)
+    return json.dumps(response)
 
 
 @mcp.tool()
@@ -226,7 +264,11 @@ def google_calendar_create_events(
     Set add_google_meet=True to attach a real Google Meet video-conference link to the event. The
     link is returned as hangout_link once Google finishes provisioning it; if it isn't ready yet the
     response includes conference_status instead (e.g. "pending") — call google_calendar_get_event
-    shortly after to fetch the link. A plain "Google Meet" string in location does not create a link.
+    shortly after to fetch the link. A conference_status other than "pending" (e.g. "failure") won't
+    resolve on its own; call this tool again with add_google_meet=True to retry, rather than polling
+    google_calendar_get_event for it to change. A plain "Google Meet" string in location does not
+    create a link, and if the account/domain can't create Meet conferences at all, this whole call
+    can fail outright rather than just skipping the link.
     """
     try:
         service = get_calendar_service()
@@ -246,21 +288,21 @@ def google_calendar_create_events(
         if location:
             event["location"] = location
         _merge_attendees(event, attendees)
+        _apply_conference_request(event, add_google_meet)
 
-        request_kwargs = _conference_and_notify_kwargs(
-            event, notify_attendees, add_google_meet
-        )
         request = service.events().insert(
             calendarId="primary",
             body=event,
-            **request_kwargs,
+            **_api_call_kwargs(event, notify_attendees),
         )
         created_event = request.execute()
-        return json.dumps(_event_response(created_event))
+        return _event_response(created_event)
 
     except Exception as e:
         logger.error(f"Error creating event: {e}")
-        return json.dumps({"status": "error", "message": str(e)})
+        return json.dumps(
+            {"status": "error", "message": _error_message(e, add_google_meet)}
+        )
 
 
 @mcp.tool()
@@ -274,7 +316,7 @@ def google_calendar_get_event(event_id: str) -> str:
     try:
         service = get_calendar_service()
         event = service.events().get(calendarId="primary", eventId=event_id).execute()
-        return json.dumps(_event_response(event))
+        return _event_response(event)
     except Exception as e:
         logger.error(f"Error getting event: {e}")
         return json.dumps({"status": "error", "message": str(e)})
@@ -296,14 +338,21 @@ def google_calendar_update_events(
     Update an existing event in Google Calendar.
     start_time and end_time must be RFC3339 formatted if provided.
     attendees is a list of email addresses to add to the event; attendees already on the event are
-    kept. Adding attendees does not, by itself, email anyone; set notify_attendees=True to have
-    Google Calendar send a native invite/update immediately to every attendee on the event (existing
-    and newly added). Confirm the recipient list with the user before setting notify_attendees=True.
+    kept, and there is no way to remove an attendee through this parameter. Adding attendees does
+    not, by itself, email anyone; set notify_attendees=True to have Google Calendar send a native
+    invite/update immediately to every attendee on the event (existing and newly added). Confirm the
+    recipient list with the user before setting notify_attendees=True.
     Set add_google_meet=True to attach a real Google Meet video-conference link to the event if it
-    doesn't already have a conference (an existing conference is left untouched). The link is
-    returned as hangout_link once Google finishes provisioning it; if it isn't ready yet the response
-    includes conference_status instead (e.g. "pending") — call google_calendar_get_event shortly
-    after to fetch the link. A plain "Google Meet" string in location does not create a link.
+    doesn't already have a conference (an existing conference is left untouched, whether it's a Meet
+    conference or a non-Google one such as Zoom -- in the latter case this is a silent no-op, with no
+    hangout_link/conference_status in the response, since the event already has a conference). The
+    link is returned as hangout_link once Google finishes provisioning it; if it isn't ready yet the
+    response includes conference_status instead (e.g. "pending") — call google_calendar_get_event
+    shortly after to fetch the link. A conference_status other than "pending" (e.g. "failure") won't
+    resolve on its own; call this tool again with add_google_meet=True to retry, rather than polling
+    google_calendar_get_event for it to change. A plain "Google Meet" string in location does not
+    create a link, and if the account/domain can't create Meet conferences at all, this whole call
+    can fail outright rather than just skipping the link.
     """
     try:
         service = get_calendar_service()
@@ -322,22 +371,22 @@ def google_calendar_update_events(
         if location:
             event["location"] = location
         _merge_attendees(event, attendees)
+        _apply_conference_request(event, add_google_meet)
 
-        request_kwargs = _conference_and_notify_kwargs(
-            event, notify_attendees, add_google_meet
-        )
         request = service.events().update(
             calendarId="primary",
             eventId=event_id,
             body=event,
-            **request_kwargs,
+            **_api_call_kwargs(event, notify_attendees),
         )
         updated_event = request.execute()
-        return json.dumps(_event_response(updated_event))
+        return _event_response(updated_event)
 
     except Exception as e:
         logger.error(f"Error updating event: {e}")
-        return json.dumps({"status": "error", "message": str(e)})
+        return json.dumps(
+            {"status": "error", "message": _error_message(e, add_google_meet)}
+        )
 
 
 @mcp.tool()

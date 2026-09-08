@@ -228,8 +228,10 @@ def google_drive_download_file(
     Ignored for a file that already has real binary content of its own
     (mime_type is not required and has no effect there).
     filename: optional name for the written file; defaults to the Drive
-    file's own name (with an extension appended if exporting to a mime_type
-    whose extension doesn't already match).
+    file's own name. Either way, if exporting a Workspace document the
+    mime_type's extension is appended when not already present (so a bare
+    filename="report" for an "application/pdf" export still ends up
+    "report.pdf").
     """
     try:
         service = get_drive_service()
@@ -254,19 +256,22 @@ def google_drive_download_file(
                 )
             request = service.files().export_media(fileId=file_id, mimeType=mime_type)
             extension = mimetypes.guess_extension(mime_type) or ""
-            safe_drive_name = _safe_output_filename(drive_name)
-            default_name = (
-                safe_drive_name
-                if safe_drive_name.endswith(extension)
-                else safe_drive_name + extension
-            )
         else:
             request = service.files().get_media(fileId=file_id)
-            default_name = _safe_output_filename(drive_name)
+            extension = ""
 
         data = _download_media(request)
 
-        chosen_name = _safe_output_filename(filename) if filename else default_name
+        # Ensure the export's extension is present regardless of whether
+        # the name came from Drive's own file name or an explicit
+        # `filename` argument — the caller passing a bare "report" for a
+        # PDF export shouldn't lose the ".pdf" any more than the default
+        # name would. Case-insensitive so "Report.PDF" doesn't become
+        # "Report.PDF.pdf".
+        chosen_name = _safe_output_filename(filename or drive_name)
+        if extension and not chosen_name.lower().endswith(extension.lower()):
+            chosen_name += extension
+
         output_path = _unique_output_path(_output_dir(), chosen_name)
         output_path.write_bytes(data)
 

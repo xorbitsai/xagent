@@ -236,6 +236,55 @@ def test_download_file_uses_explicit_filename(monkeypatch, tmp_path):
     assert result["path"] == str(tmp_path / "output" / "custom.pdf")
 
 
+def test_download_file_appends_extension_to_explicit_filename_missing_one(
+    monkeypatch, tmp_path
+):
+    """Regression guard: an explicit filename with no extension must still
+    get the export mime_type's extension appended, exactly like the
+    default (Drive-name-derived) filename already does — the caller
+    shouldn't lose the .pdf just because they named the file themselves."""
+    files = Mock()
+    files.get.return_value.execute.return_value = {
+        "id": "f1",
+        "name": "Onboarding Deck",
+        "mimeType": "application/vnd.google-apps.presentation",
+    }
+    _mock_drive_service(monkeypatch, files)
+    _patch_downloader(monkeypatch, b"content")
+
+    result = json.loads(
+        google_drive.google_drive_download_file(
+            "f1", mime_type="application/pdf", filename="report"
+        )
+    )
+
+    assert result["status"] == "success"
+    assert result["path"] == str(tmp_path / "output" / "report.pdf")
+
+
+def test_download_file_does_not_double_extension_on_case_mismatch(
+    monkeypatch, tmp_path
+):
+    """Regression guard: matching the target extension must be
+    case-insensitive — a Drive name already ending in ".PDF" (any case)
+    exported to "application/pdf" must not become "....PDF.pdf"."""
+    files = Mock()
+    files.get.return_value.execute.return_value = {
+        "id": "f1",
+        "name": "Report.PDF",
+        "mimeType": "application/vnd.google-apps.document",
+    }
+    _mock_drive_service(monkeypatch, files)
+    _patch_downloader(monkeypatch, b"content")
+
+    result = json.loads(
+        google_drive.google_drive_download_file("f1", mime_type="application/pdf")
+    )
+
+    assert result["status"] == "success"
+    assert result["path"] == str(tmp_path / "output" / "Report.PDF")
+
+
 def test_download_file_sanitizes_path_traversal_in_filename(monkeypatch, tmp_path):
     files = Mock()
     files.get.return_value.execute.return_value = {

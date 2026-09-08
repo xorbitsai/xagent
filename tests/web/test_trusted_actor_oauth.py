@@ -710,3 +710,33 @@ def test_ordinary_oauth_flow_keeps_cookie_free_state_and_provisioning(
     assert response.status_code == 200
     assert db.query(UserOAuth).one().resource_owner_key is None
     side_effects.assert_called_once_with(db, user_id=user.id, connector_key="calendar")
+
+
+def test_callback_owner_guard(oauth_db, monkeypatch):
+    from xagent.web.services import oauth_persistence
+
+    db, user = oauth_db
+    _catalog_link(db, user)
+    response = _start(db, user)
+    cookie_name, cookie_value, _ = _flow_cookie(response)
+    post = _mock_exchange(monkeypatch)
+    calls = []
+
+    def guard(session, user_id, owner_key):
+        assert session is db
+        calls.append((user_id, owner_key))
+        raise ValueError("Owner stopped")
+
+    monkeypatch.setattr(oauth_persistence, "_guard", None)
+    oauth_persistence.set_oauth_persistence_guard(guard)
+    result = auth_api.generic_oauth_callback(
+        "custom",
+        _request(_state(response), cookie=(cookie_name, cookie_value)),
+        db,
+        _provider(),
+    )
+    assert result.status_code == 400
+    assert calls == [(user.id, ACTOR_ALICE)]
+    assert post.call_count == 1
+    assert db.query(UserOAuth).count() == 0
+    oauth_persistence.set_oauth_persistence_guard(None)

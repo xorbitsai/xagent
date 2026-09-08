@@ -63,6 +63,7 @@ from ..oauth_provider_quirks import (
 from ..services import gmail_provisioning
 from ..services.auth_email import send_password_reset_email
 from ..services.db_runtime import await_task_settlement, propagate_deferred_cancellation
+from ..services.oauth_persistence import require_oauth_owner_active
 from ..services.user_oauth import (
     delete_scoped_user_oauth_accounts,
     normalize_user_oauth_resource_owner_key,
@@ -3553,6 +3554,8 @@ def generic_oauth_callback(
                     provider=provider,
                     app_id=app_id,
                 )
+                assert resource_owner_key is not None
+                require_oauth_owner_active(db, user_id, resource_owner_key)
             except ValueError:
                 db.rollback()
                 return HTMLResponse(

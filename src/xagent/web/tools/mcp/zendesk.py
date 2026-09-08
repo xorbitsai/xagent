@@ -238,10 +238,21 @@ def _require_one_of(value: str, allowed: frozenset[str], field_name: str) -> str
 # query string is scrubbed wholesale before any exception text is logged or
 # returned.
 _QUERY_STRING_PATTERN = re.compile(r"\?[^\s\"'()<>]+")
+# A bare "?" alone doesn't mean a URL query string -- an ordinary sentence
+# like "...is this a duplicate ticket? Contact support." would otherwise get
+# mangled. Only redact when the "?" is immediately preceded (within the same
+# whitespace-delimited token) by something path-shaped -- containing a "/",
+# as any real URL or path does -- leaving plain prose untouched.
+_PATH_LIKE_TOKEN_PATTERN = re.compile(r"[^\s\"'()<>]*$")
 
 
 def _scrub_query_strings(text: str) -> str:
-    return _QUERY_STRING_PATTERN.sub("?<query redacted>", text)
+    def _redact(match: re.Match[str]) -> str:
+        preceding_token = _PATH_LIKE_TOKEN_PATTERN.search(text[: match.start()])
+        token = preceding_token.group(0) if preceding_token else ""
+        return "?<query redacted>" if "/" in token else match.group(0)
+
+    return _QUERY_STRING_PATTERN.sub(_redact, text)
 
 
 def _sanitize_exception_text(exc: BaseException) -> str:
@@ -289,6 +300,14 @@ def _finalize_capped(response: str, max_output_length: int) -> str:
     # construct -- there is nothing left to shrink. XAGENT_TOOL_MAX_OUTPUT_LENGTH
     # would need to be set below roughly 20 characters to reach this.
     return json.dumps({"status": "error"}, ensure_ascii=False)
+
+
+def _error_capped(message: str) -> str:
+    """Every success path in this file is capped before it's returned; an
+    error message built from Zendesk's own (redacted) response detail
+    deserves the same guarantee -- an oversized error is still an oversized
+    string for the platform's output filter to mangle into invalid JSON."""
+    return _finalize_capped(_error(message), get_tool_max_output_length())
 
 
 def _clean_tags(tags: list[str]) -> list[str]:
@@ -356,7 +375,13 @@ def _extract_field_reasons(details: Any) -> str | None:
             text = entry.get("description") if isinstance(entry, dict) else entry
             if isinstance(text, str) and text:
                 reasons.append(text)
-    return "; ".join(reasons) if reasons else None
+    if not reasons:
+        return None
+    # A validation error can name arbitrarily many fields (e.g. a bulk-style
+    # payload with every field invalid) -- bounded the same way the
+    # unstructured response-text fallback below already is, so this can't
+    # be the thing that pushes a raised error past the output cap.
+    return truncate_error_text("; ".join(reasons))
 
 
 def _extract_error_detail(response: requests.Response) -> str | None:
@@ -749,6 +774,50 @@ def _ticket_summary(ticket: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _ticket_detail(ticket: dict[str, Any]) -> dict[str, Any]:
+    """_ticket_summary plus the fields only worth the size cost for a
+    single ticket -- the caller asked about (or just created/updated)
+    exactly one ticket, so its actual text is the point, unlike a list or
+    search result where dozens of tickets share one output cap. Mirrors
+    linear.py's _ISSUE_SUMMARY_FIELDS/_ISSUE_DETAIL_FIELDS split.
+
+    custom_fields is deliberately excluded: unlike the fields below, it's
+    unbounded and shaped entirely by the caller's own account
+    configuration, not a fixed Zendesk schema -- the truncation cost/benefit
+    is too unpredictable to include unconditionally here."""
+    return {
+        **_ticket_summary(ticket),
+        "description": ticket.get("description"),
+        "organization_id": ticket.get("organization_id"),
+        "type": ticket.get("type"),
+        "via": ticket.get("via"),
+    }
+
+
+def _build_ticket_detail_response(
+    ticket: dict[str, Any], max_output_length: int
+) -> str:
+    """Shared by zendesk_get_ticket/zendesk_create_ticket/
+    zendesk_update_ticket: description can be up to 64KiB, Zendesk's own
+    limit on a comment body (description *is* the ticket's first comment),
+    well past a typical output cap. Shrinks description the same way
+    _add_comment already shrinks an oversized comment body, rather than
+    letting one long ticket fail the whole call outright via
+    _finalize_capped's blunter last-resort fallback."""
+    detail = _ticket_detail(ticket)
+    response = _success(ticket=detail)
+    description = detail.get("description")
+    while (
+        len(response) > max_output_length
+        and isinstance(description, str)
+        and description
+    ):
+        description = description[: len(description) // 2]
+        detail = {**detail, "description": description, "description_truncated": True}
+        response = _success(ticket=detail)
+    return _finalize_capped(response, max_output_length)
+
+
 def _user_summary(user: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": user.get("id"),
@@ -794,8 +863,10 @@ def _search_result_summary(result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _resolve_path_id(value: str, pattern: re.Pattern[str], field_name: str) -> str:
-    """Accept a bare id or a full Zendesk agent UI URL (e.g.
+def _resolve_path_id(
+    value: int | str, pattern: re.Pattern[str], field_name: str
+) -> str:
+    """Accept a bare id (int or str) or a full Zendesk agent UI URL (e.g.
     "https://acme.zendesk.com/agent/tickets/123"), then percent-encode the
     result for safe interpolation into a URL path segment."""
     return url_path_id(resolve_id_from_url(str(value), pattern, field_name), field_name)
@@ -830,7 +901,7 @@ def _find_comment_event(result: Any, public: bool) -> dict[str, Any] | None:
     return None
 
 
-def _add_comment(ticket_id: str, body: str, public: bool) -> str:
+def _add_comment(ticket_id: int | str, body: str, public: bool) -> str:
     """Post a comment and return the already-capped success envelope (not
     a dict for the caller to wrap) -- a comment body can be up to 64KiB
     (Zendesk's own limit, enforced by _require_comment_body above), well
@@ -937,7 +1008,7 @@ def zendesk_search(query: str, limit: int = 25, page: int = 1) -> str:
         logger.error(
             f"Error searching Zendesk for query of length {len(query or '')}: {e}"
         )
-        return _error(str(e))
+        return _error_capped(str(e))
 
 
 @mcp.tool()
@@ -958,11 +1029,11 @@ def zendesk_list_tickets(limit: int = 25, after_cursor: str | None = None) -> st
         )
     except Exception as e:
         logger.error(f"Error listing Zendesk tickets: {e}")
-        return _error(str(e))
+        return _error_capped(str(e))
 
 
 @mcp.tool()
-def zendesk_get_ticket(ticket_id: str) -> str:
+def zendesk_get_ticket(ticket_id: int | str) -> str:
     """
     Get a Zendesk ticket by id -- a bare numeric id, or a full ticket URL
     copied from the Zendesk agent UI.
@@ -970,11 +1041,12 @@ def zendesk_get_ticket(ticket_id: str) -> str:
     try:
         path_id = _resolve_path_id(ticket_id, _TICKET_URL_ID_PATTERN, "ticket_id")
         result = _request("GET", f"/tickets/{path_id}.json")
-        response = _success(ticket=_ticket_summary(_unwrap(result, "ticket")))
-        return _finalize_capped(response, get_tool_max_output_length())
+        return _build_ticket_detail_response(
+            _unwrap(result, "ticket"), get_tool_max_output_length()
+        )
     except Exception as e:
         logger.error(f"Error fetching Zendesk ticket {ticket_id}: {e}")
-        return _error(str(e))
+        return _error_capped(str(e))
 
 
 @mcp.tool()
@@ -1030,16 +1102,17 @@ def zendesk_create_ticket(
         if tags_value is not None:
             ticket["tags"] = tags_value
         result = _request("POST", "/tickets.json", json_data={"ticket": ticket})
-        response = _success(ticket=_ticket_summary(_unwrap(result, "ticket")))
-        return _finalize_capped(response, get_tool_max_output_length())
+        return _build_ticket_detail_response(
+            _unwrap(result, "ticket"), get_tool_max_output_length()
+        )
     except Exception as e:
         logger.error(f"Error creating Zendesk ticket: {e}")
-        return _error(str(e))
+        return _error_capped(str(e))
 
 
 @mcp.tool()
 def zendesk_update_ticket(
-    ticket_id: str,
+    ticket_id: int | str,
     status: str | None = None,
     priority: str | None = None,
     tags: list[str] | None = None,
@@ -1098,15 +1171,16 @@ def zendesk_update_ticket(
             f"/tickets/{_resolve_path_id(ticket_id, _TICKET_URL_ID_PATTERN, 'ticket_id')}.json",
             json_data={"ticket": fields},
         )
-        response = _success(ticket=_ticket_summary(_unwrap(result, "ticket")))
-        return _finalize_capped(response, get_tool_max_output_length())
+        return _build_ticket_detail_response(
+            _unwrap(result, "ticket"), get_tool_max_output_length()
+        )
     except Exception as e:
         logger.error(f"Error updating Zendesk ticket {ticket_id}: {e}")
-        return _error(str(e))
+        return _error_capped(str(e))
 
 
 @mcp.tool()
-def zendesk_delete_ticket(ticket_id: str) -> str:
+def zendesk_delete_ticket(ticket_id: int | str) -> str:
     """
     Delete a Zendesk ticket. This is a soft delete: Zendesk moves the
     ticket to its "Deleted tickets" area rather than destroying it
@@ -1118,15 +1192,20 @@ def zendesk_delete_ticket(ticket_id: str) -> str:
     try:
         path_id = _resolve_path_id(ticket_id, _TICKET_URL_ID_PATTERN, "ticket_id")
         _request("DELETE", f"/tickets/{path_id}.json")
-        return _success(ticket_id=path_id)
+        # DELETE returns no body for Zendesk to echo an integer id from, but
+        # every other tool's ticket_id field is a real int -- path_id is
+        # percent-encoded (a no-op for a genuine numeric id, the only value
+        # that ever reaches this point without _resolve_path_id already
+        # raising), so it converts back cleanly.
+        return _success(ticket_id=int(path_id))
     except Exception as e:
         logger.error(f"Error deleting Zendesk ticket {ticket_id}: {e}")
-        return _error(str(e))
+        return _error_capped(str(e))
 
 
 @mcp.tool()
 def zendesk_list_ticket_comments(
-    ticket_id: str, limit: int = 25, after_cursor: str | None = None
+    ticket_id: int | str, limit: int = 25, after_cursor: str | None = None
 ) -> str:
     """
     List the comment thread on a ticket, oldest first (the first comment is
@@ -1145,11 +1224,11 @@ def zendesk_list_ticket_comments(
         )
     except Exception as e:
         logger.error(f"Error listing comments for Zendesk ticket {ticket_id}: {e}")
-        return _error(str(e))
+        return _error_capped(str(e))
 
 
 @mcp.tool()
-def zendesk_reply_to_ticket(ticket_id: str, body: str) -> str:
+def zendesk_reply_to_ticket(ticket_id: int | str, body: str) -> str:
     """
     Reply to a Zendesk ticket as a public comment -- visible to the
     requester/end user. Returns the created comment (id, body, and
@@ -1164,11 +1243,11 @@ def zendesk_reply_to_ticket(ticket_id: str, body: str) -> str:
         return _add_comment(ticket_id, body, public=True)
     except Exception as e:
         logger.error(f"Error replying to Zendesk ticket {ticket_id}: {e}")
-        return _error(str(e))
+        return _error_capped(str(e))
 
 
 @mcp.tool()
-def zendesk_add_internal_note(ticket_id: str, body: str) -> str:
+def zendesk_add_internal_note(ticket_id: int | str, body: str) -> str:
     """
     Add an internal note to a Zendesk ticket. Internal notes are only
     visible to agents, never to the requester/end user. Returns the created
@@ -1183,7 +1262,7 @@ def zendesk_add_internal_note(ticket_id: str, body: str) -> str:
         return _add_comment(ticket_id, body, public=False)
     except Exception as e:
         logger.error(f"Error adding internal note to Zendesk ticket {ticket_id}: {e}")
-        return _error(str(e))
+        return _error_capped(str(e))
 
 
 @mcp.tool()
@@ -1200,11 +1279,11 @@ def zendesk_list_users(limit: int = 25, after_cursor: str | None = None) -> str:
         )
     except Exception as e:
         logger.error(f"Error listing Zendesk users: {e}")
-        return _error(str(e))
+        return _error_capped(str(e))
 
 
 @mcp.tool()
-def zendesk_get_user(user_id: str) -> str:
+def zendesk_get_user(user_id: int | str) -> str:
     """
     Get a Zendesk user by id.
     user_id: a bare numeric id, or a full user URL copied from the Zendesk
@@ -1217,7 +1296,7 @@ def zendesk_get_user(user_id: str) -> str:
         return _finalize_capped(response, get_tool_max_output_length())
     except Exception as e:
         logger.error(f"Error fetching Zendesk user {user_id}: {e}")
-        return _error(str(e))
+        return _error_capped(str(e))
 
 
 @mcp.tool()
@@ -1258,7 +1337,7 @@ def zendesk_search_users(query: str, limit: int = 25, page: int = 1) -> str:
         logger.error(
             f"Error searching Zendesk users for query of length {len(query or '')}: {e}"
         )
-        return _error(str(e))
+        return _error_capped(str(e))
 
 
 @mcp.tool()
@@ -1279,11 +1358,11 @@ def zendesk_list_organizations(limit: int = 25, after_cursor: str | None = None)
         )
     except Exception as e:
         logger.error(f"Error listing Zendesk organizations: {e}")
-        return _error(str(e))
+        return _error_capped(str(e))
 
 
 @mcp.tool()
-def zendesk_get_organization(organization_id: str) -> str:
+def zendesk_get_organization(organization_id: int | str) -> str:
     """
     Get a Zendesk organization by id.
     organization_id: a bare numeric id, or a full organization URL copied
@@ -1300,7 +1379,7 @@ def zendesk_get_organization(organization_id: str) -> str:
         return _finalize_capped(response, get_tool_max_output_length())
     except Exception as e:
         logger.error(f"Error fetching Zendesk organization {organization_id}: {e}")
-        return _error(str(e))
+        return _error_capped(str(e))
 
 
 if __name__ == "__main__":

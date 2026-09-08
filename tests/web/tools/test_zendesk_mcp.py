@@ -370,6 +370,22 @@ def test_finalize_capped_falls_back_to_minimal_envelope_below_any_message():
     assert json.loads(raw) == {"status": "error"}
 
 
+def test_scrub_query_strings_redacts_a_real_url_query():
+    text = "Max retries exceeded with url: /search.json?query=email:jane@example.com"
+
+    assert "jane@example.com" not in zendesk._scrub_query_strings(text)
+    assert "/search.json?<query redacted>" in zendesk._scrub_query_strings(text)
+
+
+def test_scrub_query_strings_leaves_a_plain_question_mark_alone():
+    # A "?" alone doesn't mean a URL query string -- only one immediately
+    # preceded by something path-shaped (containing a "/") is a real query
+    # string; ordinary prose with a "?" must not get mangled.
+    text = "Is this a duplicate ticket? Contact support."
+
+    assert zendesk._scrub_query_strings(text) == text
+
+
 def test_cursor_page_returns_next_cursor_when_has_more():
     page, has_more, after_cursor = zendesk._cursor_page(
         {
@@ -639,6 +655,27 @@ def test_request_raises_with_structured_error_detail(monkeypatch):
     )
 
     with pytest.raises(RuntimeError, match="Not found"):
+        zendesk._request("GET", "/tickets/999.json")
+
+
+@pytest.mark.parametrize("status_code", [401, 403])
+def test_request_raises_a_clear_error_on_auth_failure(monkeypatch, status_code):
+    # An expired/invalid API token (401) or one lacking the needed
+    # permission (403) is a distinct, common failure mode from a not-found
+    # or validation error -- must surface as a clear, structured message
+    # like every other HTTPError case, not just an untested code path.
+    monkeypatch.setattr(
+        zendesk._session,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                status_code=status_code,
+                json_data={"error": "Couldn't authenticate you"},
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="Couldn't authenticate you"):
         zendesk._request("GET", "/tickets/999.json")
 
 
@@ -1113,6 +1150,70 @@ def test_get_ticket_returns_summary(monkeypatch):
     assert result["ticket"]["subject"] == "Help"
 
 
+def test_get_ticket_includes_description(monkeypatch):
+    # A single ticket fetch is exactly the case where the caller wants the
+    # actual text, not just metadata -- without this, the only way to read
+    # a ticket's body was a second call to list comments and guess the
+    # first one is the description. Mirrors linear.py's detail-vs-summary
+    # split.
+    monkeypatch.setattr(
+        zendesk._session,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "ticket": {
+                        "id": 1,
+                        "subject": "Help",
+                        "description": "The full body text of the ticket.",
+                        "organization_id": 42,
+                        "type": "incident",
+                        "via": {"channel": "web"},
+                    }
+                }
+            )
+        ),
+    )
+
+    result = json.loads(zendesk.zendesk_get_ticket(1))
+
+    assert result["ticket"]["description"] == "The full body text of the ticket."
+    assert result["ticket"]["organization_id"] == 42
+    assert result["ticket"]["type"] == "incident"
+    assert result["ticket"]["via"] == {"channel": "web"}
+
+
+def test_get_ticket_shrinks_an_oversized_description_before_erroring(monkeypatch):
+    # description can be up to 64KiB, well past a typical output cap --
+    # this must degrade the same way an oversized comment body already
+    # does (shrink with a truncated flag), not fail the whole call via
+    # _finalize_capped's blunter last-resort fallback.
+    monkeypatch.setattr(
+        zendesk._session,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "ticket": {
+                        "id": 1,
+                        "subject": "Help",
+                        "description": "x" * 5000,
+                    }
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(zendesk, "get_tool_max_output_length", lambda: 2000)
+
+    raw = zendesk.zendesk_get_ticket(1)
+    result = json.loads(raw)
+
+    assert result["status"] == "success"
+    assert result["ticket"]["description_truncated"] is True
+    assert len(result["ticket"]["description"]) < 5000
+    assert len(raw) <= 2000
+
+
 def test_get_ticket_falls_back_to_error_when_response_is_too_large(monkeypatch):
     # zendesk_get_ticket builds a single fixed-shape object with no list to
     # shrink -- unlike the list/comment tools, it had no size guarantee at
@@ -1430,10 +1531,10 @@ def test_delete_ticket_accepts_agent_ui_url(monkeypatch):
 
     assert result["status"] == "success"
     assert mock_request.call_args.kwargs["url"].endswith("/tickets/123.json")
-    # The response must echo the resolved numeric id, not the raw URL
-    # the caller passed in -- so it's directly comparable with the id
-    # every other tool's response returns.
-    assert result["ticket_id"] == "123"
+    # The response must echo the resolved numeric id as a real int, not the
+    # raw URL the caller passed in and not a string -- so it's directly
+    # comparable with the id every other tool's response returns.
+    assert result["ticket_id"] == 123
 
 
 def test_update_ticket_clears_tags_with_explicit_empty_list(monkeypatch):
@@ -2134,6 +2235,65 @@ async def test_optional_params_accept_explicit_none_through_tool_schema(
                     "comments": [],
                     "users": [],
                     "organizations": [],
+                    "meta": {"has_more": False},
+                }
+            )
+        ),
+    )
+
+    content, structured = await zendesk.mcp.call_tool(tool_name, arguments)
+
+    result = json.loads(structured["result"])
+    assert result["status"] == "success"
+
+
+@pytest.mark.parametrize(
+    "tool_name, arguments",
+    [
+        ("zendesk_get_ticket", {"ticket_id": 1}),
+        ("zendesk_delete_ticket", {"ticket_id": 1}),
+        ("zendesk_list_ticket_comments", {"ticket_id": 1, "after_cursor": None}),
+        ("zendesk_reply_to_ticket", {"ticket_id": 1, "body": "hi"}),
+        ("zendesk_add_internal_note", {"ticket_id": 1, "body": "hi"}),
+        ("zendesk_get_user", {"user_id": 1}),
+        ("zendesk_get_organization", {"organization_id": 1}),
+        (
+            "zendesk_update_ticket",
+            {
+                "ticket_id": 1,
+                "status": None,
+                "priority": None,
+                "tags": [],
+                "assignee_id": None,
+                "group_id": None,
+            },
+        ),
+    ],
+)
+async def test_id_params_accept_a_bare_int_through_tool_schema(
+    monkeypatch, tool_name, arguments
+):
+    """Every id-based tool's own responses echo Zendesk's ids as JSON
+    integers (e.g. zendesk_list_tickets' `tickets[].id`), so an LLM that
+    just listed tickets and now wants to act on one is the most natural
+    caller to pass that same int straight back in -- but ticket_id/user_id/
+    organization_id were typed plain `str`, whose generated schema has no
+    "integer" variant, so FastMCP's Pydantic validation rejected an int
+    before this module's own code (which already coerces via
+    _resolve_path_id's str(value)) ever ran. Confirmed by reproducing the
+    rejection directly against real int args through zendesk.mcp.call_tool
+    (not a plain Python call, which bypasses schema validation entirely)."""
+    monkeypatch.setattr(
+        zendesk._session,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "ticket": {"id": 1},
+                    "user": {"id": 1},
+                    "organization": {"id": 1},
+                    "comments": [],
+                    "audit": {"events": []},
                     "meta": {"has_more": False},
                 }
             )

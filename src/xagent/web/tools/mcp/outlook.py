@@ -116,7 +116,7 @@ def _message_body(content: str, content_type: str) -> dict[str, str]:
     return {"contentType": normalized, "content": content}
 
 
-_RRULE_WEEKDAYS = [_MO, _TU, _WE, _TH, _FR, _SA, _SU]
+_RRULE_WEEKDAYS = (_MO, _TU, _WE, _TH, _FR, _SA, _SU)
 
 _RRULE_DAY_TO_GRAPH = {
     "MO": "monday",
@@ -184,11 +184,15 @@ def _build_graph_recurrence(
         pattern = {"type": "daily", "interval": interval}
     elif freq == "WEEKLY":
         byday = parts.get("BYDAY")
-        days = (
-            [_RRULE_DAY_TO_GRAPH[code] for code in byday.split(",")]
-            if byday
-            else [_RRULE_DAY_TO_GRAPH[_weekday_code_from_date(start_date)]]
-        )
+        if byday:
+            days = []
+            for code in byday.split(","):
+                clean_code = code.strip().upper()
+                if clean_code not in _RRULE_DAY_TO_GRAPH:
+                    raise ValueError(f"invalid day code in BYDAY: {code!r}")
+                days.append(_RRULE_DAY_TO_GRAPH[clean_code])
+        else:
+            days = [_RRULE_DAY_TO_GRAPH[_weekday_code_from_date(start_date)]]
         pattern = {"type": "weekly", "interval": interval, "daysOfWeek": days}
     elif freq == "MONTHLY" and "BYMONTHDAY" in parts:
         pattern = {
@@ -493,18 +497,29 @@ def outlook_update_event(
                     f"/me/events/{quote(event_id, safe='')}",
                     params={"$select": "start"},
                 )
-                effective_start = (existing.get("start") or {}).get("dateTime")
+                existing_start_field = existing.get("start") or {}
+                effective_start = existing_start_field.get("dateTime")
                 if not effective_start:
                     raise ValueError(
                         "could not determine the event's start time to "
                         "validate the recurrence rule; pass start_datetime "
                         "explicitly"
                     )
-                # This GET sent no Prefer header, so Graph returned the
-                # value in UTC regardless of what `timezone` the caller
-                # passed - that parameter only pairs with a start_datetime
-                # the caller is ALSO providing, which isn't the case here.
-                effective_timezone = "UTC"
+                # `timezone` only pairs with a start_datetime the caller is
+                # ALSO providing, which isn't the case here - Graph's
+                # dateTimeTimeZone object always reports the zone its
+                # dateTime is actually expressed in (defaulting to "UTC"
+                # when no Prefer header was sent, as here), so read that
+                # instead of trusting the caller to have independently
+                # passed a matching timezone.
+                existing_timezone = existing_start_field.get("timeZone")
+                if not existing_timezone:
+                    raise ValueError(
+                        "existing event has no timeZone on its start time; "
+                        "cannot safely build a recurrence rule without an "
+                        "explicit start_datetime for this update"
+                    )
+                effective_timezone = existing_timezone
             payload["recurrence"] = _build_graph_recurrence(
                 recurrence, effective_start, effective_timezone
             )

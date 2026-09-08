@@ -1,6 +1,6 @@
 """update Google Drive description for the sharing tools
 
-Revision ID: 20260908_update_google_drive_description_category
+Revision ID: 20260908_update_google_drive_description
 Revises: 20260904_add_auto_model_config
 Create Date: 2026-09-08
 
@@ -11,7 +11,7 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "20260908_update_google_drive_description_category"
+revision: str = "20260908_update_google_drive_description"
 down_revision: Union[str, None] = "20260904_add_auto_model_config"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None

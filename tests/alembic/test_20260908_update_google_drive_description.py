@@ -4,6 +4,7 @@ import importlib.util
 from pathlib import Path
 from unittest.mock import patch
 
+import sqlalchemy as sa
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from sqlalchemy import create_engine, text
@@ -12,10 +13,10 @@ from sqlalchemy import create_engine, text
 def _load_migration_module():
     migration_file = (
         Path(__file__).parent.parent.parent
-        / "src/xagent/migrations/versions/20260908_update_google_drive_description_category.py"
+        / "src/xagent/migrations/versions/20260908_update_google_drive_description.py"
     )
     spec = importlib.util.spec_from_file_location(
-        "update_google_drive_description_category_migration", migration_file
+        "update_google_drive_description_migration", migration_file
     )
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -145,6 +146,40 @@ def test_upgrade_without_description_column_is_a_noop(tmp_path):
         )
         with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()  # must not raise when description is missing
+        # The column genuinely doesn't exist -- confirms the no-op above
+        # actually exercised the missing-column guard, not a coincidence.
+        columns = {
+            c["name"] for c in sa.inspect(connection).get_columns("public_mcp_apps")
+        }
+        assert "description" not in columns
+
+
+def test_upgrade_without_app_id_column_is_a_noop(tmp_path):
+    """_columns_present requires BOTH app_id and description; only the
+    description-missing half was covered above."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE public_mcp_apps (
+                    id INTEGER PRIMARY KEY,
+                    description TEXT
+                )
+                """
+            )
+        )
+        connection.execute(
+            text("INSERT INTO public_mcp_apps (description) VALUES (:d)"),
+            {"d": migration.PREVIOUS_DESCRIPTION},
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()  # must not raise when app_id is missing
+        description = connection.execute(
+            text("SELECT description FROM public_mcp_apps")
+        ).scalar()
+        assert description == migration.PREVIOUS_DESCRIPTION
 
 
 def test_upgrade_without_table_is_a_noop(tmp_path):
@@ -153,6 +188,8 @@ def test_upgrade_without_table_is_a_noop(tmp_path):
     with engine.begin() as connection:
         with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()  # must not raise when the table doesn't exist
+        tables = set(sa.inspect(connection).get_table_names())
+        assert "public_mcp_apps" not in tables
 
 
 def test_upgrade_without_matching_row_is_a_noop(tmp_path):

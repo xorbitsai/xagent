@@ -26,14 +26,17 @@ setup_proxy_env()
 
 mcp = FastMCP("google-drive-mcp")
 
-# Matches the id segment out of any of the common Drive/Docs/Sheets/Slides
-# share-link shapes, since a user (and therefore a model relaying the user's
-# words) is far more likely to hand over the URL they see in the browser
-# than the bare id. The optional "u/<n>/" branch tolerates the account-index
-# segment Google inserts (e.g. ".../file/u/1/d/<id>/view") whenever more than
-# one Google account is signed into the browser -- see google_sheets.py's
-# identical (?:u/\d+/)? tolerance for the spreadsheets URL shape. "(?!e/)"
-# after each "d/" excludes the "published to web" link shape
+# A Drive/Docs/Sheets/Slides/Forms/Drawings id is always [a-zA-Z0-9_-]+.
+_DRIVE_ID_CHARS = re.compile(r"[a-zA-Z0-9_-]+")
+
+# Matches the id segment out of any of the common share-link shapes, since a
+# user (and therefore a model relaying the user's words) is far more likely
+# to hand over the URL they see in the browser than the bare id. The
+# optional "u/<n>/" branch tolerates the account-index segment Google
+# inserts (e.g. ".../file/u/1/d/<id>/view") whenever more than one Google
+# account is signed into the browser -- see google_sheets.py's identical
+# (?:u/\d+/)? tolerance for the spreadsheets URL shape. "(?!e/)" after each
+# "d/" excludes the "published to web" link shape
 # (".../d/e/<publish-id>/pubhtml"): that "e" is a literal path segment, not
 # part of the id, and the real Drive file id isn't present in that URL at
 # all -- the published-to-web token isn't a valid fileId, so this must not
@@ -43,8 +46,23 @@ mcp = FastMCP("google-drive-mcp")
 # elsewhere in the URL (e.g. a query value).
 _DRIVE_PATH_ID_PATTERN = re.compile(
     r"/(?:file/(?:u/\d+/)?d|folders|document/(?:u/\d+/)?d"
-    r"|spreadsheets/(?:u/\d+/)?d|presentation/(?:u/\d+/)?d)/(?!e/)"
-    r"([a-zA-Z0-9_-]+)"
+    r"|spreadsheets/(?:u/\d+/)?d|presentation/(?:u/\d+/)?d"
+    r"|forms/(?:u/\d+/)?d|drawings/(?:u/\d+/)?d)/(?!e/)"
+    rf"({_DRIVE_ID_CHARS.pattern})"
+)
+
+# Same alternation as _DRIVE_PATH_ID_PATTERN but without the id-capturing
+# group or the "(?!e/)" exclusion -- used only to recognize that a path *is*
+# one of these share-link shapes at all, including the shapes deliberately
+# excluded above (e.g. the published-to-web "/d/e/" form). See
+# _resolve_file_id: a path matching this but not _DRIVE_PATH_ID_PATTERN was
+# recognized-and-rejected, not merely unrecognized, and must not fall
+# through to the "?id=" query fallback below -- otherwise the fallback would
+# re-derive an id from the very link shape the exclusion above refused.
+_DRIVE_PATH_SHAPE_PATTERN = re.compile(
+    r"/(?:file/(?:u/\d+/)?d|folders|document/(?:u/\d+/)?d"
+    r"|spreadsheets/(?:u/\d+/)?d|presentation/(?:u/\d+/)?d"
+    r"|forms/(?:u/\d+/)?d|drawings/(?:u/\d+/)?d)/"
 )
 
 # Hosts _resolve_file_id treats as an authoritative Drive/Docs/Sheets/Slides
@@ -52,7 +70,11 @@ _DRIVE_PATH_ID_PATTERN = re.compile(
 # document an agent reads) that merely happens to parse with a matching
 # path/query shape would have its id extracted and passed to a share/
 # delete/permission call as if it were this connector's own link.
-_DRIVE_URL_HOSTS = frozenset({"drive.google.com", "docs.google.com"})
+# drive.usercontent.google.com is Google's own host for direct-download
+# links (e.g. from a "confirm download" interstitial for large files).
+_DRIVE_URL_HOSTS = frozenset(
+    {"drive.google.com", "docs.google.com", "drive.usercontent.google.com"}
+)
 
 # "owner" is deliberately excluded: ownership transfer needs
 # transferOwnership=True, is not reversible the way a role change is, and is
@@ -84,15 +106,20 @@ _EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _MAX_PERMISSION_LIST_PAGES = 1000
 
 
-def _resolve_file_id(file_id: str) -> str:
+def _resolve_file_id(file_id: str, field_name: str = "file_id") -> str:
     """Return the id captured out of a Drive/Docs/Sheets/Slides share link,
     or ``file_id`` itself (stripped) when it's already a bare id -- or, for
     anything URL-shaped that isn't a trusted link, unresolved verbatim so an
     obviously-invalid fileId reaches the API instead of a silently wrong one.
 
-    A real Drive id is always ``[a-zA-Z0-9_-]+`` and never contains "/" or
-    "?", so only a value containing one of those characters is even
-    considered URL-shaped; a bare id short-circuits immediately.
+    A real Drive id is always ``[a-zA-Z0-9_-]+`` (``_DRIVE_ID_CHARS``) and
+    never contains "/" or "?", so only a value containing one of those
+    characters is even considered URL-shaped; a bare id short-circuits
+    immediately. Empty/whitespace-only input is rejected outright (matching
+    ``require_clean_identifier``'s treatment of ``email``/``permission_id``
+    elsewhere in this file) rather than silently resolving to ``""``, which
+    would otherwise reach the Drive API as a request against the bare
+    ``.../files/`` collection endpoint instead of a specific file.
 
     urlparse only populates ``.scheme``/``.netloc`` for a string with an
     explicit "scheme://" prefix (or at least a leading "//"): a scheme-less
@@ -109,11 +136,23 @@ def _resolve_file_id(file_id: str) -> str:
     raw string -- so a URL whose overall host is allowed but whose query
     *value* merely contains a matching shape (".../search?q=/file/d/<id>")
     can't have that unrelated substring extracted as if it were the URL's
-    own resource id.
+    own resource id. A path recognized as a share-link shape that
+    _DRIVE_PATH_ID_PATTERN deliberately excludes (the published-to-web
+    "/d/e/" form) is rejected outright rather than falling through to the
+    "?id=" query check -- otherwise appending "?id=<anything>" to an
+    excluded link would trivially re-derive an id the path exclusion just
+    refused to give up. A query "id=" value is validated against the same
+    id character class as the path form: unlike a path segment, Drive's own
+    client library does not percent-encode "." before sending it, so an
+    unvalidated "id=.." would reach the API as a literal ".." path segment,
+    which dot-segment normalization can collapse into an unrelated
+    endpoint.
     """
     if not isinstance(file_id, str):
-        raise ValueError("file_id must be a string")
+        raise ValueError(f"{field_name} must be a string")
     stripped = file_id.strip()
+    if not stripped:
+        raise ValueError(f"{field_name} must be a non-empty id")
     if not re.search(r"[/?]", stripped):
         return stripped
     try:
@@ -127,44 +166,59 @@ def _resolve_file_id(file_id: str) -> str:
     match = _DRIVE_PATH_ID_PATTERN.search(parsed.path)
     if match:
         return match.group(1)
+    if _DRIVE_PATH_SHAPE_PATTERN.search(parsed.path):
+        return stripped
     query_id = parse_qs(parsed.query).get("id")
-    if query_id:
+    if query_id and _DRIVE_ID_CHARS.fullmatch(query_id[0]):
         return query_id[0]
     return stripped
 
 
 def _require_share_role(role: str) -> str:
     if role not in _SHARE_ROLES:
-        raise ValueError(f"role must be one of {_SHARE_ROLES}")
+        allowed = ", ".join(_SHARE_ROLES)
+        raise ValueError(f"role must be one of {allowed}")
     return role
 
 
-def _capped_response(build: Callable[[Any, bool], str], value: Any) -> str:
-    """Halve ``value`` (a list or a string) until ``build(value, truncated)``
+def _capped_response(
+    render: Callable[[Any, bool], str], value: Any, truncated: bool = False
+) -> str:
+    """Halve ``value`` (a list or a string) until ``render(value, truncated)``
     fits the platform's output limit -- mirrors deputy.py's/salesforce.py's
     _success_with_capped_list. There is no cursor to resume from here, so
     entries/content dropped this way are gone for this call, not just this
     page. Shared by _capped_list_response and _capped_content_response so a
     future change to the halving strategy only has one loop to update.
+
+    ``truncated`` seeds the initial state rather than always starting
+    False, so a caller that already knows the value is incomplete for a
+    reason this function can't see itself (e.g. a paginated fetch that gave
+    up before exhausting every page) can report that honestly even if the
+    partial ``value`` it did collect happens to still fit under the limit.
+
+    Named ``render``, not ``build``, to avoid shadowing the module-level
+    ``build`` imported from googleapiclient.discovery.
     """
     max_output_length = get_tool_max_output_length()
-    truncated = False
-    response = build(value, truncated)
+    response = render(value, truncated)
     while len(response) > max_output_length and value:
         value = value[: len(value) // 2]
         truncated = True
-        response = build(value, truncated)
+        response = render(value, truncated)
     return response
 
 
-def _capped_list_response(field_name: str, items: list[Any]) -> str:
+def _capped_list_response(
+    field_name: str, items: list[Any], *, truncated: bool = False
+) -> str:
     def _build(items: list[Any], truncated: bool) -> str:
         return json.dumps(
             {"status": "success", field_name: items, "truncated": truncated},
             ensure_ascii=False,
         )
 
-    return _capped_response(_build, items)
+    return _capped_response(_build, items, truncated)
 
 
 def _capped_content_response(file_metadata: dict[str, Any], content: str) -> str:
@@ -258,6 +312,22 @@ def google_drive_get_file_content(file_id: str, mime_type: str = "text/plain") -
         )
         file_mime_type = file_metadata.get("mimeType", "")
 
+        if file_mime_type in (
+            "application/vnd.google-apps.folder",
+            "application/vnd.google-apps.shortcut",
+        ):
+            # Both mimeTypes start with "application/vnd.google-apps" and
+            # would otherwise fall into the export_media branch below,
+            # which makes no sense for either (a folder has no content to
+            # export; a shortcut is a pointer, not a document) and would
+            # fail with an opaque API error instead of an actionable one.
+            # Now that folder share links resolve via _resolve_file_id,
+            # this is a directly reachable input, not a hypothetical.
+            raise ValueError(
+                f"file_id resolves to a {file_mime_type.rsplit('.', 1)[-1]}, "
+                "which has no content to read."
+            )
+
         if "application/vnd.google-apps" in file_mime_type:
             # Export Google Workspace document. Sheets has no text/plain
             # export format (only Docs/Slides do) and 400s on it, so the
@@ -304,7 +374,7 @@ def google_drive_create_file(
     try:
         file_metadata: dict[str, Any] = {"name": name, "mimeType": mime_type}
         if parent_id:
-            file_metadata["parents"] = [_resolve_file_id(parent_id)]
+            file_metadata["parents"] = [_resolve_file_id(parent_id, "parent_id")]
 
         service = get_drive_service()
         fh = io.BytesIO(content.encode("utf-8"))
@@ -341,7 +411,7 @@ def google_drive_create_folder(name: str, parent_id: str | None = None) -> str:
             "mimeType": "application/vnd.google-apps.folder",
         }
         if parent_id:
-            file_metadata["parents"] = [_resolve_file_id(parent_id)]
+            file_metadata["parents"] = [_resolve_file_id(parent_id, "parent_id")]
 
         service = get_drive_service()
         folder = (
@@ -541,6 +611,13 @@ def google_drive_list_permissions(file_id: str) -> str:
                 break
             if approx_length > max_output_length:
                 break
+        else:
+            # The loop ran out of iterations without either a natural
+            # "no more pages" or "already too big" stop -- a nextPageToken
+            # may still exist that was never followed, so this can't
+            # honestly report a complete list even if the permissions
+            # collected so far happen to still fit under the output cap.
+            return _capped_list_response("permissions", permissions, truncated=True)
 
         return _capped_list_response("permissions", permissions)
     except Exception as e:
@@ -564,7 +641,14 @@ def google_drive_share_file(
     role: "reader" (can view), "commenter" (can view and comment), or
     "writer" (can edit). Sharing a folder gives that access to everything
     inside it. When send_notification is True, Google emails the person
-    being added; message is included in that email if given.
+    being added; message is included in that email if given. If
+    send_notification is False, message is silently discarded (Google's
+    API rejects a notification message when no notification is sent) --
+    the response won't flag this, so don't rely on the message being
+    delivered without also checking send_notification.
+    This grants access to a specific email only; it can't create "anyone
+    with the link" link-sharing. google_drive_remove_permission can still
+    revoke an existing link-shared permission if one is already present.
     """
     try:
         _require_share_role(role)

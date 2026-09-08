@@ -170,10 +170,80 @@ def test_resolve_file_id_rejects_non_string_input():
         google_drive._resolve_file_id(12345)
 
 
+@pytest.mark.parametrize("value", ["", "   ", "\t\n"])
+def test_resolve_file_id_rejects_empty_or_whitespace_input(value):
+    """An unrejected empty file_id would reach the Drive API as a request
+    against the bare .../files/ collection endpoint instead of a specific
+    file -- reject it the same way email/permission_id already are via
+    require_clean_identifier."""
+    with pytest.raises(ValueError, match="file_id must be a non-empty id"):
+        google_drive._resolve_file_id(value)
+
+
+def test_resolve_file_id_uses_the_given_field_name_in_errors():
+    with pytest.raises(ValueError, match="parent_id must be a non-empty id"):
+        google_drive._resolve_file_id("", "parent_id")
+    with pytest.raises(ValueError, match="parent_id must be a string"):
+        google_drive._resolve_file_id(123, "parent_id")
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        # googleapiclient does not percent-encode "." before sending it, so
+        # an unvalidated id reaches the API as a literal path segment;
+        # dot-segment normalization could then collapse "files/.." into an
+        # unrelated endpoint. Character-class-validating the query "id="
+        # value (matching what the path branch already implicitly requires)
+        # closes this off.
+        "https://drive.google.com/x?id=..",
+        "https://drive.google.com/x?id=.",
+        "https://drive.google.com/x?id=../../etc",
+    ],
+)
+def test_resolve_file_id_rejects_dot_segments_from_query_fallback(url):
+    assert google_drive._resolve_file_id(url) == url
+
+
+def test_resolve_file_id_query_fallback_respects_published_link_exclusion():
+    """The path pattern's "(?!e/)" exclusion for published-to-web links
+    must not be bypassable by simply appending "?id=<anything>": the query
+    fallback used to run unconditionally whenever the path match failed,
+    without knowing *why* it failed."""
+    url = "https://docs.google.com/document/d/e/2PACX-1abcXYZ/pub?id=SNEAKY"
+    assert google_drive._resolve_file_id(url) == url
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://drive.google.com/forms/d/abc123/edit", "abc123"),
+        ("https://drive.google.com/forms/u/1/d/abc123/edit", "abc123"),
+        ("https://drive.google.com/drawings/d/abc123/edit", "abc123"),
+        ("https://drive.google.com/drawings/u/2/d/abc123/edit", "abc123"),
+    ],
+)
+def test_resolve_file_id_supports_forms_and_drawings(url, expected):
+    assert google_drive._resolve_file_id(url) == expected
+
+
+def test_resolve_file_id_supports_usercontent_host():
+    url = "https://drive.usercontent.google.com/download?id=abc123&export=download"
+    assert google_drive._resolve_file_id(url) == "abc123"
+
+
 @pytest.mark.parametrize("bad_role", ["owner", "organizer", ""])
 def test_require_share_role_rejects_roles_outside_the_allowed_set(bad_role):
     with pytest.raises(ValueError, match="role"):
         google_drive._require_share_role(bad_role)
+
+
+def test_require_share_role_error_message_is_not_a_tuple_repr():
+    with pytest.raises(ValueError) as exc_info:
+        google_drive._require_share_role("owner")
+    message = str(exc_info.value)
+    assert "(" not in message and "'" not in message
+    assert "reader, commenter, writer" in message
 
 
 @pytest.mark.parametrize("good_role", ["reader", "commenter", "writer"])
@@ -271,6 +341,10 @@ def test_search_passes_shared_drive_support_and_clamps_max_results(monkeypatch):
 
 
 def test_search_caps_oversized_output(monkeypatch):
+    # Pinned rather than relying on the ~50KB default: XAGENT_TOOL_MAX_OUTPUT_LENGTH
+    # is honored and tests/conftest.py force-loads .env, so an environment
+    # override could otherwise make this flaky in either direction.
+    monkeypatch.setattr(google_drive, "get_tool_max_output_length", lambda: 3000)
     service = _mock_drive_service(monkeypatch)
     huge_files = [
         {"id": f"f{i}", "name": "x" * 200, "mimeType": "text/plain"}
@@ -346,7 +420,7 @@ def test_create_file_validates_parent_id_before_building_service(monkeypatch):
     )
 
     assert result["status"] == "error"
-    assert "file_id must be a string" in result["message"]
+    assert "parent_id must be a string" in result["message"]
     get_service.assert_not_called()
 
 
@@ -359,7 +433,7 @@ def test_create_folder_validates_parent_id_before_building_service(monkeypatch):
     )
 
     assert result["status"] == "error"
-    assert "file_id must be a string" in result["message"]
+    assert "parent_id must be a string" in result["message"]
     get_service.assert_not_called()
 
 
@@ -482,7 +556,39 @@ def test_get_file_content_keeps_text_plain_default_for_docs(monkeypatch):
     )
 
 
+@pytest.mark.parametrize(
+    "folder_mime_type",
+    [
+        "application/vnd.google-apps.folder",
+        "application/vnd.google-apps.shortcut",
+    ],
+)
+def test_get_file_content_rejects_folder_and_shortcut_with_a_clear_message(
+    monkeypatch, folder_mime_type
+):
+    """Both mimeTypes start with "application/vnd.google-apps" and would
+    otherwise fall into the export_media branch, which makes no sense for
+    either -- and folder share links are now resolvable via
+    _resolve_file_id, so this is directly reachable, not hypothetical."""
+    service = _mock_drive_service(monkeypatch)
+    service.files.return_value.get.return_value.execute.return_value = {
+        "id": "abc123",
+        "name": "Team Folder",
+        "mimeType": folder_mime_type,
+    }
+
+    result = json.loads(google_drive.google_drive_get_file_content("abc123"))
+
+    assert result["status"] == "error"
+    assert "no content to read" in result["message"]
+    service.files.return_value.export_media.assert_not_called()
+    service.files.return_value.get_media.assert_not_called()
+
+
 def test_get_file_content_caps_oversized_output(monkeypatch):
+    # Pinned rather than relying on the ~50KB default -- see
+    # test_search_caps_oversized_output's comment for why.
+    monkeypatch.setattr(google_drive, "get_tool_max_output_length", lambda: 3000)
     service = _mock_drive_service(monkeypatch)
     service.files.return_value.get.return_value.execute.return_value = {
         "id": "abc123",
@@ -545,6 +651,9 @@ def test_list_permissions_returns_permissions(monkeypatch):
 
 
 def test_list_permissions_caps_oversized_output(monkeypatch):
+    # Pinned rather than relying on the ~50KB default -- see
+    # test_search_caps_oversized_output's comment for why.
+    monkeypatch.setattr(google_drive, "get_tool_max_output_length", lambda: 3000)
     service = _mock_drive_service(monkeypatch)
     huge_permissions = [
         {
@@ -589,6 +698,28 @@ def test_list_permissions_follows_next_page_token(monkeypatch):
     calls = service.permissions.return_value.list.call_args_list
     assert calls[0].kwargs["pageToken"] is None
     assert calls[1].kwargs["pageToken"] == "page2"
+
+
+def test_list_permissions_reports_truncated_when_page_bound_is_exhausted(
+    monkeypatch,
+):
+    """If the loop-safety bound is hit while a nextPageToken still exists
+    and the accumulated size never crossed the output cap, the result must
+    still say truncated=True -- more permissions may exist on pages that
+    were never fetched, so reporting a complete list would be dishonest
+    even though what little was collected happens to fit comfortably."""
+    monkeypatch.setattr(google_drive, "_MAX_PERMISSION_LIST_PAGES", 3)
+    service = _mock_drive_service(monkeypatch)
+    service.permissions.return_value.list.return_value.execute.return_value = {
+        "permissions": [{"id": "perm"}],
+        "nextPageToken": "more",  # always another page available
+    }
+
+    result = json.loads(google_drive.google_drive_list_permissions("fid"))
+
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert service.permissions.return_value.list.call_count == 3
 
 
 def test_list_permissions_stops_paginating_once_over_the_output_limit(monkeypatch):
@@ -715,8 +846,9 @@ def test_share_file_defaults_to_reader_with_notification(monkeypatch):
     service = _mock_drive_service(monkeypatch)
     service.permissions.return_value.create.return_value.execute.return_value = {}
 
-    json.loads(google_drive.google_drive_share_file("fid", "a@x.com"))
+    result = json.loads(google_drive.google_drive_share_file("fid", "a@x.com"))
 
+    assert result["status"] == "success"
     kwargs = service.permissions.return_value.create.call_args.kwargs
     assert kwargs["body"]["role"] == "reader"
     assert kwargs["sendNotificationEmail"] is True
@@ -730,12 +862,13 @@ def test_share_file_omits_email_message_when_notification_disabled(monkeypatch):
     service = _mock_drive_service(monkeypatch)
     service.permissions.return_value.create.return_value.execute.return_value = {}
 
-    json.loads(
+    result = json.loads(
         google_drive.google_drive_share_file(
             "fid", "a@x.com", send_notification=False, message="hi"
         )
     )
 
+    assert result["status"] == "success"
     kwargs = service.permissions.return_value.create.call_args.kwargs
     assert kwargs["sendNotificationEmail"] is False
     assert "emailMessage" not in kwargs

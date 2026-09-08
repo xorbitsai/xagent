@@ -124,31 +124,46 @@ def _merge_attendees(event: dict[str, Any], attendees: list[str] | None) -> None
         event["attendees"] = existing + new_attendees
 
 
+def _create_request_status_code(conference_data: dict[str, Any]) -> str | None:
+    """Safely read conferenceData.createRequest.status.statusCode, or None
+    if any part of that path is absent or explicitly null.
+
+    Shared by _needs_conference_request (decides whether to retry) and
+    _event_response (decides what to tell the caller): this exact chain has
+    already needed two separate null-safety fixes (a missing conferenceData,
+    then a missing conferenceSolution.key -- an unrelated field, but caught
+    by the same class of review), each landing in only one of the two
+    call sites at a time because the logic lived in two places. Keeping one
+    copy means a future defensive-parsing fix only has to land once.
+    """
+    create_request = conference_data.get("createRequest") or {}
+    return (create_request.get("status") or {}).get("statusCode")
+
+
 def _needs_conference_request(event: dict[str, Any]) -> bool:
     """True if add_google_meet should (re)send a createRequest.
 
-    The only signal this reads is createRequest.status.statusCode: it
-    returns True when the event has no conferenceData at all, or when the
-    only conferenceData present is a createRequest whose status.statusCode
-    is "failure". Everything else returns False, so it's left untouched:
-    a still-*pending* createRequest (status.statusCode == "pending" --
-    which, like a failed one, has no entryPoints/conferenceSolution yet,
-    so those fields can't be used to tell "safe to retry" apart from "do
-    not clobber the in-flight request"); an already-resolved conference
-    (its createRequest, if it went through one at all, carries
-    status.statusCode == "success", or there's no createRequest key at all
-    for a conference attached some other way -- e.g. a Zoom add-on);
-    a legacy event carrying `hangoutLink` with no `conferenceData` at all
-    (predates the conferenceData API).
+    Checks two signals, in order. First, a legacy `hangoutLink` with no
+    `conferenceData` at all (predates the conferenceData API) counts as
+    already resolved -- False, so it isn't clobbered by a duplicate
+    conference. Otherwise: True when the event has no conferenceData at
+    all, or when the only conferenceData present is a createRequest whose
+    status.statusCode is "failure". Everything else returns False, so it's
+    left untouched: a still-*pending* createRequest (status.statusCode ==
+    "pending" -- which, like a failed one, has no entryPoints/
+    conferenceSolution yet, so those fields alone can't be used to tell
+    "safe to retry" apart from "do not clobber the in-flight request"); an
+    already-resolved conference (its createRequest, if it went through one
+    at all, carries status.statusCode == "success", or there's no
+    createRequest key at all for a conference attached some other way --
+    e.g. a Zoom add-on).
     """
     if event.get("hangoutLink"):
         return False
     conference_data = event.get("conferenceData") or {}
     if not conference_data:
         return True
-    create_request = conference_data.get("createRequest") or {}
-    status_code = (create_request.get("status") or {}).get("statusCode")
-    return status_code == "failure"
+    return _create_request_status_code(conference_data) == "failure"
 
 
 def _apply_conference_request(event: dict[str, Any], add_google_meet: bool) -> bool:
@@ -243,8 +258,7 @@ def _event_response(event: dict[str, Any]) -> str:
     if hangout_link:
         extra["hangout_link"] = hangout_link
     else:
-        create_request = conference_data.get("createRequest") or {}
-        status_code = (create_request.get("status") or {}).get("statusCode")
+        status_code = _create_request_status_code(conference_data)
         if status_code:
             # Meet link creation is asynchronous; surface the status instead of
             # implying failure when hangoutLink isn't populated yet. A status

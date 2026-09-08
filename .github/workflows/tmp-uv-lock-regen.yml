@@ -1,0 +1,47 @@
+name: TEMP - regenerate uv.lock (manual, one-off)
+
+# Throwaway helper: this repo's CI (pre-commit -> "Check uv lockfile") needs a
+# uv.lock produced by resolving against the real https://pypi.org/simple, but
+# the machine preparing this branch could not reach files.pythonhosted.org to
+# run `uv lock` itself. GitHub-hosted runners have normal network access, so
+# this workflow does it instead and hands the result back as an artifact.
+# Delete this file once that's done - it's not meant to be merged.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  regen:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Ensure uv is available
+        shell: bash
+        run: |
+          set -e
+          if ! command -v uv >/dev/null 2>&1; then
+            echo "uv not found, installing..."
+            python3 -m pip install --user uv
+            echo "$HOME/.local/bin" >> $GITHUB_PATH
+          fi
+          python3 -m uv --version || uv --version
+
+      - name: Run uv lock
+        shell: bash
+        run: |
+          set -e
+          if python3 -m uv --version >/dev/null 2>&1; then
+            _UV="python3 -m uv"
+          else
+            _UV="uv"
+          fi
+          $_UV lock
+
+      - name: Upload uv.lock
+        uses: actions/upload-artifact@v4
+        with:
+          name: uv-lock
+          path: uv.lock
+          retention-days: 1

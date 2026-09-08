@@ -140,8 +140,7 @@ def _rrule_until_to_date(until: str) -> str:
 
 def _weekday_code_from_date(date_str: str) -> str:
     """The RRULE two-letter day code (MO/TU/.../SU) for a 'YYYY-MM-DD' date."""
-    year, month, day = (int(part) for part in date_str.split("-"))
-    return str(_RRULE_WEEKDAYS[date(year, month, day).weekday()])
+    return str(_RRULE_WEEKDAYS[date.fromisoformat(date_str).weekday()])
 
 
 def _build_graph_recurrence(
@@ -174,7 +173,7 @@ def _build_graph_recurrence(
         if zone is None:
             raise ValueError(f"unknown timezone for recurrence rule: {timezone}")
         anchor = anchor.replace(tzinfo=zone)
-    parts = parse_rrule(recurrence, anchor.isoformat())
+    parts = parse_rrule(recurrence, anchor)
     freq = parts["FREQ"].upper()
     interval = int(parts.get("INTERVAL", "1"))
     start_date = start_datetime.split("T", 1)[0]

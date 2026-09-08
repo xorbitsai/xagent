@@ -2,6 +2,7 @@ import json
 import os
 import re
 import urllib.request
+from datetime import datetime
 from typing import Any
 from urllib.parse import quote
 
@@ -129,19 +130,23 @@ def ensure_rrule_prefix(rrule_text: str) -> str:
     return body if body.upper().startswith("RRULE:") else f"RRULE:{body}"
 
 
-def parse_rrule(rrule_text: str, dtstart: str) -> dict[str, str]:
+def parse_rrule(rrule_text: str, dtstart: str | datetime) -> dict[str, str]:
     """Validate an RFC 5545 RRULE string and return its components (FREQ,
     INTERVAL, BYDAY, UNTIL, COUNT, ...) as a plain dict of upper-cased keys
     to raw string values.
 
-    ``dtstart`` (an RFC3339/ISO8601 datetime, matching what these calendar
-    tools already require for start_time/start_datetime) anchors a
-    validation pass through ``dateutil.rrule.rrulestr`` so a rule that's
-    syntactically plausible but semantically broken (e.g. an UNTIL before
-    dtstart, or a nonsense FREQ) is rejected here rather than being sent to
-    Google/Outlook and either erroring opaquely or - worse - only ever
-    landing as inert description text, which is exactly the failure mode
-    reported against this connector before recurrence support existed.
+    ``dtstart`` anchors a validation pass through ``dateutil.rrule.rrulestr``
+    so a rule that's syntactically plausible but semantically broken (e.g.
+    an UNTIL before dtstart, or a nonsense FREQ) is rejected here rather
+    than being sent to Google/Outlook and either erroring opaquely or -
+    worse - only ever landing as inert description text, which is exactly
+    the failure mode reported against this connector before recurrence
+    support existed. Pass an RFC3339/ISO8601 string (matching what these
+    calendar tools already require for start_time/start_datetime), or a
+    `datetime` directly when the caller already has one on hand (e.g.
+    after localizing a naive Outlook start time) - skipping the
+    format-then-reparse round trip that passing `.isoformat()` back in
+    would otherwise cost.
 
     The returned dict (rather than the parsed rrule object) is what
     callers actually build a provider payload from: Google takes the RRULE
@@ -171,10 +176,15 @@ def parse_rrule(rrule_text: str, dtstart: str) -> dict[str, str]:
             "'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;UNTIL=20260911T235959Z'"
         )
 
-    try:
-        anchor = _date_parser.isoparse(dtstart)
-    except ValueError as exc:
-        raise ValueError(f"invalid start time for recurrence rule: {dtstart}") from exc
+    if isinstance(dtstart, datetime):
+        anchor = dtstart
+    else:
+        try:
+            anchor = _date_parser.isoparse(dtstart)
+        except ValueError as exc:
+            raise ValueError(
+                f"invalid start time for recurrence rule: {dtstart}"
+            ) from exc
     try:
         _rrulestr(f"RRULE:{body}", dtstart=anchor)
     except (ValueError, TypeError) as exc:

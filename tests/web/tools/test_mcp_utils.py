@@ -150,6 +150,19 @@ def test_parse_rrule_rejects_bad_dtstart():
         utils.parse_rrule("FREQ=DAILY", "not-a-date")
 
 
+def test_parse_rrule_accepts_a_datetime_object_directly():
+    """A caller that already has a datetime (e.g. after localizing a naive
+    Outlook start time) shouldn't need to format it back into a string
+    just to have it reparsed here."""
+    from datetime import datetime, timezone
+
+    parts = utils.parse_rrule(
+        "FREQ=DAILY;UNTIL=20260911T235959Z",
+        datetime(2026, 8, 26, 7, 0, 0, tzinfo=timezone.utc),
+    )
+    assert parts == {"FREQ": "DAILY", "UNTIL": "20260911T235959Z"}
+
+
 def test_url_path_id_output_survives_requests_url_normalization():
     """Confirms the actual exploit this guards against: a naively
     interpolated ".." collapses the path via requests' own URL

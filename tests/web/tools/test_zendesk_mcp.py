@@ -943,6 +943,36 @@ def test_get_ticket_returns_summary(monkeypatch):
     assert result["ticket"]["subject"] == "Help"
 
 
+def test_get_ticket_falls_back_to_error_when_response_is_too_large(monkeypatch):
+    # zendesk_get_ticket builds a single fixed-shape object with no list to
+    # shrink -- unlike the list/comment tools, it had no size guarantee at
+    # all before _finalize_capped was added here. A ticket with a large
+    # tag set (caller/account-controlled content) must still produce valid
+    # JSON, not a response the platform's own output filter then
+    # hard-truncates into garbage.
+    monkeypatch.setattr(
+        zendesk._session,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "ticket": {
+                        "id": 1,
+                        "subject": "x" * 5000,
+                        "tags": [f"tag{i}" for i in range(100)],
+                    }
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(zendesk, "get_tool_max_output_length", lambda: 200)
+
+    raw = zendesk.zendesk_get_ticket(1)
+    result = json.loads(raw)  # must not raise -- valid JSON either way
+
+    assert result["status"] == "error"
+
+
 def test_get_ticket_accepts_agent_ui_url(monkeypatch):
     # A caller copying a link out of the Zendesk agent UI (rather than a
     # bare id) must resolve to the same ticket, not error out.
@@ -1114,6 +1144,20 @@ def test_update_ticket_rejects_invalid_status():
     result = json.loads(zendesk.zendesk_update_ticket(1, status="archived"))
 
     assert result["status"] == "error"
+
+
+def test_update_ticket_rejects_closed_status(monkeypatch):
+    # "closed" is a valid value the status field can *read* as, but
+    # reaching it is automation-only (Zendesk rejects a direct attempt to
+    # set it remotely) -- it must not be in the locally-accepted set
+    # either, or local validation gives false confidence it's settable.
+    mock_request = Mock()
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    result = json.loads(zendesk.zendesk_update_ticket(1, status="closed"))
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
 
 
 def test_update_ticket_rejects_invalid_priority():
@@ -1606,6 +1650,22 @@ def test_get_user_returns_summary(monkeypatch):
 
     assert result["status"] == "success"
     assert result["user"]["name"] == "Jane"
+
+
+def test_get_user_falls_back_to_error_when_response_is_too_large(monkeypatch):
+    monkeypatch.setattr(
+        zendesk._session,
+        "request",
+        Mock(
+            return_value=MockResponse(json_data={"user": {"id": 1, "name": "x" * 5000}})
+        ),
+    )
+    monkeypatch.setattr(zendesk, "get_tool_max_output_length", lambda: 200)
+
+    raw = zendesk.zendesk_get_user(1)
+    result = json.loads(raw)  # must not raise -- valid JSON either way
+
+    assert result["status"] == "error"
 
 
 def test_get_user_accepts_agent_ui_url(monkeypatch):

@@ -47,13 +47,21 @@ _session = requests.Session()
 # resolution for the real connection, so any ambient proxy silently bypasses
 # _base_url()'s private-network check of the addresses *this process*
 # resolved -- the exact DNS-rebinding-via-proxy hole that check exists to
-# close. Same posture as posthog.py/magento.py, the two other connectors
-# carrying that check. trust_env=False also disables requests' own
-# REQUESTS_CA_BUNDLE/CURL_CA_BUNDLE lookup, so it is re-applied explicitly:
-# an operator opting into a trusted egress proxy (XAGENT_TRUSTED_EGRESS_PROXY=1)
-# is the textbook TLS-intercepting corporate proxy with an internal CA, which
-# would otherwise fail closed with an opaque SSLError. .netrc auto-auth stays
-# disabled since this connector always sends its own Basic Auth.
+# close. Same intent as posthog.py/magento.py, the two other connectors
+# carrying that check -- though applied once here (at import, to this
+# module-level _session) rather than per-call (their _make_request()
+# builds a fresh Session and re-reads these env vars on every call): each
+# MCP tool call runs in its own fresh subprocess (see
+# mcp_adapter._execute_mcp_call), so "at import" and "at the one call this
+# process will ever make" are the same moment here, same as it already is
+# for the rest of this module-level _session's configuration.
+# trust_env=False also disables requests' own REQUESTS_CA_BUNDLE/
+# CURL_CA_BUNDLE lookup, so it is re-applied explicitly: an operator
+# opting into a trusted egress proxy (XAGENT_TRUSTED_EGRESS_PROXY=1) is
+# the textbook TLS-intercepting corporate proxy with an internal CA,
+# which would otherwise fail closed with an opaque SSLError. .netrc
+# auto-auth stays disabled since this connector always sends its own
+# Basic Auth.
 _session.trust_env = False
 _ca_bundle = environ.get("REQUESTS_CA_BUNDLE") or environ.get("CURL_CA_BUNDLE")
 if _ca_bundle:
@@ -73,13 +81,12 @@ MAX_RETRY_AFTER_SECONDS = 30
 _SUBDOMAIN_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 
 # Zendesk's own documented ceilings on how deep a result window can be
-# paginated (page * per_page must stay under this) -- past it Zendesk itself
-# returns an opaque HTTP error rather than a clean "no more results". Checked
-# client-side so a caller mechanically incrementing `page` gets a predictable
-# empty page instead of that error. The two search endpoints have different
-# documented ceilings -- the unified /search.json is capped at 1,000 results,
-# while /users/search.json goes to 10,000 -- so they are NOT interchangeable
-# despite both being "search" endpoints.
+# paginated -- checked client-side (see _past_search_window) so a page that
+# cannot contain a single valid result gets a predictable empty response
+# instead of an opaque remote error. The two search endpoints have
+# different documented ceilings -- the unified /search.json is capped at
+# 1,000 results, while /users/search.json goes to 10,000 -- so they are NOT
+# interchangeable despite both being "search" endpoints.
 _MAX_SEARCH_RESULT_WINDOW = 1000
 _MAX_USER_SEARCH_RESULT_WINDOW = 10000
 
@@ -203,7 +210,13 @@ def _blank_to_none(value: str | None) -> str | None:
 # error naming the accepted values, instead of a remote 422 whose body only
 # says the value is invalid -- the same posture intercom.py takes for its
 # analogous `state` parameter.
-_TICKET_STATUSES = frozenset({"new", "open", "pending", "hold", "solved", "closed"})
+#
+# "closed" is deliberately excluded from the settable set: Zendesk's status
+# field can *read* as "closed", but reaching it is automation-only (a set
+# number of days after "solved") -- a direct PUT trying to set it is
+# rejected remotely, so allowing it through local validation would only
+# trade one confusing error for another.
+_TICKET_STATUSES = frozenset({"new", "open", "pending", "hold", "solved"})
 _TICKET_PRIORITIES = frozenset({"low", "normal", "high", "urgent"})
 
 
@@ -825,10 +838,11 @@ def zendesk_search(query: str, limit: int = 25, page: int = 1) -> str:
         max_results = _clamp_limit(limit)
         page = max(1, page)
         if _past_search_window(page, max_results, _MAX_SEARCH_RESULT_WINDOW):
-            # Past Zendesk's own documented result-window ceiling: Zendesk
-            # itself would answer with an opaque HTTP error here, so return
-            # a clean, predictable "no more results" instead of forwarding
-            # a caller mechanically incrementing `page` into that error.
+            # This page's *start* is past the window (see
+            # _past_search_window's docstring) -- it cannot contain a
+            # single valid result, so return a clean, predictable "no more
+            # results" instead of forwarding a caller mechanically
+            # incrementing `page` into a request that could only error.
             # Validate config here too (normally _request's job) -- this
             # branch never reaches _request, so a misconfigured
             # subdomain/credential would otherwise be masked as "no
@@ -887,7 +901,8 @@ def zendesk_get_ticket(ticket_id: str) -> str:
     try:
         path_id = _resolve_path_id(ticket_id, _TICKET_URL_ID_PATTERN, "ticket_id")
         result = _request("GET", f"/tickets/{path_id}.json")
-        return _success(ticket=_ticket_summary(_unwrap(result, "ticket")))
+        response = _success(ticket=_ticket_summary(_unwrap(result, "ticket")))
+        return _finalize_capped(response, get_tool_max_output_length())
     except Exception as e:
         logger.error(f"Error fetching Zendesk ticket {ticket_id}: {e}")
         return _error(str(e))
@@ -946,7 +961,8 @@ def zendesk_create_ticket(
         if tags_value is not None:
             ticket["tags"] = tags_value
         result = _request("POST", "/tickets.json", json_data={"ticket": ticket})
-        return _success(ticket=_ticket_summary(_unwrap(result, "ticket")))
+        response = _success(ticket=_ticket_summary(_unwrap(result, "ticket")))
+        return _finalize_capped(response, get_tool_max_output_length())
     except Exception as e:
         logger.error(f"Error creating Zendesk ticket: {e}")
         return _error(str(e))
@@ -968,11 +984,12 @@ def zendesk_update_ticket(
     instead.
     ticket_id: a bare numeric id, or a full ticket URL copied from the
     Zendesk agent UI.
-    status: optional, one of "new", "open", "pending", "hold", "solved",
-    "closed" (case-insensitive) -- a blank (empty or whitespace-only)
-    string is treated the same as leaving it unset (there is no valid
-    "clear the status" value); any other non-blank value is rejected
-    locally.
+    status: optional, one of "new", "open", "pending", "hold", "solved"
+    (case-insensitive) -- "closed" is not settable directly; Zendesk
+    reaches it automatically some time after "solved". A blank (empty or
+    whitespace-only) string is treated the same as leaving it unset (there
+    is no valid "clear the status" value); any other non-blank value is
+    rejected locally.
     priority: optional, one of "low", "normal", "high", "urgent"
     (case-insensitive) -- a blank string is treated the same as leaving it
     unset, for the same reason; any other non-blank value is rejected
@@ -1012,7 +1029,8 @@ def zendesk_update_ticket(
             f"/tickets/{_resolve_path_id(ticket_id, _TICKET_URL_ID_PATTERN, 'ticket_id')}.json",
             json_data={"ticket": fields},
         )
-        return _success(ticket=_ticket_summary(_unwrap(result, "ticket")))
+        response = _success(ticket=_ticket_summary(_unwrap(result, "ticket")))
+        return _finalize_capped(response, get_tool_max_output_length())
     except Exception as e:
         logger.error(f"Error updating Zendesk ticket {ticket_id}: {e}")
         return _error(str(e))
@@ -1126,7 +1144,8 @@ def zendesk_get_user(user_id: str) -> str:
     try:
         path_id = _resolve_path_id(user_id, _USER_URL_ID_PATTERN, "user_id")
         result = _request("GET", f"/users/{path_id}.json")
-        return _success(user=_user_summary(_unwrap(result, "user")))
+        response = _success(user=_user_summary(_unwrap(result, "user")))
+        return _finalize_capped(response, get_tool_max_output_length())
     except Exception as e:
         logger.error(f"Error fetching Zendesk user {user_id}: {e}")
         return _error(str(e))
@@ -1206,9 +1225,10 @@ def zendesk_get_organization(organization_id: str) -> str:
             organization_id, _ORGANIZATION_URL_ID_PATTERN, "organization_id"
         )
         result = _request("GET", f"/organizations/{path_id}.json")
-        return _success(
+        response = _success(
             organization=_organization_summary(_unwrap(result, "organization"))
         )
+        return _finalize_capped(response, get_tool_max_output_length())
     except Exception as e:
         logger.error(f"Error fetching Zendesk organization {organization_id}: {e}")
         return _error(str(e))

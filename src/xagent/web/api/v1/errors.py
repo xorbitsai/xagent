@@ -27,6 +27,8 @@ from typing import Any, NoReturn
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
+from ...services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
+
 
 class V1ErrorCode(str, Enum):
     """Stable error codes for ``/v1/*`` responses.
@@ -110,6 +112,7 @@ class V1ErrorCode(str, Enum):
     # Server-side bug. Detail is sanitized; the raw exception stays in
     # the server log.
     INTERNAL_ERROR = "internal_error"
+    AUTO_MODEL_UNAVAILABLE = "auto_model_unavailable"
 
     CONNECTOR_NOT_FOUND = "connector_not_found"
     INVALID_RUNTIME_CONTEXT = "invalid_runtime_context"
@@ -178,6 +181,7 @@ _DEFAULT_MESSAGES: dict[V1ErrorCode, str] = {
         "Monthly execution quota exceeded for this client application."
     ),
     V1ErrorCode.INTERNAL_ERROR: "Internal server error.",
+    V1ErrorCode.AUTO_MODEL_UNAVAILABLE: CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE,
     V1ErrorCode.CONNECTOR_NOT_FOUND: "Connector not found or not accessible.",
     V1ErrorCode.INVALID_RUNTIME_CONTEXT: "Invalid connector runtime context.",
     V1ErrorCode.MISSING_RUNTIME_CONTEXT: "Required connector runtime context is missing.",

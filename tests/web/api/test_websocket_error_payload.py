@@ -505,8 +505,27 @@ async def test_handle_execute_task_unauthenticated_does_not_fail_task(
 
 
 @pytest.mark.asyncio
-async def test_execute_task_background_error_marks_task_failed(_test_db, monkeypatch):
+@pytest.mark.parametrize(
+    ("error_factory", "expected_error_code"),
+    [
+        (
+            lambda secret: RuntimeError(f"setup failed: {secret}"),
+            websocket_api.ClientErrorCode.TASK_EXECUTION_FAILED,
+        ),
+        (
+            lambda secret: websocket_api.AutoModelUnavailableError(
+                f"no active candidate: {secret}"
+            ),
+            websocket_api.ClientErrorCode.AUTO_MODEL_UNAVAILABLE,
+        ),
+    ],
+    ids=["generic", "auto-model-unavailable"],
+)
+async def test_execute_task_background_error_marks_task_failed(
+    _test_db, monkeypatch, error_factory, expected_error_code
+):
     secret = "provider-token-secret"
+    failure = error_factory(secret)
     db = _direct_db_session()
     try:
         user = User(username="owner", password_hash="hash")
@@ -535,7 +554,7 @@ async def test_execute_task_background_error_marks_task_failed(_test_db, monkeyp
 
     class FailingAgentManager:
         async def get_agent_for_task(self, *args, **kwargs):
-            raise RuntimeError(f"setup failed: {secret}")
+            raise failure
 
     monkeypatch.setattr(
         websocket_api.manager,
@@ -556,8 +575,10 @@ async def test_execute_task_background_error_marks_task_failed(_test_db, monkeyp
     assert broadcast_task_id == task_id
     assert payload["type"] == "task_error"
     assert payload["task"]["status"] == "failed"
-    assert payload["message"] == websocket_api.CLIENT_SAFE_TASK_FAILURE
-    assert payload["error"] == websocket_api.CLIENT_SAFE_TASK_FAILURE
+    expected_message = websocket_api.client_error_message(expected_error_code)
+    assert payload["message"] == expected_message
+    assert payload["error"] == expected_message
+    assert payload["error_code"] == expected_error_code.value
     assert secret not in repr(payload)
 
     db = _direct_db_session()
@@ -567,7 +588,7 @@ async def test_execute_task_background_error_marks_task_failed(_test_db, monkeyp
         assert persisted_task.status == TaskStatus.FAILED
         assert persisted_task.runner_id is None
         assert persisted_task.lease_expires_at is None
-        assert persisted_task.error_message == f"setup failed: {secret}"
+        assert persisted_task.error_message == str(failure)
     finally:
         db.close()
 

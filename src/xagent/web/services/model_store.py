@@ -469,6 +469,29 @@ class ModelStore:
         invalidate_model_cache(None if default_was_shared else user_id)
         return user_default
 
+    def refresh_auto_model_abilities(self, config_ids: list[int]) -> None:
+        if not config_ids:
+            return
+
+        from ..models.auto_model import AutoModelCandidate, AutoModelConfig
+        from .auto_model_service import AutoModelService
+
+        self.db.flush()
+        for config in self.db.query(AutoModelConfig).filter(
+            AutoModelConfig.id.in_(config_ids)
+        ):
+            targets = (
+                self.db.query(DBModel)
+                .join(
+                    AutoModelCandidate, AutoModelCandidate.target_model_id == DBModel.id
+                )
+                .filter(AutoModelCandidate.config_id == config.id)
+                .all()
+            )
+            AutoModelService._update_router_model_abilities(
+                config.router_model, targets
+            )
+
     def commit_model_update(
         self, *, user_id: int, db_model: DBModel, invalidate_globally: bool
     ) -> None:
@@ -490,6 +513,11 @@ class ModelStore:
         if share_with_users:
             user_model.is_shared = True  # type: ignore[assignment]
         elif currently_shared:
+            self.prune_external_auto_references(
+                model_id=model_id,
+                owner_user_id=user_id,
+            )
+
             owner_defaults = (
                 self.db.query(UserDefaultModel)
                 .filter(
@@ -517,6 +545,45 @@ class ModelStore:
         self.db.refresh(db_model)
         self.db.refresh(user_model)
         invalidate_model_cache(None)
+
+    def prune_external_auto_references(
+        self, *, model_id: int, owner_user_id: int
+    ) -> int:
+        """Remove Auto bindings that lose access when an owner mutates a model."""
+
+        from ..models.auto_model import AutoModelCandidate, AutoModelConfig
+
+        external_config_ids = [
+            int(config_id)
+            for (config_id,) in (
+                self.db.query(AutoModelCandidate.config_id)
+                .join(
+                    AutoModelConfig,
+                    AutoModelCandidate.config_id == AutoModelConfig.id,
+                )
+                .filter(
+                    AutoModelCandidate.target_model_id == model_id,
+                    AutoModelConfig.user_id != owner_user_id,
+                )
+                .all()
+            )
+        ]
+        if not external_config_ids:
+            return 0
+        self.db.query(AutoModelConfig).filter(
+            AutoModelConfig.id.in_(external_config_ids),
+            AutoModelConfig.fallback_model_id == model_id,
+        ).update({AutoModelConfig.fallback_model_id: None}, synchronize_session=False)
+        deleted = int(
+            self.db.query(AutoModelCandidate)
+            .filter(
+                AutoModelCandidate.config_id.in_(external_config_ids),
+                AutoModelCandidate.target_model_id == model_id,
+            )
+            .delete(synchronize_session=False)
+        )
+        self.refresh_auto_model_abilities(external_config_ids)
+        return deleted
 
     def delete_model(
         self, *, model_storage: CoreStorage, user_model: UserModel

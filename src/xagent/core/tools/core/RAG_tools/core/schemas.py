@@ -2269,7 +2269,20 @@ class WebIngestionResult(BaseModel):
 
     status: str = Field(
         ...,
-        description="Overall status: success|error|partial",
+        description=(
+            "Overall status: success|error|partial. A crawl the site blocked "
+            "is still success when its pages were ingested; see "
+            "crawl_blocked_by_site."
+        ),
+    )
+    crawl_blocked_by_site: bool = Field(
+        default=False,
+        description=(
+            "The crawl ended because the site refused every link past the "
+            "start page. Only ever set alongside status='success' - a run with "
+            "page failures is already partial or error, and this flag is about "
+            "what the site did rather than about how ingestion went."
+        ),
     )
     collection: str = Field(..., description="Target collection name")
 

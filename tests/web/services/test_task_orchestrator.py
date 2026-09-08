@@ -20,7 +20,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from datetime import datetime, timedelta, timezone
-from threading import Barrier, get_ident
+from threading import Barrier, Event, get_ident
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -35,6 +35,7 @@ from tests.web.pool_contention_shared import (
     EXHAUSTION_POOL_TIMEOUT,
     GUARD_TIMEOUT,
     LOOP_LIVENESS_TICKS,
+    assert_pool_checkout_off_loop,
     gated_pool_checkout,
     wait_for_ticks,
 )
@@ -71,12 +72,16 @@ from xagent.web.services.chat_history_service import (
     inspect_user_message_delivery,
     mark_user_message_delivery,
 )
-from xagent.web.services.client_error_messages import CLIENT_SAFE_TASK_FAILURE
+from xagent.web.services.client_error_messages import (
+    CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE,
+    CLIENT_SAFE_TASK_FAILURE,
+)
 from xagent.web.services.connector_runtime import (
     get_ephemeral_runtime_values,
     pop_ephemeral_runtime_values,
     store_ephemeral_runtime_values,
 )
+from xagent.web.services.llm_utils import AutoModelUnavailableError
 from xagent.web.services.mcp_runtime import (
     MCPBuiltinOAuthActorPolicy,
     MCPBuiltinOAuthActorPolicyRequiredError,
@@ -1277,13 +1282,17 @@ async def test_begin_turn_schedules_even_when_caller_cancelled(db_session) -> No
     off-loop claim is in flight (which commits RUNNING in a worker thread),
     the owned claim+schedule task must settle before cancellation propagates,
     so a committed RUNNING task is never left with no scheduled worker."""
-    import time as _time
+    import threading
 
     user = _create_user(db_session)
     task = _create_task(db_session, user.id, status=TaskStatus.PENDING)
 
+    claim_started = threading.Event()
+    release_claim = threading.Event()
+
     def slow_claim(task_id, task_owner_user_id, *, payload, kind):
-        _time.sleep(0.15)  # window during which we cancel the caller
+        claim_started.set()
+        assert release_claim.wait(timeout=GUARD_TIMEOUT)
         return _ClaimedTurn(
             task_lease=TaskLease(
                 task_id=task_id,
@@ -1316,10 +1325,16 @@ async def test_begin_turn_schedules_even_when_caller_cancelled(db_session) -> No
                 kind=TurnKind.CREATE,
             )
         )
-        await asyncio.sleep(0.05)  # let it enter the off-loop claim
-        t.cancel()
+        try:
+            assert await asyncio.to_thread(claim_started.wait, GUARD_TIMEOUT)
+            t.cancel()
+        finally:
+            release_claim.set()
+            await asyncio.wait_for(
+                asyncio.gather(t, return_exceptions=True), timeout=GUARD_TIMEOUT
+            )
         with pytest.raises(asyncio.CancelledError):
-            await t
+            t.result()
 
     sched.assert_called_once()  # scheduled despite the cancellation
 
@@ -1400,29 +1415,23 @@ async def test_schedule_claimed_create_turn_offloads_cache_invalidation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A committed domain claim must not invalidate Redis on the event loop."""
-    import time as _time
-
     task_id = 987654
     event_loop_thread = get_ident()
     invalidations: list[tuple[int, int]] = []
-    ticker_stop = asyncio.Event()
-    ticks = 0
+    entered = Event()
+    release = Event()
 
     def slow_invalidate(observed_task_id: int) -> None:
         invalidations.append((observed_task_id, get_ident()))
-        _time.sleep(0.08)
+        entered.set()
+        assert get_ident() != event_loop_thread
+        assert release.wait(timeout=30), "cache invalidation was never released"
 
     async def fake_schedule(**_kwargs):
         async def done() -> None:
             return None
 
         return asyncio.create_task(done())
-
-    async def ticker() -> None:
-        nonlocal ticks
-        while not ticker_stop.is_set():
-            ticks += 1
-            await asyncio.sleep(0.005)
 
     monkeypatch.setattr(
         task_orchestrator_module,
@@ -1447,24 +1456,26 @@ async def test_schedule_claimed_create_turn_offloads_cache_invalidation(
         run_id="committed-run",
     )
 
-    ticker_task = asyncio.create_task(ticker())
-    try:
-        started = await TaskTurnOrchestrator.schedule_claimed_create_turn(
+    startup = asyncio.create_task(
+        TaskTurnOrchestrator.schedule_claimed_create_turn(
             task_id=task_id,
             task_owner_user_id=1,
             actor_user_id=1,
             payload=TaskTurnPayload("start"),
             claimed=claimed,
         )
-        await started.background_task
+    )
+    try:
+        assert await asyncio.to_thread(entered.wait, 30)
+        assert not startup.done()
     finally:
-        ticker_stop.set()
-        await ticker_task
+        release.set()
+        started = await asyncio.wait_for(startup, timeout=30)
+    await started.background_task
 
     assert len(invalidations) == 1
     assert invalidations[0][0] == task_id
     assert invalidations[0][1] != event_loop_thread
-    assert ticks >= 3, "claim-cache invalidation blocked the asyncio event loop"
 
 
 @pytest.mark.asyncio
@@ -2151,14 +2162,6 @@ async def test_schedule_bg_pool_timeout_defers_settlement_to_lease_recovery(
         seed_db.commit()
 
     lease = TaskLease(task_id=task_id, runner_id="test-runner", run_id="run-a")
-    ticker_stop = asyncio.Event()
-    ticks = 0
-
-    async def ticker() -> None:
-        nonlocal ticks
-        while not ticker_stop.is_set():
-            ticks += 1
-            await asyncio.sleep(0.01)
 
     def load_snapshot_from_contended_pool(*_args, **_kwargs):
         with SessionLocal() as snapshot_db:
@@ -2170,9 +2173,9 @@ async def test_schedule_bg_pool_timeout_defers_settlement_to_lease_recovery(
         logging.ERROR,
         logger="xagent.web.services.task_orchestrator",
     )
-    ticker_task = asyncio.create_task(ticker())
     try:
         with (
+            assert_pool_checkout_off_loop(engine),
             patch(
                 "xagent.web.services.task_orchestrator.acquire_task_lease_isolated",
                 return_value=lease,
@@ -2215,13 +2218,7 @@ async def test_schedule_bg_pool_timeout_defers_settlement_to_lease_recovery(
         mock_execute.assert_not_awaited()
         mock_stop_heartbeat.assert_awaited_once()
         mock_settle.assert_not_called()
-        assert ticks >= 10, (
-            "setup QueuePool timeout blocked the asyncio event loop; "
-            f"ticker advanced only {ticks} times"
-        )
     finally:
-        ticker_stop.set()
-        await ticker_task
         held_connection.close()
 
     with SessionLocal() as verify_db:
@@ -4199,3 +4196,32 @@ async def test_incidental_failure_persists_the_generic_history_type(
     assert settled["client_message_type"] == TASK_FAILURE_MESSAGE_TYPE
     assert settled["client_error_message"] == CLIENT_SAFE_TASK_FAILURE
     assert "secret-token-xyz" not in settled["client_error_message"]
+
+
+@pytest.mark.asyncio
+async def test_leased_auto_failure_preserves_client_classification(db_session) -> None:
+    error = AutoModelUnavailableError("private model binding details")
+    with _captured_terminal_broadcast(error, db_session) as (
+        task_id,
+        frames,
+        settlements,
+    ):
+        task = db_session.query(Task).filter(Task.id == task_id).one()
+        with patch(
+            "xagent.web.api.websocket.execute_task_background",
+            new=AsyncMock(side_effect=error),
+        ) as execute:
+            await _run_failing_turn(task_id, int(task.user_id), task.source)
+        execute.assert_awaited_once()
+        assert execute.await_args.kwargs["task_lease"] == TaskLease(
+            task_id=task_id, runner_id="runner-a", run_id="run-a"
+        )
+
+    assert len(frames) == 1
+    assert frames[0]["code"] == "auto_model_unavailable"
+    assert frames[0]["message"] == CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
+    assert len(settlements) == 1
+    assert settlements[0]["client_message_type"] == CLIENT_SAFE_FAILURE_MESSAGE_TYPE
+    assert settlements[0]["client_error_message"] == CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
+    assert settlements[0]["error_message"] == CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
+    assert "private model binding details" not in json.dumps(frames)

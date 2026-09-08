@@ -170,3 +170,40 @@ async def wait_for_ticks(
     while read_ticks() - baseline < minimum and loop.time() < deadline:
         await asyncio.sleep(0.01)
     return read_ticks() - baseline
+
+
+@contextmanager
+def assert_pool_checkout_off_loop(engine) -> Iterator[None]:
+    """Check loop progress at each real checkout, preserving pool exhaustion.
+
+    Unlike the contention gate, this does not release the held connection.
+    The worker waits for one loop acknowledgement and then performs the real
+    checkout, so timeout/error assertions remain about SQLAlchemy's pool.
+    """
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    original_do_get = engine.pool._do_get
+    checkout_threads: list[int] = []
+    acknowledged = 0
+
+    def checked_do_get():
+        nonlocal acknowledged
+        thread_id = threading.get_ident()
+        checkout_threads.append(thread_id)
+        assert thread_id != loop_thread, "pool checkout ran on the event loop"
+        progress = threading.Event()
+        loop.call_soon_threadsafe(progress.set)
+        assert progress.wait(GUARD_TIMEOUT), "loop never acknowledged pool checkout"
+        acknowledged += 1
+        return original_do_get()
+
+    engine.pool._do_get = checked_do_get
+    try:
+        yield
+        # Workflows may catch checkout failures; don't let that swallow a failed
+        # thread/progress assertion inside the probe.
+        assert checkout_threads, "the operation never attempted a pool checkout"
+        assert loop_thread not in checkout_threads
+        assert acknowledged == len(checkout_threads)
+    finally:
+        engine.pool._do_get = original_do_get

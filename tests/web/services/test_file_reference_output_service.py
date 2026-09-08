@@ -1226,18 +1226,19 @@ def test_reconcile_stays_fast_on_a_large_unresolvable_reference():
     # and scale quadratically, on a function that reruns on every read of
     # attacker-influenceable chat history. Generous bound (real fix runs in
     # well under a second even at far larger sizes) to avoid environment
-    # flakiness while still catching a real regression.
+    # flakiness while still catching a real regression. Measure thread CPU
+    # time so a preempted CI worker is not mistaken for regex backtracking.
     db, user, task = _create_context()
     try:
         content = "[x](file:" + "a" * 100_000
-        start = time.monotonic()
+        start = time.thread_time()
         result = reconcile_assistant_file_references(
             db,
             task_id=int(task.id),
             user_id=int(user.id),
             content=content,
         )
-        elapsed = time.monotonic() - start
+        elapsed = time.thread_time() - start
 
         assert result == content
         assert elapsed < 2.0
@@ -1635,22 +1636,18 @@ def test_replace_markdown_file_references_propagates_a_raising_callback():
 
 
 def test_the_parsers_skip_content_without_the_file_literal():
-    """A cheap containment check in front of a pattern whose atomic label
-    group explores bracket-run candidates.
-
-    ``"[" * 100000 + "]"`` measures at ~1.5s through ``finditer`` and is
-    instant with the precheck. Asserted as a time bound rather than by
-    inspection because the cost is the whole point; the threshold is two
-    orders of magnitude below the unguarded figure, so it cannot flake on a
-    slow machine while still failing outright if the precheck is removed."""
+    """Content without file: must bypass both regex scanning entry points."""
     pathological = "[" * 100_000 + "]"
-
-    started = time.perf_counter()
-    assert list(iter_markdown_file_references(pathological)) == []
-    assert replace_markdown_file_references(pathological, lambda _: "X") == pathological
-    elapsed = time.perf_counter() - started
-
-    assert elapsed < 0.2, f"the file: precheck is not short-circuiting ({elapsed:.3f}s)"
+    with patch(
+        "xagent.web.services.file_reference_output_service._MARKDOWN_FILE_REFERENCE_RE"
+    ) as pattern:
+        assert list(iter_markdown_file_references(pathological)) == []
+        assert (
+            replace_markdown_file_references(pathological, lambda _: "X")
+            == pathological
+        )
+        pattern.finditer.assert_not_called()
+        pattern.sub.assert_not_called()
 
 
 def test_a_non_string_still_raises_rather_than_yielding_nothing():

@@ -9,6 +9,7 @@ import pytest
 
 from xagent.web.services.ops_signals import (
     GMAIL_OIDC_SERVICE_ACCOUNT_UNVERIFIED,
+    active_degradations,
     clear_degradation,
     register_degradation,
 )
@@ -16,9 +17,21 @@ from xagent.web.services.ops_signals import (
 
 @pytest.fixture(autouse=True)
 def _clean_registry():
-    clear_degradation(GMAIL_OIDC_SERVICE_ACCOUNT_UNVERIFIED)
+    """Empty the whole registry, not just this suite's own signal.
+
+    Both tests below assert an exact /health payload, so any signal left
+    active by an earlier module on the same xdist worker fails them. Some
+    of those signals -- ``INTERACTION_HANDOFF_DEGRADED`` and
+    ``INTERACTION_RUN_PARTITION_MISMATCH_DEGRADED`` -- have no production
+    clear site at all, so a producing suite is the only thing that could
+    remove them; clearing everything here keeps that a shared convention
+    rather than a single-file obligation.
+    """
+    for name in list(active_degradations()):
+        clear_degradation(name)
     yield
-    clear_degradation(GMAIL_OIDC_SERVICE_ACCOUNT_UNVERIFIED)
+    for name in list(active_degradations()):
+        clear_degradation(name)
 
 
 def test_health_is_plain_ok_without_degradations() -> None:

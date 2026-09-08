@@ -1237,6 +1237,7 @@ def test_prepare_channel_task_rolls_back_new_task_when_claim_is_rejected(
 async def test_prepare_channel_task_keeps_event_loop_responsive(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    event_loop_thread = threading.get_ident()
     worker_started = threading.Event()
     allow_worker = threading.Event()
 
@@ -1250,7 +1251,8 @@ async def test_prepare_channel_task_keeps_event_loop_responsive(
 
     def blocking_prepare(**_kwargs):  # type: ignore[no-untyped-def]
         worker_started.set()
-        assert allow_worker.wait(timeout=2)
+        assert threading.get_ident() != event_loop_thread
+        assert allow_worker.wait(timeout=30)
         return claim
 
     monkeypatch.setattr(
@@ -1271,12 +1273,15 @@ async def test_prepare_channel_task_keeps_event_loop_responsive(
             channel_name="Telegram",
         )
     )
-    await asyncio.to_thread(worker_started.wait, 2)
-    await asyncio.sleep(0)
+    try:
+        assert await asyncio.to_thread(worker_started.wait, 30)
+        await asyncio.sleep(0)
 
-    assert preparation.done() is False
-    allow_worker.set()
-    prepared = await preparation
+        assert preparation.done() is False
+    finally:
+        allow_worker.set()
+        result = await asyncio.wait_for(preparation, timeout=30)
+    prepared = result
     assert prepared is not None
     assert prepared.user_id == 7
     assert prepared.task_id == 11
@@ -1289,6 +1294,7 @@ async def test_register_channel_uploaded_files_keeps_event_loop_responsive(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    event_loop_thread = threading.get_ident()
     worker_started = threading.Event()
     allow_worker = threading.Event()
     downloaded = DownloadedChannelFile(
@@ -1301,7 +1307,8 @@ async def test_register_channel_uploaded_files_keeps_event_loop_responsive(
 
     def blocking_register(**_kwargs) -> tuple:  # type: ignore[no-untyped-def]
         worker_started.set()
-        assert allow_worker.wait(timeout=2)
+        assert threading.get_ident() != event_loop_thread
+        assert allow_worker.wait(timeout=30)
         return ()
 
     monkeypatch.setattr(
@@ -1317,12 +1324,15 @@ async def test_register_channel_uploaded_files_keeps_event_loop_responsive(
             files=(downloaded,),
         )
     )
-    await asyncio.to_thread(worker_started.wait, 2)
-    await asyncio.sleep(0)
+    try:
+        assert await asyncio.to_thread(worker_started.wait, 30)
+        await asyncio.sleep(0)
 
-    assert registration.done() is False
-    allow_worker.set()
-    assert await registration == ()
+        assert registration.done() is False
+    finally:
+        allow_worker.set()
+        result = await asyncio.wait_for(registration, timeout=30)
+    assert result == ()
 
 
 @pytest.mark.asyncio
@@ -1538,12 +1548,14 @@ async def test_prepare_channel_task_compensates_late_claim_before_cancellation(
 async def test_load_active_channel_configs_keeps_event_loop_responsive(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    event_loop_thread = threading.get_ident()
     worker_started = threading.Event()
     allow_worker = threading.Event()
 
     def blocking_load(*_args, **_kwargs) -> tuple:  # type: ignore[no-untyped-def]
         worker_started.set()
-        assert allow_worker.wait(timeout=2)
+        assert threading.get_ident() != event_loop_thread
+        assert allow_worker.wait(timeout=30)
         return ()
 
     monkeypatch.setattr(
@@ -1557,12 +1569,15 @@ async def test_load_active_channel_configs_keeps_event_loop_responsive(
             required_config_keys=("bot_token",),
         )
     )
-    await asyncio.to_thread(worker_started.wait, 2)
-    await asyncio.sleep(0)
+    try:
+        assert await asyncio.to_thread(worker_started.wait, 30)
+        await asyncio.sleep(0)
 
-    assert loading.done() is False
-    allow_worker.set()
-    assert await loading == ()
+        assert loading.done() is False
+    finally:
+        allow_worker.set()
+        result = await asyncio.wait_for(loading, timeout=30)
+    assert result == ()
 
 
 @pytest.mark.asyncio

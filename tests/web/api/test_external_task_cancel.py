@@ -36,6 +36,10 @@ from xagent.web.services.external_task_cancel import (
     EXTERNAL_TURN_INTERRUPTED_MESSAGE,
     cancel_external_task_unserialized,
 )
+from xagent.web.services.task_command_terminal_events import (
+    TerminalTaskEventMessageCode,
+    terminal_event_draft_for_error,
+)
 from xagent.web.services.task_command_transport import (
     MAX_COMMAND_FAILURES,
     ClaimedTaskCommand,
@@ -863,9 +867,10 @@ async def test_external_cancel_failures_classified_rejected(
 ) -> None:
     """Every expected failure leaves the core as a rejection.
 
-    A rejection is terminal without an error frame, which is the outcome an
-    anonymous visitor should get for a stop whose target is gone. A plain
-    exception would instead retry and then render as an error bubble.
+    A rejection is terminal — a plain exception would instead retry and then
+    render as an error bubble. Whether the visitor hears about it is the
+    dispatcher's per-reason policy, not the core's: the core itself
+    broadcasts nothing on any rejection.
     """
     agent_id, owner_user_id = _create_agent()
     task_id = _create_task(
@@ -950,43 +955,8 @@ async def test_terminal_command_error_text_external(
     assert set(payloads[0]) == {"type", "message", "task_id", "timestamp"}
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("task_status", "expected_message"),
-    [
-        (TaskStatus.RUNNING, EXTERNAL_CANCEL_NOT_APPLIED_MESSAGE),
-        (TaskStatus.FAILED, EXTERNAL_TURN_INTERRUPTED_MESSAGE),
-        (TaskStatus.COMPLETED, EXTERNAL_TURN_INTERRUPTED_MESSAGE),
-        (TaskStatus.PAUSED, EXTERNAL_CANCEL_NOT_APPLIED_MESSAGE),
-    ],
-    ids=[
-        "still_running",
-        "already_failed",
-        "already_completed",
-        "paused_is_still_alive",
-    ],
-)
-async def test_terminal_command_error_text_follows_the_task_state(
-    monkeypatch: pytest.MonkeyPatch,
-    task_status: TaskStatus,
-    expected_message: str,
-) -> None:
-    """The exhausted-cancel wording asserts only what the task's state proves.
-
-    ``PAUSED`` looks stopped to the frontend's spinner logic, but the run
-    behind it can still produce more output on resume, so the terminal
-    sentence would be false there just as it would be on ``RUNNING``.
-    """
-    agent_id, owner_user_id = _create_agent()
-    task_id = _create_task(
-        agent_id=agent_id,
-        owner_user_id=owner_user_id,
-        title="terminal wording by task state",
-        status=task_status,
-        control_state=TaskControlState.RUNNING.value,
-    )
-    manager = _broadcast_manager(monkeypatch)
-    command = ClaimedTaskCommand(
+def _exhausted_cancel_command(*, task_id: int, agent_id: int) -> ClaimedTaskCommand:
+    return ClaimedTaskCommand(
         id=1,
         task_id=task_id,
         actor_user_id=None,
@@ -1001,12 +971,272 @@ async def test_terminal_command_error_text_follows_the_task_state(
         attempt_count=1,
     )
 
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("task_status", "expected_message"),
+    [
+        (TaskStatus.RUNNING, EXTERNAL_CANCEL_NOT_APPLIED_MESSAGE),
+        (TaskStatus.FAILED, EXTERNAL_TURN_INTERRUPTED_MESSAGE),
+        (TaskStatus.PAUSED, EXTERNAL_CANCEL_NOT_APPLIED_MESSAGE),
+    ],
+    ids=[
+        "still_running",
+        "already_failed",
+        "paused_is_still_alive",
+    ],
+)
+async def test_terminal_command_error_text_follows_the_task_state(
+    monkeypatch: pytest.MonkeyPatch,
+    task_status: TaskStatus,
+    expected_message: str,
+) -> None:
+    """The exhausted-cancel wording asserts only what the task's state proves.
+
+    ``PAUSED`` looks stopped to the frontend's spinner logic, but the run
+    behind it can still produce more output on resume, so the terminal
+    sentence would be false there just as it would be on ``RUNNING``.
+    ``COMPLETED`` is covered separately below: it is the one state where the
+    broadcast is suppressed outright rather than reworded.
+    """
+    agent_id, owner_user_id = _create_agent()
+    task_id = _create_task(
+        agent_id=agent_id,
+        owner_user_id=owner_user_id,
+        title="terminal wording by task state",
+        status=task_status,
+        control_state=TaskControlState.RUNNING.value,
+    )
+    manager = _broadcast_manager(monkeypatch)
+    command = _exhausted_cancel_command(task_id=task_id, agent_id=agent_id)
+
     await websocket_api._broadcast_terminal_command_error(
         command, RuntimeError(f"lease lost at {task_id}")
     )
 
     payloads = _broadcast_payloads(manager)
     assert payloads[0]["message"] == expected_message
+
+
+@pytest.mark.asyncio
+async def test_terminal_command_error_completed_task_stays_silent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An exhausted cancel against a completed target sends no live frame.
+
+    ``EXTERNAL_TURN_INTERRUPTED_MESSAGE`` is the only wording this branch has
+    for a terminal task, and it is false for ``COMPLETED``: the run finished
+    on its own, and its completion frame already answered the visitor. A
+    live "interrupted" frame here would be the only error-shaped message the
+    client sees for a run that actually succeeded, so the broadcast is
+    suppressed rather than reworded.
+    """
+    agent_id, owner_user_id = _create_agent()
+    task_id = _create_task(
+        agent_id=agent_id,
+        owner_user_id=owner_user_id,
+        title="terminal wording by task state",
+        status=TaskStatus.COMPLETED,
+        control_state=TaskControlState.RUNNING.value,
+    )
+    manager = _broadcast_manager(monkeypatch)
+    command = _exhausted_cancel_command(task_id=task_id, agent_id=agent_id)
+
+    await websocket_api._broadcast_terminal_command_error(
+        command, RuntimeError(f"lease lost at {task_id}")
+    )
+
+    assert manager.broadcast_to_task.await_count == 0
+
+
+def _external_cancel_command(
+    *,
+    task_id: int,
+    agent_id: int,
+    target_state_version: int | None = 4,
+) -> ClaimedTaskCommand:
+    payload: dict[str, Any] = {"agent_id": agent_id, "scope": "external"}
+    if target_state_version is not None:
+        payload["target_state_version"] = target_state_version
+    return ClaimedTaskCommand(
+        id=7,
+        task_id=task_id,
+        actor_user_id=None,
+        command_id=f"cancel:{task_id}:4",
+        kind=TaskCommandKind.CANCEL,
+        payload=payload,
+        target_run_id="run-external",
+        attempt_count=1,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("task_kwargs", "target_state_version", "expected_message", "expected_code"),
+    [
+        (
+            {"state_version": 9},
+            4,
+            EXTERNAL_CANCEL_NOT_APPLIED_MESSAGE,
+            TerminalTaskEventMessageCode.EXTERNAL_CANCEL_NOT_APPLIED,
+        ),
+        (
+            {
+                "status": TaskStatus.FAILED,
+                "control_state": TaskControlState.FAILED.value,
+                "state_version": 5,
+                "error_message": "provider exploded",
+            },
+            4,
+            EXTERNAL_TURN_INTERRUPTED_MESSAGE,
+            TerminalTaskEventMessageCode.EXTERNAL_TURN_INTERRUPTED,
+        ),
+        (
+            {},
+            None,
+            EXTERNAL_CANCEL_NOT_APPLIED_MESSAGE,
+            TerminalTaskEventMessageCode.EXTERNAL_CANCEL_NOT_APPLIED,
+        ),
+        (
+            {"run_id": "run-successor"},
+            4,
+            EXTERNAL_CANCEL_NOT_APPLIED_MESSAGE,
+            TerminalTaskEventMessageCode.EXTERNAL_CANCEL_NOT_APPLIED,
+        ),
+    ],
+    ids=[
+        "live_successor",
+        "settled_on_its_own",
+        "missing_version_target",
+        "run_id_moved_before_dispatch",
+    ],
+)
+async def test_rejected_external_cancel_stale_run_broadcasts(
+    monkeypatch: pytest.MonkeyPatch,
+    task_kwargs: dict[str, Any],
+    target_state_version: int | None,
+    expected_message: str,
+    expected_code: TerminalTaskEventMessageCode,
+) -> None:
+    """A stale external cancel tells the visitor, through the real dispatch.
+
+    The one reachable orphaned rejection (#2009): the widget's stop press
+    fenced against a run/version that moved before the command dispatched.
+    Nothing else answers that press — the target's own settlement already
+    happened or belongs to a successor run — so the rejection must broadcast,
+    with wording read from the task's current status and without the durable
+    command identity. The missing-version flavor is the dispatcher's own
+    validation raise, riding the same gate. The run-id-moved flavor is a
+    third producer of the same reason: the dispatcher's own pre-check in
+    ``_execute_durable_task_command`` compares the command's target run id
+    against the task's current one before the command ever reaches this
+    core's own checks, and its rejection travels through the same
+    per-reason gate.
+    """
+    agent_id, owner_user_id = _create_agent()
+    task_id = _create_task(
+        agent_id=agent_id,
+        owner_user_id=owner_user_id,
+        title="stale cancel is announced",
+        **task_kwargs,
+    )
+    manager = _broadcast_manager(monkeypatch)
+
+    with pytest.raises(TaskCommandRejected) as raised:
+        await websocket_api.execute_durable_task_command(
+            _external_cancel_command(
+                task_id=task_id,
+                agent_id=agent_id,
+                target_state_version=target_state_version,
+            )
+        )
+
+    assert raised.value.reason == "stale_run"
+    payloads = _broadcast_payloads(manager)
+    assert [payload["type"] for payload in payloads] == ["agent_error"]
+    assert payloads[0]["message"] == expected_message
+    assert set(payloads[0]) == {"type", "message", "task_id", "timestamp"}
+    assert raised.value.args[0] not in repr(payloads)
+    draft = terminal_event_draft_for_error(raised.value)
+    assert draft is not None
+    assert draft.message_code is expected_code
+    assert draft.include_command_identity is False
+
+
+@pytest.mark.asyncio
+async def test_rejected_external_cancel_completed_target_stays_silent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A completed target's own completion frame already answered the visitor.
+
+    The stop press raced a turn that finished cleanly: run id and state
+    version still match the command's target exactly, but
+    ``_assert_external_cancel_target`` rejects it as ``stale_run`` anyway,
+    because ``COMPLETED`` is terminal regardless of the tuple match. Every
+    wording ``_broadcast_terminal_command_error`` can pick for a ``stale_run``
+    external cancel asserts the turn did not finish cleanly, and that is
+    false here - the task's own completion frame already told the visitor
+    the answer landed, so a live "interrupted" frame would contradict it.
+    The persisted terminal-event draft keeps its ordinary audit
+    classification either way: it is write-only audit data that no reader
+    renders to a client, so there is nothing false about leaving it as
+    ``EXTERNAL_TURN_INTERRUPTED``.
+    """
+    agent_id, owner_user_id = _create_agent()
+    task_id = _create_task(
+        agent_id=agent_id,
+        owner_user_id=owner_user_id,
+        title="completed target stays silent",
+        status=TaskStatus.COMPLETED,
+        control_state=TaskControlState.COMPLETED.value,
+        state_version=4,
+    )
+    manager = _broadcast_manager(monkeypatch)
+
+    with pytest.raises(TaskCommandRejected) as raised:
+        await websocket_api.execute_durable_task_command(
+            _external_cancel_command(
+                task_id=task_id,
+                agent_id=agent_id,
+                target_state_version=4,
+            )
+        )
+
+    assert raised.value.reason == "stale_run"
+    assert manager.broadcast_to_task.await_count == 0
+    draft = terminal_event_draft_for_error(raised.value)
+    assert draft is not None
+    assert draft.message_code is TerminalTaskEventMessageCode.EXTERNAL_TURN_INTERRUPTED
+    assert draft.include_command_identity is False
+
+
+@pytest.mark.asyncio
+async def test_rejected_external_cancel_task_not_found_stays_silent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``task_not_found`` keeps the documented silence.
+
+    The status read has no row to consult, so the fallback wording would
+    invite retrying a stop against a task that no longer exists. Silence is
+    the per-reason policy for this rejection, not a routing gap.
+    """
+    agent_id, owner_user_id = _create_agent()
+    task_id = _create_task(
+        agent_id=agent_id,
+        owner_user_id=owner_user_id,
+        title="not an external task",
+        source="a2a",
+    )
+    manager = _broadcast_manager(monkeypatch)
+
+    with pytest.raises(TaskCommandRejected) as raised:
+        await websocket_api.execute_durable_task_command(
+            _external_cancel_command(task_id=task_id, agent_id=agent_id)
+        )
+
+    assert raised.value.reason == "task_not_found"
+    assert manager.broadcast_to_task.await_count == 0
+    assert terminal_event_draft_for_error(raised.value) is None
 
 
 @pytest.mark.asyncio

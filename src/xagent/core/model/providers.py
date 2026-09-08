@@ -1,9 +1,10 @@
 import os
 from typing import Any, Optional
 
-# When an OpenRouter model carries this name, route the prompt through
-# xrouter-llm (in-process) instead of calling OpenRouter directly with it.
+# When an OpenRouter or configured router model carries this name, route the
+# prompt through xrouter-llm (in-process) instead of calling a provider directly.
 AUTO_MODEL_NAME = "auto"
+ROUTER_PROVIDER = "router"
 
 _PROVIDER_ALIASES: dict[str, str] = {
     "ark": "volcengine-ark",
@@ -298,13 +299,13 @@ def curated_models_for_provider(provider: str) -> tuple[str, ...]:
 
 
 def is_auto_router_model(provider: str, model_name: Optional[str]) -> bool:
-    """True when an OpenRouter model is the virtual ``auto`` router.
+    """True when a model is the virtual ``auto`` router.
 
-    Such a model is served by xrouter-llm (in-process selection) instead of
-    being sent to OpenRouter directly.
+    ``openrouter/auto`` is the legacy single-credential form. ``router/auto``
+    resolves every selected routing profile to a concrete saved model config.
     """
     return (
-        canonical_provider_name(provider) == "openrouter"
+        canonical_provider_name(provider) in {"openrouter", ROUTER_PROVIDER}
         and (model_name or "").strip().lower() == AUTO_MODEL_NAME
     )
 

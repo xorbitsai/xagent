@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 from typing import Any, Iterable
 
+from ..artifact_validation.defaults import default_registry
 from ..file_ref import (
     build_workspace_file_ref,
     guess_mime_type,
@@ -33,7 +34,7 @@ GENERATED_ARTIFACT_EXTENSIONS = {
     ".webm",
     ".xls",
     ".xlsx",
-}
+} | set(default_registry().extensions)
 SAFE_FILE_REF_KEYS = {
     "download_url",
     "file_id",
@@ -44,6 +45,7 @@ SAFE_FILE_REF_KEYS = {
     "preview_url",
     "relative_path",
     "size",
+    "validation",
 }
 # Every media tool returns its artifact as <kind>_path alongside file_id/file_ref.
 # Missing keys were redacted only by coincidence: file_ref.file_path registers the
@@ -100,7 +102,7 @@ def artifact_type_for_filename(filename: str) -> str:
     return "file"
 
 
-def build_inline_artifact(file_ref: dict[str, Any]) -> dict[str, str]:
+def build_inline_artifact(file_ref: dict[str, Any]) -> dict[str, Any]:
     filename = str(file_ref.get("filename") or "artifact")
     return {
         "type": artifact_type_for_filename(filename),
@@ -108,6 +110,7 @@ def build_inline_artifact(file_ref: dict[str, Any]) -> dict[str, str]:
         "filename": filename,
         "mime_type": str(file_ref.get("mime_type") or guess_mime_type(filename)),
         "display": "inline",
+        **({"validation": file_ref["validation"]} if "validation" in file_ref else {}),
     }
 
 
@@ -148,7 +151,7 @@ def format_tool_result_for_observation(tool_name: str, result: Any) -> str:
 
     metadata = _observation_metadata(sanitized, _OBSERVATION_EXCLUDED_KEYS)
     return (
-        f"Tool '{tool_name}' produced displayable artifact(s):\n"
+        f"Tool '{tool_name}' produced artifact(s); check validation before delivery:\n"
         + "\n".join(artifact_lines)
         + "\nUse the Markdown/chat form in assistant messages. "
         + "When writing HTML for Xagent preview, reference the same file_id "
@@ -179,7 +182,7 @@ def _format_artifact_lines(artifacts: list[Any]) -> list[str]:
                     [
                         f"- {filename}",
                         "  file_id: unavailable, registration did not complete",
-                        "  The file itself is written and intact. No file_id "
+                        "  The tool reported a written file; this does not establish readability. No file_id "
                         "can be obtained for it in this task; say so plainly "
                         "and never rewrite the file to try to mint one.",
                     ]
@@ -200,6 +203,33 @@ def _format_artifact_lines(artifacts: list[Any]) -> list[str]:
                 ]
             )
         )
+        validation = artifact.get("validation")
+        if not isinstance(validation, dict):
+            lines.append(
+                "  Validation: NOT RUN. No validation report was produced for this file."
+            )
+            continue
+        status = validation.get("status", "unchecked")
+        if status == "invalid":
+            lines.append(
+                "  Validation: INVALID. Repair and recheck, or report failure; do not claim a usable deliverable."
+            )
+        elif status == "valid":
+            lines.append(
+                "  Validation: format readable; content correctness is not checked."
+            )
+        else:
+            lines.append(
+                "  Validation: UNCHECKED. Do not claim this file passed validation."
+            )
+            checks = validation.get("checks")
+            if isinstance(checks, list):
+                for check in checks:
+                    if isinstance(check, dict) and check.get("status") == "unchecked":
+                        message = check.get("message")
+                        if isinstance(message, str) and message.strip():
+                            lines.append(f"  Validation reason: {message}")
+                            break
     return lines
 
 
@@ -304,7 +334,7 @@ def build_generated_file_metadata(
     file_paths: Iterable[str | Path],
 ) -> dict[str, list[Any]]:
     file_refs: list[dict[str, Any]] = []
-    artifacts: list[dict[str, str]] = []
+    artifacts: list[dict[str, Any]] = []
     generated_files: list[str] = []
 
     for file_path in sorted({Path(path).resolve() for path in file_paths}):
@@ -314,7 +344,7 @@ def build_generated_file_metadata(
             continue
         try:
             file_ref = build_workspace_file_ref(
-                workspace=workspace, file_path=file_path
+                workspace=workspace, file_path=file_path, validate=True
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(

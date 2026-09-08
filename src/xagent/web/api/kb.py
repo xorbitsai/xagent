@@ -4478,7 +4478,10 @@ async def create_ingest_job(
     try:
         job = create_background_job(
             db,
-            user_id=int(_user.id),
+            # Owner is the real member who polls /api/jobs/{id}, not the team
+            # storage tenant _user was swapped to; the worker keeps reading the
+            # tenant from payload["user_id"].
+            user_id=int(actor_user.id),
             job_type=BackgroundJobType.KB_INGEST_DOCUMENT,
             payload=job_payload,
             idempotency_key=idempotency_key,
@@ -6178,7 +6181,10 @@ async def create_ingest_web_job(
     try:
         job = create_background_job(
             db,
-            user_id=int(_user.id),
+            # Owner is the real member who polls /api/jobs/{id}, not the team
+            # storage tenant _user was swapped to; the worker keeps reading the
+            # tenant from payload["user_id"].
+            user_id=int(actor_user.id),
             job_type=BackgroundJobType.KB_INGEST_WEB,
             payload={
                 "collection": safe_collection,

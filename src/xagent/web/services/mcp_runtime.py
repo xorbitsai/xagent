@@ -26,10 +26,11 @@ class MCPBuiltinOAuthActorPolicyMismatchError(RuntimeError):
 
 @dataclass(frozen=True)
 class MCPBuiltinOAuthActorPolicy:
-    """Trusted actor owner namespace for builtin OAuth MCP execution.
+    """Trusted actor owner namespace for catalog OAuth MCP execution.
 
-    Server visibility and builtin classification remain xagent runtime
-    decisions. The caller supplies only the immutable credential owner.
+    Server visibility and catalog classification remain xagent runtime
+    decisions. The caller supplies only the immutable credential owner. The
+    owner governs both builtin-provider and remote MCP OAuth credentials.
     """
 
     resource_owner_key: str = dataclass_field(repr=False)

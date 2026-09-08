@@ -117,6 +117,7 @@ from ..services.db_runtime import (
     run_db_io_cancellation_safe,
 )
 from ..services.external_task_cancel import (
+    EXTERNAL_CANCEL_BROADCAST_REJECTION_REASONS,
     EXTERNAL_COMMAND_SCOPE,
     cancel_external_task_unserialized,
     external_cancel_exhausted_message,
@@ -153,6 +154,7 @@ from ..services.hot_path_cache import (
     task_cache_ttl_seconds,
     web_task_history_key,
 )
+from ..services.llm_utils import AutoModelUnavailableError
 from ..services.managed_file_ref import (
     DurableObjectIntegrityError,
     DurableStorageOperationError,
@@ -166,6 +168,7 @@ from ..services.task_command_terminal_events import (
     TerminalTaskEventDraft,
     TerminalTaskEventMessageCode,
     bind_terminal_event_draft,
+    first_party_message_terminal_text,
     is_external_cancel_command,
     terminal_event_draft_for_error,
 )
@@ -351,7 +354,7 @@ def create_terminal_task_error_event(
     failure this path exists to remove. A bad optional argument costs that
     argument and nothing else. The rejection is logged with its stack.
 
-    ``code`` must be a member of ``CONNECTOR_RUNTIME_CLIENT_ERROR_CODES``.
+    ``code`` must be a connector-runtime code or ``AUTO_MODEL_UNAVAILABLE``.
     """
 
     # Python annotations are not enforced at run time, so the mypy gate on the
@@ -367,7 +370,11 @@ def create_terminal_task_error_event(
     # and an unhashable value would raise inside the membership test on a
     # path whose whole point is that it never raises.
     if code is not None and (
-        not isinstance(code, str) or code not in CONNECTOR_RUNTIME_CLIENT_ERROR_CODES
+        not isinstance(code, str)
+        or (
+            code not in CONNECTOR_RUNTIME_CLIENT_ERROR_CODES
+            and code != ClientErrorCode.AUTO_MODEL_UNAVAILABLE.value
+        )
     ):
         logger.error(
             "task_id=%s component=terminal-error-frame dropped=code "
@@ -470,6 +477,8 @@ def client_safe_error_message(
     Read a passing sweep as "the recognized egress shapes are clean", never
     as "arbitrary Python data flow cannot reach a client raw".
     """
+    if isinstance(error, AutoModelUnavailableError):
+        return client_error_message(ClientErrorCode.AUTO_MODEL_UNAVAILABLE)
     if not isinstance(error, ClientVisibleError):
         return fallback
     message = str(error)
@@ -505,11 +514,24 @@ def client_safe_task_command_failure(
     picked by what the terminal exception proves -- non-application is
     asserted only when it is established, uncertainty otherwise -- and
     needs no task status, so the caller does not read the task for it.
+
+    A first-party MESSAGE drops the prefix for the same proof rule: its
+    sender is deciding whether to resend a durably accepted reply, so the
+    sentence comes from the bound terminal-event draft instead of the
+    exception text (#1500).
     """
     if is_external_cancel_command(kind=kind.value, scope=scope):
         return external_cancel_exhausted_message(task_status)
     if scope == EXTERNAL_COMMAND_SCOPE and kind == TaskCommandKind.MESSAGE:
         return external_input_terminal_message(error)
+    if kind == TaskCommandKind.MESSAGE:
+        # A first-party MESSAGE follows the external rule above rather than
+        # the generic fallback: restating the deferral's last wait condition
+        # under a "failed" prefix tells the sender nothing about whether the
+        # accepted reply was applied (#1500). The sentence is derived from
+        # the bound terminal-event draft, so it asserts non-application only
+        # when the persisted outcome proves it.
+        return first_party_message_terminal_text(terminal_event_draft_for_error(error))
     # kind.value in the text is safe only while every external-scope kind is
     # handled above; a new external-scope kind needs its own branch first.
     return f"Task command {kind.value} failed: {client_safe_error_message(error)}"
@@ -2961,11 +2983,12 @@ async def execute_task_background(
             raise
 
         error_message = str(e)
-        error_code = (
-            e.error_code
-            if isinstance(e, ClientVisibleError)
-            else ClientErrorCode.TASK_EXECUTION_FAILED
-        )
+        if isinstance(e, AutoModelUnavailableError):
+            error_code = ClientErrorCode.AUTO_MODEL_UNAVAILABLE
+        elif isinstance(e, ClientVisibleError):
+            error_code = e.error_code
+        else:
+            error_code = ClientErrorCode.TASK_EXECUTION_FAILED
         safe_error_message = client_error_message(error_code)
         terminal_payload = await run_db_io_cancellation_safe(
             lambda: _terminal_task_error_payload(
@@ -9765,6 +9788,13 @@ async def _broadcast_terminal_command_error(
     # variable would drop this site out of its view entirely.
     if is_external_cancel_command(kind=command.kind.value, scope=scope):
         task_status = await _load_terminal_command_task_status(command.task_id)
+        if task_status is TaskStatus.COMPLETED:
+            # Every wording this branch can pick asserts the turn did not
+            # finish cleanly, which is false here - the run completed and
+            # its own completion frame already answered the audience. The
+            # persisted terminal-event draft keeps its audit classification;
+            # nothing renders it to a client.
+            return
         await manager.broadcast_to_task(
             {
                 "type": "agent_error",
@@ -9803,6 +9833,27 @@ async def _broadcast_terminal_command_error(
             command.task_id,
         )
         return
+    # ``outcome``/``resend_safe``/``message_code`` expose the persisted
+    # terminal disposition structurally (#1500), so the sender can decide
+    # whether resending the command is safe without parsing ``message``.
+    # The field names match the durable terminal-event projection (#1904),
+    # including its two disambiguators: ``task_run_id`` (the acceptance
+    # snapshot's run) and ``outcome_version`` (the attempt count, which the
+    # terminal CAS write pins to this same value), because an operator retry
+    # can send one ``command_id`` through a terminal broadcast twice.
+    # Values come from the draft the dispatcher binds before broadcasting;
+    # a missing draft degrades to the unsafe/unknown reading. Only this
+    # identity-bearing frame carries them: the two external frames above
+    # deliberately expose nothing the anonymous audience cannot act on,
+    # and a retry decision needs the ``command_id`` they withhold.
+    #
+    # ``resend_safe`` is a proof of non-application, not a retryability
+    # rating: the only producer of ``True`` is the MESSAGE contention
+    # deferral. PAUSE/RESUME/CANCEL terminals therefore always carry
+    # ``False`` even though those commands are idempotent by design -- a
+    # consumer deciding whether to offer a retry for them must reason from
+    # ``command_kind``, never from this flag.
+    draft = terminal_event_draft_for_error(error)
     await manager.broadcast_to_task(
         {
             "type": "agent_error",
@@ -9814,9 +9865,16 @@ async def _broadcast_terminal_command_error(
                 error,
                 scope=scope,
             ),
+            "outcome": "failed",
+            "resend_safe": bool(draft and draft.resend_safe),
+            "message_code": (
+                draft.message_code.value if draft and draft.message_code else None
+            ),
             "command_kind": command.kind.value,
             "task_id": command.task_id,
             "command_id": command.command_id,
+            "task_run_id": command.target_run_id,
+            "outcome_version": int(command.attempt_count or 0),
             "timestamp": datetime.now(timezone.utc).timestamp(),
         },
         command.task_id,
@@ -9890,22 +9948,35 @@ async def execute_durable_task_command(
         # Rejections come from handlers that already expose their durable
         # domain-level outcome. The dispatcher makes them terminal immediately.
         _command_origins.discard_command(command.command_id, command.task_id)
+        scope = _command_scope(command)
+        # Two external-scope commands answer an audience with no channel of
+        # its own, so their terminal rejections broadcast here. First-party
+        # rejections keep their handler-owned notifications and are
+        # deliberately not re-broadcast.
+        #
+        # MESSAGE: the external audience's answer travels through the seam
+        # executor, which reports outcomes only as these exceptions. Without
+        # a broadcast, a deferred answer that is later terminally rejected
+        # (revoked principal, stale request, spent id, quota) vanishes
+        # silently — the task stays parked and nobody is told
+        # (xorbitsai/xagent-saas#952 B2).
+        #
+        # CANCEL: per-reason policy (#2009). ``stale_run`` is the one
+        # rejection the widget's stop press can reach — the target's
+        # run/version moved between the producer's read and this dispatch —
+        # and silence there leaves the press doing nothing while the
+        # unwanted run keeps producing. The reason set and the rationale
+        # for what stays silent live with the wording constants in
+        # ``external_task_cancel.py``.
         if (
-            command.kind == TaskCommandKind.MESSAGE
-            and _command_scope(command) == EXTERNAL_COMMAND_SCOPE
+            command.kind == TaskCommandKind.MESSAGE and scope == EXTERNAL_COMMAND_SCOPE
+        ) or (
+            is_external_cancel_command(kind=command.kind.value, scope=scope)
+            and exc.reason in EXTERNAL_CANCEL_BROADCAST_REJECTION_REASONS
         ):
-            # The one command whose handler has no channel of its own: the
-            # external audience's answer travels through the seam executor,
-            # which reports outcomes only as these exceptions. Without a
-            # broadcast, a deferred answer that is later terminally rejected
-            # (revoked principal, stale request, spent id, quota) vanishes
-            # silently — the task stays parked and nobody is told
-            # (xorbitsai/xagent-saas#952 B2). First-party rejections keep
-            # their handler-owned notifications and are deliberately not
-            # re-broadcast here. An executor-bound presentation draft is
-            # preserved; the standard one is derived only when none was
-            # bound, so the persisted terminal event is classified either
-            # way.
+            # An executor-bound presentation draft is preserved; the
+            # standard one is derived only when none was bound, so the
+            # persisted terminal event is classified either way.
             if terminal_event_draft_for_error(exc) is None:
                 bind_terminal_event_draft(
                     exc,
@@ -9920,9 +9991,10 @@ async def execute_durable_task_command(
                 # broadcast in external_task_cancel.py keeps the same rule).
                 # Exception, never BaseException: cancellation propagates.
                 logger.warning(
-                    "task %s external input rejection is terminal but its "
+                    "task %s external %s rejection is terminal but its "
                     "broadcast failed",
                     command.task_id,
+                    command.kind.value,
                     exc_info=True,
                 )
         raise
@@ -10448,8 +10520,17 @@ clarification questions as plain assistant text.
 
     except Exception as e:
         logger.error("Error handling builder chat: %s", e, exc_info=True)
+        error_metadata = {}
+        if isinstance(e, AutoModelUnavailableError):
+            error_metadata["error_code"] = ClientErrorCode.AUTO_MODEL_UNAVAILABLE.value
         await websocket.send_text(
-            json.dumps({"type": "error", "message": client_safe_error_message(e)})
+            json.dumps(
+                {
+                    **error_metadata,
+                    "type": "error",
+                    "message": client_safe_error_message(e),
+                }
+            )
         )
 
 

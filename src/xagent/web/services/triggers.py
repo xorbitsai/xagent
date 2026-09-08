@@ -1857,6 +1857,17 @@ def _finish_trigger_run_after_task(start: _PreparedTriggerStart) -> None:
         elif task.status == TaskStatus.FAILED:
             setattr(run, "status", TriggerRunStatus.FAILED.value)
             setattr(run, "error_message", task.error_message)
+        else:
+            # The task is not terminal yet (pending/running/paused/
+            # waiting_for_user). Leave the run untouched. If the task later
+            # terminates (or lease recovery reclaims a crashed RUNNING
+            # lease), sync_trigger_run_status finalizes the run; a task
+            # parked at PAUSED/WAITING_FOR_USER that never resumes leaves
+            # the run at "running" indefinitely (#2177). Stamping
+            # finished_at here would instead strand the run as "running"
+            # with a finish timestamp, because this finalizer only runs
+            # once.
+            return
         setattr(run, "finished_at", _now())
         db.add(run)
         db.commit()

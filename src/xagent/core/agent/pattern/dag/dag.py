@@ -15,6 +15,9 @@ from ....task_runtime import (
 from ...context.enrichment import (
     enrich_context_with_memory,
     hydrate_top_level_user_request,
+    latest_pending_user_response,
+    pending_user_response_marker,
+    top_level_user_request,
 )
 from ...frame import ExecutionFrame, ExecutionSnapshot, ExecutionStatus
 from ...grounding import grounding_rule
@@ -22,7 +25,9 @@ from ...language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
     effective_output_language,
     final_answer_language_rule,
-    output_language_directives,
+    render_dag_step_language_reference,
+    render_structured_request_language_policy,
+    serialize_pending_user_response,
 )
 from ...result import unwrap_final_answer_content
 from ...runtime import (
@@ -1525,6 +1530,8 @@ class DAGPattern(AgentPattern):
         return assessment
 
     def _completion_assessment_messages(self, context: Any) -> list[dict[str, Any]]:
+        request = top_level_user_request(context)
+        pending_response = latest_pending_user_response(context)
         latest_messages = [
             {"role": message.role, "content": message.content}
             for message in getattr(context, "messages", [])
@@ -1536,9 +1543,16 @@ class DAGPattern(AgentPattern):
             if getattr(message, "role", None) == "user"
         ]
         payload = {
-            "output_language_policy": output_language_directives(
-                effective_output_language(context),
-                section="completion_assessment",
+            "independent_user_request": request.language_text,
+            "pending_response": (
+                serialize_pending_user_response(pending_response)
+                if pending_response is not None
+                else None
+            ),
+            "output_language_policy": render_structured_request_language_policy(
+                request_field="independent_user_request",
+                pending_field="pending_response",
+                output_language=effective_output_language(context),
             ),
             "authoritative_user_requests": authoritative_user_requests,
             "messages": latest_messages,
@@ -1573,7 +1587,7 @@ class DAGPattern(AgentPattern):
                     "placeholder because no step produced the underlying data, "
                     "name that unsourced data in reason even when you choose "
                     "status=completed. "
-                    f"{final_answer_language_rule(subject='output language policy')}"
+                    f"{final_answer_language_rule(subject='output_language_policy field')}"
                 ),
             },
             {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
@@ -1602,7 +1616,7 @@ class DAGPattern(AgentPattern):
                                 "Final user-facing answer when status is completed; "
                                 "empty when status is incomplete. "
                                 f"{final_deliverable_file_reference_instructions(can_lookup=False, include_heading=False)} "
-                                f"{final_answer_language_rule(subject='output language policy')}"
+                                f"{final_answer_language_rule(subject='output_language_policy field')}"
                             ),
                         },
                         "missing_work": {
@@ -1724,10 +1738,6 @@ class DAGPattern(AgentPattern):
         return {dep: self.step_results.get(dep) for dep in step.dependencies}
 
     def _step_instruction(self, *, root_context: Any, step: PlanStep) -> str:
-        language_policy = output_language_directives(
-            effective_output_language(root_context),
-            section="dag_step_instruction",
-        )
         dependency_note = (
             "Dependency results, if any, are provided immediately before this "
             "message. Use them as inputs for this step only."
@@ -1746,7 +1756,7 @@ class DAGPattern(AgentPattern):
             "directly and do not use it to expand the current step's completion "
             "criteria.\n\n"
             "OUTPUT LANGUAGE POLICY\n"
-            f"{language_policy}\n"
+            f"{render_dag_step_language_reference()}\n"
             "Use this policy only to preserve language for user-facing prose and "
             "persisted tool arguments. Do not use it to expand this step's "
             "completion criteria.\n\n"
@@ -1896,7 +1906,9 @@ class DAGPattern(AgentPattern):
             return False
 
         root_user_messages = [
-            message for message in root_context.messages if message.role == "user"
+            (index, message)
+            for index, message in enumerate(root_context.messages)
+            if message.role == "user"
         ]
         if len(root_user_messages) <= self.planned_user_message_count:
             return False
@@ -1905,13 +1917,38 @@ class DAGPattern(AgentPattern):
         if not active_context:
             return False
 
+        new_root_messages = root_user_messages[self.planned_user_message_count :]
+        response_index, response_message = new_root_messages[0]
+        pattern_state = self.active_step_pattern_states.get(step_id)
+        waiting_request = (
+            pattern_state.get("waiting_for_user_request")
+            if isinstance(pattern_state, dict)
+            else None
+        )
+        marker = pending_user_response_marker(waiting_request)
+        raw_response_metadata = getattr(response_message, "metadata", None)
+        response_metadata = (
+            dict(raw_response_metadata)
+            if isinstance(raw_response_metadata, dict)
+            else {}
+        )
+        if marker is not None:
+            response_metadata["response_to_waiting_for_user"] = marker
+            root_context.messages[response_index] = replace(
+                response_message,
+                metadata=response_metadata,
+            )
+
         child_context = type(root_context).from_dict(active_context)
         self._refresh_restored_step_runtime_metadata(child_context, root_context)
-        for message in root_user_messages[self.planned_user_message_count :]:
+        for _, message in new_root_messages:
+            metadata = dict(getattr(message, "metadata", None) or {})
+            if message is response_message and marker is not None:
+                metadata["response_to_waiting_for_user"] = marker
             child_context.add_user_message(
                 message.content,
                 metadata={
-                    **getattr(message, "metadata", {}),
+                    **metadata,
                     "kind": "dag_waiting_user_response",
                     "forwarded_from_root": True,
                     "dag_step_id": step_id,
@@ -1932,8 +1969,8 @@ class DAGPattern(AgentPattern):
     ) -> None:
         """Re-emit the instruction message of a checkpoint-restored step.
 
-        The instruction bakes the output language policy into message content,
-        which the metadata-only checkpoint migration cannot reach.
+        Older checkpoints can bake an output-language policy into message
+        content, which the metadata-only checkpoint migration cannot reach.
         """
         instruction = self._step_instruction(root_context=root_context, step=step)
         for index, message in enumerate(child_context.messages):

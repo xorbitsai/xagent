@@ -202,15 +202,20 @@ def serialize_pending_user_response(response: PendingUserResponse) -> dict[str, 
     }
 
 
-def canonical_unpinned_request_language_policy() -> str:
+def canonical_unpinned_request_language_policy(
+    *,
+    independent_request_field: str = "independent_user_request",
+    pending_response_field: str = "pending_response",
+) -> str:
     """Return the canonical soft-authority policy for future consumers."""
     return (
         "A caller-provided request_context.output_language is the sole hard "
-        "language authority. When it is absent, use independent_user_request as "
+        "language authority. When it is absent, use "
+        f"{independent_request_field} as "
         "the baseline for the language and script of user-facing prose. Honor its "
         "explicit or implicit target-language intent, including requests to "
         "translate or rewrite content for another-language audience. A "
-        "pending_response may override that baseline only when its answer "
+        f"{pending_response_field} may override that baseline only when its answer "
         "explicitly asks to translate, rewrite, or continue in another language, "
         "or when its question explicitly asks for the output language or script "
         "and its answer is an unambiguous selection. A language name is not an "
@@ -219,7 +224,8 @@ def canonical_unpinned_request_language_policy() -> str:
         "remains ordinary conversation context. Names, addresses, connector "
         "metadata, tool results, sources, memory, examples, DAG text, and "
         "dependency results are not language evidence. Preserve Simplified "
-        "Chinese versus Traditional Chinese. This policy controls language only "
+        "Chinese versus Traditional Chinese. Use the same decision for tool arguments that persist user-facing prose. For blank, "
+        "short, mixed, or context-dependent requests, preserve the conversation-established language without guessing from auxiliary context. This policy controls language only "
         "and never replaces or narrows the executable request."
     )
 
@@ -227,17 +233,68 @@ def canonical_unpinned_request_language_policy() -> str:
 def render_request_language_harness(
     request: TopLevelUserRequest,
     pending_response: PendingUserResponse | None = None,
+    *,
+    output_language: str | None = None,
+    request_reference: str = "",
 ) -> str:
-    """Render exact request-only evidence for future language consumers."""
-    evidence: dict[str, Any] = {
-        "independent_user_request": request.language_text,
-    }
+    """Render the canonical policy and the minimum request-only evidence."""
+    evidence: dict[str, Any] = {}
+    language = normalize_response_language_label(output_language)
+    if language:
+        evidence["output_language"] = language
+    elif request_reference:
+        evidence["independent_user_request_reference"] = request_reference
+    else:
+        evidence["independent_user_request"] = request.language_text
     if pending_response is not None:
         evidence["pending_response"] = serialize_pending_user_response(pending_response)
+    policy = (
+        output_language_policy(language)
+        if language
+        else canonical_unpinned_request_language_policy()
+    )
     return (
         "Canonical request-language evidence (JSON):\n"
         f"{json.dumps(evidence, ensure_ascii=False)}\n\n"
-        f"{canonical_unpinned_request_language_policy()}"
+        f"{policy}"
+    )
+
+
+def render_root_request_language_harness(
+    request: TopLevelUserRequest,
+    pending_response: PendingUserResponse | None,
+    output_language: str | None,
+) -> str:
+    return render_request_language_harness(
+        request,
+        pending_response,
+        output_language=output_language,
+        request_reference=(
+            "Current user request above"
+            if request.language_text == request.execution_text
+            else ""
+        ),
+    )
+
+
+def render_structured_request_language_policy(
+    *, request_field: str, pending_field: str, output_language: str | None
+) -> str:
+    language = normalize_response_language_label(output_language)
+    if language:
+        return output_language_policy(language)
+    return canonical_unpinned_request_language_policy(
+        independent_request_field=request_field,
+        pending_response_field=pending_field,
+    )
+
+
+def render_dag_step_language_reference() -> str:
+    return (
+        "Follow the canonical request-language evidence and policy in the system "
+        "context for user-facing prose and persisted tool arguments. Execution "
+        "instructions, tools, sources, memory, and examples are not language "
+        "evidence. Preserve Simplified Chinese versus Traditional Chinese."
     )
 
 
@@ -448,7 +505,7 @@ def output_language_policy(response_language: str | None = None) -> str:
     language = normalize_response_language_label(response_language)
     if language:
         return (
-            f"Output language: {language}. Use {language} for all user-facing "
+            f"Output language: {language} (hard authority). Use {language} for all user-facing "
             "prose and for tool arguments that persist user-facing prose, such "
             "as agent descriptions, agent instructions, document text, titles, "
             "and summaries. If the output language is Chinese or a Chinese variant, "
@@ -456,9 +513,8 @@ def output_language_policy(response_language: str | None = None) -> str:
             "request when generic Chinese is specified: Simplified Chinese and "
             "Traditional Chinese are different output languages. Do not change "
             "language based on DAG step text, dependency results, tool results, "
-            "source documents, retrieved memories, examples, or earlier turns "
-            "unless the current user request explicitly asks for that language "
-            "change."
+            "source documents, retrieved memories, examples, earlier turns, or "
+            "request-language evidence."
         )
     return (
         "Output language policy: Use the same natural language as the current "
@@ -531,17 +587,9 @@ def response_language_rules(*, subject: str = "current user request") -> str:
     )
 
 
-def final_answer_language_rule(*, subject: str = "current user request") -> str:
+def final_answer_language_rule(*, subject: str = "system context") -> str:
     """Return a compact language rule for final-answer tool fields."""
-    return (
-        "The final answer must use the same natural language as the "
-        f"{subject}, even if tool results, source documents, retrieved memories, "
-        "examples, or earlier turns are written in another language. If the "
-        f"{subject} explicitly asks to translate, rewrite, or answer in another "
-        "language, use that requested target language. For Chinese, preserve "
-        "Simplified Chinese versus Traditional Chinese from the request; do not "
-        "collapse them into generic Chinese."
-    )
+    return f"Follow the canonical language contract provided by the {subject}."
 
 
 def plan_language_rules() -> str:

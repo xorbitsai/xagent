@@ -66,6 +66,44 @@ def terminal_event_draft_for_error(
     return draft if isinstance(draft, TerminalTaskEventDraft) else None
 
 
+# Wording for a first-party MESSAGE command that reached a terminal
+# disposition after the sender's reply was durably accepted. The sentence
+# pair matches ``external_task_input.external_input_terminal_message``, but
+# the proof rule is narrower, not a mirror: the external helper also treats
+# ``TaskCommandRejected`` as proven non-application, while this one reads
+# only ``draft.resend_safe`` -- which stays ``False`` for rejections --
+# because first-party MESSAGE rejections keep their handler-owned
+# notification and never reach this broadcast. Whoever wires that broadcast
+# up later must widen the proof rule here, or a provably-unapplied
+# rejection would be reported as unconfirmed. The categorical "not applied"
+# sentence is reserved for outcomes whose draft proves non-application, and
+# every other terminal gets the sentence that asserts only uncertainty,
+# because a worker may have injected the message before crashing and the
+# reclaiming attempt cannot know.
+FIRST_PARTY_MESSAGE_NOT_APPLIED_MESSAGE = (
+    "This message was not applied to the task. It is safe to send it again."
+)
+FIRST_PARTY_MESSAGE_UNCONFIRMED_MESSAGE = (
+    "We could not confirm whether this message was applied to the task. "
+    "Review the conversation before sending it again."
+)
+
+
+def first_party_message_terminal_text(draft: TerminalTaskEventDraft | None) -> str:
+    """Wording for a terminal first-party MESSAGE outcome, by what is provable.
+
+    Deriving from the draft rather than the exception keeps the sentence
+    aligned with the persisted terminal event: ``resend_safe`` is set only
+    when the failed handoff proved the command never reached the downstream
+    operation. A missing draft yields the uncertain sentence, the safe
+    direction for a duplicate-send decision.
+    """
+
+    if draft is not None and draft.resend_safe:
+        return FIRST_PARTY_MESSAGE_NOT_APPLIED_MESSAGE
+    return FIRST_PARTY_MESSAGE_UNCONFIRMED_MESSAGE
+
+
 def stage_terminal_event(
     db: Session,
     *,

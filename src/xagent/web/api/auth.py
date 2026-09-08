@@ -44,6 +44,7 @@ from ..auth_config import (
     REFRESH_TOKEN_EXPIRE_DAYS,
 )
 from ..auth_dependencies import get_current_user
+from ..first_admin_setup import FirstAdminIdentity, run_first_admin_setup_hook
 from ..models.actor_oauth_flow import ActorOAuthFlowState
 from ..models.database import (
     get_db,
@@ -1276,7 +1277,9 @@ async def setup_status(db: Session = Depends(get_db)) -> SetupStatusResponse:
 
 @auth_router.post("/setup-admin", response_model=RegisterResponse)
 async def setup_admin(
-    request: RegisterRequest, db: Session = Depends(get_db)
+    request: RegisterRequest,
+    http_request: Request,
+    db: Session = Depends(get_db),
 ) -> RegisterResponse:
     if len(request.password) < PASSWORD_MIN_LENGTH:
         return RegisterResponse(
@@ -1322,11 +1325,17 @@ async def setup_admin(
         setup_setting = SystemSetting(key=SETUP_COMPLETED_SETTING_KEY, value="true")
         db.add(setup_setting)
 
+        run_first_admin_setup_hook(
+            http_request.app, db, FirstAdminIdentity(user_id=int(user.id))
+        )
         db.commit()
         db.refresh(user)
     except IntegrityError:
         db.rollback()
         return RegisterResponse(success=False, message="Setup already completed")
+    except Exception:
+        db.rollback()
+        raise
 
     return RegisterResponse(
         success=True,
@@ -2142,9 +2151,14 @@ def _actor_oauth_cookie_name(nonce: str) -> str:
 
 
 def is_actor_oauth_cookie_header(value: str) -> bool:
-    """Accept only a Set-Cookie header for an actor OAuth flow."""
-    name, separator, _rest = value.partition("=")
-    return separator == "=" and name.strip().startswith(_ACTOR_OAUTH_COOKIE_PREFIX)
+    """Accept only a non-empty Set-Cookie header for an actor OAuth flow."""
+    name, separator, rest = value.partition("=")
+    cookie_value = rest.partition(";")[0].strip()
+    return (
+        separator == "="
+        and name.strip().startswith(_ACTOR_OAUTH_COOKIE_PREFIX)
+        and bool(cookie_value)
+    )
 
 
 def _actor_oauth_cookie_scope(provider: str, db_provider: Any) -> tuple[bool, str]:

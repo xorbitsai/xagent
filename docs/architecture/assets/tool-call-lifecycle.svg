@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="640" viewBox="0 0 1200 640">
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10" fill="#66758a"/></marker></defs>
+<rect width="1200" height="640" rx="20" fill="#f5f7fb"/>
+<g font-family="PingFang SC, Heiti SC, sans-serif" fill="#20324c" text-anchor="middle">
+<text x="600" y="49" font-size="28" font-weight="600">阶段 A：统一调用边界，保留现有行为</text>
+<rect x="30" y="78" width="550" height="475" rx="16" fill="white" stroke="#dae1eb"/>
+<rect x="620" y="78" width="550" height="475" rx="16" fill="white" stroke="#dae1eb"/>
+<text x="305" y="116" font-size="22" font-weight="600">现状：调度分支决定生命周期路径</text>
+<text x="895" y="116" font-size="22" font-weight="600">目标：每次实际执行经过公共边界</text>
+<g fill="#eef2f8" stroke="#bac7d9">
+<rect x="165" y="146" width="280" height="55" rx="9"/>
+<rect x="65" y="252" width="230" height="95" rx="9"/>
+<rect x="320" y="252" width="225" height="95" rx="9" fill="#fff1e9" stroke="#e2a174"/>
+<rect x="755" y="146" width="280" height="55" rx="9"/>
+<rect x="690" y="230" width="410" height="70" rx="9" fill="#e8f2ff" stroke="#6597d8"/>
+<rect x="652" y="347" width="230" height="79" rx="9"/>
+<rect x="909" y="347" width="230" height="79" rx="9"/>
+</g>
+<g font-size="18">
+<text x="305" y="181">现有分段调度</text>
+<text x="180" y="286">普通工具包装</text><text x="180" y="316" font-size="16">上下文 / 生命周期 / 观测</text>
+<text x="432" y="286">控制处理器</text><text x="432" y="316" font-size="16">直接发送 / 等待 / 收尾</text>
+<text x="895" y="181">现有分段调度</text>
+<text x="895" y="258">公共调用入口</text><text x="895" y="283" font-size="16">共同上下文准备与生命周期记录</text>
+<text x="767" y="379">普通工具行为</text><text x="767" y="407" font-size="16">保留 Trace、计费与错误转换</text>
+<text x="1024" y="379">控制工具行为</text><text x="1024" y="407" font-size="16">保留发送、等待与答案策略</text>
+<text x="305" y="405" fill="#a4522b">共同职责分散，控制调用绕过普通入口</text>
+<text x="305" y="454" font-size="16">不能直接补普通回调：</text><text x="305" y="482" font-size="16">会改变控制工具的计费与展示</text>
+<text x="895" y="478" font-size="18">沿用现有结果回填、pending 与 checkpoint</text>
+<text x="895" y="513" font-size="16" fill="#52647c">来源随调用显式传递，保持并发隔离</text>
+</g>
+<g fill="none" stroke="#66758a" stroke-width="2" marker-end="url(#arrow)">
+<path d="M305 201V223H180V250"/><path d="M305 223H432V250"/>
+<path d="M895 201V227"/><path d="M895 300V320H767V344"/><path d="M895 320H1024V344"/>
+<path d="M767 426V443H895V455"/><path d="M1024 426V443H895"/>
+</g>
+<text x="600" y="592" font-size="18" fill="#52647c">本阶段不新增通用结果类型、消息意图体系、持久化身份制度或恢复框架</text>
+</g></svg>

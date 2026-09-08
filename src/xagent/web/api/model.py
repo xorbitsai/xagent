@@ -31,6 +31,7 @@ from xagent.core.model.model import (
     VideoModelConfig,
 )
 from xagent.core.model.providers import (
+    ROUTER_PROVIDER,
     canonical_provider_name,
     default_base_url_for_provider,
     is_auto_router_model,
@@ -39,18 +40,29 @@ from xagent.core.model.providers import (
 from xagent.core.utils.security import redact_sensitive_text
 
 from ..auth_dependencies import get_current_user
+from ..models.auto_model import AutoModelCandidate, AutoModelConfig
 from ..models.database import get_db
 from ..models.model import Model as DBModel
 from ..models.user import User, UserDefaultModel, UserModel
 from ..schemas.model import (
+    AutoModelConfigResponse,
+    AutoModelConfigUpdate,
     ModelConnectionTestRequest,
     ModelCreate,
     ModelTestRequest,
     ModelTestResponse,
     ModelUpdate,
     ModelWithAccessInfo,
+    RouterProfileResponse,
     UserDefaultModelCreate,
     UserDefaultModelResponse,
+)
+from ..services.auto_model_service import (
+    AutoModelConfigurationError,
+    AutoModelDependencyError,
+    AutoModelService,
+    is_reserved_auto_router_model_id,
+    list_router_profiles,
 )
 from ..services.llm_utils import (
     PLATFORM_MODEL_MANAGER,
@@ -317,6 +329,11 @@ async def _read_transcribe_upload_with_size_limit(file: UploadFile) -> bytes:
 def _validate_provider_model_name(provider: str, model_name: str) -> None:
     """Validate provider-specific curated model names before saving."""
 
+    if canonical_provider_name(provider) == ROUTER_PROVIDER:
+        raise HTTPException(
+            status_code=400,
+            detail="The router provider is managed through the Auto configuration.",
+        )
     if canonical_provider_name(provider) != "deepseek":
         return
 
@@ -445,6 +462,11 @@ async def create_model(
         raise HTTPException(
             status_code=403,
             detail="Model IDs beginning with 'platform/' are reserved",
+        )
+    if is_reserved_auto_router_model_id(model.model_id):
+        raise HTTPException(
+            status_code=403,
+            detail="Model IDs beginning with 'auto-router-' are reserved",
         )
 
     # Check if model_id already exists
@@ -646,6 +668,60 @@ async def list_models(
         category=category,
         is_active=is_active,
     )
+
+
+@model_router.get("/auto-config/profiles", response_model=List[RouterProfileResponse])
+async def get_auto_model_profiles(
+    _user: User = Depends(get_current_user),
+) -> List[RouterProfileResponse]:
+    """List xrouter profiles that saved LLM configurations can bind to."""
+
+    try:
+        return [
+            RouterProfileResponse.model_validate(profile)
+            for profile in list_router_profiles()
+        ]
+    except AutoModelDependencyError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@model_router.get("/auto-config", response_model=AutoModelConfigResponse)
+async def get_auto_model_config(
+    db: Session = Depends(get_db), user: User = Depends(get_current_user)
+) -> AutoModelConfigResponse:
+    """Get the current user's fixed Auto model configuration."""
+
+    service = AutoModelService(db)
+    try:
+        return AutoModelConfigResponse.model_validate(
+            service.serialize_config(
+                service.get_config(int(user.id)), user_id=int(user.id)
+            )
+        )
+    except AutoModelConfigurationError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@model_router.put("/auto-config", response_model=AutoModelConfigResponse)
+async def update_auto_model_config(
+    request: AutoModelConfigUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> AutoModelConfigResponse:
+    """Create or replace the current user's fixed Auto model configuration."""
+
+    service = AutoModelService(db)
+    try:
+        config = service.upsert_config(user_id=int(user.id), request=request)
+        return AutoModelConfigResponse.model_validate(
+            service.serialize_config(config, user_id=int(user.id))
+        )
+    except AutoModelDependencyError as exc:
+        db.rollback()
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except AutoModelConfigurationError as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @model_router.get("/user-default")
@@ -1088,6 +1164,7 @@ async def test_models(
             .filter(
                 DBModel.model_id.in_(test_request.model_ids),
                 DBModel.is_active,
+                DBModel.model_provider != ROUTER_PROVIDER,
                 build_user_model_visibility_filter(int(user.id), visible_ids),
             )
             .all()
@@ -1099,6 +1176,7 @@ async def test_models(
             .join(UserModel, DBModel.id == UserModel.model_id)
             .filter(
                 DBModel.is_active,
+                DBModel.model_provider != ROUTER_PROVIDER,
                 build_user_model_visibility_filter(int(user.id), visible_ids),
             )
             .all()
@@ -1953,6 +2031,62 @@ async def update_model(
     effective_provider = update_data.get("model_provider", db_model.model_provider)
     effective_model_name = update_data.get("model_name", db_model.model_name)
     _validate_provider_model_name(effective_provider, effective_model_name)
+    effective_category = update_data.get("category", db_model.category)
+    identity_changed = any(
+        field in update_data and update_data[field] != getattr(db_model, field)
+        for field in ("model_provider", "model_name", "base_url")
+    )
+    incompatible_with_auto = (
+        identity_changed
+        or effective_category != "llm"
+        or is_auto_router_model(effective_provider, effective_model_name)
+    )
+    if incompatible_with_auto:
+        own_auto_reference = (
+            db.query(AutoModelCandidate.id)
+            .join(
+                AutoModelConfig,
+                AutoModelConfig.id == AutoModelCandidate.config_id,
+            )
+            .filter(
+                AutoModelCandidate.target_model_id == db_model.id,
+                AutoModelConfig.user_id == int(user.id),
+            )
+            .first()
+        )
+        if own_auto_reference is not None:
+            raise HTTPException(
+                409,
+                detail="Remove this model from your Auto configuration before changing its identity or category.",
+            )
+        model_store.prune_external_auto_references(
+            model_id=int(db_model.id),
+            owner_user_id=int(user.id),
+        )
+
+    auto_candidates = (
+        db.query(AutoModelCandidate)
+        .filter(AutoModelCandidate.target_model_id == db_model.id)
+        .all()
+    )
+    if auto_candidates and "abilities" in update_data:
+        from ..services.auto_model_service import (
+            load_router_profile_catalog,
+            validate_candidate_modalities,
+        )
+
+        try:
+            catalog = load_router_profile_catalog()
+            for candidate in auto_candidates:
+                validate_candidate_modalities(
+                    catalog,
+                    str(candidate.routing_model_id),
+                    update_data["abilities"] or [],
+                )
+        except AutoModelConfigurationError as exc:
+            raise HTTPException(409, detail=str(exc)) from exc
+        except AutoModelDependencyError as exc:
+            raise HTTPException(503, detail=str(exc)) from exc
 
     for field, value in update_data.items():
         # Don't update api_key with empty string
@@ -1964,6 +2098,11 @@ async def update_model(
         # Only set fields that exist on the model
         if hasattr(db_model, field):
             setattr(db_model, field, value)
+
+    if auto_candidates:
+        model_store.refresh_auto_model_abilities(
+            [int(candidate.config_id) for candidate in auto_candidates]
+        )
 
     if share_with_users is not None:
         try:
@@ -2026,7 +2165,31 @@ async def delete_model(
             detail="Cannot delete: you have this model as your default. Change default first.",
         )
 
-    ModelStore(db).delete_model(model_storage=model_storage, user_model=user_model)
+    auto_references = (
+        db.query(AutoModelCandidate)
+        .join(
+            AutoModelConfig,
+            AutoModelConfig.id == AutoModelCandidate.config_id,
+        )
+        .filter(
+            AutoModelCandidate.target_model_id == user_model.model.id,
+            AutoModelConfig.user_id == int(user.id),
+        )
+        .count()
+    )
+    if auto_references > 0:
+        raise HTTPException(
+            409,
+            detail="Cannot delete: this model is used by an Auto configuration.",
+        )
+
+    model_store = ModelStore(db)
+    model_store.prune_external_auto_references(
+        model_id=int(user_model.model.id),
+        owner_user_id=int(user.id),
+    )
+
+    model_store.delete_model(model_storage=model_storage, user_model=user_model)
 
     return {"message": "Model deleted successfully"}
 

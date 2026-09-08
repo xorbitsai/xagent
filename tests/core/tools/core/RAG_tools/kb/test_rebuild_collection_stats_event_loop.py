@@ -21,7 +21,6 @@ from xagent.core.tools.core.RAG_tools.management import (
 )
 
 BLOCKING_SECONDS = 0.5
-HEARTBEAT_INTERVAL = 0.02
 COLLECTION_NAME = "stats_rebuild_event_loop"
 
 
@@ -75,30 +74,36 @@ def slow_vector_store(monkeypatch: pytest.MonkeyPatch) -> _SlowVectorStore:
 
 async def test_rebuild_collection_stats_keeps_event_loop_responsive(
     slow_vector_store: _SlowVectorStore,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Given a slow aggregation, the stats rebuild leaves the loop responsive."""
-    ticks = 0
+    """The loop must resume while aggregation is parked on a worker."""
+    entered = threading.Event()
+    release = threading.Event()
+    loop_thread = threading.get_ident()
+    original = slow_vector_store.aggregate_collection_stats
 
-    async def heartbeat() -> None:
-        nonlocal ticks
-        while True:
-            await asyncio.sleep(HEARTBEAT_INTERVAL)
-            ticks += 1
+    def blocked_aggregate(**kwargs):
+        entered.set()
+        assert threading.get_ident() != loop_thread
+        assert release.wait(timeout=30), "aggregation was never released"
+        return original(**kwargs)
 
-    beat = asyncio.create_task(heartbeat())
+    monkeypatch.setattr(
+        slow_vector_store, "aggregate_collection_stats", blocked_aggregate
+    )
+    rebuild = asyncio.create_task(
+        collection_manager_module._rebuild_collection_stats_impl(COLLECTION_NAME)
+    )
     try:
-        rebuilt = await collection_manager_module._rebuild_collection_stats_impl(
-            COLLECTION_NAME
-        )
+        assert await asyncio.to_thread(entered.wait, 30)
+        assert not rebuild.done()
     finally:
-        beat.cancel()
+        release.set()
+        rebuilt = await asyncio.wait_for(rebuild, timeout=30)
 
     assert rebuilt is not None
     assert rebuilt.documents == 2
     assert rebuilt.chunks == 4
-    # A 0.5s blocking call: a responsive loop ticks tens of times. Held on the
-    # event loop thread it manages one or two.
-    assert ticks >= 15, f"event loop was blocked, only {ticks} ticks"
 
 
 async def test_rebuild_collection_stats_aggregates_off_the_event_loop(

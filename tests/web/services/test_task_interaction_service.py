@@ -144,7 +144,6 @@ from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.models.user import User
 from xagent.web.services import task_interaction_service as svc
 from xagent.web.services.ops_signals import (
-    CHECKPOINT_LOAD_UNAVAILABLE,
     CHECKPOINT_PK_ANCHOR_DANGLING,
     INTERACTION_READ_PAYLOAD_UNREADABLE,
     INTERACTION_READ_PROTOCOL_UNRECOGNIZED,
@@ -155,26 +154,27 @@ from xagent.web.services.task_clarification_draft import CLARIFICATION_REQUEST_T
 from xagent.web.services.task_interaction_staging import InteractionAnchor
 from xagent.web.services.task_lease_service import TASK_RUN_ID_TRACE_FIELD, TaskLease
 
-_DEGRADATION_SIGNALS_UNDER_TEST = (
-    CHECKPOINT_PK_ANCHOR_DANGLING,
-    CHECKPOINT_LOAD_UNAVAILABLE,
-    INTERACTION_READ_PROTOCOL_UNRECOGNIZED,
-    INTERACTION_READ_PAYLOAD_UNREADABLE,
-)
-
 
 @pytest.fixture(autouse=True)
 def _clean_degradation_registry():
-    """The anchor resolver and materialize_compatibility_view register
-    process-global degradation signals on their failure paths; clear this
-    module's four signals around every test so they cannot leak into tests
-    that read the shared registry (the /health suite asserts exact
-    payloads and fails on any leftover entry)."""
-    for signal in _DEGRADATION_SIGNALS_UNDER_TEST:
-        clear_degradation(signal)
+    """Clear the whole process-global registry around every test, the same
+    way every other interaction suite's fixture does.
+
+    A named subset is not enough here. Besides the anchor resolver and
+    materialize_compatibility_view, tests in this module drive create()
+    into ``interaction_handoff``'s swallow path, which registers
+    ``INTERACTION_HANDOFF_DEGRADED`` and
+    ``INTERACTION_RUN_PARTITION_MISMATCH_DEGRADED`` -- the two signals with
+    no ``clear_degradation()`` call anywhere in production code, so nothing
+    else ever takes them back out of the registry. Whatever this module
+    leaves behind leaks into whichever module xdist schedules next on the
+    same worker, and the /health suite asserts an exact payload.
+    """
+    for name in list(active_degradations()):
+        clear_degradation(name)
     yield
-    for signal in _DEGRADATION_SIGNALS_UNDER_TEST:
-        clear_degradation(signal)
+    for name in list(active_degradations()):
+        clear_degradation(name)
 
 
 # ---------------------------------------------------------------------------
@@ -1750,8 +1750,6 @@ def test_unrecognized_protocol_version_raises_the_ops_signal_and_a_warning(
     ):
         svc.materialize_compatibility_view(_db, _seeded_task)
 
-    from xagent.web.services.ops_signals import INTERACTION_READ_PROTOCOL_UNRECOGNIZED
-
     assert INTERACTION_READ_PROTOCOL_UNRECOGNIZED in active_degradations()
     assert any(record.levelno == logging.WARNING for record in caplog.records)
 
@@ -1774,8 +1772,6 @@ def test_unreadable_payload_raises_the_ops_signal_and_a_warning(
         logging.WARNING, logger="xagent.web.services.task_interaction_service"
     ):
         svc.materialize_compatibility_view(_db, _seeded_task)
-
-    from xagent.web.services.ops_signals import INTERACTION_READ_PAYLOAD_UNREADABLE
 
     assert INTERACTION_READ_PAYLOAD_UNREADABLE in active_degradations()
     assert any(record.levelno == logging.WARNING for record in caplog.records)

@@ -31,7 +31,12 @@ from xagent.core.agent.language import (
     response_language_rules,
 )
 from xagent.core.agent.utils.context_builder import ContextBuilder
-from xagent.core.context_ref import CONTEXT_REFS_KEY, SUPERSEDES_SCOPE_KEY
+from xagent.core.context_ref import (
+    CONTEXT_REFS_KEY,
+    SUPERSEDES_SCOPE_KEY,
+    ContextReference,
+    ImageDetail,
+)
 from xagent.core.model.chat.types import (
     CONTENT_SOURCE_KEY,
     CONTENT_SOURCE_REASONING_FALLBACK,
@@ -265,9 +270,9 @@ def test_system_context_preserves_current_request_language_over_memory() -> None
 
     assert "Current user request:" in system_message
     assert "Can you analyze this GitHub project?" in system_message
-    assert "Response language rules" in system_message
-    assert "Use the same natural language as the current user request" in system_message
-    assert "Do not let retrieved memories" in system_message
+    assert "Canonical request-language evidence" in system_message
+    assert "sole hard language authority" in system_message
+    assert "memory" in system_message
 
 
 def test_system_context_includes_file_reference_output_spec() -> None:
@@ -426,7 +431,7 @@ def test_system_context_ignores_waiting_for_user_answer_as_current_request() -> 
     assert "Current user request:\nBook a trip" in system_message
     assert "Current user request:\n北京" not in system_message
     assert "answer to a pending agent question" in waiting_answer_message
-    assert "User answer: 北京" in waiting_answer_message
+    assert waiting_answer_message.endswith("北京")
 
 
 def test_dag_step_system_context_uses_output_language_policy() -> None:
@@ -443,15 +448,14 @@ def test_dag_step_system_context_uses_output_language_policy() -> None:
 
     system_message = ctx.get_messages_for_llm()[0]["content"]
 
-    assert "Step language rules" in system_message
+    assert "Canonical request-language evidence" in system_message
     assert "Output language: English" in system_message
     assert (
-        "Follow the output language policy for all user-facing prose, this "
-        "step's final_answer, and tool arguments"
+        "Follow the canonical request-language evidence and policy"
     ) in system_message
     assert "## FILE REFERENCE OUTPUTS" in system_message
-    assert "do not treat their language as authorization" in system_message
-    assert "Do not let DAG step text, dependency results" in system_message
+    assert "DAG step text" in system_message
+    assert "not language evidence" in system_message
 
 
 def test_context_builder_step_prompt_includes_file_reference_output_spec() -> None:
@@ -802,6 +806,7 @@ def test_get_messages_for_llm_uses_compact_dag_output_language_policy() -> None:
     assert "Current user request, quoted for response language only:" not in (
         system_content
     )
+    assert '"output_language": "English"' in system_content
     assert "Create two posters." not in system_content
     assert "Only execute the current DAG step" in system_content
     assert [message["role"] for message in result].count("system") == 1
@@ -816,9 +821,9 @@ def test_dag_step_without_output_language_quotes_the_request_for_language() -> N
 
     system_content = ctx.get_messages_for_llm()[0]["content"]
 
-    assert "Current user request, quoted for response language only:" in system_content
+    assert '"independent_user_request": "Crée deux affiches."' in system_content
     assert "Crée deux affiches." in system_content
-    assert "Response language rules:" in system_content
+    assert "sole hard language authority" in system_content
     assert "Output language:" not in system_content
 
 
@@ -848,11 +853,9 @@ def test_dag_step_language_quote_uses_the_typed_message() -> None:
     )
 
     system_content = ctx.get_messages_for_llm()[0]["content"]
-    quote = system_content.split(
-        "Current user request, quoted for response language only:\n"
-    )[1]
+    quote = system_content.split("Canonical request-language evidence (JSON):\n")[1]
 
-    assert quote.startswith(typed)
+    assert f'"independent_user_request": "{typed}"' in quote
     assert "Attached file(s)" not in quote
 
 
@@ -1681,6 +1684,63 @@ def test_token_estimate_falls_back_when_history_is_rewritten() -> None:
     assert ctx._get_total_tokens() == max(1, len("rewritten") // 4)
 
 
+def test_provider_estimate_drives_compaction_with_dynamic_system_prompt() -> None:
+    ctx = ExecutionContext(system_prompt="S" * 3_600)
+    ctx.add_user_message("x")
+    rendered = ctx.get_messages_for_llm()
+    rendered_tokens = ctx.estimate_context_tokens(rendered)
+    assert rendered_tokens > ctx._get_total_tokens() + 800
+
+    ctx.compact_config.threshold = rendered_tokens - 1
+    request = ctx.build_llm_compact_request_if_needed()
+
+    assert request is not None
+    assert request["original_tokens"] == rendered_tokens
+
+
+def test_provider_estimate_counts_context_refs_and_tool_call_arguments() -> None:
+    reference = ContextReference(
+        file_ref={
+            "file_id": "image-1",
+            "filename": "frame.png",
+            "mime_type": "image/png",
+        },
+        detail=ImageDetail.LOW,
+    )
+    ctx = ExecutionContext()
+    with_ref = [
+        {
+            "role": "user",
+            "content": "inspect",
+            CONTEXT_REFS_KEY: [reference.durable_dict()],
+        }
+    ]
+    without_ref = [{"role": "user", "content": "inspect"}]
+    assert ctx.estimate_context_tokens(with_ref) >= (
+        ctx.estimate_context_tokens(without_ref) + reference.estimated_tokens()
+    )
+
+    long_call = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"function": {"name": "write_file", "arguments": "x" * 1_000}}
+            ],
+        }
+    ]
+    short_call = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"function": {"name": "write_file", "arguments": ""}}],
+        }
+    ]
+    assert ctx.estimate_context_tokens(long_call) > (
+        ctx.estimate_context_tokens(short_call) + 200
+    )
+
+
 def test_serialization_roundtrip() -> None:
     ctx = ExecutionContext()
     ctx.execution_id = "task-x"
@@ -1999,6 +2059,15 @@ def _context_over_threshold(threshold: int) -> ExecutionContext:
     ctx = ExecutionContext()
     ctx.compact_config.threshold = threshold
     ctx.add_user_message("current request")
+    ctx.add_assistant_message(
+        "",
+        tool_calls=[
+            {
+                "id": "call-1",
+                "function": {"name": "read_file", "arguments": "{}"},
+            }
+        ],
+    )
     # Token estimation is chars//4, so this clears the threshold and makes the
     # request materialize.
     ctx.add_tool_result(

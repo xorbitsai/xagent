@@ -359,6 +359,7 @@ async def test_a_broken_collection_object_cannot_escape_into_the_gather(
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(30)
 async def test_a_stuck_collection_times_out_without_holding_the_batch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -369,19 +370,15 @@ async def test_a_stuck_collection_times_out_without_holding_the_batch(
 
     def search(*, collection: str, **_kwargs: Any) -> SearchPipelineResult:
         if collection == "stuck":
-            release.wait(10)
+            release.wait()
         return _pipeline_result(collection)
 
     monkeypatch.setattr(document_search, "run_document_search", search)
 
-    started = time.perf_counter()
     try:
         result = await document_search._search_knowledge_base_impl(_args(), user_id=1)
     finally:
         release.set()
-    elapsed = time.perf_counter() - started
-
-    assert elapsed < 5
     assert [entry.collection for entry in result.results] == ["fast"]
     assert "stuck: search timed out after 0.2s" in result.summary
 

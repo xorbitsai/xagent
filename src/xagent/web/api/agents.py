@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 from ...config import get_agent_pattern_for_execution_mode, get_uploads_dir
 from ...core.agent.language import (
     detect_prose_script_mismatch,
-    response_language_rules,
+    render_structured_request_language_policy,
 )
 from ...core.agent.service import AgentService
 from ...core.agent.voice_policy import _VOICE_INSTRUCTIONS as _core_voice_instructions
@@ -63,7 +63,8 @@ from ..services.agent_team_scope import (
     owned_agent_clause,
 )
 from ..services.api_keys import AgentApiKeyService, KeyRotationConflict
-from ..services.llm_utils import UserAwareModelStorage
+from ..services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
+from ..services.llm_utils import AutoModelUnavailableError, UserAwareModelStorage
 from ..services.workforce_access import get_visible_agent_ids
 from ..tools.config import WebToolConfig
 from ..user_isolated_memory import UserContext
@@ -560,12 +561,13 @@ async def optimize_instructions(
             "Your task is to refine and optimize the user's draft instructions for an AI agent. "
             "The output should be clear, structured, and effective for an LLM to follow. "
             "Do not include any conversational filler. Just output the optimized instructions. "
-            "Preserve the draft's natural language and Chinese script; do not switch languages "
-            "because the surrounding API prompt is written in English. "
-            f"{response_language_rules(subject='draft instructions')}"
+            "Use draft_instructions as the independent user request. "
+            "The surrounding API prompt is written in English only as an execution "
+            "environment; it is not language evidence for the optimized instructions. "
+            f"{render_structured_request_language_policy(request_field='draft_instructions', pending_field='pending_response', output_language=None)}"
         )
 
-        user_prompt = f"Draft instructions:\n{request.instructions}\n\nPlease optimize these instructions."
+        user_prompt = f"draft_instructions:\n{request.instructions}"
 
         # Call LLM
         response = await llm.chat(
@@ -592,6 +594,8 @@ async def optimize_instructions(
 
         return {"optimized_instructions": content}
 
+    except AutoModelUnavailableError as exc:
+        raise HTTPException(409, detail=CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE) from exc
     except Exception as e:
         logger.error(f"Failed to optimize instructions: {e}")
         raise HTTPException(status_code=500, detail=str(e))

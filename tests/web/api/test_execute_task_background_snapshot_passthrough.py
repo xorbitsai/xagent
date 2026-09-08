@@ -23,7 +23,6 @@ import asyncio
 import logging
 import threading
 from collections import Counter
-from time import monotonic
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -33,6 +32,11 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import QueuePool
 
+from tests.web.pool_contention_shared import (
+    GUARD_TIMEOUT,
+    LOOP_LIVENESS_TICKS,
+    wait_for_ticks,
+)
 from xagent.web.api.websocket import execute_task_background
 from xagent.web.models.agent import AgentStatus
 from xagent.web.models.task import Task, TaskStatus
@@ -456,16 +460,19 @@ async def test_snapshot_execution_start_stays_responsive_with_exhausted_pool(
         get_agent_for_task=AsyncMock(side_effect=blocked_get_agent)
     )
 
+    checkout = MagicMock(
+        side_effect=AssertionError("snapshot handoff checked out a connection")
+    )
     with _Patches(
         [
             *_common_patches(db, MagicMock()),
+            patch.object(engine.pool, "_do_get", checkout),
             patch(
                 "xagent.web.api.websocket._terminal_task_error_payload",
                 return_value=None,
             ),
         ]
     ):
-        started = monotonic()
         execution_task = asyncio.create_task(
             execute_task_background(
                 task_id=42,
@@ -479,14 +486,10 @@ async def test_snapshot_execution_start_stays_responsive_with_exhausted_pool(
         )
         ticker_task = asyncio.create_task(ticker())
         try:
-            await asyncio.wait_for(manager_entered.wait(), timeout=0.4)
-            elapsed = monotonic() - started
-            await asyncio.sleep(0.04)
-            assert elapsed < 0.15, (
-                "Snapshot handoff waited for the exhausted request pool; "
-                f"manager reached after {elapsed:.3f}s."
-            )
-            assert ticks >= 3, f"Event-loop ticker advanced only {ticks} time(s)."
+            await asyncio.wait_for(manager_entered.wait(), timeout=GUARD_TIMEOUT)
+            observed = await wait_for_ticks(lambda: ticks)
+            assert observed >= LOOP_LIVENESS_TICKS
+            checkout.assert_not_called()
         finally:
             release_manager.set()
             ticker_stop.set()

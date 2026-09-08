@@ -78,6 +78,8 @@ from ...context.enrichment import (
     IMAGE_EDIT_UNAVAILABLE_METADATA_KEY,
     enrich_context_with_memory,
     latest_user_text,
+    pending_user_response_lifecycle,
+    pending_user_response_marker,
 )
 from ...context.memory_tool import build_memory_tools
 from ...context.skill_tool import build_load_skill_tool
@@ -132,10 +134,8 @@ STRIP_LOG_MAX_TOOL_NAME_CHARS = 64
 REACT_RESPONSE_LANGUAGE_DESCRIPTION = (
     "Target natural language for user-facing prose in this ReAct response, "
     "for example English, Simplified Chinese, Traditional Chinese, or Spanish. "
-    "For Chinese requests, choose Simplified Chinese or Traditional Chinese to "
-    "match the request script; do not use generic Chinese. If the current user "
-    "request explicitly asks to answer in another language, use that requested "
-    "target language."
+    "Follow the canonical request-language policy in the system context; do not "
+    "collapse Chinese variants into generic Chinese."
 )
 
 
@@ -1763,22 +1763,19 @@ class ReActPattern(AgentPattern):
         if not isinstance(messages, list):
             return None
 
-        for index in range(len(messages) - 1, after_message_count - 1, -1):
+        for index in range(after_message_count, len(messages)):
             message = messages[index]
             if getattr(message, "role", None) != "user":
                 continue
-            metadata = dict(getattr(message, "metadata", {}) or {})
-            if metadata.get("response_to_waiting_for_user"):
+            metadata = getattr(message, "metadata", None)
+            metadata = dict(metadata) if isinstance(metadata, dict) else {}
+            if pending_user_response_lifecycle(message) is not None:
                 return str(getattr(message, "content", "") or "")
             waiting_request = self.waiting_for_user_request or {}
-            metadata["response_to_waiting_for_user"] = {
-                "tool_name": waiting_request.get("tool_name"),
-                "tool_call_id": waiting_request.get("tool_call_id"),
-                "question": waiting_request.get("message", ""),
-                "message_type": waiting_request.get("message_type", "question"),
-                "interactions": waiting_request.get("interactions"),
-                "requests": waiting_request.get("requests"),
-            }
+            marker = pending_user_response_marker(waiting_request)
+            if marker is None:
+                return None
+            metadata["response_to_waiting_for_user"] = marker
             messages[index] = replace(message, metadata=metadata)
             return str(getattr(message, "content", "") or "")
         return None
@@ -2289,12 +2286,25 @@ class ReActPattern(AgentPattern):
     def _control_tool_names(self) -> set[str]:
         return set(CONTROL_TOOL_NAMES)
 
+    def _tool_message_source(self, tool_call: dict[str, Any]) -> dict[str, Any]:
+        """Return message attribution, without exposing tool arguments."""
+        source = {
+            "tool_call_id": tool_call["id"],
+            "tool_name": tool_call["name"],
+        }
+        for key in ("step_id", "dag_step_id", "turn_id"):
+            if tool_call.get(key):
+                source[key] = tool_call[key]
+        return source
+
     async def _handle_control_tool(
         self,
         tool_call: dict[str, Any],
         context: Any,
         llm: Any,
         runtime: PatternRuntime,
+        *,
+        source: dict[str, Any],
     ) -> dict[str, Any] | None:
         name = tool_call["name"]
         args = tool_call.get("args", {})
@@ -2374,6 +2384,7 @@ class ReActPattern(AgentPattern):
                 message_type=message_type,
                 expect_response=expect_response,
                 visible=visible,
+                metadata=source,
             )
             self._record_tool_call(
                 tool_call,
@@ -2459,7 +2470,10 @@ class ReActPattern(AgentPattern):
                 message_type="question",
                 expect_response=True,
                 visible=True,
-                metadata={"interactions": interactions},
+                metadata={
+                    **source,
+                    "interactions": interactions,
+                },
             )
             self._record_tool_call(
                 tool_call,
@@ -2780,7 +2794,17 @@ class ReActPattern(AgentPattern):
             message_type=message_type,
             expect_response=True,
             visible=True,
-            metadata={"interactions": interactions},
+            metadata={
+                "interactions": interactions,
+                "tool_calls": [
+                    self._tool_message_source(
+                        self._with_runtime_turn_id(
+                            self._with_runtime_step(tool_call, runtime), runtime
+                        )
+                    )
+                    for tool_call, _ in waiting_pairs
+                ],
+            },
         )
         self.status = "waiting_for_user"
         self.waiting_for_user_request = {
@@ -2982,11 +3006,12 @@ class ReActPattern(AgentPattern):
 
             if kind == "control":
                 tool_call = segment[0]
-                control_result = await self._handle_control_tool(
+                control_result: dict[str, Any] | None = await self._execute_tool_safely(
                     tool_call,
-                    context,
-                    llm,
+                    tools,
                     runtime,
+                    context=context,
+                    llm=llm,
                 )
                 self.pending_tool_calls = self.pending_tool_calls[1:]
                 self._forget_tool_call_content(tool_call)
@@ -3595,7 +3620,15 @@ class ReActPattern(AgentPattern):
         tool_call: dict[str, Any],
         tools: list[Any],
         runtime: PatternRuntime,
+        *,
+        context: Any = None,
+        llm: Any = None,
     ) -> Any:
+        """Share invocation preparation and lifecycle cleanup across tool kinds.
+
+        Control handlers retain their scheduling results. Only ordinary tools
+        use the existing tracing, metering and business-error conversion.
+        """
         # Stamp a stable id on the *original* dict before the _with_* transforms
         # (which may return a copy). _record_tool_call only computes a fallback
         # key locally; without writing it back, the key drifts between the
@@ -3605,13 +3638,28 @@ class ReActPattern(AgentPattern):
         # so concurrent batch members get distinct fallback ids.
         if not tool_call.get("id"):
             tool_call["id"] = f"tool_call_{len(self.tool_ledger)}"
+        pending_call = tool_call
         tool_call = self._with_tool_call_content(tool_call)
         tool_call = self._with_runtime_step(tool_call, runtime)
         tool_call = self._with_runtime_turn_id(tool_call, runtime)
-        tool_call = self._with_trace_safe_tool_args(tool_call, tools)
+        is_control = tool_call["name"] in CONTROL_TOOL_NAMES
+        if not is_control:
+            tool_call = self._with_trace_safe_tool_args(tool_call, tools)
         self._record_tool_call(tool_call, status="running")
         recorded_terminal = False
         try:
+            if is_control:
+                # Control rejection identifies siblings by pending-object
+                # identity. Pass that original object, not the enriched copy.
+                result = await self._handle_control_tool(
+                    pending_call,
+                    context,
+                    llm,
+                    runtime,
+                    source=self._tool_message_source(tool_call),
+                )
+                recorded_terminal = True
+                return result
             await runtime.on_tool_start(tool_call=tool_call)
             try:
                 result = await runtime.run_tool_call(
@@ -3679,12 +3727,31 @@ class ReActPattern(AgentPattern):
             recorded_terminal = True
             await runtime.on_tool_end(tool_call=tool_call, result=result)
             return result
+        except (ToolCallInterrupted, asyncio.CancelledError) as exc:
+            if (
+                is_control
+                and self.tool_ledger[str(tool_call["id"])].status == "running"
+            ):
+                self._record_tool_call(tool_call, status="interrupted", error=str(exc))
+                recorded_terminal = True
+            raise
+        except Exception as exc:
+            if (
+                is_control
+                and self.tool_ledger[str(tool_call["id"])].status == "running"
+            ):
+                self._record_tool_call(tool_call, status="failed", error=str(exc))
+                recorded_terminal = True
+            raise
         finally:
-            # An infra callback (on_tool_start) can raise before any terminal
-            # record is written. Never leave the ledger stuck at "running": the
-            # consecutive-count walks skip non-terminal records, which would
-            # undercount repeated-tool-decision triggers. The exception still
-            # propagates (serial path) or is captured by the batch gather.
+            # Final-answer handling can record completion before finalization
+            # raises. Preserve that outcome, like an ordinary on_tool_end error.
+            if is_control:
+                recorded_terminal = (
+                    self.tool_ledger[str(tool_call["id"])].status != "running"
+                )
+            # Sends and infra callbacks must propagate without leaving a
+            # running ledger entry or becoming a model-visible business error.
             if not recorded_terminal:
                 self._record_tool_call(
                     tool_call,

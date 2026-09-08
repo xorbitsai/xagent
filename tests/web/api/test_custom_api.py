@@ -1,4 +1,5 @@
 import ast
+import importlib
 import inspect
 from datetime import datetime
 from types import SimpleNamespace
@@ -28,6 +29,94 @@ from xagent.web.services.connector_team_scope import (
     ConnectorDeleteDecision,
     set_connector_team_hooks,
 )
+
+_SEAM_MODULE = "xagent.web.api.custom_api"
+
+# Every top-level function in this module that can reach an installed
+# connector team hook. Written out so the discovery below cannot pass by
+# finding nothing.
+_SEAM_REACHING_FUNCTIONS = {
+    "_resolve_custom_api_for_request",
+    "_recheck_team_access_under_definition_lock",
+    "get_custom_api",
+    "update_custom_api",
+    "delete_custom_api",
+}
+
+
+def _functions_reaching_the_connector_seam() -> dict[str, ast.AST]:
+    """Every top-level function in this module that can reach an installed
+    connector team hook.
+
+    Seeded on the functions that import ``connector_team_scope`` in their own
+    body, which is how every call site in this module reaches the seam, then
+    closed transitively over plain-name calls, because one route reaches it
+    only through a helper (``get_custom_api`` through
+    ``_resolve_custom_api_for_request``). A seed-only check would miss exactly
+    the route this test exists for.
+    """
+    module = importlib.import_module(_SEAM_MODULE)
+    tree = ast.parse(inspect.getsource(module))
+    functions = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    reaching = {
+        name
+        for name, node in functions.items()
+        if any(
+            isinstance(child, ast.ImportFrom)
+            and child.module is not None
+            and child.module.endswith("connector_team_scope")
+            for child in ast.walk(node)
+        )
+    }
+    changed = True
+    while changed:
+        changed = False
+        for name, node in functions.items():
+            if name in reaching:
+                continue
+            called = {
+                child.func.id
+                for child in ast.walk(node)
+                if isinstance(child, ast.Call) and isinstance(child.func, ast.Name)
+            }
+            if called & reaching:
+                reaching.add(name)
+                changed = True
+    return {name: functions[name] for name in reaching}
+
+
+def test_the_discovery_of_seam_reaching_functions_is_not_vacuous():
+    """Pins the enumeration itself, so the assertion below cannot pass by
+    finding nothing."""
+    assert set(_functions_reaching_the_connector_seam()) == _SEAM_REACHING_FUNCTIONS
+
+
+def test_no_function_that_reaches_the_connector_seam_is_a_coroutine():
+    """An installed connector team hook may be slow -- the seam is designed on
+    the assumption that the installing application answers from its own
+    tables. FastAPI runs a coroutine route on the event loop thread itself, so
+    a slow hook call inside an ``async def`` stalls every other request the
+    process is serving, not just this one; a plain ``def`` goes to the
+    threadpool instead, where a slow call occupies one worker.
+
+    Enumerated by reachability rather than by a hand-written list of routes:
+    an earlier fix for this same risk class swept siblings along the "takes a
+    row lock" axis and therefore missed a route that calls a hook without
+    taking one.
+    """
+    offenders = [
+        name
+        for name, node in _functions_reaching_the_connector_seam().items()
+        if isinstance(node, ast.AsyncFunctionDef)
+    ]
+    assert offenders == [], (
+        "these functions can reach an installed connector team hook while "
+        f"running on the event loop thread: {sorted(offenders)}"
+    )
 
 
 def test_custom_api_models_env_validation():
@@ -244,8 +333,7 @@ async def test_create_custom_api_rejects_runtime_static_header_conflict():
     assert "Invalid runtime configuration" in str(exc_info.value.detail)
 
 
-@pytest.mark.asyncio
-async def test_get_custom_api():
+def test_get_custom_api():
     db = MagicMock(spec=Session)
     user = User(id=1)
 
@@ -262,19 +350,18 @@ async def test_get_custom_api():
 
     db.query().filter().first.return_value = mock_user_api
 
-    res = await get_custom_api(10, current_user=user, db=db)
+    res = get_custom_api(10, current_user=user, db=db)
     assert res.id == 10
     assert res.name == "test_api"
 
 
-@pytest.mark.asyncio
-async def test_get_custom_api_not_found():
+def test_get_custom_api_not_found():
     db = MagicMock(spec=Session)
     user = User(id=1)
     db.query().filter().first.return_value = None
 
     with pytest.raises(HTTPException) as exc_info:
-        await get_custom_api(99, current_user=user, db=db)
+        get_custom_api(99, current_user=user, db=db)
     assert exc_info.value.status_code == 404
 
 

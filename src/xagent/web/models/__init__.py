@@ -1,6 +1,7 @@
 from .actor_oauth_flow import ActorOAuthFlowState
 from .agent import Agent
 from .agent_api_key import AgentApiKey
+from .auto_model import AutoModelCandidate, AutoModelConfig
 from .background_job import BackgroundJob, BackgroundJobStatus, BackgroundJobType
 from .chat_message import TaskChatMessage
 from .custom_api import CustomApi, UserCustomApi
@@ -20,6 +21,7 @@ from .system_setting import SystemSetting
 from .task import DAGExecution, Task, TaskConnectorRuntimeContext
 from .task_command import TaskExecutionCommand
 from .task_command_terminal_event import TaskCommandTerminalEvent
+from .task_execution_event import TaskExecutionEvent
 from .task_interaction import TaskInteractionRequest
 from .template_stats import TemplateStats, UserTemplateRelation
 from .tool_config import ToolConfig, ToolUsage
@@ -67,6 +69,7 @@ __all__ = [
     "Task",
     "TaskExecutionCommand",
     "TaskCommandTerminalEvent",
+    "TaskExecutionEvent",
     "TaskInteractionRequest",
     "TaskConnectorRuntimeContext",
     "DAGExecution",
@@ -84,6 +87,8 @@ __all__ = [
     "SystemSetting",
     "Agent",
     "AgentApiKey",
+    "AutoModelConfig",
+    "AutoModelCandidate",
     "BackgroundJob",
     "BackgroundJobStatus",
     "BackgroundJobType",

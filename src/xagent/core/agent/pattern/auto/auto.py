@@ -181,6 +181,10 @@ class _AutoChildRuntime:
     def active_react_step_id(self) -> str | None:
         return self.parent.active_react_step_id
 
+    @property
+    def active_turn_id(self) -> str | None:
+        return self.parent.active_turn_id
+
     async def should_interrupt(self) -> bool:
         return await self.parent.should_interrupt()
 
@@ -204,6 +208,9 @@ class _AutoChildRuntime:
 
     async def end_final_answer_stream(self, message_id: str, content: str) -> None:
         await self.parent.end_final_answer_stream(message_id, content)
+
+    async def prepare_final_answer(self, content: str) -> str:
+        return await self.parent.prepare_final_answer(content)
 
     async def fail_final_answer_stream(self, message_id: str, error: str) -> None:
         await self.parent.fail_final_answer_stream(message_id, error)

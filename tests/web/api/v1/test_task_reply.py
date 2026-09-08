@@ -27,6 +27,8 @@ from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.schemas.v1 import ReplyRequest
+from xagent.web.services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
+from xagent.web.services.llm_utils import AutoModelUnavailableError
 from xagent.web.services.task_execution_controller import TaskControlState
 from xagent.web.services.task_lease_service import TaskLease, current_task_lease
 
@@ -795,6 +797,11 @@ def test_reply_checkpoint_missing_restore_clears_an_unpaired_marker(mock_start_t
     ("error", "expected_status", "expected_code"),
     [
         (
+            AutoModelUnavailableError("private model details"),
+            409,
+            "auto_model_unavailable",
+        ),
+        (
             CheckpointCorruptError("all matching rows undecodable"),
             409,
             "interaction_not_resumable",
@@ -843,6 +850,8 @@ def test_reply_checkpoint_read_error_maps_to_distinct_code(
 
     assert resp.status_code == expected_status, resp.text
     assert resp.json()["error"]["code"] == expected_code
+    if isinstance(error, AutoModelUnavailableError):
+        assert resp.json()["error"]["message"] == CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
 
     db = _direct_db_session()
     try:

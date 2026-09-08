@@ -21,11 +21,16 @@ from xagent.web.models.user_oauth import UserOAuth
 from xagent.web.services import connector_team_scope
 from xagent.web.services.mcp_runtime import MCPBuiltinOAuthActorPolicy
 from xagent.web.tools import config as web_tools_config
-from xagent.web.tools.config import WebToolConfig
+from xagent.web.tools.config import (
+    ResolvedToken,
+    WebToolConfig,
+    set_oauth_token_resolver_hook,
+)
 
 OWNER_A = "toby:slack:team:actor-a"
 OWNER_B = "toby:slack:team:actor-b"
 APP_ID = "actor-drive"
+REMOTE_APP_ID = "actor-remote"
 APP_EXECUTION = {
     "name": "Actor Drive",
     "transport": "oauth",
@@ -116,6 +121,87 @@ def _add_builtin_server(
     return server
 
 
+def _add_remote_server(db: Session, user: User) -> MCPServer:
+    app = PublicMCPApp(
+        app_id=REMOTE_APP_ID,
+        name="Actor Remote",
+        transport="streamable_http",
+        launch_config={
+            "url": "https://mcp.example.com/mcp",
+            "auth": {
+                "type": "mcp_oauth",
+                "resource": "https://mcp.example.com/mcp",
+                "issuer": "https://auth.example.com",
+                "scope": "records.read",
+                "client_id": "actor-client",
+            },
+        },
+        is_visible_in_connector=True,
+    )
+    server = MCPServer.from_config(
+        {
+            "name": REMOTE_APP_ID,
+            "managed": "external",
+            "transport": "streamable_http",
+            "url": "https://mcp.example.com/mcp",
+            "auth": dict(app.launch_config["auth"]),
+        }
+    )
+    db.add_all([app, server])
+    db.flush()
+    db.add(
+        UserMCPServer(
+            user_id=int(user.id),
+            mcpserver_id=int(server.id),
+            is_owner=False,
+            is_active=True,
+        )
+    )
+    db.commit()
+    return server
+
+
+def _add_remote_grant(
+    db: Session,
+    user: User,
+    server: MCPServer,
+    *,
+    owner: str,
+    token: str,
+) -> MCPOAuthGrant:
+    client = (
+        db.query(MCPOAuthClient)
+        .filter(MCPOAuthClient.mcp_server_id == int(server.id))
+        .one_or_none()
+    )
+    if client is None:
+        client = MCPOAuthClient(
+            mcp_server_id=int(server.id),
+            issuer="https://auth.example.com",
+            authorization_endpoint="https://auth.example.com/authorize",
+            token_endpoint="https://auth.example.com/token",
+            client_id="actor-client",
+            token_endpoint_auth_method="none",
+            redirect_uri="https://xagent.example.com/api/mcp/oauth/callback",
+        )
+        db.add(client)
+        db.flush()
+    grant = MCPOAuthGrant(
+        mcp_server_id=int(server.id),
+        user_id=int(user.id),
+        mcp_oauth_client_id=int(client.id),
+        resource_owner_key=owner,
+        issuer="https://auth.example.com",
+        resource="https://mcp.example.com/mcp",
+        scope="records.read",
+        access_token=encrypt_value(token),
+        status="active",
+    )
+    db.add(grant)
+    db.commit()
+    return grant
+
+
 def _add_actor_credential(
     db: Session,
     user: User,
@@ -173,6 +259,503 @@ def test_actor_policy_is_frozen_normalized_and_owner_only() -> None:
 def test_actor_policy_rejects_invalid_owner(value: object) -> None:
     with pytest.raises((TypeError, ValueError)):
         MCPBuiltinOAuthActorPolicy(resource_owner_key=value)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_actor_remote_prefers_exact_owner_over_workspace_grant(
+    db_session,
+) -> None:
+    server = _add_remote_server(db_session.db, db_session.user)
+    _add_remote_grant(
+        db_session.db,
+        db_session.user,
+        server,
+        owner=f"xagent:user:{db_session.user.id}",
+        token="workspace-token",
+    )
+    _add_remote_grant(
+        db_session.db,
+        db_session.user,
+        server,
+        owner=OWNER_A,
+        token="actor-token",
+    )
+
+    configs = await _config(db_session, policy=_policy()).get_mcp_server_configs()
+
+    assert configs[0]["config"]["headers"]["Authorization"] == "Bearer actor-token"
+
+
+@pytest.mark.asyncio
+async def test_actor_remote_falls_back_to_workspace_grant(db_session) -> None:
+    server = _add_remote_server(db_session.db, db_session.user)
+    _add_remote_grant(
+        db_session.db,
+        db_session.user,
+        server,
+        owner=f"xagent:user:{db_session.user.id}",
+        token="workspace-token",
+    )
+
+    configs = await _config(db_session, policy=_policy()).get_mcp_server_configs()
+
+    assert configs[0]["config"]["headers"]["Authorization"] == "Bearer workspace-token"
+
+
+@pytest.mark.parametrize("stale_kind", ["expired", "scope"])
+@pytest.mark.asyncio
+async def test_actor_remote_falls_back_from_unusable_actor_grant(
+    db_session, stale_kind
+) -> None:
+    server = _add_remote_server(db_session.db, db_session.user)
+    _add_remote_grant(
+        db_session.db,
+        db_session.user,
+        server,
+        owner=f"xagent:user:{db_session.user.id}",
+        token="workspace-token",
+    )
+    actor_grant = _add_remote_grant(
+        db_session.db,
+        db_session.user,
+        server,
+        owner=OWNER_A,
+        token="stale-actor-token",
+    )
+    if stale_kind == "expired":
+        actor_grant.expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+    else:
+        actor_grant.scope = "old.read"
+    db_session.db.commit()
+
+    configs = await _config(db_session, policy=_policy()).get_mcp_server_configs()
+
+    assert configs[0]["config"]["headers"]["Authorization"] == "Bearer workspace-token"
+    assert "stale-actor-token" not in str(configs)
+
+
+@pytest.mark.parametrize("drift", ["url", "transport", "auth", "managed", "ownership"])
+@pytest.mark.asyncio
+async def test_actor_remote_rejects_drifted_catalog_server(db_session, drift) -> None:
+    server = _add_remote_server(db_session.db, db_session.user)
+    _add_remote_grant(
+        db_session.db,
+        db_session.user,
+        server,
+        owner=OWNER_A,
+        token="actor-token",
+    )
+    if drift == "url":
+        server.url = "https://attacker.example/mcp"
+    elif drift == "transport":
+        server.transport = "sse"
+    elif drift == "auth":
+        server.auth = {**server.auth, "scope": "records.write"}
+    elif drift == "managed":
+        server.managed = "internal"
+    elif drift == "ownership":
+        association = db_session.db.query(UserMCPServer).one()
+        association.is_owner = True
+    db_session.db.commit()
+
+    configs = await _config(db_session, policy=_policy()).get_mcp_server_configs()
+
+    assert configs[0]["transport"] == "unavailable"
+    assert "actor-token" not in str(configs)
+
+
+@pytest.mark.asyncio
+async def test_actor_remote_strips_non_catalog_headers(db_session) -> None:
+    server = _add_remote_server(db_session.db, db_session.user)
+    _add_remote_grant(
+        db_session.db,
+        db_session.user,
+        server,
+        owner=OWNER_A,
+        token="actor-token",
+    )
+    server.headers = {"Host": "attacker.example", "Cookie": "session=secret"}
+    db_session.db.commit()
+
+    configs = await _config(db_session, policy=_policy()).get_mcp_server_configs()
+
+    assert configs[0]["config"]["headers"] == {"Authorization": "Bearer actor-token"}
+
+
+@pytest.mark.asyncio
+async def test_actor_remote_marks_missing_auth_unavailable(db_session) -> None:
+    server = _add_remote_server(db_session.db, db_session.user)
+    server.auth = None
+    db_session.db.commit()
+
+    configs = await _config(db_session, policy=_policy()).get_mcp_server_configs()
+
+    assert configs[0]["transport"] == "unavailable"
+    assert configs[0]["config"]["reason"] == "config_load_failed"
+
+
+@pytest.mark.asyncio
+async def test_actor_remote_ignores_foreign_auth_app_id(db_session) -> None:
+    server = _add_remote_server(db_session.db, db_session.user)
+    _add_remote_grant(
+        db_session.db,
+        db_session.user,
+        server,
+        owner=OWNER_A,
+        token="actor-token",
+    )
+    attacker = User(username="foreign-user", password_hash="x", is_admin=False)
+    foreign_server = MCPServer.from_config(
+        {
+            "name": "foreign-server",
+            "managed": "external",
+            "transport": "streamable_http",
+            "url": "https://attacker.example/mcp",
+            "auth": {"app_id": REMOTE_APP_ID},
+        }
+    )
+    db_session.db.add_all([attacker, foreign_server])
+    db_session.db.flush()
+    db_session.db.add(
+        UserMCPServer(
+            user_id=int(attacker.id),
+            mcpserver_id=int(foreign_server.id),
+            is_active=True,
+            is_owner=True,
+        )
+    )
+    db_session.db.commit()
+
+    configs = await _config(db_session, policy=_policy()).get_mcp_server_configs()
+
+    assert len(configs) == 1
+    assert configs[0]["config"]["headers"]["Authorization"] == "Bearer actor-token"
+
+
+@pytest.mark.asyncio
+async def test_actor_policy_preserves_owned_custom_app_id_collision(db_session) -> None:
+    _add_remote_server(db_session.db, db_session.user)
+    custom_server = MCPServer.from_config(
+        {
+            "name": "custom-remote",
+            "managed": "external",
+            "transport": "streamable_http",
+            "url": "https://custom.example.com/mcp",
+            "auth": {
+                "type": "mcp_oauth",
+                "app_id": REMOTE_APP_ID,
+                "resource": "https://mcp.example.com/mcp",
+                "issuer": "https://auth.example.com",
+                "scope": "records.read",
+                "client_id": "actor-client",
+            },
+        }
+    )
+    db_session.db.add(custom_server)
+    db_session.db.flush()
+    db_session.db.add(
+        UserMCPServer(
+            user_id=int(db_session.user.id),
+            mcpserver_id=int(custom_server.id),
+            is_active=True,
+            is_owner=True,
+        )
+    )
+    db_session.db.commit()
+    _add_remote_grant(
+        db_session.db,
+        db_session.user,
+        custom_server,
+        owner=f"xagent:user:{db_session.user.id}",
+        token="custom-token",
+    )
+
+    configs = await _config(db_session, policy=_policy()).get_mcp_server_configs()
+
+    custom_config = next(
+        config for config in configs if config["name"] == custom_server.name
+    )
+    assert custom_config["config"]["headers"]["Authorization"] == (
+        "Bearer custom-token"
+    )
+
+
+@pytest.mark.asyncio
+async def test_actor_policy_preserves_custom_resolver_candidates(db_session) -> None:
+    _add_remote_server(db_session.db, db_session.user)
+    app = (
+        db_session.db.query(PublicMCPApp)
+        .filter(PublicMCPApp.app_id == REMOTE_APP_ID)
+        .one()
+    )
+    app.provider_name = "records-provider"
+    custom_server = MCPServer.from_config(
+        {
+            "name": "custom-resolver-remote",
+            "managed": "external",
+            "transport": "streamable_http",
+            "url": "https://custom.example.com/mcp",
+            "auth": {"type": "mcp_oauth", "app_id": REMOTE_APP_ID},
+        }
+    )
+    db_session.db.add(custom_server)
+    db_session.db.flush()
+    db_session.db.add(
+        UserMCPServer(
+            user_id=int(db_session.user.id),
+            mcpserver_id=int(custom_server.id),
+            is_active=True,
+            is_owner=True,
+        )
+    )
+    db_session.db.commit()
+    providers = []
+
+    async def resolver(request) -> ResolvedToken | None:
+        providers.append(request.provider)
+        if request.provider == "records-provider":
+            return ResolvedToken(access_token="resolver-token")
+        return None
+
+    set_oauth_token_resolver_hook(resolver)
+    try:
+        configs = await _config(db_session, policy=_policy()).get_mcp_server_configs()
+    finally:
+        set_oauth_token_resolver_hook(None)
+
+    custom_config = next(
+        config for config in configs if config["name"] == custom_server.name
+    )
+    assert providers == ["records-provider"]
+    assert custom_config["config"]["headers"]["Authorization"] == (
+        "Bearer resolver-token"
+    )
+
+
+@pytest.mark.asyncio
+async def test_actor_policy_preserves_team_owned_custom_oauth(db_session) -> None:
+    custom_server = MCPServer.from_config(
+        {
+            "name": "retained-team-custom",
+            "managed": "external",
+            "transport": "streamable_http",
+            "url": "https://team.example.com/mcp",
+            "auth": {"type": "mcp_oauth"},
+        }
+    )
+    db_session.db.add(custom_server)
+    db_session.db.commit()
+    connector_team_scope.set_connector_team_hooks(
+        team_visibility=lambda _db, *, team_id: {
+            "mcp": {int(custom_server.id)} if team_id == 41 else set(),
+            "custom_api": set(),
+            "owned_mcp_definitions": {int(custom_server.id)},
+        }
+    )
+
+    async def resolver(request) -> ResolvedToken | None:
+        if request.provider == custom_server.name:
+            return ResolvedToken(access_token="team-custom-token")
+        return None
+
+    set_oauth_token_resolver_hook(resolver)
+    try:
+        configs = await _config(
+            db_session,
+            policy=_policy(),
+            connector_team_id=41,
+        ).get_mcp_server_configs()
+    finally:
+        set_oauth_token_resolver_hook(None)
+
+    assert configs[0]["name"] == custom_server.name
+    assert configs[0]["config"]["headers"]["Authorization"] == (
+        "Bearer team-custom-token"
+    )
+
+
+@pytest.mark.asyncio
+async def test_actor_policy_rejects_unowned_team_catalog_drift(db_session) -> None:
+    server = _add_remote_server(db_session.db, db_session.user)
+    db_session.db.query(UserMCPServer).delete()
+    server.name = "renamed-team-catalog"
+    db_session.db.commit()
+    connector_team_scope.set_connector_team_hooks(
+        team_visibility=lambda _db, *, team_id: {
+            "mcp": {int(server.id)} if team_id == 41 else set(),
+            "custom_api": set(),
+            "owned_mcp_definitions": set(),
+        }
+    )
+
+    configs = await _config(
+        db_session,
+        policy=_policy(),
+        connector_team_id=41,
+    ).get_mcp_server_configs()
+
+    assert configs[0]["transport"] == "unavailable"
+    assert configs[0]["config"]["reason"] == "config_load_failed"
+
+
+@pytest.mark.asyncio
+async def test_actor_remote_rejects_unverifiable_catalog_identity(db_session) -> None:
+    server = _add_remote_server(db_session.db, db_session.user)
+    server.name = "renamed-remote"
+    db_session.db.commit()
+    _add_remote_grant(
+        db_session.db,
+        db_session.user,
+        server,
+        owner=f"xagent:user:{db_session.user.id}",
+        token="workspace-token",
+    )
+
+    configs = await _config(db_session, policy=_policy()).get_mcp_server_configs()
+
+    assert configs[0]["transport"] == "unavailable"
+    assert configs[0]["config"]["reason"] == "config_load_failed"
+    assert "workspace-token" not in str(configs)
+
+
+@pytest.mark.asyncio
+async def test_actor_remote_rejects_catalog_auth_reclassification(db_session) -> None:
+    server = _add_remote_server(db_session.db, db_session.user)
+    app = (
+        db_session.db.query(PublicMCPApp)
+        .filter(PublicMCPApp.app_id == REMOTE_APP_ID)
+        .one()
+    )
+    app.launch_config = {
+        **app.launch_config,
+        "auth": {"type": "api_key"},
+    }
+    db_session.db.commit()
+    _add_remote_grant(
+        db_session.db,
+        db_session.user,
+        server,
+        owner=f"xagent:user:{db_session.user.id}",
+        token="workspace-token",
+    )
+
+    configs = await _config(db_session, policy=_policy()).get_mcp_server_configs()
+
+    assert configs[0]["transport"] == "unavailable"
+    assert configs[0]["config"]["reason"] == "config_load_failed"
+    assert "workspace-token" not in str(configs)
+
+
+@pytest.mark.asyncio
+async def test_actor_remote_never_uses_another_actor_grant(db_session) -> None:
+    server = _add_remote_server(db_session.db, db_session.user)
+    _add_remote_grant(
+        db_session.db,
+        db_session.user,
+        server,
+        owner=OWNER_B,
+        token="other-actor-token",
+    )
+
+    configs = await _config(db_session, policy=_policy()).get_mcp_server_configs()
+
+    assert configs[0]["transport"] == "unavailable"
+    assert "other-actor-token" not in str(configs)
+
+
+@pytest.mark.asyncio
+async def test_actor_remote_rejects_task_supplied_owner(db_session) -> None:
+    server = _add_remote_server(db_session.db, db_session.user)
+    _add_remote_grant(
+        db_session.db,
+        db_session.user,
+        server,
+        owner=OWNER_A,
+        token="actor-token",
+    )
+    _add_remote_grant(
+        db_session.db,
+        db_session.user,
+        server,
+        owner=OWNER_B,
+        token="other-actor-token",
+    )
+
+    configs = await _config(
+        db_session,
+        policy=_policy(),
+        mcp_auth_context={str(server.id): {"resource_owner_key": OWNER_B}},
+    ).get_mcp_server_configs()
+
+    assert configs[0]["transport"] == "unavailable"
+    assert configs[0]["config"]["reason"] == "config_load_failed"
+    assert "other-actor-token" not in str(configs)
+
+
+@pytest.mark.asyncio
+async def test_actor_remote_ignores_delegated_authorization(db_session) -> None:
+    server = _add_remote_server(db_session.db, db_session.user)
+    _add_remote_grant(
+        db_session.db,
+        db_session.user,
+        server,
+        owner=OWNER_A,
+        token="actor-token",
+    )
+    server.runtime_bindings = [
+        {
+            "source": {"input_type": "secrets", "key": "authorization"},
+            "target": {
+                "target_type": "transport_headers",
+                "key": "Authorization",
+            },
+        }
+    ]
+    server.allow_delegated_authorization = True
+    db_session.db.commit()
+    tool_config = _config(db_session, policy=_policy())
+    tool_config._connector_runtime_view = {
+        f"mcp:{server.id}": {
+            "context": {"account": "task-context"},
+            "secrets": {"authorization": "Bearer task-token"},
+            "auth_selector": {},
+        }
+    }
+
+    configs = await tool_config.get_mcp_server_configs()
+
+    assert configs[0]["config"]["headers"]["Authorization"] == "Bearer actor-token"
+    assert "task-token" not in str(configs)
+    assert "connector_runtime" not in configs[0]
+    assert "runtime_bindings" not in configs[0]
+
+
+@pytest.mark.asyncio
+async def test_actor_remote_ignores_resolver_hook(db_session) -> None:
+    server = _add_remote_server(db_session.db, db_session.user)
+    _add_remote_grant(
+        db_session.db,
+        db_session.user,
+        server,
+        owner=OWNER_A,
+        token="actor-token",
+    )
+    calls = 0
+
+    async def resolver(_request) -> ResolvedToken:
+        nonlocal calls
+        calls += 1
+        return ResolvedToken(access_token="resolver-token")
+
+    set_oauth_token_resolver_hook(resolver)
+    try:
+        configs = await _config(db_session, policy=_policy()).get_mcp_server_configs()
+    finally:
+        set_oauth_token_resolver_hook(None)
+
+    assert calls == 0
+    assert configs[0]["config"]["headers"]["Authorization"] == "Bearer actor-token"
+    assert "resolver-token" not in str(configs)
 
 
 @pytest.mark.asyncio

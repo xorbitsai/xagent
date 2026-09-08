@@ -89,7 +89,7 @@ async def test_worker_cleanup_does_not_block_other_users(sandbox_mgr) -> None:
     try:
         sandbox_key = await asyncio.wait_for(
             manager._acquire_sandbox_task("2"),
-            timeout=0.05,
+            timeout=30,
         )
     finally:
         cleanup_release.set()
@@ -151,7 +151,7 @@ async def test_worker_cleanup_blocks_same_user_provider_recreate(sandbox_mgr) ->
             await asyncio.wait_for(create_called.wait(), timeout=0.05)
 
         cleanup_release.set()
-        sandbox = await asyncio.wait_for(create_task, timeout=0.5)
+        sandbox = await asyncio.wait_for(create_task, timeout=30)
         await release_task
     finally:
         cleanup_release.set()

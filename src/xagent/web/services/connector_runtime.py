@@ -45,6 +45,12 @@ from ..models.agent import Agent
 from ..models.custom_api import CustomApi, UserCustomApi
 from ..models.mcp import MCPServer, UserMCPServer
 from ..models.task import Task, TaskConnectorRuntimeContext
+from ..schemas.connector_runtime import (
+    ConnectorRuntimeConnectorModel,
+    ConnectorRuntimeInputModel,
+    ConnectorRuntimeRefModel,
+    ConnectorRuntimeRequirementsModel,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -418,6 +424,78 @@ def prepare_connector_runtime_selection_snapshot(
     return _runtime_declared_refs(selected)
 
 
+def resolve_agent_runtime_requirements(
+    *, db: Session, agent: Agent | None, connector_user_id: int | None
+) -> tuple[tuple[ConnectorRef, ...], ConnectorRuntimeRequirementsModel]:
+    """Resolve an agent's declared runtime inputs before any task exists.
+
+    Calls ``resolve_agent_selected_connectors`` exactly once. The returned
+    refs are ``_runtime_declared_refs`` applied to that same call's result
+    -- same filter, same canonical order -- because a caller creating a
+    task persists them into ``Task.connector_runtime_selected_refs``, and
+    every later reader of that column (the per-turn gate,
+    ``load_connector_runtime_view``) depends on it holding exactly that
+    set. Both the write and the read of that column sort by
+    ``(connector_type, connector_id)``, so the invariant the column
+    carries is the set under that canonical order, not the order a caller
+    happened to hand over. Do not derive the refs any other way, even one
+    that looks equivalent.
+
+    The report has no task to consult, so every input's ``satisfied`` is
+    ``False`` and the top-level ``satisfied`` answers "would a task created
+    from this agent right now need nothing else" -- i.e. no required input
+    is declared, and no declared key carries a name the per-turn gate would
+    reject. Never queries any task's stored values: doing so would
+    make the answer depend on which task happened to be looked up, and this
+    endpoint has none in scope.
+
+    Never asserts that a required value is present -- reporting what is
+    missing is the whole point, and raising on it belongs to the per-turn
+    gate that runs later, not to this report.
+    """
+
+    if agent is None or connector_user_id is None:
+        return (), ConnectorRuntimeRequirementsModel(
+            satisfied=True, secrets_expires_at=None, connectors=[]
+        )
+    selected = resolve_agent_selected_connectors(
+        db=db, agent=agent, connector_user_id=int(connector_user_id)
+    )
+    refs = _runtime_declared_refs(selected)
+    connectors = [
+        _build_connector_report(ref, selected[ref], stored_context=None) for ref in refs
+    ]
+    return refs, ConnectorRuntimeRequirementsModel(
+        satisfied=_all_required_inputs_satisfied(connectors),
+        secrets_expires_at=None,
+        connectors=connectors,
+    )
+
+
+def build_task_runtime_requirements(
+    *, db: Session, task: Task, agent: Agent | None
+) -> ConnectorRuntimeRequirementsModel:
+    """Report a task's stored connector-runtime state.
+
+    Pure read: issues no write of any kind. Never asserts that a required
+    value is present -- that assertion belongs to the per-turn gate, not to
+    this report; a caller who needs "can this task run right now" reads the
+    ``satisfied`` fields this returns rather than calling a helper that
+    raises.
+    """
+
+    connector_user_id = int(task.user_id)
+    agent_team_id = (
+        int(agent.team_id) if agent is not None and agent.team_id is not None else None
+    )
+    visible = _load_visible_runtime_connectors(
+        db, user_id=connector_user_id, agent_team_id=agent_team_id
+    )
+    selected_refs = _load_task_selected_refs(task)
+    stored_context = _load_task_context_rows(db, task_id=int(task.id))
+    return _build_task_requirements_model(selected_refs, visible, stored_context)
+
+
 def bind_connector_runtime_selection_snapshot(
     *, task: Task, selected_refs: Iterable[ConnectorRef]
 ) -> None:
@@ -789,6 +867,151 @@ def _load_task_context_rows(
         context: dict[str, Any] = row.context if isinstance(row.context, dict) else {}
         result[ref] = dict(context)
     return result
+
+
+def _normalize_runtime_input_type(declaration: Any) -> str:
+    """Normalize a declared input's ``type`` the same way the connector-
+    owner form does (``frontend/src/components/mcp/runtime-inputs-form.tsx``):
+    ``"object"`` stays ``"object"``, everything else -- including a missing
+    or unrecognized value -- becomes ``"string"``. Never pass the raw
+    declared value through unnormalized.
+    """
+    raw = declaration.get("type") if isinstance(declaration, dict) else None
+    return "object" if raw == "object" else "string"
+
+
+def _build_connector_report(
+    ref: ConnectorRef, connector: Any, *, stored_context: dict[str, Any] | None
+) -> ConnectorRuntimeConnectorModel:
+    """Project one connector's runtime declaration into a requirements
+    report entry. Reads only the fields ``ConnectorRuntimeInputModel``
+    exposes -- never the connector's URL, headers, environment,
+    authentication configuration, or ``runtime_bindings``, and never a
+    stored value itself.
+
+    ``stored_context`` is ``None`` for the agent-keyed report, which has no
+    task and therefore no value table to consult: every ``context`` key is
+    then unsatisfied, matching ``secrets``/``auth_selector``, which are
+    always unsatisfied at this phase regardless of ``stored_context``
+    because no secret store exists yet.
+    """
+    schema = _runtime_input_schema(connector)
+    context_stored = stored_context or {}
+    inputs: list[ConnectorRuntimeInputModel] = []
+    for section_name in (
+        RUNTIME_INPUT_CONTEXT,
+        RUNTIME_INPUT_SECRETS,
+        RUNTIME_INPUT_AUTH_SELECTOR,
+    ):
+        if (
+            section_name == RUNTIME_INPUT_AUTH_SELECTOR
+            and ref.connector_type != CONNECTOR_TYPE_MCP
+        ):
+            continue
+        declarations = _schema_section(schema, section_name)
+        for key, declaration in declarations.items():
+            try:
+                validate_runtime_source_key(key)
+            except ValueError:
+                # No value can ever be stored under this key's syntax --
+                # the per-turn gate rejects it with a 400, required or
+                # not. It is still listed, unconditionally unsatisfied
+                # even with a stored value under that name; dropping the
+                # key would hide from a caller the one thing that will
+                # fail the turn. The top-level flag is held at false by
+                # ``_all_required_inputs_satisfied``, which re-checks the
+                # syntax of every listed key rather than reading these
+                # per-key flags alone, because a key of this kind fails
+                # the turn whether or not it is required. This report
+                # still never raises: the real fix is validating key
+                # syntax at connector create/update time, not here.
+                satisfied = False
+            else:
+                satisfied = (
+                    key in context_stored
+                    if section_name == RUNTIME_INPUT_CONTEXT
+                    else False
+                )
+            inputs.append(
+                ConnectorRuntimeInputModel(
+                    section=section_name,
+                    key=key,
+                    type=_normalize_runtime_input_type(declaration),
+                    required=_is_required(declaration),
+                    satisfied=satisfied,
+                    expired=False,
+                )
+            )
+    return ConnectorRuntimeConnectorModel(
+        connector_ref=ConnectorRuntimeRefModel(
+            connector_type=ref.connector_type, connector_id=ref.connector_id
+        ),
+        name=str(getattr(connector, "name", "")),
+        inputs=inputs,
+    )
+
+
+def _all_required_inputs_satisfied(
+    connectors: list[ConnectorRuntimeConnectorModel],
+) -> bool:
+    """Top-level ``satisfied``: every required input, across every
+    reported connector and every section including ``secrets``, is
+    satisfied, and no reported connector declares a key whose name the
+    per-turn gate rejects. An empty report is therefore satisfied: no
+    connectors, or none with a required input and none with a malformed
+    key, reports satisfied.
+
+    The malformed-key rule ignores ``required`` on purpose. The per-turn
+    gate (``_require_context_values``, ``_require_ephemeral_values``)
+    validates the syntax of every declared key and raises before it looks
+    at ``required`` at all, so a connector declaring ``{"bad.key":
+    {"required": false}}`` fails every turn while nothing about it is
+    required. Reading only the per-key ``satisfied`` flags of required
+    inputs would report such a task as ready to run.
+    """
+    return all(
+        _key_syntax_is_accepted(input_item.key)
+        and (input_item.satisfied or not input_item.required)
+        for connector in connectors
+        for input_item in connector.inputs
+    )
+
+
+def _key_syntax_is_accepted(key: str) -> bool:
+    """Whether the per-turn gate would accept this declared key's name,
+    asked without raising. Same predicate the gate applies, via the same
+    validator, so the two cannot drift apart.
+    """
+    try:
+        validate_runtime_source_key(key)
+    except ValueError:
+        return False
+    return True
+
+
+def _build_task_requirements_model(
+    selected_refs: tuple[ConnectorRef, ...],
+    visible: dict[ConnectorRef, Any],
+    stored_context: dict[ConnectorRef, dict[str, Any]],
+) -> ConnectorRuntimeRequirementsModel:
+    connectors: list[ConnectorRuntimeConnectorModel] = []
+    for ref in selected_refs:
+        connector = visible.get(ref)
+        if connector is None:
+            # Same rule as load_connector_runtime_view: a selected ref the
+            # caller can no longer see has no runtime tool either, so it is
+            # skipped rather than reported as missing something.
+            continue
+        connectors.append(
+            _build_connector_report(
+                ref, connector, stored_context=stored_context.get(ref)
+            )
+        )
+    return ConnectorRuntimeRequirementsModel(
+        satisfied=_all_required_inputs_satisfied(connectors),
+        secrets_expires_at=None,
+        connectors=connectors,
+    )
 
 
 def _validate_values_against_schema(

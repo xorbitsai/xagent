@@ -75,6 +75,10 @@ File delivery integrity:
 - When the user requests a new file or file-based artifact, it is not delivered until a successful tool result returns its registered FileRef or markdown_link.
 - Do not call final_answer claiming that a file was created or delivered unless that result exists."""
 
+FILE_REF_OUTPUT_INSTRUCTIONS += """
+- Tool execution success and file validation are separate. If validation.status is invalid, repair the file and recheck it, or clearly report the failure; do not present it as a usable completed deliverable. Keep its file_id available for repair.
+- An unchecked or absent validation result is not a pass. State that limitation when delivering the file; a valid result establishes format readability only, not business/content correctness."""
+
 FILE_REF_MODEL_INSTRUCTIONS = f"""## FILE REFERENCES
 Files are referenced by FileRef objects. Treat file_id as the canonical file handle.
 
@@ -192,12 +196,17 @@ def build_workspace_file_ref(
     file_id: str | None = None,
     mime_type: str | None = None,
     internal: bool = False,
+    validate: bool = False,
 ) -> dict[str, Any]:
     """Register a workspace file and build the model/API-facing FileRef.
 
     ``internal`` keeps execution scratch data resolvable by ``file_id`` without
     creating a user-visible or durably uploaded file record. It fails closed
     when the workspace does not support internal registration.
+
+    ``validate`` checks a completed output snapshot without changing registration
+    or tool success. Call from a worker thread, as with other blocking file I/O.
+    It applies only to user-visible outputs; internal scratch files are not checked.
     """
     resolved_path = Path(file_path).resolve()
     if not resolved_path.exists() or not resolved_path.is_file():
@@ -233,6 +242,10 @@ def build_workspace_file_ref(
         except ValueError:
             relative_path = str(resolved_path)
         result["relative_path"] = relative_path
+        if validate:
+            from .artifact_validation.service import validate_artifact
+
+            result["validation"] = validate_artifact(resolved_path).as_dict()
     return result
 
 

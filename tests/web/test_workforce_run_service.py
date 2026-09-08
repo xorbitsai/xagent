@@ -1,5 +1,5 @@
 import asyncio
-import time
+import threading
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
@@ -884,11 +884,16 @@ async def test_create_workforce_run_releases_connection_before_worker_transactio
     db.commit()
 
     checked_out: list[int] = []
+    entered = threading.Event()
+    release = threading.Event()
+    loop_thread = threading.get_ident()
     original = workforce_runs_module._create_claimed_workforce_run_isolated
 
     def observed(*args: Any, **kwargs: Any):
         checked_out.append(engine.pool.checkedout())
-        time.sleep(0.05)
+        entered.set()
+        assert threading.get_ident() != loop_thread
+        assert release.wait(timeout=30), "workforce transaction was never released"
         return original(*args, **kwargs)
 
     monkeypatch.setattr(
@@ -897,32 +902,26 @@ async def test_create_workforce_run_releases_connection_before_worker_transactio
         observed,
     )
 
-    ticker_stop = asyncio.Event()
-    ticks = 0
-
-    async def ticker() -> None:
-        nonlocal ticks
-        while not ticker_stop.is_set():
-            ticks += 1
-            await asyncio.sleep(0.005)
-
-    ticker_task = asyncio.create_task(ticker())
-    try:
-        result = await create_workforce_run(
+    startup = asyncio.create_task(
+        create_workforce_run(
             db,
             user,
             workforce,
             message="Coordinate a launch brief",
         )
-        await result.background_task
+    )
+    try:
+        assert await asyncio.to_thread(entered.wait, 30)
+        assert not startup.done()
+        assert checked_out == [0]
     finally:
-        ticker_stop.set()
-        await ticker_task
+        release.set()
+        result = await asyncio.wait_for(startup, timeout=30)
+    await result.background_task
 
     assert result.task.status == TaskStatus.RUNNING
     assert result.workforce_run.status == "running"
     assert checked_out == [0]
-    assert ticks >= 3, "workforce turn startup blocked the asyncio event loop"
 
 
 @pytest.mark.asyncio
@@ -939,11 +938,16 @@ async def test_create_preview_workforce_run_releases_connection_before_worker_tr
     db.commit()
 
     checked_out: list[int] = []
+    entered = threading.Event()
+    release = threading.Event()
+    loop_thread = threading.get_ident()
     original = workforce_runs_module._create_claimed_preview_run_isolated
 
     def observed(*args: Any, **kwargs: Any):
         checked_out.append(engine.pool.checkedout())
-        time.sleep(0.05)
+        entered.set()
+        assert threading.get_ident() != loop_thread
+        assert release.wait(timeout=30), "workforce transaction was never released"
         return original(*args, **kwargs)
 
     monkeypatch.setattr(
@@ -952,18 +956,8 @@ async def test_create_preview_workforce_run_releases_connection_before_worker_tr
         observed,
     )
 
-    ticker_stop = asyncio.Event()
-    ticks = 0
-
-    async def ticker() -> None:
-        nonlocal ticks
-        while not ticker_stop.is_set():
-            ticks += 1
-            await asyncio.sleep(0.005)
-
-    ticker_task = asyncio.create_task(ticker())
-    try:
-        result = await create_preview_workforce_run(
+    startup = asyncio.create_task(
+        create_preview_workforce_run(
             db,
             user_id=user.id,
             name="Launch Team",
@@ -978,15 +972,19 @@ async def test_create_preview_workforce_run_releases_connection_before_worker_tr
             ],
             message="Draft a launch brief",
         )
-        await result.background_task
+    )
+    try:
+        assert await asyncio.to_thread(entered.wait, 30)
+        assert not startup.done()
+        assert checked_out == [0]
     finally:
-        ticker_stop.set()
-        await ticker_task
+        release.set()
+        result = await asyncio.wait_for(startup, timeout=30)
+    await result.background_task
 
     assert result.task.status == TaskStatus.RUNNING
     assert result.workforce_run.status == "running"
     assert checked_out == [0]
-    assert ticks >= 3, "preview workforce turn startup blocked the asyncio event loop"
 
 
 @pytest.mark.asyncio

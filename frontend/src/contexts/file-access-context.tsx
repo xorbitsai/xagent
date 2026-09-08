@@ -17,6 +17,7 @@ export interface FileAccessPolicy {
   inlineDownloadUrl: (fileId: string) => string
   relativePreviewUrl: (fileId: string, relativePath: string) => string
   pdfPreviewUrl?: (fileId: string) => string
+  validationUrl?: (fileId: string) => string
   /**
    * Execute under this policy's credential boundary. The built-in default
    * attaches Bearer authorization. The public policy forces same-origin
@@ -77,6 +78,7 @@ export const defaultFileAccessPolicy: FileAccessPolicy = {
     return getApiUrl() ? url.toString() : `${url.pathname}${url.search}${url.hash}`
   },
   pdfPreviewUrl: (fileId) => buildUrl(`${FILES_API_PREFIX}/preview-pdf/${encodeFileId(fileId)}`),
+  validationUrl: (fileId) => buildUrl(`${FILES_API_PREFIX}/preview/${encodeFileId(fileId)}?validation_only=true`),
   request: apiRequest,
   listFiles: (query) => {
     const params = new URLSearchParams({ page: "1", size: "20" })
@@ -197,6 +199,7 @@ export function createPublicFileAccessPolicy(accessToken: string): FileAccessPol
     downloadUrl: inlineDownloadUrl,
     inlinePreviewUrl,
     inlineDownloadUrl,
+    validationUrl: (fileId) => `${inlinePreviewUrl(fileId)}&validation_only=true`,
     relativePreviewUrl: (fileId, relativePath) => {
       const url = new URL(
         inlinePreviewUrl(fileId),

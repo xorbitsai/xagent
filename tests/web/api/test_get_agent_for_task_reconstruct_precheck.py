@@ -44,6 +44,7 @@ from xagent.web.api.chat import AgentServiceManager
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.task import DAGExecution, Task, TaskStatus, TraceEvent
 from xagent.web.models.user import User
+from xagent.web.services.llm_utils import AutoModelUnavailableError
 from xagent.web.services.task_setup_snapshot import (
     RuntimeUserFields,
     TaskOwnerMismatchError,
@@ -412,6 +413,33 @@ async def test_active_snapshot_owner_mismatch_does_not_fall_back() -> None:
 
     assert exc_info.value is mismatch
     snapshot_loader.assert_called_once_with(42, 999)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [TaskStatus.RUNNING, TaskStatus.PENDING])
+async def test_auto_model_unavailable_does_not_fall_back_during_task_setup(
+    status: TaskStatus,
+) -> None:
+    """Auto exhaustion must escape both reconstruction and normal setup."""
+
+    manager = AgentServiceManager()
+    fallback = MagicMock()
+    manager._default_llm = fallback
+    user = _make_user()
+    task = _make_task(status)
+    db = _build_db(task, user=user)
+    error = AutoModelUnavailableError("Auto model has no active configured candidates")
+
+    with patch(
+        "xagent.web.api.chat.load_task_setup_snapshot_sync",
+        side_effect=error,
+    ) as snapshot_loader:
+        with pytest.raises(AutoModelUnavailableError) as exc_info:
+            await manager.get_agent_for_task(task_id=42, db=db, user=user)
+
+    assert exc_info.value is error
+    assert manager._default_llm is fallback
+    snapshot_loader.assert_called_once_with(42, None)
 
 
 @pytest.mark.asyncio

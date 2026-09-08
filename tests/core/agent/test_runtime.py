@@ -1049,17 +1049,17 @@ async def test_on_llm_start_emits_context_usage_fields() -> None:
     runtime = PatternRuntime(tracer=tracer, execution_id="task-1")
     ctx = ExecutionContext()
     ctx.compact_config.threshold = 96000
-    ctx.add_message("user", "x" * 400)
+    ctx.add_message("user", "persisted-only")
 
-    await runtime.on_llm_start(
-        context=ctx, messages=[{"role": "user", "content": "x" * 400}]
-    )
+    messages = [{"role": "user", "content": "x" * 400}]
+    tools = [{"function": {"name": "save", "description": "d" * 400}}]
+    await runtime.on_llm_start(context=ctx, messages=messages, tools=tools)
 
     usage = [e["data"] for e in tracer.events if "context_threshold" in e["data"]]
     assert usage, tracer.events
     assert usage[0]["context_threshold"] == 96000
     assert isinstance(usage[0]["context_tokens"], int)
-    assert usage[0]["context_tokens"] > 0
+    assert usage[0]["context_tokens"] == ctx.estimate_context_tokens(messages, tools)
 
 
 @pytest.mark.asyncio
@@ -1495,6 +1495,12 @@ async def test_compaction_retries_with_a_smaller_budget_before_truncating() -> N
     context = ExecutionContext(execution_id="budget-retry")
     context.compact_config.threshold = 32000
     context.add_user_message("current request")
+    context.add_assistant_message(
+        "",
+        tool_calls=[
+            {"id": "call-1", "function": {"name": "read_file", "arguments": "{}"}}
+        ],
+    )
     context.add_tool_result(
         "read_file", {"output": "x" * 200_000}, tool_call_id="call-1"
     )
@@ -1541,6 +1547,12 @@ async def test_compaction_ladder_skips_a_budget_the_model_cannot_use() -> None:
     context = ExecutionContext(execution_id="budget-ladder")
     context.compact_config.threshold = 32000
     context.add_user_message("current request")
+    context.add_assistant_message(
+        "",
+        tool_calls=[
+            {"id": "call-1", "function": {"name": "read_file", "arguments": "{}"}}
+        ],
+    )
     context.add_tool_result(
         "read_file", {"output": "x" * 200_000}, tool_call_id="call-1"
     )
@@ -1590,6 +1602,12 @@ async def test_compaction_stops_descending_once_a_budget_is_accepted() -> None:
     context = ExecutionContext(execution_id="budget-monotone")
     context.compact_config.threshold = 32000
     context.add_user_message("current request")
+    context.add_assistant_message(
+        "",
+        tool_calls=[
+            {"id": "call-1", "function": {"name": "read_file", "arguments": "{}"}}
+        ],
+    )
     context.add_tool_result(
         "read_file", {"output": "x" * 200_000}, tool_call_id="call-1"
     )
@@ -1725,6 +1743,15 @@ def _oversized_context(execution_id: str) -> ExecutionContext:
     context = ExecutionContext(execution_id=execution_id)
     context.compact_config.threshold = 32000
     context.add_user_message("current request")
+    context.add_assistant_message(
+        "",
+        tool_calls=[
+            {
+                "id": "call-1",
+                "function": {"name": "read_file", "arguments": "{}"},
+            }
+        ],
+    )
     context.add_tool_result(
         "read_file", {"output": "x" * 200_000}, tool_call_id="call-1"
     )

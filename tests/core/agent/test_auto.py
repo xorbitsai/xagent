@@ -25,7 +25,6 @@ from xagent.core.agent.language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
     OUTPUT_LANGUAGE_SOURCE_METADATA_KEY,
     OUTPUT_LANGUAGE_SOURCE_PLAN,
-    response_language_rules,
 )
 from xagent.core.agent.pattern.auto.auto import DECISION_TOOL_NAME, _AutoChildRuntime
 from xagent.core.model.chat.basic.router import RouterLLM
@@ -864,10 +863,10 @@ async def test_auto_pattern_final_answer_completes_without_child_pattern() -> No
     assert runtime.last_checkpoint is not None
     assert runtime.last_checkpoint["pattern"] == "AutoPattern"
     assert (
-        "same natural language as the current user request"
+        "canonical language contract provided by the system context"
         in tool_schema["description"]
     )
-    assert "tool results, source documents" in answer_schema["description"]
+    assert "canonical language contract" in answer_schema["description"]
 
 
 @pytest.mark.asyncio
@@ -2300,7 +2299,7 @@ async def test_stale_memory_language_does_not_reach_child_as_hard_policy() -> No
     assert "Output language:" not in child_system
     assert "Output language policy:" not in child_system
     assert "Summarize the quarterly revenue trend in one paragraph." in child_system
-    assert response_language_rules() in child_system
+    assert "Canonical request-language evidence" in child_system
 
 
 @pytest.mark.asyncio
@@ -2326,15 +2325,9 @@ async def test_direct_final_answer_allows_an_explicit_target_language() -> None:
     assert result["success"] is True
     assert result["output"] == "La capitale de l'Italie est Rome."
     assert OUTPUT_LANGUAGE_METADATA_KEY not in context.metadata
-    target_rule = (
-        "If the current user request explicitly asks to translate, rewrite, or "
-        "answer in another language, use that requested target language."
-    )
+    target_rule = "explicit or implicit target-language intent"
     tool_schema = llm.calls[0]["tools"][0]["function"]
-    assert target_rule in tool_schema["description"]
-    assert (
-        target_rule in tool_schema["parameters"]["properties"]["answer"]["description"]
-    )
+    assert "canonical language contract" in tool_schema["description"]
     system_content = context.get_messages_for_llm()[0]["content"]
     assert request in system_content
     assert target_rule in system_content
@@ -2420,3 +2413,60 @@ async def test_auto_summarizes_with_the_main_model_when_no_compact_model() -> No
     assert not any(
         "Conversation history to compact" in prompt for prompt in route_prompts
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool_name", ["send_message", "ask_user_question", "zhipu_web_search"]
+)
+async def test_auto_react_messages_preserve_user_turn_attribution(
+    tool_name: str,
+) -> None:
+    class WaitingSearchTool(FakeSearchTool):
+        async def run_json_async(self, args: dict[str, Any]) -> dict[str, Any]:
+            return {"status": "waiting_for_user", "message": "Which source?"}
+
+    context = ExecutionContext(execution_id="auto-message-source")
+    context.add_user_message("Ask before continuing", metadata={"turn_id": "turn-42"})
+    runtime = PatternRuntime()
+    observed: list[dict[str, Any]] = []
+
+    async def capture(payload: dict[str, Any]) -> None:
+        assert runtime.active_turn_id == "turn-42"
+        observed.append(payload)
+
+    runtime.outbound_message_handler = capture
+    args = (
+        {"query": "options"}
+        if tool_name == "zhipu_web_search"
+        else {"message": "Which option?", "expect_response": True}
+    )
+    llm = FakeLLM(
+        [
+            decision_tool_response("react", "Needs user input."),
+            {
+                "tool_calls": [
+                    {
+                        "id": "ask-1",
+                        "function": {
+                            "name": tool_name,
+                            "arguments": json.dumps(args),
+                        },
+                    }
+                ]
+            },
+        ]
+    )
+    result = await AutoPattern().run(
+        context=context, tools=[WaitingSearchTool()], llm=llm, runtime=runtime
+    )
+
+    assert result["status"] == "waiting_for_user"
+    assert len(observed) == 1
+    source = observed[0]["metadata"]
+    if tool_name == "zhipu_web_search":
+        assert len(source["tool_calls"]) == 1
+        source = source["tool_calls"][0]
+    assert source["tool_call_id"] == "ask-1"
+    assert source["tool_name"] == tool_name
+    assert source["turn_id"] == "turn-42"

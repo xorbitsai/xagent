@@ -6,6 +6,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 const apiRequestMock = vi.hoisted(() => vi.fn())
 const toastErrorMock = vi.hoisted(() => vi.fn())
 
+// Validation has its own server-boundary/integration suite; these tests isolate
+// the existing renderer and streaming contracts from that separate request.
+vi.mock('@/components/file/artifact-validation', () => ({
+  ArtifactValidation: ({ children }: { children: React.ReactNode }) => <>{children}</>,
+}))
+
 vi.mock('@/components/ui/sonner', () => ({
   toast: { error: toastErrorMock },
 }))

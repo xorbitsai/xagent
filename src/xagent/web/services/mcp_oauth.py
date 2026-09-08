@@ -873,6 +873,30 @@ async def _refresh_runtime_grant_in_dedicated_session(  # noqa: PLR0913
         refresh_db.close()
 
 
+def select_mcp_oauth_owner(
+    db: Any,
+    *,
+    server_id: int,
+    user_id: int,
+    actor_owner_key: str,
+    auth_config: dict[str, Any],
+) -> str:
+    """Prefer one usable exact actor grant, otherwise use the workspace owner."""
+
+    actor_grants = select_mcp_oauth_grants(
+        db,
+        server_id=server_id,
+        user_id=user_id,
+        auth_config=auth_config,
+        resource_owner_key=actor_owner_key,
+    )
+    try:
+        _select_runtime_grant(actor_grants, set())
+    except MCPOAuthRuntimeError:
+        return f"xagent:user:{user_id}"
+    return actor_owner_key
+
+
 def select_mcp_oauth_grants(  # noqa: PLR0913
     db: Any,
     *,

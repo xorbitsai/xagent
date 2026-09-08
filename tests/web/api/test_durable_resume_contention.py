@@ -719,15 +719,20 @@ async def test_two_concurrent_durable_resumes_schedule_one_execution(
         first = asyncio.ensure_future(
             _execute_durable_task_command(_command(task, owner, "resume-race-a"))
         )
-        await asyncio.wait_for(first_resume_entered.wait(), timeout=1)
+        try:
+            # These are hang guards, not latency assertions: database work and
+            # thread scheduling can take over a second on a loaded CI runner.
+            await asyncio.wait_for(first_resume_entered.wait(), timeout=30)
 
-        # The slot is reserved but no coordinator is registered yet, so the
-        # second command sees RESERVATION_HELD -- uncertain, not satisfied.
-        with pytest.raises(TaskCommandDeferred, match="resume slot"):
-            await _execute_durable_task_command(_command(task, owner, "resume-race-b"))
-
-        release_first_resume.set()
-        result = await asyncio.wait_for(first, timeout=1)
+            # The slot is reserved but no coordinator is registered yet, so the
+            # second command sees RESERVATION_HELD -- uncertain, not satisfied.
+            with pytest.raises(TaskCommandDeferred, match="resume slot"):
+                await _execute_durable_task_command(
+                    _command(task, owner, "resume-race-b")
+                )
+        finally:
+            release_first_resume.set()
+            result = await asyncio.wait_for(first, timeout=30)
 
     assert result is not None
     assert result["resume_outcome"] == ResumeCommandOutcome.SCHEDULED.value

@@ -17,6 +17,12 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.orm.state import InstanceState
 from sqlalchemy.pool import QueuePool
 
+from tests.web.pool_contention_shared import (
+    GUARD_TIMEOUT,
+    LOOP_LIVENESS_TICKS,
+    gated_pool_checkout,
+    wait_for_ticks,
+)
 from xagent.core.execution_scope import ExecutionScope
 from xagent.core.task_runtime import TaskRuntimeContext
 from xagent.core.tools.adapters.vibe.config import (
@@ -798,25 +804,29 @@ async def test_tool_factory_credential_prefetch_waits_off_event_loop(tmp_path):
     async def build_tools() -> list:
         return await ToolFactory.create_all_tools(cfg)
 
-    ticker_task = asyncio.create_task(ticker())
-    build_task = asyncio.create_task(build_tools())
-    try:
-        await asyncio.sleep(0.08)
-        assert ticks >= 4
-        assert not build_task.done()
+    with gated_pool_checkout(engine) as gate:
+        ticker_task = asyncio.create_task(ticker())
+        build_task = asyncio.create_task(build_tools())
+        try:
+            await gate.wait_until_contending()
+            observed = await wait_for_ticks(lambda: ticks)
+            assert observed >= LOOP_LIVENESS_TICKS
+            assert not build_task.done()
 
-        held_connection.close()
-        await build_task
-    finally:
-        if not held_connection.closed:
             held_connection.close()
-        if not build_task.done():
-            build_task.cancel()
+            gate.let_through()
+            await asyncio.wait_for(build_task, timeout=GUARD_TIMEOUT)
+        finally:
+            if not held_connection.closed:
+                held_connection.close()
+                gate.let_through()
+            if not build_task.done():
+                build_task.cancel()
             await asyncio.gather(build_task, return_exceptions=True)
-        stop.set()
-        await ticker_task
-        cfg.close()
-        engine.dispose()
+            stop.set()
+            await ticker_task
+            cfg.close()
+            engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -2843,28 +2853,34 @@ async def test_runtime_policy_refresh_waits_for_pool_off_event_loop(tmp_path):
             ticks += 1
             await asyncio.sleep(0.01)
 
-    ticker_task = asyncio.create_task(ticker())
-    try:
-        await asyncio.sleep(0.02)
-        ticks_before_wait = ticks
-        refresh_task = asyncio.create_task(cfg.refresh_runtime_policy())
-        await asyncio.sleep(0.08)
-        assert ticks - ticks_before_wait >= 4
-        assert not refresh_task.done()
+    with gated_pool_checkout(engine) as gate:
+        ticker_task = asyncio.create_task(ticker())
+        try:
+            refresh_task = asyncio.create_task(cfg.refresh_runtime_policy())
+            await gate.wait_until_contending()
+            observed = await wait_for_ticks(lambda: ticks)
+            assert observed >= LOOP_LIVENESS_TICKS
+            assert not refresh_task.done()
 
-        held_connection.close()
-        await refresh_task
-        assert cfg.get_user_tool_overrides() == {"calculator": {"enabled": False}}
-        assert cfg.get_user_tool_allowlist() == ["file"]
-    finally:
-        if not held_connection.closed:
             held_connection.close()
-        stop.set()
-        await ticker_task
-        cfg.close()
-        set_user_tool_overrides_hook(None)
-        set_user_tool_allowlist_hook(None)
-        engine.dispose()
+            gate.let_through()
+            await asyncio.wait_for(refresh_task, timeout=GUARD_TIMEOUT)
+            assert cfg.get_user_tool_overrides() == {"calculator": {"enabled": False}}
+            assert cfg.get_user_tool_allowlist() == ["file"]
+        finally:
+            if not held_connection.closed:
+                held_connection.close()
+                gate.let_through()
+            await asyncio.wait_for(
+                asyncio.gather(refresh_task, return_exceptions=True),
+                timeout=GUARD_TIMEOUT,
+            )
+            stop.set()
+            await ticker_task
+            cfg.close()
+            set_user_tool_overrides_hook(None)
+            set_user_tool_allowlist_hook(None)
+            engine.dispose()
 
 
 def test_legacy_oauth_session_uses_engine_when_caller_is_connection_bound():

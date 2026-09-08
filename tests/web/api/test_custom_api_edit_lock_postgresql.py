@@ -45,6 +45,7 @@ from xagent.web.models.custom_api import CustomApi, UserCustomApi
 from xagent.web.models.database import Base
 from xagent.web.models.user import User
 from xagent.web.services.connector_team_scope import (
+    ConnectorAccess,
     ConnectorDeleteDecision,
     set_connector_team_hooks,
 )
@@ -88,6 +89,51 @@ def seeded(session_factory):
         )
         db.commit()
         return int(owner.id), int(api.id)
+
+
+@pytest.fixture()
+def member(session_factory):
+    """A second user, distinct from ``seeded``'s owner, with no personal
+    link row of their own by default -- the caller the post-lock
+    re-authorization tests below exercise."""
+    with session_factory() as db:
+        user = User(
+            username="custom-api-edit-lock-member", password_hash="x", is_admin=False
+        )
+        db.add(user)
+        db.commit()
+        return int(user.id)
+
+
+def _add_member_link(session_factory, member_id, api_id, *, can_edit):
+    with session_factory() as db:
+        db.add(
+            UserCustomApi(
+                user_id=member_id,
+                custom_api_id=api_id,
+                is_owner=False,
+                can_edit=can_edit,
+                is_active=True,
+            )
+        )
+        db.commit()
+
+
+def _sequenced_access_hook(*answers):
+    """An access hook that answers differently on successive calls, mirroring
+    ``tests/web/api/test_custom_api_team_connector_edit.py``'s helper of the
+    same name. Records every call's ``refs`` on ``.calls`` so a test can pin
+    how many round trips the route pays."""
+    calls: list[object] = []
+
+    def hook(db, user_id, refs):
+        calls.append(refs)
+        index = min(len(calls) - 1, len(answers) - 1)
+        answer = answers[index]
+        return {ref: answer for ref in refs}
+
+    hook.calls = calls
+    return hook
 
 
 def test_a_second_editor_blocks_until_the_first_editors_transaction_finishes(
@@ -933,3 +979,313 @@ def test_a_delete_whose_association_is_revoked_after_the_lock_is_refused_before_
         assert fresh.query(CustomApi).filter(CustomApi.id == api_id).one(), (
             "the shared definition row must survive a refused delete"
         )
+
+
+def test_a_link_deleted_mid_wait_is_admitted_when_the_team_verdict_still_grants(
+    session_factory, seeded, member
+) -> None:
+    """A caller whose own link row grants the edit at the gate -- so the
+    gate never resolves a team verdict at all -- but whose row is deleted
+    by a second connection while this route holds the definition row's
+    lock. The post-lock re-check must ask the team verdict on its own
+    behalf, and a granting answer must let the edit through even though no
+    personal row survived the wait.
+    """
+    import xagent.web.api.custom_api as custom_api_api
+    from xagent.web.api.custom_api import CustomApiUpdate
+
+    owner_id, api_id = seeded
+    _add_member_link(session_factory, member, api_id, can_edit=True)
+    current_user = SimpleNamespace(id=member, is_admin=False)
+
+    db = session_factory()
+    real_commit = db.commit
+    commits: list[str] = []
+
+    def record_commit():
+        commits.append("commit")
+        return real_commit()
+
+    db.commit = record_commit
+    revoked_already, queried_entities = _revoke_link_after_lock(
+        db, session_factory, member, api_id, "link-deleted", "can_edit"
+    )
+    hook = _sequenced_access_hook(ConnectorAccess(team_owned=True, can_edit=True))
+    set_connector_team_hooks(access=hook)
+    try:
+        response = custom_api_api.update_custom_api(
+            api_id,
+            CustomApiUpdate(description="admitted-after-link-deleted"),
+            current_user=current_user,
+            db=db,
+        )
+        assert response.description == "admitted-after-link-deleted"
+        assert revoked_already.is_set(), "the concurrent deletion never ran"
+        assert queried_entities[:3] == [
+            (UserCustomApi,),
+            (CustomApi,),
+            (UserCustomApi,),
+        ]
+        assert len(hook.calls) == 1, (
+            "the gate's own row already granted the edit, so it never "
+            "resolves a verdict; only the post-lock re-check should ask"
+        )
+        assert commits == ["commit"]
+    finally:
+        set_connector_team_hooks()
+        db.close()
+
+    with session_factory() as fresh:
+        row = fresh.query(CustomApi).filter(CustomApi.id == api_id).one()
+        assert row.description == "admitted-after-link-deleted"
+
+
+def test_a_link_deleted_mid_wait_after_a_granting_gate_verdict_costs_two_calls(
+    session_factory, seeded, member
+) -> None:
+    """The gate itself needed the team verdict here (the caller's own row
+    does not grant the edit on its own), so it already spent one hook call
+    before the lock. The link is then deleted while the lock is held, and
+    the post-lock re-check spends a second call re-asking the same
+    verdict -- two calls in total, not one.
+    """
+    import xagent.web.api.custom_api as custom_api_api
+    from xagent.web.api.custom_api import CustomApiUpdate
+
+    owner_id, api_id = seeded
+    _add_member_link(session_factory, member, api_id, can_edit=False)
+    current_user = SimpleNamespace(id=member, is_admin=False)
+
+    db = session_factory()
+    revoked_already, queried_entities = _revoke_link_after_lock(
+        db, session_factory, member, api_id, "link-deleted", "can_edit"
+    )
+    hook = _sequenced_access_hook(ConnectorAccess(team_owned=True, can_edit=True))
+    set_connector_team_hooks(access=hook)
+    try:
+        response = custom_api_api.update_custom_api(
+            api_id,
+            CustomApiUpdate(description="admitted-after-second-verdict"),
+            current_user=current_user,
+            db=db,
+        )
+        assert response.description == "admitted-after-second-verdict"
+        assert revoked_already.is_set(), "the concurrent deletion never ran"
+        assert len(hook.calls) == 2, (
+            "the gate's own can_edit=False row already spent one call; the "
+            "post-lock re-check must spend a second one, not reuse the first"
+        )
+    finally:
+        set_connector_team_hooks()
+        db.close()
+
+    with session_factory() as fresh:
+        row = fresh.query(CustomApi).filter(CustomApi.id == api_id).one()
+        assert row.description == "admitted-after-second-verdict"
+
+
+def test_a_personal_row_downgraded_mid_wait_is_admitted_when_the_team_verdict_still_grants(
+    session_factory, seeded, member
+) -> None:
+    """The caller's own row survives the wait but is downgraded to
+    ``can_edit=False`` by a second connection while the lock is held. The
+    gate never resolved a team verdict (the row granted the edit on its
+    own at that point), so this is the re-check's only call.
+    """
+    import xagent.web.api.custom_api as custom_api_api
+    from xagent.web.api.custom_api import CustomApiUpdate
+
+    owner_id, api_id = seeded
+    _add_member_link(session_factory, member, api_id, can_edit=True)
+    current_user = SimpleNamespace(id=member, is_admin=False)
+
+    db = session_factory()
+    revoked_already, queried_entities = _revoke_link_after_lock(
+        db, session_factory, member, api_id, "can-edit-cleared", "can_edit"
+    )
+    hook = _sequenced_access_hook(ConnectorAccess(team_owned=True, can_edit=True))
+    set_connector_team_hooks(access=hook)
+    try:
+        response = custom_api_api.update_custom_api(
+            api_id,
+            CustomApiUpdate(description="admitted-after-downgrade"),
+            current_user=current_user,
+            db=db,
+        )
+        assert response.description == "admitted-after-downgrade"
+        assert revoked_already.is_set(), "the concurrent downgrade never ran"
+        assert len(hook.calls) == 1
+    finally:
+        set_connector_team_hooks()
+        db.close()
+
+    with session_factory() as fresh:
+        row = fresh.query(CustomApi).filter(CustomApi.id == api_id).one()
+        assert row.description == "admitted-after-downgrade"
+        link = (
+            fresh.query(UserCustomApi)
+            .filter(
+                UserCustomApi.custom_api_id == api_id,
+                UserCustomApi.user_id == member,
+            )
+            .one()
+        )
+        assert link.can_edit is False
+
+
+def test_a_link_deleted_mid_wait_with_a_denying_verdict_is_a_404_with_no_shared_write(
+    session_factory, seeded, member
+) -> None:
+    """The same deletion-mid-wait window as the granting tests above, but
+    the re-resolved team verdict denies the edit: the caller has no
+    surviving personal row and no team access either, so this is the same
+    404 an unrelated caller has always gotten, with nothing committed.
+    """
+    import xagent.web.api.custom_api as custom_api_api
+    from xagent.web.api.custom_api import CustomApiUpdate
+
+    owner_id, api_id = seeded
+    _add_member_link(session_factory, member, api_id, can_edit=True)
+    current_user = SimpleNamespace(id=member, is_admin=False)
+
+    db = session_factory()
+    real_commit = db.commit
+    commits: list[str] = []
+
+    def record_commit():
+        commits.append("commit")
+        return real_commit()
+
+    db.commit = record_commit
+    revoked_already, queried_entities = _revoke_link_after_lock(
+        db, session_factory, member, api_id, "link-deleted", "can_edit"
+    )
+    hook = _sequenced_access_hook(ConnectorAccess(team_owned=True, can_edit=False))
+    set_connector_team_hooks(access=hook)
+    try:
+        with pytest.raises(HTTPException) as exc:
+            custom_api_api.update_custom_api(
+                api_id,
+                CustomApiUpdate(description="should-not-land"),
+                current_user=current_user,
+                db=db,
+            )
+        assert exc.value.status_code == 404
+        assert revoked_already.is_set(), "the concurrent deletion never ran"
+        assert commits == [], "a refused edit must commit nothing"
+    finally:
+        set_connector_team_hooks()
+        db.close()
+
+    with session_factory() as fresh:
+        row = fresh.query(CustomApi).filter(CustomApi.id == api_id).one()
+        assert row.description is None, (
+            "the shared definition row must be untouched by a refused edit"
+        )
+
+
+def test_a_link_deleted_mid_wait_on_a_mixed_payload_is_400_not_a_stale_data_error(
+    session_factory, seeded, member
+) -> None:
+    """A payload that carries ``is_active`` alongside a definition-row
+    field takes the lock (the definition field decides that), and the
+    caller's link row is then deleted while the lock is held. The team
+    verdict still grants the edit, so the definition-row half is allowed
+    through -- but with no personal row left to hold ``is_active``, the
+    locked guard must refuse with the same 400 the pre-lock guard uses,
+    rather than letting ``user_api.is_active = ...`` set a shadow
+    attribute on an ORM object backed by a row that no longer exists.
+    """
+    import xagent.web.api.custom_api as custom_api_api
+    from xagent.web.api.custom_api import CustomApiUpdate
+
+    owner_id, api_id = seeded
+    _add_member_link(session_factory, member, api_id, can_edit=True)
+    current_user = SimpleNamespace(id=member, is_admin=False)
+
+    db = session_factory()
+    real_commit = db.commit
+    commits: list[str] = []
+
+    def record_commit():
+        commits.append("commit")
+        return real_commit()
+
+    db.commit = record_commit
+    revoked_already, queried_entities = _revoke_link_after_lock(
+        db, session_factory, member, api_id, "link-deleted", "can_edit"
+    )
+    hook = _sequenced_access_hook(ConnectorAccess(team_owned=True, can_edit=True))
+    set_connector_team_hooks(access=hook)
+    try:
+        with pytest.raises(HTTPException) as exc:
+            custom_api_api.update_custom_api(
+                api_id,
+                CustomApiUpdate(description="should-not-land", is_active=False),
+                current_user=current_user,
+                db=db,
+            )
+        assert exc.value.status_code == 400
+        assert exc.value.detail == (
+            "No personal connection exists to configure is_active for this API"
+        )
+        assert revoked_already.is_set(), "the concurrent deletion never ran"
+        assert commits == [], "a refused edit must commit nothing"
+    finally:
+        set_connector_team_hooks()
+        db.close()
+
+    with session_factory() as fresh:
+        row = fresh.query(CustomApi).filter(CustomApi.id == api_id).one()
+        assert row.description is None, (
+            "the shared definition row must be untouched by a refused edit"
+        )
+
+
+def test_a_link_deleted_mid_wait_admits_through_a_fresh_stand_in_not_a_stale_object(
+    session_factory, seeded, member
+) -> None:
+    """The same admission as the first test in this group, checked from
+    the response side: with no personal row surviving the wait, the
+    response must come from a freshly constructed stand-in rather than
+    the (now stale) ORM object the gate resolved before the lock. Reusing
+    that stale object would raise ``ObjectDeletedError`` once this
+    request's own ``db.commit()`` expires it and something then reads one
+    of its columns -- the failure mode this route had before the fix,
+    which only shows up once this session's own commit forces a refresh
+    of an object mapped to a row a *different* connection removed.
+    """
+    import xagent.web.api.custom_api as custom_api_api
+    from xagent.web.api.custom_api import CustomApiUpdate
+
+    owner_id, api_id = seeded
+    _add_member_link(session_factory, member, api_id, can_edit=True)
+    current_user = SimpleNamespace(id=member, is_admin=False)
+
+    db = session_factory()
+    revoked_already, queried_entities = _revoke_link_after_lock(
+        db, session_factory, member, api_id, "link-deleted", "can_edit"
+    )
+    hook = _sequenced_access_hook(ConnectorAccess(team_owned=True, can_edit=True))
+    set_connector_team_hooks(access=hook)
+    try:
+        response = custom_api_api.update_custom_api(
+            api_id,
+            CustomApiUpdate(description="stand-in-response"),
+            current_user=current_user,
+            db=db,
+        )
+        assert revoked_already.is_set(), "the concurrent deletion never ran"
+        # The stand-in's own flag defaults, not whatever the deleted row
+        # last held -- read straight off the response with no further
+        # session activity in between, so a reused stale object would
+        # already have raised by this point rather than merely disagreeing.
+        assert response.is_active is True
+        assert response.is_default is False
+    finally:
+        set_connector_team_hooks()
+        db.close()
+
+    with session_factory() as fresh:
+        row = fresh.query(CustomApi).filter(CustomApi.id == api_id).one()
+        assert row.description == "stand-in-response"

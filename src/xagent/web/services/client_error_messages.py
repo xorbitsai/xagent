@@ -26,6 +26,10 @@ CLIENT_SAFE_VALIDATION_ERROR = "The message could not be processed. Please try a
 # Task audiences did not necessarily initiate the failing operation, so a
 # task-level failure uses neutral wording instead of the validation fallback.
 CLIENT_SAFE_TASK_FAILURE = "Task execution failed."
+CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE = (
+    "Your Auto model configuration has no usable candidate models. "
+    "Review your Auto model settings."
+)
 CLIENT_SAFE_GUIDANCE_IN_PROGRESS = (
     "A previous guidance message is still being applied. Please wait for it to finish."
 )
@@ -36,6 +40,7 @@ class ClientErrorCode(StrEnum):
 
     MESSAGE_PROCESSING_FAILED = "message_processing_failed"
     TASK_EXECUTION_FAILED = "task_execution_failed"
+    AUTO_MODEL_UNAVAILABLE = "auto_model_unavailable"
     GUIDANCE_IN_PROGRESS = "guidance_in_progress"
     MESSAGE_RATE_LIMITED = "message_rate_limited"
     MESSAGE_ID_CONFLICT = "message_id_conflict"
@@ -61,6 +66,7 @@ def client_error_message(code: ClientErrorCode) -> str:
     return {
         ClientErrorCode.MESSAGE_PROCESSING_FAILED: CLIENT_SAFE_VALIDATION_ERROR,
         ClientErrorCode.TASK_EXECUTION_FAILED: CLIENT_SAFE_TASK_FAILURE,
+        ClientErrorCode.AUTO_MODEL_UNAVAILABLE: CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE,
         ClientErrorCode.GUIDANCE_IN_PROGRESS: CLIENT_SAFE_GUIDANCE_IN_PROGRESS,
         ClientErrorCode.MESSAGE_RATE_LIMITED: (
             "You're sending messages too quickly. Please wait a moment and try again."

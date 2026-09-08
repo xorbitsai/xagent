@@ -188,7 +188,7 @@ def test_disconnect_first_replacement_cannot_receive_stale_callback_grant(
     disconnect_errors: list[BaseException] = []
     producer_results: list[object] = []
 
-    def gated_team_delete(*args):
+    def gated_team_delete(*args, **kwargs):
         teardown_locked.set()
         assert allow_teardown.wait(timeout=5)
         return SimpleNamespace(
@@ -307,7 +307,7 @@ def test_producer_first_holds_lifecycle_locks_until_grant_commit(
     monkeypatch.setattr(
         connector_team_scope,
         "delete_team_connector",
-        lambda *args: SimpleNamespace(
+        lambda *args, **kwargs: SimpleNamespace(
             blocked_reason=None,
             team_owned=False,
             authorized=False,
@@ -385,7 +385,7 @@ def _allow_app_teardown(monkeypatch) -> None:
     monkeypatch.setattr(
         connector_team_scope,
         "delete_team_connector",
-        lambda *args: SimpleNamespace(
+        lambda *args, **kwargs: SimpleNamespace(
             blocked_reason=None,
             team_owned=False,
             authorized=False,
@@ -623,7 +623,7 @@ def test_real_callback_producer_blocks_disconnect_until_grant_commit(
     monkeypatch.setattr(
         connector_team_scope,
         "delete_team_connector",
-        lambda *args: SimpleNamespace(
+        lambda *args, **kwargs: SimpleNamespace(
             blocked_reason=None,
             team_owned=False,
             authorized=False,
@@ -711,7 +711,7 @@ def test_connect_rejects_delete_during_discovery(
             token_endpoint_auth_method="none",
         )
 
-    def gated_team_delete(*args):
+    def gated_team_delete(*args, **kwargs):
         delete_locked.set()
         assert allow_delete.wait(timeout=5)
         return SimpleNamespace(
@@ -874,3 +874,132 @@ def test_callback_rejects_deactivation_during_exchange(
             .one()
         )
         assert association.is_active is False
+
+
+def test_trusted_reconnect_and_disconnect_use_one_lock_order(
+    postgresql_engine, monkeypatch
+) -> None:
+    factory = sessionmaker(bind=postgresql_engine, autoflush=False, autocommit=False)
+    seed = _seed_lifecycle(factory, flow_consumed=False)
+    with factory() as setup_db:
+        association = (
+            setup_db.query(UserMCPServer)
+            .filter(
+                UserMCPServer.user_id == seed["user_id"],
+                UserMCPServer.mcpserver_id == seed["server_id"],
+            )
+            .one()
+        )
+        association.is_owner = False
+        association.can_delete = True
+        association.is_active = False
+        setup_db.query(MCPOAuthFlowState).delete()
+        setup_db.commit()
+
+    discovery_started = threading.Event()
+    allow_discovery = threading.Event()
+    delete_locked = threading.Event()
+    allow_delete = threading.Event()
+    connect_finished = threading.Event()
+    connect_errors: list[BaseException] = []
+    disconnect_errors: list[BaseException] = []
+
+    def ensure_catalog(db, app_id):
+        assert app_id == "postgres-oauth-records"
+        return db.get(MCPServer, seed["server_id"]), {"id": app_id}
+
+    async def discover(*args, **kwargs):
+        discovery_started.set()
+        assert allow_discovery.wait(timeout=10)
+        return _discovery()
+
+    async def register(*args, **kwargs):
+        return SimpleNamespace(
+            client_id="postgres-dynamic-client",
+            token_endpoint_auth_method="none",
+        )
+
+    def gated_team_delete(*args, **kwargs):
+        delete_locked.set()
+        assert allow_delete.wait(timeout=10)
+        return SimpleNamespace(
+            blocked_reason=None,
+            team_owned=False,
+            authorized=False,
+            delete_definition=False,
+        )
+
+    monkeypatch.setattr(mcp_api, "_ensure_catalog_mcp_oauth_server", ensure_catalog)
+    monkeypatch.setattr(mcp_api, "_discover_mcp_oauth_for_server", discover)
+    monkeypatch.setattr(mcp_api, "register_mcp_oauth_public_client", register)
+    monkeypatch.setattr(
+        connector_team_scope, "delete_team_connector", gated_team_delete
+    )
+
+    def connect() -> None:
+        try:
+            with factory() as connect_db:
+                asyncio.run(
+                    mcp_api.connect_mcp_oauth_app_for_owner(
+                        "postgres-oauth-records",
+                        mcp_api.MCPOAuthConnectRequest(redirect_after="/settings/mcp"),
+                        current_user=connect_db.get(User, seed["user_id"]),
+                        db=connect_db,
+                        resource_owner_key="toby:slack:workspace:alice",
+                        accept="application/json",
+                    )
+                )
+                connect_db.commit()
+        except BaseException as exc:  # pragma: no cover - assertion reports it
+            connect_errors.append(exc)
+        finally:
+            connect_finished.set()
+
+    def disconnect() -> None:
+        try:
+            with factory() as disconnect_db:
+                asyncio.run(
+                    mcp_api.delete_mcp_server(
+                        seed["server_id"],
+                        current_user=disconnect_db.get(User, seed["user_id"]),
+                        db=disconnect_db,
+                    )
+                )
+        except BaseException as exc:  # pragma: no cover - assertion reports it
+            disconnect_errors.append(exc)
+
+    connect_thread = threading.Thread(target=connect, name="postgres-owner-connect")
+    disconnect_thread = threading.Thread(
+        target=disconnect, name="postgres-owner-disconnect"
+    )
+    try:
+        connect_thread.start()
+        assert discovery_started.wait(timeout=10)
+        disconnect_thread.start()
+        assert delete_locked.wait(timeout=10)
+        allow_discovery.set()
+        assert not connect_finished.wait(timeout=0.2)
+        allow_delete.set()
+        connect_thread.join(timeout=10)
+        disconnect_thread.join(timeout=10)
+    finally:
+        allow_discovery.set()
+        allow_delete.set()
+
+    assert not connect_thread.is_alive()
+    assert not disconnect_thread.is_alive()
+    assert disconnect_errors == []
+    assert len(connect_errors) == 1
+    assert isinstance(connect_errors[0], HTTPException)
+    assert connect_errors[0].status_code == 409
+    with factory() as verify_db:
+        assert (
+            verify_db.query(UserMCPServer)
+            .filter(
+                UserMCPServer.user_id == seed["user_id"],
+                UserMCPServer.mcpserver_id == seed["server_id"],
+            )
+            .count()
+            == 0
+        )
+        assert verify_db.query(MCPOAuthFlowState).count() == 0

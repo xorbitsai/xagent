@@ -15,6 +15,7 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         "src/components/file/file-preview-content.tsx",
         "src/components/file/file-viewer.tsx",
         "src/components/file/inline-file-preview.tsx",
+        "src/components/file/artifact-validation.tsx",
         "src/components/file/pptx-preview-renderer.tsx",
         "src/components/task/task-conversation-panel.tsx",
         "src/components/ui/markdown-renderer.tsx",
@@ -30,6 +31,8 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         "src/lib/api-wrapper.ts",
         "src/lib/auth-cache.ts",
         "src/lib/files-disabled-presentation.ts",
+        "src/lib/remark-currency-safe-math.ts",
+        "src/lib/remark-preserve-table-content.ts",
         "src/lib/widget-parent-message.ts",
         "src/contexts/presentation-capabilities.tsx",
         "src/app/settings/page.tsx",
@@ -75,6 +78,12 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
           statements: 85, branches: 80, functions: 90, lines: 85,
         },
         "src/lib/auth-cache.ts": { statements: 90, branches: 80, functions: 90, lines: 90 },
+        "src/lib/remark-currency-safe-math.ts": {
+          statements: 100, branches: 100, functions: 100, lines: 100,
+        },
+        "src/lib/remark-preserve-table-content.ts": {
+          statements: 95, branches: 80, functions: 100, lines: 95,
+        },
         "src/contexts/presentation-capabilities.tsx": {
           statements: 100, branches: 100, functions: 100, lines: 100,
         },
@@ -112,6 +121,9 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         "src/components/file/inline-file-preview.tsx": {
           statements: 70, branches: 55, functions: 60, lines: 70,
         },
+        "src/components/file/artifact-validation.tsx": {
+          statements: 90, branches: 80, functions: 90, lines: 90,
+        },
         "src/components/file/pptx-preview-renderer.tsx": {
           statements: 45, branches: 35, functions: 30, lines: 45,
         },
@@ -144,6 +156,7 @@ export default defineConfig({
       "src/components/file/file-preview-content.test.tsx",
       "src/components/file/file-viewer.test.tsx",
       "src/components/file/inline-file-preview.test.tsx",
+      "src/components/file/artifact-validation.test.tsx",
       "src/components/file/pptx-preview-renderer.test.tsx",
       "src/components/layout/sidebar.test.tsx",
       "src/components/pages/login.test.tsx",
@@ -166,6 +179,7 @@ export default defineConfig({
       "src/lib/api-wrapper.test.ts",
       "src/lib/auth-cache.test.ts",
       "src/lib/files-disabled-presentation.test.ts",
+      "src/lib/remark-currency-safe-math.test.ts",
     ],
   },
 })

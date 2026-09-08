@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from threading import Barrier
@@ -391,6 +392,13 @@ def test_pk_anchor_validation_failure_does_not_fall_back_to_the_legacy_scan(
     that exact row, not a cue to go search other rows -- even when the
     legacy event_id column names a different, genuinely valid checkpoint
     that a legacy-only scan would have accepted.
+
+    One shape is deliberately excluded and is not this test's subject: a row
+    whose *only* failed condition is the run partition, and only because the
+    field is absent, is a pre-existing row rather than a failed validation,
+    and does defer to the legacy scan (see
+    test_pk_anchor_missing_run_partition_defers_to_the_legacy_scan). This
+    test's row fails on ``build_id``, which no reclassification covers.
     """
     user = _create_user(db_session, suffix="pk-no-fallback")
     task = _create_expired_task(
@@ -433,6 +441,259 @@ def test_pk_anchor_validation_failure_does_not_fall_back_to_the_legacy_scan(
         is CheckpointRecoveryVerdict.NOT_RECOVERABLE
     )
     assert _recover_expired_task(db_session, task) == TaskStatus.FAILED
+
+
+def test_pk_anchor_missing_run_partition_defers_to_the_legacy_scan(
+    db_session, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A pointer row whose only failed condition is an *absent* run-partition
+    field is a pre-existing row -- the shape the 20260804 backfill produces
+    from a trace_events row written before that field existed -- not a
+    mismatched one. It defers to the legacy event_id scan the same way a
+    dangling pointer does, instead of failing the candidate on the spot.
+
+    The legacy pointer here names a different, genuinely valid checkpoint, so
+    the deferral has somewhere to land and the candidate recovers. That is
+    what separates this cell from
+    test_recovery_rejects_checkpoint_without_current_run_provenance[None],
+    where both pointers name the same field-less row and the deferral
+    correctly still ends in FAILED.
+    """
+    caplog.set_level(logging.INFO, logger="xagent.web.services.task_lease_service")
+    user = _create_user(db_session, suffix="pk-absent-partition")
+    task = _create_expired_task(
+        db_session,
+        user_id=int(user.id),
+        suffix="pk-absent-partition",
+    )
+    pre_existing_anchor = TraceEvent(
+        task_id=task.id,
+        event_id="pk-absent-partition-preexisting",
+        event_type="system_update_general",
+        timestamp=utc_now(),
+        data={
+            "checkpoint_type": CHECKPOINT_TYPE,
+            "snapshot": {"type": "checkpoint"},
+            # No TASK_RUN_ID_TRACE_FIELD at all -- absent, not wrong.
+        },
+    )
+    valid_legacy_row = TraceEvent(
+        task_id=task.id,
+        event_id="pk-absent-partition-valid",
+        event_type="system_update_general",
+        timestamp=utc_now(),
+        data={
+            "checkpoint_type": CHECKPOINT_TYPE,
+            "snapshot": {"type": "checkpoint"},
+            TASK_RUN_ID_TRACE_FIELD: task.run_id,
+        },
+    )
+    db_session.add_all([pre_existing_anchor, valid_legacy_row])
+    db_session.flush()
+    task.last_checkpoint_trace_event_id = pre_existing_anchor.id
+    task.last_checkpoint_event_id = valid_legacy_row.event_id
+    db_session.commit()
+
+    candidate = _candidate_for_task(task)
+    assert (
+        resolve_checkpoint_recovery(db_session, candidate)
+        is CheckpointRecoveryVerdict.RECOVERABLE
+    )
+    # resolve_checkpoint_recovery is pure and was just called directly above
+    # to check the verdict; clear its log line so the assertion below pins
+    # the recovery path's own call, not a second echo of the first.
+    caplog.clear()
+    assert _recover_expired_task(db_session, task) == TaskStatus.PAUSED
+
+    infos = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.INFO
+        and r.name == "xagent.web.services.task_lease_service"
+    ]
+    assert len(infos) == 1, caplog.records
+    assert infos[0].msg == (
+        "Task %s's checkpoint pointer %s is missing its "
+        "run-partition field; deferring to the legacy event_id scan "
+        "rather than treating the row as a mismatch"
+    )
+
+
+def test_pk_anchor_wrong_run_partition_still_fails_without_a_legacy_retry(
+    db_session,
+) -> None:
+    """The reclassification above requires the run-partition field to be
+    *absent*. A field that is present and holds another run's id is a real
+    mismatch: it fails the candidate on the spot and never reaches the legacy
+    scan, even when the legacy pointer names a genuinely valid checkpoint
+    that scan would have accepted.
+    """
+    user = _create_user(db_session, suffix="pk-wrong-partition")
+    task = _create_expired_task(
+        db_session,
+        user_id=int(user.id),
+        suffix="pk-wrong-partition",
+    )
+    mismatched_anchor = TraceEvent(
+        task_id=task.id,
+        event_id="pk-wrong-partition-mismatched",
+        event_type="system_update_general",
+        timestamp=utc_now(),
+        data={
+            "checkpoint_type": CHECKPOINT_TYPE,
+            "snapshot": {"type": "checkpoint"},
+            TASK_RUN_ID_TRACE_FIELD: "some-other-run",
+        },
+    )
+    valid_legacy_row = TraceEvent(
+        task_id=task.id,
+        event_id="pk-wrong-partition-valid",
+        event_type="system_update_general",
+        timestamp=utc_now(),
+        data={
+            "checkpoint_type": CHECKPOINT_TYPE,
+            "snapshot": {"type": "checkpoint"},
+            TASK_RUN_ID_TRACE_FIELD: task.run_id,
+        },
+    )
+    db_session.add_all([mismatched_anchor, valid_legacy_row])
+    db_session.flush()
+    task.last_checkpoint_trace_event_id = mismatched_anchor.id
+    task.last_checkpoint_event_id = valid_legacy_row.event_id
+    db_session.commit()
+
+    candidate = _candidate_for_task(task)
+    assert (
+        resolve_checkpoint_recovery(db_session, candidate)
+        is CheckpointRecoveryVerdict.NOT_RECOVERABLE
+    )
+    assert _recover_expired_task(db_session, task) == TaskStatus.FAILED
+
+
+def test_pk_anchor_no_run_id_candidate_fails_closed_before_the_shared_predicate(
+    db_session,
+) -> None:
+    """A candidate with no run_id (a run claim that never wrote provenance)
+    fails closed before the shared predicate is even consulted. The shared
+    predicate treats a null run_id as a legitimate partition, matched by a
+    row whose own run field is also absent -- but that answer belongs to the
+    root-checkpoint read path the predicate was written for, not to lease
+    recovery, which cannot prove an exact pointer belongs to the expired run
+    without provenance. This is the guard the read path's shared predicate
+    delegates back to its callers; this test pins that lease recovery
+    actually applies it.
+    """
+    user = _create_user(db_session, suffix="pk-no-run-id")
+    task = _create_expired_task(
+        db_session,
+        user_id=int(user.id),
+        suffix="pk-no-run-id",
+    )
+    task.run_id = None
+    row = TraceEvent(
+        task_id=task.id,
+        event_id="pk-no-run-id-row",
+        event_type="system_update_general",
+        timestamp=utc_now(),
+        data={
+            "checkpoint_type": CHECKPOINT_TYPE,
+            "snapshot": {"type": "checkpoint"},
+            # No TASK_RUN_ID_TRACE_FIELD -- matches a null run_id under the
+            # shared predicate's own rule, which is exactly why this
+            # candidate must fail closed before reaching it.
+        },
+    )
+    db_session.add(row)
+    db_session.flush()
+    task.last_checkpoint_trace_event_id = row.id
+    db_session.commit()
+
+    candidate = _candidate_for_task(task)
+    assert (
+        resolve_checkpoint_recovery(db_session, candidate)
+        is CheckpointRecoveryVerdict.NOT_RECOVERABLE
+    )
+
+
+def test_pk_anchor_execution_identity_mismatch_is_not_recoverable(
+    db_session,
+) -> None:
+    """The shared predicate's execution-identity condition is evaluated for
+    lease recovery too, with execution_id set to str(candidate.task_id) --
+    web's execution id is the task id, the same value the other two
+    by-primary-key callers pass. A row whose payload carries a different
+    execution_id fails that condition and is not recoverable, proving the
+    sixth condition is actually wired up rather than silently skipped."""
+    user = _create_user(db_session, suffix="pk-wrong-execution-id")
+    task = _create_expired_task(
+        db_session,
+        user_id=int(user.id),
+        suffix="pk-wrong-execution-id",
+    )
+    row = TraceEvent(
+        task_id=task.id,
+        event_id="pk-wrong-execution-id-row",
+        event_type="system_update_general",
+        timestamp=utc_now(),
+        data={
+            "checkpoint_type": CHECKPOINT_TYPE,
+            "snapshot": {"type": "checkpoint"},
+            TASK_RUN_ID_TRACE_FIELD: task.run_id,
+            "execution_id": "not-this-task-id",
+        },
+    )
+    db_session.add(row)
+    db_session.flush()
+    task.last_checkpoint_trace_event_id = row.id
+    db_session.commit()
+
+    candidate = _candidate_for_task(task)
+    assert (
+        resolve_checkpoint_recovery(db_session, candidate)
+        is CheckpointRecoveryVerdict.NOT_RECOVERABLE
+    )
+
+
+def test_pk_anchor_execution_identity_match_is_recoverable(db_session) -> None:
+    """The positive side of the identity check above: a row whose payload
+    carries the *correct* execution_id -- str(task.id), matching what
+    _candidate_row_failures passes -- is recoverable.
+
+    This is not redundant with the happy-path checkpoints built by
+    _create_expired_task, which never set an execution_id field at all;
+    checkpoint_execution_id then reads as empty and the identity condition
+    is vacuously satisfied regardless of what value is passed in. Only a
+    row that actually carries the right id proves the right id is the one
+    being passed, rather than merely that nothing is being compared.
+    """
+    user = _create_user(db_session, suffix="pk-right-execution-id")
+    task = _create_expired_task(
+        db_session,
+        user_id=int(user.id),
+        suffix="pk-right-execution-id",
+    )
+    row = TraceEvent(
+        task_id=task.id,
+        event_id="pk-right-execution-id-row",
+        event_type="system_update_general",
+        timestamp=utc_now(),
+        data={
+            "checkpoint_type": CHECKPOINT_TYPE,
+            "snapshot": {"type": "checkpoint"},
+            TASK_RUN_ID_TRACE_FIELD: task.run_id,
+            "execution_id": str(task.id),
+        },
+    )
+    db_session.add(row)
+    db_session.flush()
+    task.last_checkpoint_trace_event_id = row.id
+    db_session.commit()
+
+    candidate = _candidate_for_task(task)
+    assert (
+        resolve_checkpoint_recovery(db_session, candidate)
+        is CheckpointRecoveryVerdict.RECOVERABLE
+    )
 
 
 _RECOVERY_SINGLE_FAULT_FIELDS = [
@@ -677,6 +938,105 @@ def test_ambiguous_legacy_checkpoint_registers_a_degradation_signal(
             is CheckpointRecoveryVerdict.INDETERMINATE
         )
         assert CHECKPOINT_LEGACY_POINTER_AMBIGUOUS in active_degradations()
+    finally:
+        clear_degradation(CHECKPOINT_LEGACY_POINTER_AMBIGUOUS)
+
+
+def test_pk_anchor_missing_run_partition_then_ambiguous_legacy_id_is_indeterminate(
+    db_session,
+) -> None:
+    """The two deferral conditions meeting at once: a pointer row missing only
+    its run-partition field defers to the legacy scan, and that scan finds the
+    legacy event_id on more than one row.
+
+    Pinned because it is a change of kind, not of degree. Before the pointer
+    row was reclassified, a field-less pointer row resolved NOT_RECOVERABLE on
+    the spot and the task was failed once. The same candidate now reaches the
+    legacy scan's ambiguity branch, so the verdict is INDETERMINATE: the task
+    and its lease are left untouched and every later sweep selects the
+    candidate again, with no terminal exit of its own. Leaving it untouched is
+    deliberate -- an ambiguity a later sweep may resolve must not fail a
+    readable checkpoint -- but the repetition is unbounded, which is why the
+    degradation signal asserted below has to fire. Whether an INDETERMINATE
+    candidate should reach a terminal state after a bounded number of sweeps
+    is #2118, not decided here.
+
+    Both conditions are needed to reach this path. Either alone is already
+    covered: test_pk_anchor_missing_run_partition_defers_to_the_legacy_scan
+    has the deferral landing on a valid row, and
+    test_ambiguous_legacy_checkpoint_skips_the_candidate_for_the_next_sweep
+    reaches the ambiguity through a pointer that was never set.
+    """
+    from xagent.web.services.ops_signals import (
+        CHECKPOINT_LEGACY_POINTER_AMBIGUOUS,
+        active_degradations,
+        clear_degradation,
+    )
+
+    user = _create_user(db_session, suffix="absent-partition-ambiguous")
+    task = _create_expired_task(
+        db_session,
+        user_id=int(user.id),
+        suffix="absent-partition-ambiguous",
+    )
+    legacy_event_id = "absent-partition-ambiguous-legacy"
+    pre_existing_anchor = TraceEvent(
+        task_id=task.id,
+        event_id="absent-partition-ambiguous-preexisting",
+        event_type="system_update_general",
+        timestamp=utc_now(),
+        data={
+            "checkpoint_type": CHECKPOINT_TYPE,
+            "snapshot": {"type": "checkpoint"},
+            # No TASK_RUN_ID_TRACE_FIELD at all -- absent, not wrong, so the
+            # pointer defers instead of failing the candidate on the spot.
+        },
+    )
+    duplicate_legacy_rows = [
+        TraceEvent(
+            task_id=task.id,
+            event_id=legacy_event_id,
+            event_type="system_update_general",
+            timestamp=utc_now(),
+            data={
+                "checkpoint_type": CHECKPOINT_TYPE,
+                "snapshot": {"type": "checkpoint"},
+                TASK_RUN_ID_TRACE_FIELD: task.run_id,
+            },
+        )
+        for _ in range(2)
+    ]
+    db_session.add_all([pre_existing_anchor, *duplicate_legacy_rows])
+    db_session.flush()
+    task.last_checkpoint_trace_event_id = pre_existing_anchor.id
+    task.last_checkpoint_event_id = legacy_event_id
+    db_session.commit()
+
+    clear_degradation(CHECKPOINT_LEGACY_POINTER_AMBIGUOUS)
+    try:
+        candidate = _candidate_for_task(task)
+        assert (
+            resolve_checkpoint_recovery(db_session, candidate)
+            is CheckpointRecoveryVerdict.INDETERMINATE
+        )
+        assert CHECKPOINT_LEGACY_POINTER_AMBIGUOUS in active_degradations()
+
+        assert _recover_expired_task(db_session, task) is None
+
+        db_session.expire_all()
+        persisted = db_session.get(Task, int(task.id))
+        assert persisted.status == TaskStatus.RUNNING
+        assert persisted.runner_id is not None
+        assert persisted.lease_expires_at is not None
+
+        # No terminal exit: the candidate is still on the expired-lease scan,
+        # so the next sweep resolves the same two conditions the same way.
+        rescanned = get_expired_task_lease_candidates(
+            db_session,
+            cutoff=utc_now(),
+            limit=10,
+        )
+        assert any(c.task_id == int(task.id) for c in rescanned)
     finally:
         clear_degradation(CHECKPOINT_LEGACY_POINTER_AMBIGUOUS)
 

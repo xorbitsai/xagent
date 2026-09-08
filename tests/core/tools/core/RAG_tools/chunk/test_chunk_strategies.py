@@ -1,9 +1,13 @@
 """Unit tests for chunk strategies (P0 token merge, P1 protected content & headers, custom separators)."""
 
+import pytest
+
 from xagent.core.tools.core.RAG_tools.chunk.chunk_strategies import (
     _find_protected_ranges,
     _split_by_headers,
     _split_by_separators_core,
+    _split_by_separators_with_metadata,
+    _split_by_separators_with_metadata_and_protection,
     apply_markdown_strategy,
     apply_recursive_strategy,
     attach_media_context,
@@ -126,12 +130,118 @@ class TestSplitBySeparatorsCore:
         assert "block1" in result[0]
         assert "block2" in result[1] or "block3" in result[1]
 
+    def test_splitting_is_lossless(self) -> None:
+        """The one invariant a splitter owes its caller: rejoining the pieces
+        reproduces the input exactly. Nothing else here checked that, and every
+        other case uses a single separator, so a bug that dropped every other
+        delimiter across mixed separators went unseen."""
+        texts = [
+            "attach documents and Qualifications in bulk using our CSV integration.",
+            "Line one\n\nLine two\nLine three with words",
+            "第一句。第二句！第三句？结束",
+            "a, b, c. d e f",
+            "mixed\n\npara, with. all 。 separators！ present？ here",
+        ]
+        for text in texts:
+            assert "".join(_split_by_separators_core(text, None)) == text
+
+    def test_delimiters_attach_to_the_preceding_chunk(self) -> None:
+        """The docstring's contract. One capturing group per separator makes
+        re.split emit N elements per match, so a two-step read lands on the
+        wrong element and delimiters end up leading the *next* chunk instead."""
+        result = _split_by_separators_core("attach documents and more", None)
+
+        assert result == ["attach ", "documents ", "and ", "more"]
+
+    def test_adjacent_separators_do_not_form_a_punctuation_chunk(self) -> None:
+        """A separator that follows another separator has a delimiter but no
+        text of its own. Judging the piece by the whole string counts the
+        punctuation as content and emits a chunk holding only that."""
+        result = _split_by_separators_core("hello 。 world", None)
+
+        assert result == ["hello 。 ", "world"]
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "",
+            "x",
+            "no separators present here at all",
+            "。leading delimiter then text",
+            "trailing delimiter then nothing。",
+        ],
+    )
+    def test_splitting_is_lossless_at_the_edges(self, text: str) -> None:
+        assert "".join(_split_by_separators_core(text, None)) == text
+
+    def test_splitting_is_lossless_with_custom_separators(self) -> None:
+        """Every other case here uses the defaults, so a bug that only showed
+        up with a caller-supplied list would go unseen."""
+        text = "one|two||three|four"
+        assert "".join(_split_by_separators_core(text, ["||", "|"])) == text
+
     def test_empty_separators_list_uses_default(self) -> None:
         text = "a\n\nb"
         result = _split_by_separators_core(text, [])
         assert len(result) == 2
         assert "a" in result[0]
         assert "b" in result[1]
+
+
+class TestSplitWithMetadataIsLossless:
+    """The core splitter's guarantee has to survive the wrappers. It did not:
+    the metadata wrapper dropped whitespace-only units, and the protected-content
+    path - which apply_recursive_strategy uses by default - runs the wrapper once
+    per segment between fenced regions, so the separator holding two code blocks
+    apart was deleted."""
+
+    def test_metadata_wrapper_keeps_a_blank_leading_unit(self) -> None:
+        """Text opening with a separator makes the core splitter emit a blank
+        first unit. Filtering blank units here is what deleted the separator
+        between two protected regions, so the input has to contain one - a
+        string with no blank unit passes whether or not the filter is there."""
+        text = "\n\nalpha beta"
+        units = _split_by_separators_with_metadata(text, None)
+
+        assert [u["text"] for u in units] == ["\n\n", "alpha ", "beta"]
+        assert "".join(u["text"] for u in units) == text
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "intro text\n\n```\ncode here\n```\n\ntail words",
+            "a\n\n```\nx\n```\n\n```\ny\n```\n\nb",
+            "```\nonly a fence\n```",
+            "no fence anywhere in this text",
+        ],
+    )
+    def test_protected_regions_keep_the_text_between_them(self, text: str) -> None:
+        units = _split_by_separators_with_metadata_and_protection(
+            text, None, None, None
+        )
+
+        assert "".join(u["text"] for u in units) == text
+
+
+class TestApplyRecursiveStrategyKeepsWordsApart:
+    """The bug reached users through this entry point, not through the private
+    helpers, so the regression guard belongs here too. Every other test around
+    it asserts chunk counts and substring presence, neither of which notices
+    words fusing together."""
+
+    def test_words_are_not_fused(self) -> None:
+        """chunk_size is a character budget, so it is set well above the text
+        to keep the window from cutting words itself - what is under test is
+        the separator handling, not where the window lands."""
+        text = "attach documents and Qualifications in bulk using our CSV integration"
+        chunks = apply_recursive_strategy(
+            [{"text": text}], {"chunk_size": 500, "chunk_overlap": 0}
+        )
+
+        joined = " ".join(c["text"] for c in chunks)
+        for glued in ("CSVintegration", "documentsand", "inbulk", "usingour"):
+            assert glued not in joined
+        assert "CSV integration" in joined
 
 
 class TestApplyRecursiveStrategyCustomSeparators:

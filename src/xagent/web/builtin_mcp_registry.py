@@ -446,7 +446,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
         {
             "app_id": "google-drive",
             "name": "Google Drive",
-            "description": "Access Google Drive to search for files, read documents, manage your cloud storage, and share files or folders with others.",
+            "description": "Access Google Drive to search for files, read documents, manage your cloud storage, and manage sharing on files or folders -- including granting access to someone new and revoking an existing collaborator's access.",
             "icon": "https://www.google.com/s2/favicons?domain=drive.google.com&sz=128",
             "transport": "oauth",
             "provider_name": "google",

@@ -31,7 +31,9 @@ PREVIOUS_DESCRIPTION = (
 )
 CURRENT_DESCRIPTION = (
     "Access Google Drive to search for files, read documents, manage your "
-    "cloud storage, and share files or folders with others."
+    "cloud storage, and manage sharing on files or folders -- including "
+    "granting access to someone new and revoking an existing "
+    "collaborator's access."
 )
 
 

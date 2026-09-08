@@ -1,3 +1,4 @@
+import base64
 import io
 import json
 import logging
@@ -115,6 +116,39 @@ _EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 # kept returning a nextPageToken forever.
 _MAX_PERMISSION_LIST_PAGES = 1000
 
+# Google Workspace types with no files.export support at all, for any
+# mimeType (confirmed against Google's own export-formats reference) --
+# google_drive_get_file_content rejects these outright with an actionable
+# message instead of letting them fall into the generic export branch and
+# 400 opaquely. Folder/shortcut aren't documents at all, but are included
+# here since they share the same "no content to export" outcome and the
+# same "application/vnd.google-apps" prefix that would otherwise route
+# them into that branch too.
+_GOOGLE_APPS_TYPES_WITH_NO_EXPORT = frozenset(
+    {
+        "application/vnd.google-apps.folder",
+        "application/vnd.google-apps.shortcut",
+        "application/vnd.google-apps.form",
+        "application/vnd.google-apps.site",
+    }
+)
+
+# Maps a Google Workspace mimeType to what google_drive_get_file_content
+# should export it as when the caller left mime_type at its "text/plain"
+# default -- either because text/plain isn't a supported export format for
+# that type at all (Sheets, Drawings, Apps Script all 400 on it), or
+# because a different format is what a caller who didn't specify one
+# almost certainly wants. Each value here is genuine text (CSV/SVG-as-XML/
+# JSON), so it decodes sensibly through this function's existing
+# decode("utf-8", errors="replace") path, unlike Drawings' other export
+# options (pdf/png/jpeg), which would come out as garbled replacement
+# characters.
+_TEXT_PLAIN_EXPORT_FALLBACK = {
+    "application/vnd.google-apps.spreadsheet": "text/csv",
+    "application/vnd.google-apps.drawing": "image/svg+xml",
+    "application/vnd.google-apps.script": "application/vnd.google-apps.script+json",
+}
+
 
 def _resolve_file_id(file_id: str, field_name: str = "file_id") -> str:
     """Return the id captured out of a Drive/Docs/Sheets/Slides share link,
@@ -200,8 +234,15 @@ def _require_share_role(role: str) -> str:
     return role
 
 
+def _default_halve(value: Any) -> Any:
+    return value[: len(value) // 2]
+
+
 def _capped_response(
-    render: Callable[[Any, bool], str], value: Any, truncated: bool = False
+    render: Callable[[Any, bool], str],
+    value: Any,
+    truncated: bool = False,
+    halve: Callable[[Any], Any] = _default_halve,
 ) -> str:
     """Halve ``value`` (a list or a string) until ``render(value, truncated)``
     fits the platform's output limit -- mirrors deputy.py's/salesforce.py's
@@ -216,13 +257,18 @@ def _capped_response(
     up before exhausting every page) can report that honestly even if the
     partial ``value`` it did collect happens to still fit under the limit.
 
+    ``halve`` defaults to a plain half-length slice, but a caller whose
+    ``value`` has structure a byte-offset cut could break (e.g. base64,
+    where an arbitrary cut produces a string that isn't just incomplete
+    but genuinely invalid) can supply an alignment-preserving version.
+
     Named ``render``, not ``build``, to avoid shadowing the module-level
     ``build`` imported from googleapiclient.discovery.
     """
     max_output_length = get_tool_max_output_length()
     response = render(value, truncated)
     while len(response) > max_output_length and value:
-        value = value[: len(value) // 2]
+        value = halve(value)
         truncated = True
         response = render(value, truncated)
     return response
@@ -240,10 +286,20 @@ def _capped_list_response(
     return _capped_response(_build, items, truncated)
 
 
-def _capped_content_response(file_metadata: dict[str, Any], content: str) -> str:
+def _halve_base64(value: str) -> str:
+    return value[: (len(value) // 2) // 4 * 4]
+
+
+def _capped_content_response(
+    file_metadata: dict[str, Any], content: str, encoding: str = "utf-8"
+) -> str:
     """Same halving idea as _capped_list_response, applied to a single
     string instead of a list since downloaded/exported file content has no
     natural list of records to shrink.
+
+    ``encoding`` tells the caller how ``content`` is represented (see
+    google_drive_get_file_content, which falls back to base64 for content
+    that isn't valid UTF-8) and picks the matching halving strategy.
     """
 
     def _build(content: str, truncated: bool) -> str:
@@ -252,12 +308,14 @@ def _capped_content_response(file_metadata: dict[str, Any], content: str) -> str
                 "status": "success",
                 "file": file_metadata,
                 "content": content,
+                "encoding": encoding,
                 "truncated": truncated,
             },
             ensure_ascii=False,
         )
 
-    return _capped_response(_build, content)
+    halve = _halve_base64 if encoding == "base64" else _default_halve
+    return _capped_response(_build, content, halve=halve)
 
 
 def get_drive_service() -> Any:
@@ -291,12 +349,13 @@ def google_drive_search(query: str = "", max_results: int = 10) -> str:
     Use query parameter for Google Drive search syntax (e.g. "name contains 'meeting'").
     """
     try:
+        page_size = clamp_limit(max_results, max_limit=1000)
         service = get_drive_service()
         results = (
             service.files()
             .list(
                 q=query if query else None,
-                pageSize=clamp_limit(max_results, max_limit=1000),
+                pageSize=page_size,
                 supportsAllDrives=True,
                 includeItemsFromAllDrives=True,
                 fields="nextPageToken, files(id, name, mimeType, modifiedTime)",
@@ -331,42 +390,39 @@ def google_drive_get_file_content(file_id: str, mime_type: str = "text/plain") -
         )
         file_mime_type = file_metadata.get("mimeType", "")
 
-        if file_mime_type in (
-            "application/vnd.google-apps.folder",
-            "application/vnd.google-apps.shortcut",
-            "application/vnd.google-apps.form",
-        ):
-            # These three all start with "application/vnd.google-apps" and
-            # would otherwise fall into the export_media branch below,
-            # which makes no sense for any of them (a folder has no content
-            # to export; a shortcut is a pointer, not a document; Forms has
-            # no files.export support at all, for any mimeType) and would
-            # fail with an opaque API error instead of an actionable one.
-            # Now that folder/form share links resolve via _resolve_file_id
-            # (forms/d/ was added alongside folders/documents/etc.), this
-            # is a directly reachable input, not a hypothetical.
+        if file_mime_type in _GOOGLE_APPS_TYPES_WITH_NO_EXPORT:
+            # These all start with "application/vnd.google-apps" and would
+            # otherwise fall into the export_media branch below, which
+            # makes no sense for any of them (a folder/shortcut has no
+            # document content; Forms and Sites have no files.export
+            # support at all, for any mimeType) and would fail with an
+            # opaque API error instead of an actionable one. Folder/form
+            # share links are directly reachable via _resolve_file_id
+            # (forms/d/ was added alongside folders/documents/etc.), not a
+            # hypothetical.
             raise ValueError(
                 f"file_id resolves to a {file_mime_type.rsplit('.', 1)[-1]}, "
                 "which has no content to read."
             )
 
         if "application/vnd.google-apps" in file_mime_type:
-            # Export Google Workspace document. Sheets has no text/plain
-            # export format (only Docs/Slides do) and 400s on it, so the
-            # "text/plain" default -- reasonable for the far more common
-            # Docs/Slides case -- needs a per-type fallback for Sheets.
-            # Drawings has no text/plain export either, and unlike Sheets
-            # there's no text-shaped alternative to fall back to -- only
-            # pdf/png/jpeg/svg -- so it defaults to svg specifically
-            # because it's the one of those that's actual text (XML) and
-            # will decode sensibly below, rather than raw image/PDF bytes
-            # coming out as garbled replacement characters.
+            # Export Google Workspace document. The tool's "text/plain"
+            # default is reasonable for the common Docs/Slides case, but
+            # several other Workspace types either have no text/plain
+            # export at all (400s outright) or export something other
+            # than what a caller who left mime_type untouched would want.
+            # _TEXT_PLAIN_EXPORT_FALLBACK maps each such type to the
+            # format that (a) Drive actually supports exporting it as and
+            # (b) is genuinely text (CSV/SVG-XML/JSON), so it decodes
+            # sensibly below instead of raw binary bytes coming out as
+            # garbled replacement characters. Only consulted when the
+            # caller left mime_type at its default -- an explicit
+            # mime_type is always honored as-is.
             export_mime_type = mime_type
             if mime_type == "text/plain":
-                if file_mime_type == "application/vnd.google-apps.spreadsheet":
-                    export_mime_type = "text/csv"
-                elif file_mime_type == "application/vnd.google-apps.drawing":
-                    export_mime_type = "image/svg+xml"
+                export_mime_type = _TEXT_PLAIN_EXPORT_FALLBACK.get(
+                    file_mime_type, mime_type
+                )
             request = service.files().export_media(
                 fileId=resolved_file_id, mimeType=export_mime_type
             )
@@ -382,9 +438,25 @@ def google_drive_get_file_content(file_id: str, mime_type: str = "text/plain") -
         while done is False:
             _, done = downloader.next_chunk()
 
-        return _capped_content_response(
-            file_metadata, fh.getvalue().decode("utf-8", errors="replace")
-        )
+        raw_bytes = fh.getvalue()
+        try:
+            # A strict decode, not errors="replace": the export branch
+            # above only ever requests genuinely text formats (plain
+            # text/CSV/SVG-as-XML/JSON), so a UTF-8 failure there would be
+            # a real bug worth surfacing, not something to paper over. The
+            # get_media (regular download) branch can return any binary
+            # file -- a PDF, image, zip, or non-UTF-8-encoded text file --
+            # which replace-decoding would silently corrupt into
+            # replacement characters with no signal anything was lost;
+            # base64 preserves it exactly, same pattern as onedrive.py's
+            # onedrive_get_file_content/_decode_bytes.
+            content = raw_bytes.decode("utf-8")
+            encoding = "utf-8"
+        except UnicodeDecodeError:
+            content = base64.b64encode(raw_bytes).decode("ascii")
+            encoding = "base64"
+
+        return _capped_content_response(file_metadata, content, encoding)
     except Exception as e:
         logger.error(f"Error getting file content: {e}")
         return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
@@ -447,7 +519,7 @@ def google_drive_create_folder(name: str, parent_id: str | None = None) -> str:
             .create(
                 body=file_metadata,
                 supportsAllDrives=True,
-                fields="id, name, webViewLink",
+                fields="id, name, webViewLink, mimeType",
             )
             .execute()
         )
@@ -554,8 +626,10 @@ def _execute_ignoring_204_ssl_eof(
 def google_drive_delete_file(file_id: str) -> str:
     """
     Delete a file or folder in Google Drive.
-    Note: This skips the trash and permanently deletes the file if the user has permission.
-    Otherwise, you may want to use google_drive_trash_file if needed, but this permanently deletes.
+    Note: this skips the trash and permanently deletes the file -- there is
+    no separate "move to trash" tool on this connector, so confirm with the
+    user that permanent deletion (not just removing it from view) is what
+    they want before calling this.
     """
     try:
         resolved_file_id = _resolve_file_id(file_id)

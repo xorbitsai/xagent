@@ -1,3 +1,4 @@
+import base64
 import json
 from unittest.mock import Mock
 
@@ -388,6 +389,23 @@ def test_search_returns_error_payload_on_failure(monkeypatch):
     assert "quota exceeded" in result["message"]
 
 
+def test_search_validates_max_results_before_building_service(monkeypatch):
+    """Every other tool in this file validates/resolves its input before
+    calling get_drive_service() (Credentials construction + a discovery-
+    doc build); google_drive_search was the one outlier that built the
+    service first and only clamped max_results afterward, paying that
+    cost on every malformed call before ever rejecting it."""
+    get_service = Mock()
+    monkeypatch.setattr(google_drive, "get_drive_service", get_service)
+
+    result = json.loads(
+        google_drive.google_drive_search("x", max_results="not-a-number")
+    )
+
+    assert result["status"] == "error"
+    get_service.assert_not_called()
+
+
 def test_create_file_resolves_parent_id_url_and_supports_shared_drives(monkeypatch):
     service = _mock_drive_service(monkeypatch)
     service.files.return_value.create.return_value.execute.return_value = {
@@ -424,6 +442,7 @@ def test_create_folder_resolves_parent_id_url_and_supports_shared_drives(monkeyp
     kwargs = service.files.return_value.create.call_args.kwargs
     assert kwargs["body"]["parents"] == ["abc123"]
     assert kwargs["supportsAllDrives"] is True
+    assert kwargs["fields"] == "id, name, webViewLink, mimeType"
 
 
 def test_create_file_validates_parent_id_before_building_service(monkeypatch):
@@ -479,6 +498,40 @@ def test_get_file_content_resolves_full_drive_url(monkeypatch):
     media_kwargs = service.files.return_value.get_media.call_args.kwargs
     assert media_kwargs["fileId"] == "abc123"
     assert media_kwargs["supportsAllDrives"] is True
+    assert result["content"] == "hello"
+    assert result["encoding"] == "utf-8"
+
+
+def test_get_file_content_falls_back_to_base64_for_binary_content(monkeypatch):
+    """A regular (non-Workspace) file downloaded via get_media can be
+    anything -- a PDF, image, zip, or non-UTF-8-encoded text file. Forcing
+    a UTF-8 decode with errors="replace" would silently corrupt it into
+    replacement characters with status: success and no signal anything
+    was lost; base64 preserves it exactly, matching onedrive.py's
+    onedrive_get_file_content/_decode_bytes pattern for the same problem."""
+    service = _mock_drive_service(monkeypatch)
+    service.files.return_value.get.return_value.execute.return_value = {
+        "id": "img1",
+        "name": "photo.png",
+        "mimeType": "image/png",
+    }
+    binary_content = b"\x89PNG\r\n\x1a\n\x00\x01\xff\xfe"
+
+    class _FakeDownloader:
+        def __init__(self, fh, _request):
+            self._fh = fh
+
+        def next_chunk(self):
+            self._fh.write(binary_content)
+            return None, True
+
+    monkeypatch.setattr(google_drive, "MediaIoBaseDownload", _FakeDownloader)
+
+    result = json.loads(google_drive.google_drive_get_file_content("img1"))
+
+    assert result["status"] == "success"
+    assert result["encoding"] == "base64"
+    assert base64.b64decode(result["content"]) == binary_content
 
 
 def test_get_file_content_defaults_spreadsheet_export_to_csv(monkeypatch):
@@ -603,6 +656,38 @@ def test_get_file_content_respects_explicit_mime_type_for_drawing(monkeypatch):
     )
 
 
+def test_get_file_content_defaults_apps_script_export_to_json(monkeypatch):
+    """Apps Script projects have exactly one supported export format
+    (application/vnd.google-apps.script+json) -- text/plain 400s on it the
+    same way it does for Sheets/Drawings, but unlike those two there's no
+    other plausible default a caller might have meant, so this is the only
+    fallback that makes sense."""
+    service = _mock_drive_service(monkeypatch)
+    service.files.return_value.get.return_value.execute.return_value = {
+        "id": "script1",
+        "name": "My Script",
+        "mimeType": "application/vnd.google-apps.script",
+    }
+
+    class _FakeDownloader:
+        def __init__(self, fh, _request):
+            self._fh = fh
+
+        def next_chunk(self):
+            self._fh.write(b'{"files": []}')
+            return None, True
+
+    monkeypatch.setattr(google_drive, "MediaIoBaseDownload", _FakeDownloader)
+
+    result = json.loads(google_drive.google_drive_get_file_content("script1"))
+
+    assert result["status"] == "success"
+    assert (
+        service.files.return_value.export_media.call_args.kwargs["mimeType"]
+        == "application/vnd.google-apps.script+json"
+    )
+
+
 def test_get_file_content_keeps_text_plain_default_for_docs(monkeypatch):
     """The text/csv fallback is specific to spreadsheets -- Docs supports
     text/plain export natively and must not be redirected to csv too."""
@@ -638,17 +723,18 @@ def test_get_file_content_keeps_text_plain_default_for_docs(monkeypatch):
         "application/vnd.google-apps.folder",
         "application/vnd.google-apps.shortcut",
         "application/vnd.google-apps.form",
+        "application/vnd.google-apps.site",
     ],
 )
 def test_get_file_content_rejects_folder_and_shortcut_with_a_clear_message(
     monkeypatch, folder_mime_type
 ):
-    """All three mimeTypes start with "application/vnd.google-apps" and
+    """All of these mimeTypes start with "application/vnd.google-apps" and
     would otherwise fall into the export_media branch, which makes no
     sense for any of them (a folder has no content; a shortcut is a
-    pointer; Forms has no files.export support at all) -- and folder/form
-    share links are now resolvable via _resolve_file_id, so this is
-    directly reachable, not hypothetical."""
+    pointer; Forms and Sites have no files.export support at all) -- and
+    folder/form share links are now resolvable via _resolve_file_id, so
+    this is directly reachable, not hypothetical."""
     service = _mock_drive_service(monkeypatch)
     service.files.return_value.get.return_value.execute.return_value = {
         "id": "abc123",
@@ -691,6 +777,43 @@ def test_get_file_content_caps_oversized_output(monkeypatch):
     assert result["status"] == "success"
     assert result["truncated"] is True
     assert 0 < len(result["content"]) < len(huge_content)
+
+
+def test_get_file_content_caps_oversized_binary_content_as_valid_base64(monkeypatch):
+    """Halving a base64 string at an arbitrary character offset (as the
+    plain-text halving does) can produce a result that isn't just
+    incomplete but genuinely invalid base64 -- unlike truncated text,
+    which merely cuts off mid-character/word. The halving used for
+    encoding="base64" must stay 4-character aligned so the truncated
+    result still decodes."""
+    monkeypatch.setattr(google_drive, "get_tool_max_output_length", lambda: 3000)
+    service = _mock_drive_service(monkeypatch)
+    service.files.return_value.get.return_value.execute.return_value = {
+        "id": "img1",
+        "name": "big.png",
+        "mimeType": "image/png",
+    }
+    huge_binary = bytes(range(256)) * 100  # not valid UTF-8
+
+    class _FakeDownloader:
+        def __init__(self, fh, _request):
+            self._fh = fh
+
+        def next_chunk(self):
+            self._fh.write(huge_binary)
+            return None, True
+
+    monkeypatch.setattr(google_drive, "MediaIoBaseDownload", _FakeDownloader)
+
+    result = json.loads(google_drive.google_drive_get_file_content("img1"))
+
+    assert result["status"] == "success"
+    assert result["encoding"] == "base64"
+    assert result["truncated"] is True
+    # Must not raise -- confirms the truncated string is still valid,
+    # correctly-padded base64, not an arbitrary character-offset cut.
+    decoded = base64.b64decode(result["content"], validate=True)
+    assert 0 < len(decoded) < len(huge_binary)
 
 
 def test_rename_file_resolves_full_drive_url(monkeypatch):

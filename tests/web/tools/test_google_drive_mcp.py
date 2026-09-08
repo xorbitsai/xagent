@@ -98,6 +98,47 @@ def test_get_file_content_rejects_binary_mime_types(monkeypatch, mime_type):
     files.get.assert_not_called()
 
 
+def test_get_file_content_rejects_regular_file_whose_real_mime_type_is_binary(
+    monkeypatch,
+):
+    """Regression guard for the actual bug this tool exists to fix: for a
+    regular (non-Workspace) file, get_media() ignores the mime_type
+    parameter entirely and returns the file's own real bytes — so it's
+    file_mime_type (from Drive's metadata), not the request's mime_type
+    default of "text/plain", that must gate whether decoding as UTF-8 is
+    safe. Calling with the default text/plain param on an actual PDF must
+    still be rejected, not silently corrupted."""
+    files = Mock()
+    files.get.return_value.execute.return_value = {
+        "id": "f1",
+        "name": "report.pdf",
+        "mimeType": "application/pdf",
+    }
+    _mock_drive_service(monkeypatch, files)
+    _patch_downloader(monkeypatch, b"%PDF-1.4 real pdf bytes")
+
+    result = json.loads(google_drive.google_drive_get_file_content("f1"))
+
+    assert result["status"] == "error"
+    assert "google_drive_download_file" in result["message"]
+
+
+def test_get_file_content_accepts_regular_text_file(monkeypatch):
+    files = Mock()
+    files.get.return_value.execute.return_value = {
+        "id": "f1",
+        "name": "notes.txt",
+        "mimeType": "text/plain",
+    }
+    _mock_drive_service(monkeypatch, files)
+    _patch_downloader(monkeypatch, b"hello world")
+
+    result = json.loads(google_drive.google_drive_get_file_content("f1"))
+
+    assert result["status"] == "success"
+    assert result["content"] == "hello world"
+
+
 def test_get_file_content_returns_error_payload_on_api_failure(monkeypatch):
     files = Mock()
     files.get.return_value.execute.side_effect = RuntimeError("boom")
@@ -257,6 +298,30 @@ def test_download_file_preserves_extension_for_degenerate_drive_name(
     result = json.loads(
         google_drive.google_drive_download_file("f1", mime_type="application/pdf")
     )
+
+    assert result["status"] == "success"
+    output_path = Path(result["path"])
+    assert output_path.name == "file.pdf"
+
+
+def test_download_file_preserves_extension_for_non_ascii_drive_name(
+    monkeypatch, tmp_path
+):
+    """Regression guard: a name whose entire stem is non-ASCII (e.g. CJK)
+    sanitizes down to nothing on its own, but the extension must survive —
+    this is the regular-file (get_media) branch, which has no separate
+    "extension" variable to fall back on the way the Workspace-export
+    branch does, so the fix has to live in _safe_output_filename itself."""
+    files = Mock()
+    files.get.return_value.execute.return_value = {
+        "id": "f1",
+        "name": "季度报告.pdf",
+        "mimeType": "application/pdf",
+    }
+    _mock_drive_service(monkeypatch, files)
+    _patch_downloader(monkeypatch, b"content")
+
+    result = json.loads(google_drive.google_drive_download_file("f1"))
 
     assert result["status"] == "success"
     output_path = Path(result["path"])

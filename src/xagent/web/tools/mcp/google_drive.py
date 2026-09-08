@@ -53,11 +53,29 @@ def _output_dir() -> Path:
 
 
 def _safe_output_filename(name: str) -> str:
-    """Collapse a Drive file name into a single path segment so it can't
-    escape the output directory (e.g. via ".." or embedded "/") — the name
-    comes from user/Drive data, not a trusted constant."""
-    candidate = _UNSAFE_FILENAME_CHARS.sub("_", Path(name).name).strip("._") or "file"
-    return candidate
+    """Collapse a Drive file name into a single safe path segment so it
+    can't escape the output directory (e.g. via ".." or embedded "/") — the
+    name comes from user/Drive data, not a trusted constant.
+
+    Stem and suffix are sanitized separately: sanitizing the whole string
+    in one pass would let the trailing ".strip('._')" eat into the
+    extension's own leading dot whenever the stem sanitizes down to nothing
+    (e.g. an all-non-ASCII or all-punctuation name) — "季度报告.pdf" must
+    still come out as "....pdf" (something ending in .pdf), not "pdf".
+    """
+    base = Path(name).name
+    stem = _UNSAFE_FILENAME_CHARS.sub("_", Path(base).stem).strip("._")
+    suffix = _UNSAFE_FILENAME_CHARS.sub("_", Path(base).suffix)
+    return (stem or "file") + suffix
+
+
+def _download_media(request: Any) -> bytes:
+    fh = io.BytesIO()
+    downloader = MediaIoBaseDownload(fh, request)
+    done = False
+    while done is False:
+        status, done = downloader.next_chunk()
+    return fh.getvalue()
 
 
 def _unique_output_path(output_dir: Path, filename: str) -> Path:
@@ -159,23 +177,33 @@ def google_drive_get_file_content(file_id: str, mime_type: str = "text/plain") -
         file_mime_type = file_metadata.get("mimeType", "")
 
         if "application/vnd.google-apps" in file_mime_type:
-            # Export Google Workspace document
+            # Export Google Workspace document — always produces content in
+            # the requested (already-validated-as-text) mime_type.
             request = service.files().export_media(fileId=file_id, mimeType=mime_type)
         else:
-            # Download regular file
+            # Regular file: get_media ignores mime_type entirely and
+            # returns the file's own real bytes, so it's file_mime_type —
+            # not the requested mime_type — that determines whether
+            # decoding as UTF-8 is safe.
+            if not _is_text_mime_type(file_mime_type):
+                return json.dumps(
+                    {
+                        "status": "error",
+                        "message": (
+                            f"'{file_metadata.get('name', file_id)}' is not a "
+                            f"text file (mimeType '{file_mime_type}') — this "
+                            "tool would corrupt it by decoding as UTF-8. Use "
+                            "google_drive_download_file instead."
+                        ),
+                    }
+                )
             request = service.files().get_media(fileId=file_id)
-
-        fh = io.BytesIO()
-        downloader = MediaIoBaseDownload(fh, request)
-        done = False
-        while done is False:
-            status, done = downloader.next_chunk()
 
         return json.dumps(
             {
                 "status": "success",
                 "file": file_metadata,
-                "content": fh.getvalue().decode("utf-8", errors="replace"),
+                "content": _download_media(request).decode("utf-8", errors="replace"),
             }
         )
     except Exception as e:
@@ -226,11 +254,6 @@ def google_drive_download_file(
                 )
             request = service.files().export_media(fileId=file_id, mimeType=mime_type)
             extension = mimetypes.guess_extension(mime_type) or ""
-            # Sanitize the base name *before* appending the extension: doing
-            # it after would let a degenerate name (e.g. all dots/spaces,
-            # which _safe_output_filename's trailing ".strip('._')" removes)
-            # eat into the extension's leading dot too, producing a bare
-            # "pdf" instead of "file.pdf".
             safe_drive_name = _safe_output_filename(drive_name)
             default_name = (
                 safe_drive_name
@@ -241,12 +264,7 @@ def google_drive_download_file(
             request = service.files().get_media(fileId=file_id)
             default_name = _safe_output_filename(drive_name)
 
-        fh = io.BytesIO()
-        downloader = MediaIoBaseDownload(fh, request)
-        done = False
-        while done is False:
-            status, done = downloader.next_chunk()
-        data = fh.getvalue()
+        data = _download_media(request)
 
         chosen_name = _safe_output_filename(filename) if filename else default_name
         output_path = _unique_output_path(_output_dir(), chosen_name)

@@ -334,14 +334,17 @@ def google_drive_get_file_content(file_id: str, mime_type: str = "text/plain") -
         if file_mime_type in (
             "application/vnd.google-apps.folder",
             "application/vnd.google-apps.shortcut",
+            "application/vnd.google-apps.form",
         ):
-            # Both mimeTypes start with "application/vnd.google-apps" and
+            # These three all start with "application/vnd.google-apps" and
             # would otherwise fall into the export_media branch below,
-            # which makes no sense for either (a folder has no content to
-            # export; a shortcut is a pointer, not a document) and would
+            # which makes no sense for any of them (a folder has no content
+            # to export; a shortcut is a pointer, not a document; Forms has
+            # no files.export support at all, for any mimeType) and would
             # fail with an opaque API error instead of an actionable one.
-            # Now that folder share links resolve via _resolve_file_id,
-            # this is a directly reachable input, not a hypothetical.
+            # Now that folder/form share links resolve via _resolve_file_id
+            # (forms/d/ was added alongside folders/documents/etc.), this
+            # is a directly reachable input, not a hypothetical.
             raise ValueError(
                 f"file_id resolves to a {file_mime_type.rsplit('.', 1)[-1]}, "
                 "which has no content to read."
@@ -352,12 +355,18 @@ def google_drive_get_file_content(file_id: str, mime_type: str = "text/plain") -
             # export format (only Docs/Slides do) and 400s on it, so the
             # "text/plain" default -- reasonable for the far more common
             # Docs/Slides case -- needs a per-type fallback for Sheets.
+            # Drawings has no text/plain export either, and unlike Sheets
+            # there's no text-shaped alternative to fall back to -- only
+            # pdf/png/jpeg/svg -- so it defaults to svg specifically
+            # because it's the one of those that's actual text (XML) and
+            # will decode sensibly below, rather than raw image/PDF bytes
+            # coming out as garbled replacement characters.
             export_mime_type = mime_type
-            if (
-                file_mime_type == "application/vnd.google-apps.spreadsheet"
-                and mime_type == "text/plain"
-            ):
-                export_mime_type = "text/csv"
+            if mime_type == "text/plain":
+                if file_mime_type == "application/vnd.google-apps.spreadsheet":
+                    export_mime_type = "text/csv"
+                elif file_mime_type == "application/vnd.google-apps.drawing":
+                    export_mime_type = "image/svg+xml"
             request = service.files().export_media(
                 fileId=resolved_file_id, mimeType=export_mime_type
             )
@@ -495,7 +504,16 @@ def _is_confirmed_gone(verify_err: Exception) -> bool:
     """
     status = getattr(getattr(verify_err, "resp", None), "status", None)
     if status is not None:
-        return bool(status == 404)
+        # httplib2.Response coerces .status to int, so this is always an
+        # int in practice via the real client -- try/except rather than an
+        # isinstance/str check so a status representation this doesn't
+        # anticipate (a different transport, a mock, a future library
+        # version) still compares correctly instead of silently skipping
+        # the real-status check it exists to provide.
+        try:
+            return int(status) == 404
+        except (TypeError, ValueError):
+            pass
     return "404" in str(verify_err) or "not found" in str(verify_err).lower()
 
 

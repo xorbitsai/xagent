@@ -542,6 +542,67 @@ def test_get_file_content_respects_explicit_mime_type_for_spreadsheet(monkeypatc
     )
 
 
+def test_get_file_content_defaults_drawing_export_to_svg(monkeypatch):
+    """Drawings has no text/plain export format either (only
+    pdf/png/jpeg/svg), and unlike Sheets there's no other text-shaped
+    format to fall back to -- svg is the one of those that's actually text
+    (XML) and will decode sensibly, rather than raw image/PDF bytes coming
+    out as garbled replacement characters."""
+    service = _mock_drive_service(monkeypatch)
+    service.files.return_value.get.return_value.execute.return_value = {
+        "id": "drawing1",
+        "name": "Diagram",
+        "mimeType": "application/vnd.google-apps.drawing",
+    }
+
+    class _FakeDownloader:
+        def __init__(self, fh, _request):
+            self._fh = fh
+
+        def next_chunk(self):
+            self._fh.write(b"<svg></svg>")
+            return None, True
+
+    monkeypatch.setattr(google_drive, "MediaIoBaseDownload", _FakeDownloader)
+
+    result = json.loads(google_drive.google_drive_get_file_content("drawing1"))
+
+    assert result["status"] == "success"
+    assert (
+        service.files.return_value.export_media.call_args.kwargs["mimeType"]
+        == "image/svg+xml"
+    )
+
+
+def test_get_file_content_respects_explicit_mime_type_for_drawing(monkeypatch):
+    service = _mock_drive_service(monkeypatch)
+    service.files.return_value.get.return_value.execute.return_value = {
+        "id": "drawing1",
+        "name": "Diagram",
+        "mimeType": "application/vnd.google-apps.drawing",
+    }
+
+    class _FakeDownloader:
+        def __init__(self, fh, _request):
+            self._fh = fh
+
+        def next_chunk(self):
+            self._fh.write(b"fake-png-bytes")
+            return None, True
+
+    monkeypatch.setattr(google_drive, "MediaIoBaseDownload", _FakeDownloader)
+
+    result = json.loads(
+        google_drive.google_drive_get_file_content("drawing1", mime_type="image/png")
+    )
+
+    assert result["status"] == "success"
+    assert (
+        service.files.return_value.export_media.call_args.kwargs["mimeType"]
+        == "image/png"
+    )
+
+
 def test_get_file_content_keeps_text_plain_default_for_docs(monkeypatch):
     """The text/csv fallback is specific to spreadsheets -- Docs supports
     text/plain export natively and must not be redirected to csv too."""
@@ -576,15 +637,18 @@ def test_get_file_content_keeps_text_plain_default_for_docs(monkeypatch):
     [
         "application/vnd.google-apps.folder",
         "application/vnd.google-apps.shortcut",
+        "application/vnd.google-apps.form",
     ],
 )
 def test_get_file_content_rejects_folder_and_shortcut_with_a_clear_message(
     monkeypatch, folder_mime_type
 ):
-    """Both mimeTypes start with "application/vnd.google-apps" and would
-    otherwise fall into the export_media branch, which makes no sense for
-    either -- and folder share links are now resolvable via
-    _resolve_file_id, so this is directly reachable, not hypothetical."""
+    """All three mimeTypes start with "application/vnd.google-apps" and
+    would otherwise fall into the export_media branch, which makes no
+    sense for any of them (a folder has no content; a shortcut is a
+    pointer; Forms has no files.export support at all) -- and folder/form
+    share links are now resolvable via _resolve_file_id, so this is
+    directly reachable, not hypothetical."""
     service = _mock_drive_service(monkeypatch)
     service.files.return_value.get.return_value.execute.return_value = {
         "id": "abc123",
@@ -1074,6 +1138,15 @@ class TestExecuteIgnoring204SslEof:
         verify_done = Mock(side_effect=not_found)
 
         google_drive._execute_ignoring_204_ssl_eof(execute, verify_done)  # no raise
+
+    def test_is_confirmed_gone_handles_a_stringified_status(self):
+        """httplib2.Response always coerces .status to int in practice, but
+        the check shouldn't silently stop working (skip straight to
+        returning False, never reaching the string fallback) if some other
+        transport, mock, or future library version ever represents it as
+        e.g. "404" instead of 404."""
+        err = type("Err", (), {"resp": type("Resp", (), {"status": "404"})()})()
+        assert google_drive._is_confirmed_gone(err) is True
 
     def test_raises_even_when_original_error_text_contains_not_found(self):
         """The "not complete" exception raised when verify_done() shows the

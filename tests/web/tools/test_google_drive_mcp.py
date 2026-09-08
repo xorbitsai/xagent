@@ -19,7 +19,7 @@ def _credentials(monkeypatch):
 def _output_dir_env(tmp_path, monkeypatch):
     """Every test gets its own isolated output root so nothing here ever
     writes into the real working directory."""
-    monkeypatch.setenv("XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS", str(tmp_path))
+    monkeypatch.setenv("XAGENT_GOOGLE_DRIVE_OUTPUT_DIR", str(tmp_path))
     return tmp_path
 
 
@@ -137,6 +137,44 @@ def test_get_file_content_accepts_regular_text_file(monkeypatch):
 
     assert result["status"] == "success"
     assert result["content"] == "hello world"
+
+
+def test_get_file_content_accepts_rtf(monkeypatch):
+    """Regression guard: RTF is 7-bit-ASCII-clean per spec (non-ASCII
+    content is escaped, not raw bytes), so it round-trips through UTF-8
+    decoding safely — the binary-content guard must not reject it."""
+    files = Mock()
+    files.get.return_value.execute.return_value = {
+        "id": "f1",
+        "name": "notes.rtf",
+        "mimeType": "application/rtf",
+    }
+    _mock_drive_service(monkeypatch, files)
+    _patch_downloader(monkeypatch, rb"{\rtf1 hello}")
+
+    result = json.loads(
+        google_drive.google_drive_get_file_content("f1", "application/rtf")
+    )
+
+    assert result["status"] == "success"
+
+
+def test_get_file_content_exports_workspace_doc(monkeypatch):
+    files = Mock()
+    files.get.return_value.execute.return_value = {
+        "id": "f1",
+        "name": "Notes",
+        "mimeType": "application/vnd.google-apps.document",
+    }
+    _mock_drive_service(monkeypatch, files)
+    _patch_downloader(monkeypatch, b"exported text")
+
+    result = json.loads(google_drive.google_drive_get_file_content("f1", "text/plain"))
+
+    assert result["status"] == "success"
+    assert result["content"] == "exported text"
+    files.export_media.assert_called_once_with(fileId="f1", mimeType="text/plain")
+    files.get_media.assert_not_called()
 
 
 def test_get_file_content_returns_error_payload_on_api_failure(monkeypatch):
@@ -375,6 +413,121 @@ def test_download_file_preserves_extension_for_non_ascii_drive_name(
     assert result["status"] == "success"
     output_path = Path(result["path"])
     assert output_path.name == "file.pdf"
+
+
+def test_download_file_preserves_extension_only_drive_name(monkeypatch, tmp_path):
+    """Regression guard: Path(".pdf").suffix is '' per pathlib's dotfile
+    convention (a leading dot with nothing before it never counts as an
+    extension separator) — so a Drive name that's *exactly* an extension
+    must still be recognized as one, not silently reduced to "pdf" with
+    the leading dot dropped."""
+    files = Mock()
+    files.get.return_value.execute.return_value = {
+        "id": "f1",
+        "name": ".pdf",
+        "mimeType": "application/pdf",
+    }
+    _mock_drive_service(monkeypatch, files)
+    _patch_downloader(monkeypatch, b"content")
+
+    result = json.loads(google_drive.google_drive_download_file("f1"))
+
+    assert result["status"] == "success"
+    output_path = Path(result["path"])
+    assert output_path.name == "file.pdf"
+
+
+def test_download_file_sanitizes_path_traversal_in_explicit_filename(
+    monkeypatch, tmp_path
+):
+    """Regression guard: only the Drive-reported name was tested for
+    traversal/unsafe-character sanitization elsewhere — an explicit
+    `filename` argument goes through the exact same _safe_output_filename
+    call and must be sanitized identically."""
+    files = Mock()
+    files.get.return_value.execute.return_value = {
+        "id": "f1",
+        "name": "report.txt",
+        "mimeType": "text/plain",
+    }
+    _mock_drive_service(monkeypatch, files)
+    _patch_downloader(monkeypatch, b"content")
+
+    result = json.loads(
+        google_drive.google_drive_download_file("f1", filename="../../etc/passwd")
+    )
+
+    assert result["status"] == "success"
+    output_path = Path(result["path"])
+    assert output_path.parent == tmp_path / "output"
+    assert output_path.is_relative_to(tmp_path / "output")
+
+
+def test_download_file_truncates_overlong_filename(monkeypatch, tmp_path):
+    """Regression guard: an unbounded sanitized filename can exceed the
+    ~255-byte NAME_MAX most filesystems enforce, making the final
+    write_bytes() raise OSError/ENAMETOOLONG and fail the whole call
+    instead of just using a shorter name."""
+    files = Mock()
+    files.get.return_value.execute.return_value = {
+        "id": "f1",
+        "name": ("a" * 500) + ".pdf",
+        "mimeType": "application/pdf",
+    }
+    _mock_drive_service(monkeypatch, files)
+    _patch_downloader(monkeypatch, b"content")
+
+    result = json.loads(google_drive.google_drive_download_file("f1"))
+
+    assert result["status"] == "success"
+    output_path = Path(result["path"])
+    assert len(output_path.name) <= 210
+    assert output_path.name.endswith(".pdf")
+
+
+def test_download_file_truncates_overlong_suffix_too(monkeypatch, tmp_path):
+    """Regression guard: the length cap must also bound the suffix, not
+    just the stem — a name like "a." + 300 chars has almost its entire
+    length in what _split_stem_suffix treats as the "extension" (everything
+    from the last dot onward), so truncating only the stem would still
+    leave a 300+ char filename."""
+    files = Mock()
+    files.get.return_value.execute.return_value = {
+        "id": "f1",
+        "name": "a." + ("x" * 300),
+        "mimeType": "text/plain",
+    }
+    _mock_drive_service(monkeypatch, files)
+    _patch_downloader(monkeypatch, b"content")
+
+    result = json.loads(google_drive.google_drive_download_file("f1"))
+
+    assert result["status"] == "success"
+    output_path = Path(result["path"])
+    assert len(output_path.name) <= 30
+
+
+def test_download_file_errors_when_no_task_workspace_is_configured(
+    monkeypatch, tmp_path
+):
+    """Regression guard: an unset output-dir env var must fail loudly
+    rather than silently writing into whatever directory the MCP
+    subprocess happens to have as its cwd."""
+    monkeypatch.delenv("XAGENT_GOOGLE_DRIVE_OUTPUT_DIR", raising=False)
+    files = Mock()
+    files.get.return_value.execute.return_value = {
+        "id": "f1",
+        "name": "report.pdf",
+        "mimeType": "application/pdf",
+    }
+    _mock_drive_service(monkeypatch, files)
+    _patch_downloader(monkeypatch, b"content")
+
+    result = json.loads(google_drive.google_drive_download_file("f1"))
+
+    assert result["status"] == "error"
+    assert "XAGENT_GOOGLE_DRIVE_OUTPUT_DIR" in result["message"]
+    assert not (tmp_path / "output").exists()
 
 
 def test_download_file_dedupes_existing_filename(monkeypatch, tmp_path):

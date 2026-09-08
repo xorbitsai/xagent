@@ -29,7 +29,11 @@ mcp = FastMCP("google-drive-mcp")
 # (PDFs, Office/OOXML formats, images, etc.) must go through
 # google_drive_download_file instead — decoding arbitrary binary content as
 # UTF-8 with errors="replace" silently corrupts it into unusable garbage.
-_TEXT_MIME_TYPES = {"application/json", "application/xml"}
+# RTF is included because it's specified as 7-bit-ASCII-clean (escape
+# sequences carry any non-ASCII content), so it round-trips through UTF-8
+# decoding safely, unlike the binary formats this allowlist exists to keep
+# out.
+_TEXT_MIME_TYPES = {"application/json", "application/xml", "application/rtf"}
 
 
 def _is_text_mime_type(mime_type: str) -> bool:
@@ -38,18 +42,48 @@ def _is_text_mime_type(mime_type: str) -> bool:
 
 _UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.() -]")
 
+# Comfortably under the ~255-byte NAME_MAX most filesystems enforce, leaving
+# room for the " (N)" suffix _unique_output_path may append on top.
+_MAX_FILENAME_LENGTH = 200
+# Generous for any real extension, including compound ones like ".tar.gz" —
+# a "suffix" longer than this isn't behaving like an extension anymore (see
+# _safe_output_filename), so it gets truncated too rather than left to blow
+# the overall length cap on its own.
+_MAX_SUFFIX_LENGTH = 20
+
 
 def _output_dir() -> Path:
     """Root directory google_drive_download_file writes into: the current
     task's workspace output/ subdirectory, mirroring TaskWorkspace.output_dir
     so downloaded files show up alongside other generated deliverables."""
-    raw_dirs = os.environ.get("XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS", "")
-    base = next((d for raw in raw_dirs.split(",") if (d := raw.strip())), "") or str(
-        Path.cwd()
-    )
-    output_dir = (Path(base).expanduser().resolve()) / "output"
+    base = os.environ.get("XAGENT_GOOGLE_DRIVE_OUTPUT_DIR", "").strip()
+    if not base:
+        raise RuntimeError(
+            "No task workspace configured for this connector "
+            "(XAGENT_GOOGLE_DRIVE_OUTPUT_DIR is unset) — "
+            "google_drive_download_file needs a task workspace to write "
+            "into."
+        )
+    output_dir = Path(base).expanduser().resolve() / "output"
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir
+
+
+def _split_stem_suffix(base: str) -> tuple[str, str]:
+    """Like Path(base).stem/.suffix, except a name that's *entirely* a
+    leading dot plus extension (e.g. ".pdf") is treated as having that
+    extension. pathlib's own split refuses to do this — it follows the
+    Unix dotfile convention where a single leading dot with nothing before
+    it never counts as an extension separator, leaving Path(".pdf").suffix
+    empty — but Drive occasionally hands back names in exactly this shape,
+    and silently losing the extension breaks the downloaded file's type.
+    Only that narrow shape is special-cased; e.g. "..pdf" or "..." already
+    split the way we want via plain pathlib and are left alone.
+    """
+    suffix = Path(base).suffix
+    if not suffix and base.startswith(".") and base.count(".") == 1 and len(base) > 1:
+        return "", base
+    return Path(base).stem, suffix
 
 
 def _safe_output_filename(name: str) -> str:
@@ -64,9 +98,11 @@ def _safe_output_filename(name: str) -> str:
     still come out as "....pdf" (something ending in .pdf), not "pdf".
     """
     base = Path(name).name
-    stem = _UNSAFE_FILENAME_CHARS.sub("_", Path(base).stem).strip("._")
-    suffix = _UNSAFE_FILENAME_CHARS.sub("_", Path(base).suffix)
-    return (stem or "file") + suffix
+    stem, suffix = _split_stem_suffix(base)
+    stem = _UNSAFE_FILENAME_CHARS.sub("_", stem).strip("._") or "file"
+    suffix = _UNSAFE_FILENAME_CHARS.sub("_", suffix)[:_MAX_SUFFIX_LENGTH]
+    max_stem_length = max(1, _MAX_FILENAME_LENGTH - len(suffix))
+    return stem[:max_stem_length] + suffix
 
 
 def _download_media(request: Any) -> bytes:

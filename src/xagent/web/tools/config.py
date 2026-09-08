@@ -1853,6 +1853,26 @@ class WebToolConfig(BaseToolConfig):
                 seen.add(dir_path)
         return ",".join(unique_dirs)
 
+    def _build_mcp_task_output_dir(self) -> str:
+        """Single write-target root for connectors that create new files in
+        the task workspace (currently just Google Drive's download tool).
+
+        Deliberately distinct from _build_mcp_file_allowed_dirs() above:
+        that one is a read allowlist that may reasonably include
+        allowed_external_dirs (e.g. read-only KB folders) alongside the
+        task dir, and multiple consumers of it pick whichever entry a
+        requested path happens to fall under. A write target has no such
+        "any of these" semantics — writing into an external read-only dir
+        by picking the wrong list entry would be wrong, not just
+        suboptimal — so this only ever returns the task dir itself, never
+        an external dir, and is empty whenever there's no task workspace.
+        """
+        task_id = self._workspace_config.get("task_id")
+        if not task_id:
+            return ""
+        base_dir = Path(str(self._workspace_config.get("base_dir", get_uploads_dir())))
+        return str((base_dir / str(task_id)).expanduser().resolve())
+
     def _get_is_admin_from_request(self, request: Any) -> bool:
         """Extract is_admin flag from the request user, defaulting to False.
 
@@ -3663,12 +3683,15 @@ class WebToolConfig(BaseToolConfig):
                 env["XAGENT_LINKEDIN_IMAGE_ALLOWED_DIRS"] = allowed_file_dirs
                 env["XAGENT_SLACK_FILE_ALLOWED_DIRS"] = allowed_file_dirs
                 env["XAGENT_GMAIL_FILE_ALLOWED_DIRS"] = allowed_file_dirs
-                # Unlike the three above (read-only upload allowlists), Google
-                # Drive uses this as a write target root for
-                # google_drive_download_file — it downloads/exports into
-                # <this dir>/output/, mirroring TaskWorkspace.output_dir so
-                # the result shows up alongside other generated deliverables.
-                env["XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS"] = allowed_file_dirs
+            # Distinct from the three read allowlists above: Google Drive's
+            # download tool writes NEW files into the task workspace, so it
+            # gets its own single-value, task-dir-only var rather than
+            # reusing the read-allowlist shape (see
+            # _build_mcp_task_output_dir's docstring for why that would be
+            # wrong, not just differently-shaped).
+            task_output_dir = self._build_mcp_task_output_dir()
+            if task_output_dir:
+                env["XAGENT_GOOGLE_DRIVE_OUTPUT_DIR"] = task_output_dir
             transport_config["env"] = env
             return transport_config
 

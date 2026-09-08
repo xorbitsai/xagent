@@ -119,6 +119,31 @@ def test_parse_rrule_accepts_and_strips_rrule_prefix():
     assert parts == {"FREQ": "DAILY", "COUNT": "5"}
 
 
+def test_ensure_rrule_prefix_adds_prefix_and_uppercases():
+    assert utils.ensure_rrule_prefix("FREQ=DAILY;COUNT=5") == "RRULE:FREQ=DAILY;COUNT=5"
+
+
+def test_ensure_rrule_prefix_keeps_existing_prefix_and_uppercases():
+    assert (
+        utils.ensure_rrule_prefix("rrule:freq=weekly;byday=mo,tu")
+        == "RRULE:FREQ=WEEKLY;BYDAY=MO,TU"
+    )
+
+
+def test_ensure_rrule_prefix_normalizes_lowercase_rrule():
+    """RFC 5545's RRULE grammar has no case-sensitive free-text values, so
+    a fully lowercase rule (which parse_rrule's dateutil-backed validation
+    tolerates) must still reach the calendar API canonicalized to
+    uppercase - not sent verbatim in whatever case an LLM happened to
+    produce."""
+    assert (
+        utils.ensure_rrule_prefix(
+            "freq=weekly;byday=mo,tu,we,th,fr;until=20260911t235959z"
+        )
+        == "RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;UNTIL=20260911T235959Z"
+    )
+
+
 def test_parse_rrule_rejects_empty_string():
     with pytest.raises(ValueError, match="must not be empty"):
         utils.parse_rrule("", "2026-08-26T07:00:00+08:00")
@@ -161,6 +186,46 @@ def test_parse_rrule_accepts_a_datetime_object_directly():
         datetime(2026, 8, 26, 7, 0, 0, tzinfo=timezone.utc),
     )
     assert parts == {"FREQ": "DAILY", "UNTIL": "20260911T235959Z"}
+
+
+def test_parse_rrule_rejects_until_before_dtstart():
+    """dateutil's own rrulestr validation does NOT catch this - an UNTIL
+    before dtstart parses fine and just silently yields zero occurrences,
+    which would otherwise report status=success for a "recurring" event
+    that never actually recurs. This must be checked explicitly."""
+    from datetime import datetime, timezone
+
+    with pytest.raises(ValueError, match="before the start time"):
+        utils.parse_rrule(
+            "FREQ=DAILY;UNTIL=20260101T000000Z",
+            datetime(2026, 6, 1, tzinfo=timezone.utc),
+        )
+
+
+def test_parse_rrule_allows_until_after_dtstart():
+    from datetime import datetime, timezone
+
+    parts = utils.parse_rrule(
+        "FREQ=DAILY;UNTIL=20260601T000000Z",
+        datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+    assert parts["UNTIL"] == "20260601T000000Z"
+
+
+def test_parse_rrule_naive_dtstart_with_utc_until_is_rejected_by_dateutil_itself():
+    """A naive dtstart combined with a "Z"-suffixed (UTC/aware) UNTIL is
+    already rejected by dateutil's own rrulestr validation before this
+    function's explicit UNTIL-vs-dtstart check ever runs - documented here
+    so the anchor.tzinfo guard in that check (added for exactly this kind
+    of aware/naive mismatch) isn't mistaken for dead code: dateutil catches
+    this shape first, with its own message."""
+    from datetime import datetime
+
+    with pytest.raises(ValueError, match="invalid recurrence rule"):
+        utils.parse_rrule(
+            "FREQ=DAILY;UNTIL=20260101T000000Z",
+            datetime(2026, 6, 1),
+        )
 
 
 def test_url_path_id_output_survives_requests_url_normalization():

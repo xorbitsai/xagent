@@ -8,13 +8,7 @@ from urllib.parse import quote
 import requests
 from dateutil import parser as _date_parser
 from dateutil import tz as _tz
-from dateutil.rrule import FR as _FR
-from dateutil.rrule import MO as _MO
-from dateutil.rrule import SA as _SA
-from dateutil.rrule import SU as _SU
-from dateutil.rrule import TH as _TH
-from dateutil.rrule import TU as _TU
-from dateutil.rrule import WE as _WE
+from dateutil.rrule import weekdays as _RRULE_WEEKDAYS
 from mcp.server.fastmcp import FastMCP
 
 from .utils import parse_rrule, setup_proxy_env
@@ -116,8 +110,6 @@ def _message_body(content: str, content_type: str) -> dict[str, str]:
     return {"contentType": normalized, "content": content}
 
 
-_RRULE_WEEKDAYS = (_MO, _TU, _WE, _TH, _FR, _SA, _SU)
-
 _RRULE_DAY_TO_GRAPH = {
     "MO": "monday",
     "TU": "tuesday",
@@ -129,13 +121,69 @@ _RRULE_DAY_TO_GRAPH = {
 }
 
 
-def _rrule_until_to_date(until: str) -> str:
+# dateutil.tz.gettz only resolves IANA names ("Asia/Manila"). This tool
+# always writes IANA names itself, but an event fetched from Graph (the
+# outlook_update_event recurrence-without-start_datetime path) can carry a
+# Windows-style identifier instead, whenever the event was created by a
+# different client (Outlook desktop/web default to these). Not exhaustive -
+# just the common business timezones - so an unmapped Windows name still
+# fails with a clear, actionable error rather than resolving silently wrong.
+_WINDOWS_TZ_TO_IANA = {
+    "UTC": "UTC",
+    "Pacific Standard Time": "America/Los_Angeles",
+    "Mountain Standard Time": "America/Denver",
+    "Central Standard Time": "America/Chicago",
+    "Eastern Standard Time": "America/New_York",
+    "GMT Standard Time": "Europe/London",
+    "Central Europe Standard Time": "Europe/Warsaw",
+    "W. Europe Standard Time": "Europe/Berlin",
+    "Romance Standard Time": "Europe/Paris",
+    "China Standard Time": "Asia/Shanghai",
+    "Taipei Standard Time": "Asia/Taipei",
+    "Tokyo Standard Time": "Asia/Tokyo",
+    "Korea Standard Time": "Asia/Seoul",
+    "Singapore Standard Time": "Asia/Singapore",
+    "SE Asia Standard Time": "Asia/Bangkok",
+    "India Standard Time": "Asia/Kolkata",
+    "AUS Eastern Standard Time": "Australia/Sydney",
+    "New Zealand Standard Time": "Pacific/Auckland",
+}
+
+
+def _resolve_timezone(timezone: str) -> Any:
+    """Resolve a timezone name to a dateutil tzinfo, trying it as an IANA
+    name first (what this tool itself always writes) and falling back to a
+    short list of common Windows-style identifiers (what Graph often
+    reports for events created by other clients) before giving up."""
+    zone = _tz.gettz(timezone)
+    if zone is not None:
+        return zone
+    iana_name = _WINDOWS_TZ_TO_IANA.get(timezone)
+    if iana_name is not None:
+        zone = _tz.gettz(iana_name)
+        if zone is not None:
+            return zone
+    raise ValueError(f"unknown timezone for recurrence rule: {timezone}")
+
+
+def _rrule_until_to_date(until: str, zone: Any) -> str:
     """Convert an RRULE UNTIL value ('20260911T235959Z' or a bare
-    '20260911') into the 'YYYY-MM-DD' form Graph's recurrenceRange wants."""
+    '20260911') into the 'YYYY-MM-DD' form Graph's recurrenceRange wants,
+    expressed in `zone`.
+
+    Graph's recurrenceRange.endDate is a calendar date interpreted in
+    recurrenceTimeZone, not UTC - converting first (rather than taking the
+    UTC calendar date directly) matters whenever the UTC UNTIL instant
+    crosses local midnight, or a valid final local occurrence would be
+    silently excluded.
+    """
     try:
-        return _date_parser.isoparse(until.strip()).date().isoformat()
+        parsed = _date_parser.isoparse(until.strip())
     except ValueError as exc:
         raise ValueError(f"invalid UNTIL value in recurrence rule: {until}") from exc
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(zone)
+    return parsed.date().isoformat()
 
 
 def _weekday_code_from_date(date_str: str) -> str:
@@ -156,7 +204,9 @@ def _build_graph_recurrence(
     needs an index (first/second/.../last) Graph requires but an RRULE
     without a numeric BYDAY prefix doesn't carry, so guessing here would
     silently produce the wrong days rather than the ones actually asked
-    for.
+    for. Numeric components (INTERVAL, BYMONTHDAY, BYMONTH) are
+    range-checked here too, rather than left for Graph's API to reject
+    remotely with an opaque error.
 
     start_datetime here is Outlook's own convention: a naive local
     dateTime paired with a separate timeZone field, unlike Google's
@@ -165,17 +215,21 @@ def _build_graph_recurrence(
     one does, just not embedded in the string - so it's localized with
     `timezone` before validation; passing the bare naive string through
     would make dateutil see a floating time and reject a (correct) UTC
-    UNTIL as a mismatch.
+    UNTIL as a mismatch. The same resolved zone is then reused (not
+    re-looked-up) to convert UNTIL into `range.endDate`.
     """
+    zone = _resolve_timezone(timezone)
     anchor = _date_parser.isoparse(start_datetime)
     if anchor.tzinfo is None:
-        zone = _tz.gettz(timezone)
-        if zone is None:
-            raise ValueError(f"unknown timezone for recurrence rule: {timezone}")
         anchor = anchor.replace(tzinfo=zone)
     parts = parse_rrule(recurrence, anchor)
     freq = parts["FREQ"].upper()
     interval = int(parts.get("INTERVAL", "1"))
+    if interval < 1:
+        raise ValueError(
+            f"invalid recurrence rule: INTERVAL must be a positive integer, "
+            f"got {parts.get('INTERVAL')!r}"
+        )
     start_date = start_datetime.split("T", 1)[0]
 
     pattern: dict[str, Any]
@@ -194,17 +248,42 @@ def _build_graph_recurrence(
             days = [_RRULE_DAY_TO_GRAPH[_weekday_code_from_date(start_date)]]
         pattern = {"type": "weekly", "interval": interval, "daysOfWeek": days}
     elif freq == "MONTHLY" and "BYMONTHDAY" in parts:
+        if "BYDAY" in parts:
+            raise ValueError(
+                "unsupported recurrence pattern: FREQ=MONTHLY with both "
+                'BYMONTHDAY and BYDAY (e.g. "the 15th, but only if a '
+                "Tuesday\") has no equivalent in Outlook's recurrence model"
+            )
+        day_of_month = int(parts["BYMONTHDAY"])
+        if not 1 <= day_of_month <= 31:
+            raise ValueError(
+                "invalid recurrence rule: BYMONTHDAY must be between 1 and "
+                f'31 for this connector (negative offsets like "last day '
+                f"of the month\" aren't supported), got {day_of_month}"
+            )
         pattern = {
             "type": "absoluteMonthly",
             "interval": interval,
-            "dayOfMonth": int(parts["BYMONTHDAY"]),
+            "dayOfMonth": day_of_month,
         }
     elif freq == "YEARLY" and "BYMONTH" in parts and "BYMONTHDAY" in parts:
+        month = int(parts["BYMONTH"])
+        if not 1 <= month <= 12:
+            raise ValueError(
+                f"invalid recurrence rule: BYMONTH must be between 1 and "
+                f"12, got {month}"
+            )
+        day_of_month = int(parts["BYMONTHDAY"])
+        if not 1 <= day_of_month <= 31:
+            raise ValueError(
+                "invalid recurrence rule: BYMONTHDAY must be between 1 and "
+                f"31 for this connector, got {day_of_month}"
+            )
         pattern = {
             "type": "absoluteYearly",
             "interval": interval,
-            "dayOfMonth": int(parts["BYMONTHDAY"]),
-            "month": int(parts["BYMONTH"]),
+            "dayOfMonth": day_of_month,
+            "month": month,
         }
     else:
         raise ValueError(
@@ -217,7 +296,7 @@ def _build_graph_recurrence(
         range_: dict[str, Any] = {
             "type": "endDate",
             "startDate": start_date,
-            "endDate": _rrule_until_to_date(parts["UNTIL"]),
+            "endDate": _rrule_until_to_date(parts["UNTIL"], zone),
         }
     elif "COUNT" in parts:
         range_ = {
@@ -487,7 +566,7 @@ def outlook_update_event(
             payload["attendees"] = _attendee_list(attendees)
         if is_all_day is not None:
             payload["isAllDay"] = is_all_day
-        if recurrence:
+        if recurrence is not None:
             effective_start = start_datetime
             effective_timezone = timezone
             if effective_start is None:

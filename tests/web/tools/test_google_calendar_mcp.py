@@ -77,6 +77,25 @@ def test_create_events_accepts_recurrence_with_explicit_prefix(monkeypatch):
     assert kwargs["body"]["recurrence"] == ["RRULE:FREQ=DAILY;COUNT=10"]
 
 
+def test_create_events_normalizes_lowercase_recurrence(monkeypatch):
+    """Regression test: dateutil's validation is lenient about case, so a
+    lowercase RRULE must still be canonicalized to uppercase before
+    reaching Google's API - not sent verbatim in whatever case an LLM
+    happened to produce."""
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_create_events(
+        summary="Standup",
+        start_time="2026-08-26T09:00:00+08:00",
+        end_time="2026-08-26T09:15:00+08:00",
+        recurrence="freq=daily;count=10",
+    )
+
+    _, kwargs = service.events.return_value.insert.call_args
+    assert kwargs["body"]["recurrence"] == ["RRULE:FREQ=DAILY;COUNT=10"]
+
+
 def test_create_events_rejects_invalid_recurrence_without_calling_the_api(
     monkeypatch,
 ):
@@ -140,6 +159,40 @@ def test_update_events_adds_recurrence_to_a_previously_single_event(monkeypatch)
     _, kwargs = service.events.return_value.update.call_args
     assert kwargs["body"]["recurrence"] == [
         "RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;UNTIL=20260911T235959Z"
+    ]
+
+
+def test_update_events_preserves_existing_exdate_when_replacing_the_rrule(
+    monkeypatch,
+):
+    """Regression test: Google's `recurrence` field is a flat list of
+    RRULE/EXDATE/RDATE/EXRULE lines, not just the RRULE. Overwriting the
+    whole list with only the new RRULE would silently resurrect a
+    previously-cancelled single occurrence."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00+08:00"},
+        "end": {"dateTime": "2026-08-26T07:15:00+08:00"},
+        "recurrence": [
+            "RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR",
+            "EXDATE:20260902T070000+08:00",
+        ],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;UNTIL=20260911T235959Z",
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["body"]["recurrence"] == [
+        "RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;UNTIL=20260911T235959Z",
+        "EXDATE:20260902T070000+08:00",
     ]
 
 

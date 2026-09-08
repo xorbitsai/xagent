@@ -124,10 +124,22 @@ def success_with_capped_dict(field_name: str, data: Any) -> str:
 
 def ensure_rrule_prefix(rrule_text: str) -> str:
     """Return `rrule_text` with a leading "RRULE:" if it doesn't already
-    have one, matching the prefix `parse_rrule` strips - kept in one place
-    so the two don't drift out of sync."""
+    have one (matching the prefix `parse_rrule` strips - kept in one place
+    so the two don't drift out of sync), with its body canonicalized to
+    uppercase.
+
+    RFC 5545's RRULE grammar has no case-sensitive free-text values - every
+    token (FREQ's value, BYDAY's day codes, the "T"/"Z" markers in UNTIL,
+    ...) is a fixed-case keyword - so uppercasing the whole body is always
+    safe, and it matters here specifically: `parse_rrule`'s validation
+    tolerates lowercase (dateutil is lenient), but a lowercase rule would
+    otherwise reach Google's API as literal text at whatever case the
+    caller happened to use.
+    """
     body = rrule_text.strip()
-    return body if body.upper().startswith("RRULE:") else f"RRULE:{body}"
+    if body.upper().startswith("RRULE:"):
+        body = body[len("RRULE:") :]
+    return f"RRULE:{body.strip().upper()}"
 
 
 def parse_rrule(rrule_text: str, dtstart: str | datetime) -> dict[str, str]:
@@ -137,14 +149,18 @@ def parse_rrule(rrule_text: str, dtstart: str | datetime) -> dict[str, str]:
 
     ``dtstart`` anchors a validation pass through ``dateutil.rrule.rrulestr``
     so a rule that's syntactically plausible but semantically broken (e.g.
-    an UNTIL before dtstart, or a nonsense FREQ) is rejected here rather
-    than being sent to Google/Outlook and either erroring opaquely or -
-    worse - only ever landing as inert description text, which is exactly
-    the failure mode reported against this connector before recurrence
-    support existed. Pass an RFC3339/ISO8601 string (matching what these
-    calendar tools already require for start_time/start_datetime), or a
-    `datetime` directly when the caller already has one on hand (e.g.
-    after localizing a naive Outlook start time) - skipping the
+    a nonsense FREQ) is rejected here rather than being sent to
+    Google/Outlook and either erroring opaquely or - worse - only ever
+    landing as inert description text, which is exactly the failure mode
+    reported against this connector before recurrence support existed.
+    ``dtstart`` also anchors a separate, explicit check this function adds
+    on top of dateutil's: an UNTIL before dtstart parses fine under
+    rrulestr (it just silently produces zero occurrences), so that case is
+    checked here directly rather than trusted to the library. Pass an
+    RFC3339/ISO8601 string (matching what these calendar tools already
+    require for start_time/start_datetime), or a `datetime` directly when
+    the caller already has one on hand (e.g. after localizing a naive
+    Outlook start time) - skipping the
     format-then-reparse round trip that passing `.isoformat()` back in
     would otherwise cost.
 
@@ -189,6 +205,30 @@ def parse_rrule(rrule_text: str, dtstart: str | datetime) -> dict[str, str]:
         _rrulestr(f"RRULE:{body}", dtstart=anchor)
     except (ValueError, TypeError) as exc:
         raise ValueError(f"invalid recurrence rule {rrule_text!r}: {exc}") from exc
+
+    # dateutil's rrulestr above does NOT catch this: an UNTIL before dtstart
+    # parses fine and just silently yields zero occurrences - a "recurring"
+    # event that never actually recurs, reported as success. Only checked
+    # when both sides are timezone-aware (the well-defined case both
+    # callers actually produce by the time they get here); an aware-vs-
+    # naive comparison would raise TypeError rather than answer the
+    # question, so it's skipped rather than guessed at.
+    if "UNTIL" in parts:
+        try:
+            until_dt = _date_parser.isoparse(parts["UNTIL"])
+        except ValueError as exc:
+            raise ValueError(
+                f"invalid UNTIL value in recurrence rule: {parts['UNTIL']!r}"
+            ) from exc
+        if (
+            anchor.tzinfo is not None
+            and until_dt.tzinfo is not None
+            and until_dt < anchor
+        ):
+            raise ValueError(
+                f"recurrence UNTIL ({parts['UNTIL']}) is before the start "
+                "time; this recurrence would never actually happen"
+            )
 
     return parts
 

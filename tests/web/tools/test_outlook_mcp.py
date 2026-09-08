@@ -127,6 +127,69 @@ def test_build_graph_recurrence_absolute_yearly():
     }
 
 
+def test_build_graph_recurrence_rejects_bymonthday_with_byday_on_monthly():
+    """FREQ=MONTHLY with both BYMONTHDAY and BYDAY (e.g. "the 15th, but
+    only if a Tuesday") is valid RFC 5545 - dateutil accepts it - but
+    Graph's absoluteMonthly pattern has no way to express that
+    intersection. Silently keeping only BYMONTHDAY would translate it into
+    a materially different, broader "every 15th" recurrence with no
+    warning."""
+    with pytest.raises(ValueError, match="BYMONTHDAY and BYDAY"):
+        outlook._build_graph_recurrence(
+            "FREQ=MONTHLY;BYMONTHDAY=15;BYDAY=2TU", "2026-08-15T07:00:00+08:00"
+        )
+
+
+def test_build_graph_recurrence_rejects_out_of_range_bymonthday():
+    with pytest.raises(ValueError, match="BYMONTHDAY must be between 1 and 31"):
+        outlook._build_graph_recurrence(
+            "FREQ=MONTHLY;BYMONTHDAY=32", "2026-08-15T07:00:00+08:00"
+        )
+
+
+def test_build_graph_recurrence_rejects_negative_bymonthday():
+    """RRULE allows BYMONTHDAY=-1 ("the last day of the month"), but
+    Graph's dayOfMonth field only accepts 1-31 - this must be rejected
+    with a clear error rather than sent to Graph as a bare -1."""
+    with pytest.raises(ValueError, match="BYMONTHDAY must be between 1 and 31"):
+        outlook._build_graph_recurrence(
+            "FREQ=MONTHLY;BYMONTHDAY=-1", "2026-08-15T07:00:00+08:00"
+        )
+
+
+def test_build_graph_recurrence_rejects_out_of_range_bymonth():
+    with pytest.raises(ValueError, match="BYMONTH must be between 1 and 12"):
+        outlook._build_graph_recurrence(
+            "FREQ=YEARLY;BYMONTH=13;BYMONTHDAY=1", "2026-08-15T07:00:00+08:00"
+        )
+
+
+def test_build_graph_recurrence_rejects_non_positive_interval():
+    with pytest.raises(ValueError, match="INTERVAL must be a positive integer"):
+        outlook._build_graph_recurrence(
+            "FREQ=DAILY;INTERVAL=0", "2026-08-15T07:00:00+08:00"
+        )
+
+
+def test_build_graph_recurrence_resolves_windows_style_timezone():
+    """Graph commonly reports Windows-style timezone identifiers (e.g. for
+    events created via Outlook desktop/web rather than this tool), which
+    dateutil.tz.gettz can't resolve directly - a small common-cases
+    mapping must translate it rather than raising for an otherwise valid,
+    pre-existing event."""
+    recurrence = outlook._build_graph_recurrence(
+        "FREQ=DAILY", "2026-08-26T07:00:00", "Pacific Standard Time"
+    )
+    assert recurrence["range"]["recurrenceTimeZone"] == "Pacific Standard Time"
+
+
+def test_build_graph_recurrence_rejects_unmapped_timezone():
+    with pytest.raises(ValueError, match="unknown timezone"):
+        outlook._build_graph_recurrence(
+            "FREQ=DAILY", "2026-08-26T07:00:00", "Not A Real Timezone"
+        )
+
+
 def test_build_graph_recurrence_rejects_unsupported_pattern():
     """A relative pattern ("second Tuesday of the month") needs an index
     Graph requires but plain RRULE components here don't carry - this must
@@ -166,7 +229,9 @@ def test_create_event_sends_translated_recurrence(monkeypatch):
         "thursday",
         "friday",
     ]
-    assert payload["recurrence"]["range"]["endDate"] == "2026-09-11"
+    # 2026-09-11T23:59:59Z is 2026-09-12 07:59:59 in Asia/Manila (+08:00) -
+    # the correct local endDate is the 12th, not the UTC calendar date.
+    assert payload["recurrence"]["range"]["endDate"] == "2026-09-12"
 
 
 def test_create_event_rejects_invalid_recurrence_without_calling_graph(monkeypatch):
@@ -319,4 +384,26 @@ def test_update_event_rejects_invalid_recurrence_without_calling_graph(monkeypat
     )
 
     assert result["status"] == "error"
+    graph_request.assert_not_called()
+
+
+def test_update_event_rejects_explicit_empty_recurrence(monkeypatch):
+    """Regression test: every other optional field in this function uses
+    an `is not None` check so an explicitly-passed value is never silently
+    ignored; recurrence must behave the same way rather than treating
+    recurrence="" identically to not mentioning it at all."""
+    graph_request = Mock()
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_update_event(
+            event_id="existing-1",
+            start_datetime="2026-08-26T07:00:00",
+            end_datetime="2026-08-26T07:15:00",
+            recurrence="",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "must not be empty" in result["message"]
     graph_request.assert_not_called()

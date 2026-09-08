@@ -32,6 +32,26 @@ def _normalize_rrule(recurrence: str, dtstart: str) -> list[str]:
     return [ensure_rrule_prefix(recurrence)]
 
 
+def _merge_recurrence(
+    existing_recurrence: list[str] | None, new_rrule: str
+) -> list[str]:
+    """Build the `recurrence` list for an update: replace the RRULE line(s)
+    with `new_rrule`, but keep any EXDATE/RDATE/EXRULE lines already on the
+    event (e.g. a previously-cancelled single occurrence) intact.
+
+    Google's `recurrence` field is a flat list of RRULE/EXRULE/RDATE/EXDATE
+    lines, not just the RRULE - overwriting the whole list with only the
+    new RRULE would silently resurrect any occurrence the user had already
+    cancelled.
+    """
+    preserved = [
+        line
+        for line in existing_recurrence or []
+        if not line.strip().upper().startswith("RRULE:")
+    ]
+    return [new_rrule, *preserved]
+
+
 def get_calendar_service() -> Any:
     token = os.environ.get("GOOGLE_ACCESS_TOKEN")
     refresh_token = os.environ.get("GOOGLE_REFRESH_TOKEN")
@@ -396,7 +416,8 @@ def google_calendar_update_events(
     start_time and end_time must be RFC3339 formatted if provided.
     recurrence works like it does in google_calendar_create_events: a
     single RFC 5545 RRULE string turns this event into a repeating series,
-    or replaces its existing one.
+    or replaces its existing one. Any EXDATE/RDATE lines already on the
+    event (e.g. a previously-cancelled single occurrence) are kept.
     attendees is a list of email addresses to add to the event; attendees already on the event are
     kept, and there is no way to remove an attendee through this parameter. Adding attendees does
     not, by itself, email anyone; set notify_attendees=True to have Google Calendar send a native
@@ -439,7 +460,8 @@ def google_calendar_update_events(
                     "the recurrence rule (it may be an all-day event); pass "
                     "start_time explicitly"
                 )
-            event["recurrence"] = _normalize_rrule(recurrence, effective_start)
+            new_rrule = _normalize_rrule(recurrence, effective_start)[0]
+            event["recurrence"] = _merge_recurrence(event.get("recurrence"), new_rrule)
         _merge_attendees(event, attendees)
         requested_conference = _apply_conference_request(event, add_google_meet)
 

@@ -56,6 +56,54 @@ def test_resolve_file_id_accepts_bare_id_and_url_forms(value, expected):
     assert google_drive._resolve_file_id(value) == expected
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        # "id" is an extremely common, generic query-param name -- without
+        # host-gating, any unrelated site's link would get its id extracted
+        # and passed to a share/delete/permission call as if it were this
+        # connector's own share link.
+        "https://example.com/article?id=12345",
+        "https://evil.com/x?id=ATTACKER_CHOSEN_ID",
+        # Same risk for the path-shaped patterns: a deliberately-crafted,
+        # non-Google URL can be made to match the same path shape.
+        "https://evil.com/file/d/ATTACKER_ID/view",
+        "https://evil.com/drive/folders/ATTACKER_ID",
+    ],
+)
+def test_resolve_file_id_does_not_extract_id_from_untrusted_hosts(url):
+    """A prompt-injected agent could be fed a URL like these (e.g. quoted
+    inside a document's content) as `file_id`; the resolver must not
+    silently redirect a share/delete/permission call onto whatever id that
+    URL happens to name -- it should fail as an obviously-invalid fileId
+    instead, by returning the URL unresolved."""
+    assert google_drive._resolve_file_id(url) == url
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        # "Publish to web" links have no real Drive file id in them at all
+        # -- "e" is a literal path segment, not part of an id, and the
+        # actual publish token isn't usable as a fileId.
+        "https://docs.google.com/spreadsheets/d/e/2PACX-1vTabc123xyz/pubhtml",
+        "https://docs.google.com/document/d/e/2PACX-1vTabc123xyz/pub",
+        "https://docs.google.com/presentation/d/e/2PACX-1vTabc123xyz/pub",
+    ],
+)
+def test_resolve_file_id_does_not_mistake_published_link_e_segment_for_id(url):
+    assert google_drive._resolve_file_id(url) == url
+
+
+def test_resolve_file_id_still_matches_a_real_id_starting_with_e():
+    """The "/d/e/" exclusion for published links must be specific to that
+    literal segment, not reject any id that happens to start with "e"."""
+    assert (
+        google_drive._resolve_file_id("https://drive.google.com/file/d/e5f6g7/view")
+        == "e5f6g7"
+    )
+
+
 @pytest.mark.parametrize("bad_role", ["owner", "organizer", ""])
 def test_require_share_role_rejects_roles_outside_the_allowed_set(bad_role):
     with pytest.raises(ValueError, match="role"):
@@ -134,7 +182,9 @@ def test_id_taking_tools_resolve_full_drive_urls(monkeypatch, mock_target, invok
 
     invoke(_FOLDER_URL_WITH_ID)
 
-    assert mock_target(service).call_args.kwargs["fileId"] == "abc123"
+    kwargs = mock_target(service).call_args.kwargs
+    assert kwargs["fileId"] == "abc123"
+    assert kwargs["supportsAllDrives"] is True
 
 
 def test_search_passes_shared_drive_support_and_clamps_max_results(monkeypatch):
@@ -242,8 +292,12 @@ def test_get_file_content_resolves_full_drive_url(monkeypatch):
     result = json.loads(google_drive.google_drive_get_file_content(_FOLDER_URL_WITH_ID))
 
     assert result["status"] == "success"
-    assert service.files.return_value.get.call_args.kwargs["fileId"] == "abc123"
-    assert service.files.return_value.get_media.call_args.kwargs["fileId"] == "abc123"
+    get_kwargs = service.files.return_value.get.call_args.kwargs
+    assert get_kwargs["fileId"] == "abc123"
+    assert get_kwargs["supportsAllDrives"] is True
+    media_kwargs = service.files.return_value.get_media.call_args.kwargs
+    assert media_kwargs["fileId"] == "abc123"
+    assert media_kwargs["supportsAllDrives"] is True
 
 
 def test_get_file_content_defaults_spreadsheet_export_to_csv(monkeypatch):
@@ -336,6 +390,32 @@ def test_get_file_content_keeps_text_plain_default_for_docs(monkeypatch):
     )
 
 
+def test_get_file_content_caps_oversized_output(monkeypatch):
+    service = _mock_drive_service(monkeypatch)
+    service.files.return_value.get.return_value.execute.return_value = {
+        "id": "abc123",
+        "name": "big.txt",
+        "mimeType": "text/plain",
+    }
+    huge_content = ("x" * 200_000).encode("utf-8")
+
+    class _FakeDownloader:
+        def __init__(self, fh, _request):
+            self._fh = fh
+
+        def next_chunk(self):
+            self._fh.write(huge_content)
+            return None, True
+
+    monkeypatch.setattr(google_drive, "MediaIoBaseDownload", _FakeDownloader)
+
+    result = json.loads(google_drive.google_drive_get_file_content("abc123"))
+
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert 0 < len(result["content"]) < len(huge_content)
+
+
 def test_rename_file_resolves_full_drive_url(monkeypatch):
     service = _mock_drive_service(monkeypatch)
     service.files.return_value.update.return_value.execute.return_value = {
@@ -348,7 +428,9 @@ def test_rename_file_resolves_full_drive_url(monkeypatch):
     )
 
     assert result["status"] == "success"
-    assert service.files.return_value.update.call_args.kwargs["fileId"] == "abc123"
+    kwargs = service.files.return_value.update.call_args.kwargs
+    assert kwargs["fileId"] == "abc123"
+    assert kwargs["supportsAllDrives"] is True
 
 
 def test_list_permissions_returns_permissions(monkeypatch):
@@ -513,13 +595,19 @@ def test_share_file_rejects_role_outside_the_share_roles(monkeypatch, bad_role):
     service.permissions.return_value.create.assert_not_called()
 
 
-@pytest.mark.parametrize("bad_email", ["", "not-an-email", " a@x.com"])
+@pytest.mark.parametrize(
+    "bad_email",
+    ["", "not-an-email", " a@x.com", "a@", "@b", "a@b"],
+)
 def test_share_file_rejects_invalid_email(monkeypatch, bad_email):
+    """ "a@", "@b", and "a@b" (no dot in the domain) look email-shaped enough
+    to pass a bare "@" in email check, but are not valid addresses."""
     service = _mock_drive_service(monkeypatch)
 
     result = json.loads(google_drive.google_drive_share_file("fid", bad_email))
 
     assert result["status"] == "error"
+    assert "email" in result["message"]
     service.permissions.return_value.create.assert_not_called()
 
 
@@ -550,6 +638,7 @@ def test_update_permission_changes_role(monkeypatch):
     kwargs = service.permissions.return_value.update.call_args.kwargs
     assert kwargs["permissionId"] == "perm1"
     assert kwargs["body"] == {"role": "writer"}
+    assert kwargs["fields"] == "id, type, role, emailAddress, displayName"
 
 
 @pytest.mark.parametrize("bad_role", ["owner", "organizer", ""])
@@ -640,6 +729,41 @@ class TestExecuteIgnoring204SslEof:
 
         with pytest.raises(Exception, match="UNEXPECTED_EOF_WHILE_READING"):
             google_drive._execute_ignoring_204_ssl_eof(execute, verify_done)
+
+    def test_trusts_http_status_over_uri_text_on_a_real_http_error(self):
+        """A real HttpError's __str__ embeds the request URI (which
+        contains the resolved file/permission id) alongside the actual
+        status code. If an id happens to contain the digits "404", a naive
+        substring match on str(verify_err) would misread a genuine 403
+        (object still exists; access merely denied) as "confirmed gone".
+        Checking verify_err.resp.status first must not fall for that."""
+        from googleapiclient.errors import HttpError
+
+        resp = type("Resp", (), {"status": 403, "reason": "Forbidden"})()
+        forbidden = HttpError(
+            resp,
+            b'{"error": {"message": "Permission denied"}}',
+            uri="https://www.googleapis.com/drive/v3/files/1AbC404xyz?fields=id",
+        )
+        assert "404" in str(forbidden)  # confirms the trap is real
+
+        execute = Mock(side_effect=Exception("UNEXPECTED_EOF_WHILE_READING"))
+        verify_done = Mock(side_effect=forbidden)
+
+        with pytest.raises(Exception, match="UNEXPECTED_EOF_WHILE_READING"):
+            google_drive._execute_ignoring_204_ssl_eof(execute, verify_done)
+
+    def test_treats_a_real_http_404_as_confirmed_gone(self):
+        from googleapiclient.errors import HttpError
+
+        resp = type("Resp", (), {"status": 404, "reason": "Not Found"})()
+        not_found = HttpError(
+            resp, b'{"error": {"message": "File not found"}}', uri="https://x/1abc"
+        )
+        execute = Mock(side_effect=Exception("UNEXPECTED_EOF_WHILE_READING"))
+        verify_done = Mock(side_effect=not_found)
+
+        google_drive._execute_ignoring_204_ssl_eof(execute, verify_done)  # no raise
 
     def test_raises_even_when_original_error_text_contains_not_found(self):
         """The "not complete" exception raised when verify_done() shows the

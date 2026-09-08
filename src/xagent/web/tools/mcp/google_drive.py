@@ -5,6 +5,7 @@ import os
 import re
 from collections.abc import Callable
 from typing import Any
+from urllib.parse import urlparse
 
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build  # type: ignore[import-not-found]
@@ -40,21 +41,59 @@ mcp = FastMCP("google-drive-mcp")
 # "[?&]id=" branch matches the older `drive.google.com/open?id=<id>` /
 # `docs.google.com/open?id=<id>` share-link format, still emitted by
 # DriveApp.getUrl() in Apps Script and some third-party integrations, which
-# has no "/d/<id>" path segment for the first branch to match at all.
+# has no "/d/<id>" path segment for the first branch to match at all --
+# _resolve_file_id below is what keeps that branch from being host-agnostic.
+# "(?!e/)" after each "d/" excludes the "published to web" link shape
+# (".../d/e/<publish-id>/pubhtml"): that "e" is a literal path segment, not
+# part of the id, and the real Drive file id isn't present in that URL at
+# all -- the published-to-web token isn't a valid fileId, so this must not
+# match rather than confidently return the wrong string ("e").
 _DRIVE_URL_ID_PATTERN = re.compile(
     r"(?:/(?:file/(?:u/\d+/)?d|folders|document/(?:u/\d+/)?d"
-    r"|spreadsheets/(?:u/\d+/)?d|presentation/(?:u/\d+/)?d)/|[?&]id=)"
+    r"|spreadsheets/(?:u/\d+/)?d|presentation/(?:u/\d+/)?d)/(?!e/)|[?&]id=)"
     r"([a-zA-Z0-9_-]+)"
 )
+
+# Hosts _resolve_file_id treats as an authoritative Drive/Docs/Sheets/Slides
+# share link. Both the path patterns above and the query-string "id="
+# fallback are otherwise host-agnostic regex/substring matches -- without
+# this check, an untrusted URL (e.g. quoted inside a document an agent
+# reads) that merely happens to contain a matching shape, most easily
+# "?id=<attacker-chosen-id>" since "id" is an extremely common, generic
+# query-param name across the web, would get its id extracted and passed
+# to a share/delete/permission call as if it were this connector's own
+# link.
+_DRIVE_URL_HOSTS = frozenset({"drive.google.com", "docs.google.com"})
 
 # "owner" is deliberately excluded: ownership transfer needs
 # transferOwnership=True, is not reversible the way a role change is, and is
 # a distinct product decision from "share this with someone" -- one this
-# connector doesn't make on the model's behalf.
+# connector doesn't make on the model's behalf. The Shared-Drive-only
+# "organizer"/"fileOrganizer" roles are excluded for the same reason: they
+# grant administrative control over the drive/folder (managing membership,
+# restructuring), which is a materially different, more privileged action
+# than the plain collaboration roles below -- not an oversight of
+# supportsAllDrives support, which applies independently of which roles
+# this connector chooses to expose.
 _SHARE_ROLES = ("reader", "commenter", "writer")
+
+# Same shape as api/auth.py's EMAIL_PATTERN, kept as its own local copy
+# rather than imported: this module runs as its own subprocess per MCP tool
+# call (see get_drive_service's callers), and auth.py is a ~3800-line
+# FastAPI router with heavy top-level imports (fastapi, jose, and an
+# import-time os.environ mutation) -- pulling that whole module in for one
+# regex would add real per-call import cost and an unwarranted dependency
+# from a connector tool onto the web API layer. "a@b" (no dot in the
+# domain) and "a@"/"@b" (an empty local or domain part) are not valid
+# email addresses; the previous "@" not in email check accepted all three.
+_EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 def _resolve_file_id(file_id: str) -> str:
+    if isinstance(file_id, str):
+        parsed = urlparse(file_id.strip())
+        if parsed.scheme and parsed.hostname not in _DRIVE_URL_HOSTS:
+            return file_id.strip()
     return resolve_id_from_url(file_id, _DRIVE_URL_ID_PATTERN, "file_id")
 
 
@@ -84,6 +123,34 @@ def _capped_list_response(field_name: str, items: list[Any]) -> str:
         items = items[: len(items) // 2]
         truncated = True
         response = _build(items, truncated)
+    return response
+
+
+def _capped_content_response(file_metadata: dict[str, Any], content: str) -> str:
+    """Build the success payload, halving ``content`` until it fits the
+    platform's output limit -- same halving idea as _capped_list_response,
+    applied to a single string instead of a list since downloaded/exported
+    file content has no natural list of records to shrink.
+    """
+    max_output_length = get_tool_max_output_length()
+
+    def _build(content: str, truncated: bool) -> str:
+        return json.dumps(
+            {
+                "status": "success",
+                "file": file_metadata,
+                "content": content,
+                "truncated": truncated,
+            },
+            ensure_ascii=False,
+        )
+
+    truncated = False
+    response = _build(content, truncated)
+    while len(response) > max_output_length and content:
+        content = content[: len(content) // 2]
+        truncated = True
+        response = _build(content, truncated)
     return response
 
 
@@ -184,13 +251,8 @@ def google_drive_get_file_content(file_id: str, mime_type: str = "text/plain") -
         while done is False:
             _, done = downloader.next_chunk()
 
-        return json.dumps(
-            {
-                "status": "success",
-                "file": file_metadata,
-                "content": fh.getvalue().decode("utf-8", errors="replace"),
-            },
-            ensure_ascii=False,
+        return _capped_content_response(
+            file_metadata, fh.getvalue().decode("utf-8", errors="replace")
         )
     except Exception as e:
         logger.error(f"Error getting file content: {e}")
@@ -294,6 +356,27 @@ def google_drive_rename_file(file_id: str, new_name: str) -> str:
         return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
 
 
+def _is_confirmed_gone(verify_err: Exception) -> bool:
+    """Whether ``verify_err`` (raised by re-fetching the object) means it is
+    actually gone, i.e. a 404.
+
+    An ``HttpError``'s own ``resp.status`` is the real, unambiguous HTTP
+    status code and is checked first when available. Falling back to
+    substring-matching "404"/"not found" in ``str(verify_err)`` is fragile
+    on its own: ``HttpError.__str__`` embeds the request URI, which
+    contains the resolved file/permission id, so a real 403 (object still
+    exists; access was merely denied) on an id that happens to contain the
+    digits "404" would otherwise be misread as "confirmed gone" --
+    reporting a delete/permission-removal that never happened as a success.
+    The string fallback stays for non-HttpError exceptions (e.g. a plain
+    error from a different failure path, or in tests).
+    """
+    status = getattr(getattr(verify_err, "resp", None), "status", None)
+    if status is not None:
+        return bool(status == 404)
+    return "404" in str(verify_err) or "not found" in str(verify_err).lower()
+
+
 def _execute_ignoring_204_ssl_eof(
     execute: Callable[[], Any], verify_done: Callable[[], None]
 ) -> None:
@@ -318,7 +401,7 @@ def _execute_ignoring_204_ssl_eof(
         try:
             verify_done()
         except Exception as verify_err:
-            if "404" in str(verify_err) or "not found" in str(verify_err).lower():
+            if _is_confirmed_gone(verify_err):
                 return  # Successfully completed
             raise e from verify_err
 
@@ -427,7 +510,7 @@ def google_drive_share_file(
     try:
         _require_share_role(role)
         require_clean_identifier(email, "email")
-        if "@" not in email:
+        if not _EMAIL_PATTERN.match(email):
             raise ValueError("email must be a valid email address")
         resolved_file_id = _resolve_file_id(file_id)
 

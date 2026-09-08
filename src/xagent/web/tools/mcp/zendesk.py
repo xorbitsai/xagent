@@ -1035,8 +1035,9 @@ def zendesk_list_tickets(limit: int = 25, after_cursor: str | None = None) -> st
 @mcp.tool()
 def zendesk_get_ticket(ticket_id: int | str) -> str:
     """
-    Get a Zendesk ticket by id -- a bare numeric id, or a full ticket URL
-    copied from the Zendesk agent UI.
+    Get a Zendesk ticket by id.
+    ticket_id: a bare numeric id, or a full ticket URL copied from the
+    Zendesk agent UI.
     """
     try:
         path_id = _resolve_path_id(ticket_id, _TICKET_URL_ID_PATTERN, "ticket_id")

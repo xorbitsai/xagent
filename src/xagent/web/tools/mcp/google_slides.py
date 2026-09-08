@@ -21,6 +21,33 @@ mcp = FastMCP("google-slides-mcp")
 
 _PRESENTATION_URL_ID_PATTERN = re.compile(r"/presentation/d/([a-zA-Z0-9_-]+)")
 
+# Predefined layouts we know how to fill in, mapped to the (title_placeholder,
+# body_placeholder) types Slides creates for each one. `None` means that slot
+# doesn't exist on the layout at all.
+_LAYOUT_PLACEHOLDERS: dict[str, tuple[str | None, str | None]] = {
+    "TITLE": ("CENTERED_TITLE", "SUBTITLE"),
+    "TITLE_AND_BODY": ("TITLE", "BODY"),
+    "TITLE_ONLY": ("TITLE", None),
+    "SECTION_HEADER": ("TITLE", None),
+    "SECTION_TITLE_AND_DESCRIPTION": ("TITLE", "BODY"),
+    "ONE_COLUMN_TEXT": ("TITLE", "BODY"),
+    "MAIN_POINT": ("TITLE", None),
+    "BIG_NUMBER": ("TITLE", "BODY"),
+    "BLANK": (None, None),
+}
+
+_BULLET_PREFIX_PATTERN = re.compile(r"^[ \t]*[•\-\*][ \t]+")
+
+
+def _strip_bullet_prefixes(text: str) -> str:
+    """Drop a leading "•"/"-"/"*" marker from each line.
+
+    Callers pass body text with literal bullet glyphs; once we ask Slides to
+    render real bulleted paragraphs (see createParagraphBullets below) those
+    glyphs would double up with Slides' own bullet, so strip them first.
+    """
+    return "\n".join(_BULLET_PREFIX_PATTERN.sub("", line) for line in text.split("\n"))
+
 
 def get_slides_service() -> Any:
     token = os.environ.get("GOOGLE_ACCESS_TOKEN")
@@ -131,13 +158,80 @@ def google_slides_create_presentation(title: str) -> str:
 
 @mcp.tool()
 def google_slides_add_slide(
-    presentation_id: str, title: str = "", body: str = ""
+    presentation_id: str,
+    title: str = "",
+    body: str = "",
+    layout: str = "TITLE_AND_BODY",
 ) -> str:
     """
     Append a slide with a title and body text to a Google Slides presentation.
-    The body supports plain text; use newlines to separate bullet lines.
+    The body supports plain text; use newlines to separate bullet lines — each
+    line is rendered as its own bulleted paragraph (don't type literal "•"/"-"
+    markers, Slides adds the bullet glyph itself).
+
+    layout picks the slide's predefined layout, which decides which of
+    title/body actually have a placeholder to land in:
+      - "TITLE_AND_BODY" (default): title + full bulleted body content.
+      - "TITLE": a cover/section-opening slide — title is the big centered
+        title, body (optional) becomes the subtitle line (not bulleted).
+      - "TITLE_ONLY", "SECTION_HEADER", "MAIN_POINT": title only, no body
+        placeholder — pass body="" or the call is rejected.
+      - "SECTION_TITLE_AND_DESCRIPTION", "ONE_COLUMN_TEXT", "BIG_NUMBER":
+        title + bulleted body, like TITLE_AND_BODY with a different look.
+      - "BLANK": no placeholders at all; use google_slides_batch_update to
+        add free-form text boxes/images instead.
     """
     try:
+        if layout not in _LAYOUT_PLACEHOLDERS:
+            return json.dumps(
+                {
+                    "status": "error",
+                    "message": (
+                        f"Unknown layout '{layout}'. Supported layouts: "
+                        f"{', '.join(sorted(_LAYOUT_PLACEHOLDERS))}"
+                    ),
+                }
+            )
+
+        title_placeholder, body_placeholder = _LAYOUT_PLACEHOLDERS[layout]
+
+        if title and title_placeholder is None:
+            return json.dumps(
+                {
+                    "status": "error",
+                    "message": (
+                        f"layout '{layout}' has no title placeholder, so "
+                        "'title' would be silently dropped. Use a different "
+                        "layout, or google_slides_batch_update for a custom "
+                        "text box."
+                    ),
+                }
+            )
+        if body and body_placeholder is None:
+            return json.dumps(
+                {
+                    "status": "error",
+                    "message": (
+                        f"layout '{layout}' has no body placeholder, so "
+                        "'body' would be silently dropped. Use a layout "
+                        "with a body/subtitle placeholder (e.g. "
+                        "TITLE_AND_BODY, TITLE) or omit body."
+                    ),
+                }
+            )
+        if not body and body_placeholder == "BODY":
+            return json.dumps(
+                {
+                    "status": "error",
+                    "message": (
+                        f"layout '{layout}' expects body content but none "
+                        "was provided. Include this slide's full bullet/"
+                        "detail text in 'body' — don't create the slide "
+                        "with just a title."
+                    ),
+                }
+            )
+
         pres_id = _resolve_presentation_id(presentation_id)
         service = get_slides_service()
 
@@ -145,28 +239,52 @@ def google_slides_add_slide(
         title_id = f"{slide_id}_title"
         body_id = f"{slide_id}_body"
 
+        placeholder_mappings: list[dict[str, Any]] = []
+        if title_placeholder is not None:
+            placeholder_mappings.append(
+                {
+                    "layoutPlaceholder": {"type": title_placeholder},
+                    "objectId": title_id,
+                }
+            )
+        if body_placeholder is not None:
+            placeholder_mappings.append(
+                {
+                    "layoutPlaceholder": {"type": body_placeholder},
+                    "objectId": body_id,
+                }
+            )
+
         requests: list[dict[str, Any]] = [
             {
                 "createSlide": {
                     "objectId": slide_id,
-                    "slideLayoutReference": {"predefinedLayout": "TITLE_AND_BODY"},
-                    "placeholderIdMappings": [
-                        {
-                            "layoutPlaceholder": {"type": "TITLE"},
-                            "objectId": title_id,
-                        },
-                        {
-                            "layoutPlaceholder": {"type": "BODY"},
-                            "objectId": body_id,
-                        },
-                    ],
+                    "slideLayoutReference": {"predefinedLayout": layout},
+                    "placeholderIdMappings": placeholder_mappings,
                 }
             }
         ]
         if title:
             requests.append({"insertText": {"objectId": title_id, "text": title}})
         if body:
-            requests.append({"insertText": {"objectId": body_id, "text": body}})
+            requests.append(
+                {
+                    "insertText": {
+                        "objectId": body_id,
+                        "text": _strip_bullet_prefixes(body),
+                    }
+                }
+            )
+            if body_placeholder == "BODY":
+                requests.append(
+                    {
+                        "createParagraphBullets": {
+                            "objectId": body_id,
+                            "textRange": {"type": "ALL"},
+                            "bulletPreset": "BULLET_DISC_CIRCLE_SQUARE",
+                        }
+                    }
+                )
 
         service.presentations().batchUpdate(
             presentationId=pres_id, body={"requests": requests}

@@ -1,4 +1,5 @@
 import json
+import time
 from unittest.mock import Mock
 
 import pytest
@@ -296,6 +297,23 @@ def test_add_slide_fully_unwraps_a_line_with_more_than_one_leading_marker(monkey
     assert body_text == "nested"
 
 
+def test_strip_bullet_prefixes_bounds_work_on_a_degenerate_glued_marker_run():
+    """Regression guard for a real perf/DoS finding: _strip_line used to
+    re-scan the whole remaining line on every stripped marker with no
+    cap, making a line of N glued "•" characters (body has no length
+    limit; plausible from a runaway/malformed LLM completion) O(n^2) —
+    measured at over a second for N=200_000. _MAX_MARKER_STRIPS_PER_LINE
+    must keep this bounded regardless of N."""
+    line = "•" * 200_000 + "Hello"
+
+    start = time.perf_counter()
+    result = google_slides._strip_bullet_prefixes(line)
+    elapsed = time.perf_counter() - start
+
+    assert elapsed < 1.0
+    assert result.endswith("Hello")
+
+
 def test_add_slide_drops_blank_lines_and_trailing_newline_from_bulleted_body(
     monkeypatch,
 ):
@@ -401,6 +419,27 @@ def test_add_slide_rejects_empty_title_for_title_only_layout(monkeypatch, layout
     _mock_slides_service(monkeypatch, presentations)
 
     result = json.loads(google_slides.google_slides_add_slide("pres1", layout=layout))
+
+    assert result["status"] == "error"
+    assert "completely empty slide" in result["message"]
+    presentations.batchUpdate.assert_not_called()
+
+
+@pytest.mark.parametrize("layout", ["TITLE_ONLY", "SECTION_HEADER"])
+def test_add_slide_rejects_title_that_is_only_a_newline(monkeypatch, layout):
+    """Regression guard: before the newline-collapse + .strip()-based
+    guards were added together, title="\\n" was truthy under the old bare
+    truthiness check and slipped past the empty-slide guard, producing a
+    createSlide with no insertText for the title at all (insertion always
+    used title.strip()) — a silently blank slide. Collapsing "\\n" to " "
+    and then stripping it must route this through the empty-slide guard
+    with its real message, not a misleading one from elsewhere."""
+    presentations = Mock()
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(
+        google_slides.google_slides_add_slide("pres1", title="\n", layout=layout)
+    )
 
     assert result["status"] == "error"
     assert "completely empty slide" in result["message"]

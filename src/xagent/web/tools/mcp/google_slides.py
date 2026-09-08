@@ -114,13 +114,23 @@ def _leading_whitespace_to_tabs(leading: str) -> str:
     return "\t" * level
 
 
+# Upper bound on how many leading markers _strip_line unwraps from one
+# line. Real content never nests anywhere near this deep (the case this
+# exists for, "• - nested", needs 2); the cap exists purely to bound the
+# work: each iteration re-scans the line from its new start, so without a
+# cap a degenerate line of N glued markers (e.g. "•" * 200_000, from a
+# runaway/malformed LLM completion — body has no length limit) makes
+# _strip_line O(n^2), measured to take over a second at N=200_000.
+_MAX_MARKER_STRIPS_PER_LINE = 8
+
+
 def _strip_bullet_prefixes(text: str) -> str:
-    """Drop a leading "•"/"-"/"*" marker from each line — repeatedly, so a
-    line with more than one leading marker (e.g. "• - nested") is fully
-    unwrapped rather than leaving a residual marker as literal text — and
-    convert any leading indentation into nesting-level tabs. See
-    _BULLET_PREFIX_PATTERN for the narrower rules that keep this from
-    corrupting non-bullet content.
+    """Drop a leading "•"/"-"/"*" marker from each line — repeatedly, up
+    to _MAX_MARKER_STRIPS_PER_LINE times, so a line with more than one
+    leading marker (e.g. "• - nested") is fully unwrapped rather than
+    leaving a residual marker as literal text — and convert any leading
+    indentation into nesting-level tabs. See _BULLET_PREFIX_PATTERN for
+    the narrower rules that keep this from corrupting non-bullet content.
 
     The public docstrings tell callers not to type literal bullet glyphs,
     but callers may do so anyway; once we ask Slides to render real
@@ -129,7 +139,7 @@ def _strip_bullet_prefixes(text: str) -> str:
     """
 
     def _strip_line(line: str) -> str:
-        while True:
+        for _ in range(_MAX_MARKER_STRIPS_PER_LINE):
             match = _BULLET_PREFIX_PATTERN.match(line)
             if match is None:
                 return line
@@ -137,6 +147,7 @@ def _strip_bullet_prefixes(text: str) -> str:
             if stripped == line:
                 return line
             line = stripped
+        return line
 
     return "\n".join(_strip_line(line) for line in text.split("\n"))
 

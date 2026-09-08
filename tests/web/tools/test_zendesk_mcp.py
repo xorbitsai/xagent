@@ -342,6 +342,34 @@ def test_extract_error_detail_falls_back_to_field_reasons_without_description():
     )
 
 
+def test_finalize_capped_returns_response_unchanged_when_it_fits():
+    assert zendesk._finalize_capped('{"status": "success"}', 2000) == (
+        '{"status": "success"}'
+    )
+
+
+def test_finalize_capped_shrinks_its_own_fallback_to_fit_a_small_cap():
+    # A reviewer-reported example: XAGENT_TOOL_MAX_OUTPUT_LENGTH=80 is well
+    # under the ~155-char detailed fallback message this function used to
+    # return unconditionally, which itself exceeded the cap it was meant to
+    # respect. The shorter "output cap too small" tier must be used instead.
+    raw = zendesk._finalize_capped("x" * 5000, 80)
+
+    assert len(raw) <= 80
+    assert json.loads(raw)["status"] == "error"
+    assert json.loads(raw)["message"] == "output cap too small"
+
+
+def test_finalize_capped_falls_back_to_minimal_envelope_below_any_message():
+    # Below the size of even the shortest fixed error message this function
+    # can construct, it must still return valid, in-cap JSON -- the
+    # unsatisfiable case is a misconfigured cap, not a bug in the fallback.
+    raw = zendesk._finalize_capped("x" * 5000, 20)
+
+    assert len(raw) <= 20
+    assert json.loads(raw) == {"status": "error"}
+
+
 def test_cursor_page_returns_next_cursor_when_has_more():
     page, has_more, after_cursor = zendesk._cursor_page(
         {
@@ -745,6 +773,53 @@ def test_search_explains_a_single_oversized_item(monkeypatch):
     assert len(raw) <= 2000
 
 
+def test_search_uses_short_message_when_full_explanation_does_not_fit(monkeypatch):
+    # Same gap as the cursor paginator's equivalent test: a cap too small
+    # for the long explanation but large enough for a shorter one must
+    # still explain the oversized-item case, not silently revert to a bare
+    # has_more=true/empty-results envelope with no message.
+    one_huge_result = [{"result_type": "ticket", "id": 1, "subject": "x" * 5000}]
+    monkeypatch.setattr(
+        zendesk._session,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={"results": one_huge_result, "count": 1, "next_page": None}
+            )
+        ),
+    )
+    monkeypatch.setattr(zendesk, "get_tool_max_output_length", lambda: 200)
+
+    raw = zendesk.zendesk_search("type:ticket", limit=50)
+    result = json.loads(raw)
+
+    assert result["status"] == "success"
+    assert result["results"] == []
+    assert result["has_more"] is True
+    assert "too large to fit" in result["message"]
+    assert len(raw) <= 200
+
+
+def test_search_reports_error_when_even_short_message_does_not_fit(monkeypatch):
+    one_huge_result = [{"result_type": "ticket", "id": 1, "subject": "x" * 5000}]
+    monkeypatch.setattr(
+        zendesk._session,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={"results": one_huge_result, "count": 1, "next_page": None}
+            )
+        ),
+    )
+    monkeypatch.setattr(zendesk, "get_tool_max_output_length", lambda: 150)
+
+    raw = zendesk.zendesk_search("type:ticket", limit=50)
+    result = json.loads(raw)
+
+    assert result["status"] == "error"
+    assert len(raw) <= 150
+
+
 def test_search_clamps_page_to_at_least_one(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(json_data={"results": [], "count": 0})
@@ -926,7 +1001,8 @@ def test_list_tickets_falls_back_to_error_when_cap_is_impossibly_small(monkeypat
     # An operator-configured XAGENT_TOOL_MAX_OUTPUT_LENGTH small enough that
     # even the empty, message-less envelope exceeds it must still produce
     # valid JSON -- not an oversized string for the platform's own output
-    # filter to hard-truncate into garbage.
+    # filter to hard-truncate into garbage. The fallback itself must also
+    # fit under the cap, not just be "a short string" in the abstract.
     one_huge_ticket = [{"id": 1, "subject": "x" * 5000}]
     monkeypatch.setattr(
         zendesk._session,
@@ -943,6 +1019,64 @@ def test_list_tickets_falls_back_to_error_when_cap_is_impossibly_small(monkeypat
     result = json.loads(raw)  # must not raise -- valid JSON either way
 
     assert result["status"] == "error"
+    assert len(raw) <= 20
+
+
+def test_list_tickets_uses_short_message_when_full_explanation_does_not_fit(
+    monkeypatch,
+):
+    # A cap too small for _OVERSIZED_ITEMS_MESSAGE (342 chars in this
+    # scenario) but large enough for a shorter one must still explain the
+    # oversized-item case -- never silently fall back to a bare
+    # has_more=true/empty-list envelope just because the long explanation
+    # didn't fit, which would be indistinguishable from ordinary truncation
+    # and would send the caller into a retry loop that can never progress.
+    one_huge_ticket = [{"id": 1, "subject": "x" * 5000}]
+    monkeypatch.setattr(
+        zendesk._session,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={"tickets": one_huge_ticket, "meta": {"has_more": False}}
+            )
+        ),
+    )
+    monkeypatch.setattr(zendesk, "get_tool_max_output_length", lambda: 200)
+
+    raw = zendesk.zendesk_list_tickets(limit=50)
+    result = json.loads(raw)
+
+    assert result["status"] == "success"
+    assert result["tickets"] == []
+    assert result["has_more"] is True
+    assert "too large to fit" in result["message"]
+    assert len(raw) <= 200
+
+
+def test_list_tickets_reports_error_when_even_short_message_does_not_fit(
+    monkeypatch,
+):
+    # Below the short message's own size, neither explanation fits -- this
+    # must fall to _finalize_capped's own error tier rather than ever
+    # returning the misleading bare has_more=true envelope, which fits at
+    # this cap but has no way to tell the caller why the page is empty.
+    one_huge_ticket = [{"id": 1, "subject": "x" * 5000}]
+    monkeypatch.setattr(
+        zendesk._session,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={"tickets": one_huge_ticket, "meta": {"has_more": False}}
+            )
+        ),
+    )
+    monkeypatch.setattr(zendesk, "get_tool_max_output_length", lambda: 150)
+
+    raw = zendesk.zendesk_list_tickets(limit=50)
+    result = json.loads(raw)
+
+    assert result["status"] == "error"
+    assert len(raw) <= 150
 
 
 def test_ticket_summary_includes_group_id(monkeypatch):

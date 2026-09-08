@@ -254,6 +254,9 @@ _OVERSIZED_ITEMS_MESSAGE = (
     "may surface different items if more exist, but cannot shrink an "
     "individually oversized item."
 )
+_OVERSIZED_ITEMS_MESSAGE_SHORT = (
+    "Every item in this page was too large to fit; retrying will not help."
+)
 
 
 def _finalize_capped(response: str, max_output_length: int) -> str:
@@ -264,14 +267,28 @@ def _finalize_capped(response: str, max_output_length: int) -> str:
     XAGENT_TOOL_MAX_OUTPUT_LENGTH under that floor, and the platform's
     output filter then truncates the oversized string at a raw character
     boundary -- handing the caller invalid JSON. A short, valid error
-    envelope is strictly better than that, and names the actual cause."""
+    envelope is strictly better than that, and names the actual cause.
+
+    The error envelope itself is shrunk in stages rather than returned
+    unconditionally: a cap small enough to reject the full response can
+    also be too small for the detailed explanation, so each stage below is
+    tried only if the previous one still doesn't fit."""
     if len(response) <= max_output_length:
         return response
-    return _error(
+    detailed = _error(
         "response cannot fit the configured output cap of "
         f"{max_output_length} characters even after truncation; raise "
         "XAGENT_TOOL_MAX_OUTPUT_LENGTH"
     )
+    if len(detailed) <= max_output_length:
+        return detailed
+    minimal = _error("output cap too small")
+    if len(minimal) <= max_output_length:
+        return minimal
+    # Below the size of any valid JSON error envelope this function can
+    # construct -- there is nothing left to shrink. XAGENT_TOOL_MAX_OUTPUT_LENGTH
+    # would need to be set below roughly 20 characters to reach this.
+    return json.dumps({"status": "error"}, ensure_ascii=False)
 
 
 def _clean_tags(tags: list[str]) -> list[str]:
@@ -609,11 +626,23 @@ def _list_offset_paginated(
         # Collapsed all the way to zero: even the single largest item didn't
         # fit alone, so has_more=true here is NOT the usual "retry with a
         # smaller limit" situation -- a smaller limit cannot shrink an
-        # individually oversized item. Say so, but only if the message
-        # itself still fits (mirrors hubspot.py's _paged_list).
-        with_message = _build([], True, _OVERSIZED_ITEMS_MESSAGE)
-        if len(with_message) <= max_output_length:
-            response = with_message
+        # individually oversized item. Say so (mirrors hubspot.py's
+        # _paged_list) -- but never fall through to the bare has_more=true
+        # envelope silently just because the explanation didn't fit: without
+        # it, this is indistinguishable from ordinary truncation and drives
+        # the caller into a retry loop that can never make progress. Try a
+        # shorter explanation before giving up on explaining at all.
+        for message in (_OVERSIZED_ITEMS_MESSAGE, _OVERSIZED_ITEMS_MESSAGE_SHORT):
+            candidate = _build([], True, message)
+            if len(candidate) <= max_output_length:
+                return candidate
+        return _finalize_capped(
+            _error(
+                "every item in this page was too large to fit the "
+                "configured output cap; raise XAGENT_TOOL_MAX_OUTPUT_LENGTH"
+            ),
+            max_output_length,
+        )
     return _finalize_capped(response, max_output_length)
 
 
@@ -685,11 +714,23 @@ def _list_cursor_paginated(
         # Collapsed to zero: the single largest item didn't fit alone, so
         # "retry the same cursor with a smaller limit" cannot help -- a
         # smaller limit doesn't shrink an individually oversized item. Say
-        # so, but only if the message itself still fits (hubspot.py's
-        # _paged_list pattern).
-        with_message = _build([], fallback_cursor, True, _OVERSIZED_ITEMS_MESSAGE)
-        if len(with_message) <= max_output_length:
-            response = with_message
+        # so (hubspot.py's _paged_list pattern) -- but never fall through to
+        # the bare has_more=true envelope silently just because the
+        # explanation didn't fit: without it, this is indistinguishable from
+        # ordinary truncation and drives the caller into a retry loop that
+        # can never make progress. Try a shorter explanation before giving
+        # up on explaining at all.
+        for message in (_OVERSIZED_ITEMS_MESSAGE, _OVERSIZED_ITEMS_MESSAGE_SHORT):
+            candidate = _build([], fallback_cursor, True, message)
+            if len(candidate) <= max_output_length:
+                return candidate
+        return _finalize_capped(
+            _error(
+                "every item in this page was too large to fit the "
+                "configured output cap; raise XAGENT_TOOL_MAX_OUTPUT_LENGTH"
+            ),
+            max_output_length,
+        )
     return _finalize_capped(response, max_output_length)
 
 

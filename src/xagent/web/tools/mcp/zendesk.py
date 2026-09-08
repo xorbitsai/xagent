@@ -11,6 +11,7 @@ import requests
 from mcp.server.fastmcp import FastMCP
 
 from ....config import get_tool_max_output_length
+from ....core.tools.core.web_content import get_trusted_proxy_url
 from ....core.utils.security import (
     PrivateNetworkHostError,
     redact_sensitive_text,
@@ -38,6 +39,25 @@ mcp = FastMCP("zendesk-mcp")
 # to any single tool call that happens to make more than one request; a
 # fresh connection per call is otherwise a fixed cost this avoids for free.
 _session = requests.Session()
+# trust_env=False so requests never falls back to an ambient/OS-native proxy
+# source get_trusted_proxy_url() doesn't police: a trust_env=True Session
+# (requests' default) still calls urllib.request.getproxies(), which falls
+# back *past* HTTP_PROXY/HTTPS_PROXY/ALL_PROXY to the OS's own proxy
+# configuration once no env var is set. A proxy performs its own DNS
+# resolution for the real connection, so any ambient proxy silently bypasses
+# _base_url()'s private-network check of the addresses *this process*
+# resolved -- the exact DNS-rebinding-via-proxy hole that check exists to
+# close. Same posture as posthog.py/magento.py, the two other connectors
+# carrying that check. trust_env=False also disables requests' own
+# REQUESTS_CA_BUNDLE/CURL_CA_BUNDLE lookup, so it is re-applied explicitly:
+# an operator opting into a trusted egress proxy (XAGENT_TRUSTED_EGRESS_PROXY=1)
+# is the textbook TLS-intercepting corporate proxy with an internal CA, which
+# would otherwise fail closed with an opaque SSLError. .netrc auto-auth stays
+# disabled since this connector always sends its own Basic Auth.
+_session.trust_env = False
+_ca_bundle = environ.get("REQUESTS_CA_BUNDLE") or environ.get("CURL_CA_BUNDLE")
+if _ca_bundle:
+    _session.verify = _ca_bundle
 
 DEFAULT_TIMEOUT_SECONDS = 30
 MAX_LIMIT = 100
@@ -178,6 +198,69 @@ def _blank_to_none(value: str | None) -> str | None:
     return (value or "").strip() or None
 
 
+# Zendesk's closed enums for the two ticket fields this connector writes.
+# Validated locally (case-insensitively) so a typo surfaces as a clear local
+# error naming the accepted values, instead of a remote 422 whose body only
+# says the value is invalid -- the same posture intercom.py takes for its
+# analogous `state` parameter.
+_TICKET_STATUSES = frozenset({"new", "open", "pending", "hold", "solved", "closed"})
+_TICKET_PRIORITIES = frozenset({"low", "normal", "high", "urgent"})
+
+
+def _require_one_of(value: str, allowed: frozenset[str], field_name: str) -> str:
+    normalized = value.lower()
+    if normalized not in allowed:
+        raise ValueError(
+            f"{field_name} must be one of {sorted(allowed)}, got {value!r}"
+        )
+    return normalized
+
+
+# Any query string in text that came back from `requests`: both
+# requests.HTTPError (via response.url) and connection-level exceptions (via
+# urllib3's "Max retries exceeded with url: /path?query=...") echo the full
+# request URL, and the search tools' `query` parameter -- documented with an
+# email-address example -- rides in that query string. redact_sensitive_text
+# only knows credential-shaped keys (api_key/token/...), not `query=`, so the
+# query string is scrubbed wholesale before any exception text is logged or
+# returned.
+_QUERY_STRING_PATTERN = re.compile(r"\?[^\s\"'()<>]+")
+
+
+def _scrub_query_strings(text: str) -> str:
+    return _QUERY_STRING_PATTERN.sub("?<query redacted>", text)
+
+
+def _sanitize_exception_text(exc: BaseException) -> str:
+    return _scrub_query_strings(redact_sensitive_text(str(exc)))
+
+
+_OVERSIZED_ITEMS_MESSAGE = (
+    "Every item in this page was individually too large to fit the output "
+    "size limit, so none could be returned. Retrying with a smaller `limit` "
+    "may surface different items if more exist, but cannot shrink an "
+    "individually oversized item."
+)
+
+
+def _finalize_capped(response: str, max_output_length: int) -> str:
+    """Last line of defense for every size-capped response builder in this
+    file: the halving loops above it shrink *content*, but the fixed
+    envelope around that content (status/has_more/cursor keys) has a floor
+    they cannot shrink below. An operator can configure
+    XAGENT_TOOL_MAX_OUTPUT_LENGTH under that floor, and the platform's
+    output filter then truncates the oversized string at a raw character
+    boundary -- handing the caller invalid JSON. A short, valid error
+    envelope is strictly better than that, and names the actual cause."""
+    if len(response) <= max_output_length:
+        return response
+    return _error(
+        "response cannot fit the configured output cap of "
+        f"{max_output_length} characters even after truncation; raise "
+        "XAGENT_TOOL_MAX_OUTPUT_LENGTH"
+    )
+
+
 def _clean_tags(tags: list[str]) -> list[str]:
     """Strip whitespace and drop empty entries from a caller-supplied tag
     list before sending it to Zendesk -- FastMCP's schema only validates
@@ -259,6 +342,22 @@ def _request(
     params: dict[str, Any] | None = None,
     json_data: dict[str, Any] | None = None,
 ) -> Any:
+    # An ambient HTTP(S) proxy makes the *proxy* perform DNS resolution for
+    # the real connection, not this process -- silently bypassing
+    # _base_url()'s private-network validation, which only checks the
+    # addresses this process itself resolves. get_trusted_proxy_url()
+    # raises unless the proxy is explicitly marked trusted to enforce its
+    # own private-range egress policy (XAGENT_TRUSTED_EGRESS_PROXY=1),
+    # rather than silently trusting whatever setup_proxy_env() promoted
+    # from the OS. Paired with the module session's trust_env=False, "no
+    # proxy" here is an actual guarantee for the call, not just for the env
+    # vars this function reads.
+    try:
+        proxy_url = get_trusted_proxy_url()
+    except PrivateNetworkHostError as exc:
+        raise type(exc)(redact_sensitive_text(str(exc))) from exc
+    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else {}
+
     url = f"{_base_url()}{path}"
     try:
         for attempt in (0, 1):
@@ -269,6 +368,7 @@ def _request(
                 params=params,
                 json=json_data,
                 timeout=DEFAULT_TIMEOUT_SECONDS,
+                proxies=proxies,
                 # A redirect response is never followed with Basic Auth
                 # credentials still attached: Zendesk's documented API
                 # doesn't redirect, so a 3xx here is either a
@@ -286,11 +386,12 @@ def _request(
                     continue
             break
     except requests.RequestException as exc:
-        # A connection/timeout/proxy failure's message can itself embed
-        # sensitive data -- e.g. a ProxyError echoing the ambient
-        # HTTPS_PROXY URL, which may carry embedded user:pass@ credentials
-        # (setup_proxy_env() exports whatever the OS has configured).
-        raise RuntimeError(redact_sensitive_text(str(exc))) from exc
+        # A connection/timeout/proxy failure's message can embed sensitive
+        # data two ways: a ProxyError echoing a proxy URL with user:pass@
+        # credentials, and urllib3's "Max retries exceeded with url:
+        # /search.json?query=..." echoing the request's own query string
+        # (which for the search tools can carry end-user PII).
+        raise RuntimeError(_sanitize_exception_text(exc)) from exc
 
     if 300 <= response.status_code < 400:
         raise RuntimeError(
@@ -300,12 +401,19 @@ def _request(
     try:
         response.raise_for_status()
     except requests.HTTPError as exc:
-        message = str(exc)
+        # Deliberately NOT str(exc): requests formats an HTTPError as
+        # "<status> ... for url: <full url>", and the full URL includes the
+        # query string -- for the search tools, the caller's raw query
+        # (documented with an email-address example). Status + Zendesk's
+        # own (redacted) error detail is everything the caller can act on.
+        message = f"Zendesk returned HTTP {response.status_code}"
         detail = _extract_error_detail(response)
         if detail is None:
             detail = truncate_error_text(response.text.strip())
         if detail:
-            message = f"{message} - {redact_sensitive_text(detail)}"
+            message = (
+                f"{message} - {_scrub_query_strings(redact_sensitive_text(detail))}"
+            )
         raise RuntimeError(message) from exc
 
     if response.status_code == 204 or not response.content:
@@ -387,17 +495,21 @@ def _offset_page(
 
 
 def _past_search_window(page: int, max_results: int, ceiling: int) -> bool:
-    """True once the requested page's *end* offset crosses Zendesk's
-    documented search-window ceiling for the endpoint being called (1,000
-    for /search.json, 10,000 for /users/search.json -- see
-    _MAX_SEARCH_RESULT_WINDOW / _MAX_USER_SEARCH_RESULT_WINDOW), past which
-    Zendesk itself returns an opaque HTTP error rather than a clean empty
-    page. Checked against the window's end (page * max_results), not its
-    start, so a `limit` that doesn't evenly divide the ceiling still
-    catches a page that straddles it instead of letting it through to
-    error out remotely (e.g. limit=30, page=34 spans results 991-1020 of a
-    1,000-result window)."""
-    return page * max_results > ceiling
+    """True once the requested page *starts* at or past Zendesk's documented
+    search-window ceiling for the endpoint being called (1,000 for
+    /search.json, 10,000 for /users/search.json -- see
+    _MAX_SEARCH_RESULT_WINDOW / _MAX_USER_SEARCH_RESULT_WINDOW), i.e. the
+    page cannot contain a single result Zendesk would serve.
+
+    Deliberately the window's *start*, not its end: a page that merely
+    straddles the ceiling (limit=30, page=34 spans 991-1020 of a 1,000
+    window) still holds results 991-1000, and rejecting it locally would
+    silently discard them with has_more=false -- unrecoverable through this
+    tool. Forwarding it instead has a strictly better worst case: Zendesk
+    either serves the valid tail, or answers 422 (documented for pages past
+    the limit), which _request surfaces as a visible, structured error
+    rather than silent data loss."""
+    return (page - 1) * max_results >= ceiling
 
 
 def _list_offset_paginated(
@@ -429,7 +541,9 @@ def _list_offset_paginated(
     summaries = [summary_fn(item) for item in items]
     extra_fields = extra_fields_fn(result) if extra_fields_fn else {}
 
-    def _build(page: list[dict[str, Any]], truncated: bool) -> str:
+    def _build(
+        page: list[dict[str, Any]], truncated: bool, message: str | None = None
+    ) -> str:
         return _success(
             **{list_key: page},
             **extra_fields,
@@ -439,6 +553,7 @@ def _list_offset_paginated(
             # this call dropped for size.
             has_more=has_more or truncated,
             truncated=truncated,
+            **({"message": message} if message else {}),
         )
 
     response = _build(summaries, False)
@@ -449,7 +564,16 @@ def _list_offset_paginated(
     while len(response) > max_output_length and summaries:
         summaries = summaries[: len(summaries) // 2]
         response = _build(summaries, True)
-    return response
+    if not summaries:
+        # Collapsed all the way to zero: even the single largest item didn't
+        # fit alone, so has_more=true here is NOT the usual "retry with a
+        # smaller limit" situation -- a smaller limit cannot shrink an
+        # individually oversized item. Say so, but only if the message
+        # itself still fits (mirrors hubspot.py's _paged_list).
+        with_message = _build([], True, _OVERSIZED_ITEMS_MESSAGE)
+        if len(with_message) <= max_output_length:
+            response = with_message
+    return _finalize_capped(response, max_output_length)
 
 
 def _list_cursor_paginated(
@@ -479,7 +603,12 @@ def _list_cursor_paginated(
     items, has_more, next_cursor = _cursor_page(result, list_key, max_results)
     summaries = [summary_fn(item) for item in items]
 
-    def _build(page: list[dict[str, Any]], cursor: str | None, truncated: bool) -> str:
+    def _build(
+        page: list[dict[str, Any]],
+        cursor: str | None,
+        truncated: bool,
+        message: str | None = None,
+    ) -> str:
         return _success(
             **{list_key: page},
             # A truncated page must report has_more=True even if Zendesk's
@@ -489,6 +618,7 @@ def _list_cursor_paginated(
             has_more=has_more or truncated,
             after_cursor=cursor,
             truncated=truncated,
+            **({"message": message} if message else {}),
         )
 
     response = _build(summaries, next_cursor, False)
@@ -510,7 +640,16 @@ def _list_cursor_paginated(
     while len(response) > max_output_length and summaries:
         summaries = summaries[: len(summaries) // 2]
         response = _build(summaries, fallback_cursor, True)
-    return response
+    if not summaries:
+        # Collapsed to zero: the single largest item didn't fit alone, so
+        # "retry the same cursor with a smaller limit" cannot help -- a
+        # smaller limit doesn't shrink an individually oversized item. Say
+        # so, but only if the message itself still fits (hubspot.py's
+        # _paged_list pattern).
+        with_message = _build([], fallback_cursor, True, _OVERSIZED_ITEMS_MESSAGE)
+        if len(with_message) <= max_output_length:
+            response = with_message
+    return _finalize_capped(response, max_output_length)
 
 
 def _ticket_summary(ticket: dict[str, Any]) -> dict[str, Any]:
@@ -580,19 +719,31 @@ def _resolve_path_id(value: str, pattern: re.Pattern[str], field_name: str) -> s
     return url_path_id(resolve_id_from_url(str(value), pattern, field_name), field_name)
 
 
-def _find_comment_event(result: Any) -> dict[str, Any] | None:
+def _find_comment_event(result: Any, public: bool) -> dict[str, Any] | None:
     """Pull the newly created Comment event out of a ticket-update
     response's audit trail (PUT /tickets/{id}.json returns {"ticket":
     ..., "audit": {"events": [...]}} -- the audit, not the ticket object
     itself, is where a just-added comment's own id/body/public actually
     show up), so reply/note tools can confirm exactly what was posted --
     including `public`, the one field that distinguishes a customer-visible
-    reply from an internal note."""
+    reply from an internal note.
+
+    Each audit covers a single update and this connector posts exactly one
+    comment per update, so the Comment event is normally unique. The
+    `public` match is cheap insurance for the residual case (an
+    account-configured integration adding its own comment into the same
+    audit): a candidate whose visibility differs from what was sent can
+    never be the one this call created, so it's skipped rather than risk
+    labeling an internal note as public."""
     if not isinstance(result, dict):
         return None
     events = (result.get("audit") or {}).get("events") or []
     for event in events:
-        if isinstance(event, dict) and event.get("type") == "Comment":
+        if (
+            isinstance(event, dict)
+            and event.get("type") == "Comment"
+            and event.get("public") == public
+        ):
             return _comment_summary(event)
     return None
 
@@ -604,7 +755,14 @@ def _add_comment(ticket_id: str, body: str, public: bool) -> str:
     past a configured output cap, and this is the only mutation response
     in this file that echoes caller-supplied free text back verbatim, so
     it needs its own truncation handling rather than relying on the list
-    tools' page-shrinking (there's no list here to shrink)."""
+    tools' page-shrinking (there's no list here to shrink).
+
+    Two things can be oversized, and they are shrunk in order of how much
+    the caller loses: first the echoed comment body (a preview; id/public
+    still confirm what was posted), then the ticket summary (collapsed to
+    just its id -- the correlation key -- since a long subject or a large
+    tag set is fixed-size content no halving of the *comment* can offset).
+    A top-level `truncated` flag reports either cut."""
     body = _require_comment_body(body, "body")
     result = _request(
         "PUT",
@@ -613,30 +771,37 @@ def _add_comment(ticket_id: str, body: str, public: bool) -> str:
     )
     ticket = _unwrap(result, "ticket")
     ticket_summary = _ticket_summary(ticket) if isinstance(ticket, dict) else ticket
-    comment = _find_comment_event(result)
+    comment = _find_comment_event(result, public)
 
-    def _build(comment_value: dict[str, Any] | None) -> str:
-        return _success(ticket=ticket_summary, comment=comment_value)
+    def _build(
+        ticket_value: Any, comment_value: dict[str, Any] | None, truncated: bool
+    ) -> str:
+        return _success(ticket=ticket_value, comment=comment_value, truncated=truncated)
 
-    response = _build(comment)
+    response = _build(ticket_summary, comment, False)
     max_output_length = get_tool_max_output_length()
-    if len(response) <= max_output_length or not isinstance(comment, dict):
+    if len(response) <= max_output_length:
         return response
 
-    comment_body = comment.get("body")
-    if not isinstance(comment_body, str) or not comment_body:
-        return response
-
-    # Truncate the echoed body rather than dropping the comment entirely:
-    # id/public/created_at still confirm what was posted and -- crucially
-    # -- whether it went out publicly, even once the body preview is cut.
-    truncated_comment = dict(comment)
-    while len(response) > max_output_length and comment_body:
+    truncated_comment = dict(comment) if isinstance(comment, dict) else comment
+    comment_body = (
+        truncated_comment.get("body") if isinstance(truncated_comment, dict) else None
+    )
+    while (
+        len(response) > max_output_length
+        and isinstance(truncated_comment, dict)
+        and isinstance(comment_body, str)
+        and comment_body
+    ):
         comment_body = comment_body[: len(comment_body) // 2]
         truncated_comment["body"] = comment_body
         truncated_comment["body_truncated"] = True
-        response = _build(truncated_comment)
-    return response
+        response = _build(ticket_summary, truncated_comment, True)
+
+    if len(response) > max_output_length and isinstance(ticket_summary, dict):
+        ticket_summary = {"id": ticket_summary.get("id")}
+        response = _build(ticket_summary, truncated_comment, True)
+    return _finalize_capped(response, max_output_length)
 
 
 @mcp.tool()
@@ -683,7 +848,12 @@ def zendesk_search(query: str, limit: int = 25, page: int = 1) -> str:
         # example is an email address) -- logged length-bounded rather than
         # verbatim, matching this file's redaction posture for response
         # bodies elsewhere.
-        logger.error(f"Error searching Zendesk for query of length {len(query)}: {e}")
+        # `query or ""`: a None query fails _require_non_blank inside the
+        # try, and len(None) here would turn the error handler itself into
+        # an uncaught TypeError.
+        logger.error(
+            f"Error searching Zendesk for query of length {len(query or '')}: {e}"
+        )
         return _error(str(e))
 
 
@@ -744,7 +914,8 @@ def zendesk_create_ticket(
     requester_email already matches an existing user, but REQUIRED if it
     doesn't -- Zendesk rejects an unrecognized requester_email with no
     requester_name. Must not be passed without requester_email.
-    priority: optional, one of "low", "normal", "high", "urgent".
+    priority: optional, one of "low", "normal", "high", "urgent"
+    (case-insensitive) -- any other value is rejected locally.
     tags: optional list of tags -- a non-empty list with only blank/
     whitespace entries is rejected rather than silently sent as no tags.
     """
@@ -768,7 +939,9 @@ def zendesk_create_ticket(
             raise ValueError("requester_name requires requester_email")
         priority = _blank_to_none(priority)
         if priority:
-            ticket["priority"] = priority
+            ticket["priority"] = _require_one_of(
+                priority, _TICKET_PRIORITIES, "priority"
+            )
         tags_value = _resolve_tags(tags)
         if tags_value is not None:
             ticket["tags"] = tags_value
@@ -796,10 +969,14 @@ def zendesk_update_ticket(
     ticket_id: a bare numeric id, or a full ticket URL copied from the
     Zendesk agent UI.
     status: optional, one of "new", "open", "pending", "hold", "solved",
-    "closed" -- a blank (empty or whitespace-only) string is treated the
-    same as leaving it unset (there is no valid "clear the status" value).
-    priority: optional, one of "low", "normal", "high", "urgent" -- a blank
-    string is treated the same as leaving it unset, for the same reason.
+    "closed" (case-insensitive) -- a blank (empty or whitespace-only)
+    string is treated the same as leaving it unset (there is no valid
+    "clear the status" value); any other non-blank value is rejected
+    locally.
+    priority: optional, one of "low", "normal", "high", "urgent"
+    (case-insensitive) -- a blank string is treated the same as leaving it
+    unset, for the same reason; any other non-blank value is rejected
+    locally.
     tags: optional list of tags -- replaces the ticket's existing tags
     entirely (pass an empty list to clear them), it does not add to them.
     A non-empty list with only blank/whitespace entries is rejected rather
@@ -812,10 +989,12 @@ def zendesk_update_ticket(
         fields: dict[str, Any] = {}
         status = _blank_to_none(status)
         if status:
-            fields["status"] = status
+            fields["status"] = _require_one_of(status, _TICKET_STATUSES, "status")
         priority = _blank_to_none(priority)
         if priority:
-            fields["priority"] = priority
+            fields["priority"] = _require_one_of(
+                priority, _TICKET_PRIORITIES, "priority"
+            )
         tags_value = _resolve_tags(tags)
         if tags_value is not None:
             fields["tags"] = tags_value
@@ -989,7 +1168,7 @@ def zendesk_search_users(query: str, limit: int = 25, page: int = 1) -> str:
         # logged length-bounded rather than verbatim, matching
         # zendesk_search's redaction posture.
         logger.error(
-            f"Error searching Zendesk users for query of length {len(query)}: {e}"
+            f"Error searching Zendesk users for query of length {len(query or '')}: {e}"
         )
         return _error(str(e))
 

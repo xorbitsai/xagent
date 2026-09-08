@@ -176,6 +176,54 @@ def test_require_non_blank_accepts_non_empty_value():
     assert zendesk._require_non_blank("hello", "field") == "hello"
 
 
+@pytest.mark.parametrize(
+    "value, expected",
+    [(None, None), ("", None), ("   ", None), ("  hi  ", "hi"), ("hi", "hi")],
+)
+def test_blank_to_none(value, expected):
+    assert zendesk._blank_to_none(value) == expected
+
+
+@pytest.mark.parametrize(
+    "tags, expected",
+    [
+        (["vip", "urgent"], ["vip", "urgent"]),
+        (["vip ", "  urgent"], ["vip", "urgent"]),
+        (["vip ", "", "  "], ["vip"]),
+        ([], []),
+    ],
+)
+def test_clean_tags(tags, expected):
+    assert zendesk._clean_tags(tags) == expected
+
+
+def test_resolve_tags_none_means_not_provided():
+    assert zendesk._resolve_tags(None) is None
+
+
+def test_resolve_tags_empty_list_means_explicit_clear():
+    assert zendesk._resolve_tags([]) == []
+
+
+def test_resolve_tags_cleans_a_non_empty_list():
+    assert zendesk._resolve_tags(["vip ", "", "urgent"]) == ["vip", "urgent"]
+
+
+def test_resolve_tags_rejects_a_non_empty_list_that_cleans_to_nothing():
+    with pytest.raises(ValueError, match="no usable values"):
+        zendesk._resolve_tags(["  ", ""])
+
+
+def test_require_one_of_normalizes_case():
+    allowed = frozenset({"solved", "open"})
+    assert zendesk._require_one_of("Solved", allowed, "status") == "solved"
+
+
+def test_require_one_of_rejects_unknown_value():
+    with pytest.raises(ValueError, match="must be one of"):
+        zendesk._require_one_of("archived", frozenset({"solved", "open"}), "status")
+
+
 def test_search_sends_stripped_query(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(json_data={"results": [], "count": 0})
@@ -244,6 +292,12 @@ def test_extract_error_detail_handles_nested_error_object():
     )
 
     assert zendesk._extract_error_detail(response) == "Bad credentials"
+
+
+def test_extract_error_detail_falls_back_to_title_when_message_absent():
+    response = MockResponse(json_data={"error": {"title": "Unauthorized"}})
+
+    assert zendesk._extract_error_detail(response) == "Unauthorized"
 
 
 def test_extract_error_detail_returns_none_for_non_json_body():
@@ -411,6 +465,37 @@ def test_request_does_not_retry_a_second_429(monkeypatch):
     assert mock_request.call_count == 2
 
 
+def test_request_does_not_retry_on_non_numeric_retry_after(monkeypatch):
+    # A non-numeric Retry-After (or, per test below, a missing one) must
+    # fall back to "no usable wait signal" -- not raise out of the retry
+    # logic itself.
+    response = MockResponse(
+        status_code=429, url="x", headers={"Retry-After": "not-a-number"}
+    )
+    mock_request = Mock(return_value=response)
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+    monkeypatch.setattr(zendesk.time, "sleep", Mock())
+
+    with pytest.raises(RuntimeError):
+        zendesk._request("GET", "/tickets.json")
+
+    assert mock_request.call_count == 1
+    zendesk.time.sleep.assert_not_called()
+
+
+def test_request_does_not_retry_on_missing_retry_after(monkeypatch):
+    response = MockResponse(status_code=429, url="x", headers={})
+    mock_request = Mock(return_value=response)
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+    monkeypatch.setattr(zendesk.time, "sleep", Mock())
+
+    with pytest.raises(RuntimeError):
+        zendesk._request("GET", "/tickets.json")
+
+    assert mock_request.call_count == 1
+    zendesk.time.sleep.assert_not_called()
+
+
 def test_request_redacts_connection_error_message(monkeypatch):
     def _raise(*args, **kwargs):
         raise requests.exceptions.ProxyError(
@@ -424,6 +509,57 @@ def test_request_redacts_connection_error_message(monkeypatch):
         zendesk._request("GET", "/tickets.json")
 
     assert "sp-secret-proxy-pass" not in str(excinfo.value)
+
+
+def test_request_http_error_message_omits_query_bearing_url(monkeypatch):
+    # requests.HTTPError's default str() is "<status> ... for url: <full
+    # url>", and the full url includes the query string -- for the search
+    # tools, the caller's own query, documented with an email-address
+    # example. The raised message is built from the status code and
+    # Zendesk's own error detail only, never str(exc), so the query never
+    # reaches it in the first place.
+    monkeypatch.setattr(
+        zendesk._session,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                status_code=422,
+                url="https://acme.zendesk.com/api/v2/search.json"
+                "?query=email:jane@example.com",
+                text="not json",
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        zendesk._request(
+            "GET", "/search.json", params={"query": "email:jane@example.com"}
+        )
+
+    assert "jane@example.com" not in str(excinfo.value)
+    assert "email:jane@example.com" not in str(excinfo.value)
+
+
+def test_request_scrubs_query_string_from_connection_error_message(monkeypatch):
+    # Unlike the HTTPError path above, a connection-level failure's own
+    # message (urllib3's "Max retries exceeded with url: ...") is the only
+    # thing available and does get surfaced -- so it goes through
+    # _sanitize_exception_text's query-string scrub rather than str(exc)
+    # verbatim.
+    def _raise(*args, **kwargs):
+        raise requests.exceptions.ConnectionError(
+            "Max retries exceeded with url: "
+            "/api/v2/search.json?query=email:jane@example.com "
+            "(Caused by NewConnectionError(...))"
+        )
+
+    monkeypatch.setattr(zendesk._session, "request", _raise)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        zendesk._request("GET", "/search.json")
+
+    assert "jane@example.com" not in str(excinfo.value)
+    assert "<query redacted>" in str(excinfo.value)
 
 
 def test_request_raises_with_structured_error_detail(monkeypatch):
@@ -474,6 +610,16 @@ def test_request_truncates_unstructured_error_body(monkeypatch):
 
 def test_search_requires_non_blank_query():
     result = json.loads(zendesk.zendesk_search("   "))
+
+    assert result["status"] == "error"
+
+
+def test_search_handles_none_query_without_crashing_the_error_handler():
+    # _require_non_blank raises for a None query, but the except block's
+    # own len(query) used to run on the original (still-None) parameter --
+    # turning the error handler itself into an uncaught TypeError instead
+    # of a clean _error() response.
+    result = json.loads(zendesk.zendesk_search(None))
 
     assert result["status"] == "error"
 
@@ -536,7 +682,31 @@ def test_search_forces_has_more_when_output_truncated(monkeypatch):
     assert result["truncated"] is True
     assert 0 < len(result["results"]) < len(big_results)
     assert result["has_more"] is True
-    assert len(raw) <= 2000 + 200  # last halving step can overshoot
+    assert len(raw) <= 2000  # _finalize_capped guarantees this now
+
+
+def test_search_explains_a_single_oversized_item(monkeypatch):
+    one_huge_result = [{"result_type": "ticket", "id": 1, "subject": "x" * 5000}]
+    monkeypatch.setattr(
+        zendesk._session,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={"results": one_huge_result, "count": 1, "next_page": None}
+            )
+        ),
+    )
+    monkeypatch.setattr(zendesk, "get_tool_max_output_length", lambda: 2000)
+
+    raw = zendesk.zendesk_search("type:ticket", limit=50)
+    result = json.loads(raw)
+
+    assert result["status"] == "success"
+    assert result["results"] == []
+    assert result["truncated"] is True
+    assert result["has_more"] is True
+    assert "individually too large" in result["message"]
+    assert len(raw) <= 2000
 
 
 def test_search_clamps_page_to_at_least_one(monkeypatch):
@@ -550,17 +720,23 @@ def test_search_clamps_page_to_at_least_one(monkeypatch):
     assert mock_request.call_args.kwargs["params"]["page"] == 1
 
 
-def test_past_search_window_checks_the_windows_end_not_its_start():
-    # limit=30, page=34: (page-1)*limit=990 is under the 1000 ceiling, but
-    # the requested range is results 991-1020, which straddles past it --
-    # the check must catch the window's *end*, not just where it starts,
-    # or a non-divisor limit slips a straddling page through to an opaque
-    # Zendesk HTTP error instead of this connector's own clean handling.
+def test_past_search_window_checks_the_windows_start_not_its_end():
+    # limit=30, page=34: the page starts at (page-1)*limit=990, still under
+    # the 1000 ceiling, so it can contain real results (991-1000) even
+    # though it also straddles past the ceiling. Rejecting it locally
+    # (checking the end) would silently discard those results with no way
+    # to recover them through this tool -- forwarding it to Zendesk instead
+    # either serves the valid tail or gets a visible 422, never silent loss.
+    # page=34 itself (start=1020) is genuinely past the window and must be
+    # rejected.
     ceiling = zendesk._MAX_SEARCH_RESULT_WINDOW
-    assert zendesk._past_search_window(page=34, max_results=30, ceiling=ceiling) is True
     assert (
         zendesk._past_search_window(page=33, max_results=30, ceiling=ceiling) is False
     )
+    assert (
+        zendesk._past_search_window(page=34, max_results=30, ceiling=ceiling) is False
+    )
+    assert zendesk._past_search_window(page=35, max_results=30, ceiling=ceiling) is True
 
 
 def test_past_search_window_uses_the_ceiling_it_is_given():
@@ -647,7 +823,7 @@ def test_list_tickets_caps_output_size(monkeypatch):
     # reflect that regardless of what Zendesk's meta said, or a caller that
     # trusts has_more alone will stop paging and silently lose them.
     assert result["has_more"] is True
-    assert len(raw) <= 2000 + 200  # last halving step can overshoot
+    assert len(raw) <= 2000  # _finalize_capped guarantees this now
 
 
 def test_list_tickets_truncation_retries_same_page_not_zendesks_next_page(monkeypatch):
@@ -678,6 +854,59 @@ def test_list_tickets_truncation_retries_same_page_not_zendesks_next_page(monkey
     assert result["truncated"] is True
     assert result["has_more"] is True
     assert result["after_cursor"] == "cur0"
+
+
+def test_list_tickets_explains_a_single_oversized_item(monkeypatch):
+    # If even the single largest remaining ticket doesn't fit alone, the
+    # halving loop collapses to an empty list while has_more/truncated stay
+    # true -- "retry with a smaller limit" (the tool's own general advice)
+    # cannot help here, since limit only controls item *count*, not the
+    # size of one item. Say so explicitly instead of implying a fix that
+    # doesn't exist.
+    one_huge_ticket = [{"id": 1, "subject": "x" * 5000}]
+    monkeypatch.setattr(
+        zendesk._session,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={"tickets": one_huge_ticket, "meta": {"has_more": False}}
+            )
+        ),
+    )
+    monkeypatch.setattr(zendesk, "get_tool_max_output_length", lambda: 2000)
+
+    raw = zendesk.zendesk_list_tickets(limit=50)
+    result = json.loads(raw)
+
+    assert result["status"] == "success"
+    assert result["tickets"] == []
+    assert result["truncated"] is True
+    assert result["has_more"] is True
+    assert "individually too large" in result["message"]
+    assert len(raw) <= 2000
+
+
+def test_list_tickets_falls_back_to_error_when_cap_is_impossibly_small(monkeypatch):
+    # An operator-configured XAGENT_TOOL_MAX_OUTPUT_LENGTH small enough that
+    # even the empty, message-less envelope exceeds it must still produce
+    # valid JSON -- not an oversized string for the platform's own output
+    # filter to hard-truncate into garbage.
+    one_huge_ticket = [{"id": 1, "subject": "x" * 5000}]
+    monkeypatch.setattr(
+        zendesk._session,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={"tickets": one_huge_ticket, "meta": {"has_more": False}}
+            )
+        ),
+    )
+    monkeypatch.setattr(zendesk, "get_tool_max_output_length", lambda: 20)
+
+    raw = zendesk.zendesk_list_tickets(limit=50)
+    result = json.loads(raw)  # must not raise -- valid JSON either way
+
+    assert result["status"] == "error"
 
 
 def test_ticket_summary_includes_group_id(monkeypatch):
@@ -879,6 +1108,36 @@ def test_update_ticket_sends_only_provided_fields(monkeypatch):
     assert body["ticket"] == {"status": "solved"}
     assert mock_request.call_args.kwargs["url"].endswith("/tickets/1.json")
     assert mock_request.call_args.kwargs["method"] == "PUT"
+
+
+def test_update_ticket_rejects_invalid_status():
+    result = json.loads(zendesk.zendesk_update_ticket(1, status="archived"))
+
+    assert result["status"] == "error"
+
+
+def test_update_ticket_rejects_invalid_priority():
+    result = json.loads(zendesk.zendesk_update_ticket(1, priority="critical"))
+
+    assert result["status"] == "error"
+
+
+def test_update_ticket_normalizes_status_and_priority_case(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"ticket": {"id": 1}}))
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    zendesk.zendesk_update_ticket(1, status="Solved", priority="URGENT")
+
+    body = mock_request.call_args.kwargs["json"]
+    assert body["ticket"] == {"status": "solved", "priority": "urgent"}
+
+
+def test_create_ticket_rejects_invalid_priority():
+    result = json.loads(
+        zendesk.zendesk_create_ticket("Help", "Something's broken", priority="asap")
+    )
+
+    assert result["status"] == "error"
 
 
 def test_update_ticket_treats_empty_status_and_priority_as_not_provided(monkeypatch):
@@ -1087,6 +1346,25 @@ def test_add_comment_accepts_body_at_exactly_the_zendesk_limit(monkeypatch):
     assert result["status"] == "success"
 
 
+def test_add_comment_rejects_multibyte_body_over_the_byte_limit(monkeypatch):
+    # The limit is a *byte* limit (Zendesk's own wording is "64kB"), and
+    # _require_comment_body measures value.encode("utf-8"), not len(value)
+    # -- confirm the byte-vs-character distinction actually holds: a CJK
+    # character is 3 bytes in UTF-8, so 25,000 of them is well under
+    # 65,536 *characters* but well over 65,536 *bytes* (75,000). A
+    # character-count check would wrongly accept this.
+    mock_request = Mock()
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+    multibyte_body = "你" * 25000
+    assert len(multibyte_body) < zendesk._MAX_COMMENT_BODY_BYTES
+    assert len(multibyte_body.encode("utf-8")) > zendesk._MAX_COMMENT_BODY_BYTES
+
+    result = json.loads(zendesk.zendesk_reply_to_ticket(1, multibyte_body))
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
 def test_create_ticket_rejects_comment_over_zendesk_limit(monkeypatch):
     mock_request = Mock()
     monkeypatch.setattr(zendesk._session, "request", mock_request)
@@ -1138,7 +1416,7 @@ def test_add_comment_truncates_echoed_body_to_fit_output_cap(monkeypatch):
     # publicly, even with the body preview cut down.
     assert result["comment"]["id"] == 999
     assert result["comment"]["public"] is True
-    assert len(raw) <= 2000 + 200  # last halving step can overshoot
+    assert len(raw) <= 2000  # _finalize_capped guarantees this now
 
 
 def test_reply_to_ticket_returns_created_comment_from_audit_events(monkeypatch):
@@ -1193,6 +1471,91 @@ def test_add_internal_note_returns_none_comment_when_audit_missing(monkeypatch):
 
     assert result["status"] == "success"
     assert result["comment"] is None
+
+
+def test_add_internal_note_does_not_echo_a_mismatched_public_comment(monkeypatch):
+    # A residual case where an account-configured integration adds its own
+    # comment into the same audit trail: the first Comment-type event isn't
+    # necessarily the one this call created. Matching on `public` is cheap
+    # insurance -- a candidate whose visibility differs from what this call
+    # actually sent can never be it, so it must not be echoed back
+    # mislabeled (an internal note reported as having gone out publicly
+    # would be a real, visible-to-nobody-but-us safety issue).
+    monkeypatch.setattr(
+        zendesk._session,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "ticket": {"id": 1},
+                    "audit": {
+                        "events": [
+                            {
+                                "type": "Comment",
+                                "id": 111,
+                                "body": "A public reply from another integration",
+                                "public": True,
+                            },
+                            {
+                                "type": "Comment",
+                                "id": 222,
+                                "body": "Escalating to tier 2",
+                                "public": False,
+                            },
+                        ]
+                    },
+                }
+            )
+        ),
+    )
+
+    result = json.loads(zendesk.zendesk_add_internal_note(1, "Escalating to tier 2"))
+
+    assert result["status"] == "success"
+    assert result["comment"]["id"] == 222
+    assert result["comment"]["public"] is False
+
+
+def test_add_comment_reports_ticket_and_comment_truncation_independently(monkeypatch):
+    # A long subject plus many tags can make the ticket summary alone
+    # exceed the cap even after the comment body is fully shrunk -- the
+    # halving loop must fall through to trimming the ticket summary too
+    # (down to its id, the correlation key) rather than returning an
+    # over-cap response once comment_body has nothing left to give.
+    monkeypatch.setattr(
+        zendesk._session,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "ticket": {
+                        "id": 1,
+                        "subject": "x" * 5000,
+                        "tags": [f"tag{i}" for i in range(100)],
+                    },
+                    "audit": {
+                        "events": [
+                            {
+                                "type": "Comment",
+                                "id": 1,
+                                "body": "Thanks!",
+                                "public": True,
+                            }
+                        ]
+                    },
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(zendesk, "get_tool_max_output_length", lambda: 2000)
+
+    raw = zendesk.zendesk_reply_to_ticket(1, "Thanks!")
+    result = json.loads(raw)
+
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert result["ticket"] == {"id": 1}
+    assert len(raw) <= 2000
 
 
 def test_list_cursor_paginated_requests_boundary_indicators(monkeypatch):
@@ -1261,6 +1624,12 @@ def test_get_user_accepts_agent_ui_url(monkeypatch):
 
 def test_search_users_requires_non_blank_query():
     result = json.loads(zendesk.zendesk_search_users(""))
+
+    assert result["status"] == "error"
+
+
+def test_search_users_handles_none_query_without_crashing_the_error_handler():
+    result = json.loads(zendesk.zendesk_search_users(None))
 
     assert result["status"] == "error"
 
@@ -1362,7 +1731,7 @@ def test_search_users_forces_has_more_when_output_truncated(monkeypatch):
     assert result["truncated"] is True
     assert 0 < len(result["users"]) < len(big_users)
     assert result["has_more"] is True
-    assert len(raw) <= 2000 + 200  # last halving step can overshoot
+    assert len(raw) <= 2000  # _finalize_capped guarantees this now
 
 
 def test_list_organizations_returns_summaries(monkeypatch):
@@ -1426,6 +1795,55 @@ def test_session_is_a_requests_session():
     # `_request()` has something to call `.request()` on, not cross-call
     # pooling (which doesn't happen here).
     assert isinstance(zendesk._session, requests.Session)
+
+
+def test_session_disables_trust_env():
+    # requests.Session()'s default trust_env=True falls back to the OS's
+    # own proxy configuration once no HTTP(S)_PROXY env var is set, which
+    # would let an ambient/OS-native proxy silently perform DNS resolution
+    # for the real connection -- bypassing _base_url()'s private-network
+    # check of the addresses this process itself resolved. This is the
+    # actual behavioral assertion; isinstance(_session, requests.Session)
+    # alone (the previous version of this test) doesn't verify it.
+    assert zendesk._session.trust_env is False
+
+
+def test_request_passes_empty_proxies_when_none_trusted(monkeypatch):
+    monkeypatch.delenv("HTTP_PROXY", raising=False)
+    monkeypatch.delenv("HTTPS_PROXY", raising=False)
+    monkeypatch.delenv("http_proxy", raising=False)
+    monkeypatch.delenv("https_proxy", raising=False)
+    mock_request = Mock(return_value=MockResponse(json_data={"ok": True}))
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    zendesk._request("GET", "/tickets.json")
+
+    assert mock_request.call_args.kwargs["proxies"] == {}
+
+
+def test_request_raises_when_ambient_proxy_is_not_trusted(monkeypatch):
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.internal:8080")
+    monkeypatch.delenv("XAGENT_TRUSTED_EGRESS_PROXY", raising=False)
+    mock_request = Mock(return_value=MockResponse(json_data={"ok": True}))
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    with pytest.raises(ValueError, match="not marked as trusted"):
+        zendesk._request("GET", "/tickets.json")
+    mock_request.assert_not_called()
+
+
+def test_request_forwards_explicitly_trusted_proxy(monkeypatch):
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.internal:8080")
+    monkeypatch.setenv("XAGENT_TRUSTED_EGRESS_PROXY", "1")
+    mock_request = Mock(return_value=MockResponse(json_data={"ok": True}))
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    zendesk._request("GET", "/tickets.json")
+
+    assert mock_request.call_args.kwargs["proxies"] == {
+        "http": "http://proxy.internal:8080",
+        "https": "http://proxy.internal:8080",
+    }
 
 
 @pytest.mark.parametrize(
@@ -1512,3 +1930,8 @@ def test_zendesk_app_registry_requires_subdomain_email_and_token():
         "ZENDESK_EMAIL",
         "ZENDESK_API_TOKEN",
     ]
+    # The release gate this connector's unverified write tools ship behind
+    # -- only the migration test asserted this before, and the registry
+    # row (what a running server actually seeds/reads from) is the more
+    # direct thing to pin.
+    assert zendesk_app["is_visible_in_connector"] is False

@@ -77,6 +77,7 @@ def _create_task(
         title=f"task-{task_id}",
         description="task",
         status=status,
+        lease_attempt_id="test-attempt" if runner_id is not None else None,
         runner_id=runner_id,
         run_id=run_id,
         agent_config=(
@@ -127,6 +128,7 @@ def _task_setup_snapshot(
 
 def _task_lease(task_id: int) -> TaskLease:
     return TaskLease(
+        attempt_id="test-attempt",
         task_id=task_id,
         runner_id="test-runner",
         run_id=f"run-{task_id}",

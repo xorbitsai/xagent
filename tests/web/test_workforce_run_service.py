@@ -31,7 +31,10 @@ from xagent.web.models.task import TaskStatus
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.services import task_orchestrator as task_orchestrator_module
 from xagent.web.services import workforce_runs as workforce_runs_module
-from xagent.web.services.task_lease_service import acquire_task_lease
+from xagent.web.services.task_lease_service import (
+    acquire_task_lease,
+    bind_task_lease_context,
+)
 from xagent.web.services.workforce_access import WorkforcePolicy, set_workforce_policy
 from xagent.web.services.workforce_runs import (
     create_preview_workforce_run,
@@ -1529,14 +1532,15 @@ def test_release_current_runner_task_lease_with_workforce_sync_pauses_run(
     lease = acquire_task_lease(db_session, int(task.id))
     assert lease is not None
 
-    assert (
-        release_current_runner_task_lease_with_workforce_sync(
-            db_session,
-            int(task.id),
-            status=TaskStatus.WAITING_FOR_USER,
+    with bind_task_lease_context(lease):
+        assert (
+            release_current_runner_task_lease_with_workforce_sync(
+                db_session,
+                int(task.id),
+                status=TaskStatus.WAITING_FOR_USER,
+            )
+            is True
         )
-        is True
-    )
     db_session.refresh(task)
     db_session.refresh(run)
 

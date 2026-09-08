@@ -1230,8 +1230,8 @@ class InteractionHandoff:
     def _assert_current_attempt(self) -> None:
         """Raise unless the task row's current attempt is this lease's.
 
-        The comparison itself, and why ``lease.attempt_id is None`` skips
-        the check rather than failing it, live with the predicate
+        The comparison, including rejection of a missing attempt, lives with
+        the predicate
         (``task_row_matches_lease_attempt``, ``task_lease_service.py``).
 
         What stays here is what the predicate cannot know: this reads
@@ -1254,13 +1254,9 @@ class InteractionHandoff:
         row lock is ever actually taken there (the same fact
         ``get_next_expired_task_lease_candidate_for_update`` in
         ``task_lease_service.py`` documents for its own row-lock read).
-        What keeps this comparison's window closed on SQLite instead is
-        single-writer semantics: SQLite's database-wide writer lock
-        serializes every write regardless of which row it targets. That
-        makes this a TOCTOU (time-of-check-to-time-of-use) gap that happens
-        to stay closed because nothing else can be writing concurrently,
-        not a genuine row-level lock -- a caller that assumes real row
-        locking here is assuming something SQLite does not provide.
+        The caller must acquire SQLite's writer lock before reading the task,
+        for example through ``lock_task_lease_no_commit``. Single-writer
+        semantics alone do not protect a SELECT performed before that lock.
         """
 
         if not task_row_matches_lease_attempt(self.task, self.lease):
@@ -1531,14 +1527,9 @@ def interaction_handoff(
     on the session's own dialect and skipped entirely on PostgreSQL, which
     was checked directly and does not share this behavior at all.
 
-    In the wiring-window while ``lease.attempt_id is None`` is still
-    possible (see ``_assert_current_attempt``'s docstring), this handoff's
-    identity key is already run-scoped (``uq_task_interaction_request_identity``
-    covers ``task_id, run_id, request_idempotency_key``), which is weaker
-    protection against a stale worker than the task-scoped identity an
-    earlier design considered: both the attempt fence and the stale-worker
-    protection a task-scoped key would have given are absent for the same
-    rolling-restart window at once.
+    Missing acquisition tokens are rejected by the attempt check. Existing
+    workers must be drained before enabling strict-owner execution; a new
+    process must not adopt a predecessor's token from the task row.
     """
 
     # A zero-row, SQLite-only, single-column UPDATE, issued deliberately

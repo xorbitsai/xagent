@@ -3,6 +3,7 @@
 import logging
 from typing import TYPE_CHECKING, Any, List
 
+from ....utils.setup_metrics import mcp_setup
 from .config import (
     MCPConfigLoadError,
     MCPToolLoadSummary,
@@ -168,6 +169,7 @@ async def _finish_mcp_setup(
 
 
 @register_tool(categories={"mcp"}, selection_gate="mcp")
+@mcp_setup.measure()
 async def create_mcp_tools(config: "BaseToolConfig") -> List[Any]:
     """Create MCP tools from configuration.
 

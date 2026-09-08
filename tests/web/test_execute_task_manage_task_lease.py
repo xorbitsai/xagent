@@ -93,7 +93,9 @@ def _create_single_connection_runtime_db(tmp_path, filename: str):
 @pytest.mark.asyncio
 async def test_execute_task_binds_outer_lease_only_during_agent_execution() -> None:
     manager = AgentServiceManager()
-    lease = TaskLease(task_id=42, runner_id="runner-a", run_id="run-a")
+    lease = TaskLease(
+        task_id=42, runner_id="runner-a", run_id="run-a", attempt_id="test-attempt"
+    )
     observed_leases: list[TaskLease | None] = []
 
     class LeaseObservingAgent(_FakeAgentService):
@@ -128,7 +130,9 @@ async def test_execute_task_binds_outer_lease_only_during_agent_execution() -> N
 @pytest.mark.asyncio
 async def test_execute_task_tracks_usage_for_outer_owned_lease() -> None:
     manager = AgentServiceManager()
-    lease = TaskLease(task_id=42, runner_id="runner-a", run_id="run-a")
+    lease = TaskLease(
+        task_id=42, runner_id="runner-a", run_id="run-a", attempt_id="test-attempt"
+    )
     tracker = MagicMock(
         start_tracking=AsyncMock(),
         complete_tracking=AsyncMock(),
@@ -174,6 +178,7 @@ async def test_execute_task_tracks_usage_for_outer_owned_lease() -> None:
         task_id=42,
         expected_run_id="run-a",
         expected_runner_id="runner-a",
+        expected_attempt_id="test-attempt",
     )
     tracker.start_tracking.assert_awaited_once()
     tracker.complete_tracking.assert_awaited_once()
@@ -182,7 +187,9 @@ async def test_execute_task_tracks_usage_for_outer_owned_lease() -> None:
 @pytest.mark.asyncio
 async def test_execute_task_external_lease_loss_cancels_agent_execution() -> None:
     manager = AgentServiceManager()
-    lease = TaskLease(task_id=42, runner_id="runner-a", run_id="run-a")
+    lease = TaskLease(
+        task_id=42, runner_id="runner-a", run_id="run-a", attempt_id="test-attempt"
+    )
     execution_started = asyncio.Event()
     execution_cancelled = asyncio.Event()
 
@@ -226,7 +233,9 @@ async def test_execute_task_external_lease_loss_cancels_agent_execution() -> Non
 @pytest.mark.asyncio
 async def test_execute_task_managed_lease_loss_skips_usage_and_release() -> None:
     manager = AgentServiceManager()
-    lease = TaskLease(task_id=42, runner_id="runner-a", run_id="run-a")
+    lease = TaskLease(
+        task_id=42, runner_id="runner-a", run_id="run-a", attempt_id="test-attempt"
+    )
     execution_started = asyncio.Event()
     execution_cancelled = asyncio.Event()
     tracker = MagicMock(
@@ -303,7 +312,9 @@ async def test_execute_task_lease_loss_during_title_update_cancels_stale_write()
     None
 ):
     manager = AgentServiceManager()
-    lease = TaskLease(task_id=42, runner_id="runner-a", run_id="run-a")
+    lease = TaskLease(
+        task_id=42, runner_id="runner-a", run_id="run-a", attempt_id="test-attempt"
+    )
     title_started = asyncio.Event()
     title_cancelled = asyncio.Event()
 
@@ -403,6 +414,7 @@ async def test_execute_task_workforce_pool_timeout_stops_tracker_checkout(
         task_id=task_id,
         runner_id="test-runner",
         run_id="test-run",
+        attempt_id="test-attempt",
     )
     release_lease = MagicMock(return_value=True)
     stop_heartbeat = AsyncMock()
@@ -474,6 +486,7 @@ async def test_execute_task_pre_run_timeout_waits_for_shared_heartbeat_batch() -
         task_id=task_id,
         runner_id="test-runner",
         run_id="test-run",
+        attempt_id="test-attempt",
     )
     manager = AgentServiceManager()
     workforce_started = threading.Event()
@@ -575,6 +588,7 @@ async def test_execute_task_waits_for_shared_heartbeat_timeout_and_retains_lease
         task_id=task_id,
         runner_id="test-runner",
         run_id="test-run",
+        attempt_id="test-attempt",
     )
     manager = AgentServiceManager()
     usage_started = threading.Event()
@@ -680,6 +694,7 @@ async def test_execute_task_tracker_pool_timeout_stops_execution_and_release() -
         task_id=task_id,
         runner_id="test-runner",
         run_id="test-run",
+        attempt_id="test-attempt",
     )
     manager = AgentServiceManager()
     agent_service = _FakeAgentService()
@@ -988,6 +1003,7 @@ async def test_execute_task_acquires_and_releases_lease_when_manage_true(
         task_id=int(task.id),
         runner_id="test-runner",
         run_id="test-run",
+        attempt_id="test-attempt",
     )
     manager = AgentServiceManager()
 
@@ -1227,6 +1243,7 @@ async def test_execute_task_cancellation_during_workforce_sync_releases_lease() 
         task_id=task_id,
         runner_id="test-runner",
         run_id="test-run",
+        attempt_id="test-attempt",
     )
     manager = AgentServiceManager()
     workforce_sync_started = threading.Event()
@@ -1318,6 +1335,7 @@ async def test_execute_task_cancellation_during_tracker_start_releases_lease() -
         task_id=task_id,
         runner_id="test-runner",
         run_id="test-run",
+        attempt_id="test-attempt",
     )
     manager = AgentServiceManager()
     tracker_start_entered = asyncio.Event()
@@ -1420,6 +1438,7 @@ async def test_execute_task_cleans_up_when_sandbox_acquire_raises(
         task_id=int(task.id),
         runner_id="test-runner",
         run_id="test-run",
+        attempt_id="test-attempt",
     )
     manager = AgentServiceManager()
     tracker = MagicMock()
@@ -1489,6 +1508,7 @@ async def test_execute_task_persists_final_usage_before_releasing_lease() -> Non
         task_id=task_id,
         runner_id="test-runner",
         run_id="test-run",
+        attempt_id="test-attempt",
     )
     manager = AgentServiceManager()
     events: list[str] = []
@@ -1560,6 +1580,7 @@ async def test_execute_task_persists_final_usage_before_releasing_lease() -> Non
         task_id=task_id,
         expected_run_id="test-run",
         expected_runner_id="test-runner",
+        expected_attempt_id="test-attempt",
     )
     assert events == ["usage", "heartbeat", "lease", "sandbox"]
 
@@ -1572,6 +1593,7 @@ async def test_execute_task_releases_sandbox_when_lease_release_raises() -> None
         task_id=task_id,
         runner_id="test-runner",
         run_id="test-run",
+        attempt_id="test-attempt",
     )
     manager = AgentServiceManager()
     tracker = MagicMock()
@@ -1635,6 +1657,7 @@ async def test_execute_task_final_usage_pool_timeout_retains_lease() -> None:
         task_id=task_id,
         runner_id="test-runner",
         run_id="test-run",
+        attempt_id="test-attempt",
     )
     manager = AgentServiceManager()
     tracker = MagicMock()
@@ -1706,6 +1729,7 @@ async def test_execute_task_heartbeat_pool_timeout_retains_lease() -> None:
         task_id=task_id,
         runner_id="test-runner",
         run_id="test-run",
+        attempt_id="test-attempt",
     )
     manager = AgentServiceManager()
     tracker = MagicMock()
@@ -1774,6 +1798,7 @@ async def test_execute_task_heartbeat_loss_after_result_rejects_success() -> Non
         task_id=task_id,
         runner_id="test-runner",
         run_id="test-run",
+        attempt_id="test-attempt",
     )
     manager = AgentServiceManager()
     tracker = MagicMock()
@@ -1840,6 +1865,7 @@ def test_task_title_update_is_fenced_by_exact_lease(db_session) -> None:
         status=TaskStatus.RUNNING,
         runner_id="current-runner",
         run_id="current-run",
+        lease_attempt_id="test-attempt",
     )
     db_session.add(task)
     db_session.commit()
@@ -1848,11 +1874,13 @@ def test_task_title_update_is_fenced_by_exact_lease(db_session) -> None:
         task_id=int(task.id),
         runner_id="stale-runner",
         run_id="stale-run",
+        attempt_id="test-attempt",
     )
     current = TaskLease(
         task_id=int(task.id),
         runner_id="current-runner",
         run_id="current-run",
+        attempt_id="test-attempt",
     )
 
     assert (
@@ -1887,6 +1915,7 @@ async def test_execute_task_cancellation_during_heartbeat_stop_drains_cleanup() 
         task_id=task_id,
         runner_id="test-runner",
         run_id="test-run",
+        attempt_id="test-attempt",
     )
     manager = AgentServiceManager()
     events: list[str] = []
@@ -2081,6 +2110,7 @@ def test_delayed_workforce_running_projection_cannot_resurrect_terminal_run(
         agent_id=manager.id,
         agent_config={},
         execution_mode="auto",
+        lease_attempt_id="test-attempt",
     )
     db_session.add(task)
     db_session.flush()
@@ -2102,6 +2132,7 @@ def test_delayed_workforce_running_projection_cannot_resurrect_terminal_run(
             task_id=int(task.id),
             runner_id="stale-a",
             run_id="same-run",
+            attempt_id="test-attempt",
         )
         if use_stale_lease
         else None

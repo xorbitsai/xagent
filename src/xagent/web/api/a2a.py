@@ -81,6 +81,7 @@ from ..services.task_lease_service import (
     run_task_lease_heartbeat,
     run_while_task_lease_owned,
     stop_task_lease_heartbeat,
+    task_lease_attempt_predicate,
 )
 from ..services.task_orchestrator import (
     TaskTurnError,
@@ -355,6 +356,7 @@ def _update_a2a_resume_input_sync(
                 Task.id == task_lease.task_id,
                 Task.status == TaskStatus.RUNNING,
                 Task.runner_id == task_lease.runner_id,
+                task_lease_attempt_predicate(task_lease),
                 Task.run_id == task_lease.run_id,
             )
             .update(

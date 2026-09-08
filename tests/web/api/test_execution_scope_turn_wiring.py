@@ -887,6 +887,7 @@ async def test_resume_db_lifecycle_runs_in_short_session_workers() -> None:
             assert kwargs == {
                 "expected_run_id": "run-a",
                 "expected_runner_id": "runner-a",
+                "expected_attempt_id": None,
             }
 
         async def start_tracking(self) -> None:
@@ -966,6 +967,7 @@ async def test_resume_final_usage_and_heartbeat_finish_before_lease_release() ->
             assert kwargs == {
                 "expected_run_id": "run-a",
                 "expected_runner_id": "runner-a",
+                "expected_attempt_id": None,
             }
 
         async def start_tracking(self) -> None:
@@ -1057,6 +1059,7 @@ async def test_resume_pool_timeout_does_not_start_secondary_db_cleanup(caplog) -
             assert kwargs == {
                 "expected_run_id": "run-a",
                 "expected_runner_id": "runner-a",
+                "expected_attempt_id": None,
             }
             self.complete_tracking = AsyncMock()
             self.stop_periodic_updates = AsyncMock()
@@ -1649,6 +1652,7 @@ async def test_resume_tracker_pool_timeout_skips_result_and_lease_checkouts() ->
             assert kwargs == {
                 "expected_run_id": "run-a",
                 "expected_runner_id": "runner-a",
+                "expected_attempt_id": None,
             }
 
         async def start_tracking(self) -> None:
@@ -1718,6 +1722,7 @@ async def test_resume_heartbeat_pool_timeout_skips_result_and_lease_checkouts() 
             assert kwargs == {
                 "expected_run_id": "run-a",
                 "expected_runner_id": "runner-a",
+                "expected_attempt_id": None,
             }
 
         async def start_tracking(self) -> None:
@@ -1792,6 +1797,7 @@ async def test_resume_lease_loss_cancels_execution_without_stale_side_effects() 
             assert kwargs == {
                 "expected_run_id": "run-a",
                 "expected_runner_id": "runner-a",
+                "expected_attempt_id": None,
             }
             self.complete_tracking = AsyncMock()
             self.stop_periodic_updates = AsyncMock()
@@ -1884,6 +1890,7 @@ async def test_resume_error_delivery_pool_timeout_skips_lease_checkout() -> None
             assert kwargs == {
                 "expected_run_id": "run-a",
                 "expected_runner_id": "runner-a",
+                "expected_attempt_id": None,
             }
 
         async def start_tracking(self) -> None:
@@ -1966,6 +1973,7 @@ async def test_resume_cancellation_drains_all_final_cleanup() -> None:
             assert kwargs == {
                 "expected_run_id": "run-a",
                 "expected_runner_id": "runner-a",
+                "expected_attempt_id": None,
             }
 
         async def start_tracking(self) -> None:

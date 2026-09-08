@@ -25,6 +25,9 @@ from tests.web.pool_contention_shared import (
     gated_pool_checkout,
     wait_for_ticks,
 )
+from tests.web.services.task_lease_shared import (
+    live_task_lease as live_task_lease_fixture,
+)
 from xagent.core.agent.runner import UserMessageInjectionOutcome
 from xagent.db.sqlite import apply_sqlite_concurrency_pragmas
 from xagent.web.api import websocket as websocket_api
@@ -80,6 +83,8 @@ from xagent.web.services.task_command_transport import (
     task_has_live_foreign_runner,
     task_has_live_runner,
 )
+
+live_task_lease = live_task_lease_fixture
 
 
 @pytest.fixture()
@@ -1011,6 +1016,7 @@ def test_failed_command_retry_preserves_immutable_target(db_session) -> None:
 
 @pytest.mark.asyncio
 async def test_recovery_dispatches_committed_message_across_run_rotation(
+    live_task_lease,
     db_session,
 ) -> None:
     user, task = _create_running_task(db_session)
@@ -1048,6 +1054,7 @@ async def test_recovery_dispatches_committed_message_across_run_rotation(
     task.run_id = "run-2"
     task.lease_expires_at = datetime.utcnow() - timedelta(seconds=1)
     db_session.commit()
+    live_task_lease(db_session, task)
 
     runtime_agent = MagicMock()
     runtime_agent.supports_live_control.return_value = True

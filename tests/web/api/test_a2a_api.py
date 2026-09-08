@@ -840,6 +840,7 @@ def test_update_a2a_resume_input_rolls_back_the_interaction_close_with_the_fence
             source="a2a",
             is_visible=False,
             interaction_protocol_version=1,
+            lease_attempt_id="test-attempt",
         )
         db.add(task)
         db.commit()
@@ -855,7 +856,10 @@ def test_update_a2a_resume_input_rolls_back_the_interaction_close_with_the_fence
     # clause requires an exact match, so this lease has already lost the
     # race by the time the write is attempted.
     stale_lease = TaskLease(
-        task_id=task_id, runner_id="a-different-runner", run_id="run-atomicity"
+        task_id=task_id,
+        runner_id="a-different-runner",
+        run_id="run-atomicity",
+        attempt_id="test-attempt",
     )
     updated = a2a_api._update_a2a_resume_input_sync(
         stale_lease,
@@ -1404,6 +1408,7 @@ def test_checkpoint_resume_rejects_duplicate_request_while_exact_lease_is_live()
             source="a2a",
             is_visible=False,
             agent_config={"a2a_context_id": "ctx-duplicate"},
+            lease_attempt_id="test-attempt",
         )
         db.add(task)
         db.commit()
@@ -1603,6 +1608,7 @@ def test_prelease_restore_from_a_cancelled_acquisition_leaves_marker_untouched()
             source="a2a",
             is_visible=False,
             interaction_protocol_version=1,
+            lease_attempt_id="test-attempt",
         )
         db.add(task)
         db.commit()
@@ -1621,6 +1627,7 @@ def test_prelease_restore_from_a_cancelled_acquisition_leaves_marker_untouched()
         task_id=task_id,
         runner_id="cancelled-acquire-runner",
         run_id="run-cancelled-acquire",
+        attempt_id="test-attempt",
     )
     restored = a2a_api._restore_a2a_resume_prelease_sync(
         acquired_lease, status=TaskStatus.WAITING_FOR_USER
@@ -2866,6 +2873,7 @@ async def test_cancel_accepts_exact_same_run_local_settlement() -> None:
             source="a2a",
             is_visible=False,
             agent_config={"a2a_context_id": "ctx-local-settlement"},
+            lease_attempt_id="test-attempt",
         )
         db.add(task)
         db.commit()
@@ -2961,6 +2969,7 @@ def test_cancel_rejects_unattributed_or_incomplete_failed_settlement(
             is_visible=False,
             agent_config={"a2a_context_id": "ctx-unattributed-settlement"},
             error_message="task execution failed",
+            lease_attempt_id="test-attempt",
         )
         db.add(task)
         db.commit()

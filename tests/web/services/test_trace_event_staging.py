@@ -514,9 +514,15 @@ def test_shell_passes_the_partition_stamped_data_into_prune(
     task = db.get(Task, task_id)
     task.status = TaskStatus.RUNNING
     task.runner_id = "runner-a"
+    task.lease_attempt_id = "test-attempt"
     task.run_id = "run-a-t6"
     db.commit()
-    lease = TaskLease(task_id=task_id, runner_id="runner-a", run_id="run-a-t6")
+    lease = TaskLease(
+        task_id=task_id,
+        runner_id="runner-a",
+        run_id="run-a-t6",
+        attempt_id="test-attempt",
+    )
 
     captured: list[dict[str, Any]] = []
     original_prune = DatabaseTraceHandler._prune_checkpoint_history

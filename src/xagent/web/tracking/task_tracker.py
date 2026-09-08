@@ -72,6 +72,7 @@ def _task_for_run(
     task_id: int,
     expected_run_id: str | None,
     expected_runner_id: str | None = None,
+    expected_attempt_id: str | None = None,
 ) -> Any | None:
     from ..models.task import Task
 
@@ -79,7 +80,14 @@ def _task_for_run(
     if expected_run_id is not None:
         query = query.filter(Task.run_id == expected_run_id)
     if expected_runner_id is not None:
-        query = query.filter(Task.runner_id == expected_runner_id)
+        from sqlalchemy import false
+
+        query = query.filter(
+            Task.runner_id == expected_runner_id,
+            Task.lease_attempt_id == expected_attempt_id
+            if expected_attempt_id is not None
+            else false(),
+        )
     return query.first()
 
 
@@ -88,12 +96,14 @@ def _task_seed_from_session(
     task_id: int,
     expected_run_id: str | None = None,
     expected_runner_id: str | None = None,
+    expected_attempt_id: str | None = None,
 ) -> _TaskTrackingSeed:
     task = _task_for_run(
         db_session,
         task_id,
         expected_run_id,
         expected_runner_id,
+        expected_attempt_id,
     )
     if task is None:
         run_suffix = (
@@ -121,6 +131,7 @@ def _load_task_seed_sync(
     task_id: int,
     expected_run_id: str | None = None,
     expected_runner_id: str | None = None,
+    expected_attempt_id: str | None = None,
 ) -> _TaskTrackingSeed:
     db_session = _new_short_session()
     try:
@@ -129,6 +140,7 @@ def _load_task_seed_sync(
             task_id,
             expected_run_id,
             expected_runner_id,
+            expected_attempt_id,
         )
     finally:
         db_session.close()
@@ -140,6 +152,7 @@ def _commit_task_usage_if_owned(
     usage: TokenUsage,
     expected_run_id: str | None = None,
     expected_runner_id: str | None = None,
+    expected_attempt_id: str | None = None,
 ) -> bool:
     """Persist counters only while the durable run owner still matches.
 
@@ -153,7 +166,14 @@ def _commit_task_usage_if_owned(
     if expected_run_id is not None:
         query = query.filter(Task.run_id == expected_run_id)
     if expected_runner_id is not None:
-        query = query.filter(Task.runner_id == expected_runner_id)
+        from sqlalchemy import false
+
+        query = query.filter(
+            Task.runner_id == expected_runner_id,
+            Task.lease_attempt_id == expected_attempt_id
+            if expected_attempt_id is not None
+            else false(),
+        )
     updated = query.update(
         {
             Task.input_tokens: usage.input_tokens,
@@ -176,6 +196,7 @@ def _write_task_usage_sync(
     usage: TokenUsage,
     expected_run_id: str | None = None,
     expected_runner_id: str | None = None,
+    expected_attempt_id: str | None = None,
 ) -> bool:
     db_session = _new_short_session()
     try:
@@ -185,6 +206,7 @@ def _write_task_usage_sync(
             usage,
             expected_run_id,
             expected_runner_id,
+            expected_attempt_id,
         )
     except Exception:
         try:
@@ -249,6 +271,7 @@ def _complete_task_usage_sync(
     usage: TokenUsage,
     expected_run_id: str | None = None,
     expected_runner_id: str | None = None,
+    expected_attempt_id: str | None = None,
 ) -> bool:
     """Persist one run while its durable ownership fence still wins."""
     from ..services.db_runtime import is_database_pool_timeout
@@ -262,6 +285,7 @@ def _complete_task_usage_sync(
                 usage,
                 expected_run_id,
                 expected_runner_id,
+                expected_attempt_id,
             )
         except Exception as error:  # noqa: BLE001
             logger.warning(
@@ -323,6 +347,7 @@ class TaskTracker:
         update_interval_seconds: int = 15,
         expected_run_id: str | None = None,
         expected_runner_id: str | None = None,
+        expected_attempt_id: str | None = None,
     ) -> None:
         """Initialize the task tracker.
 
@@ -335,12 +360,14 @@ class TaskTracker:
             expected_run_id: Optional durable run fence. When provided, writes
                 are ignored after a replacement run changes the task's run id.
             expected_runner_id: Optional durable runner fence. When provided,
-                seed reads and writes require both the expected run and runner.
+                seed reads and writes require the run, runner, and acquisition.
+            expected_attempt_id: Acquisition that owns the tracked counters.
         """
         self.task_id = task_id
         self.update_interval_seconds = update_interval_seconds
         self.expected_run_id = expected_run_id
         self.expected_runner_id = expected_runner_id
+        self.expected_attempt_id = expected_attempt_id
         self._is_tracking = False
         self._update_task: Optional[asyncio.Task] = None
         self._stop_event = asyncio.Event()
@@ -359,6 +386,7 @@ class TaskTracker:
                 task_id,
                 expected_run_id,
                 expected_runner_id,
+                expected_attempt_id,
             )
             if db_session is not None
             else None
@@ -383,6 +411,7 @@ class TaskTracker:
                     self.task_id,
                     self.expected_run_id,
                     self.expected_runner_id,
+                    self.expected_attempt_id,
                 )
             )
             self._seed = seed
@@ -431,6 +460,7 @@ class TaskTracker:
                     usage,
                     self.expected_run_id,
                     self.expected_runner_id,
+                    self.expected_attempt_id,
                 )
             )
             if not task_exists:
@@ -590,6 +620,7 @@ class TaskTracker:
                     usage,
                     self.expected_run_id,
                     self.expected_runner_id,
+                    self.expected_attempt_id,
                 )
             )
         except Exception as e:  # noqa: BLE001

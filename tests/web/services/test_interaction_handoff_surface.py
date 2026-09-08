@@ -62,6 +62,8 @@ def _seed(session_factory) -> tuple[int, int]:
     db = session_factory()
     user_id = make_user(db)
     task_id = make_task(db, user_id=user_id)
+    db.get(Task, task_id).lease_attempt_id = "test-attempt"
+    db.commit()
     anchor_id = make_trace_event(db, task_id=task_id)
     db.close()
     return task_id, anchor_id
@@ -84,7 +86,7 @@ def _anchor(trace_event_id: int, **overrides: Any) -> InteractionAnchor:
 
 def _lease(task_id: int, *, run_id: str = "run-a") -> TaskLease:
     return TaskLease(
-        task_id=task_id, runner_id="runner-1", run_id=run_id, attempt_id=None
+        task_id=task_id, runner_id="runner-1", run_id=run_id, attempt_id="test-attempt"
     )
 
 

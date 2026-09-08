@@ -77,6 +77,7 @@ from ...services.task_lease_service import (
     run_task_lease_heartbeat,
     run_while_task_lease_owned,
     stop_task_lease_heartbeat,
+    task_lease_attempt_predicate,
 )
 from .deps import ApiKeyPrincipal, record_key_usage
 from .errors import V1ApiError, V1ErrorCode
@@ -334,6 +335,7 @@ def _update_reply_input_sync(
                 Task.id == task_lease.task_id,
                 Task.status == TaskStatus.RUNNING,
                 Task.runner_id == task_lease.runner_id,
+                task_lease_attempt_predicate(task_lease),
                 Task.run_id == task_lease.run_id,
             )
             .update(

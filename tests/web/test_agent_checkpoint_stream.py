@@ -986,7 +986,9 @@ def test_database_trace_handler_build_checkpoint_does_not_update_task_pointer() 
             },
         )
 
-        with bind_task_lease_context(TaskLease(int(task.id), "runner-a", "run-a")):
+        with bind_task_lease_context(
+            TaskLease(int(task.id), "runner-a", "run-a", attempt_id="test-attempt")
+        ):
             handler._save_trace_event(db, event)
         db.refresh(task)
 
@@ -1002,12 +1004,14 @@ def test_database_trace_handler_tags_and_points_to_current_run_checkpoint() -> N
     _, db, task = _create_trace_handler_test_task("current-run-checkpoint")
     task.status = TaskStatus.RUNNING
     task.runner_id = "runner-a"
+    task.lease_attempt_id = "test-attempt"
     task.run_id = "run-a"
     db.commit()
     lease = TaskLease(
         task_id=int(task.id),
         runner_id="runner-a",
         run_id="run-a",
+        attempt_id="test-attempt",
     )
     event = TraceEvent(
         CHECKPOINT_EVENT_TYPE,
@@ -1057,12 +1061,14 @@ def test_database_trace_handler_rejects_stale_checkpoint(
     _, db, task = _create_trace_handler_test_task("stale-run-checkpoint")
     task.status = TaskStatus.RUNNING
     task.runner_id = "runner-b"
+    task.lease_attempt_id = "test-attempt"
     task.run_id = "run-b"
     db.commit()
     stale_lease = TaskLease(
         task_id=int(task.id),
         runner_id="runner-a",
         run_id="run-a",
+        attempt_id="test-attempt",
     )
     event = TraceEvent(
         CHECKPOINT_EVENT_TYPE,
@@ -1112,10 +1118,13 @@ def test_database_trace_handler_pointer_update_skips_silently_when_task_is_gone(
     )
     task.status = TaskStatus.RUNNING
     task.runner_id = "runner-a"
+    task.lease_attempt_id = "test-attempt"
     task.run_id = "run-a"
     db.commit()
     task_id = int(task.id)
-    lease = TaskLease(task_id=task_id, runner_id="runner-a", run_id="run-a")
+    lease = TaskLease(
+        task_id=task_id, runner_id="runner-a", run_id="run-a", attempt_id="test-attempt"
+    )
     event = TraceEvent(
         CHECKPOINT_EVENT_TYPE,
         task_id=str(task_id),
@@ -1151,6 +1160,7 @@ def test_cached_database_trace_handler_reads_run_context_per_event() -> None:
     handler = DatabaseTraceHandler(int(task.id))
     task.status = TaskStatus.RUNNING
     task.runner_id = "runner-a"
+    task.lease_attempt_id = "test-attempt"
     task.run_id = "run-a"
     db.commit()
     first = TraceEvent(
@@ -1173,14 +1183,19 @@ def test_cached_database_trace_handler_reads_run_context_per_event() -> None:
     )
 
     try:
-        with bind_task_lease_context(TaskLease(int(task.id), "runner-a", "run-a")):
+        with bind_task_lease_context(
+            TaskLease(int(task.id), "runner-a", "run-a", attempt_id="test-attempt")
+        ):
             handler._save_trace_event(db, first)
 
         task.runner_id = "runner-b"
+        task.lease_attempt_id = "test-attempt"
         task.run_id = "run-b"
         task.last_checkpoint_event_id = None
         db.commit()
-        with bind_task_lease_context(TaskLease(int(task.id), "runner-b", "run-b")):
+        with bind_task_lease_context(
+            TaskLease(int(task.id), "runner-b", "run-b", attempt_id="test-attempt")
+        ):
             handler._save_trace_event(db, second)
 
         rows = (
@@ -1248,7 +1263,9 @@ def test_database_trace_handler_load_latest_checkpoint_is_build_scoped(
             ),
         )
 
-        with bind_task_lease_context(TaskLease(int(task.id), "runner-a", "run-a")):
+        with bind_task_lease_context(
+            TaskLease(int(task.id), "runner-a", "run-a", attempt_id="test-attempt")
+        ):
             # The root checkpoint was written before the lease bound above,
             # so it carries no run tag. With no tagged checkpoint on record
             # for this task, the root reader's partition widens to the
@@ -1277,6 +1294,7 @@ def test_database_trace_handler_loads_checkpoint_only_from_bound_run(
     SessionLocal, db, task = _create_trace_handler_test_task("run-scoped-load")
     task.status = TaskStatus.RUNNING
     task.runner_id = "runner-b"
+    task.lease_attempt_id = "test-attempt"
     task.run_id = "run-b"
     db.commit()
     task_id = int(task.id)
@@ -1313,7 +1331,9 @@ def test_database_trace_handler_loads_checkpoint_only_from_bound_run(
     monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
 
     try:
-        with bind_task_lease_context(TaskLease(task_id, "runner-b", "run-b")):
+        with bind_task_lease_context(
+            TaskLease(task_id, "runner-b", "run-b", attempt_id="test-attempt")
+        ):
             assert DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
                 "shared-execution"
             ) == {"label": "run-b"}
@@ -1333,7 +1353,9 @@ async def test_database_trace_handler_load_worker_inherits_run_context(
 
     monkeypatch.setattr(handler, "_sync_load_latest_checkpoint", observe_bound_run)
 
-    with bind_task_lease_context(TaskLease(7, "runner-b", "run-b")):
+    with bind_task_lease_context(
+        TaskLease(7, "runner-b", "run-b", attempt_id="test-attempt")
+    ):
         assert await handler.load_latest_checkpoint("shared-execution") == {
             "run_id": "run-b"
         }
@@ -1353,6 +1375,7 @@ def test_database_trace_handler_bound_run_widens_to_legacy_checkpoint_when_untag
     SessionLocal, db, task = _create_trace_handler_test_task("run-legacy-load")
     task.status = TaskStatus.RUNNING
     task.runner_id = "runner-b"
+    task.lease_attempt_id = "test-attempt"
     task.run_id = "run-b"
     db.commit()
     task_id = int(task.id)
@@ -1377,7 +1400,9 @@ def test_database_trace_handler_bound_run_widens_to_legacy_checkpoint_when_untag
     monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
 
     try:
-        with bind_task_lease_context(TaskLease(task_id, "runner-b", "run-b")):
+        with bind_task_lease_context(
+            TaskLease(task_id, "runner-b", "run-b", attempt_id="test-attempt")
+        ):
             assert DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
                 "shared-execution"
             ) == {"label": "legacy"}
@@ -1393,6 +1418,7 @@ def test_database_trace_handler_load_without_pk_anchor_uses_legacy_scan(
     SessionLocal, db, task = _create_trace_handler_test_task("no-pk-anchor-load")
     task.status = TaskStatus.RUNNING
     task.runner_id = "runner-a"
+    task.lease_attempt_id = "test-attempt"
     task.run_id = "run-a"
     db.commit()
     task_id = int(task.id)
@@ -1419,7 +1445,9 @@ def test_database_trace_handler_load_without_pk_anchor_uses_legacy_scan(
     monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
 
     try:
-        with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
+        with bind_task_lease_context(
+            TaskLease(task_id, "runner-a", "run-a", attempt_id="test-attempt")
+        ):
             assert DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
                 "shared-execution"
             ) == {"label": "legacy-only"}
@@ -1435,6 +1463,7 @@ def test_database_trace_handler_load_uses_pk_anchor_over_newer_row(
     SessionLocal, db, task = _create_trace_handler_test_task("pk-anchor-load")
     task.status = TaskStatus.RUNNING
     task.runner_id = "runner-a"
+    task.lease_attempt_id = "test-attempt"
     task.run_id = "run-a"
     db.commit()
     task_id = int(task.id)
@@ -1473,7 +1502,9 @@ def test_database_trace_handler_load_uses_pk_anchor_over_newer_row(
     monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
 
     try:
-        with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
+        with bind_task_lease_context(
+            TaskLease(task_id, "runner-a", "run-a", attempt_id="test-attempt")
+        ):
             assert DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
                 "shared-execution"
             ) == {"label": "anchored"}
@@ -1533,6 +1564,7 @@ def test_database_trace_handler_load_pk_anchor_single_fault_raises_corrupt(
     )
     task.status = TaskStatus.RUNNING
     task.runner_id = "runner-a"
+    task.lease_attempt_id = "test-attempt"
     task.run_id = "run-a"
     db.commit()
     task_id = int(task.id)
@@ -1601,7 +1633,9 @@ def test_database_trace_handler_load_pk_anchor_single_fault_raises_corrupt(
     monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
 
     try:
-        with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
+        with bind_task_lease_context(
+            TaskLease(task_id, "runner-a", "run-a", attempt_id="test-attempt")
+        ):
             with pytest.raises(CheckpointCorruptError):
                 DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
                     "shared-execution"
@@ -1646,6 +1680,7 @@ def test_database_trace_handler_load_pk_anchor_absent_run_field_still_raises_cor
     )
     task.status = TaskStatus.RUNNING
     task.runner_id = "runner-a"
+    task.lease_attempt_id = "test-attempt"
     task.run_id = "run-a"
     db.commit()
     task_id = int(task.id)
@@ -1693,7 +1728,9 @@ def test_database_trace_handler_load_pk_anchor_absent_run_field_still_raises_cor
     monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
 
     try:
-        with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
+        with bind_task_lease_context(
+            TaskLease(task_id, "runner-a", "run-a", attempt_id="test-attempt")
+        ):
             with pytest.raises(CheckpointCorruptError):
                 DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
                     "shared-execution"
@@ -1719,6 +1756,7 @@ def test_database_trace_handler_load_pk_anchor_without_execution_identity_loads(
     )
     task.status = TaskStatus.RUNNING
     task.runner_id = "runner-a"
+    task.lease_attempt_id = "test-attempt"
     task.run_id = "run-a"
     db.commit()
     task_id = int(task.id)
@@ -1751,7 +1789,9 @@ def test_database_trace_handler_load_pk_anchor_without_execution_identity_loads(
     monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
 
     try:
-        with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
+        with bind_task_lease_context(
+            TaskLease(task_id, "runner-a", "run-a", attempt_id="test-attempt")
+        ):
             assert DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
                 "shared-execution"
             ) == {"label": "no-execution-identity"}
@@ -1775,6 +1815,7 @@ def test_database_trace_handler_load_dangling_pk_anchor_falls_back_with_telemetr
     SessionLocal, db, task = _create_trace_handler_test_task("pk-anchor-dangling")
     task.status = TaskStatus.RUNNING
     task.runner_id = "runner-a"
+    task.lease_attempt_id = "test-attempt"
     task.run_id = "run-a"
     db.commit()
     task_id = int(task.id)
@@ -1802,7 +1843,9 @@ def test_database_trace_handler_load_dangling_pk_anchor_falls_back_with_telemetr
 
     clear_degradation(CHECKPOINT_PK_ANCHOR_DANGLING)
     try:
-        with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
+        with bind_task_lease_context(
+            TaskLease(task_id, "runner-a", "run-a", attempt_id="test-attempt")
+        ):
             assert DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
                 "shared-execution"
             ) == {"label": "legacy-fallback"}
@@ -1901,6 +1944,7 @@ def test_database_trace_handler_unbound_root_load_fails_closed_for_active_run(
     SessionLocal, db, task = _create_trace_handler_test_task("unbound-active-load")
     task.status = TaskStatus.RUNNING
     task.runner_id = "runner-a"
+    task.lease_attempt_id = "test-attempt"
     task.run_id = "run-a"
     db.commit()
     task_id = int(task.id)
@@ -1957,7 +2001,9 @@ def test_database_trace_handler_load_refuses_lease_bound_to_another_task(
 
     try:
         with (
-            bind_task_lease_context(TaskLease(task_id + 1, "runner-a", "run-a")),
+            bind_task_lease_context(
+                TaskLease(task_id + 1, "runner-a", "run-a", attempt_id="test-attempt")
+            ),
             pytest.raises(CheckpointAccessRefusedError) as excinfo,
         ):
             DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
@@ -2007,7 +2053,9 @@ def test_partition_refusal_is_distinct_from_absence(
         # A reader that IS bound to the tagged run reads its own partition
         # and, for an execution id with no matching row there, gets the
         # authoritative "queried successfully, found nothing" result.
-        with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
+        with bind_task_lease_context(
+            TaskLease(task_id, "runner-a", "run-a", attempt_id="test-attempt")
+        ):
             assert (
                 DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
                     "other-execution"
@@ -2028,6 +2076,7 @@ def test_read_partition_keeps_bound_run_when_a_tagged_checkpoint_exists(
     SessionLocal, db, task = _create_trace_handler_test_task("tagged-keeps-bound")
     task.status = TaskStatus.RUNNING
     task.runner_id = "runner-a"
+    task.lease_attempt_id = "test-attempt"
     task.run_id = "run-a"
     db.commit()
     task_id = int(task.id)
@@ -2063,7 +2112,9 @@ def test_read_partition_keeps_bound_run_when_a_tagged_checkpoint_exists(
     monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
 
     try:
-        with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
+        with bind_task_lease_context(
+            TaskLease(task_id, "runner-a", "run-a", attempt_id="test-attempt")
+        ):
             assert DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
                 "shared-execution"
             ) == {"label": "tagged"}
@@ -2147,6 +2198,7 @@ def test_legacy_checkpoint_is_read_after_a_run_id_is_minted(
     )
     task.status = TaskStatus.RUNNING
     task.runner_id = "runner-a"
+    task.lease_attempt_id = "test-attempt"
     task.run_id = "run-a"
     db.commit()
     task_id = int(task.id)
@@ -2175,7 +2227,9 @@ def test_legacy_checkpoint_is_read_after_a_run_id_is_minted(
     monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
 
     try:
-        with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
+        with bind_task_lease_context(
+            TaskLease(task_id, "runner-a", "run-a", attempt_id="test-attempt")
+        ):
             assert DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
                 "shared-execution"
             ) == {"label": "legacy"}
@@ -2212,6 +2266,7 @@ def test_widened_partition_is_confirmed_before_rejecting_a_row_failing_any_other
     )
     task.status = TaskStatus.RUNNING
     task.runner_id = "runner-a"
+    task.lease_attempt_id = "test-attempt"
     task.run_id = "run-a"
     db.commit()
     task_id = int(task.id)
@@ -2281,7 +2336,9 @@ def test_widened_partition_is_confirmed_before_rejecting_a_row_failing_any_other
     expected_partition = "run-a" if field == "run_partition" else None
 
     try:
-        with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
+        with bind_task_lease_context(
+            TaskLease(task_id, "runner-a", "run-a", attempt_id="test-attempt")
+        ):
             assert (
                 DatabaseTraceHandler(task_id)._root_checkpoint_read_partition(db).run_id
                 == expected_partition
@@ -2338,6 +2395,7 @@ def test_widened_read_never_returns_without_a_fresh_recheck(
     SessionLocal, db, task = _create_trace_handler_test_task(f"widened-recheck-{shape}")
     task.status = TaskStatus.RUNNING
     task.runner_id = "runner-a"
+    task.lease_attempt_id = "test-attempt"
     task.run_id = "run-a"
     db.commit()
     task_id = int(task.id)
@@ -2422,7 +2480,9 @@ def test_widened_read_never_returns_without_a_fresh_recheck(
     )
 
     try:
-        with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
+        with bind_task_lease_context(
+            TaskLease(task_id, "runner-a", "run-a", attempt_id="test-attempt")
+        ):
             with pytest.raises(CheckpointUnavailableError):
                 DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
                     "shared-execution"
@@ -2442,6 +2502,7 @@ def test_widened_read_is_not_flagged_stale_when_nothing_concurrent_happens(
     SessionLocal, db, task = _create_trace_handler_test_task("widened-recheck-no-race")
     task.status = TaskStatus.RUNNING
     task.runner_id = "runner-a"
+    task.lease_attempt_id = "test-attempt"
     task.run_id = "run-a"
     db.commit()
     task_id = int(task.id)
@@ -2456,7 +2517,9 @@ def test_widened_read_is_not_flagged_stale_when_nothing_concurrent_happens(
     monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
 
     try:
-        with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
+        with bind_task_lease_context(
+            TaskLease(task_id, "runner-a", "run-a", attempt_id="test-attempt")
+        ):
             assert (
                 DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
                     "shared-execution"
@@ -2572,6 +2635,7 @@ def test_recheck_probe_failure_surfaces_as_unavailable_not_a_snapshot(
     SessionLocal, db, task = _create_trace_handler_test_task("recheck-probe-failure")
     task.status = TaskStatus.RUNNING
     task.runner_id = "runner-a"
+    task.lease_attempt_id = "test-attempt"
     task.run_id = "run-a"
     db.commit()
     task_id = int(task.id)
@@ -2618,7 +2682,9 @@ def test_recheck_probe_failure_surfaces_as_unavailable_not_a_snapshot(
     )
 
     try:
-        with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
+        with bind_task_lease_context(
+            TaskLease(task_id, "runner-a", "run-a", attempt_id="test-attempt")
+        ):
             with pytest.raises(CheckpointUnavailableError):
                 DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
                     "shared-execution"
@@ -2639,6 +2705,7 @@ def test_run_bound_read_issues_no_extra_probe(
     SessionLocal, db, task = _create_trace_handler_test_task("run-bound-no-extra-probe")
     task.status = TaskStatus.RUNNING
     task.runner_id = "runner-a"
+    task.lease_attempt_id = "test-attempt"
     task.run_id = "run-a"
     db.commit()
     task_id = int(task.id)
@@ -2675,7 +2742,9 @@ def test_run_bound_read_issues_no_extra_probe(
     )
 
     try:
-        with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
+        with bind_task_lease_context(
+            TaskLease(task_id, "runner-a", "run-a", attempt_id="test-attempt")
+        ):
             assert DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
                 "shared-execution"
             ) == {"label": "tagged"}
@@ -2755,6 +2824,7 @@ def test_probe_failure_registers_signal_from_both_callers(
     if leased:
         task.status = TaskStatus.RUNNING
         task.runner_id = "runner-a"
+        task.lease_attempt_id = "test-attempt"
         task.run_id = "run-a"
         db.commit()
     else:
@@ -2791,7 +2861,9 @@ def test_probe_failure_registers_signal_from_both_callers(
     clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
     try:
         if leased:
-            with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
+            with bind_task_lease_context(
+                TaskLease(task_id, "runner-a", "run-a", attempt_id="test-attempt")
+            ):
                 with pytest.raises(CheckpointUnavailableError):
                     DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
                         "shared-execution"
@@ -2818,6 +2890,7 @@ def test_widening_self_extinguishes_after_the_first_tagged_checkpoint(
     SessionLocal, db, task = _create_trace_handler_test_task("self-extinguish")
     task.status = TaskStatus.RUNNING
     task.runner_id = "runner-a"
+    task.lease_attempt_id = "test-attempt"
     task.run_id = "run-a"
     db.commit()
     task_id = int(task.id)
@@ -2842,7 +2915,9 @@ def test_widening_self_extinguishes_after_the_first_tagged_checkpoint(
     monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
 
     try:
-        with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
+        with bind_task_lease_context(
+            TaskLease(task_id, "runner-a", "run-a", attempt_id="test-attempt")
+        ):
             # Before this run has tagged anything, the partition itself is
             # widened -- not merely serving stale content that could
             # coincidentally match a narrower partition.
@@ -2912,6 +2987,7 @@ def test_widening_increments_its_counter_only_when_it_engages(
     SessionLocal, db, task = _create_trace_handler_test_task("widening-counter")
     task.status = TaskStatus.RUNNING
     task.runner_id = "runner-a"
+    task.lease_attempt_id = "test-attempt"
     task.run_id = "run-a"
     db.commit()
     task_id = int(task.id)
@@ -2936,7 +3012,9 @@ def test_widening_increments_its_counter_only_when_it_engages(
     monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
 
     try:
-        with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
+        with bind_task_lease_context(
+            TaskLease(task_id, "runner-a", "run-a", attempt_id="test-attempt")
+        ):
             # 1. No run-tagged checkpoint yet: the lease-bound read widens,
             # and the counter moves by exactly one.
             before = widened_count()
@@ -4459,6 +4537,7 @@ def test_database_trace_handler_load_pk_anchor_undecodable_payload_falls_back_to
     SessionLocal, db, task = _create_trace_handler_test_task("anchor-undecodable-older")
     task.status = TaskStatus.RUNNING
     task.runner_id = "runner-a"
+    task.lease_attempt_id = "test-attempt"
     task.run_id = "run-a"
     db.commit()
     task_id = int(task.id)
@@ -4496,7 +4575,9 @@ def test_database_trace_handler_load_pk_anchor_undecodable_payload_falls_back_to
     )
 
     try:
-        with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
+        with bind_task_lease_context(
+            TaskLease(task_id, "runner-a", "run-a", attempt_id="test-attempt")
+        ):
             assert DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
                 "shared-execution"
             ) == {"label": "older-readable"}
@@ -4515,6 +4596,7 @@ def test_database_trace_handler_load_pk_anchor_undecodable_payload_without_older
     SessionLocal, db, task = _create_trace_handler_test_task("anchor-undecodable-only")
     task.status = TaskStatus.RUNNING
     task.runner_id = "runner-a"
+    task.lease_attempt_id = "test-attempt"
     task.run_id = "run-a"
     db.commit()
     task_id = int(task.id)
@@ -4539,7 +4621,9 @@ def test_database_trace_handler_load_pk_anchor_undecodable_payload_without_older
     )
 
     try:
-        with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
+        with bind_task_lease_context(
+            TaskLease(task_id, "runner-a", "run-a", attempt_id="test-attempt")
+        ):
             with pytest.raises(CheckpointCorruptError):
                 DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
                     "shared-execution"
@@ -4564,6 +4648,7 @@ def test_database_trace_handler_load_pk_anchor_generic_decode_failure_is_unavail
     SessionLocal, db, task = _create_trace_handler_test_task("anchor-generic-only")
     task.status = TaskStatus.RUNNING
     task.runner_id = "runner-a"
+    task.lease_attempt_id = "test-attempt"
     task.run_id = "run-a"
     db.commit()
     task_id = int(task.id)
@@ -4588,7 +4673,9 @@ def test_database_trace_handler_load_pk_anchor_generic_decode_failure_is_unavail
     clear_degradation(CHECKPOINT_DECODE_FALLBACK)
     clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
     try:
-        with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
+        with bind_task_lease_context(
+            TaskLease(task_id, "runner-a", "run-a", attempt_id="test-attempt")
+        ):
             with pytest.raises(CheckpointUnavailableError):
                 DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
                     "shared-execution"
@@ -4632,6 +4719,7 @@ def test_database_trace_handler_decode_fallback_clears_after_a_successful_decode
     )
     task.status = TaskStatus.RUNNING
     task.runner_id = "runner-a"
+    task.lease_attempt_id = "test-attempt"
     task.run_id = "run-a"
     db.commit()
     task_id = int(task.id)
@@ -4658,7 +4746,9 @@ def test_database_trace_handler_decode_fallback_clears_after_a_successful_decode
         CHECKPOINT_DECODE_FALLBACK, "left over from an earlier fallback"
     )
     try:
-        with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
+        with bind_task_lease_context(
+            TaskLease(task_id, "runner-a", "run-a", attempt_id="test-attempt")
+        ):
             assert (
                 DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
                     "shared-execution"
@@ -4694,6 +4784,7 @@ def test_database_trace_handler_load_pk_anchor_database_failure_is_unavailable(
     )
     task.status = TaskStatus.RUNNING
     task.runner_id = "runner-a"
+    task.lease_attempt_id = "test-attempt"
     task.run_id = "run-a"
     db.commit()
     task_id = int(task.id)
@@ -4736,7 +4827,9 @@ def test_database_trace_handler_load_pk_anchor_database_failure_is_unavailable(
 
     clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
     try:
-        with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
+        with bind_task_lease_context(
+            TaskLease(task_id, "runner-a", "run-a", attempt_id="test-attempt")
+        ):
             with pytest.raises(CheckpointUnavailableError):
                 DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
                     "shared-execution"
@@ -4773,6 +4866,7 @@ def test_database_trace_handler_anchored_read_clears_the_dangling_signal(
     )
     task.status = TaskStatus.RUNNING
     task.runner_id = "runner-a"
+    task.lease_attempt_id = "test-attempt"
     task.run_id = "run-a"
     db.commit()
     task_id = int(task.id)
@@ -4800,7 +4894,9 @@ def test_database_trace_handler_anchored_read_clears_the_dangling_signal(
         CHECKPOINT_PK_ANCHOR_DANGLING, "left over from another task's read"
     )
     try:
-        with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
+        with bind_task_lease_context(
+            TaskLease(task_id, "runner-a", "run-a", attempt_id="test-attempt")
+        ):
             assert (
                 DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
                     "shared-execution"
@@ -4914,10 +5010,13 @@ def test_database_trace_handler_flush_without_primary_key_refuses_to_write_the_a
     _, db, task = _create_trace_handler_test_task("flush-without-pk")
     task.status = TaskStatus.RUNNING
     task.runner_id = "runner-a"
+    task.lease_attempt_id = "test-attempt"
     task.run_id = "run-a"
     db.commit()
     task_id = int(task.id)
-    lease = TaskLease(task_id=task_id, runner_id="runner-a", run_id="run-a")
+    lease = TaskLease(
+        task_id=task_id, runner_id="runner-a", run_id="run-a", attempt_id="test-attempt"
+    )
     event = TraceEvent(
         CHECKPOINT_EVENT_TYPE,
         task_id=str(task_id),

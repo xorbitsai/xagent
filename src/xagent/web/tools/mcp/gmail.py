@@ -1,8 +1,10 @@
 import base64
 import json
 import logging
+import mimetypes
 import os
 from email.message import EmailMessage
+from pathlib import Path
 from typing import Any
 
 from google.oauth2.credentials import Credentials
@@ -18,6 +20,113 @@ logger = logging.getLogger("gmail-mcp")
 setup_proxy_env()
 
 mcp = FastMCP("gmail-mcp")
+
+# Gmail's real limit is 25MB on the base64-encoded message. base64 inflates
+# raw bytes by 4/3, so this caps the raw (pre-encoding) total at 3/4 of that
+# — keeping the actual encoded message under Gmail's real limit rather than
+# letting a ~24MB raw attachment (which passes a naive 25MB raw check) still
+# fail the real send with an opaque API error. This is a budget shared
+# across every message in one gmail_send_messages call, not per-message —
+# a batch of many medium attachments is capped the same as one big one.
+_MAX_ATTACHMENT_BYTES = int(25 * 1024 * 1024 * 3 / 4)
+
+
+def _allowed_file_dirs() -> list[Path]:
+    raw_dirs = os.environ.get("XAGENT_GMAIL_FILE_ALLOWED_DIRS", "")
+    if not raw_dirs.strip():
+        return [Path.cwd().resolve()]
+    return [
+        Path(stripped).expanduser().resolve()
+        for raw_dir in raw_dirs.split(",")
+        if (stripped := raw_dir.strip())
+    ]
+
+
+def _resolve_allowed_file_path(file_path: str) -> Path:
+    """Restrict gmail_send_messages attachments to files under an
+    allowlisted directory, the same defense slack_upload_file and the
+    LinkedIn connector's image upload use — without it an agent could be
+    tricked into exfiltrating arbitrary host files through this tool.
+
+    Pass an absolute path — a relative path resolves against this
+    process's own working directory, not the allowed directory, and will
+    not find a file written to the task workspace."""
+    local_path = Path(file_path).expanduser()
+    if not local_path.is_absolute():
+        local_path = Path.cwd() / local_path
+    local_path = local_path.resolve()
+
+    if not local_path.is_file():
+        raise FileNotFoundError(f"Attachment not found: {file_path}")
+
+    allowed_dirs = _allowed_file_dirs()
+    for allowed_dir in allowed_dirs:
+        if local_path.is_relative_to(allowed_dir):
+            return local_path
+
+    # The absolute host path is deliberately kept out of the raised message:
+    # it reaches the caller/LLM unfiltered via the error payload below, and
+    # host filesystem layout has no business in a model transcript. Full
+    # detail (including the allowed directories) is logged server-side.
+    logger.warning(
+        "Rejected gmail attachment path %s outside allowed directories: %s",
+        local_path,
+        ", ".join(str(path) for path in allowed_dirs),
+    )
+    raise PermissionError(
+        "attachment path is outside the allowed directories; ask the user "
+        "for a file inside the task workspace or another allowed location"
+    )
+
+
+def _resolve_message_attachments(
+    msg_data: dict, budget_remaining: int
+) -> tuple[list[tuple[str, bytes]], int]:
+    """Resolve+read every attachment for one message, enforcing the
+    allowlist, empty-file, and size-budget checks.
+
+    `budget_remaining` is the *whole batch's* shared remaining byte budget,
+    not a per-message allowance — the caller threads the returned value
+    into the next message's call, so a batch of many medium attachments is
+    capped the same as one big one instead of each message getting its own
+    fresh _MAX_ATTACHMENT_BYTES allowance.
+
+    Each file's size is checked via fstat *before* reading it, so an
+    oversized file is rejected without first loading it into memory.
+    """
+    attachments: list[tuple[str, bytes]] = []
+    raw_attachments = msg_data.get("attachments")
+    if raw_attachments is None:
+        return attachments, budget_remaining
+    if not isinstance(raw_attachments, list):
+        raise ValueError("'attachments' must be a list of file paths")
+
+    for attachment_path in raw_attachments:
+        local_path = _resolve_allowed_file_path(attachment_path)
+        try:
+            with local_path.open("rb") as fh:
+                size = os.fstat(fh.fileno()).st_size
+                if size == 0:
+                    raise ValueError(f"Attachment is empty: {attachment_path}")
+                if size > budget_remaining:
+                    raise ValueError(
+                        "Attachments in this batch exceed the "
+                        f"{_MAX_ATTACHMENT_BYTES // (1024 * 1024)}MB total "
+                        f"budget (only {budget_remaining // (1024 * 1024)}MB "
+                        "left)."
+                    )
+                data = fh.read()
+        except OSError as e:
+            # Keep the absolute host path out of the message reaching the
+            # caller/LLM, matching the scrubbing _resolve_allowed_file_path
+            # already does for the "outside allowed directories" case —
+            # str(OSError) embeds the path, so it can't be re-raised as-is.
+            logger.warning("Could not read attachment %s: %s", local_path, e)
+            raise ValueError(f"Could not read attachment: {attachment_path}") from e
+
+        budget_remaining -= size
+        attachments.append((local_path.name, data))
+    return attachments, budget_remaining
 
 
 def get_gmail_service() -> Any:
@@ -162,14 +271,42 @@ def gmail_read_threads(thread_ids: list[str]) -> str:
 def gmail_send_messages(messages: list[dict], action: str = "draft") -> str:
     """
     Send multiple Gmail messages or save them as drafts. Calling this tool triggers an interactive user confirmation in the UI to choose "Save to drafts" or "Send" before any message is sent.
-    messages should be a list of dicts with 'to', 'subject', 'body', and optionally 'cc', 'bcc'.
+    messages should be a list of dicts with 'to', 'subject', 'body', and optionally 'cc', 'bcc', 'attachments'.
     action can be "send" or "draft".
+
+    'attachments' is a list of local file paths (e.g. a file exported to the
+    task workspace) to attach to that message — each path must be inside an
+    allowed directory (automatically scoped to the current task workspace),
+    the same restriction slack_upload_file uses. Pass an absolute path — a
+    relative path resolves against this process's own working directory,
+    not the allowed directory, and will not find a file written to the
+    task workspace. If you tell the recipient a file is attached, you MUST list it here:
+    writing "see attached" in the body does not attach anything by itself,
+    and this tool has no other way to send a file. Each successful result
+    includes an 'attachments' list of what was actually attached (filename
+    + byte size) — check that before telling the user a file was sent,
+    don't assume it from the request alone. All attachments across the
+    whole call share one combined size budget (see _MAX_ATTACHMENT_BYTES).
     """
     try:
+        if not isinstance(messages, list):
+            raise ValueError("'messages' must be a list of message dicts")
+
+        # Resolve every message's attachments before sending any message, so
+        # a bad attachment path on message 2 can't leave message 1 already
+        # sent while message 2 silently fails partway through the batch.
+        resolved_attachments: list[list[tuple[str, bytes]]] = []
+        budget_remaining = _MAX_ATTACHMENT_BYTES
+        for msg_data in messages:
+            attachments, budget_remaining = _resolve_message_attachments(
+                msg_data, budget_remaining
+            )
+            resolved_attachments.append(attachments)
+
         service = get_gmail_service()
         results = []
 
-        for msg_data in messages:
+        for msg_data, attachments in zip(messages, resolved_attachments):
             message = EmailMessage()
             message.set_content(msg_data.get("body", ""))
             message["To"] = msg_data.get("to", "")
@@ -181,6 +318,27 @@ def gmail_send_messages(messages: list[dict], action: str = "draft") -> str:
             if "bcc" in msg_data:
                 message["Bcc"] = msg_data["bcc"]
 
+            attached_summary: list[dict[str, Any]] = []
+            for filename, data in attachments:
+                guessed_type, _ = mimetypes.guess_type(filename)
+                maintype, _, subtype = (
+                    guessed_type or "application/octet-stream"
+                ).partition("/")
+                # A text-maintype part with no charset parameter defaults to
+                # us-ascii per RFC 2045, mojibaking any non-ASCII UTF-8
+                # content (e.g. a .txt/.csv/.md attachment) — the message
+                # body gets utf-8 via set_content automatically, but
+                # add_attachment needs it spelled out explicitly.
+                params = {"charset": "utf-8"} if maintype == "text" else {}
+                message.add_attachment(
+                    data,
+                    maintype=maintype,
+                    subtype=subtype or "octet-stream",
+                    filename=filename,
+                    params=params,
+                )
+                attached_summary.append({"filename": filename, "size": len(data)})
+
             encoded_message = base64.urlsafe_b64encode(message.as_bytes()).decode()
             create_message = {"raw": encoded_message}
 
@@ -191,7 +349,13 @@ def gmail_send_messages(messages: list[dict], action: str = "draft") -> str:
                     .send(userId="me", body=create_message)
                     .execute()
                 )
-                results.append({"status": "sent", "id": sent_message["id"]})
+                results.append(
+                    {
+                        "status": "sent",
+                        "id": sent_message["id"],
+                        "attachments": attached_summary,
+                    }
+                )
             else:
                 draft = (
                     service.users()
@@ -199,7 +363,13 @@ def gmail_send_messages(messages: list[dict], action: str = "draft") -> str:
                     .create(userId="me", body={"message": create_message})
                     .execute()
                 )
-                results.append({"status": "drafted", "id": draft["id"]})
+                results.append(
+                    {
+                        "status": "drafted",
+                        "id": draft["id"],
+                        "attachments": attached_summary,
+                    }
+                )
 
         return json.dumps({"status": "success", "results": results})
     except Exception as e:

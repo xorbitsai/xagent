@@ -13,8 +13,10 @@ from xagent.web.models.task import Task, TaskStatus
 from ..models.workforce import Workforce, WorkforceAgent, WorkforceRun
 from .task_lease_service import (
     TaskLease,
+    lock_task_lease_no_commit,
     release_current_runner_task_lease,
     release_task_lease,
+    task_lease_attempt_predicate,
 )
 from .workforce_snapshot import (
     WORKFORCE_CONFIG_FINGERPRINT_VERSION,
@@ -654,8 +656,10 @@ def _sync_workforce_run_status_for_task_id(
     if task_lease is not None:
         if task_lease.task_id != int(task_id) or task_lease.run_id is None:
             return False
+        lock_task_lease_no_commit(db, task_lease)
         task_query = task_query.filter(
             Task.runner_id == task_lease.runner_id,
+            task_lease_attempt_predicate(task_lease),
             Task.run_id == task_lease.run_id,
         )
     task = task_query.with_for_update().first()

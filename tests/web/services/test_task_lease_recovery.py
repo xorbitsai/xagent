@@ -144,6 +144,7 @@ def _candidate_for_task(task: Task) -> TaskLeaseRecoveryCandidate:
         runner_id=task.runner_id,
         run_id=task.run_id,
         lease_expires_at=task.lease_expires_at,
+        attempt_id=task.lease_attempt_id,
         state_version=int(task.state_version or 0),
         last_checkpoint_event_id=task.last_checkpoint_event_id,
         last_checkpoint_trace_event_id=task.last_checkpoint_trace_event_id,

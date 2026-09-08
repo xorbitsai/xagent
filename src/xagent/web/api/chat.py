@@ -54,6 +54,7 @@ from ...core.tools.adapters.vibe.selection_spec import (
     with_mcp_tools,
 )
 from ...core.tools.core.knowledge_base_scope import KnowledgeBaseScopeError
+from ...core.utils.setup_metrics import agent_setup
 from ...sandbox import SandboxMountIntent
 from ..auth_dependencies import get_current_user
 from ..dynamic_memory_store import get_memory_store
@@ -136,6 +137,7 @@ from ..services.task_lease_service import (
     run_task_lease_heartbeat,
     run_while_task_lease_owned,
     stop_task_lease_heartbeat,
+    task_lease_attempt_predicate,
 )
 from ..services.task_runtime import (
     FILE_OPERATION_ACCESS_VERSION_KEY,
@@ -1052,6 +1054,7 @@ def _update_task_title_isolated(
                 .where(
                     Task.id == task_id,
                     Task.runner_id == task_lease.runner_id,
+                    task_lease_attempt_predicate(task_lease),
                     Task.run_id == task_lease.run_id,
                     Task.title != task_name,
                 )
@@ -2189,6 +2192,7 @@ class AgentServiceManager:
             else None,
         )
 
+    @agent_setup.measure()
     async def get_agent_for_task(
         self,
         task_id: int,
@@ -3651,6 +3655,11 @@ class AgentServiceManager:
                         task_id=int(tracker_task_id),
                         expected_run_id=(
                             tracking_lease.run_id
+                            if tracking_lease is not None
+                            else None
+                        ),
+                        expected_attempt_id=(
+                            tracking_lease.attempt_id
                             if tracking_lease is not None
                             else None
                         ),

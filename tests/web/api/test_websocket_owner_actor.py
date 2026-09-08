@@ -25,6 +25,9 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import QueuePool
 
 from tests.shared.execution_scope import register_scope_resolver
+from tests.web.services.task_lease_shared import (
+    live_task_lease as live_task_lease_fixture,
+)
 from xagent.core.agent.checkpoint import (
     CheckpointAccessRefusedError,
     CheckpointCorruptError,
@@ -76,6 +79,8 @@ from xagent.web.services.task_lease_service import (
     current_task_lease,
     get_runner_id,
 )
+
+live_task_lease = live_task_lease_fixture
 
 
 @pytest.fixture()
@@ -1260,12 +1265,15 @@ async def test_chat_without_client_id_uses_durable_command_id_as_turn_id(
 
 
 @pytest.mark.asyncio
-async def test_running_chat_message_is_persisted_before_resume(db_session) -> None:
+async def test_running_chat_message_is_persisted_before_resume(
+    live_task_lease, db_session
+) -> None:
     owner = _user(db_session, "owner")
     task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
     task.runner_id = "live-runner"
     task.run_id = "live-run"
     db_session.commit()
+    live_lease = live_task_lease(db_session, task)
     agent = MagicMock()
     agent.supports_live_control.return_value = True
     agent.get_dag_pattern.return_value = None
@@ -1320,13 +1328,7 @@ async def test_running_chat_message_is_persisted_before_resume(db_session) -> No
     assert stored.content == "Use the audio tool"
     assert stored.turn_id == "live-turn-1"
     assert agent.post_user_message.await_args.kwargs["turn_id"] == "live-turn-1"
-    assert observed_leases == [
-        TaskLease(
-            task_id=int(task.id),
-            runner_id="live-runner",
-            run_id="live-run",
-        )
-    ]
+    assert observed_leases == [live_lease]
     bg_mgr.register_reserved_resume.assert_called_once()
     accepted = [
         call.args[0]
@@ -1601,6 +1603,7 @@ async def test_deferred_chat_message_is_acked_after_durable_command_commit(
 
 @pytest.mark.asyncio
 async def test_live_lease_injection_degrades_to_deferred_on_checkpoint_unavailable(
+    live_task_lease,
     db_session,
 ) -> None:
     """A checkpoint read failure during live injection must fold into the
@@ -1611,6 +1614,7 @@ async def test_live_lease_injection_degrades_to_deferred_on_checkpoint_unavailab
     task.runner_id = "unavailable-runner"
     task.run_id = "unavailable-run"
     db_session.commit()
+    live_task_lease(db_session, task)
     agent = MagicMock()
     agent.supports_live_control.return_value = True
     agent.get_dag_pattern.return_value = None
@@ -1723,6 +1727,7 @@ async def test_live_lease_injection_degrades_to_deferred_on_checkpoint_unavailab
     ids=["live-ack", "suppressed-ack"],
 )
 async def test_durable_failure_keeps_detail_sender_only(
+    live_task_lease,
     db_session,
     error: Exception,
     sender_error_code: str,
@@ -1735,6 +1740,7 @@ async def test_durable_failure_keeps_detail_sender_only(
     task.runner_id = "rejected-runner"
     task.run_id = "rejected-run"
     db_session.commit()
+    live_task_lease(db_session, task)
     agent = MagicMock()
     agent.supports_live_control.return_value = True
     agent.get_dag_pattern.return_value = None
@@ -1908,6 +1914,7 @@ async def test_attachment_bind_race_keeps_specific_failure_on_origin_lane(
 
 @pytest.mark.asyncio
 async def test_resume_registration_failure_keeps_injected_delivery_pending(
+    live_task_lease,
     db_session,
 ) -> None:
     owner = _user(db_session, "owner")
@@ -1915,6 +1922,7 @@ async def test_resume_registration_failure_keeps_injected_delivery_pending(
     task.runner_id = "registration-runner"
     task.run_id = "registration-run"
     db_session.commit()
+    live_task_lease(db_session, task)
     agent = MagicMock()
     agent.supports_live_control.return_value = True
     agent.get_dag_pattern.return_value = None
@@ -1977,6 +1985,7 @@ async def test_resume_registration_failure_keeps_injected_delivery_pending(
 
 @pytest.mark.asyncio
 async def test_live_marker_failure_after_registered_handoff_is_still_accepted(
+    live_task_lease,
     db_session,
 ) -> None:
     owner = _user(db_session, "marker-failure-owner")
@@ -1984,6 +1993,7 @@ async def test_live_marker_failure_after_registered_handoff_is_still_accepted(
     task.runner_id = "marker-failure-runner"
     task.run_id = "marker-failure-run"
     db_session.commit()
+    live_task_lease(db_session, task)
     agent = MagicMock()
     agent.supports_live_control.return_value = True
     agent.get_dag_pattern.return_value = None
@@ -2033,6 +2043,7 @@ async def test_live_marker_failure_after_registered_handoff_is_still_accepted(
 
 @pytest.mark.asyncio
 async def test_live_resume_reads_the_interaction_row_before_injecting(
+    live_task_lease,
     db_session,
 ) -> None:
     """The close is keyed on the row observed *before* the injection, and
@@ -2046,6 +2057,7 @@ async def test_live_resume_reads_the_interaction_row_before_injecting(
     task.runner_id = "close-order-runner"
     task.run_id = "close-order-run"
     db_session.commit()
+    live_task_lease(db_session, task)
     agent = MagicMock()
     agent.supports_live_control.return_value = True
     agent.get_dag_pattern.return_value = None
@@ -2107,6 +2119,7 @@ async def test_live_resume_reads_the_interaction_row_before_injecting(
 
 @pytest.mark.asyncio
 async def test_live_injection_skips_the_close_on_a_replayed_turn_id(
+    live_task_lease,
     db_session,
 ) -> None:
     """A replayed turn id short-circuits inside AgentRunner.inject_user_message
@@ -2125,6 +2138,7 @@ async def test_live_injection_skips_the_close_on_a_replayed_turn_id(
     task.run_id = "close-replay-run"
     task.interaction_protocol_version = 1
     db_session.commit()
+    live_task_lease(db_session, task)
     task_id = int(task.id)
     _seed_active_interaction_row(
         db_session,
@@ -2176,6 +2190,7 @@ async def test_live_injection_skips_the_close_on_a_replayed_turn_id(
 
 @pytest.mark.asyncio
 async def test_live_close_failure_after_registered_handoff_is_still_accepted(
+    live_task_lease,
     db_session,
 ) -> None:
     """A legacy resume interaction close failure must not turn an already
@@ -2185,6 +2200,7 @@ async def test_live_close_failure_after_registered_handoff_is_still_accepted(
     task.runner_id = "close-failure-runner"
     task.run_id = "close-failure-run"
     db_session.commit()
+    live_task_lease(db_session, task)
     agent = MagicMock()
     agent.supports_live_control.return_value = True
     agent.get_dag_pattern.return_value = None
@@ -2237,6 +2253,7 @@ async def test_live_close_failure_after_registered_handoff_is_still_accepted(
 
 @pytest.mark.asyncio
 async def test_live_close_cancellation_does_not_abort_registered_handoff(
+    live_task_lease,
     db_session,
 ) -> None:
     """Same guarantee as the failure case above, for the CancelledError
@@ -2246,6 +2263,7 @@ async def test_live_close_cancellation_does_not_abort_registered_handoff(
     task.runner_id = "close-cancel-runner"
     task.run_id = "close-cancel-run"
     db_session.commit()
+    live_task_lease(db_session, task)
     agent = MagicMock()
     agent.supports_live_control.return_value = True
     agent.get_dag_pattern.return_value = None
@@ -2334,12 +2352,16 @@ def test_lease_restore_clears_the_marker_once_no_active_row_remains(
     owner = _user(db_session, "restore-clears-marker-owner")
     task = _task(db_session, owner.id, status=TaskStatus.WAITING_FOR_USER)
     task.runner_id = "current-runner"
+    task.lease_attempt_id = "restore-attempt"
     task.run_id = "run-clears-marker"
     task.interaction_protocol_version = 1
     db_session.commit()
 
     lease = TaskLease(
-        task_id=int(task.id), runner_id="current-runner", run_id="run-clears-marker"
+        task_id=int(task.id),
+        runner_id="current-runner",
+        run_id="run-clears-marker",
+        attempt_id="restore-attempt",
     )
     restored = _restore_resumed_task_lease_to_prior_status(
         lease, status=TaskStatus.WAITING_FOR_USER
@@ -2534,6 +2556,7 @@ async def test_message_handoff_registers_the_minted_run_not_the_stale_one(
 
 @pytest.mark.asyncio
 async def test_live_marker_cancellation_does_not_cancel_registered_handoff(
+    live_task_lease,
     db_session,
 ) -> None:
     owner = _user(db_session, "marker-cancellation-owner")
@@ -2541,6 +2564,7 @@ async def test_live_marker_cancellation_does_not_cancel_registered_handoff(
     task.runner_id = "marker-cancellation-runner"
     task.run_id = "marker-cancellation-run"
     db_session.commit()
+    live_task_lease(db_session, task)
     agent = MagicMock()
     agent.supports_live_control.return_value = True
     agent.get_dag_pattern.return_value = None
@@ -2840,6 +2864,7 @@ def test_missing_task_prepare_keeps_an_absent_commit_outcome_unknown(
 
 @pytest.mark.asyncio
 async def test_live_control_delivery_failure_pool_timeout_is_not_retried(
+    live_task_lease,
     db_session,
 ) -> None:
     """One failed DELIVERY_FAILED checkout still produces one rejection ack."""
@@ -2848,6 +2873,7 @@ async def test_live_control_delivery_failure_pool_timeout_is_not_retried(
     task.runner_id = "pool-timeout-runner"
     task.run_id = "pool-timeout-run"
     db_session.commit()
+    live_task_lease(db_session, task)
     agent = MagicMock()
     agent.supports_live_control.return_value = True
     agent.get_dag_pattern.return_value = None
@@ -2907,6 +2933,7 @@ async def test_live_control_delivery_failure_pool_timeout_is_not_retried(
 
 @pytest.mark.asyncio
 async def test_delivery_failure_persistence_drains_before_cancellation(
+    live_task_lease,
     db_session,
 ) -> None:
     owner = _user(db_session, "delivery-cancellation-owner")
@@ -2914,6 +2941,7 @@ async def test_delivery_failure_persistence_drains_before_cancellation(
     task.runner_id = "delivery-cancellation-runner"
     task.run_id = "delivery-cancellation-run"
     db_session.commit()
+    live_task_lease(db_session, task)
     agent = MagicMock()
     agent.supports_live_control.return_value = True
     agent.get_dag_pattern.return_value = None

@@ -46,6 +46,8 @@ from ...web.services.task_interaction_schema import interaction_requests_table_e
 from ...web.services.task_lease_service import (
     TASK_RUN_ID_TRACE_FIELD,
     current_task_lease,
+    lock_task_lease_no_commit,
+    task_lease_attempt_predicate,
 )
 from ...web.services.trace_event_staging import (
     checkpoint_run_partition_filter,
@@ -982,6 +984,29 @@ class DatabaseTraceHandler(BaseTraceHandler):
 
             # Serialize data to ensure JSON compatibility
             data = self._serialize_data_for_json(event.data or {})
+            lease = current_task_lease() if self.build_id is None else None
+            is_legacy_checkpoint = (
+                event_type_str == "system_update_general"
+                and isinstance(data, dict)
+                and data.get("checkpoint_type") == CHECKPOINT_TYPE
+            )
+            # Checkpoints use the conditional pointer UPDATE below: it rolls
+            # back the staged row on a fence miss and retains the established
+            # missing-task classification. Other legacy traces need a lock
+            # before their projection is staged.
+            if not is_legacy_checkpoint and lease is not None:
+                if lease.task_id != self.task_id or not lock_task_lease_no_commit(
+                    db, lease
+                ):
+                    if (
+                        db.query(Task.id).filter(Task.id == self.task_id).first()
+                        is None
+                    ):
+                        db.rollback()
+                        if not event.require_persisted:
+                            return
+                        raise RuntimeError(f"Task {self.task_id} no longer exists")
+                    raise RuntimeError("Trace event producer lost its task lease")
             if event_type_str in {
                 "tool_execution_start",
                 "tool_execution_end",
@@ -1035,6 +1060,7 @@ class DatabaseTraceHandler(BaseTraceHandler):
                         Task.id == self.task_id,
                         Task.status == TaskStatus.RUNNING,
                         Task.runner_id == checkpoint_lease.runner_id,
+                        task_lease_attempt_predicate(checkpoint_lease),
                         Task.run_id == checkpoint_lease.run_id,
                     )
                     .values(

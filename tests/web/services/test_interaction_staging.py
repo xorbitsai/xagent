@@ -95,6 +95,10 @@ def _seed(session_factory) -> tuple[int, int]:
     db = session_factory()
     user_id = make_user(db)
     task_id = make_task(db, user_id=user_id)
+    db.execute(
+        sa.update(Task).where(Task.id == task_id).values(lease_attempt_id="attempt-a")
+    )
+    db.commit()
     anchor_id = make_trace_event(db, task_id=task_id)
     db.close()
     return task_id, anchor_id
@@ -1548,7 +1552,7 @@ def test_p_reclaim_survives_a_conflict_on_its_own_calls_insert(
 
 
 def _lease(
-    task_id: int, *, run_id: str = "run-a", attempt_id: str | None = None
+    task_id: int, *, run_id: str = "run-a", attempt_id: str | None = "attempt-a"
 ) -> TaskLease:
     return TaskLease(
         task_id=task_id, runner_id="runner-1", run_id=run_id, attempt_id=attempt_id
@@ -2049,7 +2053,7 @@ def test_cm2d_bare_runtime_error_from_with_body_propagates_and_unwinds(
     db.close()
 
 
-def test_cm3_attempt_assertion_gates_on_not_none(tmp_path: Path) -> None:
+def test_cm3_missing_attempt_cannot_stage(tmp_path: Path) -> None:
     engine = _engine(tmp_path)
     session_factory = _session_factory(engine)
     task_id, anchor_id = _seed(session_factory)
@@ -2057,15 +2061,9 @@ def test_cm3_attempt_assertion_gates_on_not_none(tmp_path: Path) -> None:
     anchor = _anchor(anchor_id)
     task = db.get(Task, task_id)
 
-    # attempt_id is None -> assertion is skipped even though task's own
-    # lease_attempt_id disagrees.
-    db.execute(
-        sa.update(Task).where(Task.id == task_id).values(lease_attempt_id="whatever")
-    )
-    db.commit()
     lease = _lease(task_id, attempt_id=None)
     with interaction_handoff(db, lease, task=task, anchor=anchor, now=_now()) as h:
-        result = h.stage(
+        h.stage(
             kind="clarification",
             protocol_version=1,
             request_payload={"prompt": "p"},
@@ -2073,8 +2071,8 @@ def test_cm3_attempt_assertion_gates_on_not_none(tmp_path: Path) -> None:
             expires_at=_now() + timedelta(minutes=15),
         )
     db.commit()
-    assert result.created is True
-    assert ops_signals.active_degradations() == {}
+    assert db.query(TaskInteractionRequest).count() == 0
+    assert ops_signals.INTERACTION_HANDOFF_DEGRADED in ops_signals.active_degradations()
     db.close()
 
 
@@ -2432,7 +2430,7 @@ def test_cm8d_stage_call_that_raises_before_staging_names_no_row(
     db = session_factory()
     anchor = _anchor(anchor_id)
     lease = TaskLease(
-        task_id=task_id, runner_id="runner-1", run_id=None, attempt_id=None
+        task_id=task_id, runner_id="runner-1", run_id=None, attempt_id="attempt-a"
     )
     task = db.get(Task, task_id)
 
@@ -3020,7 +3018,7 @@ def test_cm12_lease_without_run_id_is_rejected_in_stage(tmp_path: Path) -> None:
     db = session_factory()
     anchor = _anchor(anchor_id)
     lease = TaskLease(
-        task_id=task_id, runner_id="runner-1", run_id=None, attempt_id=None
+        task_id=task_id, runner_id="runner-1", run_id=None, attempt_id="attempt-a"
     )
     task = db.get(Task, task_id)
 

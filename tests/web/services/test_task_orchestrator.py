@@ -433,6 +433,7 @@ async def test_begin_turn_claim_replaces_stale_lease_and_checkpoint_pointer(
         output="answer",
     )
     task.runner_id = "dead-runner-from-crash"
+    task.lease_attempt_id = "test-attempt"
     task.lease_expires_at = utc_now() + timedelta(hours=1)
     task.last_checkpoint_event_id = "previous-run-checkpoint"
     stale_checkpoint = TraceEvent(
@@ -1036,6 +1037,7 @@ def test_schedule_failure_compensation_does_not_fail_foreign_live_lease(
     task.agent_config = {"workforce_run_id": int(run.id)}
     task.run_id = "claimed-run"
     task.runner_id = "replacement-runner"
+    task.lease_attempt_id = "test-attempt"
     task.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
     task.error_message = "replacement still running"
     db_session.commit()
@@ -1046,6 +1048,7 @@ def test_schedule_failure_compensation_does_not_fail_foreign_live_lease(
                 task_id=int(task.id),
                 runner_id="stale-runner",
                 run_id="claimed-run",
+                attempt_id="test-attempt",
             ),
             error_message="stale schedule failure",
         )
@@ -1073,6 +1076,7 @@ def test_error_settlement_releases_terminal_lease_without_reporting_failure(
     task = _create_task(db_session, user.id, status=TaskStatus.COMPLETED)
     task.run_id = "completed-run"
     task.runner_id = "completed-runner"
+    task.lease_attempt_id = "test-attempt"
     task.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
     db_session.add(
         TaskChatMessage(
@@ -1090,6 +1094,7 @@ def test_error_settlement_releases_terminal_lease_without_reporting_failure(
             task_id=int(task.id),
             runner_id="completed-runner",
             run_id="completed-run",
+            attempt_id="test-attempt",
         ),
         error_message="completion broadcast failed",
     )
@@ -1298,6 +1303,7 @@ async def test_begin_turn_schedules_even_when_caller_cancelled(db_session) -> No
                 task_id=task_id,
                 runner_id=get_runner_id(),
                 run_id="slow-claim-run",
+                attempt_id="test-attempt",
             ),
             status=TaskStatus.RUNNING,
             updated_at=datetime.now(timezone.utc),
@@ -1361,6 +1367,7 @@ async def test_repeated_cancellation_keeps_turn_command_gate_until_claim_settles
                 task_id=task_id,
                 runner_id=get_runner_id(),
                 run_id="blocked-claim-run",
+                attempt_id="test-attempt",
             ),
             status=TaskStatus.RUNNING,
             updated_at=datetime.now(timezone.utc),
@@ -1448,6 +1455,7 @@ async def test_schedule_claimed_create_turn_offloads_cache_invalidation(
             task_id=task_id,
             runner_id=get_runner_id(),
             run_id="committed-run",
+            attempt_id="test-attempt",
         ),
         status=TaskStatus.RUNNING,
         updated_at=None,
@@ -1616,6 +1624,7 @@ def test_finish_turn_running_skips_when_other_worker_holds_live_lease(
     task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
     # Plant a live lease held by a different runner
     task.runner_id = "other-worker"
+    task.lease_attempt_id = "test-attempt"
     task.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
     task.output = "other worker's in-progress output"
     db_session.commit()
@@ -1655,6 +1664,7 @@ def test_finish_turn_running_flips_failed_when_lease_expired(db_session) -> None
     user = _create_user(db_session)
     task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
     task.runner_id = "other-worker"
+    task.lease_attempt_id = "test-attempt"
     task.lease_expires_at = datetime.now(timezone.utc) - timedelta(minutes=5)
     db_session.commit()
 
@@ -1669,6 +1679,7 @@ def test_finish_turn_running_flips_failed_when_we_own_lease(db_session) -> None:
     user = _create_user(db_session)
     task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
     task.runner_id = get_runner_id()  # our own process
+    task.lease_attempt_id = "test-attempt"
     task.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
     db_session.commit()
 
@@ -1690,6 +1701,7 @@ def test_finish_turn_does_not_touch_a_new_run_owned_by_same_process(
     user = _create_user(db_session)
     task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
     task.runner_id = get_runner_id()
+    task.lease_attempt_id = "test-attempt"
     task.run_id = "new-run"
     task.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
     db_session.commit()
@@ -1698,6 +1710,7 @@ def test_finish_turn_does_not_touch_a_new_run_owned_by_same_process(
         task_id=int(task.id),
         runner_id=get_runner_id(),
         run_id="old-run",
+        attempt_id="test-attempt",
     )
     finish_turn(db_session, int(task.id), task_lease=stale_lease)
 
@@ -1716,6 +1729,7 @@ def test_finish_turn_cache_invalidation_failure_is_non_fatal_after_release(
     user = _create_user(db_session)
     task = _create_task(db_session, user.id, status=TaskStatus.FAILED)
     task.runner_id = "settlement-runner"
+    task.lease_attempt_id = "test-attempt"
     task.run_id = "settlement-run"
     task.error_message = "execution failed"
     db_session.commit()
@@ -1723,6 +1737,7 @@ def test_finish_turn_cache_invalidation_failure_is_non_fatal_after_release(
         task_id=int(task.id),
         runner_id="settlement-runner",
         run_id="settlement-run",
+        attempt_id="test-attempt",
     )
 
     with patch(
@@ -1790,9 +1805,10 @@ async def test_schedule_bg_cancels_execution_after_heartbeat_loses_lease(
     user = _create_user(db_session)
     task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
     task.runner_id = "test-runner"
+    task.lease_attempt_id = "test-attempt"
     task.run_id = "run-a"
     db_session.commit()
-    lease = TaskLease(int(task.id), "test-runner", "run-a")
+    lease = TaskLease(int(task.id), "test-runner", "run-a", attempt_id="test-attempt")
     execution_started = asyncio.Event()
     execution_cancelled = asyncio.Event()
 
@@ -1975,7 +1991,9 @@ async def test_schedule_bg_resolves_scope_off_loop_before_execution(
     user = _create_user(db_session)
     task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
     task_id = int(task.id)
-    fake_lease = TaskLease(task_id=task_id, runner_id="test-runner")
+    fake_lease = TaskLease(
+        task_id=task_id, runner_id="test-runner", attempt_id="test-attempt"
+    )
     # The scope lookup must wait for the slot, never give up on it.
     engine, SessionLocal = queue_pool_runtime_db_factory(
         pool_timeout=CONTENTION_POOL_TIMEOUT
@@ -2082,7 +2100,9 @@ async def test_schedule_bg_persists_setup_failures_off_loop(
     user = _create_user(db_session)
     task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
     task_id = int(task.id)
-    fake_lease = TaskLease(task_id=task_id, runner_id="test-runner")
+    fake_lease = TaskLease(
+        task_id=task_id, runner_id="test-runner", attempt_id="test-attempt"
+    )
     loop_thread = get_ident()
     marker_threads: list[int] = []
     snapshot = None if failure_point == "missing_snapshot" else MagicMock()
@@ -2158,10 +2178,16 @@ async def test_schedule_bg_pool_timeout_defers_settlement_to_lease_recovery(
         user_id = int(user.id)
         task_source = task.source
         task.runner_id = "test-runner"
+        task.lease_attempt_id = "test-attempt"
         task.run_id = "run-a"
         seed_db.commit()
 
-    lease = TaskLease(task_id=task_id, runner_id="test-runner", run_id="run-a")
+    lease = TaskLease(
+        task_id=task_id,
+        runner_id="test-runner",
+        run_id="run-a",
+        attempt_id="test-attempt",
+    )
 
     def load_snapshot_from_contended_pool(*_args, **_kwargs):
         with SessionLocal() as snapshot_db:
@@ -2242,7 +2268,12 @@ async def test_schedule_bg_heartbeat_pool_timeout_skips_settlement(
     user = _create_user(db_session)
     task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
     task_id = int(task.id)
-    lease = TaskLease(task_id=task_id, runner_id="test-runner", run_id="run-a")
+    lease = TaskLease(
+        task_id=task_id,
+        runner_id="test-runner",
+        run_id="run-a",
+        attempt_id="test-attempt",
+    )
     heartbeat_timeout = SQLAlchemyTimeoutError("heartbeat pool timeout")
 
     with (
@@ -2321,6 +2352,7 @@ async def test_schedule_bg_settles_owned_terminal_task_observed_by_heartbeat(
     task_id = int(task.id)
     task.source = "trigger"
     task.runner_id = "terminal-runner"
+    task.lease_attempt_id = "test-attempt"
     task.run_id = "terminal-run"
     task.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
     run = TriggerRun(
@@ -2336,6 +2368,7 @@ async def test_schedule_bg_settles_owned_terminal_task_observed_by_heartbeat(
         task_id=task_id,
         runner_id="terminal-runner",
         run_id="terminal-run",
+        attempt_id="test-attempt",
     )
     terminal_committed = asyncio.Event()
     allow_execution_return = asyncio.Event()
@@ -2426,6 +2459,7 @@ async def test_schedule_bg_releases_lease_without_blocking_pool_checkout(
         user_id = int(user.id)
         task_source = task.source
         task.runner_id = runner_id
+        task.lease_attempt_id = "test-attempt"
         task.run_id = "run-a"
         seed_db.commit()
 
@@ -2448,6 +2482,7 @@ async def test_schedule_bg_releases_lease_without_blocking_pool_checkout(
                 task_id=task_id,
                 runner_id=runner_id,
                 run_id="run-a",
+                attempt_id="test-attempt",
             ),
         ),
         patch(
@@ -2516,7 +2551,9 @@ async def test_schedule_bg_releases_lease_on_execute_task_background_exception(
 
     user = _create_user(db_session)
     task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
-    fake_lease = TaskLease(task_id=int(task.id), runner_id="test-runner")
+    fake_lease = TaskLease(
+        task_id=int(task.id), runner_id="test-runner", attempt_id="test-attempt"
+    )
     payload = TaskTurnPayload("x")
     _store_runtime_secret_for_turn(payload.turn_id)
     assert get_ephemeral_runtime_values(payload.turn_id) is not None
@@ -2580,7 +2617,9 @@ async def test_schedule_bg_broadcasts_failure_only_after_exact_settlement(
     user = _create_user(db_session)
     task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
     task_id = int(task.id)
-    lease = TaskLease(task_id=task_id, runner_id="runner-a", run_id="run-a")
+    lease = TaskLease(
+        task_id=task_id, runner_id="runner-a", run_id="run-a", attempt_id="test-attempt"
+    )
     events: list[str] = []
 
     def settle(*_args, **_kwargs) -> bool:
@@ -2702,7 +2741,12 @@ async def test_marked_legacy_execution_rejects_before_scheduling(db_session) -> 
 @pytest.mark.asyncio
 async def test_trusted_marked_create_schedule_forwards_actor_policy() -> None:
     policy = MCPBuiltinOAuthActorPolicy(resource_owner_key="actor:alice")
-    lease = TaskLease(task_id=42, runner_id="trusted-direct", run_id="run-42")
+    lease = TaskLease(
+        task_id=42,
+        runner_id="trusted-direct",
+        run_id="run-42",
+        attempt_id="test-attempt",
+    )
     claimed = _ClaimedTurn(
         task_lease=lease,
         status=TaskStatus.RUNNING,
@@ -2760,7 +2804,9 @@ async def test_schedule_bg_forwards_execution_message_to_execute_task_background
 
     user = _create_user(db_session)
     task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
-    fake_lease = TaskLease(task_id=int(task.id), runner_id="test-runner")
+    fake_lease = TaskLease(
+        task_id=int(task.id), runner_id="test-runner", attempt_id="test-attempt"
+    )
     payload = TaskTurnPayload(
         transcript_message="summarize this",
         execution_message="summarize this\n\n[uploaded file: secret.txt]",
@@ -2835,6 +2881,7 @@ async def test_schedule_bg_acquires_expired_lease_on_first_try(db_session) -> No
     user = _create_user(db_session)
     task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
     task.runner_id = "dead-runner"
+    task.lease_attempt_id = "test-attempt"
     task.lease_expires_at = utc_now() - timedelta(seconds=5)
     db_session.commit()
 
@@ -2907,10 +2954,14 @@ async def test_schedule_bg_marks_task_failed_when_snapshot_load_raises(
     user = _create_user(db_session)
     task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
     task.runner_id = "test-runner"
+    task.lease_attempt_id = "test-attempt"
     task.run_id = "run-a"
     db_session.commit()
     fake_lease = TaskLease(
-        task_id=int(task.id), runner_id="test-runner", run_id="run-a"
+        task_id=int(task.id),
+        runner_id="test-runner",
+        run_id="run-a",
+        attempt_id="test-attempt",
     )
     payload = TaskTurnPayload("x")
     _store_runtime_secret_for_turn(payload.turn_id)
@@ -2985,7 +3036,9 @@ async def test_schedule_bg_cleanup_handles_missing_payload_turn_id(db_session) -
 
     user = _create_user(db_session)
     task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
-    fake_lease = TaskLease(task_id=int(task.id), runner_id="test-runner")
+    fake_lease = TaskLease(
+        task_id=int(task.id), runner_id="test-runner", attempt_id="test-attempt"
+    )
 
     with (
         patch(
@@ -3027,19 +3080,31 @@ async def test_schedule_bg_cleanup_handles_missing_payload_turn_id(db_session) -
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["web", "trigger"])
 async def test_schedule_bg_preserves_public_safe_required_mcp_failure(
     db_session,
+    monkeypatch,
+    source,
 ) -> None:
     """A typed, curated setup failure remains actionable to the client."""
+    from xagent.core.utils import setup_metrics
     from xagent.web.api.websocket import background_task_manager
     from xagent.web.api.websocket import manager as ws_manager
 
+    counters = setup_metrics.SetupMetrics()
+    monkeypatch.setattr(setup_metrics, "trigger_execution", counters)
     user = _create_user(db_session)
     task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
     task.runner_id = "test-runner"
+    task.lease_attempt_id = "test-attempt"
     task.run_id = "run-a"
     db_session.commit()
-    lease = TaskLease(task_id=int(task.id), runner_id="test-runner", run_id="run-a")
+    lease = TaskLease(
+        task_id=int(task.id),
+        runner_id="test-runner",
+        run_id="run-a",
+        attempt_id="test-attempt",
+    )
     public_message = "Required MCP servers are unavailable."
 
     with (
@@ -3062,14 +3127,21 @@ async def test_schedule_bg_preserves_public_safe_required_mcp_failure(
             return_value=MagicMock(),
         ),
     ):
-        await _schedule_bg(
+        background = _schedule_bg(
             task_id=int(task.id),
             task_owner_user_id=int(user.id),
-            task_source=task.source,
+            task_source=source,
             payload=TaskTurnPayload("hello"),
             force_fresh=False,
             context=None,
         )
+
+        assert counters.active == (source == "trigger")
+        await background
+        assert counters.active == 0
+        assert counters.completed == (source == "trigger")
+        assert counters.failed == (source == "trigger")
+        assert counters.cancelled == 0
 
     db_session.expire_all()
     persisted = db_session.get(Task, int(task.id))
@@ -3103,10 +3175,14 @@ async def test_schedule_bg_marks_task_failed_when_execute_raises(
     user = _create_user(db_session)
     task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
     task.runner_id = "test-runner"
+    task.lease_attempt_id = "test-attempt"
     task.run_id = "run-a"
     db_session.commit()
     fake_lease = TaskLease(
-        task_id=int(task.id), runner_id="test-runner", run_id="run-a"
+        task_id=int(task.id),
+        runner_id="test-runner",
+        run_id="run-a",
+        attempt_id="test-attempt",
     )
 
     # Snapshot loader returns a minimal sentinel snapshot so the test
@@ -3177,10 +3253,14 @@ async def test_schedule_bg_does_not_overwrite_terminal_status_from_execute(
     user = _create_user(db_session)
     task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
     task.runner_id = "test-runner"
+    task.lease_attempt_id = "test-attempt"
     task.run_id = "run-a"
     db_session.commit()
     fake_lease = TaskLease(
-        task_id=int(task.id), runner_id="test-runner", run_id="run-a"
+        task_id=int(task.id),
+        runner_id="test-runner",
+        run_id="run-a",
+        attempt_id="test-attempt",
     )
     fake_snapshot = MagicMock()
 
@@ -3477,9 +3557,15 @@ def _finalize_turn_fixture(db_session, *, turn_id: str):
         db_session, task_id=int(task.id), user_id=int(user.id), turn_id=turn_id
     )
     task.runner_id = "test-runner"
+    task.lease_attempt_id = "test-attempt"
     task.run_id = "run-a"
     db_session.commit()
-    lease = TaskLease(task_id=int(task.id), runner_id="test-runner", run_id="run-a")
+    lease = TaskLease(
+        task_id=int(task.id),
+        runner_id="test-runner",
+        run_id="run-a",
+        attempt_id="test-attempt",
+    )
     return user, task, payload, lease
 
 
@@ -3888,7 +3974,9 @@ def _captured_terminal_broadcast(setup_or_run_error: BaseException, db_session):
     user = _create_user(db_session)
     task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
     task_id = int(task.id)
-    lease = TaskLease(task_id=task_id, runner_id="runner-a", run_id="run-a")
+    lease = TaskLease(
+        task_id=task_id, runner_id="runner-a", run_id="run-a", attempt_id="test-attempt"
+    )
     frames: list[dict] = []
     settlements: list[dict] = []
 
@@ -4199,6 +4287,32 @@ async def test_incidental_failure_persists_the_generic_history_type(
 
 
 @pytest.mark.asyncio
+async def test_trigger_metrics_cancelled_before_runner_starts(monkeypatch) -> None:
+    from xagent.core.utils import setup_metrics
+    from xagent.web.api.websocket import background_task_manager
+
+    counters = setup_metrics.SetupMetrics()
+    monkeypatch.setattr(setup_metrics, "trigger_execution", counters)
+    with patch.object(background_task_manager, "register_task"):
+        background = _schedule_bg(
+            task_id=1,
+            task_owner_user_id=1,
+            task_source="trigger",
+            payload=TaskTurnPayload("hello"),
+            force_fresh=False,
+            context=None,
+        )
+        assert counters.active == 1
+        background.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await background
+    assert counters.active == 0
+    assert counters.completed == 1
+    assert counters.cancelled == 1
+    assert counters.failed == 0
+
+
+@pytest.mark.asyncio
 async def test_leased_auto_failure_preserves_client_classification(db_session) -> None:
     error = AutoModelUnavailableError("private model binding details")
     with _captured_terminal_broadcast(error, db_session) as (
@@ -4214,7 +4328,10 @@ async def test_leased_auto_failure_preserves_client_classification(db_session) -
             await _run_failing_turn(task_id, int(task.user_id), task.source)
         execute.assert_awaited_once()
         assert execute.await_args.kwargs["task_lease"] == TaskLease(
-            task_id=task_id, runner_id="runner-a", run_id="run-a"
+            task_id=task_id,
+            runner_id="runner-a",
+            run_id="run-a",
+            attempt_id="test-attempt",
         )
 
     assert len(frames) == 1

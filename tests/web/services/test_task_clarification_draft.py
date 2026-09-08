@@ -331,10 +331,8 @@ def test_guards_run_most_specific_failure_first() -> None:
     assert resolution.fail_closed_reason == "ownership_changed"
 
 
-def test_none_attempt_id_skips_the_attempt_guard() -> None:
-    """``lease.attempt_id is None`` cannot prove attempt identity at all and
-    must be treated as "skip this check", never as "matches" -- the same
-    reading ``interaction_handoff`` uses for the identical sentinel."""
+def test_none_attempt_id_fails_closed() -> None:
+    """A missing acquisition cannot authorize publishing a question."""
 
     result = {"status": "waiting_for_user", "clarification_draft": _draft()}
     resolution = resolve_publishable_clarification(
@@ -344,7 +342,8 @@ def test_none_attempt_id_skips_the_attempt_guard() -> None:
         anchor=_anchor(),
         now=_now(),
     )
-    assert isinstance(resolution, Publishable)
+    assert isinstance(resolution, FailClosed)
+    assert resolution.fail_closed_reason == "attempt_mismatch"
 
 
 def test_missing_draft_guard_wins_over_unfenced_lease_guard() -> None:
@@ -1334,10 +1333,14 @@ def test_cross_run_anchor_mismatch_degrades_downstream_in_the_staging_primitive(
         task = db.get(Task, task_id)
         task.runner_id = "runner-a"
         task.run_id = "run-a"
+        task.lease_attempt_id = "attempt-a"
         db.flush([task])
 
         lease = TaskLease(
-            task_id=task_id, runner_id="runner-a", run_id="run-a", attempt_id=None
+            task_id=task_id,
+            runner_id="runner-a",
+            run_id="run-a",
+            attempt_id="attempt-a",
         )
         draft = _draft()
         result = {"status": "waiting_for_user", "clarification_draft": draft}

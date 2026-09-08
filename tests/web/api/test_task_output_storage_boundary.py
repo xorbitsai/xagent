@@ -47,6 +47,7 @@ def _seed_running_task(*, runner_id: str, run_id: str) -> tuple[int, int]:
             user_id=int(user.id),
             title="Durable output",
             status=TaskStatus.RUNNING,
+            lease_attempt_id="test-attempt",
             runner_id=runner_id,
             run_id=run_id,
         )
@@ -289,6 +290,7 @@ async def test_output_staging_holds_no_pool_slot_or_task_lock(
             result={"success": True, "output": "done", "file_outputs": []},
             expected_run_id="run-a",
             task_lease=TaskLease(
+                attempt_id="test-attempt",
                 task_id=task_id,
                 runner_id="runner-a",
                 run_id="run-a",
@@ -378,6 +380,7 @@ async def test_takeover_during_output_upload_cannot_commit_old_run_metadata(
             result={"success": True, "output": "stale", "file_outputs": []},
             expected_run_id="run-old",
             task_lease=TaskLease(
+                attempt_id="test-attempt",
                 task_id=task_id,
                 runner_id="runner-old",
                 run_id="run-old",
@@ -480,6 +483,7 @@ def test_metadata_version_change_rolls_back_entire_task_finalization(
                 },
                 expected_run_id="cas-run",
                 task_lease=TaskLease(
+                    attempt_id="test-attempt",
                     task_id=task_id,
                     runner_id="cas-runner",
                     run_id="cas-run",
@@ -544,6 +548,7 @@ def test_resumed_finalizer_uses_same_prepared_output_transaction(
             task_owner_user_id=user_id,
             result={"success": True, "output": "resume done", "file_outputs": []},
             task_lease=TaskLease(
+                attempt_id="test-attempt",
                 task_id=task_id,
                 runner_id="resume-runner",
                 run_id="resume-run",
@@ -635,6 +640,7 @@ def test_lost_resume_owner_compensates_new_version_without_deleting_committed_ob
             task_owner_user_id=user_id,
             result={"success": True, "output": "stale", "file_outputs": []},
             task_lease=TaskLease(
+                attempt_id="test-attempt",
                 task_id=task_id,
                 runner_id="version-runner-old",
                 run_id="version-run-old",
@@ -748,6 +754,7 @@ def test_superseded_output_is_deleted_only_after_exact_metadata_commit(
             result={"success": True, "output": "done", "file_outputs": []},
             expected_run_id="commit-run",
             task_lease=TaskLease(
+                attempt_id="test-attempt",
                 task_id=task_id,
                 runner_id="commit-runner",
                 run_id="commit-run",
@@ -848,6 +855,7 @@ def _assert_cleanup_failure_does_not_reclassify_committed_finalization(
             fail_cleanup_after_commit,
         )
         lease = TaskLease(
+            attempt_id="test-attempt",
             task_id=task_id,
             runner_id=runner_id,
             run_id=run_id,
@@ -1145,7 +1153,12 @@ async def test_cancelled_output_staging_compensates_late_result_before_return(
 
 @pytest.mark.asyncio
 async def test_resume_output_staging_finishes_while_heartbeat_is_still_active() -> None:
-    lease = TaskLease(task_id=42, runner_id="resume-runner", run_id="resume-run")
+    lease = TaskLease(
+        attempt_id="test-attempt",
+        task_id=42,
+        runner_id="resume-runner",
+        run_id="resume-run",
+    )
     heartbeat_stop = asyncio.Event()
     stage_started = threading.Event()
     allow_stage = threading.Event()

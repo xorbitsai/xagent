@@ -21,6 +21,9 @@ from tests.web.api.client_safe_ast_guard import (
     _scan,
 )
 from tests.web.api.client_safe_ast_guard import guard_offenders as _guard_offenders
+from tests.web.services.task_lease_shared import (
+    live_task_lease as live_task_lease_fixture,
+)
 from xagent.web.api import websocket as websocket_api
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
@@ -31,6 +34,8 @@ from xagent.web.services.mcp_runtime import (
 from xagent.web.services.task_orchestrator import TaskTurnOrchestrator
 
 from .conftest import _direct_db_session
+
+live_task_lease = live_task_lease_fixture
 
 SECRET = "/srv/xagent/secrets/prod.key"
 
@@ -2209,6 +2214,7 @@ async def test_unexpected_intervention_error_keeps_its_traceback(
 
 @pytest.mark.asyncio
 async def test_chat_validation_redacts_both_the_ack_and_the_broadcast(
+    live_task_lease,
     _test_db: None,
 ) -> None:
     """The inner chat validation branch answers on two sinks; assert both.
@@ -2236,6 +2242,7 @@ async def test_chat_validation_redacts_both_the_ack_and_the_broadcast(
         task.runner_id = "rt5-runner"
         task.run_id = "rt5-run"
         db.commit()
+        live_task_lease(db, task)
         task_id, owner_id = int(task.id), int(owner.id)
     finally:
         db.close()
@@ -2329,6 +2336,7 @@ def _chat_runtime_error_harness(secret_error: Exception):
 
 @pytest.mark.asyncio
 async def test_runtime_error_is_redacted_and_coded_for_every_audience(
+    live_task_lease,
     _test_db: None,
 ) -> None:
     """Neither the initiator nor task subscribers may receive exception text."""
@@ -2350,6 +2358,7 @@ async def test_runtime_error_is_redacted_and_coded_for_every_audience(
         task.runner_id = "rt6-runner"
         task.run_id = "rt6-run"
         db.commit()
+        live_task_lease(db, task)
         task_id, owner_id = int(task.id), int(owner.id)
     finally:
         db.close()
@@ -2694,6 +2703,7 @@ async def test_origin_entry_dies_with_its_command_or_socket(
 
 @pytest.mark.asyncio
 async def test_durable_chat_runtime_error_is_safe_for_verified_origin(
+    live_task_lease,
     _test_db: None,
 ) -> None:
     """Durable chat sends one safe, coded bubble to its verified origin."""
@@ -2715,6 +2725,7 @@ async def test_durable_chat_runtime_error_is_safe_for_verified_origin(
         task.runner_id = "rt7-runner"
         task.run_id = "rt7-run"
         db.commit()
+        live_task_lease(db, task)
         task_id, owner_id = int(task.id), int(owner.id)
     finally:
         db.close()
@@ -3041,6 +3052,7 @@ def test_same_command_id_on_two_tasks_is_isolated(_clean_origins: None) -> None:
 
 @pytest.mark.asyncio
 async def test_live_chat_runtime_error_sends_one_safe_rejection(
+    live_task_lease,
     _test_db: None,
 ) -> None:
     """The live path returns one coded rejection and never exposes detail."""
@@ -3062,6 +3074,7 @@ async def test_live_chat_runtime_error_sends_one_safe_rejection(
         task.runner_id = "rt8-runner"
         task.run_id = "rt8-run"
         db.commit()
+        live_task_lease(db, task)
         task_id, owner_id = int(task.id), int(owner.id)
     finally:
         db.close()

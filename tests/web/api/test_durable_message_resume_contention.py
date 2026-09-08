@@ -10,6 +10,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from tests.web.services.task_lease_shared import (
+    live_task_lease as live_task_lease_fixture,
+)
 from xagent.core.agent.runner import UserMessageInjectionOutcome
 from xagent.web.api import websocket as websocket_api
 from xagent.web.api.websocket import (
@@ -36,6 +39,8 @@ from xagent.web.services.task_command_transport import (
     get_runner_id,
     max_command_defers,
 )
+
+live_task_lease = live_task_lease_fixture
 
 
 @pytest.fixture()
@@ -232,6 +237,7 @@ async def test_recovered_delivery_makes_contention_unsafe_to_resend(
 
 @pytest.mark.asyncio
 async def test_dispatcher_reclaims_and_applies_message_after_contention_clears(
+    live_task_lease,
     db_session,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -241,6 +247,7 @@ async def test_dispatcher_reclaims_and_applies_message_after_contention_clears(
     task.runner_id = get_runner_id()
     task.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=1)
     db_session.commit()
+    live_task_lease(db_session, task)
 
     enqueued = enqueue_task_command(
         db_session,

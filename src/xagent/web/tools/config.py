@@ -3662,6 +3662,7 @@ class WebToolConfig(BaseToolConfig):
             if allowed_file_dirs:
                 env["XAGENT_LINKEDIN_IMAGE_ALLOWED_DIRS"] = allowed_file_dirs
                 env["XAGENT_SLACK_FILE_ALLOWED_DIRS"] = allowed_file_dirs
+                env["XAGENT_GMAIL_FILE_ALLOWED_DIRS"] = allowed_file_dirs
             transport_config["env"] = env
             return transport_config
 

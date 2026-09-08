@@ -24,15 +24,20 @@ _PRESENTATION_URL_ID_PATTERN = re.compile(r"/presentation/d/([a-zA-Z0-9_-]+)")
 # Predefined layouts we know how to fill in, mapped to the (title_placeholder,
 # body_placeholder) types Slides creates for each one. `None` means that slot
 # doesn't exist on the layout at all.
+#
+# Deliberately limited to the layouts whose placeholder composition is well
+# established (matching Google's official Apps Script PredefinedLayout docs
+# and this file's pre-existing TITLE_AND_BODY mapping). Google's docs
+# explicitly warn a predefined layout's placeholder set "may have been
+# changed" and don't enumerate it for every layout, so less-common ones
+# (SECTION_TITLE_AND_DESCRIPTION, ONE_COLUMN_TEXT, MAIN_POINT, BIG_NUMBER)
+# are intentionally left out rather than guessed at — use
+# google_slides_batch_update for those until verified against a live API.
 _LAYOUT_PLACEHOLDERS: dict[str, tuple[str | None, str | None]] = {
     "TITLE": ("CENTERED_TITLE", "SUBTITLE"),
     "TITLE_AND_BODY": ("TITLE", "BODY"),
     "TITLE_ONLY": ("TITLE", None),
     "SECTION_HEADER": ("TITLE", None),
-    "SECTION_TITLE_AND_DESCRIPTION": ("TITLE", "BODY"),
-    "ONE_COLUMN_TEXT": ("TITLE", "BODY"),
-    "MAIN_POINT": ("TITLE", None),
-    "BIG_NUMBER": ("TITLE", "BODY"),
     "BLANK": (None, None),
 }
 
@@ -47,6 +52,10 @@ def _strip_bullet_prefixes(text: str) -> str:
     glyphs would double up with Slides' own bullet, so strip them first.
     """
     return "\n".join(_BULLET_PREFIX_PATTERN.sub("", line) for line in text.split("\n"))
+
+
+def _error(message: str) -> str:
+    return json.dumps({"status": "error", "message": message})
 
 
 def get_slides_service() -> Any:
@@ -174,62 +183,40 @@ def google_slides_add_slide(
       - "TITLE_AND_BODY" (default): title + full bulleted body content.
       - "TITLE": a cover/section-opening slide — title is the big centered
         title, body (optional) becomes the subtitle line (not bulleted).
-      - "TITLE_ONLY", "SECTION_HEADER", "MAIN_POINT": title only, no body
-        placeholder — pass body="" or the call is rejected.
-      - "SECTION_TITLE_AND_DESCRIPTION", "ONE_COLUMN_TEXT", "BIG_NUMBER":
-        title + bulleted body, like TITLE_AND_BODY with a different look.
+      - "TITLE_ONLY", "SECTION_HEADER": title only, no body placeholder —
+        pass body="" or the call is rejected.
       - "BLANK": no placeholders at all; use google_slides_batch_update to
         add free-form text boxes/images instead.
     """
     try:
         if layout not in _LAYOUT_PLACEHOLDERS:
-            return json.dumps(
-                {
-                    "status": "error",
-                    "message": (
-                        f"Unknown layout '{layout}'. Supported layouts: "
-                        f"{', '.join(sorted(_LAYOUT_PLACEHOLDERS))}"
-                    ),
-                }
+            return _error(
+                f"Unknown layout '{layout}'. Supported layouts: "
+                f"{', '.join(sorted(_LAYOUT_PLACEHOLDERS))}"
             )
 
         title_placeholder, body_placeholder = _LAYOUT_PLACEHOLDERS[layout]
 
         if title and title_placeholder is None:
-            return json.dumps(
-                {
-                    "status": "error",
-                    "message": (
-                        f"layout '{layout}' has no title placeholder, so "
-                        "'title' would be silently dropped. Use a different "
-                        "layout, or google_slides_batch_update for a custom "
-                        "text box."
-                    ),
-                }
+            return _error(
+                f"layout '{layout}' has no title placeholder, so "
+                "'title' would be silently dropped. Use a different "
+                "layout, or google_slides_batch_update for a custom "
+                "text box."
             )
         if body and body_placeholder is None:
-            return json.dumps(
-                {
-                    "status": "error",
-                    "message": (
-                        f"layout '{layout}' has no body placeholder, so "
-                        "'body' would be silently dropped. Use a layout "
-                        "with a body/subtitle placeholder (e.g. "
-                        "TITLE_AND_BODY, TITLE) or omit body."
-                    ),
-                }
+            return _error(
+                f"layout '{layout}' has no body placeholder, so "
+                "'body' would be silently dropped. Use a layout "
+                "with a body/subtitle placeholder (e.g. "
+                "TITLE_AND_BODY, TITLE) or omit body."
             )
-        if not body and body_placeholder == "BODY":
-            return json.dumps(
-                {
-                    "status": "error",
-                    "message": (
-                        f"layout '{layout}' expects body content but none "
-                        "was provided. Include this slide's full bullet/"
-                        "detail text in 'body' — don't create the slide "
-                        "with just a title."
-                    ),
-                }
+        if not body.strip() and body_placeholder == "BODY":
+            return _error(
+                f"layout '{layout}' expects body content but none "
+                "was provided. Include this slide's full bullet/"
+                "detail text in 'body' — don't create the slide "
+                "with just a title."
             )
 
         pres_id = _resolve_presentation_id(presentation_id)
@@ -267,15 +254,16 @@ def google_slides_add_slide(
         if title:
             requests.append({"insertText": {"objectId": title_id, "text": title}})
         if body:
+            is_bulleted = body_placeholder == "BODY"
             requests.append(
                 {
                     "insertText": {
                         "objectId": body_id,
-                        "text": _strip_bullet_prefixes(body),
+                        "text": _strip_bullet_prefixes(body) if is_bulleted else body,
                     }
                 }
             )
-            if body_placeholder == "BODY":
+            if is_bulleted:
                 requests.append(
                     {
                         "createParagraphBullets": {
@@ -300,7 +288,7 @@ def google_slides_add_slide(
         )
     except Exception as e:
         logger.error(f"Error adding slide: {e}")
-        return json.dumps({"status": "error", "message": str(e)})
+        return _error(str(e))
 
 
 @mcp.tool()

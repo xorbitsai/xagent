@@ -118,7 +118,7 @@ def test_add_slide_title_layout_uses_subtitle_and_skips_bullets(monkeypatch):
     assert not any("createParagraphBullets" in r for r in requests)
 
 
-@pytest.mark.parametrize("layout", ["TITLE_ONLY", "SECTION_HEADER", "MAIN_POINT"])
+@pytest.mark.parametrize("layout", ["TITLE_ONLY", "SECTION_HEADER"])
 def test_add_slide_title_only_layouts_need_no_body(monkeypatch, layout):
     presentations = Mock()
     presentations.batchUpdate.return_value.execute.return_value = {}
@@ -150,7 +150,7 @@ def test_add_slide_rejects_unknown_layout(monkeypatch):
     presentations.batchUpdate.assert_not_called()
 
 
-@pytest.mark.parametrize("layout", ["TITLE_ONLY", "SECTION_HEADER", "MAIN_POINT"])
+@pytest.mark.parametrize("layout", ["TITLE_ONLY", "SECTION_HEADER"])
 def test_add_slide_rejects_body_on_layout_without_body_placeholder(monkeypatch, layout):
     """Regression guard: these layouts have no body placeholder, so silently
     accepting `body` would drop it exactly like the reported bug — reject the
@@ -184,6 +184,49 @@ def test_add_slide_rejects_missing_body_for_content_layout(monkeypatch):
     assert result["status"] == "error"
     assert "body" in result["message"]
     presentations.batchUpdate.assert_not_called()
+
+
+def test_add_slide_rejects_whitespace_only_body_for_content_layout(monkeypatch):
+    """Regression guard: a whitespace-only body ("   ", "\\n\\n") must not
+    slip past the "body required" check just because it's non-empty — that
+    would recreate the exact content-less-slide bug the check exists for."""
+    presentations = Mock()
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(
+        google_slides.google_slides_add_slide(
+            "pres1",
+            title="Q3 Pipeline Highlights",
+            body="   \n\n  ",
+            layout="TITLE_AND_BODY",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "body" in result["message"]
+    presentations.batchUpdate.assert_not_called()
+
+
+def test_add_slide_title_layout_preserves_literal_dash_in_subtitle(monkeypatch):
+    """Regression guard: bullet-marker stripping must only apply to text
+    that's actually being turned into a bulleted list (a real BODY
+    placeholder) — a SUBTITLE is never bulleted, so a literal leading "-"
+    the caller intended as part of the subtitle text must survive."""
+    presentations = Mock()
+    presentations.batchUpdate.return_value.execute.return_value = {}
+    _mock_slides_service(monkeypatch, presentations)
+
+    google_slides.google_slides_add_slide(
+        "pres1", title="Guide", body="- The Complete Guide", layout="TITLE"
+    )
+
+    requests = _batch_update_requests(presentations)
+    body_text = next(
+        r["insertText"]["text"]
+        for r in requests
+        if "insertText" in r and "Complete Guide" in r["insertText"]["text"]
+    )
+    assert body_text == "- The Complete Guide"
 
 
 def test_add_slide_title_layout_allows_missing_body(monkeypatch):

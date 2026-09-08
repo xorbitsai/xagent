@@ -15,8 +15,7 @@ from .utils import calendar_day_bounds as _calendar_day_bounds
 from .utils import conflict_response as _conflict_response
 from .utils import datetime_key_for_comparison as _datetime_key_for_comparison
 from .utils import normalize_addresses as _normalize_addresses
-from .utils import setup_proxy_env
-from .utils import success_with_capped_dict
+from .utils import setup_proxy_env, success_with_capped_dict
 from .utils import unchecked_extra as _unchecked_extra
 from .utils import windows_overlap as _windows_overlap
 

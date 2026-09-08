@@ -5,6 +5,7 @@ Provides REST API endpoints for managing MCP server configurations
 in the web application.
 """
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -4449,7 +4450,7 @@ def _locked_catalog_app_for_server(
     return expected_app if owners == {app_id} else None
 
 
-async def teardown_mcp_app_server(
+def _teardown_mcp_app_server_locally(
     server_id: int,
     *,
     app_id: str,
@@ -4458,13 +4459,25 @@ async def teardown_mcp_app_server(
     expected_association_generation: UUID,
     current_user: User,
     db: Session,
-) -> None:
-    """Atomically disconnect one exact catalog-app association lifecycle.
+) -> tuple[int, list[_MCPOAuthGrantRevocationSnapshot]]:
+    """Own the local teardown transaction and report what still needs revoking.
 
     The caller pins both generations during preflight. This function owns the
-    local transaction, revalidates every destructive identity while locked,
-    commits local cleanup once, and only then performs best-effort provider
-    revocation without ORM access or database locks.
+    local transaction, revalidates every destructive identity while locked, and
+    commits local cleanup once. Provider revocation stays with the caller,
+    because it may only run once this commit has released every lock.
+
+    Kept a plain ``def`` and run off the event loop by its caller: this half
+    calls the connector team seam, and an installed team hook answers from the
+    installing application's own tables, so it can be slow. A seam call made
+    from a coroutine runs on the event loop thread, where a slow hook stalls
+    every other request the process is serving instead of occupying one
+    worker.
+
+    Returns the acting user id alongside the revocation snapshots because this
+    function is the half of a split teardown that has ``current_user`` in
+    scope: the caller, ``teardown_mcp_app_server``, logs the completed
+    teardown after this function returns and needs the id to do it.
     """
     revocations: list[_MCPOAuthGrantRevocationSnapshot] = []
     try:
@@ -4690,6 +4703,59 @@ async def teardown_mcp_app_server(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to delete MCP server",
         ) from None
+
+    return user_id, revocations
+
+
+async def teardown_mcp_app_server(
+    server_id: int,
+    *,
+    app_id: str,
+    expected_provider_name: str | None,
+    expected_catalog_generation: UUID,
+    expected_association_generation: UUID,
+    current_user: User,
+    db: Session,
+) -> None:
+    """Atomically disconnect one exact catalog-app association lifecycle.
+
+    The locked local transaction -- every destructive identity revalidated, the
+    connector team seam consulted, one commit -- is
+    ``_teardown_mcp_app_server_locally``, and runs in a worker thread rather
+    than here, because an installed team hook may be slow and this coroutine
+    runs on the event loop thread that serves every other request. The same
+    session is handed to that thread and back: SQLAlchemy's ``Session`` is
+    not bound to a single thread, it is only unsafe for two threads to use
+    it at once, so handing it to the worker and awaiting that call before
+    touching the session again is safe on its own terms -- this does not
+    depend on the SQLite-only engine options in ``models/database.py``
+    (``check_same_thread=False``, ``NullPool``); production runs a different
+    dialect through ``QueuePool``.
+
+    That does not by itself make the handoff safe against cancellation:
+    ``asyncio.to_thread`` does not stop the worker when the awaiting coroutine
+    is cancelled. A caller that hands this function a request-scoped session
+    (such as one ``get_db`` opened for that route) could have a client
+    disconnect trigger request cleanup and close that session while the
+    worker is still committing on it. This function has no such caller in
+    this repository today. Before wiring one in, route the call through
+    ``run_db_io_cancellation_safe`` instead and have the worker function open
+    and close its own session.
+
+    What remains here is the best-effort provider revocation, the one step that
+    genuinely needs to await. It needs no ORM access and holds no database
+    lock, and runs only after the commit above has released every lock.
+    """
+    user_id, revocations = await asyncio.to_thread(
+        _teardown_mcp_app_server_locally,
+        server_id,
+        app_id=app_id,
+        expected_provider_name=expected_provider_name,
+        expected_catalog_generation=expected_catalog_generation,
+        expected_association_generation=expected_association_generation,
+        current_user=current_user,
+        db=db,
+    )
 
     # No provider call may run until the local commit releases every lock.
     for revocation in revocations:

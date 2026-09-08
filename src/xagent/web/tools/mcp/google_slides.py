@@ -58,18 +58,36 @@ _LAYOUT_PLACEHOLDERS: dict[str, _LayoutSpec] = {
     "BLANK": _LayoutSpec(None, None, bulleted=False, body_required=False),
 }
 
-# Leading "•"/"-"/"*" marker (with or without a following space, so a marker
-# glued to text like "•First" is still recognized) at the start of a line.
-# Captures any leading whitespace so it survives the substitution — Slides'
-# createParagraphBullets infers nesting level from leading tab characters
-# in the inserted text, so stripping only the marker (not the indentation
-# in front of it) keeps multi-level bullets intact.
-_BULLET_PREFIX_PATTERN = re.compile(r"^([ \t]*)[•\-\*][ \t]*")
+# Leading "•"/"-"/"*" marker at the start of a line, with or without a
+# following space so a marker glued to a word (e.g. "•First") is still
+# recognized. Captures any leading whitespace so it survives the
+# substitution — Slides' createParagraphBullets infers nesting level from
+# leading tab characters in the inserted text, so stripping only the
+# marker (not the indentation in front of it) keeps multi-level bullets
+# intact.
+#
+# "-" and "*" also have common non-bullet meanings, so the "glued, no
+# space" case is deliberately narrower for them than for "•" (which has no
+# other meaning in plain text):
+#   - "-" glued to a digit ("-5% growth") or another "-" ("-- Author") is
+#     left alone entirely, so a negative number's sign or an em-dash
+#     convention is never silently eaten.
+#   - "*" is only treated as a marker when followed by real whitespace
+#     ("* item"); a bare glued "*" ("*emphasis* text") is left alone so
+#     markdown-style emphasis isn't corrupted.
+_BULLET_PREFIX_PATTERN = re.compile(
+    r"^([ \t]*)(?:"
+    r"•(?:[ \t]+|(?=\S))"
+    r"|-(?:[ \t]+|(?=[^\s\d\-]))"
+    r"|\*[ \t]+"
+    r")"
+)
 
 
 def _strip_bullet_prefixes(text: str) -> str:
     """Drop a leading "•"/"-"/"*" marker from each line, preserving any
-    leading whitespace before it.
+    leading whitespace before it. See _BULLET_PREFIX_PATTERN for the
+    narrower rules that keep this from corrupting non-bullet content.
 
     The public docstrings tell callers not to type literal bullet glyphs,
     but callers may do so anyway; once we ask Slides to render real
@@ -217,9 +235,10 @@ def google_slides_add_slide(
       - "BLANK": no placeholders at all; use google_slides_batch_update to
         add free-form text boxes/images instead.
 
-    Every layout with a title placeholder also needs at least a non-empty
-    title (or, for "TITLE", a non-empty body/subtitle instead) — a call
-    that would otherwise produce a completely empty slide is rejected.
+    Layouts that don't already require a body (i.e. everything except
+    TITLE_AND_BODY) still need at least a non-empty title — or, for
+    "TITLE", a non-empty body/subtitle instead — since otherwise the call
+    would produce a completely empty slide; that combination is rejected.
     """
     try:
         if layout not in _LAYOUT_PLACEHOLDERS:
@@ -301,7 +320,7 @@ def google_slides_add_slide(
         requests: list[dict[str, Any]] = [{"createSlide": create_slide}]
         if title.strip():
             requests.append({"insertText": {"objectId": title_id, "text": title}})
-        if body:
+        if body.strip():
             requests.append({"insertText": {"objectId": body_id, "text": body}})
             if is_bulleted:
                 requests.append(

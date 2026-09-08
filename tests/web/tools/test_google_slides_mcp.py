@@ -143,6 +143,29 @@ def test_add_slide_preserves_nested_bullet_indentation(monkeypatch):
     assert body_text == "Top\n  Nested\n    Deeper"
 
 
+def test_add_slide_does_not_corrupt_non_bullet_content_starting_with_marker_chars(
+    monkeypatch,
+):
+    """ "-"/"*" have common non-bullet meanings (a negative number's sign,
+    an em-dash, markdown emphasis) — a leading marker glued to a digit or
+    to another marker character, or a bare "*" with no trailing space,
+    must be left alone rather than silently mangled."""
+    presentations = Mock()
+    presentations.batchUpdate.return_value.execute.return_value = {}
+    _mock_slides_service(monkeypatch, presentations)
+
+    body = "-5% growth\n-- Author Name\n**Note\n*emphasis* not a bullet"
+    google_slides.google_slides_add_slide("pres1", title="T", body=body)
+
+    requests = _batch_update_requests(presentations)
+    body_text = next(
+        r["insertText"]["text"]
+        for r in requests
+        if "insertText" in r and "growth" in r["insertText"]["text"]
+    )
+    assert body_text == body
+
+
 def test_add_slide_rejects_marker_only_body_for_content_layout(monkeypatch):
     """A body that's only a bullet marker ("•   ") strips to an empty
     string before insertion — the body-required guard must check the
@@ -351,6 +374,32 @@ def test_add_slide_title_layout_preserves_literal_dash_in_subtitle(monkeypatch):
         if "insertText" in r and "Complete Guide" in r["insertText"]["text"]
     )
     assert body_text == "- The Complete Guide"
+
+
+def test_add_slide_skips_whitespace_only_body_insertion_on_title_layout(monkeypatch):
+    """Regression guard, symmetric with the whitespace-only-title fix: a
+    whitespace-only body on a layout where body is optional (e.g. TITLE's
+    subtitle) must not be inserted verbatim — leave the placeholder
+    untouched instead of writing invisible whitespace into it."""
+    presentations = Mock()
+    presentations.batchUpdate.return_value.execute.return_value = {}
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(
+        google_slides.google_slides_add_slide(
+            "pres1", title="Cover", body="   ", layout="TITLE"
+        )
+    )
+
+    assert result["status"] == "success"
+    requests = _batch_update_requests(presentations)
+    subtitle_object_id = requests[0]["createSlide"]["placeholderIdMappings"][1][
+        "objectId"
+    ]
+    assert not any(
+        "insertText" in r and r["insertText"]["objectId"] == subtitle_object_id
+        for r in requests
+    )
 
 
 def test_add_slide_title_layout_allows_missing_body(monkeypatch):

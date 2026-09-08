@@ -21,11 +21,14 @@ setup_proxy_env()
 
 mcp = FastMCP("gmail-mcp")
 
-# Gmail's own limit on the combined size of a message's attachments (raw
-# bytes, before base64 encoding inflates them by ~33%). Enforced here so a
-# too-large attachment fails with a clear message instead of an opaque error
-# from the send API.
-_MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
+# Gmail's real limit is 25MB on the base64-encoded message. base64 inflates
+# raw bytes by 4/3, so this caps the raw (pre-encoding) total at 3/4 of that
+# — keeping the actual encoded message under Gmail's real limit rather than
+# letting a ~24MB raw attachment (which passes a naive 25MB raw check) still
+# fail the real send with an opaque API error. This is a budget shared
+# across every message in one gmail_send_messages call, not per-message —
+# a batch of many medium attachments is capped the same as one big one.
+_MAX_ATTACHMENT_BYTES = int(25 * 1024 * 1024 * 3 / 4)
 
 
 def _allowed_file_dirs() -> list[Path]:
@@ -43,7 +46,11 @@ def _resolve_allowed_file_path(file_path: str) -> Path:
     """Restrict gmail_send_messages attachments to files under an
     allowlisted directory, the same defense slack_upload_file and the
     LinkedIn connector's image upload use — without it an agent could be
-    tricked into exfiltrating arbitrary host files through this tool."""
+    tricked into exfiltrating arbitrary host files through this tool.
+
+    Pass an absolute path — a relative path resolves against this
+    process's own working directory, not the allowed directory, and will
+    not find a file written to the task workspace."""
     local_path = Path(file_path).expanduser()
     if not local_path.is_absolute():
         local_path = Path.cwd() / local_path
@@ -72,27 +79,54 @@ def _resolve_allowed_file_path(file_path: str) -> Path:
     )
 
 
-def _resolve_message_attachments(msg_data: dict) -> list[tuple[str, bytes]]:
+def _resolve_message_attachments(
+    msg_data: dict, budget_remaining: int
+) -> tuple[list[tuple[str, bytes]], int]:
     """Resolve+read every attachment for one message, enforcing the
-    allowlist, empty-file, and total-size checks. Reading (not just
-    stat-ing) here — and only once — is what lets the caller pre-validate
-    every message's attachments before sending any of them."""
+    allowlist, empty-file, and size-budget checks.
+
+    `budget_remaining` is the *whole batch's* shared remaining byte budget,
+    not a per-message allowance — the caller threads the returned value
+    into the next message's call, so a batch of many medium attachments is
+    capped the same as one big one instead of each message getting its own
+    fresh _MAX_ATTACHMENT_BYTES allowance.
+
+    Each file's size is checked via fstat *before* reading it, so an
+    oversized file is rejected without first loading it into memory.
+    """
     attachments: list[tuple[str, bytes]] = []
-    total_bytes = 0
-    for attachment_path in msg_data.get("attachments") or []:
+    raw_attachments = msg_data.get("attachments")
+    if raw_attachments is None:
+        return attachments, budget_remaining
+    if not isinstance(raw_attachments, list):
+        raise ValueError("'attachments' must be a list of file paths")
+
+    for attachment_path in raw_attachments:
         local_path = _resolve_allowed_file_path(attachment_path)
-        with local_path.open("rb") as fh:
-            data = fh.read()
-        if not data:
-            raise ValueError(f"Attachment is empty: {attachment_path}")
-        total_bytes += len(data)
-        if total_bytes > _MAX_ATTACHMENT_BYTES:
-            raise ValueError(
-                f"Attachments for '{msg_data.get('to', '')}' exceed the "
-                f"{_MAX_ATTACHMENT_BYTES // (1024 * 1024)}MB limit."
-            )
+        try:
+            with local_path.open("rb") as fh:
+                size = os.fstat(fh.fileno()).st_size
+                if size == 0:
+                    raise ValueError(f"Attachment is empty: {attachment_path}")
+                if size > budget_remaining:
+                    raise ValueError(
+                        "Attachments in this batch exceed the "
+                        f"{_MAX_ATTACHMENT_BYTES // (1024 * 1024)}MB total "
+                        f"budget (only {budget_remaining // (1024 * 1024)}MB "
+                        "left)."
+                    )
+                data = fh.read()
+        except OSError as e:
+            # Keep the absolute host path out of the message reaching the
+            # caller/LLM, matching the scrubbing _resolve_allowed_file_path
+            # already does for the "outside allowed directories" case —
+            # str(OSError) embeds the path, so it can't be re-raised as-is.
+            logger.warning("Could not read attachment %s: %s", local_path, e)
+            raise ValueError(f"Could not read attachment: {attachment_path}") from e
+
+        budget_remaining -= size
         attachments.append((local_path.name, data))
-    return attachments
+    return attachments, budget_remaining
 
 
 def get_gmail_service() -> Any:
@@ -243,18 +277,31 @@ def gmail_send_messages(messages: list[dict], action: str = "draft") -> str:
     'attachments' is a list of local file paths (e.g. a file exported to the
     task workspace) to attach to that message — each path must be inside an
     allowed directory (automatically scoped to the current task workspace),
-    the same restriction slack_upload_file uses. If you tell the recipient a
-    file is attached, you MUST list it here: writing "see attached" in the
-    body does not attach anything by itself, and this tool has no other way
-    to send a file. Each successful result includes an 'attachments' list of
-    what was actually attached (filename + byte size) — check that before
-    telling the user a file was sent, don't assume it from the request alone.
+    the same restriction slack_upload_file uses. Pass an absolute path — a
+    relative path resolves against this process's own working directory,
+    not the allowed directory, and will not find a file written to the
+    task workspace. If you tell the recipient a file is attached, you MUST list it here:
+    writing "see attached" in the body does not attach anything by itself,
+    and this tool has no other way to send a file. Each successful result
+    includes an 'attachments' list of what was actually attached (filename
+    + byte size) — check that before telling the user a file was sent,
+    don't assume it from the request alone. All attachments across the
+    whole call share one combined size budget (see _MAX_ATTACHMENT_BYTES).
     """
     try:
+        if not isinstance(messages, list):
+            raise ValueError("'messages' must be a list of message dicts")
+
         # Resolve every message's attachments before sending any message, so
         # a bad attachment path on message 2 can't leave message 1 already
         # sent while message 2 silently fails partway through the batch.
-        resolved_attachments = [_resolve_message_attachments(msg) for msg in messages]
+        resolved_attachments: list[list[tuple[str, bytes]]] = []
+        budget_remaining = _MAX_ATTACHMENT_BYTES
+        for msg_data in messages:
+            attachments, budget_remaining = _resolve_message_attachments(
+                msg_data, budget_remaining
+            )
+            resolved_attachments.append(attachments)
 
         service = get_gmail_service()
         results = []
@@ -277,11 +324,18 @@ def gmail_send_messages(messages: list[dict], action: str = "draft") -> str:
                 maintype, _, subtype = (
                     guessed_type or "application/octet-stream"
                 ).partition("/")
+                # A text-maintype part with no charset parameter defaults to
+                # us-ascii per RFC 2045, mojibaking any non-ASCII UTF-8
+                # content (e.g. a .txt/.csv/.md attachment) — the message
+                # body gets utf-8 via set_content automatically, but
+                # add_attachment needs it spelled out explicitly.
+                params = {"charset": "utf-8"} if maintype == "text" else {}
                 message.add_attachment(
                     data,
                     maintype=maintype,
                     subtype=subtype or "octet-stream",
                     filename=filename,
+                    params=params,
                 )
                 attached_summary.append({"filename": filename, "size": len(data)})
 

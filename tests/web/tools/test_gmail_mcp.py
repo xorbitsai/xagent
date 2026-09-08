@@ -89,6 +89,74 @@ def test_send_messages_attaches_workspace_file(monkeypatch, tmp_path):
     assert attachment_parts[0].get_filename() == "deck.pdf"
     assert attachment_parts[0].get_content_type() == "application/pdf"
     assert attachment_parts[0].get_payload(decode=True) == b"%PDF-1.4 fake pdf bytes"
+    # A regression where add_attachment clobbered the body set via
+    # message.set_content(...) would go undetected without this.
+    assert "Please find attached." in sent.get_body(("plain",)).get_content()
+
+
+def test_send_messages_preserves_cc_and_bcc_alongside_attachments(
+    monkeypatch, tmp_path
+):
+    """add_attachment() converts a single-part message into a multipart one
+    (via the stdlib's make_mixed()) — this must not drop headers set before
+    the attachment was added."""
+    monkeypatch.setenv("XAGENT_GMAIL_FILE_ALLOWED_DIRS", str(tmp_path))
+    pdf_path = tmp_path / "deck.pdf"
+    pdf_path.write_bytes(b"content")
+
+    users = Mock()
+    users.messages.return_value.send.return_value.execute.return_value = {"id": "m1"}
+    _mock_gmail_service(monkeypatch, users)
+
+    gmail.gmail_send_messages(
+        [
+            {
+                "to": "hazel@example.com",
+                "cc": "cc@example.com",
+                "bcc": "bcc@example.com",
+                "subject": "Deck",
+                "body": "B",
+                "attachments": [str(pdf_path)],
+            }
+        ],
+        action="send",
+    )
+
+    sent = _sent_raw_message(users)
+    assert sent["Cc"] == "cc@example.com"
+    assert sent["Bcc"] == "bcc@example.com"
+    assert len(list(sent.iter_attachments())) == 1
+
+
+def test_send_messages_attaches_non_ascii_text_with_utf8_charset(monkeypatch, tmp_path):
+    """Regression guard: a text-maintype attachment with no charset
+    parameter defaults to us-ascii per RFC 2045, mojibaking non-ASCII UTF-8
+    content — the message body gets utf-8 automatically via set_content,
+    but add_attachment needs it spelled out explicitly."""
+    monkeypatch.setenv("XAGENT_GMAIL_FILE_ALLOWED_DIRS", str(tmp_path))
+    notes_path = tmp_path / "notes.txt"
+    notes_path.write_text("café", encoding="utf-8")
+
+    users = Mock()
+    users.messages.return_value.send.return_value.execute.return_value = {"id": "m1"}
+    _mock_gmail_service(monkeypatch, users)
+
+    gmail.gmail_send_messages(
+        [
+            {
+                "to": "a@example.com",
+                "subject": "S",
+                "body": "B",
+                "attachments": [str(notes_path)],
+            }
+        ],
+        action="send",
+    )
+
+    sent = _sent_raw_message(users)
+    attachment = next(sent.iter_attachments())
+    assert attachment.get_content_type() == "text/plain"
+    assert attachment.get_content() == "café"
 
 
 def test_draft_messages_also_supports_attachments(monkeypatch, tmp_path):
@@ -151,6 +219,7 @@ def test_send_messages_rejects_attachment_outside_allowed_dirs(monkeypatch, tmp_
     assert result["status"] == "error"
     assert "outside the allowed" in result["message"]
     assert str(outside_file) not in result["message"]
+    assert str(allowed_dir) not in result["message"]
     users.messages.return_value.send.assert_not_called()
 
 
@@ -229,7 +298,202 @@ def test_send_messages_rejects_oversized_attachments(monkeypatch, tmp_path):
     )
 
     assert result["status"] == "error"
-    assert "limit" in result["message"]
+    assert "budget" in result["message"]
+    users.messages.return_value.send.assert_not_called()
+
+
+def test_send_messages_accumulates_attachment_sizes_correctly(monkeypatch, tmp_path):
+    """Regression guard: a cap patched to fit exactly one of two attachments
+    must reject on the *second* one, not the first — this distinguishes a
+    correct running total (+=) from a bug that just overwrites it (=),
+    which a single-attachment test can't tell apart."""
+    monkeypatch.setenv("XAGENT_GMAIL_FILE_ALLOWED_DIRS", str(tmp_path))
+    file_a = tmp_path / "a.bin"
+    file_a.write_bytes(b"\x00" * 10)
+    file_b = tmp_path / "b.bin"
+    file_b.write_bytes(b"\x00" * 10)
+    monkeypatch.setattr(gmail, "_MAX_ATTACHMENT_BYTES", 15)
+
+    users = Mock()
+    _mock_gmail_service(monkeypatch, users)
+
+    result = json.loads(
+        gmail.gmail_send_messages(
+            [
+                {
+                    "to": "a@example.com",
+                    "subject": "S",
+                    "body": "B",
+                    "attachments": [str(file_a), str(file_b)],
+                }
+            ],
+            action="send",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "budget" in result["message"]
+    users.messages.return_value.send.assert_not_called()
+
+
+def test_send_messages_enforces_size_budget_across_whole_batch(monkeypatch, tmp_path):
+    """Regression guard: the size cap is a budget shared across every
+    message in the call, not a fresh allowance reset per message — two
+    messages each individually under the cap but exceeding it combined
+    must still be rejected."""
+    monkeypatch.setenv("XAGENT_GMAIL_FILE_ALLOWED_DIRS", str(tmp_path))
+    file_a = tmp_path / "a.bin"
+    file_a.write_bytes(b"\x00" * 10)
+    file_b = tmp_path / "b.bin"
+    file_b.write_bytes(b"\x00" * 10)
+    monkeypatch.setattr(gmail, "_MAX_ATTACHMENT_BYTES", 15)
+
+    users = Mock()
+    _mock_gmail_service(monkeypatch, users)
+
+    result = json.loads(
+        gmail.gmail_send_messages(
+            [
+                {
+                    "to": "a@example.com",
+                    "subject": "S1",
+                    "body": "B1",
+                    "attachments": [str(file_a)],
+                },
+                {
+                    "to": "b@example.com",
+                    "subject": "S2",
+                    "body": "B2",
+                    "attachments": [str(file_b)],
+                },
+            ],
+            action="send",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "budget" in result["message"]
+    users.messages.return_value.send.assert_not_called()
+
+
+def test_send_messages_rejects_non_list_attachments(monkeypatch, tmp_path):
+    """Regression guard: a bare string (a plausible LLM mistake instead of
+    a one-element list) must be rejected with a clear error, not iterated
+    character-by-character into a confusing "file not found: /" error."""
+    monkeypatch.setenv("XAGENT_GMAIL_FILE_ALLOWED_DIRS", str(tmp_path))
+    users = Mock()
+    _mock_gmail_service(monkeypatch, users)
+
+    result = json.loads(
+        gmail.gmail_send_messages(
+            [
+                {
+                    "to": "a@example.com",
+                    "subject": "S",
+                    "body": "B",
+                    "attachments": "/workspace/deck.pdf",
+                }
+            ],
+            action="send",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "attachments" in result["message"]
+    users.messages.return_value.send.assert_not_called()
+
+
+def test_send_messages_rejects_non_list_messages(monkeypatch):
+    users = Mock()
+    _mock_gmail_service(monkeypatch, users)
+
+    result = json.loads(
+        gmail.gmail_send_messages(
+            {"to": "a@example.com", "subject": "S", "body": "B"}  # not a list
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "messages" in result["message"]
+    users.messages.return_value.send.assert_not_called()
+
+
+def test_send_messages_scrubs_os_error_detail_on_read_failure(monkeypatch, tmp_path):
+    """Regression guard: str(OSError) can reveal more than the caller's own
+    input (errno text, and — for a caller-supplied relative/short path —
+    the fully resolved absolute host path), so the raw exception text must
+    not reach the caller/LLM-facing message; only the caller's own
+    attachment string (which they already know) may appear, the same way
+    the empty-file/oversized-attachment errors already echo it back."""
+    monkeypatch.setenv("XAGENT_GMAIL_FILE_ALLOWED_DIRS", str(tmp_path))
+    unreadable = tmp_path / "unreadable.pdf"
+    unreadable.write_bytes(b"content")
+
+    def _boom(self, mode="rb"):
+        raise OSError(13, "Permission denied", str(unreadable))
+
+    monkeypatch.setattr(gmail.Path, "open", _boom)
+
+    users = Mock()
+    _mock_gmail_service(monkeypatch, users)
+
+    result = json.loads(
+        gmail.gmail_send_messages(
+            [
+                {
+                    "to": "a@example.com",
+                    "subject": "S",
+                    "body": "B",
+                    "attachments": [str(unreadable)],
+                }
+            ],
+            action="send",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "Permission denied" not in result["message"]
+    assert "Errno 13" not in result["message"]
+    users.messages.return_value.send.assert_not_called()
+
+
+def test_send_messages_scrubs_resolved_path_on_read_failure_for_relative_input(
+    monkeypatch, tmp_path
+):
+    """Same as above, but from the angle that matters most: when the
+    caller supplies a short/relative attachment string, the fully resolved
+    absolute host path (which the caller never typed and reveals real
+    filesystem layout) must not leak into the error either — only the
+    caller's own original string may appear."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("XAGENT_GMAIL_FILE_ALLOWED_DIRS", str(tmp_path))
+    unreadable = tmp_path / "unreadable.pdf"
+    unreadable.write_bytes(b"content")
+
+    def _boom(self, mode="rb"):
+        raise OSError(13, "Permission denied", str(unreadable))
+
+    monkeypatch.setattr(gmail.Path, "open", _boom)
+
+    users = Mock()
+    _mock_gmail_service(monkeypatch, users)
+
+    result = json.loads(
+        gmail.gmail_send_messages(
+            [
+                {
+                    "to": "a@example.com",
+                    "subject": "S",
+                    "body": "B",
+                    "attachments": ["unreadable.pdf"],
+                }
+            ],
+            action="send",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert str(unreadable) not in result["message"]
     users.messages.return_value.send.assert_not_called()
 
 

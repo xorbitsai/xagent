@@ -670,6 +670,77 @@ def test_update_event_error_message_hints_at_add_google_meet_on_failure(monkeypa
     assert "add_google_meet" in result["message"]
 
 
+def test_update_event_error_message_has_no_hint_when_add_google_meet_was_a_noop(
+    monkeypatch,
+):
+    """Regression test: add_google_meet=True is a no-op when the event
+    already has a resolved conference -- this call's body never actually
+    carried a createRequest, so a failure has nothing to do with Meet and
+    the hint would misdirect the caller."""
+    existing_event = {
+        "id": "evt1",
+        "conferenceData": {
+            "conferenceSolution": {"key": {"type": "hangoutsMeet"}},
+            "entryPoints": [{"entryPointType": "video", "uri": "https://x"}],
+        },
+    }
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    service.events.return_value.update.return_value.execute.side_effect = RuntimeError(
+        "Bad Request"
+    )
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(event_id="evt1", add_google_meet=True)
+    )
+
+    assert result["status"] == "error"
+    assert result["message"] == "Bad Request"
+
+
+def test_update_event_error_message_has_no_hint_when_the_preliminary_fetch_fails(
+    monkeypatch,
+):
+    """Regression test: a failure in the preliminary events().get() fetch
+    (e.g. a bad event_id) happens before _apply_conference_request ever
+    runs, so this call's body never carried a createRequest either."""
+    service = _fake_service({"id": "evt1"})
+    service.events.return_value.get.return_value.execute.side_effect = RuntimeError(
+        "Not Found"
+    )
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(event_id="evt1", add_google_meet=True)
+    )
+
+    assert result["status"] == "error"
+    assert result["message"] == "Not Found"
+
+
+def test_create_event_error_message_has_no_hint_when_service_setup_fails(monkeypatch):
+    """Regression test: a failure before any event body is even built (e.g.
+    a missing/invalid credential) happens before _apply_conference_request
+    ever runs, so blaming a Meet conference request would be wrong."""
+
+    def _raise():
+        raise ValueError("GOOGLE_ACCESS_TOKEN environment variable is missing")
+
+    monkeypatch.setattr(calendar, "get_calendar_service", _raise)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="1:1",
+            start_time="2026-09-07T15:00:00+08:00",
+            end_time="2026-09-07T16:00:00+08:00",
+            add_google_meet=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "add_google_meet" not in result["message"]
+
+
 def test_create_event_error_message_has_no_hint_without_add_google_meet(monkeypatch):
     service = _fake_service({"id": "evt1"})
     service.events.return_value.insert.return_value.execute.side_effect = RuntimeError(

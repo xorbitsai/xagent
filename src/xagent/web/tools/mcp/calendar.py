@@ -151,15 +151,24 @@ def _needs_conference_request(event: dict[str, Any]) -> bool:
     return status_code == "failure"
 
 
-def _apply_conference_request(event: dict[str, Any], add_google_meet: bool) -> None:
+def _apply_conference_request(event: dict[str, Any], add_google_meet: bool) -> bool:
     """Mutates event in place: attaches a fresh Meet createRequest when
     add_google_meet=True and _needs_conference_request(event) says one isn't
     already in flight or resolved. A no-op (no error, no signal in the
     response) if the event already has a *non*-Meet conference (e.g. Zoom) --
     see the add_google_meet docstring on the public tools.
+
+    Returns whether a createRequest was actually added to `event` this call
+    -- the caller's raw add_google_meet argument isn't enough on its own to
+    tell whether this specific request's body ended up carrying one (it may
+    have been a no-op), which matters for _error_message: blaming a Meet
+    conference request for a failure is only accurate when this call's body
+    actually contained one.
     """
     if add_google_meet and _needs_conference_request(event):
         _add_conference_request(event)
+        return True
+    return False
 
 
 def _api_call_kwargs(event: dict[str, Any], notify_attendees: bool) -> dict[str, Any]:
@@ -178,18 +187,28 @@ def _api_call_kwargs(event: dict[str, Any], notify_attendees: bool) -> dict[str,
     }
 
 
-def _error_message(exc: Exception, add_google_meet: bool) -> str:
-    """Append an actionable hint when a request that asked for a Google Meet
-    conference fails outright (as opposed to the conference itself merely
-    failing to provision -- see _needs_conference_request/conference_status
-    for that path). If the account/domain can't create Meet conferences at
-    all, Google can reject the whole insert()/update() call, taking the
-    entire event create/update down with it; that's indistinguishable here
-    from any other request-level failure, so at least point the caller at
-    the one thing in this request that's most likely to be the cause.
+def _error_message(exc: Exception, requested_conference: bool) -> str:
+    """Append an actionable hint when a request whose body actually included
+    a Google Meet createRequest fails outright (as opposed to the conference
+    itself merely failing to provision -- see
+    _needs_conference_request/conference_status for that path). If the
+    account/domain can't create Meet conferences at all, Google can reject
+    the whole insert()/update() call, taking the entire event create/update
+    down with it; that's indistinguishable here from any other request-level
+    failure, so at least point the caller at the one thing in this request
+    that's most likely to be the cause.
+
+    requested_conference must be whether THIS call's body actually carried a
+    createRequest (_apply_conference_request's return value), not the raw
+    add_google_meet argument: add_google_meet=True is a no-op whenever the
+    event already has a conference, and a failure can also happen before
+    _apply_conference_request ever runs (auth setup, or update()'s
+    preliminary event fetch) -- in both cases blaming a Meet conference
+    request that was never actually part of this call would misdirect the
+    caller at an unrelated failure's real cause.
     """
     message = str(exc)
-    if add_google_meet:
+    if requested_conference:
         message += (
             " (this request included a Google Meet conference request; if this"
             " Google account/domain cannot create Meet conferences, retry with"
@@ -270,6 +289,7 @@ def google_calendar_create_events(
     create a link, and if the account/domain can't create Meet conferences at all, this whole call
     can fail outright rather than just skipping the link.
     """
+    requested_conference = False
     try:
         service = get_calendar_service()
 
@@ -288,7 +308,7 @@ def google_calendar_create_events(
         if location:
             event["location"] = location
         _merge_attendees(event, attendees)
-        _apply_conference_request(event, add_google_meet)
+        requested_conference = _apply_conference_request(event, add_google_meet)
 
         request = service.events().insert(
             calendarId="primary",
@@ -301,7 +321,7 @@ def google_calendar_create_events(
     except Exception as e:
         logger.error(f"Error creating event: {e}")
         return json.dumps(
-            {"status": "error", "message": _error_message(e, add_google_meet)}
+            {"status": "error", "message": _error_message(e, requested_conference)}
         )
 
 
@@ -354,6 +374,7 @@ def google_calendar_update_events(
     create a link, and if the account/domain can't create Meet conferences at all, this whole call
     can fail outright rather than just skipping the link.
     """
+    requested_conference = False
     try:
         service = get_calendar_service()
 
@@ -371,7 +392,7 @@ def google_calendar_update_events(
         if location:
             event["location"] = location
         _merge_attendees(event, attendees)
-        _apply_conference_request(event, add_google_meet)
+        requested_conference = _apply_conference_request(event, add_google_meet)
 
         request = service.events().update(
             calendarId="primary",
@@ -385,7 +406,7 @@ def google_calendar_update_events(
     except Exception as e:
         logger.error(f"Error updating event: {e}")
         return json.dumps(
-            {"status": "error", "message": _error_message(e, add_google_meet)}
+            {"status": "error", "message": _error_message(e, requested_conference)}
         )
 
 

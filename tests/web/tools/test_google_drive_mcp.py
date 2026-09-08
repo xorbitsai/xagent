@@ -128,6 +128,48 @@ def test_resolve_file_id_still_matches_a_real_id_starting_with_e():
     )
 
 
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        # A scheme-less trusted-host link whose query value itself embeds
+        # a full URL. An earlier "does '//' occur anywhere in the string"
+        # heuristic failed to prepend "//" here (since "//" already
+        # appears, just not at the front), so urlparse saw no netloc and
+        # the whole string was rejected as untrusted -- even though this
+        # is a perfectly legitimate Drive link.
+        (
+            "docs.google.com/document/d/ABCID123/edit"
+            "?usp=sharing&continue=https://other.com/x",
+            "ABCID123",
+        ),
+        # A harmless double-slash typo in the path must not defeat
+        # resolution either, for the same reason.
+        ("drive.google.com/file/d/ABCID123//view", "ABCID123"),
+    ],
+)
+def test_resolve_file_id_handles_scheme_less_urls_containing_another_scheme(
+    url, expected
+):
+    assert google_drive._resolve_file_id(url) == expected
+
+
+def test_resolve_file_id_does_not_extract_id_from_unrelated_query_value():
+    """The host check validates the URL's overall authority, but the id
+    must come from the URL's own path/query structure -- not a free-text
+    search of the whole string. Otherwise a URL whose host is a real,
+    trusted drive.google.com but whose query VALUE merely contains a
+    matching shape (here, a hypothetical search results page) would have
+    that unrelated substring extracted as if it were the URL's own
+    resource id."""
+    url = "https://drive.google.com/search?q=/file/d/OTHERID/view"
+    assert google_drive._resolve_file_id(url) == url
+
+
+def test_resolve_file_id_rejects_non_string_input():
+    with pytest.raises(ValueError, match="file_id must be a string"):
+        google_drive._resolve_file_id(12345)
+
+
 @pytest.mark.parametrize("bad_role", ["owner", "organizer", ""])
 def test_require_share_role_rejects_roles_outside_the_allowed_set(bad_role):
     with pytest.raises(ValueError, match="role"):
@@ -293,6 +335,32 @@ def test_create_folder_resolves_parent_id_url_and_supports_shared_drives(monkeyp
     kwargs = service.files.return_value.create.call_args.kwargs
     assert kwargs["body"]["parents"] == ["abc123"]
     assert kwargs["supportsAllDrives"] is True
+
+
+def test_create_file_validates_parent_id_before_building_service(monkeypatch):
+    get_service = Mock()
+    monkeypatch.setattr(google_drive, "get_drive_service", get_service)
+
+    result = json.loads(
+        google_drive.google_drive_create_file("notes.txt", "hello", parent_id=123)
+    )
+
+    assert result["status"] == "error"
+    assert "file_id must be a string" in result["message"]
+    get_service.assert_not_called()
+
+
+def test_create_folder_validates_parent_id_before_building_service(monkeypatch):
+    get_service = Mock()
+    monkeypatch.setattr(google_drive, "get_drive_service", get_service)
+
+    result = json.loads(
+        google_drive.google_drive_create_folder("Subfolder", parent_id=123)
+    )
+
+    assert result["status"] == "error"
+    assert "file_id must be a string" in result["message"]
+    get_service.assert_not_called()
 
 
 def test_get_file_content_resolves_full_drive_url(monkeypatch):
@@ -551,6 +619,46 @@ def test_list_permissions_stops_paginating_once_over_the_output_limit(monkeypatc
     # Stopped after the first oversized page rather than following
     # nextPageToken indefinitely.
     assert service.permissions.return_value.list.call_count == 1
+
+
+def test_list_permissions_pagination_check_matches_the_real_encoding(monkeypatch):
+    """The early-stop length check must use ensure_ascii=False, matching
+    _capped_list_response's actual encoding -- otherwise a page of
+    non-ASCII displayName/emailAddress values (CJK/accented/emoji names are
+    common on a Shared Drive) inflates the check's estimate (each such
+    character escapes to a 6+-char \\uXXXX sequence under the ensure_ascii
+    default) well past what the real, smaller ensure_ascii=False payload
+    needs, causing pagination to stop before a real nextPageToken is
+    exhausted -- while the final response, measuring the true smaller size,
+    reports truncated=False and silently omits the remaining page(s)."""
+    service = _mock_drive_service(monkeypatch)
+    monkeypatch.setattr(google_drive, "get_tool_max_output_length", lambda: 3000)
+
+    page1 = [
+        {
+            "id": f"perm{i}",
+            "type": "user",
+            "role": "reader",
+            "emailAddress": f"user{i}@example.com",
+            "displayName": "中文姓名" * 5,
+        }
+        for i in range(15)
+    ]
+    page2 = [
+        {"id": "perm15", "type": "user", "role": "reader", "emailAddress": "a@x.com"},
+        {"id": "perm16", "type": "user", "role": "reader", "emailAddress": "b@x.com"},
+    ]
+    service.permissions.return_value.list.return_value.execute.side_effect = [
+        {"permissions": page1, "nextPageToken": "page2"},
+        {"permissions": page2},
+    ]
+
+    result = json.loads(google_drive.google_drive_list_permissions("fid"))
+
+    assert service.permissions.return_value.list.call_count == 2
+    assert result["status"] == "success"
+    assert result["truncated"] is False
+    assert {p["id"] for p in result["permissions"]} == {f"perm{i}" for i in range(17)}
 
 
 def test_list_permissions_defaults_missing_key(monkeypatch):

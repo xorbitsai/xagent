@@ -5,7 +5,7 @@ import os
 import re
 from collections.abc import Callable
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build  # type: ignore[import-not-found]
@@ -16,12 +16,7 @@ from googleapiclient.http import (  # type: ignore[import-not-found]
 from mcp.server.fastmcp import FastMCP
 
 from ....config import get_tool_max_output_length
-from .utils import (
-    clamp_limit,
-    require_clean_identifier,
-    resolve_id_from_url,
-    setup_proxy_env,
-)
+from .utils import clamp_limit, require_clean_identifier, setup_proxy_env
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("google-drive-mcp")
@@ -37,32 +32,26 @@ mcp = FastMCP("google-drive-mcp")
 # than the bare id. The optional "u/<n>/" branch tolerates the account-index
 # segment Google inserts (e.g. ".../file/u/1/d/<id>/view") whenever more than
 # one Google account is signed into the browser -- see google_sheets.py's
-# identical (?:u/\d+/)? tolerance for the spreadsheets URL shape. The
-# "[?&]id=" branch matches the older `drive.google.com/open?id=<id>` /
-# `docs.google.com/open?id=<id>` share-link format, still emitted by
-# DriveApp.getUrl() in Apps Script and some third-party integrations, which
-# has no "/d/<id>" path segment for the first branch to match at all --
-# _resolve_file_id below is what keeps that branch from being host-agnostic.
-# "(?!e/)" after each "d/" excludes the "published to web" link shape
+# identical (?:u/\d+/)? tolerance for the spreadsheets URL shape. "(?!e/)"
+# after each "d/" excludes the "published to web" link shape
 # (".../d/e/<publish-id>/pubhtml"): that "e" is a literal path segment, not
 # part of the id, and the real Drive file id isn't present in that URL at
 # all -- the published-to-web token isn't a valid fileId, so this must not
-# match rather than confidently return the wrong string ("e").
-_DRIVE_URL_ID_PATTERN = re.compile(
-    r"(?:/(?:file/(?:u/\d+/)?d|folders|document/(?:u/\d+/)?d"
-    r"|spreadsheets/(?:u/\d+/)?d|presentation/(?:u/\d+/)?d)/(?!e/)|[?&]id=)"
+# match rather than confidently return the wrong string ("e"). Applied only
+# to a URL's parsed .path (see _resolve_file_id) rather than searched over
+# the whole raw string, so a match can't come from an unrelated substring
+# elsewhere in the URL (e.g. a query value).
+_DRIVE_PATH_ID_PATTERN = re.compile(
+    r"/(?:file/(?:u/\d+/)?d|folders|document/(?:u/\d+/)?d"
+    r"|spreadsheets/(?:u/\d+/)?d|presentation/(?:u/\d+/)?d)/(?!e/)"
     r"([a-zA-Z0-9_-]+)"
 )
 
 # Hosts _resolve_file_id treats as an authoritative Drive/Docs/Sheets/Slides
-# share link. Both the path patterns above and the query-string "id="
-# fallback are otherwise host-agnostic regex/substring matches -- without
-# this check, an untrusted URL (e.g. quoted inside a document an agent
-# reads) that merely happens to contain a matching shape, most easily
-# "?id=<attacker-chosen-id>" since "id" is an extremely common, generic
-# query-param name across the web, would get its id extracted and passed
-# to a share/delete/permission call as if it were this connector's own
-# link.
+# share link. Without this check, an untrusted URL (e.g. quoted inside a
+# document an agent reads) that merely happens to parse with a matching
+# path/query shape would have its id extracted and passed to a share/
+# delete/permission call as if it were this connector's own link.
 _DRIVE_URL_HOSTS = frozenset({"drive.google.com", "docs.google.com"})
 
 # "owner" is deliberately excluded: ownership transfer needs
@@ -88,32 +77,60 @@ _SHARE_ROLES = ("reader", "commenter", "writer")
 # email addresses; the previous "@" not in email check accepted all three.
 _EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
+# Loop-safety bound for google_drive_list_permissions' pagination, not a
+# real expected page count (that's governed by output-size capping instead)
+# -- just enough to guarantee termination if a misbehaving API response
+# kept returning a nextPageToken forever.
+_MAX_PERMISSION_LIST_PAGES = 1000
+
 
 def _resolve_file_id(file_id: str) -> str:
-    if isinstance(file_id, str):
-        stripped = file_id.strip()
-        # A real Drive id is always [a-zA-Z0-9_-]+ and never contains "/"
-        # or "?", so only a value containing one of those characters can be
-        # a URL shape in the first place -- only those go through the host
-        # check. This matters because urlparse only populates
-        # .scheme/.hostname for a string with an explicit "scheme://" (or a
-        # leading "//") prefix: a scheme-less "evil.com/file/d/<id>/view"
-        # (at least as natural a shape for an attacker to plant in text an
-        # agent reads as a full https:// URL) would otherwise report an
-        # empty scheme/hostname and slip straight past a bare
-        # urlparse(stripped) check into the host-agnostic pattern match
-        # below -- exactly the bypass the host allowlist exists to close.
-        # Prepending "//" when there's no "//" already present makes
-        # urlparse treat a bare "host/path" or "host?query" the same way
-        # it treats an explicit "//host/path" protocol-relative URL.
-        if re.search(r"[/?]", stripped):
-            try:
-                parsed = urlparse(stripped if "//" in stripped else f"//{stripped}")
-            except ValueError:
-                return stripped
-            if parsed.hostname not in _DRIVE_URL_HOSTS:
-                return stripped
-    return resolve_id_from_url(file_id, _DRIVE_URL_ID_PATTERN, "file_id")
+    """Return the id captured out of a Drive/Docs/Sheets/Slides share link,
+    or ``file_id`` itself (stripped) when it's already a bare id -- or, for
+    anything URL-shaped that isn't a trusted link, unresolved verbatim so an
+    obviously-invalid fileId reaches the API instead of a silently wrong one.
+
+    A real Drive id is always ``[a-zA-Z0-9_-]+`` and never contains "/" or
+    "?", so only a value containing one of those characters is even
+    considered URL-shaped; a bare id short-circuits immediately.
+
+    urlparse only populates ``.scheme``/``.netloc`` for a string with an
+    explicit "scheme://" prefix (or at least a leading "//"): a scheme-less
+    "evil.com/file/d/<id>/view" (at least as natural a shape for an
+    attacker to plant in text an agent reads as a full https:// URL) would
+    otherwise parse with no netloc and slip past a naive urlparse(value)
+    check. Retrying with a "//" prefix only when the *first* parse found no
+    netloc (rather than keying off whether "//" occurs anywhere in the
+    string) correctly handles a scheme-less link that itself contains a
+    nested "https://" further in, e.g. in a "continue=" query value.
+
+    Once the host is confirmed trusted, the id is extracted from the
+    parsed URL's own ``.path``/``.query`` -- not searched over the whole
+    raw string -- so a URL whose overall host is allowed but whose query
+    *value* merely contains a matching shape (".../search?q=/file/d/<id>")
+    can't have that unrelated substring extracted as if it were the URL's
+    own resource id.
+    """
+    if not isinstance(file_id, str):
+        raise ValueError("file_id must be a string")
+    stripped = file_id.strip()
+    if not re.search(r"[/?]", stripped):
+        return stripped
+    try:
+        parsed = urlparse(stripped)
+        if not parsed.netloc:
+            parsed = urlparse(f"//{stripped}")
+    except ValueError:
+        return stripped
+    if parsed.hostname not in _DRIVE_URL_HOSTS:
+        return stripped
+    match = _DRIVE_PATH_ID_PATTERN.search(parsed.path)
+    if match:
+        return match.group(1)
+    query_id = parse_qs(parsed.query).get("id")
+    if query_id:
+        return query_id[0]
+    return stripped
 
 
 def _require_share_role(role: str) -> str:
@@ -285,11 +302,11 @@ def google_drive_create_file(
     and pass plain text or HTML in the content. For normal text files, use "text/plain".
     """
     try:
-        service = get_drive_service()
         file_metadata: dict[str, Any] = {"name": name, "mimeType": mime_type}
         if parent_id:
             file_metadata["parents"] = [_resolve_file_id(parent_id)]
 
+        service = get_drive_service()
         fh = io.BytesIO(content.encode("utf-8"))
 
         # When creating a Google Doc, the upload mime type needs to be the original content's mime type (like text/plain)
@@ -319,7 +336,6 @@ def google_drive_create_folder(name: str, parent_id: str | None = None) -> str:
     Create a new folder in Google Drive.
     """
     try:
-        service = get_drive_service()
         file_metadata: dict[str, Any] = {
             "name": name,
             "mimeType": "application/vnd.google-apps.folder",
@@ -327,6 +343,7 @@ def google_drive_create_folder(name: str, parent_id: str | None = None) -> str:
         if parent_id:
             file_metadata["parents"] = [_resolve_file_id(parent_id)]
 
+        service = get_drive_service()
         folder = (
             service.files()
             .create(
@@ -474,6 +491,7 @@ def google_drive_list_permissions(file_id: str) -> str:
         service = get_drive_service()
         max_output_length = get_tool_max_output_length()
         permissions: list[Any] = []
+        approx_length = 0
         page_token: str | None = None
         # For an item in a Shared Drive, Drive returns at most 100
         # permissions per page when pageSize isn't set (a non-Shared-Drive
@@ -481,7 +499,7 @@ def google_drive_list_permissions(file_id: str) -> str:
         # nextPageToken so a heavily-shared Shared Drive folder isn't
         # silently under-reported. Bounded so a misbehaving API response
         # can't turn this into an infinite loop.
-        for _ in range(1000):
+        for _ in range(_MAX_PERMISSION_LIST_PAGES):
             results = (
                 service.permissions()
                 .list(
@@ -495,16 +513,33 @@ def google_drive_list_permissions(file_id: str) -> str:
                 )
                 .execute()
             )
-            permissions.extend(results.get("permissions", []))
-            page_token = results.get("nextPageToken")
-            if not page_token:
-                break
+            new_permissions = results.get("permissions", [])
+            permissions.extend(new_permissions)
             # _capped_list_response below will halve this back down to fit
             # the output limit regardless, so once there's already enough
             # data to exceed it, fetching further pages is pure waste: more
             # blocking network round-trips for permissions that get thrown
-            # away immediately after.
-            if len(json.dumps(permissions)) > max_output_length:
+            # away immediately after. Tracked incrementally (each new page's
+            # items serialized once, not the whole accumulated list every
+            # iteration) to stay O(n) rather than O(n^2) for a long
+            # permission list; ensure_ascii=False so this length estimate
+            # isn't inflated relative to what _capped_list_response will
+            # actually measure -- with the default ensure_ascii=True, a
+            # non-ASCII displayName/emailAddress (CJK, accented, emoji names
+            # are common on a Shared Drive) would each be escaped to a
+            # 6+-byte \uXXXX sequence here even though the real response
+            # keeps them as 1-2 bytes, overestimating this list as needing
+            # to stop paginating even though the true payload would still
+            # fit -- and _capped_list_response would then measure the true,
+            # smaller size and leave truncated=False, silently under-
+            # reporting collaborators while claiming a complete result.
+            approx_length += sum(
+                len(json.dumps(p, ensure_ascii=False)) for p in new_permissions
+            )
+            page_token = results.get("nextPageToken")
+            if not page_token:
+                break
+            if approx_length > max_output_length:
                 break
 
         return _capped_list_response("permissions", permissions)

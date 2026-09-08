@@ -115,3 +115,88 @@ def test_url_path_id_output_survives_requests_url_normalization():
 
     with pytest.raises(ValueError):
         utils.url_path_id("..", "record_id")
+
+
+def test_datetime_key_for_comparison_truncates_seven_digit_fractional_seconds():
+    """Outlook commonly reports 100-nanosecond (7-digit) fractional
+    seconds, one more digit than a microsecond can hold - this must not
+    depend on whichever CPython version happens to run it."""
+    key = utils.datetime_key_for_comparison("2026-08-27T10:00:00.0000000")
+    assert key == utils.datetime_key_for_comparison("2026-08-27T10:00:00")
+
+
+def test_datetime_key_for_comparison_treats_equal_instants_as_equal_across_offsets():
+    z_form = utils.datetime_key_for_comparison("2026-08-27T02:00:00Z")
+    offset_form = utils.datetime_key_for_comparison("2026-08-27T10:00:00+08:00")
+    assert z_form == offset_form
+
+
+def test_datetime_key_for_comparison_falls_back_to_raw_string_on_malformed_input():
+    assert utils.datetime_key_for_comparison("not-a-date") == "not-a-date"
+
+
+def test_datetime_key_for_comparison_passes_none_through():
+    assert utils.datetime_key_for_comparison(None) is None
+
+
+def test_normalize_addresses_drops_case_insensitive_duplicates():
+    """Regression test: email addresses are case-insensitive, so the same
+    person listed twice with different casing must not become two separate
+    attendee entries downstream - keeps the first casing seen."""
+    assert utils.normalize_addresses(
+        ["Chelsea@Example.com", "chelsea@example.com", "new@example.com"]
+    ) == ["Chelsea@Example.com", "new@example.com"]
+
+
+def test_normalize_addresses_dedup_works_for_comma_separated_string_input():
+    assert utils.normalize_addresses("a@x.com, A@X.com, b@x.com") == [
+        "a@x.com",
+        "b@x.com",
+    ]
+
+
+def test_attendees_were_given_treats_empty_string_as_not_provided():
+    assert utils.attendees_were_given(None) is False
+    assert utils.attendees_were_given("") is False
+
+
+def test_attendees_were_given_treats_empty_list_as_provided():
+    """An explicit [] is a deliberate "clear everyone" - distinct from
+    not-provided, unlike an empty string."""
+    assert utils.attendees_were_given([]) is True
+    assert utils.attendees_were_given(["a@x.com"]) is True
+    assert utils.attendees_were_given("a@x.com") is True
+
+
+def test_unchecked_extra_empty_when_nothing_unchecked():
+    assert utils.unchecked_extra([], None) == {}
+    assert utils.unchecked_extra([], "some reason") == {}
+
+
+def test_unchecked_extra_includes_reason_only_when_given():
+    assert utils.unchecked_extra(["a@x.com"], None) == {
+        "unchecked_attendees": ["a@x.com"]
+    }
+    assert utils.unchecked_extra(["a@x.com"], "reconnect the connector") == {
+        "unchecked_attendees": ["a@x.com"],
+        "unchecked_reason": "reconnect the connector",
+    }
+
+
+def test_attendees_needing_check_disjoint_window_checks_everyone():
+    assert utils.attendees_needing_check(
+        ["old@x.com", "new@x.com"],
+        {"old@x.com"},
+        moved_to_a_disjoint_window=True,
+    ) == ["old@x.com", "new@x.com"]
+
+
+def test_attendees_needing_check_same_or_overlapping_window_checks_only_new():
+    """An existing attendee's schedule always shows this event's own busy
+    block for a window it still occupies - only newly-added attendees are
+    safe to check there."""
+    assert utils.attendees_needing_check(
+        ["old@x.com", "new@x.com"],
+        {"old@x.com"},
+        moved_to_a_disjoint_window=False,
+    ) == ["new@x.com"]

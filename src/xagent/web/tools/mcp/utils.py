@@ -314,15 +314,23 @@ def reject_reversed_window(start_value: str, end_value: str) -> None:
     Deliberately permissive when either side doesn't parse to a real,
     comparable instant (stays silent rather than rejecting) - matching
     this module's other datetime comparisons, which treat "can't tell"
-    as "don't block", not "assume invalid".
+    as "don't block", not "assume invalid". That includes the case where
+    both sides parse but one is offset-aware and the other naive (e.g. a
+    ``Z``-suffixed value alongside a naive one): Python raises
+    ``TypeError`` comparing those with ``<=`` even though both are real
+    ``datetime`` instances, so the ``isinstance`` check alone isn't
+    enough to guarantee a safe comparison - see ``windows_overlap``,
+    which guards the identical hazard the same way.
     """
     start_key = datetime_key_for_comparison(start_value)
     end_key = datetime_key_for_comparison(end_value)
-    if (
-        isinstance(start_key, datetime)
-        and isinstance(end_key, datetime)
-        and end_key <= start_key
-    ):
+    if not (isinstance(start_key, datetime) and isinstance(end_key, datetime)):
+        return
+    try:
+        reversed_or_empty = end_key <= start_key
+    except TypeError:
+        return
+    if reversed_or_empty:
         raise ValueError(f"end ({end_value!r}) must be after start ({start_value!r}).")
 
 

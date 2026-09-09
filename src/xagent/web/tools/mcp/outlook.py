@@ -779,6 +779,8 @@ def outlook_update_event(
             existing_start = existing_start_field.get("dateTime")
             effective_start = start_datetime or existing_start
             effective_end = end_datetime or existing_end
+            if effective_start and effective_end:
+                _reject_reversed_window(effective_start, effective_end)
             # Both boundaries always end up denominated in the same zone
             # here: when only one of start_datetime/end_datetime is given
             # (single_boundary_update), `existing_zone` already equals

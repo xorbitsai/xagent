@@ -237,6 +237,18 @@ def test_reject_reversed_window_is_permissive_on_unparseable_input():
     utils.reject_reversed_window("not-a-date", "also-not-a-date")
 
 
+def test_reject_reversed_window_is_permissive_when_aware_and_naive_are_mixed():
+    """Regression test: both sides parse to real `datetime` instances, but
+    comparing an offset-aware one against a naive one with `<=` raises
+    `TypeError` in Python - the `isinstance` check alone doesn't guard
+    against this, only checking that both are `datetime` instances of the
+    SAME awareness does. Must stay permissive here, not crash with a raw
+    TypeError, matching `windows_overlap`'s handling of the identical
+    hazard."""
+    utils.reject_reversed_window("2026-08-27T10:30:00", "2026-08-27T10:30:00Z")
+    utils.reject_reversed_window("2026-08-27T10:30:00Z", "2026-08-27T10:00:00")
+
+
 def test_resolve_zone_name_covers_graphs_additional_time_zones():
     """Regression test: `_WINDOWS_TO_IANA` was missing several of the
     Windows names for zones Microsoft's own dateTimeTimeZone docs list

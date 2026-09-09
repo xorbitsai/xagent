@@ -58,15 +58,20 @@ def _is_insufficient_scope_error(exc: Any) -> bool:
     error = data.get("error") if isinstance(data, dict) else None
     if not isinstance(error, dict):
         return False
-    for entry in error.get("errors") or []:
-        if isinstance(entry, dict) and entry.get("reason") == "insufficientPermissions":
-            return True
-    for entry in error.get("details") or []:
-        if (
-            isinstance(entry, dict)
-            and entry.get("reason") == "ACCESS_TOKEN_SCOPE_INSUFFICIENT"
-        ):
-            return True
+    for field, reason in (
+        ("errors", "insufficientPermissions"),
+        ("details", "ACCESS_TOKEN_SCOPE_INSUFFICIENT"),
+    ):
+        entries = error.get(field)
+        if not isinstance(entries, list):
+            # A real Google error body always shapes these as arrays -
+            # this is defensive against a malformed/unexpected body,
+            # which is exactly the "can't tell" case this function
+            # already treats as False elsewhere (e.g. non-JSON content).
+            continue
+        for entry in entries:
+            if isinstance(entry, dict) and entry.get("reason") == reason:
+                return True
     return False
 
 
@@ -654,6 +659,8 @@ def google_calendar_update_events(
         existing_end = _event_boundary(event.get("end"), calendar_timezone)
         effective_start = start_time or existing_start
         effective_end = end_time or existing_end
+        if effective_start and effective_end:
+            _reject_reversed_window(effective_start, effective_end)
         existing_start_key = _datetime_key_for_comparison(existing_start)
         existing_end_key = _datetime_key_for_comparison(existing_end)
         effective_start_key = _datetime_key_for_comparison(effective_start)

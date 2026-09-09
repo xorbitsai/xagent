@@ -1337,6 +1337,28 @@ def test_update_events_moving_time_checks_organizer_and_all_attendees(fake_servi
     assert queried_emails == {"existing@example.com"}
 
 
+def test_update_events_rejects_a_reversed_window(fake_service):
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+        "attendees": [],
+    }
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-27T10:30:00+08:00",
+            end_time="2026-08-27T10:00:00+08:00",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "must be after" in result["message"]
+    assert fake_service._events.list_calls == []
+    assert fake_service._events.update_calls == []
+
+
 def test_freebusy_lookup_is_case_insensitive(fake_service):
     """Not confirmed against real Google API behavior, but the lookup should
     be defensive either way: a case-mismatched key must not silently
@@ -1565,6 +1587,18 @@ def test_is_insufficient_scope_error_rejects_unrelated_403():
 def test_is_insufficient_scope_error_tolerates_malformed_body():
     malformed = HttpError(_FakeHttpResp(403), b"not json")
     assert calendar._is_insufficient_scope_error(malformed) is False
+
+
+def test_is_insufficient_scope_error_tolerates_non_list_error_fields():
+    """Regression test: valid JSON whose "errors"/"details" field is
+    present but isn't an array (e.g. a boolean/object, from a malformed
+    or unexpected error body) must not crash - `x or []` treats a truthy
+    non-list value as itself, and iterating a non-iterable raises
+    TypeError; must fall through to "can't tell, so False" instead."""
+    non_list_fields = HttpError(
+        _FakeHttpResp(403), b'{"error": {"errors": true, "details": 42}}'
+    )
+    assert calendar._is_insufficient_scope_error(non_list_fields) is False
 
 
 def test_freebusy_other_http_errors_still_propagate(fake_service):

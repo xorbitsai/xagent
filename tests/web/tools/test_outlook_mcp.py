@@ -866,6 +866,31 @@ def test_update_event_moving_time_checks_organizer_and_all_attendees(monkeypatch
     assert graph_request.call_count == 3
 
 
+def test_update_event_rejects_a_reversed_window(monkeypatch):
+    graph_request = Mock(
+        return_value={
+            "start": {"dateTime": "2026-08-27T09:00:00", "timeZone": "UTC"},
+            "end": {"dateTime": "2026-08-27T09:30:00", "timeZone": "UTC"},
+            "attendees": [],
+            "isAllDay": False,
+        }
+    )
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_update_event(
+            event_id="self-1",
+            start_datetime="2026-08-27T10:30:00",
+            end_datetime="2026-08-27T10:00:00",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "must be after" in result["message"]
+    # Only the existing-event GET - no calendarView/getSchedule/PATCH.
+    assert graph_request.call_count == 1
+
+
 def test_all_day_events_are_no_longer_exempt_from_conflict_checks(monkeypatch):
     """Regression check: the create path used to skip the conflict check
     whenever is_all_day was True, with no equivalent skip on the Google

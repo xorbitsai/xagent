@@ -5,6 +5,7 @@ import urllib.request
 from datetime import datetime
 from typing import Any
 from urllib.parse import quote
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dateutil import parser as _date_parser
 from dateutil.rrule import rrulestr as _rrulestr
@@ -122,11 +123,30 @@ def success_with_capped_dict(field_name: str, data: Any) -> str:
     return response
 
 
+def resolve_zoneinfo(timezone: str) -> ZoneInfo:
+    """Resolve an IANA timezone name to a stdlib ZoneInfo, raising a clean
+    ValueError (naming the bad value) instead of letting ZoneInfoNotFoundError
+    propagate unworded."""
+    try:
+        return ZoneInfo(timezone)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ValueError(f"unknown timezone: {timezone!r}") from exc
+
+
+def _strip_rrule_prefix(rrule_text: str) -> str:
+    """Return `rrule_text` with any leading "RRULE:" (case-insensitive)
+    removed and outer whitespace trimmed - the one place this stripping
+    happens, so `ensure_rrule_prefix` and `parse_rrule` can't drift apart
+    on what counts as "the prefix"."""
+    body = rrule_text.strip()
+    if body.upper().startswith("RRULE:"):
+        body = body[len("RRULE:") :]
+    return body.strip()
+
+
 def ensure_rrule_prefix(rrule_text: str) -> str:
-    """Return `rrule_text` with a leading "RRULE:" if it doesn't already
-    have one (matching the prefix `parse_rrule` strips - kept in one place
-    so the two don't drift out of sync), with its body canonicalized to
-    uppercase.
+    """Return `rrule_text` with a leading "RRULE:" (adding one if it
+    doesn't already have one), with its body canonicalized to uppercase.
 
     RFC 5545's RRULE grammar has no case-sensitive free-text values - every
     token (FREQ's value, BYDAY's day codes, the "T"/"Z" markers in UNTIL,
@@ -136,13 +156,14 @@ def ensure_rrule_prefix(rrule_text: str) -> str:
     otherwise reach Google's API as literal text at whatever case the
     caller happened to use.
     """
-    body = rrule_text.strip()
-    if body.upper().startswith("RRULE:"):
-        body = body[len("RRULE:") :]
-    return f"RRULE:{body.strip().upper()}"
+    return f"RRULE:{_strip_rrule_prefix(rrule_text).upper()}"
 
 
-def parse_rrule(rrule_text: str, dtstart: str | datetime) -> dict[str, str]:
+def parse_rrule(
+    rrule_text: str,
+    dtstart: str | datetime,
+    timezone: str | None = None,
+) -> dict[str, str]:
     """Validate an RFC 5545 RRULE string and return its components (FREQ,
     INTERVAL, BYDAY, UNTIL, COUNT, ...) as a plain dict of upper-cased keys
     to raw string values.
@@ -160,9 +181,17 @@ def parse_rrule(rrule_text: str, dtstart: str | datetime) -> dict[str, str]:
     RFC3339/ISO8601 string (matching what these calendar tools already
     require for start_time/start_datetime), or a `datetime` directly when
     the caller already has one on hand (e.g. after localizing a naive
-    Outlook start time) - skipping the
-    format-then-reparse round trip that passing `.isoformat()` back in
-    would otherwise cost.
+    Outlook start time) - skipping the format-then-reparse round trip that
+    passing `.isoformat()` back in would otherwise cost.
+
+    ``timezone``, if given, localizes a naive ``dtstart`` (e.g. an all-day
+    Google event's bare "date", or an Outlook naive dateTime with no
+    embedded offset) before validation. This matters beyond cosmetics:
+    RFC 5545 requires DTSTART and UNTIL to either both be timezone-aware or
+    both be "floating" - a naive DTSTART paired with the (very common)
+    "Z"-suffixed/aware UNTIL is otherwise rejected by dateutil with a
+    confusingly-worded error, and the UNTIL-not-before-dtstart check above
+    can't run at all without an aware anchor to compare against.
 
     The returned dict (rather than the parsed rrule object) is what
     callers actually build a provider payload from: Google takes the RRULE
@@ -171,9 +200,13 @@ def parse_rrule(rrule_text: str, dtstart: str | datetime) -> dict[str, str]:
     dateutil's internal representation, just confirmation that the text is
     valid RFC 5545.
     """
-    body = rrule_text.strip()
-    if body.upper().startswith("RRULE:"):
-        body = body[len("RRULE:") :]
+    if "\n" in rrule_text or "\r" in rrule_text:
+        raise ValueError(
+            "recurrence rule must not contain embedded newlines (this could "
+            "smuggle an extra RRULE/EXDATE/RDATE line into the calendar API "
+            "request)"
+        )
+    body = _strip_rrule_prefix(rrule_text)
     if not body:
         raise ValueError("recurrence rule must not be empty")
 
@@ -191,6 +224,37 @@ def parse_rrule(rrule_text: str, dtstart: str | datetime) -> dict[str, str]:
             "recurrence rule must include FREQ, e.g. "
             "'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;UNTIL=20260911T235959Z'"
         )
+    if "UNTIL" in parts and "COUNT" in parts:
+        raise ValueError(
+            "recurrence rule must not specify both UNTIL and COUNT - RFC "
+            "5545 treats these as mutually exclusive ways to end a series"
+        )
+    if "INTERVAL" in parts:
+        try:
+            interval_value = int(parts["INTERVAL"])
+        except ValueError:
+            raise ValueError(
+                f"invalid recurrence rule: INTERVAL must be an integer, "
+                f"got {parts['INTERVAL']!r}"
+            ) from None
+        if interval_value < 1:
+            raise ValueError(
+                "invalid recurrence rule: INTERVAL must be a positive "
+                f"integer, got {interval_value}"
+            )
+    if "COUNT" in parts:
+        try:
+            count_value = int(parts["COUNT"])
+        except ValueError:
+            raise ValueError(
+                f"invalid recurrence rule: COUNT must be an integer, got "
+                f"{parts['COUNT']!r}"
+            ) from None
+        if count_value < 1:
+            raise ValueError(
+                "invalid recurrence rule: COUNT must be a positive integer, "
+                f"got {count_value}"
+            )
 
     if isinstance(dtstart, datetime):
         anchor = dtstart
@@ -201,6 +265,8 @@ def parse_rrule(rrule_text: str, dtstart: str | datetime) -> dict[str, str]:
             raise ValueError(
                 f"invalid start time for recurrence rule: {dtstart}"
             ) from exc
+    if anchor.tzinfo is None and timezone is not None:
+        anchor = anchor.replace(tzinfo=resolve_zoneinfo(timezone))
     try:
         _rrulestr(f"RRULE:{body}", dtstart=anchor)
     except (ValueError, TypeError) as exc:
@@ -209,10 +275,10 @@ def parse_rrule(rrule_text: str, dtstart: str | datetime) -> dict[str, str]:
     # dateutil's rrulestr above does NOT catch this: an UNTIL before dtstart
     # parses fine and just silently yields zero occurrences - a "recurring"
     # event that never actually recurs, reported as success. Only checked
-    # when both sides are timezone-aware (the well-defined case both
-    # callers actually produce by the time they get here); an aware-vs-
-    # naive comparison would raise TypeError rather than answer the
-    # question, so it's skipped rather than guessed at.
+    # when both sides are timezone-aware (guaranteed for every caller that
+    # passes `timezone` above for a naive dtstart, or that already had an
+    # aware one); an aware-vs-naive comparison would raise TypeError rather
+    # than answer the question, so it's skipped rather than guessed at.
     if "UNTIL" in parts:
         try:
             until_dt = _date_parser.isoparse(parts["UNTIL"])

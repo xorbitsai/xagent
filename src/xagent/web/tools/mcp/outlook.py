@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 from datetime import date
 from typing import Any
 from urllib.parse import quote
@@ -8,7 +9,6 @@ from urllib.parse import quote
 import requests
 from dateutil import parser as _date_parser
 from dateutil import tz as _tz
-from dateutil.rrule import weekdays as _RRULE_WEEKDAYS
 from mcp.server.fastmcp import FastMCP
 
 from .utils import parse_rrule, setup_proxy_env
@@ -155,6 +155,8 @@ def _resolve_timezone(timezone: str) -> Any:
     name first (what this tool itself always writes) and falling back to a
     short list of common Windows-style identifiers (what Graph often
     reports for events created by other clients) before giving up."""
+    if not timezone.strip():
+        raise ValueError("timezone must not be blank")
     zone = _tz.gettz(timezone)
     if zone is not None:
         return zone
@@ -186,9 +188,92 @@ def _rrule_until_to_date(until: str, zone: Any) -> str:
     return parsed.date().isoformat()
 
 
-def _weekday_code_from_date(date_str: str) -> str:
-    """The RRULE two-letter day code (MO/TU/.../SU) for a 'YYYY-MM-DD' date."""
-    return str(_RRULE_WEEKDAYS[date.fromisoformat(date_str).weekday()])
+_WEEKDAY_INDEX_TO_GRAPH_DAY = (
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+)
+
+
+def _graph_day_from_date(date_str: str) -> str:
+    """The Graph day-of-week name (monday/tuesday/.../sunday) for a
+    'YYYY-MM-DD' date."""
+    return _WEEKDAY_INDEX_TO_GRAPH_DAY[date.fromisoformat(date_str).weekday()]
+
+
+_NUMBERED_BYDAY_RE = re.compile(r"^([+-]?)(\d+)?(MO|TU|WE|TH|FR|SA|SU)$")
+
+_ORDINAL_TO_GRAPH_INDEX = {1: "first", 2: "second", 3: "third", 4: "fourth", -1: "last"}
+
+
+def _parse_relative_byday(byday: str) -> tuple[str, list[str]]:
+    """Parse a numbered BYDAY value (e.g. "2TU" for "the second Tuesday", or
+    "-1FR,-1SA" for "the last Friday and Saturday") into the (index,
+    daysOfWeek) pair Graph's relativeMonthly/relativeYearly pattern needs.
+
+    Every code must carry the same numeric ordinal - Graph's `index` field
+    applies to the whole pattern, not per-day, so "2TU,3WE" ("second
+    Tuesday" and "third Wednesday" together) has no single-index Graph
+    equivalent and must be rejected rather than silently collapsed to one
+    of the two ordinals. Likewise a code with no ordinal at all (plain
+    "MO") means something different under RFC 5545 (every such weekday in
+    the period, not one specific occurrence) and is rejected rather than
+    guessed at.
+    """
+    ordinal: int | None = None
+    days: list[str] = []
+    seen_days: set[str] = set()
+    for raw_code in byday.split(","):
+        code = raw_code.strip().upper()
+        match = _NUMBERED_BYDAY_RE.match(code)
+        if not match:
+            raise ValueError(f"invalid day code in BYDAY: {raw_code!r}")
+        sign, number, day_code = match.groups()
+        if number is None:
+            raise ValueError(
+                f"unsupported recurrence pattern: BYDAY={byday!r} includes "
+                f"{raw_code!r} with no numeric ordinal; a relative pattern "
+                "needs one on every day (e.g. '2TU' for 'the second "
+                "Tuesday', not 'TU')"
+            )
+        this_ordinal = int(f"{sign}{number}")
+        if this_ordinal not in _ORDINAL_TO_GRAPH_INDEX:
+            raise ValueError(
+                f"unsupported recurrence pattern: BYDAY ordinal "
+                f"{this_ordinal} has no Outlook equivalent; this connector "
+                "only supports 1st/2nd/3rd/4th, and -1 (last)"
+            )
+        if ordinal is None:
+            ordinal = this_ordinal
+        elif ordinal != this_ordinal:
+            raise ValueError(
+                f"unsupported recurrence pattern: BYDAY={byday!r} mixes "
+                "different numeric ordinals; Outlook's recurrence index "
+                "applies to the whole rule, not per day"
+            )
+        if day_code not in seen_days:
+            seen_days.add(day_code)
+            days.append(_RRULE_DAY_TO_GRAPH[day_code])
+    assert ordinal is not None
+    return _ORDINAL_TO_GRAPH_INDEX[ordinal], days
+
+
+# Components every FREQ recognizes in this connector, on top of whatever a
+# specific FREQ branch below consumes - checked once a pattern is built, so
+# a component this connector silently ignores (e.g. BYDAY on a plain DAILY
+# rule, or BYSETPOS/BYHOUR/BYWEEKNO anywhere) is rejected instead of just
+# never making it into the Graph payload.
+_COMMON_RRULE_KEYS = {"FREQ", "INTERVAL", "UNTIL", "COUNT", "WKST"}
+_FREQ_RECOGNIZED_KEYS = {
+    "DAILY": set(),
+    "WEEKLY": {"BYDAY"},
+    "MONTHLY": {"BYDAY", "BYMONTHDAY"},
+    "YEARLY": {"BYDAY", "BYMONTH", "BYMONTHDAY"},
+}
 
 
 def _int_rrule_component(
@@ -226,15 +311,19 @@ def _build_graph_recurrence(
     Microsoft Graph's event.recurrence expects.
 
     Graph has no "just take this RRULE text" input the way Google Calendar
-    does, so this maps the common cases Toby is expected to produce
-    (daily, weekly, absolute monthly, absolute yearly) and fails loudly on
-    anything else - a relative pattern like "second Tuesday of the month"
-    needs an index (first/second/.../last) Graph requires but an RRULE
-    without a numeric BYDAY prefix doesn't carry, so guessing here would
-    silently produce the wrong days rather than the ones actually asked
-    for. Numeric components (INTERVAL, BYMONTHDAY, BYMONTH) are
-    range-checked here too, rather than left for Graph's API to reject
-    remotely with an opaque error.
+    does, so this maps the cases Toby is expected to produce: daily,
+    weekly, absolute monthly/yearly (a plain BYMONTHDAY/BYMONTH, or none at
+    all - RFC 5545 then derives it from the start date), and relative
+    monthly/yearly via a numbered BYDAY (e.g. "2TU" for "the second
+    Tuesday", "-1FR" for "the last Friday") translated into Graph's
+    index+daysOfWeek. Any other component this connector doesn't translate
+    for the given FREQ (e.g. BYDAY on a plain DAILY rule, or BYSETPOS/
+    BYHOUR/BYWEEKNO anywhere) is rejected rather than silently dropped -
+    dateutil's own RRULE validation accepts these as syntactically valid,
+    but ignoring them here would translate a rule into a materially
+    different, broader recurrence with no warning. Numeric components
+    (INTERVAL, BYMONTHDAY, BYMONTH) are range-checked here too, rather than
+    left for Graph's API to reject remotely with an opaque error.
 
     start_datetime here is Outlook's own convention: a naive local
     dateTime paired with a separate timeZone field, unlike Google's
@@ -258,7 +347,16 @@ def _build_graph_recurrence(
             f"invalid recurrence rule: INTERVAL must be a positive integer, "
             f"got {parts.get('INTERVAL')!r}"
         )
-    start_date = start_datetime.split("T", 1)[0]
+    start_date = anchor.date().isoformat()
+
+    if freq in _FREQ_RECOGNIZED_KEYS:
+        leftover = set(parts) - _COMMON_RRULE_KEYS - _FREQ_RECOGNIZED_KEYS[freq]
+        if leftover:
+            raise ValueError(
+                "unsupported recurrence pattern: this connector does not "
+                f"translate {', '.join(sorted(leftover))} for FREQ={freq} "
+                "into an Outlook recurrence"
+            )
 
     pattern: dict[str, Any]
     if freq == "DAILY":
@@ -267,21 +365,45 @@ def _build_graph_recurrence(
         byday = parts.get("BYDAY")
         if byday:
             days = []
+            seen_days: set[str] = set()
             for code in byday.split(","):
                 clean_code = code.strip().upper()
                 if clean_code not in _RRULE_DAY_TO_GRAPH:
                     raise ValueError(f"invalid day code in BYDAY: {code!r}")
-                days.append(_RRULE_DAY_TO_GRAPH[clean_code])
+                if clean_code not in seen_days:
+                    seen_days.add(clean_code)
+                    days.append(_RRULE_DAY_TO_GRAPH[clean_code])
         else:
-            days = [_RRULE_DAY_TO_GRAPH[_weekday_code_from_date(start_date)]]
-        pattern = {"type": "weekly", "interval": interval, "daysOfWeek": days}
+            days = [_graph_day_from_date(start_date)]
+        wkst_code = parts.get("WKST", "MO").strip().upper()
+        if wkst_code not in _RRULE_DAY_TO_GRAPH:
+            raise ValueError(f"invalid day code in WKST: {parts['WKST']!r}")
+        pattern = {
+            "type": "weekly",
+            "interval": interval,
+            "daysOfWeek": days,
+            # RFC 5545 defaults WKST to Monday when omitted; Graph's own
+            # firstDayOfWeek default is Sunday - stamping it explicitly
+            # keeps interval-boundary weeks consistent with the RRULE's
+            # actual (possibly implicit) semantics instead of silently
+            # picking up Graph's different default.
+            "firstDayOfWeek": _RRULE_DAY_TO_GRAPH[wkst_code],
+        }
     elif freq == "MONTHLY" and "BYMONTHDAY" in parts and "BYDAY" in parts:
         raise ValueError(
             "unsupported recurrence pattern: FREQ=MONTHLY with both "
             'BYMONTHDAY and BYDAY (e.g. "the 15th, but only if a '
             "Tuesday\") has no equivalent in Outlook's recurrence model"
         )
-    elif freq == "MONTHLY" and "BYDAY" not in parts:
+    elif freq == "MONTHLY" and "BYDAY" in parts:
+        index, days = _parse_relative_byday(parts["BYDAY"])
+        pattern = {
+            "type": "relativeMonthly",
+            "interval": interval,
+            "daysOfWeek": days,
+            "index": index,
+        }
+    elif freq == "MONTHLY":
         # BYMONTHDAY defaults to DTSTART's own day of month when omitted
         # (RFC 5545's own rule for an unqualified FREQ=MONTHLY), so this
         # covers "repeat monthly on the 15th" (BYMONTHDAY=15) as well as
@@ -292,7 +414,17 @@ def _build_graph_recurrence(
             "interval": interval,
             "dayOfMonth": day_of_month,
         }
-    elif freq == "YEARLY" and "BYDAY" not in parts:
+    elif freq == "YEARLY" and "BYDAY" in parts:
+        index, days = _parse_relative_byday(parts["BYDAY"])
+        month = _int_rrule_component(parts, "BYMONTH", anchor.month, 1, 12)
+        pattern = {
+            "type": "relativeYearly",
+            "interval": interval,
+            "daysOfWeek": days,
+            "index": index,
+            "month": month,
+        }
+    elif freq == "YEARLY":
         # Same RFC 5545 default as above: an omitted BYMONTH/BYMONTHDAY is
         # derived from DTSTART's own month/day.
         month = _int_rrule_component(parts, "BYMONTH", anchor.month, 1, 12)
@@ -306,10 +438,9 @@ def _build_graph_recurrence(
     else:
         raise ValueError(
             f"unsupported recurrence pattern (FREQ={freq}); this connector "
-            "only translates DAILY, WEEKLY, MONTHLY (BYMONTHDAY optional, "
-            "defaulting to the start date's day), and YEARLY (BYMONTH/"
-            "BYMONTHDAY optional, defaulting to the start date's month/day) "
-            "into an Outlook recurrence"
+            "only translates DAILY, WEEKLY, MONTHLY (BYMONTHDAY or a "
+            "numbered BYDAY), and YEARLY (BYMONTH/BYMONTHDAY or a numbered "
+            "BYDAY) into an Outlook recurrence"
         )
 
     if "UNTIL" in parts:
@@ -525,9 +656,10 @@ def outlook_create_event(
     so this is translated into its own structured recurrence - only
     DAILY, WEEKLY, MONTHLY, and YEARLY rules are supported (MONTHLY's
     BYMONTHDAY and YEARLY's BYMONTH/BYMONTHDAY are optional, defaulting to
-    the start date's own day/month per RFC 5545); anything else is
-    rejected with a clear error rather than silently producing the wrong
-    pattern.
+    the start date's own day/month per RFC 5545; either can instead use a
+    numbered BYDAY, e.g. 'FREQ=MONTHLY;BYDAY=2TU' for "the second Tuesday
+    of every month"); anything else is rejected with a clear error rather
+    than silently producing the wrong pattern.
     """
     try:
         payload: dict[str, Any] = {
@@ -592,32 +724,48 @@ def outlook_update_event(
             effective_start = start_datetime
             effective_timezone = timezone
             if effective_start is None:
+                # Without a `Prefer: outlook.timezone` header, Graph ALWAYS
+                # reports start/end in UTC (both dateTime and
+                # timeZone: "UTC"), regardless of the zone the event was
+                # actually created in - so the calendar-date portion of
+                # that dateTime (which BYDAY-from-start-date derives from,
+                # and which becomes recurrenceRange.startDate) would
+                # silently be the wrong local day whenever the event's true
+                # zone differs from UTC. originalStartTimeZone instead
+                # names the zone the event was really created in, so it's
+                # read first and used to re-fetch start expressed in that
+                # zone, rather than trusting the UTC-defaulted response.
+                existing = _graph_request(
+                    "GET",
+                    f"/me/events/{quote(event_id, safe='')}",
+                    params={"$select": "originalStartTimeZone"},
+                )
+                original_timezone = existing.get("originalStartTimeZone")
+                if (
+                    not original_timezone
+                    or original_timezone == "tzone://Microsoft/Custom"
+                ):
+                    raise ValueError(
+                        "could not determine the event's true creation "
+                        "timezone (originalStartTimeZone is missing or a "
+                        "legacy custom timezone Graph can't resolve by "
+                        "name); pass start_datetime and timezone explicitly "
+                        "to set a recurrence rule on this event"
+                    )
                 existing = _graph_request(
                     "GET",
                     f"/me/events/{quote(event_id, safe='')}",
                     params={"$select": "start"},
+                    extra_headers={"Prefer": f'outlook.timezone="{original_timezone}"'},
                 )
                 existing_start_field = existing.get("start") or {}
                 effective_start = existing_start_field.get("dateTime")
-                if not effective_start:
+                existing_timezone = existing_start_field.get("timeZone")
+                if not effective_start or not existing_timezone:
                     raise ValueError(
                         "could not determine the event's start time to "
                         "validate the recurrence rule; pass start_datetime "
                         "explicitly"
-                    )
-                # `timezone` only pairs with a start_datetime the caller is
-                # ALSO providing, which isn't the case here - Graph's
-                # dateTimeTimeZone object always reports the zone its
-                # dateTime is actually expressed in (defaulting to "UTC"
-                # when no Prefer header was sent, as here), so read that
-                # instead of trusting the caller to have independently
-                # passed a matching timezone.
-                existing_timezone = existing_start_field.get("timeZone")
-                if not existing_timezone:
-                    raise ValueError(
-                        "existing event has no timeZone on its start time; "
-                        "cannot safely build a recurrence rule without an "
-                        "explicit start_datetime for this update"
                     )
                 effective_timezone = existing_timezone
             payload["recurrence"] = _build_graph_recurrence(

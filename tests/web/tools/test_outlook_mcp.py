@@ -46,6 +46,7 @@ def test_build_graph_recurrence_weekly_with_explicit_byday():
         "type": "weekly",
         "interval": 1,
         "daysOfWeek": ["monday", "tuesday", "wednesday", "thursday", "friday"],
+        "firstDayOfWeek": "monday",
     }
     assert recurrence["range"]["endDate"] == "2026-09-11"
 
@@ -230,19 +231,132 @@ def test_build_graph_recurrence_rejects_unmapped_timezone():
         )
 
 
-def test_build_graph_recurrence_rejects_unsupported_pattern():
-    """A relative pattern ("second Tuesday of the month") needs an index
-    Graph requires but plain RRULE components here don't carry - this must
-    be rejected rather than silently produced with the wrong days."""
+def test_build_graph_recurrence_rejects_unsupported_freq():
+    """FREQ=HOURLY is valid RFC 5545 that dateutil accepts, but this
+    connector has no Graph pattern type to translate it into."""
     with pytest.raises(ValueError, match="unsupported recurrence pattern"):
-        outlook._build_graph_recurrence(
-            "FREQ=MONTHLY;BYDAY=2TU", "2026-08-11T07:00:00+08:00"
-        )
+        outlook._build_graph_recurrence("FREQ=HOURLY", "2026-08-11T07:00:00+08:00")
 
 
 def test_build_graph_recurrence_rejects_invalid_rrule():
     with pytest.raises(ValueError, match="invalid recurrence rule"):
         outlook._build_graph_recurrence("FREQ=FORTNIGHTLY", "2026-08-11T07:00:00+08:00")
+
+
+def test_build_graph_recurrence_relative_monthly():
+    """FREQ=MONTHLY;BYDAY=2TU ("the second Tuesday of every month") has no
+    BYMONTHDAY equivalent but does map onto Graph's relativeMonthly type."""
+    recurrence = outlook._build_graph_recurrence(
+        "FREQ=MONTHLY;BYDAY=2TU", "2026-08-11T07:00:00+08:00"
+    )
+
+    assert recurrence["pattern"] == {
+        "type": "relativeMonthly",
+        "interval": 1,
+        "daysOfWeek": ["tuesday"],
+        "index": "second",
+    }
+
+
+def test_build_graph_recurrence_relative_monthly_last_weekday():
+    recurrence = outlook._build_graph_recurrence(
+        "FREQ=MONTHLY;BYDAY=-1FR", "2026-08-11T07:00:00+08:00"
+    )
+
+    assert recurrence["pattern"] == {
+        "type": "relativeMonthly",
+        "interval": 1,
+        "daysOfWeek": ["friday"],
+        "index": "last",
+    }
+
+
+def test_build_graph_recurrence_relative_yearly():
+    recurrence = outlook._build_graph_recurrence(
+        "FREQ=YEARLY;BYMONTH=11;BYDAY=4TH", "2026-08-11T07:00:00+08:00"
+    )
+
+    assert recurrence["pattern"] == {
+        "type": "relativeYearly",
+        "interval": 1,
+        "daysOfWeek": ["thursday"],
+        "index": "fourth",
+        "month": 11,
+    }
+
+
+def test_build_graph_recurrence_relative_pattern_rejects_mixed_ordinals():
+    with pytest.raises(ValueError, match="mixes different numeric ordinals"):
+        outlook._build_graph_recurrence(
+            "FREQ=MONTHLY;BYDAY=2TU,3WE", "2026-08-11T07:00:00+08:00"
+        )
+
+
+def test_build_graph_recurrence_relative_pattern_rejects_missing_ordinal():
+    """A plain (non-numbered) BYDAY on MONTHLY means something different
+    under RFC 5545 (every such weekday in the month) - it must not be
+    silently treated as a relative single-occurrence pattern."""
+    with pytest.raises(ValueError, match="no numeric ordinal"):
+        outlook._build_graph_recurrence(
+            "FREQ=MONTHLY;BYDAY=TU", "2026-08-11T07:00:00+08:00"
+        )
+
+
+def test_build_graph_recurrence_relative_pattern_rejects_unsupported_ordinal():
+    with pytest.raises(ValueError, match="has no Outlook equivalent"):
+        outlook._build_graph_recurrence(
+            "FREQ=MONTHLY;BYDAY=5TU", "2026-08-11T07:00:00+08:00"
+        )
+
+
+def test_build_graph_recurrence_rejects_leftover_byday_on_daily():
+    """BYDAY on a plain DAILY rule is syntactically valid RRULE but this
+    connector's daily pattern has no way to honor it - it must be rejected
+    rather than silently ignored, which would translate the rule into a
+    materially broader "every day" recurrence with no warning."""
+    with pytest.raises(ValueError, match="unsupported recurrence pattern"):
+        outlook._build_graph_recurrence(
+            "FREQ=DAILY;BYDAY=MO", "2026-08-11T07:00:00+08:00"
+        )
+
+
+def test_build_graph_recurrence_rejects_leftover_bysetpos():
+    with pytest.raises(ValueError, match="BYSETPOS"):
+        outlook._build_graph_recurrence(
+            "FREQ=WEEKLY;BYDAY=MO;BYSETPOS=1", "2026-08-11T07:00:00+08:00"
+        )
+
+
+def test_build_graph_recurrence_weekly_dedupes_byday():
+    recurrence = outlook._build_graph_recurrence(
+        "FREQ=WEEKLY;BYDAY=MO,MO,TU", "2026-08-11T07:00:00+08:00"
+    )
+
+    assert recurrence["pattern"]["daysOfWeek"] == ["monday", "tuesday"]
+
+
+def test_build_graph_recurrence_weekly_defaults_first_day_of_week_to_monday():
+    """RFC 5545 defaults WKST to Monday when omitted, but Graph's own
+    firstDayOfWeek default is Sunday - the RRULE's own default must be
+    stamped explicitly rather than picking up Graph's different one."""
+    recurrence = outlook._build_graph_recurrence(
+        "FREQ=WEEKLY;BYDAY=MO,TU", "2026-08-11T07:00:00+08:00"
+    )
+
+    assert recurrence["pattern"]["firstDayOfWeek"] == "monday"
+
+
+def test_build_graph_recurrence_weekly_honors_explicit_wkst():
+    recurrence = outlook._build_graph_recurrence(
+        "FREQ=WEEKLY;BYDAY=MO,TU;WKST=SU", "2026-08-11T07:00:00+08:00"
+    )
+
+    assert recurrence["pattern"]["firstDayOfWeek"] == "sunday"
+
+
+def test_resolve_timezone_rejects_blank_string():
+    with pytest.raises(ValueError, match="must not be blank"):
+        outlook._resolve_timezone("")
 
 
 def test_create_event_sends_translated_recurrence(monkeypatch):
@@ -332,9 +446,13 @@ def test_update_event_adds_recurrence_using_the_passed_start_datetime(monkeypatc
 def test_update_event_fetches_existing_start_when_not_provided(monkeypatch):
     """Setting recurrence without also moving the event must validate and
     translate the rule against the event's own existing start time rather
-    than requiring the caller to repeat it."""
+    than requiring the caller to repeat it. Without a Prefer header Graph
+    always reports start in UTC regardless of the event's true zone, so
+    this must first read originalStartTimeZone and re-fetch start
+    expressed in that zone rather than trusting the UTC-defaulted GET."""
     graph_request = Mock(
         side_effect=[
+            {"originalStartTimeZone": "UTC"},
             {"start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "UTC"}},
             {"id": "updated"},
         ]
@@ -349,10 +467,16 @@ def test_update_event_fetches_existing_start_when_not_provided(monkeypatch):
     )
 
     assert result["status"] == "success"
-    assert graph_request.call_count == 2
-    get_call = graph_request.call_args_list[0]
-    assert get_call.args[:2] == ("GET", "/me/events/existing-1")
-    patch_call = graph_request.call_args_list[1]
+    assert graph_request.call_count == 3
+    tz_get_call = graph_request.call_args_list[0]
+    assert tz_get_call.args[:2] == ("GET", "/me/events/existing-1")
+    assert tz_get_call.kwargs["params"] == {"$select": "originalStartTimeZone"}
+    start_get_call = graph_request.call_args_list[1]
+    assert start_get_call.args[:2] == ("GET", "/me/events/existing-1")
+    assert start_get_call.kwargs["extra_headers"] == {
+        "Prefer": 'outlook.timezone="UTC"'
+    }
+    patch_call = graph_request.call_args_list[2]
     assert patch_call.kwargs["body"]["recurrence"]["range"]["startDate"] == (
         "2026-08-26"
     )
@@ -372,6 +496,7 @@ def test_update_event_uses_the_existing_events_own_timezone_not_the_default(
     whenever the event's local day differs from its UTC day."""
     graph_request = Mock(
         side_effect=[
+            {"originalStartTimeZone": "Asia/Manila"},
             {"start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "Asia/Manila"}},
             {"id": "updated"},
         ]
@@ -386,7 +511,7 @@ def test_update_event_uses_the_existing_events_own_timezone_not_the_default(
     )
 
     assert result["status"] == "success"
-    patch_call = graph_request.call_args_list[1]
+    patch_call = graph_request.call_args_list[2]
     recurrence = patch_call.kwargs["body"]["recurrence"]
     assert recurrence["range"]["recurrenceTimeZone"] == "Asia/Manila"
     # 2026-08-26 is a Wednesday; deriving the weekday from the wrong
@@ -395,8 +520,8 @@ def test_update_event_uses_the_existing_events_own_timezone_not_the_default(
     assert recurrence["pattern"]["daysOfWeek"] == ["wednesday"]
 
 
-def test_update_event_fails_loudly_when_existing_event_has_no_timezone(monkeypatch):
-    graph_request = Mock(return_value={"start": {"dateTime": "2026-08-26T07:00:00"}})
+def test_update_event_fails_loudly_when_original_timezone_is_unavailable(monkeypatch):
+    graph_request = Mock(return_value={})
     monkeypatch.setattr(outlook, "_graph_request", graph_request)
 
     result = json.loads(
@@ -407,7 +532,50 @@ def test_update_event_fails_loudly_when_existing_event_has_no_timezone(monkeypat
     )
 
     assert result["status"] == "error"
-    assert "timeZone" in result["message"]
+    assert "originalStartTimeZone" in result["message"]
+    graph_request.assert_called_once()
+
+
+def test_update_event_fails_loudly_on_legacy_custom_timezone(monkeypatch):
+    """Graph's documented placeholder for an unresolvable legacy custom
+    timezone (set in desktop Outlook) - there's no name to resolve it by,
+    so this must be rejected rather than passed to Graph's Prefer header
+    as a literal, meaningless value."""
+    graph_request = Mock(
+        return_value={"originalStartTimeZone": "tzone://Microsoft/Custom"}
+    )
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_update_event(
+            event_id="existing-1",
+            recurrence="FREQ=WEEKLY;COUNT=5",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "originalStartTimeZone" in result["message"]
+    graph_request.assert_called_once()
+
+
+def test_update_event_fails_loudly_when_prefer_header_get_has_no_start(monkeypatch):
+    graph_request = Mock(
+        side_effect=[
+            {"originalStartTimeZone": "Asia/Manila"},
+            {"start": {}},
+        ]
+    )
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_update_event(
+            event_id="existing-1",
+            recurrence="FREQ=WEEKLY;COUNT=5",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "could not determine the event's start time" in result["message"]
 
 
 def test_update_event_rejects_invalid_recurrence_without_calling_graph(monkeypatch):

@@ -228,6 +228,89 @@ def test_parse_rrule_naive_dtstart_with_utc_until_is_rejected_by_dateutil_itself
         )
 
 
+def test_parse_rrule_timezone_localizes_naive_dtstart_for_utc_until():
+    """Confirmed bug: unlike the previous test (no timezone given), passing
+    a resolvable IANA timezone must localize a naive dtstart so it can be
+    compared against a "Z"-suffixed UNTIL instead of dateutil rejecting the
+    aware/naive mismatch."""
+    parts = utils.parse_rrule(
+        "FREQ=DAILY;UNTIL=20260911T235959Z",
+        "2026-08-26T07:00:00",
+        timezone="Asia/Shanghai",
+    )
+    assert parts["UNTIL"] == "20260911T235959Z"
+
+
+def test_parse_rrule_timezone_still_rejects_until_before_dtstart():
+    with pytest.raises(ValueError, match="before the start time"):
+        utils.parse_rrule(
+            "FREQ=DAILY;UNTIL=20260101T000000Z",
+            "2026-08-26T07:00:00",
+            timezone="Asia/Shanghai",
+        )
+
+
+def test_parse_rrule_rejects_unknown_timezone():
+    with pytest.raises(ValueError, match="unknown timezone"):
+        utils.parse_rrule(
+            "FREQ=DAILY;UNTIL=20260911T235959Z",
+            "2026-08-26T07:00:00",
+            timezone="Not/ARealZone",
+        )
+
+
+def test_parse_rrule_rejects_non_positive_interval():
+    with pytest.raises(ValueError, match="INTERVAL must be a positive integer"):
+        utils.parse_rrule("FREQ=DAILY;INTERVAL=0", "2026-08-26T07:00:00+08:00")
+
+
+def test_parse_rrule_rejects_non_integer_interval():
+    with pytest.raises(ValueError, match="INTERVAL must be an integer"):
+        utils.parse_rrule("FREQ=DAILY;INTERVAL=abc", "2026-08-26T07:00:00+08:00")
+
+
+def test_parse_rrule_rejects_non_positive_count():
+    with pytest.raises(ValueError, match="COUNT must be a positive integer"):
+        utils.parse_rrule("FREQ=DAILY;COUNT=0", "2026-08-26T07:00:00+08:00")
+
+
+def test_parse_rrule_rejects_non_integer_count():
+    with pytest.raises(ValueError, match="COUNT must be an integer"):
+        utils.parse_rrule("FREQ=DAILY;COUNT=abc", "2026-08-26T07:00:00+08:00")
+
+
+def test_parse_rrule_rejects_until_and_count_together():
+    """RFC 5545 treats UNTIL and COUNT as mutually exclusive ways to end a
+    series - dateutil's own rrulestr validation does not catch this
+    (COUNT simply wins), so it must be checked explicitly."""
+    with pytest.raises(ValueError, match="must not specify both UNTIL and COUNT"):
+        utils.parse_rrule(
+            "FREQ=DAILY;UNTIL=20260911T235959Z;COUNT=5",
+            "2026-08-26T07:00:00+08:00",
+        )
+
+
+def test_parse_rrule_rejects_embedded_newline():
+    """A newline could smuggle an extra RRULE/EXDATE/RDATE line into the
+    calendar API request past this connector's single-RRULE validation."""
+    with pytest.raises(ValueError, match="embedded newlines"):
+        utils.parse_rrule(
+            "FREQ=DAILY\nEXDATE:20260101T000000Z",
+            "2026-08-26T07:00:00+08:00",
+        )
+
+
+def test_resolve_zoneinfo_returns_zoneinfo_for_valid_iana_name():
+    from zoneinfo import ZoneInfo
+
+    assert utils.resolve_zoneinfo("Asia/Shanghai") == ZoneInfo("Asia/Shanghai")
+
+
+def test_resolve_zoneinfo_rejects_unknown_timezone():
+    with pytest.raises(ValueError, match="unknown timezone"):
+        utils.resolve_zoneinfo("Not/ARealZone")
+
+
 def test_url_path_id_output_survives_requests_url_normalization():
     """Confirms the actual exploit this guards against: a naively
     interpolated ".." collapses the path via requests' own URL

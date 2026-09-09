@@ -46,7 +46,14 @@ from .models.public_mcp import PublicMCPApp
 # scopes at all, yet the callback would still complete (MYOB's businessId
 # guard has nothing to do with scopes) and activate the app's UserMCPServer
 # against a grant with zero sme-* permissions.
-APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT = frozenset({"facebook", "github", "myob"})
+#
+# meta-ads: same reasoning as facebook -- its "ads_read" scope isn't part of
+# the meta provider's default_scopes and is brand new (no pre-existing bare
+# "meta" grant could ever have carried it), so a bare connect must never be
+# treated as satisfying it.
+APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT = frozenset(
+    {"facebook", "github", "myob", "meta-ads"}
+)
 
 
 def _normalize_oauth_grant_key(value: object) -> str | None:

@@ -1094,6 +1094,30 @@ def test_update_slide_skips_delete_text_when_placeholder_has_only_a_newline(
     assert requests[0]["insertText"]["text"] == "First title"
 
 
+def test_update_slide_still_clears_whitespace_beyond_the_bare_terminator(monkeypatch):
+    """Regression guard: only the exact "" or "\\n" (the implicit
+    terminator) should skip deleteText — any other whitespace-only text
+    (e.g. a stray " \\n" left by a slide edited by something other than
+    this tool) must still be cleared. insertText has no insertionIndex
+    here, so it defaults to prepending rather than replacing; skipping
+    the delete for arbitrary whitespace would leave that stale text
+    merged into what's supposed to be a clean replacement."""
+    presentations = Mock()
+    presentations.batchUpdate.return_value.execute.return_value = {}
+    _mock_slides_service(monkeypatch, presentations)
+    _mock_presentation_get(
+        presentations,
+        "slide1",
+        [_placeholder_element("title_obj", "TITLE", text=" \n")],
+    )
+
+    google_slides.google_slides_update_slide("pres1", "slide1", title="First title")
+
+    requests = _batch_update_requests(presentations)
+    delete_req = next(r["deleteText"] for r in requests if "deleteText" in r)
+    assert delete_req["objectId"] == "title_obj"
+
+
 def test_update_slide_only_touches_the_field_provided(monkeypatch):
     presentations = Mock()
     presentations.batchUpdate.return_value.execute.return_value = {}
@@ -1360,6 +1384,37 @@ def test_update_slide_writes_title_into_centered_title_placeholder(monkeypatch):
     assert title_insert["text"] == "New title"
 
 
+def test_update_slide_writes_body_into_object_placeholder(monkeypatch):
+    """OBJECT is a real Slides placeholder type common on slides from an
+    imported/non-standard-theme presentation (e.g. one converted from
+    PowerPoint) — update_slide must recognize it as a body-role
+    placeholder like BODY/SUBTITLE, not reject it as unrecognized."""
+    presentations = Mock()
+    presentations.batchUpdate.return_value.execute.return_value = {}
+    _mock_slides_service(monkeypatch, presentations)
+    _mock_presentation_get(
+        presentations,
+        "slide1",
+        [_placeholder_element("body_obj", "OBJECT", text="Old detail")],
+    )
+
+    result = json.loads(
+        google_slides.google_slides_update_slide("pres1", "slide1", body="New detail")
+    )
+
+    assert result["status"] == "success"
+    requests = _batch_update_requests(presentations)
+    body_insert = next(
+        r["insertText"]
+        for r in requests
+        if "insertText" in r and r["insertText"]["objectId"] == "body_obj"
+    )
+    assert body_insert["text"] == "New detail"
+    # OBJECT is a generic content placeholder, not the same as a real
+    # bulleted BODY list — bullets are only applied for the "BODY" type.
+    assert not any("createParagraphBullets" in r for r in requests)
+
+
 def test_update_slide_only_targets_the_first_placeholder_of_a_duplicated_role(
     monkeypatch,
 ):
@@ -1463,10 +1518,11 @@ def test_delete_slide_rejects_id_that_is_not_a_slide(monkeypatch):
     """Regression guard: a placeholder shape id (e.g. one this file itself
     mints as f"{slide_id}_title") must not be silently accepted — Slides'
     deleteObject would delete just that shape while reporting success as if
-    the whole slide had been removed. The presentation genuinely contains
-    a shape with this id (nested inside slide1's pageElements, not as a
-    top-level slide) — proving the rejection is because it's the wrong
-    *kind* of id, not merely because "slide1_title" is unrecognized."""
+    the whole slide had been removed. The mocked presentation genuinely
+    contains a shape with this id — nested inside slide1's pageElements,
+    not as a top-level slide — confirming _find_slide's rejection comes
+    from checking only top-level slide ids (by design), not from the id
+    being absent from the API response altogether."""
     presentations = Mock()
     _mock_slides_service(monkeypatch, presentations)
     _mock_presentation_get(

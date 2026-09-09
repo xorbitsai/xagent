@@ -603,7 +603,18 @@ def google_slides_update_slide(
                 continue
             element, placeholder_type = placeholders[role]
             object_id = element["objectId"]
-            if _element_text(element).strip():
+            # Slides represents a "cleared" placeholder as a lone trailing
+            # "\n" (the implicit paragraph terminator every text-containing
+            # shape carries), not a truly empty string — treat exactly
+            # that (or genuinely empty) as nothing-to-delete. Anything
+            # else, even whitespace-only text beyond that terminator (e.g.
+            # a stray " \n" from a slide edited by something other than
+            # this tool), still gets deleteText: insertText has no
+            # insertionIndex here, so it defaults to prepending at the
+            # start rather than replacing — skipping the delete for
+            # arbitrary whitespace would leave that stale text merged
+            # into what's supposed to be a clean replacement.
+            if _element_text(element) not in ("", "\n"):
                 requests.append(
                     {
                         "deleteText": {

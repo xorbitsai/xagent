@@ -191,6 +191,34 @@ def _weekday_code_from_date(date_str: str) -> str:
     return str(_RRULE_WEEKDAYS[date.fromisoformat(date_str).weekday()])
 
 
+def _int_rrule_component(
+    parts: dict[str, str], key: str, default: int, low: int, high: int
+) -> int:
+    """Parse an RRULE numeric component (BYMONTHDAY/BYMONTH), defaulting to
+    `default` - the corresponding field from DTSTART, per RFC 5545's own
+    rule that an omitted BYMONTHDAY/BYMONTH is derived from the start date
+    - when the component is absent. Range-checks the result and raises a
+    clean error for a value `int()` can't parse (e.g. a comma-separated
+    multi-value list, valid RFC 5545 but with no single-value equivalent
+    in Graph's pattern) instead of letting a raw ValueError propagate.
+    """
+    if key not in parts:
+        return default
+    try:
+        value = int(parts[key])
+    except ValueError:
+        raise ValueError(
+            f"unsupported recurrence pattern: this connector only supports "
+            f"a single value for {key}, got {parts[key]!r}"
+        ) from None
+    if not low <= value <= high:
+        raise ValueError(
+            f"invalid recurrence rule: {key} must be between {low} and "
+            f"{high} for this connector, got {value}"
+        )
+    return value
+
+
 def _build_graph_recurrence(
     recurrence: str, start_datetime: str, timezone: str = "UTC"
 ) -> dict[str, Any]:
@@ -247,38 +275,28 @@ def _build_graph_recurrence(
         else:
             days = [_RRULE_DAY_TO_GRAPH[_weekday_code_from_date(start_date)]]
         pattern = {"type": "weekly", "interval": interval, "daysOfWeek": days}
-    elif freq == "MONTHLY" and "BYMONTHDAY" in parts:
-        if "BYDAY" in parts:
-            raise ValueError(
-                "unsupported recurrence pattern: FREQ=MONTHLY with both "
-                'BYMONTHDAY and BYDAY (e.g. "the 15th, but only if a '
-                "Tuesday\") has no equivalent in Outlook's recurrence model"
-            )
-        day_of_month = int(parts["BYMONTHDAY"])
-        if not 1 <= day_of_month <= 31:
-            raise ValueError(
-                "invalid recurrence rule: BYMONTHDAY must be between 1 and "
-                f'31 for this connector (negative offsets like "last day '
-                f"of the month\" aren't supported), got {day_of_month}"
-            )
+    elif freq == "MONTHLY" and "BYMONTHDAY" in parts and "BYDAY" in parts:
+        raise ValueError(
+            "unsupported recurrence pattern: FREQ=MONTHLY with both "
+            'BYMONTHDAY and BYDAY (e.g. "the 15th, but only if a '
+            "Tuesday\") has no equivalent in Outlook's recurrence model"
+        )
+    elif freq == "MONTHLY" and "BYDAY" not in parts:
+        # BYMONTHDAY defaults to DTSTART's own day of month when omitted
+        # (RFC 5545's own rule for an unqualified FREQ=MONTHLY), so this
+        # covers "repeat monthly on the 15th" (BYMONTHDAY=15) as well as
+        # plain "repeat monthly" (no BYMONTHDAY at all).
+        day_of_month = _int_rrule_component(parts, "BYMONTHDAY", anchor.day, 1, 31)
         pattern = {
             "type": "absoluteMonthly",
             "interval": interval,
             "dayOfMonth": day_of_month,
         }
-    elif freq == "YEARLY" and "BYMONTH" in parts and "BYMONTHDAY" in parts:
-        month = int(parts["BYMONTH"])
-        if not 1 <= month <= 12:
-            raise ValueError(
-                f"invalid recurrence rule: BYMONTH must be between 1 and "
-                f"12, got {month}"
-            )
-        day_of_month = int(parts["BYMONTHDAY"])
-        if not 1 <= day_of_month <= 31:
-            raise ValueError(
-                "invalid recurrence rule: BYMONTHDAY must be between 1 and "
-                f"31 for this connector, got {day_of_month}"
-            )
+    elif freq == "YEARLY" and "BYDAY" not in parts:
+        # Same RFC 5545 default as above: an omitted BYMONTH/BYMONTHDAY is
+        # derived from DTSTART's own month/day.
+        month = _int_rrule_component(parts, "BYMONTH", anchor.month, 1, 12)
+        day_of_month = _int_rrule_component(parts, "BYMONTHDAY", anchor.day, 1, 31)
         pattern = {
             "type": "absoluteYearly",
             "interval": interval,
@@ -288,8 +306,10 @@ def _build_graph_recurrence(
     else:
         raise ValueError(
             f"unsupported recurrence pattern (FREQ={freq}); this connector "
-            "only translates DAILY, WEEKLY, MONTHLY with BYMONTHDAY, and "
-            "YEARLY with BYMONTH/BYMONTHDAY into an Outlook recurrence"
+            "only translates DAILY, WEEKLY, MONTHLY (BYMONTHDAY optional, "
+            "defaulting to the start date's day), and YEARLY (BYMONTH/"
+            "BYMONTHDAY optional, defaulting to the start date's month/day) "
+            "into an Outlook recurrence"
         )
 
     if "UNTIL" in parts:
@@ -503,9 +523,11 @@ def outlook_create_event(
     e.g. 'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;UNTIL=20260911T235959Z' for
     "every weekday until Sep 11, 2026". Graph has no direct RRULE input,
     so this is translated into its own structured recurrence - only
-    DAILY, WEEKLY, MONTHLY (with BYMONTHDAY), and YEARLY (with BYMONTH/
-    BYMONTHDAY) rules are supported; anything else is rejected with a
-    clear error rather than silently producing the wrong pattern.
+    DAILY, WEEKLY, MONTHLY, and YEARLY rules are supported (MONTHLY's
+    BYMONTHDAY and YEARLY's BYMONTH/BYMONTHDAY are optional, defaulting to
+    the start date's own day/month per RFC 5545); anything else is
+    rejected with a clear error rather than silently producing the wrong
+    pattern.
     """
     try:
         payload: dict[str, Any] = {

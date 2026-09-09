@@ -127,6 +127,46 @@ def test_build_graph_recurrence_absolute_yearly():
     }
 
 
+def test_build_graph_recurrence_monthly_without_bymonthday_defaults_to_start_date():
+    """RFC 5545: an unqualified FREQ=MONTHLY (no BYMONTHDAY) repeats on
+    DTSTART's own day of the month - the most natural way to say "repeat
+    monthly" must actually work, not be rejected as unsupported."""
+    recurrence = outlook._build_graph_recurrence(
+        "FREQ=MONTHLY", "2026-08-15T07:00:00+08:00"
+    )
+
+    assert recurrence["pattern"] == {
+        "type": "absoluteMonthly",
+        "interval": 1,
+        "dayOfMonth": 15,
+    }
+
+
+def test_build_graph_recurrence_yearly_without_bymonth_defaults_to_start_date():
+    """Same RFC 5545 default as MONTHLY: an unqualified FREQ=YEARLY
+    repeats on DTSTART's own month and day."""
+    recurrence = outlook._build_graph_recurrence(
+        "FREQ=YEARLY", "2026-08-15T07:00:00+08:00"
+    )
+
+    assert recurrence["pattern"] == {
+        "type": "absoluteYearly",
+        "interval": 1,
+        "dayOfMonth": 15,
+        "month": 8,
+    }
+
+
+def test_build_graph_recurrence_rejects_multi_value_bymonthday():
+    """BYMONTHDAY=15,20 is valid RFC 5545 (multiple days per month), but
+    Graph's absoluteMonthly pattern only accepts a single dayOfMonth - a
+    raw ValueError from int("15,20") must not leak through unworded."""
+    with pytest.raises(ValueError, match="only supports a single value"):
+        outlook._build_graph_recurrence(
+            "FREQ=MONTHLY;BYMONTHDAY=15,20", "2026-08-15T07:00:00+08:00"
+        )
+
+
 def test_build_graph_recurrence_rejects_bymonthday_with_byday_on_monthly():
     """FREQ=MONTHLY with both BYMONTHDAY and BYDAY (e.g. "the 15th, but
     only if a Tuesday") is valid RFC 5545 - dateutil accepts it - but

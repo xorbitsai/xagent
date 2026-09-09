@@ -453,12 +453,15 @@ def google_calendar_update_events(
         if location:
             event["location"] = location
         if recurrence:
-            effective_start = start_time or event.get("start", {}).get("dateTime")
+            effective_start = (
+                start_time
+                or event.get("start", {}).get("dateTime")
+                or event.get("start", {}).get("date")
+            )
             if not effective_start:
                 raise ValueError(
-                    "could not determine the event's start time to validate "
-                    "the recurrence rule (it may be an all-day event); pass "
-                    "start_time explicitly"
+                    "could not determine the event's start time or date to "
+                    "validate the recurrence rule; pass start_time explicitly"
                 )
             new_rrule = _normalize_rrule(recurrence, effective_start)[0]
             event["recurrence"] = _merge_recurrence(event.get("recurrence"), new_rrule)

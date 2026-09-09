@@ -218,18 +218,40 @@ def test_update_events_rejects_invalid_recurrence_without_calling_the_api(
     service.events.return_value.update.assert_not_called()
 
 
-def test_update_events_rejects_recurrence_on_all_day_event_without_start_time(
+def test_update_events_derives_recurrence_start_from_all_day_events_date_field(
     monkeypatch,
 ):
-    """An all-day event has no "dateTime" (only "date"), so a caller
-    setting recurrence without also passing start_time must get a clear
-    error instead of an opaque TypeError from parsing None as a
-    datetime."""
+    """An all-day event has no "dateTime" (only "date") - recurrence must
+    still be derivable from that date without requiring the caller to
+    redundantly repeat start_time just because the event happens to be
+    all-day."""
     existing_event = {
         "id": "existing-1",
         "start": {"date": "2026-08-26"},
         "end": {"date": "2026-08-27"},
     }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=DAILY",
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["body"]["recurrence"] == ["RRULE:FREQ=DAILY"]
+
+
+def test_update_events_rejects_recurrence_when_no_start_information_exists(
+    monkeypatch,
+):
+    """Neither "dateTime" nor "date" present on the existing event (a
+    malformed/unexpected shape) must still get a clear error instead of an
+    opaque TypeError from parsing None as a datetime."""
+    existing_event = {"id": "existing-1"}
     service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
     monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
 

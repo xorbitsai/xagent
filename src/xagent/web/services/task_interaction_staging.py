@@ -60,10 +60,16 @@ Caller obligations, because none of them happen here:
   the two a direct caller can still see after the reclaim UPDATE has
   already committed in this transaction.
 
-Zero production callers as of this module's introduction: a static test
-(``tests/web/services/test_interaction_staging_production_gate.py``) asserts
-that no production module imports or calls either entry point. See that
-test's docstring for the removal condition.
+One production caller today: ``task_interaction_service.create`` enters
+``interaction_handoff`` and calls ``stage()``. ``create()`` itself still
+has zero production callers, held there by a live gate
+(``tests/web/services/test_task_interaction_service_create_gate.py``), so
+the chain is not reachable in production yet. The old zero-caller gate on
+this module's two entry points was replaced by three static guards
+(``tests/web/services/test_interaction_handoff_production_surface.py``)
+asserting: the only production use of ``interaction_handoff`` is
+``task_interaction_service``, validation always runs before it is
+entered, and only the three modules that need it import from this one.
 
 Every rejection the database's 23 CHECK constraints could raise on the
 INSERT is rejected in plain Python first, inside

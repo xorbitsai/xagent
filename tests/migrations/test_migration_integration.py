@@ -12,8 +12,10 @@ Usage:
 """
 
 import argparse
+import concurrent.futures
 import os
 import tempfile
+import threading
 from pathlib import Path
 
 import pytest
@@ -594,6 +596,123 @@ class TestMigrations:
             version2 = result.scalar()
 
         assert version1 == version2, "Version should not change on re-run"
+
+    @pytest.mark.postgresql
+    @pytest.mark.parametrize(
+        "drift_sql",
+        [
+            "ALTER TABLE actor_mcp_server_connections "
+            "ALTER COLUMN encrypted_env TYPE TEXT USING encrypted_env::text",
+            "ALTER TABLE actor_mcp_server_connections "
+            "ALTER COLUMN lifecycle_generation SET DEFAULT "
+            "'00000000-0000-0000-0000-000000000000'::uuid",
+            "ALTER TABLE actor_mcp_server_connections DROP CONSTRAINT "
+            "ck_actor_mcp_server_connections_generation_nonempty; "
+            "ALTER TABLE actor_mcp_server_connections ADD CONSTRAINT "
+            "ck_actor_mcp_server_connections_generation_nonempty CHECK (1 = 1)",
+            "ALTER TABLE actor_mcp_server_connections ADD CONSTRAINT "
+            "uq_actor_mcp_server_connections_user_id_drift UNIQUE (user_id)",
+        ],
+        ids=["encrypted-type", "fixed-uuid-default", "same-name-check", "extra-unique"],
+    )
+    def test_postgresql_actor_metadata_adoption_rejects_schema_drift(
+        self, postgresql_tester, drift_sql
+    ):
+        """The actor-storage revision fails closed on reflected semantic drift."""
+        from xagent.web.models.database import Base
+
+        Base.metadata.create_all(bind=postgresql_tester.engine)
+        with postgresql_tester.engine.begin() as conn:
+            conn.exec_driver_sql(drift_sql)
+        command.stamp(
+            postgresql_tester.alembic_cfg,
+            "20260901_seed_zendesk_mcp_app",
+        )
+
+        with pytest.raises(RuntimeError, match="incompatible schema"):
+            command.upgrade(
+                postgresql_tester.alembic_cfg,
+                "20260909_actor_mcp_connections",
+            )
+
+    @pytest.mark.postgresql
+    def test_postgresql_actor_create_is_idempotent_under_real_concurrency(
+        self, postgresql_tester, monkeypatch
+    ):
+        """Two database sessions converge on one row without damaging either tx."""
+        import xagent.web.services.actor_mcp_connections as service
+        from xagent.web.models.database import Base
+        from xagent.web.models.public_mcp import PublicMCPApp
+        from xagent.web.models.user import User
+
+        Base.metadata.create_all(bind=postgresql_tester.engine)
+        session_factory = sessionmaker(bind=postgresql_tester.engine)
+        with session_factory.begin() as session:
+            user = User(username="pg-race-owner", password_hash="x")
+            app = PublicMCPApp(
+                app_id="posthog",
+                name="posthog",
+                transport="stdio",
+                launch_config={"command": "stored-command-is-not-trusted"},
+            )
+            session.add_all([user, app])
+            session.flush()
+            user_id = user.id
+
+        barrier = threading.Barrier(2)
+        thread_state = threading.local()
+        real_lookup = service.get_current_actor_mcp_connection_for_create
+
+        def synchronized_initial_lookup(session, **kwargs):
+            row = real_lookup(session, **kwargs)
+            if row is None and not getattr(thread_state, "initial_lookup_seen", False):
+                thread_state.initial_lookup_seen = True
+                barrier.wait(timeout=10)
+            return row
+
+        monkeypatch.setattr(
+            service,
+            "get_current_actor_mcp_connection_for_create",
+            synchronized_initial_lookup,
+        )
+
+        def create(index):
+            with session_factory() as session:
+                snapshot = service.create_actor_mcp_connection(
+                    session,
+                    user_id=user_id,
+                    resource_owner_key="toby:postgres:race-owner",
+                    app_id="posthog",
+                    credentials={
+                        "POSTHOG_API_KEY": "same-secret",
+                        "POSTHOG_HOST": "https://x.test",
+                    },
+                )
+                session.add(
+                    User(username=f"pg-race-transaction-{index}", password_hash="x")
+                )
+                session.commit()
+                return snapshot.lifecycle_generation
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            generations = list(executor.map(create, range(2)))
+
+        assert generations[0] == generations[1]
+        with session_factory() as session:
+            assert (
+                session.execute(
+                    text("SELECT count(*) FROM actor_mcp_server_connections")
+                ).scalar_one()
+                == 1
+            )
+            assert (
+                session.execute(
+                    text(
+                        "SELECT count(*) FROM users WHERE username LIKE 'pg-race-transaction-%'"
+                    )
+                ).scalar_one()
+                == 2
+            )
 
     def test_sqlite_incremental_upgrade(self, sqlite_tester):
         """Test incremental upgrades from b9d890ed31b5 to head on SQLite.

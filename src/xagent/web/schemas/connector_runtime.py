@@ -1,25 +1,25 @@
-"""Connector runtime requirements: the shared response shape both read
-endpoints return.
+"""Connector runtime requirements: shared response shape and the values
+request body.
 
-The agent-keyed and task-keyed read endpoints both return this same
-requirements report -- which runtime inputs a task's (or a prospective
-task's) connectors declare, and whether each one already has a value --
-never a stored value itself, and never a connector's transport or
-authentication configuration -- the same shape from both, with one field,
-``satisfied``, answering a different question on each; see
+Four producers share the response shape: the agent-keyed and task-keyed
+read endpoints, the task-create response, and the values endpoint's 200
+response. All four describe a requirements report -- which runtime inputs
+a task's (or a prospective task's) connectors declare, and whether each
+one already has a value -- never a stored value itself, and never a
+connector's transport or authentication configuration. One field,
+``satisfied``, answers a different question depending on the producer; see
 ``ConnectorRuntimeRequirementsModel``.
 
-Placed in its own module rather than ``schemas/chat.py`` because a values-
-submission endpoint lands on top of it shortly and will share this same
-response shape as its own 200 body; putting it here now avoids a later
-move that would touch every existing importer.
+Placed in its own module rather than ``schemas/chat.py`` or ``schemas/v1.py``
+because it has more than one audience: folding it into either of those
+modules would couple that module's own audience to the others.
 """
 
 from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 
 class ConnectorRuntimeRefModel(BaseModel):
@@ -107,3 +107,30 @@ class ConnectorRuntimeRequirementsModel(BaseModel):
     satisfied: bool
     secrets_expires_at: str | None
     connectors: list[ConnectorRuntimeConnectorModel]
+
+
+class ConnectorRuntimeValueItem(BaseModel):
+    """One connector's caller-supplied context values.
+
+    ``secrets`` and ``auth_selector`` are deliberately absent from this
+    phase's request shape: ``extra="forbid"`` turns either one into a 422
+    rather than silently accepting and discarding it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    connector_ref: ConnectorRuntimeRefModel
+    context: dict[str, object] | None = None
+
+
+class ConnectorRuntimeValuesRequest(BaseModel):
+    """Body of ``POST /api/chat/task/{task_id}/connector-runtime-values``.
+
+    No override switch of any kind belongs here: a stored value is never
+    replaced, and ``extra="forbid"`` turns an attempt to add one (for
+    example ``if_absent`` or ``force``) into a 422.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[ConnectorRuntimeValueItem]

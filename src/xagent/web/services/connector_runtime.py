@@ -14,6 +14,12 @@ from dataclasses import dataclass
 from threading import RLock
 from typing import Any, Iterable, cast
 
+from sqlalchemy import Text
+from sqlalchemy import cast as sa_cast
+from sqlalchemy import select
+from sqlalchemy import update as sa_update
+from sqlalchemy.engine import CursorResult
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ...core.tools.adapters.vibe.connector_runtime import (
@@ -50,9 +56,16 @@ from ..schemas.connector_runtime import (
     ConnectorRuntimeInputModel,
     ConnectorRuntimeRefModel,
     ConnectorRuntimeRequirementsModel,
+    ConnectorRuntimeValueItem,
 )
 
 logger = logging.getLogger(__name__)
+
+# Two independent size caps on the values endpoint's request: no single
+# key's value may serialize past the first, and the whole batch may not
+# pass the second even if every individual key is within the first.
+_RUNTIME_CONTEXT_VALUE_MAX_BYTES = 64 * 1024
+_RUNTIME_CONTEXT_REQUEST_MAX_BYTES = 256 * 1024
 
 
 @dataclass(frozen=True)
@@ -75,6 +88,21 @@ class ConnectorRuntimeCreatePlan:
 @dataclass(frozen=True)
 class ConnectorRuntimeAppendPlan:
     ephemeral_by_ref: dict[ConnectorRef, dict[str, dict[str, Any]]]
+
+
+@dataclass(frozen=True)
+class _ContextRowSnapshot:
+    """One ``task_connector_runtime_contexts`` row as read for a write attempt.
+
+    ``context_text`` is ``CAST(context AS TEXT)`` rendered by the database
+    itself in the same query that read ``context`` -- never a Python-side
+    re-serialization. It is the only value a subsequent conditional UPDATE
+    may compare against; see ``_update_context_row``.
+    """
+
+    id: int
+    context: dict[str, Any]
+    context_text: str
 
 
 @dataclass(frozen=True)
@@ -434,8 +462,9 @@ def resolve_agent_runtime_requirements(
     -- same filter, same canonical order -- because a caller creating a
     task persists them into ``Task.connector_runtime_selected_refs``, and
     every later reader of that column (the per-turn gate,
-    ``load_connector_runtime_view``) depends on it holding exactly that
-    set. Both the write and the read of that column sort by
+    ``load_connector_runtime_view``, and the values endpoint's selection
+    check in ``_validate_payload_refs``) depends on it holding exactly
+    that set. Both the write and the read of that column sort by
     ``(connector_type, connector_id)``, so the invariant the column
     carries is the set under that canonical order, not the order a caller
     happened to hand over. Do not derive the refs any other way, even one
@@ -494,6 +523,198 @@ def build_task_runtime_requirements(
     selected_refs = _load_task_selected_refs(task)
     stored_context = _load_task_context_rows(db, task_id=int(task.id))
     return _build_task_requirements_model(selected_refs, visible, stored_context)
+
+
+def apply_task_connector_runtime_context_values(
+    *,
+    db: Session,
+    task: Task,
+    agent: Agent | None,
+    payload_items: Iterable[ConnectorRuntimeValueItem],
+) -> ConnectorRuntimeRequirementsModel:
+    """Merge caller-supplied ``context`` values into a task's connector rows.
+
+    Task ownership is the caller's job -- this function trusts the ``task``
+    it is handed and never queries for it. Everything else runs here, in
+    this order:
+
+    1. Request shape: a non-empty item list where every item carries at
+       least one ``context`` key (an empty mapping and an absent one are
+       the same thing).
+    2. (caller's job -- task ownership.)
+    3. A size cap on each key's serialized value and on the batch as a
+       whole.
+    4. No ref repeated within the batch.
+    5. Every ref is currently visible and was selected for this task
+       (``_validate_payload_refs``, shared with the create and append
+       paths).
+    6. Every key is declared and syntactically valid
+       (``_validate_values_against_schema``, reused unchanged).
+    7. Every value matches its declared, normalized type and carries
+       content -- an empty or whitespace-only string, and an empty
+       object, are rejected for optional keys as well as required ones.
+    7b. (encryption-key-configuration gate -- a later phase's tier; this
+        phase's request shape has no ``secrets`` field, so there is
+        nothing for it to check yet. See the note below tier 8.)
+    8. A key already stored with a different value fails the whole batch;
+       one stored with the same value is a no-op; one not yet stored is
+       added.
+    There is no tier 9: this endpoint never asserts that a required key is
+    present, only that what was sent is valid and conflict-free.
+
+    A later phase that adds the ``secrets`` section must not let a stored
+    secret's decode failure (``EncryptionDecodeError``) be caught and
+    treated as "no value stored" -- that would resurrect a value that
+    failed to decrypt as though it had never been set, defeating tier 8's
+    conflict detection for that key. This phase never reads or decodes a
+    secret value, so the case cannot occur yet, but the failure mode is
+    reserved: do not add a broad ``except Exception`` around a future
+    secret read here.
+
+    Tier 6 must run before 7 and 8: both of those format a caller-supplied
+    ``key`` into a ``reason`` string the caller gets back in the response,
+    and that is only safe once tier 6 has confirmed the key matches
+    ``validate_runtime_source_key`` and is declared by the connector --
+    never an arbitrary string the caller wrote.
+
+    Cross-ref ordering splits in two. Validation walks the batch in the
+    order ``payload_items`` arrives in, so which of several bad refs is
+    reported is the caller's own ordering; that is not a leak, because an
+    invisible ref answers a uniform 404 regardless of position and a
+    visible-but-unselected ref answers 400 for something the caller can
+    already see. The write, in contrast, is issued in canonical ref order
+    (``_sort_connector_refs``) no matter how the batch arrived, so two
+    concurrent requests naming the same rows in opposite order still take
+    those rows' locks in the same order and cannot deadlock each other.
+
+    The write is a compare-and-swap on the text the database itself
+    rendered for a row's previous content, retried once after a full
+    reread-and-remerge if the swap misses (either an ``IntegrityError`` on
+    a first-ever row for a ref, or an updated-row-count of zero) -- a
+    second miss surfaces as 503, never a third attempt. A stored-value
+    conflict (tier 8) is a different thing entirely and is never retried:
+    it fails the request immediately, before anything is written.
+
+    Never commits: it only ``add``s, ``flush``es and ``execute``s. The
+    caller commits once this returns, so every key in the batch lands in
+    the same transaction -- a mid-batch failure leaves nothing behind.
+    """
+
+    parsed = _parse_context_value_items(payload_items)
+    if not parsed:
+        raise ConnectorRuntimeError(
+            ERROR_INVALID_RUNTIME_CONTEXT,
+            _message_for_code(ERROR_INVALID_RUNTIME_CONTEXT),
+            details={"reason": "empty_items"},
+        )
+    for ref, context in parsed:
+        if not context:
+            _raise_runtime_error(
+                ERROR_INVALID_RUNTIME_CONTEXT, ref, reason="empty_item_payload"
+            )
+    _reject_oversized_context_payload(parsed)
+    _reject_duplicate_context_refs(parsed)
+    payload_by_ref: dict[ConnectorRef, dict[str, Any]] = dict(parsed)
+
+    connector_user_id = int(task.user_id)
+    agent_team_id = (
+        int(agent.team_id) if agent is not None and agent.team_id is not None else None
+    )
+    visible = _load_visible_runtime_connectors(
+        db, user_id=connector_user_id, agent_team_id=agent_team_id
+    )
+    selected_refs = _load_task_selected_refs(task)
+    _validate_payload_refs(payload_by_ref, visible=visible, selected_refs=selected_refs)
+    for ref, context in payload_by_ref.items():
+        connector = visible[ref]
+        _validate_values_against_schema(ref, connector, context, {}, {})
+        _validate_context_value_types(ref, connector, context)
+        # Tier 7b, the encryption-key-configuration gate, belongs to the
+        # phase that adds the `secrets` section. This request shape has no
+        # `secrets` field (`extra="forbid"` rejects one), so this tier has
+        # no trigger condition here -- do not add a placeholder branch.
+
+    task_id = int(task.id)
+    # Every statement this batch issues against a row goes out in canonical
+    # ref order, never the order the caller happened to list the refs in:
+    # two requests that touch the same two rows in opposite order would
+    # otherwise be able to take the same two row locks in opposite order
+    # and deadlock on PostgreSQL. The same ordering the task's selection
+    # snapshot is written in (`bind_connector_runtime_selection_snapshot`).
+    write_order = _sort_connector_refs(payload_by_ref)
+    rows: dict[ConnectorRef, _ContextRowSnapshot] = {}
+    merged_by_ref: dict[ConnectorRef, dict[str, Any]] = {}
+    written_keys_by_ref: dict[ConnectorRef, list[str]] = {}
+    for attempt in range(2):
+        rows = _load_task_context_row_snapshots(db, task_id=task_id)
+        merged_by_ref = {}
+        for ref, context in payload_by_ref.items():
+            stored_row = rows.get(ref)
+            stored_context = stored_row.context if stored_row is not None else {}
+            merged_by_ref[ref] = _merge_context_values(ref, stored_context, context)
+
+        conflict = False
+        written_keys_by_ref = {}
+        for ref in write_order:
+            merged = merged_by_ref[ref]
+            stored_row = rows.get(ref)
+            if stored_row is None:
+                db.add(
+                    TaskConnectorRuntimeContext(
+                        task_id=task_id,
+                        connector_type=ref.connector_type,
+                        connector_id=ref.connector_id,
+                        context=merged,
+                    )
+                )
+                written_keys_by_ref[ref] = sorted(merged)
+                continue
+            if _canonical_json_text(merged) == _canonical_json_text(stored_row.context):
+                # Same content already on the row: no write statement at
+                # all, not even a same-value UPDATE.
+                continue
+            if not _update_context_row(
+                db,
+                row_id=stored_row.id,
+                context_text_as_read=stored_row.context_text,
+                merged=merged,
+            ):
+                conflict = True
+                break
+            written_keys_by_ref[ref] = sorted(set(merged) - set(stored_row.context))
+
+        if conflict:
+            visible = _retry_or_503(
+                db, attempt=attempt, user_id=connector_user_id, team_id=agent_team_id
+            )
+            continue
+
+        try:
+            db.flush()
+        except IntegrityError:
+            visible = _retry_or_503(
+                db, attempt=attempt, user_id=connector_user_id, team_id=agent_team_id
+            )
+            continue
+        break
+
+    # The only record of a fill, per the design's disclosure: key names,
+    # the connector ref, and a count -- never a value. One line per ref
+    # that actually gained a key; a ref where every submitted key already
+    # matched what was stored logs nothing, because nothing was written.
+    for ref, keys in written_keys_by_ref.items():
+        logger.info(
+            "Connector runtime context values written "
+            "(task_id=%d, connector_ref=%s, key_count=%d, keys=%s)",
+            task_id,
+            ref.storage_key,
+            len(keys),
+            keys,
+        )
+
+    stored_context_after = {ref: row.context for ref, row in rows.items()}
+    stored_context_after.update(merged_by_ref)
+    return _build_task_requirements_model(selected_refs, visible, stored_context_after)
 
 
 def bind_connector_runtime_selection_snapshot(
@@ -817,13 +1038,18 @@ def _has_runtime_declaration(connector: Any) -> bool:
 
 
 def _validate_payload_refs(
-    payload_by_ref: dict[ConnectorRef, ConnectorRuntimePayload],
+    refs: Iterable[ConnectorRef],
     *,
     visible: dict[ConnectorRef, Any],
     selected_refs: tuple[ConnectorRef, ...],
 ) -> None:
+    """Every ref must be visible to the caller now and have been selected
+    by the task. Takes the refs alone: nothing here reads a submitted
+    value, so a caller holding only refs does not have to build payload
+    objects to call it. A mapping keyed by ref satisfies this as it is.
+    """
     selected = set(selected_refs)
-    for ref in payload_by_ref:
+    for ref in refs:
         if ref not in visible:
             _raise_runtime_error(ERROR_CONNECTOR_NOT_FOUND, ref)
         if ref not in selected:
@@ -1012,6 +1238,256 @@ def _build_task_requirements_model(
         secrets_expires_at=None,
         connectors=connectors,
     )
+
+
+def _parse_context_value_items(
+    payload_items: Iterable[ConnectorRuntimeValueItem],
+) -> list[tuple[ConnectorRef, dict[str, Any]]]:
+    """Parse the values endpoint's items into ``(ref, context)`` pairs,
+    without deduplicating or size-checking -- those are separate, later
+    tiers (4 and 3 respectively; see ``apply_task_connector_runtime_context_values``).
+    """
+    parsed: list[tuple[ConnectorRef, dict[str, Any]]] = []
+    for item in payload_items or ():
+        raw_ref = item.connector_ref.model_dump()
+        try:
+            ref = ConnectorRef.from_wire(raw_ref)
+        except ValueError as exc:
+            # An unknown connector_type, or a connector_id that fails
+            # ``ConnectorRef.from_wire``'s ``isinstance(connector_id, int)``
+            # check, cannot identify any real connector, so this is the same
+            # "not found" the visibility check below reports for a
+            # well-formed ref outside the caller's visible set -- not a
+            # request-shape error. (A non-positive connector_id passes this
+            # check -- from_wire does not validate sign -- and is rejected
+            # by that same visibility check instead, one step later.)
+            raise ConnectorRuntimeError(
+                ERROR_CONNECTOR_NOT_FOUND,
+                _message_for_code(ERROR_CONNECTOR_NOT_FOUND),
+                status_code=_status_for_code(ERROR_CONNECTOR_NOT_FOUND),
+            ) from exc
+        context = item.context or {}
+        parsed.append((ref, context))
+    return parsed
+
+
+def _reject_oversized_context_payload(
+    items: list[tuple[ConnectorRef, dict[str, Any]]],
+) -> None:
+    """Tier 3: a per-key cap and a whole-batch cap, checked before this
+    function touches the database -- the caller (the values-endpoint route)
+    has already looked up the task and agent by the time this runs, so this
+    is not the request's first database access. Which key was oversized
+    goes to the log only -- never into the response ``reason`` -- and the
+    log line never carries the value itself, only the key name, the
+    connector ref, and a byte count.
+
+    Both caps measure the value in its stored form. ``json.dumps`` defaults
+    to ``ensure_ascii=True``, so a character outside ASCII counts as the
+    six-character escape sequence JSON writes it as -- which is exactly
+    what SQLAlchemy's JSON column puts in the row, and exactly the text the
+    conditional update in ``_update_context_row`` compares against.
+    Measuring the raw UTF-8 length instead would admit a value two to three
+    times the size of the column the caps exist to bound. A caller whose
+    text is CJK or emoji therefore reaches a cap at roughly half, or a
+    third, of the character count an ASCII caller does; that is the cap's
+    intended meaning, not an oversight.
+    """
+    total_bytes = 0
+    for ref, context in items:
+        for key, value in context.items():
+            encoded_len = len(json.dumps(value).encode("utf-8"))
+            total_bytes += encoded_len
+            if encoded_len > _RUNTIME_CONTEXT_VALUE_MAX_BYTES:
+                logger.warning(
+                    "Connector runtime context value exceeds the per-key "
+                    "size cap (connector_ref=%s, key=%r, bytes=%d)",
+                    ref.storage_key,
+                    key,
+                    encoded_len,
+                )
+                _raise_runtime_error(
+                    ERROR_INVALID_RUNTIME_CONTEXT, ref, reason="payload_too_large"
+                )
+    if total_bytes > _RUNTIME_CONTEXT_REQUEST_MAX_BYTES:
+        logger.warning(
+            "Connector runtime values request exceeds the aggregate size "
+            "cap (bytes=%d)",
+            total_bytes,
+        )
+        raise ConnectorRuntimeError(
+            ERROR_INVALID_RUNTIME_CONTEXT,
+            _message_for_code(ERROR_INVALID_RUNTIME_CONTEXT),
+            details={"reason": "payload_too_large"},
+        )
+
+
+def _reject_duplicate_context_refs(
+    items: list[tuple[ConnectorRef, dict[str, Any]]],
+) -> None:
+    """Tier 4: no ref may appear twice in the same batch."""
+    seen: set[ConnectorRef] = set()
+    for ref, _context in items:
+        if ref in seen:
+            _raise_runtime_error(
+                ERROR_INVALID_RUNTIME_CONTEXT, ref, reason="duplicate_ref"
+            )
+        seen.add(ref)
+
+
+def _validate_context_value_types(
+    ref: ConnectorRef, connector: Any, context: dict[str, Any]
+) -> None:
+    """Tier 7: every value matches its declaration's normalized type and
+    carries content.
+
+    Two rules, in this order. The type first: a key declared ``object``
+    takes a mapping, every other key takes a string. Then content: a
+    string that is empty or strips to nothing, and an empty mapping, are
+    both rejected. That holds whether or not the key is required -- a
+    stored value is never replaced, so a blank one that got in would mark
+    its key filled forever while carrying nothing a connector can use, and
+    the only way out would be a new task.
+
+    Must run after tier 6 (``_validate_values_against_schema``): the ``key``
+    formatted into ``reason`` here is only safe to reflect back to the
+    caller because tier 6 has already confirmed it is syntactically valid
+    and declared, never an arbitrary caller-written string.
+    """
+    declarations = _schema_section(
+        _runtime_input_schema(connector), RUNTIME_INPUT_CONTEXT
+    )
+    for key, value in context.items():
+        declared_type = _normalize_runtime_input_type(declarations.get(key))
+        matches = (
+            isinstance(value, dict)
+            if declared_type == "object"
+            else isinstance(value, str)
+        )
+        if not matches:
+            _raise_runtime_error(
+                ERROR_INVALID_RUNTIME_CONTEXT,
+                ref,
+                reason=f"type_mismatch.{RUNTIME_INPUT_CONTEXT}.{key}",
+            )
+        blank = not value if declared_type == "object" else not value.strip()
+        if blank:
+            _raise_runtime_error(
+                ERROR_INVALID_RUNTIME_CONTEXT,
+                ref,
+                reason=f"empty_value.{RUNTIME_INPUT_CONTEXT}.{key}",
+            )
+
+
+def _merge_context_values(
+    ref: ConnectorRef, stored: dict[str, Any], incoming: dict[str, Any]
+) -> dict[str, Any]:
+    """Tier 8: per-key merge. A key not yet stored is added; one stored
+    with the same value is a no-op; one stored with a different value
+    fails the whole batch immediately, before anything is written.
+
+    "The same value" means the same canonical JSON text, not two objects
+    Python's ``==`` calls equal: a resubmission that differs only in JSON
+    form -- ``1`` against ``1.0``, or ``1`` against ``true`` -- would store
+    something different and so is a conflict, not a no-op.
+    """
+    merged = dict(stored)
+    for key, value in incoming.items():
+        if key in stored:
+            if _canonical_json_text(stored[key]) != _canonical_json_text(value):
+                _raise_runtime_error(
+                    ERROR_RUNTIME_CONTEXT_IMMUTABLE,
+                    ref,
+                    reason=f"conflict.{RUNTIME_INPUT_CONTEXT}.{key}",
+                )
+            continue
+        merged[key] = value
+    return merged
+
+
+def _load_task_context_row_snapshots(
+    db: Session, *, task_id: int
+) -> dict[ConnectorRef, _ContextRowSnapshot]:
+    """Read every context row for a task along with the database's own
+    ``CAST(context AS TEXT)`` rendering, in the same query -- the rendering
+    is the only value a later conditional UPDATE may compare against; see
+    ``_update_context_row``.
+
+    Takes no row lock of any kind (plain ``SELECT``, no
+    ``with_for_update()``). Concurrent writers are serialized at that later
+    conditional UPDATE's ``WHERE`` clause, not here -- a row read by this
+    function may already be stale by the time ``_update_context_row`` runs,
+    which is exactly the case the conditional predicate exists to catch.
+    """
+    stmt = select(
+        TaskConnectorRuntimeContext.id,
+        TaskConnectorRuntimeContext.connector_type,
+        TaskConnectorRuntimeContext.connector_id,
+        TaskConnectorRuntimeContext.context,
+        sa_cast(TaskConnectorRuntimeContext.context, Text).label("context_text"),
+    ).where(TaskConnectorRuntimeContext.task_id == task_id)
+    result: dict[ConnectorRef, _ContextRowSnapshot] = {}
+    for row in db.execute(stmt):
+        connector_type = cast(ConnectorType, str(row.connector_type))
+        ref = ConnectorRef(connector_type, int(row.connector_id))
+        result[ref] = _ContextRowSnapshot(
+            id=int(row.id),
+            context=row.context if isinstance(row.context, dict) else {},
+            context_text=row.context_text,
+        )
+    return result
+
+
+def _update_context_row(
+    db: Session, *, row_id: int, context_text_as_read: str, merged: dict[str, Any]
+) -> bool:
+    """Conditional update: only takes effect if the row's rendered text is
+    still exactly what was read. PostgreSQL's ``json`` column type has no
+    equality operator, so the comparison casts both sides to text rather
+    than comparing ``context`` directly; SQLite has no
+    ``IS NOT DISTINCT FROM``, so the comparison is a plain ``=`` and a row
+    with no matching id/text is simply not found, not an error. Returns
+    whether exactly one row was updated.
+    """
+    stmt = (
+        sa_update(TaskConnectorRuntimeContext)
+        .where(
+            TaskConnectorRuntimeContext.id == row_id,
+            sa_cast(TaskConnectorRuntimeContext.context, Text) == context_text_as_read,
+        )
+        .values(context=merged)
+    )
+    result = cast(CursorResult, db.execute(stmt))
+    return int(result.rowcount) == 1
+
+
+def _retry_or_503(
+    db: Session, *, attempt: int, user_id: int, team_id: int | None
+) -> dict[ConnectorRef, Any]:
+    """Recover a lost write inside the values endpoint's bounded retry
+    loop, or give up on it.
+
+    A write is lost two ways -- a conditional update that matched no row,
+    and an ``IntegrityError`` on a first-ever row for a ref -- and both are
+    answered identically, so both branches come here. On the second
+    attempt there is no third: the request ends as a 503 the caller may
+    retry, with no named reason, which is what tells that caller this was a
+    collision rather than something underneath failing. Otherwise the
+    transaction is rolled back and a freshly loaded visible-connector set
+    is handed back, because ``db.rollback()`` expires every ORM object
+    loaded before it, including the connector rows in ``visible`` --
+    refetching once here is cheaper than letting the retry (and the
+    response assembly after it) trigger a per-object lazy-refresh query
+    apiece.
+    """
+    db.rollback()
+    if attempt == 1:
+        raise ConnectorRuntimeError(
+            ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
+            "Connector runtime context is unavailable.",
+            status_code=503,
+        )
+    return _load_visible_runtime_connectors(db, user_id=user_id, agent_team_id=team_id)
 
 
 def _validate_values_against_schema(
@@ -1214,11 +1690,24 @@ def _is_required(declaration: Any) -> bool:
     return isinstance(declaration, dict) and bool(declaration.get("required"))
 
 
+def _canonical_json_text(value: Any) -> str:
+    """The value's canonical JSON text: keys sorted, no incidental
+    whitespace. Two values render the same text only when they would store
+    the same JSON, which comparing the decoded objects does not answer --
+    Python reads ``1``, ``1.0`` and ``True`` as equal to each other, while
+    the JSON they store (``1``, ``1.0``, ``true``) differs. Compare values
+    through this whenever the question is "would storing this change what
+    is already there".
+    """
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def _canonical_json(value: Any) -> Any:
+    return json.loads(_canonical_json_text(value))
+
+
 def _canonical_json_value(value: dict[str, Any]) -> dict[str, Any]:
-    return cast(
-        dict[str, Any],
-        json.loads(json.dumps(value, sort_keys=True, separators=(",", ":"))),
-    )
+    return cast(dict[str, Any], _canonical_json(value))
 
 
 def _raise_runtime_error(

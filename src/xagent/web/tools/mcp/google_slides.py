@@ -156,6 +156,21 @@ def _error(message: str) -> str:
     return json.dumps({"status": "error", "message": message}, ensure_ascii=False)
 
 
+def _normalize_newlines(text: str) -> str:
+    """Normalize CRLF/lone-CR line endings to plain "\\n", so text pasted
+    from a Windows editor doesn't leave stray "\\r" characters embedded in
+    what gets inserted into Slides."""
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _normalize_title(title: str) -> str:
+    """Normalize line endings, then collapse any embedded newline (and
+    surrounding whitespace) into a single space — a title is expected to
+    be a single line, so this avoids silently producing a multi-paragraph
+    title placeholder."""
+    return re.sub(r"\s*\n\s*", " ", _normalize_newlines(title))
+
+
 def _prepare_body_text(body: str, is_bulleted: bool) -> str:
     """Normalize body text before it's inserted: strip literal bullet
     markers (see _strip_bullet_prefixes) when the target placeholder
@@ -172,11 +187,9 @@ def _prepare_body_text(body: str, is_bulleted: bool) -> str:
     otherwise pass a raw truthiness/strip check and only turn out empty
     right before the API call, silently producing a content-less slide.
     """
-    if is_bulleted and body:
+    if is_bulleted:
         body = _strip_bullet_prefixes(body)
-    if body:
-        body = "\n".join(line for line in body.split("\n") if line.strip())
-    return body
+    return "\n".join(line for line in body.split("\n") if line.strip())
 
 
 def _body_insert_requests(
@@ -204,17 +217,25 @@ def _body_insert_requests(
 # Placeholder types that fill the "title" vs "body" role of a slide, used
 # to locate an existing slide's placeholders by type when editing it (as
 # opposed to _LAYOUT_PLACEHOLDERS above, which picks placeholder types
-# when *creating* a slide from a predefined layout).
+# when *creating* a slide from a predefined layout). BODY covers this
+# file's own generated slides; OBJECT is included too since it's the
+# common "body-like" placeholder type on slides from an imported/
+# non-standard-theme presentation (e.g. one converted from PowerPoint),
+# which google_slides_update_slide may be asked to edit even though
+# google_slides_add_slide never creates that type itself.
 _TITLE_PLACEHOLDER_TYPES = {"TITLE", "CENTERED_TITLE"}
-_BODY_PLACEHOLDER_TYPES = {"BODY", "SUBTITLE"}
+_BODY_PLACEHOLDER_TYPES = {"BODY", "SUBTITLE", "OBJECT"}
 
 
 def _find_slide(presentation: dict[str, Any], slide_id: str) -> dict[str, Any] | None:
-    slides: list[dict[str, Any]] = presentation.get("slides", [])
-    for slide in slides:
-        if slide.get("objectId") == slide_id:
-            return slide
-    return None
+    return next(
+        (
+            slide
+            for slide in presentation.get("slides", [])
+            if slide.get("objectId") == slide_id
+        ),
+        None,
+    )
 
 
 def _find_placeholders(
@@ -408,12 +429,8 @@ def google_slides_add_slide(
         if not isinstance(layout, str):
             return _error(f"'layout' must be a string, got {type(layout).__name__}.")
 
-        title = title.replace("\r\n", "\n").replace("\r", "\n")
-        body = body.replace("\r\n", "\n").replace("\r", "\n")
-        # A title is expected to be a single line; collapse any embedded
-        # newline (and surrounding whitespace) into a space rather than
-        # silently producing a multi-paragraph title placeholder.
-        title = re.sub(r"\s*\n\s*", " ", title)
+        title = _normalize_title(title)
+        body = _normalize_newlines(body)
         normalized_layout = layout.strip().upper()
 
         if normalized_layout not in _LAYOUT_PLACEHOLDERS:
@@ -522,9 +539,11 @@ def google_slides_update_slide(
     presentation_id: str, slide_id: str, title: str = "", body: str = ""
 ) -> str:
     """
-    Replace the title and/or body text of an existing slide (identified by
-    the slide_id a prior google_slides_add_slide call returned), instead of
-    creating a new one. Use this to fix a slide that came out wrong or
+    Replace the title and/or body text of an existing slide, identified by
+    its slide_id — either the one a prior google_slides_add_slide call
+    returned, or the "object_id" field google_slides_get_presentation
+    reports for that slide (the same id under a different key) — instead
+    of creating a new one. Use this to fix a slide that came out wrong or
     incomplete — calling google_slides_add_slide again does NOT edit that
     slide, it creates a duplicate one next to it.
 
@@ -539,13 +558,8 @@ def google_slides_update_slide(
         if not title and not body:
             return _error("Provide at least one of 'title' or 'body' to update.")
 
-        title = title.replace("\r\n", "\n").replace("\r", "\n")
-        body = body.replace("\r\n", "\n").replace("\r", "\n")
-        # A title is expected to be a single line; collapse any embedded
-        # newline (and surrounding whitespace) into a space rather than
-        # silently producing a multi-paragraph title placeholder — matches
-        # google_slides_add_slide's handling of title.
-        title = re.sub(r"\s*\n\s*", " ", title)
+        title = _normalize_title(title)
+        body = _normalize_newlines(body)
 
         if title and not title.strip():
             return _error("'title' is whitespace-only; provide real text or omit it.")
@@ -589,7 +603,7 @@ def google_slides_update_slide(
                 continue
             element, placeholder_type = placeholders[role]
             object_id = element["objectId"]
-            if _element_text(element):
+            if _element_text(element).strip():
                 requests.append(
                     {
                         "deleteText": {

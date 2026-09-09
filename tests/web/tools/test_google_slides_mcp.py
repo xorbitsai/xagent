@@ -948,6 +948,42 @@ async def test_add_slide_normalizes_layout_via_mcp_layer(monkeypatch):
     assert result["layout"] == "TITLE_AND_BODY"
 
 
+async def test_update_slide_via_mcp_layer(monkeypatch):
+    """Smoke test through the real MCP dispatch path (JSON args dict,
+    positional/keyword binding via call_tool), not just a direct Python
+    call — the only path add_slide's Literal-normalization bug (fixed
+    above) was actually reachable through."""
+    presentations = Mock()
+    presentations.batchUpdate.return_value.execute.return_value = {}
+    _mock_slides_service(monkeypatch, presentations)
+    _mock_presentation_get(
+        presentations, "slide1", [_placeholder_element("title_obj", "TITLE")]
+    )
+
+    content, _ = await google_slides.mcp.call_tool(
+        "google_slides_update_slide",
+        {"presentation_id": "pres1", "slide_id": "slide1", "title": "New title"},
+    )
+
+    result = json.loads(content[0].text)
+    assert result["status"] == "success"
+
+
+async def test_delete_slide_via_mcp_layer(monkeypatch):
+    presentations = Mock()
+    presentations.batchUpdate.return_value.execute.return_value = {}
+    _mock_slides_service(monkeypatch, presentations)
+    _mock_presentation_get(presentations, "slide1", [])
+
+    content, _ = await google_slides.mcp.call_tool(
+        "google_slides_delete_slide",
+        {"presentation_id": "pres1", "slide_id": "slide1"},
+    )
+
+    result = json.loads(content[0].text)
+    assert result["status"] == "success"
+
+
 def test_update_slide_replaces_title_and_body_and_reapplies_bullets(monkeypatch):
     presentations = Mock()
     presentations.batchUpdate.return_value.execute.return_value = {}
@@ -992,6 +1028,31 @@ def test_update_slide_replaces_title_and_body_and_reapplies_bullets(monkeypatch)
     )
     assert bullets_req["objectId"] == "body_obj"
 
+    # Order matters: batchUpdate applies requests in list order, so a
+    # deleteText must precede the insertText for the same objectId (an
+    # insert-then-delete would wipe out the new text instead of the old),
+    # and createParagraphBullets must come after the body insertText it
+    # formats.
+    def _index_of(predicate):
+        return next(i for i, r in enumerate(requests) if predicate(r))
+
+    title_delete_index = _index_of(
+        lambda r: r.get("deleteText", {}).get("objectId") == "title_obj"
+    )
+    title_insert_index = _index_of(
+        lambda r: r.get("insertText", {}).get("objectId") == "title_obj"
+    )
+    assert title_delete_index < title_insert_index
+
+    body_delete_index = _index_of(
+        lambda r: r.get("deleteText", {}).get("objectId") == "body_obj"
+    )
+    body_insert_index = _index_of(
+        lambda r: r.get("insertText", {}).get("objectId") == "body_obj"
+    )
+    bullets_index = _index_of(lambda r: "createParagraphBullets" in r)
+    assert body_delete_index < body_insert_index < bullets_index
+
 
 def test_update_slide_skips_delete_text_when_placeholder_already_empty(monkeypatch):
     presentations = Mock()
@@ -1001,6 +1062,29 @@ def test_update_slide_skips_delete_text_when_placeholder_already_empty(monkeypat
         presentations,
         "slide1",
         [_placeholder_element("title_obj", "TITLE", text="")],
+    )
+
+    google_slides.google_slides_update_slide("pres1", "slide1", title="First title")
+
+    requests = _batch_update_requests(presentations)
+    assert not any("deleteText" in r for r in requests)
+    assert requests[0]["insertText"]["text"] == "First title"
+
+
+def test_update_slide_skips_delete_text_when_placeholder_has_only_a_newline(
+    monkeypatch,
+):
+    """Regression guard: the Slides API commonly represents a "cleared"
+    placeholder as a lone trailing "\\n" (the paragraph terminator), not a
+    truly empty string — the existing-text check must treat that the same
+    as empty, or it triggers a needless deleteText."""
+    presentations = Mock()
+    presentations.batchUpdate.return_value.execute.return_value = {}
+    _mock_slides_service(monkeypatch, presentations)
+    _mock_presentation_get(
+        presentations,
+        "slide1",
+        [_placeholder_element("title_obj", "TITLE", text="\n")],
     )
 
     google_slides.google_slides_update_slide("pres1", "slide1", title="First title")
@@ -1073,6 +1157,21 @@ def test_update_slide_requires_at_least_one_field(monkeypatch):
     presentations.get.assert_not_called()
 
 
+def test_update_slide_rejects_whitespace_only_title(monkeypatch):
+    """Regression guard, symmetric with the body-side check above:
+    whitespace-only title text ("   ") must not slip past the guard just
+    because it's non-empty."""
+    presentations = Mock()
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(
+        google_slides.google_slides_update_slide("pres1", "slide1", title="   ")
+    )
+
+    assert result["status"] == "error"
+    presentations.get.assert_not_called()
+
+
 def test_update_slide_rejects_whitespace_only_body(monkeypatch):
     """Regression guard: whitespace-only text ("   ", "\\n\\n") must not
     slip past the guard just because it's non-empty — that would silently
@@ -1137,6 +1236,23 @@ def test_update_slide_rejects_title_when_slide_has_no_title_placeholder(monkeypa
 
     assert result["status"] == "error"
     assert "title" in result["message"]
+    presentations.batchUpdate.assert_not_called()
+
+
+def test_update_slide_rejects_body_when_slide_has_no_body_placeholder(monkeypatch):
+    """Regression guard, symmetric with the title-side test above."""
+    presentations = Mock()
+    _mock_slides_service(monkeypatch, presentations)
+    _mock_presentation_get(
+        presentations, "slide1", [_placeholder_element("title_obj", "TITLE", text="x")]
+    )
+
+    result = json.loads(
+        google_slides.google_slides_update_slide("pres1", "slide1", body="Detail text")
+    )
+
+    assert result["status"] == "error"
+    assert "body" in result["message"]
     presentations.batchUpdate.assert_not_called()
 
 
@@ -1311,6 +1427,25 @@ def test_update_slide_returns_error_payload_on_api_failure(monkeypatch):
     assert "boom" in result["message"]
 
 
+def test_update_slide_returns_error_payload_on_batch_update_failure(monkeypatch):
+    """Symmetric with the get() failure case above and with delete_slide's
+    own batchUpdate-failure test — the earlier presentations().get() call
+    can succeed while the actual edit still fails."""
+    presentations = Mock()
+    presentations.batchUpdate.return_value.execute.side_effect = RuntimeError("boom")
+    _mock_slides_service(monkeypatch, presentations)
+    _mock_presentation_get(
+        presentations, "slide1", [_placeholder_element("title_obj", "TITLE")]
+    )
+
+    result = json.loads(
+        google_slides.google_slides_update_slide("pres1", "slide1", title="T")
+    )
+
+    assert result["status"] == "error"
+    assert "boom" in result["message"]
+
+
 def test_delete_slide_sends_delete_object_request(monkeypatch):
     presentations = Mock()
     presentations.batchUpdate.return_value.execute.return_value = {}
@@ -1328,10 +1463,17 @@ def test_delete_slide_rejects_id_that_is_not_a_slide(monkeypatch):
     """Regression guard: a placeholder shape id (e.g. one this file itself
     mints as f"{slide_id}_title") must not be silently accepted — Slides'
     deleteObject would delete just that shape while reporting success as if
-    the whole slide had been removed."""
+    the whole slide had been removed. The presentation genuinely contains
+    a shape with this id (nested inside slide1's pageElements, not as a
+    top-level slide) — proving the rejection is because it's the wrong
+    *kind* of id, not merely because "slide1_title" is unrecognized."""
     presentations = Mock()
     _mock_slides_service(monkeypatch, presentations)
-    _mock_presentation_get(presentations, "slide1", [])
+    _mock_presentation_get(
+        presentations,
+        "slide1",
+        [_placeholder_element("slide1_title", "TITLE", text="Real title")],
+    )
 
     result = json.loads(
         google_slides.google_slides_delete_slide("pres1", "slide1_title")

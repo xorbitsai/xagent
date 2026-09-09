@@ -181,68 +181,121 @@ def test_attendees_to_add_returns_empty_for_not_provided_or_empty():
 
 
 def test_unchecked_extra_empty_when_nothing_unchecked():
-    assert utils.unchecked_extra([], None) == {}
-    assert utils.unchecked_extra([], "some reason") == {}
+    assert utils.unchecked_extra([]) == {}
 
 
-def test_unchecked_extra_includes_reason_only_when_given():
-    assert utils.unchecked_extra(["a@x.com"], None) == {
-        "unchecked_attendees": ["a@x.com"]
-    }
-    assert utils.unchecked_extra(["a@x.com"], "reconnect the connector") == {
-        "unchecked_attendees": ["a@x.com"],
-        "unchecked_reason": "reconnect the connector",
-    }
+def test_unchecked_extra_includes_attendees_when_given():
+    assert utils.unchecked_extra(["a@x.com"]) == {"unchecked_attendees": ["a@x.com"]}
 
 
-def test_attendees_needing_check_disjoint_window_checks_everyone():
-    assert utils.attendees_needing_check(
-        ["old@x.com", "new@x.com"],
-        {"old@x.com"},
-        moved_to_a_disjoint_window=True,
-    ) == ["old@x.com", "new@x.com"]
+def _key(value: str):
+    return utils.datetime_key_for_comparison(value)
 
 
-def test_attendees_needing_check_same_or_overlapping_window_checks_only_new():
-    """An existing attendee's schedule always shows this event's own busy
-    block for a window it still occupies - only newly-added attendees are
-    safe to check there."""
-    assert utils.attendees_needing_check(
-        ["old@x.com", "new@x.com"],
-        {"old@x.com"},
-        moved_to_a_disjoint_window=False,
-    ) == ["new@x.com"]
-
-
-def test_windows_overlap_detects_overlapping_and_disjoint_windows():
-    overlapping_a = utils.datetime_key_for_comparison("2026-08-27T10:00:00+00:00")
-    overlapping_b = utils.datetime_key_for_comparison("2026-08-27T10:30:00+00:00")
-    disjoint_a = utils.datetime_key_for_comparison("2026-08-27T14:00:00+00:00")
-    disjoint_b = utils.datetime_key_for_comparison("2026-08-27T14:30:00+00:00")
-
-    assert (
-        utils.windows_overlap(
-            overlapping_a, overlapping_b, overlapping_a, overlapping_b
-        )
-        is True
+def test_window_delta_segments_empty_for_unchanged_or_shrunk_window():
+    """A retained attendee's own busy block already covers everything
+    inside the old window - a new window that's identical, or a strict
+    subset of it, adds no territory worth checking them against."""
+    old_start, old_end = (
+        _key("2026-08-27T10:00:00+00:00"),
+        _key("2026-08-27T10:30:00+00:00"),
     )
+    assert utils.window_delta_segments(old_start, old_end, old_start, old_end) == []
+
+    shrunk_start = _key("2026-08-27T10:05:00+00:00")
+    shrunk_end = _key("2026-08-27T10:25:00+00:00")
     assert (
-        utils.windows_overlap(overlapping_a, overlapping_b, disjoint_a, disjoint_b)
-        is False
+        utils.window_delta_segments(old_start, old_end, shrunk_start, shrunk_end) == []
     )
 
 
-def test_windows_overlap_is_conservative_on_unparseable_or_mismatched_keys():
-    """Regression test: "can't confirm disjoint" must read as overlapping
-    (True), never as disjoint (False) - both for a key that never parsed
-    to a real datetime, and for two real datetimes that can't be compared
-    against each other (aware vs. naive raises TypeError on `<`)."""
-    real_key = utils.datetime_key_for_comparison("2026-08-27T10:00:00+00:00")
-    assert utils.windows_overlap("not-a-date", "also-not", real_key, real_key) is True
+def test_window_delta_segments_returns_the_new_only_portion_of_a_partial_nudge():
+    """10:00-10:30 nudged to 10:15-10:45 - only 10:30-10:45 is new
+    territory a retained attendee could have a genuine conflict in;
+    10:15-10:30 is still covered by their busy block for this event."""
+    old_start, old_end = (
+        _key("2026-08-27T10:00:00+00:00"),
+        _key("2026-08-27T10:30:00+00:00"),
+    )
+    new_start, new_end = (
+        _key("2026-08-27T10:15:00+00:00"),
+        _key("2026-08-27T10:45:00+00:00"),
+    )
 
-    aware_key = utils.datetime_key_for_comparison("2026-08-27T10:00:00+00:00")
-    naive_key = utils.datetime_key_for_comparison("2026-08-27T10:00:00")
-    assert utils.windows_overlap(aware_key, aware_key, naive_key, naive_key) is True
+    segments = utils.window_delta_segments(old_start, old_end, new_start, new_end)
+
+    assert segments == [(old_end, new_end)]
+
+
+def test_window_delta_segments_returns_two_segments_when_widened_on_both_sides():
+    """Extending a meeting earlier AND later in the same call creates new
+    territory on both sides of the old window."""
+    old_start, old_end = (
+        _key("2026-08-27T10:00:00+00:00"),
+        _key("2026-08-27T10:30:00+00:00"),
+    )
+    new_start, new_end = (
+        _key("2026-08-27T09:45:00+00:00"),
+        _key("2026-08-27T10:45:00+00:00"),
+    )
+
+    segments = utils.window_delta_segments(old_start, old_end, new_start, new_end)
+
+    assert len(segments) == 2
+    assert segments[0] == (new_start, old_start)
+    assert segments[1] == (old_end, new_end)
+
+
+def test_window_delta_segments_returns_the_whole_window_for_a_disjoint_move():
+    """A move to somewhere with zero overlap with the old window means the
+    entire new window is new territory - this test also confirms the
+    move-by-15-minutes example from the actual reported bug is caught:
+    the delta segment here is the same shape as the disjoint case."""
+    old_start, old_end = (
+        _key("2026-08-27T10:00:00+00:00"),
+        _key("2026-08-27T10:30:00+00:00"),
+    )
+    new_start, new_end = (
+        _key("2026-08-27T14:00:00+00:00"),
+        _key("2026-08-27T14:30:00+00:00"),
+    )
+
+    assert utils.window_delta_segments(old_start, old_end, new_start, new_end) == [
+        (new_start, new_end)
+    ]
+
+
+def test_window_delta_segments_is_conservative_on_unparseable_or_mismatched_keys():
+    """ "Can't confirm the delta is smaller than the whole window" must
+    never silently shrink what gets checked - falls back to the whole new
+    window, both for a key that never parsed to a real datetime, and for
+    two real datetimes that can't be compared (aware vs. naive raises
+    TypeError on `<`)."""
+    new_start, new_end = (
+        _key("2026-08-27T10:00:00+00:00"),
+        _key("2026-08-27T10:30:00+00:00"),
+    )
+    assert utils.window_delta_segments(
+        "not-a-date", "also-not", new_start, new_end
+    ) == [(new_start, new_end)]
+
+    naive_start = _key("2026-08-27T09:00:00")
+    naive_end = _key("2026-08-27T11:00:00")
+    assert utils.window_delta_segments(naive_start, naive_end, new_start, new_end) == [
+        (new_start, new_end)
+    ]
+
+
+def test_window_delta_segments_empty_when_new_window_itself_is_unparseable():
+    """No valid new window at all means nothing meaningful to check,
+    regardless of the old window."""
+    old_start, old_end = (
+        _key("2026-08-27T10:00:00+00:00"),
+        _key("2026-08-27T10:30:00+00:00"),
+    )
+    assert (
+        utils.window_delta_segments(old_start, old_end, "not-a-date", "also-not") == []
+    )
 
 
 def test_reject_reversed_window_raises_when_end_is_not_after_start():
@@ -274,8 +327,8 @@ def test_reject_reversed_window_is_permissive_when_aware_and_naive_are_mixed():
     `TypeError` in Python - the `isinstance` check alone doesn't guard
     against this, only checking that both are `datetime` instances of the
     SAME awareness does. Must stay permissive here, not crash with a raw
-    TypeError, matching `windows_overlap`'s handling of the identical
-    hazard."""
+    TypeError, matching `window_delta_segments`'s handling of the
+    identical hazard."""
     utils.reject_reversed_window("2026-08-27T10:30:00", "2026-08-27T10:30:00Z")
     utils.reject_reversed_window("2026-08-27T10:30:00Z", "2026-08-27T10:00:00")
 

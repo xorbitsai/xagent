@@ -2,13 +2,13 @@ import json
 import logging
 import os
 from datetime import datetime
+from datetime import timezone as dt_timezone
 from typing import Any
 from urllib.parse import quote
 
 import requests
 from mcp.server.fastmcp import FastMCP
 
-from .utils import attendees_needing_check as _attendees_needing_check
 from .utils import attendees_to_add as _attendees_to_add
 from .utils import attendees_were_given as _attendees_were_given
 from .utils import conflict_response as _conflict_response
@@ -21,7 +21,7 @@ from .utils import resolve_zoneinfo as _resolve_zoneinfo
 from .utils import setup_proxy_env
 from .utils import timezones_could_differ as _timezones_could_differ
 from .utils import unchecked_extra as _unchecked_extra
-from .utils import windows_overlap as _windows_overlap
+from .utils import window_delta_segments as _window_delta_segments
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("outlook-mcp")
@@ -159,7 +159,7 @@ def _find_conflicts(
     *,
     exclude_event_id: str | None = None,
     check_organizer: bool = True,
-) -> tuple[list[dict[str, Any]], list[str], str | None]:
+) -> tuple[list[dict[str, Any]], list[str]]:
     """Check the organizer's own calendar (when check_organizer) plus each
     attendee's schedule for anything overlapping [start_datetime,
     end_datetime) in the given timezone.
@@ -182,16 +182,16 @@ def _find_conflicts(
     outlook_update_event) rather than relying on this function to exclude
     the event's own footprint on attendee schedules.
 
-    Returns (conflicts, unchecked_attendees, unchecked_reason). The third
-    element is set only when attendees ended up unchecked because of a
-    missing-scope 403 - the one unchecked case an LLM caller can actually
-    act on (ask the user to reconnect the connector) - not for the other,
-    self-explanatory unchecked cases (absent from the response, or a
-    per-attendee error entry).
+    Returns (conflicts, unchecked_attendees). A missing-scope 403 covering
+    the whole call raises ValueError instead of degrading to unchecked -
+    that's OUR OWN credential/policy problem, not a per-attendee
+    visibility gap, and writing an event whose availability was never
+    actually checked would defeat the point of this feature. Every entry
+    that does end up in `unchecked_attendees` is the self-explanatory
+    kind (absent from the response, or its own per-attendee error).
     """
     conflicts: list[dict[str, Any]] = []
     unchecked_attendees: list[str] = []
-    unchecked_reason: str | None = None
 
     if check_organizer:
         offset_start = _offset_datetime_string(start_datetime, timezone)
@@ -226,14 +226,16 @@ def _find_conflicts(
                     continue
                 if exclude_event_id and item.get("id") == exclude_event_id:
                     continue
-                # `/me/calendarView` reports OUR OWN response to each event
-                # via `responseStatus` (matching google_calendar's check of
-                # the organizer's own attendee entry) - an event the
-                # organizer personally declined still sits on their
-                # calendar (declining doesn't clear showAs), but it's not
-                # something they're actually busy for.
-                if (item.get("responseStatus") or {}).get("response") == "declined":
-                    continue
+                # NOTE: declining an invite (responseStatus.response ==
+                # "declined") is NOT used as a busy/free signal here -
+                # Microsoft's event resource documents responseStatus and
+                # showAs as independent fields, with no documented
+                # guarantee that declining clears showAs to "free". An
+                # earlier version of this check skipped declined events
+                # outright, which silently treated a still-busy declined
+                # event as free and permitted a real double booking.
+                # `showAs` above is the one field Graph actually
+                # documents as the busy/free predicate.
                 start = item.get("start") or {}
                 end = item.get("end") or {}
                 conflicts.append(
@@ -274,19 +276,23 @@ def _find_conflicts(
                 # PERMISSION_DENIED/insufficientPermissions pairing) -
                 # but a 403 on this /me/... call for the signed-in
                 # user's own mailbox is not expected to have another
-                # cause here. Don't abort the whole booking over an
-                # availability check that can't run; the caller still
-                # sees this batch as unchecked, not silently clear.
-                unchecked_attendees.extend(batch)
-                unchecked_reason = (
-                    "Missing the calendars.read/schedule permission needed "
-                    "to check attendee availability - reconnecting the "
-                    "Outlook connector may grant it; if the connector "
-                    "already has calendar access, this is more likely an "
-                    "org-level policy blocking this call, which a "
-                    "reconnect won't fix."
-                )
-                continue
+                # cause here. This is OUR OWN credential/policy problem,
+                # not a per-attendee visibility gap (which genuinely
+                # can't be fixed and still degrades to unchecked below) -
+                # proceeding to write an event whose availability was
+                # never actually checked would defeat the entire point
+                # of this feature, so reject instead of silently booking
+                # over a possible conflict.
+                raise ValueError(
+                    "Missing the calendars.read/schedule permission "
+                    "needed to check attendee availability - "
+                    "reconnecting the Outlook connector may grant it; if "
+                    "the connector already has calendar access, this is "
+                    "more likely an org-level policy blocking this call, "
+                    "which a reconnect won't fix. Pass "
+                    "ignore_conflicts=true if the user has confirmed "
+                    "they want to proceed without this check."
+                ) from exc
             raise
 
         # Keyed by Graph's own scheduleId casing for lookup, but every
@@ -328,7 +334,7 @@ def _find_conflicts(
                         }
                     )
 
-    return conflicts, unchecked_attendees, unchecked_reason
+    return conflicts, unchecked_attendees
 
 
 @mcp.tool()
@@ -524,9 +530,8 @@ def outlook_create_event(
         normalized_attendees = _normalize_addresses(attendees) if attendees else []
 
         unchecked_attendees: list[str] = []
-        unchecked_reason: str | None = None
         if not ignore_conflicts:
-            conflicts, unchecked_attendees, unchecked_reason = _find_conflicts(
+            conflicts, unchecked_attendees = _find_conflicts(
                 start_datetime, end_datetime, timezone, normalized_attendees
             )
             if conflicts:
@@ -535,7 +540,6 @@ def outlook_create_event(
                     unchecked_attendees,
                     start_datetime,
                     end_datetime,
-                    unchecked_reason=unchecked_reason,
                 )
 
         payload: dict[str, Any] = {
@@ -552,9 +556,7 @@ def outlook_create_event(
             payload["attendees"] = _attendee_list(normalized_attendees)
 
         result = _graph_request("POST", "/me/events", body=payload)
-        return _success(
-            event=result, **_unchecked_extra(unchecked_attendees, unchecked_reason)
-        )
+        return _success(event=result, **_unchecked_extra(unchecked_attendees))
     except Exception as e:
         logger.error("Error creating Outlook event: %s", e)
         return _error(str(e))
@@ -579,9 +581,10 @@ def outlook_update_event(
     pass ignore_conflicts=True to skip the check once the user has
     explicitly confirmed a conflict is fine. Editing other fields (subject,
     body, location) without moving the event is never blocked.
-    attendees is a list of email addresses to add to the event; attendees
-    already on the event are kept, and there is no way to remove an
-    attendee through this parameter.
+    attendees, if given, fully replaces the event's attendee list: any
+    address already on the event that's left out is removed, and passing
+    an explicit empty list clears every attendee. Leave attendees unset to
+    keep the existing list untouched.
     Passing only one of start_datetime/end_datetime nudges that boundary
     while keeping the other as-is; leave timezone unset for this case and
     the event's own existing timezone is reused automatically. Passing
@@ -727,10 +730,22 @@ def outlook_update_event(
             existing_start_field = existing.get("start") or {}
             existing_end_field = existing.get("end") or {}
             # A plain GET (no Prefer header) reports start/end in UTC by
-            # default, but trust whatever `timeZone` Graph actually put on
-            # the field rather than assuming it - this may be absent
-            # (validated below, only where it's actually needed).
-            existing_zone = existing_start_field.get("timeZone")
+            # default, so its own "timeZone" field is never useful as
+            # "the event's real timezone" - same caveat as the
+            # single-boundary branch above. originalStartTimeZone is the
+            # field that actually reports it (used here, unlike the
+            # single-boundary branch, without erroring on a legacy
+            # `tzone://` custom zone or an absent value - this branch
+            # doesn't always need the real zone at all, e.g. a plain
+            # attendees-only edit on a timed event never widens anything
+            # with it, so fall back to the UTC-normalized field, the
+            # prior behavior, rather than failing a call that may not
+            # need this value to be exact).
+            existing_timezone = existing.get("originalStartTimeZone")
+            if existing_timezone and not existing_timezone.startswith("tzone://"):
+                existing_zone = existing_timezone
+            else:
+                existing_zone = existing_start_field.get("timeZone")
 
         payload: dict[str, Any] = {}
         if subject is not None:
@@ -746,34 +761,62 @@ def outlook_update_event(
             payload["body"] = _message_body(body, "text")
         if location is not None:
             payload["location"] = {"displayName": location}
-        # attendees only ever ADDS: there's no way to remove an existing
-        # attendee through this parameter (matching this tool's own
-        # docstring), so the effective set for conflict-checking purposes
-        # is always existing-plus-newly-added, never a caller-supplied
-        # subset that could silently drop someone.
+        # attendees fully REPLACES the event's attendee list (matching this
+        # connector's pre-existing base behavior before this tool's
+        # conflict-detection support was added): an explicit [] clears
+        # everyone, and any existing address left out of the new list is
+        # removed. `added_attendees` (genuinely new) and
+        # `retained_attendees_raw` (kept from before) are checked
+        # separately below - a retained attendee only needs checking
+        # against the portion of a moved window that's actually new
+        # territory, while a newly-added one needs the whole query window
+        # checked; a removed attendee needs no check at all.
         added_attendees = _attendees_to_add(attendees, existing_attendee_emails)
-        # Preserve the casing already on the event - only the
-        # membership check below needs to be case-insensitive, not
-        # what gets queried/reported back to the caller.
-        normalized_attendees = sorted(existing_attendees_raw + added_attendees)
-        if added_attendees:
-            # Only append the newly-added attendees - existing entries
-            # (their raw dicts, untouched) are carried over as-is, so
-            # their RSVP state (status, type, ...) is never at risk of
-            # being clobbered by a re-submission.
-            payload["attendees"] = list(existing.get("attendees") or []) + [
-                {"emailAddress": {"address": address}, "type": "required"}
-                for address in added_attendees
+        if attendees_given:
+            # Reuse each retained attendee's existing raw dict (not just
+            # its address) so its RSVP state (status, type, ...) is never
+            # clobbered by a re-submission - only a genuinely new address
+            # gets a fresh minimal dict.
+            existing_by_email = {
+                a["emailAddress"]["address"].lower(): a
+                for a in (existing.get("attendees") or [])
+                if (a.get("emailAddress") or {}).get("address")
+            }
+            assert (
+                attendees is not None
+            )  # narrows for mypy; attendees_given implies this
+            desired_addresses = _normalize_addresses(attendees)
+            desired_lower = {address.lower() for address in desired_addresses}
+            if desired_lower != existing_attendee_emails:
+                # A byte-identical resubmission (same members, regardless
+                # of order) is not a real change - leaving the field out of
+                # the PATCH entirely, rather than resending a reconstructed
+                # copy of it, is a stronger guarantee against wiping RSVP
+                # state than relying on every entry happening to compare
+                # equal.
+                payload["attendees"] = [
+                    existing_by_email.get(
+                        address.lower(),
+                        {"emailAddress": {"address": address}, "type": "required"},
+                    )
+                    for address in desired_addresses
+                ]
+            retained_attendees_raw = [
+                address
+                for address in existing_attendees_raw
+                if address.lower() in desired_lower
             ]
+        else:
+            retained_attendees_raw = existing_attendees_raw
         if is_all_day is not None:
             payload["isAllDay"] = is_all_day
 
         if not payload and not attendees_given:
-            # attendees_given alone can leave `payload` empty (every
-            # address it named was already on the event, so there was
-            # nothing new to append) without this having been a no-arg
-            # call - the caller did provide a real field, it just happens
-            # to be a no-op given the event's current state.
+            # attendees_given alone can leave `payload` empty (the
+            # resubmitted set exactly matches what's already on the event)
+            # without this having been a no-arg call - the caller did
+            # provide a real field, it just happens to be a no-op given the
+            # event's current state.
             raise ValueError("at least one field must be provided to update the event")
 
         # Checked unconditionally, not gated on ignore_conflicts - this is
@@ -790,7 +833,6 @@ def outlook_update_event(
             _reject_reversed_window(effective_start, effective_end)
 
         unchecked_attendees: list[str] = []
-        unchecked_reason: str | None = None
         if not ignore_conflicts and touches_schedule:
             # Both boundaries always end up denominated in the same zone
             # here: when only one of start_datetime/end_datetime is given
@@ -867,35 +909,61 @@ def outlook_update_event(
             query_start_key, query_end_key = effective_start_key, effective_end_key
             if effective_is_all_day and effective_start and effective_end:
                 query_start, _ = _naive_day_bounds(effective_start)
-                _, query_end = _naive_day_bounds(effective_end)
+                end_of_its_day, next_day_start = _naive_day_bounds(effective_end)
+                # effective_end may already BE a well-formed exclusive
+                # day boundary (exactly midnight, e.g. an existing
+                # all-day event's own end untouched by this update) -
+                # naive_day_bounds always treats its input as a day that
+                # needs widening to [that midnight, next midnight), so
+                # applying it here unconditionally would push an
+                # already-correct boundary one whole day too far,
+                # falsely conflicting with a following-day event. Only
+                # push to the next midnight when effective_end isn't
+                # already sitting exactly on one.
+                query_end = (
+                    effective_end
+                    if datetime.fromisoformat(effective_end)
+                    == datetime.fromisoformat(end_of_its_day)
+                    else next_day_start
+                )
                 query_start_key = _key(query_start, provisional_query_timezone)
                 query_end_key = _key(query_end, provisional_query_timezone)
 
-            # A window (literally moved, or widened to a full day by an
-            # is_all_day toggle) that still overlaps the event's own
-            # existing window is just as unsafe to free/busy-check
-            # existing attendees against as the unchanged-window case: the
-            # overlap still contains this event's own busy block on their
-            # calendars, which isn't a real conflict. Only a window that's
-            # moved to somewhere completely disjoint from the old one is
-            # safe to check every attendee against. `windows_overlap`
-            # itself already treats a missing/unparsed key as "can't
-            # confirm disjoint" (True), so no extra None-guard is needed
-            # here.
-            overlapping = _windows_overlap(
-                existing_start_key, existing_end_key, query_start_key, query_end_key
-            )
-            attendees_to_check = _attendees_needing_check(
-                normalized_attendees,
-                existing_attendee_emails,
-                moved_to_a_disjoint_window=literal_window_changed and not overlapping,
+            all_conflicts: list[dict[str, Any]] = []
+
+            # window_delta_segments is safe to call even when existing_zone
+            # is unknown: existing_start_key/existing_end_key and
+            # query_start_key/query_end_key all fall back to the same "UTC"
+            # assumption in that case (see the `_key` closure above), and a
+            # uniform (even if wrong) offset applied to both sides of the
+            # comparison can't change which portion is genuinely new
+            # territory - only the *absolute* query values sent to Graph
+            # below would be wrong, which is exactly what the fatal check
+            # right after this guards against, and only when a query is
+            # actually about to use them.
+            retained_segments = (
+                _window_delta_segments(
+                    existing_start_key, existing_end_key, query_start_key, query_end_key
+                )
+                if retained_attendees_raw
+                else []
             )
 
-            if query_start and query_end and (check_organizer or attendees_to_check):
+            any_query_needed = (
+                query_start
+                and query_end
+                and (check_organizer or added_attendees or retained_segments)
+            )
+            if any_query_needed:
                 # Only now, with a query actually about to run, does a
                 # missing existing-event timezone (relevant only when
                 # neither start_datetime nor end_datetime was given)
-                # become fatal rather than a moot point.
+                # become fatal rather than a moot point - a same-attendees,
+                # same-effective-window resubmission (retained_segments
+                # empty, no organizer/added-attendee query needed) must
+                # stay a no-op PATCH even if the existing event happens to
+                # be missing timezone info that would only matter for a
+                # query nothing here ends up needing.
                 if (
                     start_datetime is None
                     and end_datetime is None
@@ -906,31 +974,72 @@ def outlook_update_event(
                         "time; cannot safely check conflicts for this "
                         "update."
                     )
-                conflicts, unchecked_attendees, unchecked_reason = _find_conflicts(
+
+            if query_start and query_end and (check_organizer or added_attendees):
+                # A newly-added attendee has no footprint on this event
+                # at all, so the FULL query window is safe (and
+                # necessary) to check for them - same call also covers
+                # the organizer, who's excluded by event id rather than
+                # by window.
+                conflicts, unchecked = _find_conflicts(
                     query_start,
                     query_end,
                     provisional_query_timezone,
-                    attendees_to_check,
+                    added_attendees,
                     exclude_event_id=event_id,
                     check_organizer=check_organizer,
                 )
-                if conflicts:
-                    return _conflict_response(
-                        conflicts,
-                        unchecked_attendees,
-                        query_start,
-                        query_end,
-                        unchecked_reason=unchecked_reason,
+                all_conflicts.extend(conflicts)
+                unchecked_attendees.extend(unchecked)
+
+            # A retained attendee's own busy block for THIS event covers
+            # the entire OLD (unwidened, literal) window - querying that
+            # overlap can't tell "busy because of this event" from a real
+            # conflict. Only the portion of the query window that's
+            # genuinely new territory (window_delta_segments - empty for
+            # an unchanged/shrunk window, up to two segments for a
+            # partial nudge, or the whole query window for a disjoint
+            # move or an is_all_day widening) can hide a real conflict
+            # for them.
+            if retained_segments:
+                for seg_start, seg_end in retained_segments:
+                    seg_start_naive = seg_start.astimezone(dt_timezone.utc).replace(
+                        tzinfo=None
                     )
+                    seg_end_naive = seg_end.astimezone(dt_timezone.utc).replace(
+                        tzinfo=None
+                    )
+                    conflicts, unchecked = _find_conflicts(
+                        seg_start_naive.isoformat(),
+                        seg_end_naive.isoformat(),
+                        "UTC",
+                        retained_attendees_raw,
+                        exclude_event_id=event_id,
+                        check_organizer=False,
+                    )
+                    all_conflicts.extend(conflicts)
+                    unchecked_attendees.extend(unchecked)
+
+            if all_conflicts:
+                # narrows for mypy: a conflict can only have been found by
+                # a query that ran, and every query above only runs when
+                # query_start/query_end (or the delta segments derived
+                # from them) are real values.
+                assert query_start is not None
+                assert query_end is not None
+                return _conflict_response(
+                    all_conflicts,
+                    unchecked_attendees,
+                    query_start,
+                    query_end,
+                )
 
         result = _graph_request(
             "PATCH",
             f"/me/events/{quote(event_id, safe='')}",
             body=payload,
         )
-        return _success(
-            event=result, **_unchecked_extra(unchecked_attendees, unchecked_reason)
-        )
+        return _success(event=result, **_unchecked_extra(unchecked_attendees))
     except Exception as e:
         logger.error("Error updating Outlook event %s: %s", event_id, e)
         return _error(str(e))

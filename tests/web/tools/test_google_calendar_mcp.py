@@ -918,12 +918,15 @@ class FakeFreebusy:
 
 
 class FakeCalendars:
-    def __init__(self, timezone: str = "UTC"):
+    def __init__(self, timezone: str = "UTC", *, raise_error: Exception | None = None):
         self._timezone = timezone
+        self._raise_error = raise_error
         self.get_calls: list[dict[str, Any]] = []
 
     def get(self, **kwargs: Any) -> _Exec:
         self.get_calls.append(kwargs)
+        if self._raise_error is not None:
+            raise self._raise_error
         return _Exec({"timeZone": self._timezone})
 
 
@@ -1446,10 +1449,30 @@ def test_update_events_ignore_conflicts_skips_the_check(fake_service):
     assert len(fake_service._events.update_calls) == 1
 
 
-def test_organizer_declined_event_is_not_a_conflict(fake_service):
-    """The organizer personally declining an invite doesn't clear its
-    transparency, but it's not something they're actually busy for."""
+def test_organizer_declined_but_opaque_event_is_still_a_conflict(fake_service):
+    """Google documents `responseStatus` and `transparency` as independent
+    fields with no guaranteed link - declining an invite doesn't reliably
+    clear its transparency, so a still-opaque declined event must still be
+    treated as busy rather than assumed free."""
     event = _confirmed_event()
+    event["attendees"] = [
+        {"email": "me@example.com", "self": True, "responseStatus": "declined"}
+    ]
+    fake_service._events._list_result = {"items": [event]}
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Kickoff",
+            start_time="2026-08-27T10:00:00+08:00",
+            end_time="2026-08-27T10:30:00+08:00",
+        )
+    )
+
+    assert result["status"] == "conflict"
+
+
+def test_organizer_declined_and_transparent_event_is_not_a_conflict(fake_service):
+    event = _confirmed_event(transparency="transparent")
     event["attendees"] = [
         {"email": "me@example.com", "self": True, "responseStatus": "declined"}
     ]
@@ -1522,9 +1545,11 @@ def test_freebusy_batch_over_limit_is_chunked_into_multiple_calls(fake_service):
     assert batch_sizes == [1, 50]
 
 
-def test_freebusy_missing_scope_degrades_to_unchecked_instead_of_erroring(
-    fake_service,
-):
+def test_freebusy_missing_scope_rejects_the_write(fake_service):
+    """A whole-batch 403 means our own credential/scope is insufficient,
+    not that a particular attendee's calendar is merely invisible - proceed
+    would silently skip the entire conflict check, defeating the feature.
+    The write must be rejected rather than degraded to unchecked."""
     fake_service._freebusy = FakeFreebusy(raise_error=_insufficient_scope_error())
 
     result = json.loads(
@@ -1536,13 +1561,50 @@ def test_freebusy_missing_scope_degrades_to_unchecked_instead_of_erroring(
         )
     )
 
+    assert result["status"] == "error"
+    assert "reconnect" in result["message"].lower()
+    assert fake_service._events.insert_calls == []
+
+
+def test_freebusy_missing_scope_rejects_the_write_even_with_ignore_conflicts_false(
+    fake_service,
+):
+    """`ignore_conflicts` is the caller's explicit escape hatch - without it,
+    a scope-insufficient 403 must reject rather than silently proceed."""
+    fake_service._freebusy = FakeFreebusy(raise_error=_insufficient_scope_error())
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Kickoff",
+            start_time="2026-08-27T10:00:00+08:00",
+            end_time="2026-08-27T10:30:00+08:00",
+            attendees=["chelsea@example.com"],
+            ignore_conflicts=False,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert fake_service._events.insert_calls == []
+
+
+def test_freebusy_missing_scope_can_be_bypassed_with_ignore_conflicts(fake_service):
+    fake_service._freebusy = FakeFreebusy(raise_error=_insufficient_scope_error())
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Kickoff",
+            start_time="2026-08-27T10:00:00+08:00",
+            end_time="2026-08-27T10:30:00+08:00",
+            attendees=["chelsea@example.com"],
+            ignore_conflicts=True,
+        )
+    )
+
     assert result["status"] == "success"
-    assert result["unchecked_attendees"] == ["chelsea@example.com"]
-    assert "reconnect" in result["unchecked_reason"].lower()
     assert len(fake_service._events.insert_calls) == 1
 
 
-def test_freebusy_missing_scope_legacy_only_body_still_degrades(fake_service):
+def test_freebusy_missing_scope_legacy_only_body_still_rejects(fake_service):
     """The dual-format body is what a real Calendar API 403 actually
     carries, but a response with only the legacy `errors[]` field must
     still be recognized - not just the newer `details[]` shape."""
@@ -1559,8 +1621,8 @@ def test_freebusy_missing_scope_legacy_only_body_still_degrades(fake_service):
         )
     )
 
-    assert result["status"] == "success"
-    assert result["unchecked_attendees"] == ["chelsea@example.com"]
+    assert result["status"] == "error"
+    assert fake_service._events.insert_calls == []
 
 
 def test_is_insufficient_scope_error_matches_details_only_body():
@@ -1760,6 +1822,60 @@ def test_update_events_widens_all_day_boundary_in_the_calendars_own_timezone(
     assert fake_service._calendars.get_calls  # actually looked it up
 
 
+def test_update_events_calendar_timezone_lookup_missing_scope_rejects_the_write(
+    fake_service,
+):
+    """The calendars.get call needed to widen an all-day boundary needs its
+    own calendar.calendars.readonly scope - a token that predates that
+    migration must reject the write outright, same as a missing
+    freebusy scope, rather than silently guessing at UTC."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"date": "2026-08-27"},
+        "end": {"date": "2026-08-28"},
+        "attendees": [],
+    }
+    fake_service._calendars = FakeCalendars(raise_error=_insufficient_scope_error())
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            attendees=["new@example.com"],
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "reconnect" in result["message"].lower()
+    assert fake_service._events.update_calls == []
+
+
+def test_update_events_calendar_timezone_lookup_missing_scope_falls_back_with_ignore_conflicts(
+    fake_service,
+):
+    """ignore_conflicts is the caller's explicit escape hatch - it must not
+    be defeated by an unrelated all-day-timezone-lookup failure; the
+    write still proceeds, just without a real calendar timezone."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"date": "2026-08-27"},
+        "end": {"date": "2026-08-28"},
+        "attendees": [],
+    }
+    fake_service._calendars = FakeCalendars(raise_error=_insufficient_scope_error())
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-27T10:00:00+08:00",
+            end_time="2026-08-27T10:30:00+08:00",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    assert len(fake_service._events.update_calls) == 1
+
+
 def test_update_events_timed_event_never_looks_up_calendar_timezone(fake_service):
     """The calendar-timezone lookup is only needed to widen an all-day
     boundary - a plain timed-event update must not pay for it."""
@@ -1778,13 +1894,52 @@ def test_update_events_timed_event_never_looks_up_calendar_timezone(fake_service
     assert fake_service._calendars.get_calls == []
 
 
-def test_update_events_partial_overlap_nudge_does_not_self_conflict(fake_service):
+def test_update_events_partial_overlap_nudge_only_checks_the_new_delta_segment(
+    fake_service,
+):
     """Regression test: nudging a meeting to a window that still overlaps
-    its old one (e.g. 10:00-10:30 -> 10:15-10:45) must not check existing
-    attendees against the new window - the overlap still contains this
-    event's own busy block on their calendars, which isn't a real
-    conflict. Only a genuinely disjoint move is safe to check everyone
-    against."""
+    its old one (e.g. 10:00-10:30 -> 10:15-10:45) must only check existing
+    attendees against the genuinely new sliver (10:30-10:45) - the
+    retained 10:15-10:30 overlap still contains this event's own busy
+    block on their calendars, which isn't a real conflict. Checking the
+    delta segment (rather than skipping the check outright) still catches
+    a real conflict that happens to land in the newly-added time."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T10:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T10:30:00+08:00"},
+        "attendees": [{"email": "existing@example.com"}],
+    }
+    fake_service._events._list_result = {"items": []}
+    # The fake, unlike the real freebusy.query endpoint, doesn't filter its
+    # configured busy blocks down to the requested [timeMin, timeMax) - so
+    # this leaves it empty and instead asserts directly on the query's
+    # timeMin/timeMax below. That's the actual behavior under our control;
+    # Google's own server is responsible for only returning busy blocks
+    # that overlap whatever window we send it.
+    fake_service._freebusy = FakeFreebusy({"calendars": {}})
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-27T10:15:00+08:00",
+            end_time="2026-08-27T10:45:00+08:00",
+        )
+    )
+
+    assert result["status"] == "success"
+    assert len(fake_service._freebusy.query_calls) == 1
+    query_call = fake_service._freebusy.query_calls[0]
+    assert query_call["body"]["timeMin"] == "2026-08-27T10:30:00+08:00"
+    assert query_call["body"]["timeMax"] == "2026-08-27T10:45:00+08:00"
+
+
+def test_update_events_partial_overlap_nudge_still_catches_a_real_conflict(
+    fake_service,
+):
+    """The delta segment isn't just a smaller no-op window - a genuine
+    conflict that only exists in the newly-added time must still be
+    caught."""
     fake_service._events._get_result = {
         "id": "self-1",
         "start": {"dateTime": "2026-08-27T10:00:00+08:00"},
@@ -1795,15 +1950,11 @@ def test_update_events_partial_overlap_nudge_does_not_self_conflict(fake_service
     fake_service._freebusy = FakeFreebusy(
         {
             "calendars": {
-                # This event's own footprint on the existing attendee's
-                # calendar for the overlapping sliver (10:15-10:30) -
-                # would wrongly read as a conflict if existing attendees
-                # were checked against the new, overlapping window.
                 "existing@example.com": {
                     "busy": [
                         {
-                            "start": "2026-08-27T10:00:00+08:00",
-                            "end": "2026-08-27T10:30:00+08:00",
+                            "start": "2026-08-27T10:35:00+08:00",
+                            "end": "2026-08-27T10:40:00+08:00",
                         }
                     ]
                 },
@@ -1819,8 +1970,8 @@ def test_update_events_partial_overlap_nudge_does_not_self_conflict(fake_service
         )
     )
 
-    assert result["status"] == "success"
-    assert fake_service._freebusy.query_calls == []
+    assert result["status"] == "conflict"
+    assert result["conflicts"][0]["calendar"] == "existing@example.com"
 
 
 def test_update_events_disjoint_move_checks_existing_attendees(fake_service):
@@ -1954,11 +2105,42 @@ def test_update_events_treats_equivalent_timestamp_formats_as_unchanged(
     assert fake_service._events.update_calls[0]["sendUpdates"] == "none"
 
 
-def test_update_events_unchecked_reason_appears_alongside_a_conflict(fake_service):
-    """unchecked_attendees/unchecked_reason must still surface even when the
-    response status is "conflict" (from the organizer or another attendee),
-    not just on a clean "success" - a caller acting on the conflict still
-    needs to know some attendees were never actually checked."""
+def test_update_events_respects_sibling_timezone_on_an_offsetless_datetime(
+    fake_service,
+):
+    """Regression test: Google's own docs say dateTime "may" omit its
+    offset when a sibling timeZone field is present instead - treating
+    that offsetless value as if it belonged to some other zone (e.g. the
+    calendar's, or UTC) would misjudge a same-instant resubmission as a
+    real time change and run the organizer check against the event's own
+    now-"moved" window."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T02:00:00", "timeZone": "UTC"},
+        "end": {"dateTime": "2026-08-27T02:30:00", "timeZone": "UTC"},
+        "attendees": [{"email": "existing@example.com"}],
+    }
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-27T10:00:00+08:00",  # same instant, different offset
+            end_time="2026-08-27T10:30:00+08:00",
+            location="Room 4",
+        )
+    )
+
+    assert result["status"] == "success"
+    assert fake_service._events.list_calls == []
+    assert fake_service._freebusy.query_calls == []
+    assert fake_service._events.update_calls[0]["sendUpdates"] == "none"
+
+
+def test_update_events_missing_scope_rejects_the_write(fake_service):
+    """A whole-batch 403 while checking the newly-added attendee is our own
+    credential's problem, not a per-attendee visibility gap - the write
+    must be rejected outright, even though the organizer's own calendar
+    already turned up a real conflict."""
     fake_service._events._get_result = {
         "id": "self-1",
         "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
@@ -1979,6 +2161,32 @@ def test_update_events_unchecked_reason_appears_alongside_a_conflict(fake_servic
         )
     )
 
-    assert result["status"] == "conflict"
-    assert result["unchecked_attendees"] == ["outsider@gmail.com"]
-    assert "reconnect" in result["unchecked_reason"].lower()
+    assert result["status"] == "error"
+    assert "reconnect" in result["message"].lower()
+    assert fake_service._events.update_calls == []
+
+
+def test_update_events_missing_scope_can_be_bypassed_with_ignore_conflicts(
+    fake_service,
+):
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+        "attendees": [],
+    }
+    fake_service._events._list_result = {"items": []}
+    fake_service._freebusy = FakeFreebusy(raise_error=_insufficient_scope_error())
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-27T10:00:00+08:00",
+            end_time="2026-08-27T10:30:00+08:00",
+            attendees=["outsider@gmail.com"],
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    assert len(fake_service._events.update_calls) == 1

@@ -470,6 +470,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "oauth_scopes": [
                 "https://www.googleapis.com/auth/calendar.events",
                 "https://www.googleapis.com/auth/calendar.freebusy",
+                "https://www.googleapis.com/auth/calendar.calendars.readonly",
             ],
             "is_visible_in_connector": True,
             "launch_config": {

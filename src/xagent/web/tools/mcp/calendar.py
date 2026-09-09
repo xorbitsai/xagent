@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import uuid
+from datetime import datetime
 from typing import Any
 
 from google.oauth2.credentials import Credentials
@@ -9,16 +10,16 @@ from googleapiclient.discovery import build  # type: ignore
 from googleapiclient.errors import HttpError  # type: ignore
 from mcp.server.fastmcp import FastMCP
 
-from .utils import attendees_needing_check as _attendees_needing_check
 from .utils import attendees_to_add as _attendees_to_add
 from .utils import calendar_day_bounds as _calendar_day_bounds
 from .utils import conflict_response as _conflict_response
 from .utils import datetime_key_for_comparison as _datetime_key_for_comparison
 from .utils import normalize_addresses as _normalize_addresses
+from .utils import offset_datetime_string as _offset_datetime_string
 from .utils import reject_reversed_window as _reject_reversed_window
 from .utils import setup_proxy_env, success_with_capped_dict
 from .utils import unchecked_extra as _unchecked_extra
-from .utils import windows_overlap as _windows_overlap
+from .utils import window_delta_segments as _window_delta_segments
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("calendar-mcp")
@@ -83,7 +84,7 @@ def _find_conflicts(
     *,
     exclude_event_id: str | None = None,
     check_organizer: bool = True,
-) -> tuple[list[dict[str, Any]], list[str], str | None]:
+) -> tuple[list[dict[str, Any]], list[str]]:
     """Check the organizer's own calendar (when check_organizer) plus each
     attendee's free/busy for anything overlapping [time_min, time_max).
 
@@ -99,16 +100,16 @@ def _find_conflicts(
     (see google_calendar_update_events) rather than relying on this function
     to exclude the event's own footprint on attendee calendars.
 
-    Returns (conflicts, unchecked_attendees, unchecked_reason). The third
-    element is set only when attendees ended up unchecked because of a
-    missing-scope 403 - the one unchecked case an LLM caller can actually
-    act on (ask the user to reconnect the connector) - not for the other,
-    self-explanatory unchecked cases (absent from the response, or a
-    per-attendee error entry).
+    Returns (conflicts, unchecked_attendees). A missing-scope 403 covering
+    the whole call raises ValueError instead of degrading to unchecked -
+    that's OUR OWN credential's problem, not a per-attendee visibility
+    gap, and writing an event whose availability was never actually
+    checked would defeat the point of this feature. Every entry that
+    does end up in `unchecked_attendees` is the self-explanatory kind
+    (absent from the response, or its own per-attendee error).
     """
     conflicts: list[dict[str, Any]] = []
     unchecked_attendees: list[str] = []
-    unchecked_reason: str | None = None
 
     if check_organizer:
         organizer_events = (
@@ -131,19 +132,16 @@ def _find_conflicts(
                 continue
             if exclude_event_id and item.get("id") == exclude_event_id:
                 continue
-            # An event the organizer personally declined still sits on
-            # their calendar (declining doesn't clear transparency), but
-            # it's not something they're actually busy for.
-            self_response = next(
-                (
-                    a.get("responseStatus")
-                    for a in item.get("attendees") or []
-                    if a.get("self")
-                ),
-                None,
-            )
-            if self_response == "declined":
-                continue
+            # NOTE: declining an invite (attendees[].responseStatus ==
+            # "declined" for the organizer's own self entry) is NOT used
+            # as a busy/free signal here - Google's own Events docs treat
+            # responseStatus and transparency as independent fields, with
+            # no documented guarantee that declining clears transparency
+            # to "transparent". An earlier version of this check skipped
+            # declined events outright, which silently treated a
+            # still-opaque declined event as free and permitted a real
+            # double booking. `transparency` above is the one field
+            # Google actually documents as the busy/free predicate.
             start = item.get("start") or {}
             end = item.get("end") or {}
             conflicts.append(
@@ -179,16 +177,21 @@ def _find_conflicts(
                 # This connection's OAuth token predates the
                 # calendar.freebusy scope (see the
                 # 20260907_add_calendar_freebusy_scope migration) and
-                # hasn't been reconnected yet. Don't abort the whole
-                # booking over an availability check the token can't
-                # run - report this batch as unchecked instead.
-                unchecked_attendees.extend(batch)
-                unchecked_reason = (
+                # hasn't been reconnected yet. This is OUR OWN
+                # credential's problem, not a per-attendee visibility gap
+                # (e.g. a specific attendee's calendar being unreadable,
+                # which genuinely can't be fixed and still degrades to
+                # unchecked below) - proceeding to write an event whose
+                # availability was never actually checked would defeat
+                # the entire point of this feature, so reject instead of
+                # silently booking over a possible conflict.
+                raise ValueError(
                     "Missing the calendar.freebusy permission needed to "
                     "check attendee availability - reconnect the Google "
-                    "Calendar connector to grant it."
-                )
-                continue
+                    "Calendar connector to grant it, or pass "
+                    "ignore_conflicts=true if the user has confirmed "
+                    "they want to proceed without this check."
+                ) from exc
             raise
 
         # Google's own calendarList entries are case-normalized; be
@@ -220,26 +223,62 @@ def _find_conflicts(
                     }
                 )
 
-    return conflicts, unchecked_attendees, unchecked_reason
+    return conflicts, unchecked_attendees
 
 
 def _primary_calendar_timezone(service: Any) -> str:
     """The primary calendar's own configured IANA timezone (falls back to
     UTC if somehow absent - Google's Calendar resource always carries a
-    timeZone, so this is a defensive last resort, not the expected path)."""
-    return (
-        service.calendars().get(calendarId="primary").execute().get("timeZone") or "UTC"
-    )
+    timeZone, so this is a defensive last resort, not the expected path).
+
+    Needs the calendar.calendars.readonly scope (see the
+    20260909_add_calendar_calendars_readonly_scope migration) - neither
+    calendar.events nor calendar.freebusy authorizes calendars.get, per
+    Google's own scope reference for that endpoint.
+    """
+    try:
+        calendar = service.calendars().get(calendarId="primary").execute()
+    except HttpError as exc:
+        if exc.resp.status == 403 and _is_insufficient_scope_error(exc):
+            # This connection's OAuth token predates the
+            # calendar.calendars.readonly scope. Without the calendar's
+            # own timezone, an all-day boundary can't be safely widened
+            # for the conflict check that's about to run - reject rather
+            # than silently guessing (e.g. defaulting to UTC), which
+            # could misjudge the query window by the calendar's real
+            # UTC offset.
+            raise ValueError(
+                "Missing the calendar.calendars.readonly permission "
+                "needed to look up the calendar's timezone for this "
+                "all-day event - reconnect the Google Calendar "
+                "connector to grant it, or pass ignore_conflicts=true "
+                "if the user has confirmed they want to proceed without "
+                "this check."
+            ) from exc
+        raise
+    return calendar.get("timeZone") or "UTC"
 
 
 def _event_boundary(field: dict[str, Any] | None, tz_name: str) -> str | None:
     """Return a RFC3339 timestamp usable as a freebusy/events.list time
     bound for one side (start or end) of an event.
 
-    Google represents a timed event's boundary as {"dateTime": ...} (which
-    already carries its own zone offset - used as-is) and an all-day
-    event's as {"date": "YYYY-MM-DD"} - timeMin/timeMax require a full
-    RFC3339 timestamp with a zone offset, so a bare date needs widening.
+    Google represents a timed event's boundary as {"dateTime": ...} and an
+    all-day event's as {"date": "YYYY-MM-DD"} - timeMin/timeMax require a
+    full RFC3339 timestamp with a zone offset, so a bare date needs
+    widening.
+
+    A timed boundary's `dateTime` USUALLY already carries its own zone
+    offset, but Google's own EventDateTime docs are explicit that this
+    isn't guaranteed: "A time zone offset is required unless a time zone
+    is explicitly specified in timeZone" - a client (including one that
+    isn't this tool) can legally write an offsetless `dateTime` paired
+    with a sibling `timeZone` field instead. Comparing that offsetless
+    string as if it were self-describing would compare naive against
+    aware for what could be the same instant, defeating the overlap math
+    this whole module exists to get right - so it must be resolved
+    against its own `timeZone` (falling back to the calendar's default,
+    `tz_name`, only if this specific field is missing one).
 
     An all-day event's date is a day on the *calendar's own* calendar, not
     a UTC day - `tz_name` must be that calendar's configured timezone, not
@@ -251,7 +290,13 @@ def _event_boundary(field: dict[str, Any] | None, tz_name: str) -> str | None:
     field = field or {}
     date_time: str | None = field.get("dateTime")
     if date_time:
-        return date_time
+        try:
+            is_naive = datetime.fromisoformat(date_time).tzinfo is None
+        except ValueError:
+            return date_time  # malformed - pass through unchanged, as before
+        if not is_naive:
+            return date_time
+        return _offset_datetime_string(date_time, field.get("timeZone") or tz_name)
     date_value: str | None = field.get("date")
     if date_value:
         start, _ = _calendar_day_bounds(date_value, tz_name)
@@ -520,9 +565,8 @@ def google_calendar_create_events(
         normalized_attendees = _normalize_addresses(attendees) if attendees else []
 
         unchecked_attendees: list[str] = []
-        unchecked_reason: str | None = None
         if not ignore_conflicts:
-            conflicts, unchecked_attendees, unchecked_reason = _find_conflicts(
+            conflicts, unchecked_attendees = _find_conflicts(
                 service, start_time, end_time, normalized_attendees
             )
             if conflicts:
@@ -531,7 +575,6 @@ def google_calendar_create_events(
                     unchecked_attendees,
                     start_time,
                     end_time,
-                    unchecked_reason=unchecked_reason,
                 )
 
         event: dict[str, Any] = {
@@ -560,9 +603,7 @@ def google_calendar_create_events(
             **_api_call_kwargs(event, notify_attendees),
         )
         created_event = request.execute()
-        return _event_response(
-            created_event, **_unchecked_extra(unchecked_attendees, unchecked_reason)
-        )
+        return _event_response(created_event, **_unchecked_extra(unchecked_attendees))
 
     except Exception as e:
         logger.error(f"Error creating event: {e}")
@@ -652,9 +693,20 @@ def google_calendar_update_events(
         # boundary (see _event_boundary) - fetch it lazily so a plain
         # timed-event update doesn't pay for an extra API call it has no
         # use for.
-        calendar_timezone = (
-            _primary_calendar_timezone(service) if existing_is_all_day else "UTC"
-        )
+        try:
+            calendar_timezone = (
+                _primary_calendar_timezone(service) if existing_is_all_day else "UTC"
+            )
+        except ValueError:
+            if not ignore_conflicts:
+                raise
+            # ignore_conflicts=True means the caller has already decided
+            # the conflict check doesn't need to run - a missing-scope
+            # 403 here would only ever be surfaced by that check (or by
+            # the reversed-window sanity check below, which is fine to
+            # run a little less precisely against UTC than to block a
+            # write the caller explicitly opted out of checking).
+            calendar_timezone = "UTC"
         existing_start = _event_boundary(event.get("start"), calendar_timezone)
         existing_end = _event_boundary(event.get("end"), calendar_timezone)
         effective_start = start_time or existing_start
@@ -680,58 +732,70 @@ def google_calendar_update_events(
         }
         # attendees only ever ADDS: there's no way to remove an existing
         # attendee through this parameter (matching this tool's own
-        # docstring), so the effective set for conflict-checking purposes
-        # is always existing-plus-newly-added, never a caller-supplied
-        # subset that could silently drop someone. `added_attendees` (the
-        # ones actually new) is what the write step appends below.
+        # docstring). `added_attendees` (genuinely new) and
+        # `existing_attendees_raw` (retained) are checked separately
+        # below - a retained attendee only needs checking against the
+        # portion of a moved window that's actually new territory, while
+        # a newly-added one needs the whole effective window checked.
         added_attendees = _attendees_to_add(attendees, existing_attendee_emails)
-        # Preserve the casing already on the event - only the membership
-        # check below needs to be case-insensitive, not what gets
-        # queried/reported back to the caller.
-        normalized_attendees = sorted(existing_attendees_raw + added_attendees)
 
         unchecked_attendees: list[str] = []
-        unchecked_reason: str | None = None
         if not ignore_conflicts and effective_start and effective_end:
-            # A partial nudge that still overlaps the old window is just
-            # as unsafe to free/busy-check existing attendees against as
-            # the unchanged-window case: the overlap still contains this
-            # event's own busy block on their calendars, which isn't a
-            # real conflict. Only a window that's moved to somewhere
-            # completely disjoint from the old one is safe to check every
-            # attendee against. The organizer side has no such problem
-            # (excluded by event id, not by window), so it only needs
-            # `window_changed`, not the stricter disjoint test.
-            overlapping = _windows_overlap(
-                existing_start_key,
-                existing_end_key,
-                effective_start_key,
-                effective_end_key,
-            )
-            attendees_to_check = _attendees_needing_check(
-                normalized_attendees,
-                existing_attendee_emails,
-                moved_to_a_disjoint_window=window_changed and not overlapping,
-            )
             check_organizer = window_changed
+            all_conflicts: list[dict[str, Any]] = []
 
-            if check_organizer or attendees_to_check:
-                conflicts, unchecked_attendees, unchecked_reason = _find_conflicts(
+            # A newly-added attendee has no footprint on this event at
+            # all, so the FULL effective window is safe (and necessary)
+            # to check for them - same call also covers the organizer,
+            # who's excluded by event id rather than by window, so
+            # `window_changed` alone (not a disjoint-move test) decides
+            # whether to re-check them.
+            if check_organizer or added_attendees:
+                conflicts, unchecked = _find_conflicts(
                     service,
                     effective_start,
                     effective_end,
-                    attendees_to_check,
+                    added_attendees,
                     exclude_event_id=event_id,
                     check_organizer=check_organizer,
                 )
-                if conflicts:
-                    return _conflict_response(
-                        conflicts,
-                        unchecked_attendees,
-                        effective_start,
-                        effective_end,
-                        unchecked_reason=unchecked_reason,
+                all_conflicts.extend(conflicts)
+                unchecked_attendees.extend(unchecked)
+
+            # A retained attendee's own busy block for THIS event covers
+            # the entire OLD window - querying that overlap can't tell
+            # "busy because of this event" from a real conflict. Only the
+            # portion of the new window that's genuinely new territory
+            # (window_delta_segments - empty for an unchanged/shrunk
+            # window, up to two segments for a partial nudge that extends
+            # past the old window on one or both sides, or the whole new
+            # window for a fully disjoint move) can hide a real conflict
+            # for them.
+            if existing_attendees_raw:
+                for seg_start, seg_end in _window_delta_segments(
+                    existing_start_key,
+                    existing_end_key,
+                    effective_start_key,
+                    effective_end_key,
+                ):
+                    conflicts, unchecked = _find_conflicts(
+                        service,
+                        seg_start.isoformat(),
+                        seg_end.isoformat(),
+                        existing_attendees_raw,
+                        exclude_event_id=event_id,
+                        check_organizer=False,
                     )
+                    all_conflicts.extend(conflicts)
+                    unchecked_attendees.extend(unchecked)
+
+            if all_conflicts:
+                return _conflict_response(
+                    all_conflicts,
+                    unchecked_attendees,
+                    effective_start,
+                    effective_end,
+                )
 
         if summary:
             event["summary"] = summary
@@ -760,9 +824,7 @@ def google_calendar_update_events(
             **_api_call_kwargs(event, notify_attendees),
         )
         updated_event = request.execute()
-        return _event_response(
-            updated_event, **_unchecked_extra(unchecked_attendees, unchecked_reason)
-        )
+        return _event_response(updated_event, **_unchecked_extra(unchecked_attendees))
 
     except Exception as e:
         logger.error(f"Error updating event: {e}")

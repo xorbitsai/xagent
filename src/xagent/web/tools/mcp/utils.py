@@ -148,18 +148,17 @@ def conflict_response(
     unchecked_attendees: list[str],
     start: str,
     end: str,
-    *,
-    unchecked_reason: str | None = None,
 ) -> str:
     """Build the status="conflict" envelope a calendar-writing MCP tool
     returns instead of creating/updating an event, so the calling agent
     reports the conflict to the user rather than silently double-booking.
 
-    `unchecked_reason`, when given, is a short human-readable explanation
-    of why `unchecked_attendees` couldn't be checked (e.g. a missing OAuth
-    scope) - included only when there's an actionable cause to relay,
-    since most unchecked cases (an attendee absent from the provider's
-    response, or its own per-attendee error) are already self-explanatory.
+    `unchecked_attendees` here is always the self-explanatory kind (an
+    attendee absent from the provider's response, or its own per-attendee
+    error) - a missing-OAuth-scope 403 covering the whole call is instead
+    raised as a ValueError before this response is ever built, since
+    writing an event whose availability could never actually be checked
+    would defeat the point of this feature.
     """
     payload = {
         "status": "conflict",
@@ -174,24 +173,16 @@ def conflict_response(
             "they still want this slot."
         ),
     }
-    if unchecked_reason:
-        payload["unchecked_reason"] = unchecked_reason
     return json.dumps(payload, ensure_ascii=False)
 
 
-def unchecked_extra(
-    unchecked_attendees: list[str], unchecked_reason: str | None
-) -> dict[str, Any]:
+def unchecked_extra(unchecked_attendees: list[str]) -> dict[str, Any]:
     """Extra fields for a status="success" envelope when some attendees
     ended up unchecked - empty (nothing to add) when there's nothing to
-    report, matching `conflict_response`'s own "only when actionable"
-    policy for `unchecked_reason`."""
+    report."""
     if not unchecked_attendees:
         return {}
-    extra: dict[str, Any] = {"unchecked_attendees": unchecked_attendees}
-    if unchecked_reason:
-        extra["unchecked_reason"] = unchecked_reason
-    return extra
+    return {"unchecked_attendees": unchecked_attendees}
 
 
 def attendees_were_given(attendees: list[str] | str | None) -> bool:
@@ -221,31 +212,6 @@ def attendees_to_add(
     return [
         address
         for address in normalize_addresses(attendees)
-        if address.lower() not in existing_attendee_emails
-    ]
-
-
-def attendees_needing_check(
-    normalized_attendees: list[str],
-    existing_attendee_emails: set[str],
-    *,
-    moved_to_a_disjoint_window: bool,
-) -> list[str]:
-    """Which attendees actually need a fresh free/busy check on an update.
-
-    An existing attendee's schedule will always show this event's own
-    busy block for the window it currently occupies - querying that
-    window for them can't distinguish "busy because of this very event"
-    from a real conflict. Only once the window has moved somewhere that
-    no longer overlaps the old one is it safe to re-check everyone;
-    otherwise only the newly-added attendees (who have no such footprint
-    yet) are worth checking.
-    """
-    if moved_to_a_disjoint_window:
-        return normalized_attendees
-    return [
-        address
-        for address in normalized_attendees
         if address.lower() not in existing_attendee_emails
     ]
 
@@ -320,7 +286,7 @@ def reject_reversed_window(start_value: str, end_value: str) -> None:
     ``Z``-suffixed value alongside a naive one): Python raises
     ``TypeError`` comparing those with ``<=`` even though both are real
     ``datetime`` instances, so the ``isinstance`` check alone isn't
-    enough to guarantee a safe comparison - see ``windows_overlap``,
+    enough to guarantee a safe comparison - see ``window_delta_segments``,
     which guards the identical hazard the same way.
     """
     start_key = datetime_key_for_comparison(start_value)
@@ -353,6 +319,7 @@ _WINDOWS_TO_IANA: dict[str, str] = {
     "Central European Standard Time": "Europe/Warsaw",
     "Romance Standard Time": "Europe/Paris",
     "E. Europe Standard Time": "Europe/Bucharest",
+    "GTB Standard Time": "Europe/Bucharest",
     "FLE Standard Time": "Europe/Kyiv",
     "Turkey Standard Time": "Europe/Istanbul",
     "Russian Standard Time": "Europe/Moscow",
@@ -578,44 +545,70 @@ def calendar_day_bounds(
     return start.isoformat(), end.isoformat()
 
 
-def windows_overlap(
+def window_delta_segments(
     existing_start: datetime | str | None,
     existing_end: datetime | str | None,
     new_start: datetime | str | None,
     new_end: datetime | str | None,
-) -> bool:
-    """Whether two half-open [start, end) intervals share any instant.
+) -> list[tuple[datetime, datetime]]:
+    """The portion(s) of the half-open [new_start, new_end) window that
+    fall OUTSIDE [existing_start, existing_end) - the only territory an
+    attendee already on the event needs a fresh free/busy check against.
 
-    Takes comparison keys already produced by ``datetime_key_for_comparison``
-    (so an equal-instant value compares equal regardless of formatting/zone
-    differences), not raw strings.
+    An attendee already on the event will always show this very event's
+    own busy block for any instant inside the OLD window - querying that
+    overlap can't distinguish "busy because of this event" from a real
+    conflict, the exact self-conflict bug this function exists to avoid.
+    But a window can move in a way that's neither identical/subset (no
+    new territory at all) nor fully disjoint (the whole new window is new
+    territory) - a partial nudge like 10:00-10:30 -> 10:15-10:45 makes
+    10:30-10:45 new territory while 10:15-10:30 is still old ground, and
+    checking the retained attendee only over the confirmed-safe old
+    portion (or not at all) would silently miss a genuine conflict
+    sitting in that new segment. This computes exactly that new territory
+    so the caller can check retained attendees against precisely it,
+    while newly-added attendees (who have no footprint on this event at
+    all) still get the FULL new window checked regardless of any of this
+    - they need every instant in it verified, delta or not.
 
-    A calendar-conflict check must tell "moved to a genuinely disjoint
-    window" (safe to re-check every existing attendee - this event's own
-    footprint can't appear in a window it doesn't occupy) apart from "same
-    or overlapping window" (an existing attendee's free/busy would still
-    show this very event's own busy block inside the overlap, which isn't
-    a real conflict). This is that test.
-
-    If any key isn't a real parsed ``datetime`` - still a raw string
-    because it failed to parse, or (rarer) one side aware and the other
-    naive - "can't confirm disjoint" applies, so this returns ``True``
-    (overlapping) rather than assuming a safety it can't verify. A raw
-    string still compares (and orders) against another string with `<`
-    without raising, so this can't rely on catching ``TypeError`` alone -
-    it must check that every key actually is a comparable `datetime`.
+    Returns:
+    - ``[]`` when the new window is confirmed to add no territory beyond
+      the old one (identical or a subset) - nothing new for a retained
+      attendee to be checked against.
+    - Up to two disjoint segments when the new window extends past the
+      old one's start, end, or both (e.g. extending a meeting on both
+      sides in one call).
+    - The whole ``[new_start, new_end)`` as a single segment when the two
+      windows are confirmed to not overlap at all (matching "moved
+      somewhere completely disjoint -> check the whole thing"), OR when
+      any value isn't a real, mutually-comparable ``datetime`` (parsing
+      failure, or one side aware and the other naive) - "can't confirm
+      the delta is smaller than the whole window" must never silently
+      shrink what gets checked, so treat it as needing the full window.
+    - ``[]`` in the same can't-tell scenario if there's no valid new
+      window at all to fall back to (``new_start``/``new_end`` themselves
+      aren't real instants) - there is nothing meaningful to check.
     """
+    if not (isinstance(new_start, datetime) and isinstance(new_end, datetime)):
+        return []
     if not (
-        isinstance(existing_start, datetime)
-        and isinstance(existing_end, datetime)
-        and isinstance(new_start, datetime)
-        and isinstance(new_end, datetime)
+        isinstance(existing_start, datetime) and isinstance(existing_end, datetime)
     ):
-        return True
+        return [(new_start, new_end)]
     try:
-        return existing_start < new_end and new_start < existing_end
+        fully_disjoint = new_end <= existing_start or new_start >= existing_end
+        if fully_disjoint:
+            return [(new_start, new_end)]
+        segments = []
+        if new_start < existing_start:
+            segments.append((new_start, existing_start))
+        if new_end > existing_end:
+            segments.append((existing_end, new_end))
+        return segments
     except TypeError:
-        return True
+        # Real datetimes that still can't be compared (aware vs. naive) -
+        # same "can't confirm smaller than the whole window" fallback.
+        return [(new_start, new_end)]
 
 
 def clamp_limit(limit: int, *, max_limit: int) -> int:

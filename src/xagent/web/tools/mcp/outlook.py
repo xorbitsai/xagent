@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+from datetime import datetime
 from typing import Any
 from urllib.parse import quote
 
@@ -278,9 +279,12 @@ def _find_conflicts(
                 # sees this batch as unchecked, not silently clear.
                 unchecked_attendees.extend(batch)
                 unchecked_reason = (
-                    "Missing the calendars.read/schedule permission "
-                    "needed to check attendee availability - reconnect "
-                    "the Outlook connector to grant it."
+                    "Missing the calendars.read/schedule permission needed "
+                    "to check attendee availability - reconnecting the "
+                    "Outlook connector may grant it; if the connector "
+                    "already has calendar access, this is more likely an "
+                    "org-level policy blocking this call, which a "
+                    "reconnect won't fix."
                 )
                 continue
             raise
@@ -772,15 +776,22 @@ def outlook_update_event(
             # to be a no-op given the event's current state.
             raise ValueError("at least one field must be provided to update the event")
 
+        # Checked unconditionally, not gated on ignore_conflicts - this is
+        # basic input sanity (a window a provider API should never be
+        # asked to write), not a conflict-check decision the caller can
+        # opt out of. Matches google_calendar_update_events, and this
+        # tool's own create path, both of which validate regardless of
+        # ignore_conflicts too.
+        existing_end = existing_end_field.get("dateTime")
+        existing_start = existing_start_field.get("dateTime")
+        effective_start = start_datetime or existing_start
+        effective_end = end_datetime or existing_end
+        if effective_start and effective_end:
+            _reject_reversed_window(effective_start, effective_end)
+
         unchecked_attendees: list[str] = []
         unchecked_reason: str | None = None
         if not ignore_conflicts and touches_schedule:
-            existing_end = existing_end_field.get("dateTime")
-            existing_start = existing_start_field.get("dateTime")
-            effective_start = start_datetime or existing_start
-            effective_end = end_datetime or existing_end
-            if effective_start and effective_end:
-                _reject_reversed_window(effective_start, effective_end)
             # Both boundaries always end up denominated in the same zone
             # here: when only one of start_datetime/end_datetime is given
             # (single_boundary_update), `existing_zone` already equals
@@ -815,26 +826,15 @@ def outlook_update_event(
             # UTC here (the conservative direction: a wrong guess makes
             # the window look more likely to have "changed", which only
             # means checking more attendees, never fewer).
-            existing_start_key = _datetime_key_for_comparison(
-                _offset_datetime_string(existing_start, existing_zone or "UTC")
-                if existing_start
-                else None
-            )
-            existing_end_key = _datetime_key_for_comparison(
-                _offset_datetime_string(existing_end, existing_zone or "UTC")
-                if existing_end
-                else None
-            )
-            effective_start_key = _datetime_key_for_comparison(
-                _offset_datetime_string(effective_start, provisional_query_timezone)
-                if effective_start
-                else None
-            )
-            effective_end_key = _datetime_key_for_comparison(
-                _offset_datetime_string(effective_end, provisional_query_timezone)
-                if effective_end
-                else None
-            )
+            def _key(value: str | None, tz_name: str) -> datetime | str | None:
+                return _datetime_key_for_comparison(
+                    _offset_datetime_string(value, tz_name) if value else None
+                )
+
+            existing_start_key = _key(existing_start, existing_zone or "UTC")
+            existing_end_key = _key(existing_end, existing_zone or "UTC")
+            effective_start_key = _key(effective_start, provisional_query_timezone)
+            effective_end_key = _key(effective_end, provisional_query_timezone)
 
             # is_all_day changes the event's effective span even when the
             # literal start/end clock values don't move (e.g. turning a
@@ -868,12 +868,8 @@ def outlook_update_event(
             if effective_is_all_day and effective_start and effective_end:
                 query_start, _ = _naive_day_bounds(effective_start)
                 _, query_end = _naive_day_bounds(effective_end)
-                query_start_key = _datetime_key_for_comparison(
-                    _offset_datetime_string(query_start, provisional_query_timezone)
-                )
-                query_end_key = _datetime_key_for_comparison(
-                    _offset_datetime_string(query_end, provisional_query_timezone)
-                )
+                query_start_key = _key(query_start, provisional_query_timezone)
+                query_end_key = _key(query_end, provisional_query_timezone)
 
             # A window (literally moved, or widened to a full day by an
             # is_all_day toggle) that still overlaps the event's own

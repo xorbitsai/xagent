@@ -214,6 +214,37 @@ def test_attendees_needing_check_same_or_overlapping_window_checks_only_new():
     ) == ["new@x.com"]
 
 
+def test_windows_overlap_detects_overlapping_and_disjoint_windows():
+    overlapping_a = utils.datetime_key_for_comparison("2026-08-27T10:00:00+00:00")
+    overlapping_b = utils.datetime_key_for_comparison("2026-08-27T10:30:00+00:00")
+    disjoint_a = utils.datetime_key_for_comparison("2026-08-27T14:00:00+00:00")
+    disjoint_b = utils.datetime_key_for_comparison("2026-08-27T14:30:00+00:00")
+
+    assert (
+        utils.windows_overlap(
+            overlapping_a, overlapping_b, overlapping_a, overlapping_b
+        )
+        is True
+    )
+    assert (
+        utils.windows_overlap(overlapping_a, overlapping_b, disjoint_a, disjoint_b)
+        is False
+    )
+
+
+def test_windows_overlap_is_conservative_on_unparseable_or_mismatched_keys():
+    """Regression test: "can't confirm disjoint" must read as overlapping
+    (True), never as disjoint (False) - both for a key that never parsed
+    to a real datetime, and for two real datetimes that can't be compared
+    against each other (aware vs. naive raises TypeError on `<`)."""
+    real_key = utils.datetime_key_for_comparison("2026-08-27T10:00:00+00:00")
+    assert utils.windows_overlap("not-a-date", "also-not", real_key, real_key) is True
+
+    aware_key = utils.datetime_key_for_comparison("2026-08-27T10:00:00+00:00")
+    naive_key = utils.datetime_key_for_comparison("2026-08-27T10:00:00")
+    assert utils.windows_overlap(aware_key, aware_key, naive_key, naive_key) is True
+
+
 def test_reject_reversed_window_raises_when_end_is_not_after_start():
     with pytest.raises(ValueError, match="must be after"):
         utils.reject_reversed_window(

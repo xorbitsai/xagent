@@ -306,10 +306,11 @@ def datetime_key_for_comparison(value: str | None) -> datetime | str | None:
 
 
 def reject_reversed_window(start_value: str, end_value: str) -> None:
-    """Raise ValueError when `end_value` is not after `start_value`, for a
-    brand-new event window a caller is about to create - catching an
-    obviously backwards request locally rather than forwarding it to the
-    provider API as-is.
+    """Raise ValueError when `end_value` is not after `start_value` - an
+    event window's basic ordering sanity, checked before forwarding it to
+    the provider API as-is (both on create, and on update's effective
+    window regardless of ignore_conflicts - this isn't a conflict-check
+    decision a caller can opt out of).
 
     Deliberately permissive when either side doesn't parse to a real,
     comparable instant (stays silent rather than rejecting) - matching
@@ -327,11 +328,12 @@ def reject_reversed_window(start_value: str, end_value: str) -> None:
     if not (isinstance(start_key, datetime) and isinstance(end_key, datetime)):
         return
     try:
-        reversed_or_empty = end_key <= start_key
+        if end_key <= start_key:
+            raise ValueError(
+                f"end ({end_value!r}) must be after start ({start_value!r})."
+            )
     except TypeError:
         return
-    if reversed_or_empty:
-        raise ValueError(f"end ({end_value!r}) must be after start ({start_value!r}).")
 
 
 # Microsoft Graph timeZone values come in two shapes depending on how/where

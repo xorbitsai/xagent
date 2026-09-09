@@ -143,6 +143,44 @@ def test_create_event_detects_attendee_schedule_conflict(monkeypatch):
     assert graph_request.call_count == 2
 
 
+def test_create_event_accepts_attendees_as_a_comma_separated_string(monkeypatch):
+    """attendees is documented as list[str] | str - a comma-separated
+    string (as opposed to a list) must be end-to-end equivalent, not just
+    accepted by normalize_addresses in isolation."""
+    graph_request = Mock(
+        side_effect=[
+            {"value": []},
+            {
+                "value": [
+                    {"scheduleId": "chelsea@example.com", "scheduleItems": []},
+                    {"scheduleId": "dana@example.com", "scheduleItems": []},
+                ]
+            },
+            {"id": "created"},
+        ]
+    )
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_create_event(
+            subject="Kickoff",
+            start_datetime="2026-08-27T10:00:00",
+            end_datetime="2026-08-27T10:30:00",
+            attendees="chelsea@example.com, dana@example.com",
+        )
+    )
+
+    assert result["status"] == "success"
+    assert "unchecked_attendees" not in result
+    create_call = graph_request.call_args_list[-1]
+    assert {
+        a["emailAddress"]["address"] for a in create_call.kwargs["body"]["attendees"]
+    } == {
+        "chelsea@example.com",
+        "dana@example.com",
+    }
+
+
 def test_create_event_conflict_reports_caller_casing_not_graphs(monkeypatch):
     """Regression test: the conflict's "calendar" field must echo back the
     casing the caller supplied (matching google_calendar's equivalent
@@ -926,6 +964,30 @@ def test_update_event_ignore_conflicts_skips_the_check(monkeypatch):
     assert result["status"] == "success"
     graph_request.assert_called_once()
     assert graph_request.call_args.args[:2] == ("PATCH", "/me/events/self-1")
+
+
+def test_update_event_rejects_a_reversed_window_even_with_ignore_conflicts(
+    monkeypatch,
+):
+    """Regression test: the reversed-window guard is basic input sanity,
+    not a conflict-check decision - it must still run when
+    ignore_conflicts=True skips the actual conflict check, matching
+    google_calendar_update_events and this tool's own create path."""
+    graph_request = Mock()
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_update_event(
+            event_id="self-1",
+            start_datetime="2026-08-27T10:30:00",
+            end_datetime="2026-08-27T10:00:00",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "must be after" in result["message"]
+    graph_request.assert_not_called()
 
 
 def test_create_event_batch_over_limit_is_chunked_into_multiple_calls(

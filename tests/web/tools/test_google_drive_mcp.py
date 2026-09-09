@@ -93,6 +93,26 @@ def test_resolve_file_id_does_not_extract_id_from_untrusted_hosts(url):
 @pytest.mark.parametrize(
     "url",
     [
+        # A userinfo-bearing authority is inherently ambiguous across URL
+        # parsers: Python's urlparse (RFC 3986) resolves .hostname to
+        # whatever follows the *last* "@", so each of these has .hostname
+        # == "drive.google.com" and would pass a naive host check -- but a
+        # WHATWG-based parser (a browser rendering the same string to a
+        # human, or a different URL consumer downstream) can disagree about
+        # which side is the real destination. The literal backslash variant
+        # is the same ambiguity with an extra separator character thrown
+        # in; both must be rejected identically, not just the plain form.
+        r"https://evil.com@drive.google.com/x?id=ATTACKER_ID",
+        r"https://evil.com\@drive.google.com/x?id=ATTACKER_ID",
+    ],
+)
+def test_resolve_file_id_rejects_userinfo_bearing_authority(url):
+    assert google_drive._resolve_file_id(url) == url
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
         "drive.google.com/file/d/abc123/view",
         "drive.google.com/drive/folders/abc123",
         "docs.google.com/open?id=abc123",
@@ -246,6 +266,37 @@ def test_resolve_file_id_supports_forms_and_drawings(url, expected):
 def test_resolve_file_id_supports_usercontent_host():
     url = "https://drive.usercontent.google.com/download?id=abc123&export=download"
     assert google_drive._resolve_file_id(url) == "abc123"
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("abc123", None),  # bare id: never URL-shaped, nothing to extract
+        ("https://drive.google.com/file/d/abc123/view", None),  # no resourcekey
+        (
+            "https://drive.google.com/file/d/abc123/view?resourcekey=0-Rkey123",
+            "0-Rkey123",
+        ),
+        (
+            "https://docs.google.com/document/d/abc123/edit?resourcekey=0-Rkey123",
+            "0-Rkey123",
+        ),
+        # Untrusted host: must not leak a resourcekey-shaped query value
+        # from a URL this connector doesn't otherwise trust at all.
+        ("https://evil.com/x?id=abc123&resourcekey=0-Rkey123", None),
+        # Userinfo-bearing authority: same rejection as _resolve_file_id.
+        (
+            "https://evil.com@drive.google.com/file/d/abc123/view?resourcekey=0-Rkey123",
+            None,
+        ),
+        # A resourcekey value containing characters outside the id
+        # charset is rejected rather than passed through unvalidated into
+        # a header value.
+        ("https://drive.google.com/file/d/abc123/view?resourcekey=bad key", None),
+    ],
+)
+def test_extract_resource_key(value, expected):
+    assert google_drive._extract_resource_key(value) == expected
 
 
 @pytest.mark.parametrize("bad_role", ["owner", "organizer", ""])
@@ -500,6 +551,75 @@ def test_get_file_content_resolves_full_drive_url(monkeypatch):
     assert media_kwargs["supportsAllDrives"] is True
     assert result["content"] == "hello"
     assert result["encoding"] == "utf-8"
+
+
+def test_get_file_content_attaches_resource_key_header_from_share_link(monkeypatch):
+    """A pre-2021 link-shared item's plain fileId 404s on files.get/
+    files.get_media/files.export_media without the resourcekey from its
+    share link attached as an X-Goog-Drive-Resource-Keys header (see
+    google_drive_download.py for the same header used elsewhere in this
+    codebase). The header must be attached to both the metadata fetch and
+    the content download/export request."""
+    service = _mock_drive_service(monkeypatch)
+    get_request = service.files.return_value.get.return_value
+    get_request.headers = {}
+    get_request.execute.return_value = {
+        "id": "abc123",
+        "name": "notes.txt",
+        "mimeType": "text/plain",
+    }
+    media_request = service.files.return_value.get_media.return_value
+    media_request.headers = {}
+
+    class _FakeDownloader:
+        def __init__(self, fh, _request):
+            self._fh = fh
+
+        def next_chunk(self):
+            self._fh.write(b"hello")
+            return None, True
+
+    monkeypatch.setattr(google_drive, "MediaIoBaseDownload", _FakeDownloader)
+
+    url = "https://drive.google.com/file/d/abc123/view?resourcekey=0-Rkey123"
+    result = json.loads(google_drive.google_drive_get_file_content(url))
+
+    assert result["status"] == "success"
+    expected_header = {"X-Goog-Drive-Resource-Keys": "abc123/0-Rkey123"}
+    assert get_request.headers == expected_header
+    assert media_request.headers == expected_header
+
+
+def test_get_file_content_omits_resource_key_header_for_bare_id(monkeypatch):
+    """A bare id (or a share link with no resourcekey) never carries a
+    resourcekey -- the header must not be attached (or attached as
+    "id/None") in that ordinary case."""
+    service = _mock_drive_service(monkeypatch)
+    get_request = service.files.return_value.get.return_value
+    get_request.headers = {}
+    get_request.execute.return_value = {
+        "id": "abc123",
+        "name": "notes.txt",
+        "mimeType": "text/plain",
+    }
+    media_request = service.files.return_value.get_media.return_value
+    media_request.headers = {}
+
+    class _FakeDownloader:
+        def __init__(self, fh, _request):
+            self._fh = fh
+
+        def next_chunk(self):
+            self._fh.write(b"hello")
+            return None, True
+
+    monkeypatch.setattr(google_drive, "MediaIoBaseDownload", _FakeDownloader)
+
+    result = json.loads(google_drive.google_drive_get_file_content("abc123"))
+
+    assert result["status"] == "success"
+    assert get_request.headers == {}
+    assert media_request.headers == {}
 
 
 def test_get_file_content_falls_back_to_base64_for_binary_content(monkeypatch):
@@ -833,6 +953,18 @@ def test_rename_file_resolves_full_drive_url(monkeypatch):
     assert kwargs["supportsAllDrives"] is True
 
 
+def test_rename_file_attaches_resource_key_header(monkeypatch):
+    service = _mock_drive_service(monkeypatch)
+    update_request = service.files.return_value.update.return_value
+    update_request.headers = {}
+    update_request.execute.return_value = {"id": "abc123", "name": "renamed"}
+
+    url = "https://drive.google.com/file/d/abc123/view?resourcekey=0-Rkey123"
+    google_drive.google_drive_rename_file(url, "renamed")
+
+    assert update_request.headers == {"X-Goog-Drive-Resource-Keys": "abc123/0-Rkey123"}
+
+
 def test_list_permissions_returns_permissions(monkeypatch):
     service = _mock_drive_service(monkeypatch)
     service.permissions.return_value.list.return_value.execute.return_value = {
@@ -850,6 +982,91 @@ def test_list_permissions_returns_permissions(monkeypatch):
         service.permissions.return_value.list.call_args.kwargs["supportsAllDrives"]
         is True
     )
+
+
+def test_list_permissions_requests_permission_details_field(monkeypatch):
+    """Without permissionDetails, a caller can't tell an inherited
+    permission (comes from a parent folder, can't be changed/removed on
+    this item directly) from a direct one -- only observable for a Shared
+    Drive item, but the field must always be requested to expose it when
+    it's there."""
+    service = _mock_drive_service(monkeypatch)
+    service.permissions.return_value.list.return_value.execute.return_value = {
+        "permissions": []
+    }
+
+    google_drive.google_drive_list_permissions("fid")
+
+    fields = service.permissions.return_value.list.call_args.kwargs["fields"]
+    assert "permissionDetails" in fields
+    assert "inherited" in fields
+
+
+def test_list_permissions_accepts_a_caller_supplied_page_token(monkeypatch):
+    service = _mock_drive_service(monkeypatch)
+    service.permissions.return_value.list.return_value.execute.return_value = {
+        "permissions": [{"id": "perm1"}]
+    }
+
+    google_drive.google_drive_list_permissions("fid", page_token="resume-here")
+
+    assert (
+        service.permissions.return_value.list.call_args.kwargs["pageToken"]
+        == "resume-here"
+    )
+
+
+def test_list_permissions_returns_next_page_token_when_stopped_early(monkeypatch):
+    """When pagination stops early (either because accumulated size
+    already exceeds the output cap, or the loop-safety bound was hit) a
+    nextPageToken may still exist -- it must be surfaced so a caller can
+    resume the listing instead of the rest of the collaborators being
+    silently lost."""
+    monkeypatch.setattr(google_drive, "get_tool_max_output_length", lambda: 3000)
+    service = _mock_drive_service(monkeypatch)
+    huge_page = [
+        {
+            "id": f"perm{i}",
+            "type": "user",
+            "role": "reader",
+            "emailAddress": f"user{i}@example.com",
+            "displayName": "x" * 200,
+        }
+        for i in range(2000)
+    ]
+    service.permissions.return_value.list.return_value.execute.return_value = {
+        "permissions": huge_page,
+        "nextPageToken": "page2",
+    }
+
+    result = json.loads(google_drive.google_drive_list_permissions("fid"))
+
+    assert result["truncated"] is True
+    assert result["next_page_token"] == "page2"
+
+
+def test_list_permissions_omits_next_page_token_when_list_is_complete(monkeypatch):
+    service = _mock_drive_service(monkeypatch)
+    service.permissions.return_value.list.return_value.execute.return_value = {
+        "permissions": [{"id": "perm1"}]
+    }
+
+    result = json.loads(google_drive.google_drive_list_permissions("fid"))
+
+    assert result["truncated"] is False
+    assert "next_page_token" not in result
+
+
+def test_list_permissions_attaches_resource_key_header(monkeypatch):
+    service = _mock_drive_service(monkeypatch)
+    list_request = service.permissions.return_value.list.return_value
+    list_request.headers = {}
+    list_request.execute.return_value = {"permissions": []}
+
+    url = "https://drive.google.com/file/d/abc123/view?resourcekey=0-Rkey123"
+    google_drive.google_drive_list_permissions(url)
+
+    assert list_request.headers == {"X-Goog-Drive-Resource-Keys": "abc123/0-Rkey123"}
 
 
 def test_list_permissions_caps_oversized_output(monkeypatch):
@@ -911,6 +1128,7 @@ def test_list_permissions_reports_truncated_when_page_bound_is_exhausted(
     were never fetched, so reporting a complete list would be dishonest
     even though what little was collected happens to fit comfortably."""
     monkeypatch.setattr(google_drive, "_MAX_PERMISSION_LIST_PAGES", 3)
+    monkeypatch.setattr(google_drive, "get_tool_max_output_length", lambda: 3000)
     service = _mock_drive_service(monkeypatch)
     service.permissions.return_value.list.return_value.execute.return_value = {
         "permissions": [{"id": "perm"}],
@@ -930,6 +1148,7 @@ def test_list_permissions_stops_paginating_once_over_the_output_limit(monkeypatc
     limit, fetching further pages is pure waste -- more blocking API calls
     for data that gets thrown away immediately after."""
     service = _mock_drive_service(monkeypatch)
+    monkeypatch.setattr(google_drive, "get_tool_max_output_length", lambda: 3000)
     huge_page = [
         {
             "id": f"perm{i}",
@@ -1044,6 +1263,23 @@ def test_share_file_grants_role_to_email(monkeypatch):
     assert kwargs["supportsAllDrives"] is True
 
 
+def test_share_file_attaches_resource_key_header(monkeypatch):
+    service = _mock_drive_service(monkeypatch)
+    create_request = service.permissions.return_value.create.return_value
+    create_request.headers = {}
+    create_request.execute.return_value = {
+        "id": "perm1",
+        "type": "user",
+        "role": "reader",
+        "emailAddress": "a@x.com",
+    }
+
+    url = "https://drive.google.com/file/d/abc123/view?resourcekey=0-Rkey123"
+    google_drive.google_drive_share_file(url, "a@x.com")
+
+    assert create_request.headers == {"X-Goog-Drive-Resource-Keys": "abc123/0-Rkey123"}
+
+
 def test_share_file_defaults_to_reader_with_notification(monkeypatch):
     service = _mock_drive_service(monkeypatch)
     service.permissions.return_value.create.return_value.execute.return_value = {}
@@ -1138,6 +1374,54 @@ def test_update_permission_changes_role(monkeypatch):
     assert kwargs["fields"] == "id, type, role, emailAddress, displayName"
 
 
+def test_update_permission_attaches_resource_key_header(monkeypatch):
+    service = _mock_drive_service(monkeypatch)
+    update_request = service.permissions.return_value.update.return_value
+    update_request.headers = {}
+    update_request.execute.return_value = {"id": "perm1", "role": "writer"}
+
+    url = "https://drive.google.com/file/d/abc123/view?resourcekey=0-Rkey123"
+    google_drive.google_drive_update_permission(url, "perm1", "writer")
+
+    assert update_request.headers == {"X-Goog-Drive-Resource-Keys": "abc123/0-Rkey123"}
+
+
+@pytest.mark.parametrize("bad_permission_id", ["..", "../other", "perm/../file"])
+def test_update_permission_rejects_dot_segment_permission_id(
+    monkeypatch, bad_permission_id
+):
+    """permission_id never goes through URL resolution, but googleapiclient
+    does not percent-encode "." before interpolating it into the request
+    path -- an unvalidated dot-segment id can be collapsed by normalization
+    into an unrelated endpoint. require_clean_identifier alone accepts
+    ".." (non-empty, no surrounding whitespace); _require_drive_id must
+    additionally reject it via the same character class real ids use."""
+    service = _mock_drive_service(monkeypatch)
+
+    result = json.loads(
+        google_drive.google_drive_update_permission("fid", bad_permission_id, "reader")
+    )
+
+    assert result["status"] == "error"
+    assert "permission_id" in result["message"]
+    service.permissions.return_value.update.assert_not_called()
+
+
+@pytest.mark.parametrize("bad_permission_id", ["..", "../other", "perm/../file"])
+def test_remove_permission_rejects_dot_segment_permission_id(
+    monkeypatch, bad_permission_id
+):
+    service = _mock_drive_service(monkeypatch)
+
+    result = json.loads(
+        google_drive.google_drive_remove_permission("fid", bad_permission_id)
+    )
+
+    assert result["status"] == "error"
+    assert "permission_id" in result["message"]
+    service.permissions.return_value.delete.assert_not_called()
+
+
 @pytest.mark.parametrize("bad_role", ["owner", "organizer", ""])
 def test_update_permission_rejects_role_outside_the_share_roles(monkeypatch, bad_role):
     service = _mock_drive_service(monkeypatch)
@@ -1174,6 +1458,18 @@ def test_remove_permission_success(monkeypatch):
     assert result["status"] == "success"
     assert "perm1" in result["message"]
     service.permissions.return_value.get.assert_not_called()
+
+
+def test_remove_permission_attaches_resource_key_header(monkeypatch):
+    service = _mock_drive_service(monkeypatch)
+    delete_request = service.permissions.return_value.delete.return_value
+    delete_request.headers = {}
+    delete_request.execute.return_value = {}
+
+    url = "https://drive.google.com/file/d/abc123/view?resourcekey=0-Rkey123"
+    google_drive.google_drive_remove_permission(url, "perm1")
+
+    assert delete_request.headers == {"X-Goog-Drive-Resource-Keys": "abc123/0-Rkey123"}
 
 
 def test_remove_permission_returns_error_payload_on_failure(monkeypatch):
@@ -1318,6 +1614,18 @@ def test_delete_file_rejects_dot_segment_file_id_before_calling_the_api(monkeypa
     assert result["status"] == "error"
     assert "file_id must look like a Drive id" in result["message"]
     get_service.assert_not_called()
+
+
+def test_delete_file_attaches_resource_key_header(monkeypatch):
+    service = _mock_drive_service(monkeypatch)
+    delete_request = service.files.return_value.delete.return_value
+    delete_request.headers = {}
+    delete_request.execute.return_value = {}
+
+    url = "https://drive.google.com/file/d/abc123/view?resourcekey=0-Rkey123"
+    google_drive.google_drive_delete_file(url)
+
+    assert delete_request.headers == {"X-Goog-Drive-Resource-Keys": "abc123/0-Rkey123"}
 
 
 def test_remove_permission_tolerates_ssl_eof_on_204_response(monkeypatch):

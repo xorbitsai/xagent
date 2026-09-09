@@ -214,6 +214,18 @@ def _resolve_file_id(file_id: str, field_name: str = "file_id") -> str:
             parsed = urlparse(f"//{stripped}")
     except ValueError:
         return stripped
+    if parsed.username is not None:
+        # A userinfo-bearing authority ("evil.com@drive.google.com", or the
+        # same thing with a literal backslash before the "@") is inherently
+        # ambiguous: Python's parser (correctly, per RFC 3986) treats
+        # everything before the last "@" as userinfo and resolves
+        # .hostname to the part after it, so this would pass the trusted-
+        # host check below -- but a WHATWG-based parser (e.g. a browser
+        # rendering this same string to a human, or a different URL
+        # consumer downstream) can disagree about which side is the real
+        # destination. Reject outright rather than trust a parse that
+        # other consumers of the same string might not agree with.
+        return stripped
     if parsed.hostname not in _DRIVE_URL_HOSTS:
         return stripped
     match = _DRIVE_PATH_ID_PATTERN.search(parsed.path)
@@ -225,6 +237,80 @@ def _resolve_file_id(file_id: str, field_name: str = "file_id") -> str:
     if query_id and _DRIVE_ID_CHARS.fullmatch(query_id[0]):
         return query_id[0]
     return stripped
+
+
+def _extract_resource_key(file_id: str) -> str | None:
+    """Return the ``resourcekey`` query parameter from a Drive share link,
+    or ``None`` if ``file_id`` isn't URL-shaped, isn't a trusted Drive host,
+    or carries no resourcekey.
+
+    Google added resourcekeys in 2021 for items shared via link before that
+    date: such an item's plain fileId alone now 404s on files.get/
+    permissions.list/files.export/etc. unless the request also carries an
+    "X-Goog-Drive-Resource-Keys: <fileId>/<resourceKey>" header (see
+    google_drive_download.py/kb.py for the same header elsewhere in this
+    codebase) -- there is no separate lookup API for a resourcekey; the only
+    place it's ever exposed is the "?resourcekey=" query parameter Drive
+    puts on the share link itself.
+
+    Deliberately a standalone function that re-derives the trusted-host/
+    userinfo checks rather than folding this into _resolve_file_id and
+    returning a tuple: _resolve_file_id's plain-string return is relied on
+    by every call site and by the full existing test suite, and widening
+    its contract for a value that's usually None (only pre-2021 link-shared
+    items carry a resourcekey at all) isn't worth that blast radius.
+    """
+    if not isinstance(file_id, str):
+        return None
+    stripped = file_id.strip()
+    if not re.search(r"[/?]", stripped):
+        return None
+    try:
+        parsed = urlparse(stripped)
+        if not parsed.netloc:
+            parsed = urlparse(f"//{stripped}")
+    except ValueError:
+        return None
+    if parsed.username is not None:
+        return None
+    if parsed.hostname not in _DRIVE_URL_HOSTS:
+        return None
+    resource_key = parse_qs(parsed.query).get("resourcekey")
+    if not resource_key or not _DRIVE_ID_CHARS.fullmatch(resource_key[0]):
+        return None
+    return resource_key[0]
+
+
+def _attach_resource_key(request: Any, file_id: str, resource_key: str | None) -> Any:
+    """Attach the X-Goog-Drive-Resource-Keys header to an unexecuted
+    googleapiclient request when ``resource_key`` is present, mirroring
+    google_drive_download.py's ``request.headers.update(...)`` pattern.
+    Returns ``request`` so the call site can build/attach/execute in one
+    expression.
+    """
+    if resource_key:
+        request.headers["X-Goog-Drive-Resource-Keys"] = f"{file_id}/{resource_key}"
+    return request
+
+
+def _require_drive_id(value: str, field_name: str) -> str:
+    """Validate a raw (non-URL) Drive id such as a permission_id: non-empty,
+    no surrounding whitespace (require_clean_identifier), and restricted to
+    the same character class real Drive ids use (_DRIVE_ID_CHARS).
+
+    Closes the same dot-segment risk _resolve_file_id's bare-id path
+    guards against, for an id that (unlike file_id) never goes through URL
+    resolution at all: require_clean_identifier alone accepts ".."
+    (non-empty, no surrounding whitespace), and googleapiclient does not
+    percent-encode "." before interpolating an id into a URL path segment
+    -- an unvalidated permission_id="..\" reaches the API as a literal
+    dot-segment, which normalization can collapse a permission-removal
+    request into the file's own delete/get endpoint instead.
+    """
+    require_clean_identifier(value, field_name)
+    if not _DRIVE_ID_CHARS.fullmatch(value):
+        raise ValueError(f"{field_name} must look like a Drive id")
+    return value
 
 
 def _require_share_role(role: str) -> str:
@@ -275,13 +361,26 @@ def _capped_response(
 
 
 def _capped_list_response(
-    field_name: str, items: list[Any], *, truncated: bool = False
+    field_name: str,
+    items: list[Any],
+    *,
+    truncated: bool = False,
+    next_page_token: str | None = None,
 ) -> str:
     def _build(items: list[Any], truncated: bool) -> str:
-        return json.dumps(
-            {"status": "success", field_name: items, "truncated": truncated},
-            ensure_ascii=False,
-        )
+        response: dict[str, Any] = {
+            "status": "success",
+            field_name: items,
+            "truncated": truncated,
+        }
+        if next_page_token:
+            # Independent of the halving loop's own `truncated`/`items`
+            # cutting -- a caller-resumable page cursor from the upstream
+            # API, not something local truncation ever produces or
+            # invalidates, so it's attached once here rather than threaded
+            # through render/halve.
+            response["next_page_token"] = next_page_token
+        return json.dumps(response, ensure_ascii=False)
 
     return _capped_response(_build, items, truncated)
 
@@ -378,16 +477,15 @@ def google_drive_get_file_content(file_id: str, mime_type: str = "text/plain") -
     """
     try:
         resolved_file_id = _resolve_file_id(file_id)
+        resource_key = _extract_resource_key(file_id)
         service = get_drive_service()
-        file_metadata = (
-            service.files()
-            .get(
-                fileId=resolved_file_id,
-                supportsAllDrives=True,
-                fields="id, name, mimeType",
-            )
-            .execute()
+        get_request = service.files().get(
+            fileId=resolved_file_id,
+            supportsAllDrives=True,
+            fields="id, name, mimeType",
         )
+        _attach_resource_key(get_request, resolved_file_id, resource_key)
+        file_metadata = get_request.execute()
         file_mime_type = file_metadata.get("mimeType", "")
 
         if file_mime_type in _GOOGLE_APPS_TYPES_WITH_NO_EXPORT:
@@ -431,6 +529,7 @@ def google_drive_get_file_content(file_id: str, mime_type: str = "text/plain") -
             request = service.files().get_media(
                 fileId=resolved_file_id, supportsAllDrives=True
             )
+        _attach_resource_key(request, resolved_file_id, resource_key)
 
         fh = io.BytesIO()
         downloader = MediaIoBaseDownload(fh, request)
@@ -537,19 +636,18 @@ def google_drive_rename_file(file_id: str, new_name: str) -> str:
     """
     try:
         resolved_file_id = _resolve_file_id(file_id)
+        resource_key = _extract_resource_key(file_id)
         service = get_drive_service()
         file_metadata = {"name": new_name}
 
-        updated_file = (
-            service.files()
-            .update(
-                fileId=resolved_file_id,
-                body=file_metadata,
-                supportsAllDrives=True,
-                fields="id, name, webViewLink, mimeType",
-            )
-            .execute()
+        update_request = service.files().update(
+            fileId=resolved_file_id,
+            body=file_metadata,
+            supportsAllDrives=True,
+            fields="id, name, webViewLink, mimeType",
         )
+        _attach_resource_key(update_request, resolved_file_id, resource_key)
+        updated_file = update_request.execute()
 
         return json.dumps(
             {"status": "success", "file": updated_file}, ensure_ascii=False
@@ -633,19 +731,26 @@ def google_drive_delete_file(file_id: str) -> str:
     """
     try:
         resolved_file_id = _resolve_file_id(file_id)
+        resource_key = _extract_resource_key(file_id)
         service = get_drive_service()
-        _execute_ignoring_204_ssl_eof(
-            lambda: (
-                service.files()
-                .delete(fileId=resolved_file_id, supportsAllDrives=True)
-                .execute()
-            ),
-            lambda: (
-                service.files()
-                .get(fileId=resolved_file_id, supportsAllDrives=True)
-                .execute()
-            ),
-        )
+
+        def _delete() -> Any:
+            request = service.files().delete(
+                fileId=resolved_file_id, supportsAllDrives=True
+            )
+            return _attach_resource_key(
+                request, resolved_file_id, resource_key
+            ).execute()
+
+        def _verify_deleted() -> Any:
+            request = service.files().get(
+                fileId=resolved_file_id, supportsAllDrives=True
+            )
+            return _attach_resource_key(
+                request, resolved_file_id, resource_key
+            ).execute()
+
+        _execute_ignoring_204_ssl_eof(_delete, _verify_deleted)
 
         return json.dumps(
             {
@@ -660,20 +765,27 @@ def google_drive_delete_file(file_id: str) -> str:
 
 
 @mcp.tool()
-def google_drive_list_permissions(file_id: str) -> str:
+def google_drive_list_permissions(file_id: str, page_token: str | None = None) -> str:
     """
     List who currently has access to a Drive file or folder (owner,
     editors, commenters, viewers) and their permission ids. Use the
     returned permission ids with google_drive_update_permission or
     google_drive_remove_permission.
+    For an item in a Shared Drive with more collaborators than fit in one
+    response, the result includes a "next_page_token" -- pass it back as
+    this call's page_token to continue listing from where it left off
+    instead of silently missing the rest.
+    A permission whose "permissionDetails" marks it "inherited": true comes
+    from a parent folder, not this item directly -- it can't be changed or
+    removed here; do that on the folder it's inherited from instead.
     """
     try:
         resolved_file_id = _resolve_file_id(file_id)
+        resource_key = _extract_resource_key(file_id)
         service = get_drive_service()
         max_output_length = get_tool_max_output_length()
         permissions: list[Any] = []
         approx_length = 0
-        page_token: str | None = None
         # For an item in a Shared Drive, Drive returns at most 100
         # permissions per page when pageSize isn't set (a non-Shared-Drive
         # item always returns everything in one page); follow
@@ -681,19 +793,19 @@ def google_drive_list_permissions(file_id: str) -> str:
         # silently under-reported. Bounded so a misbehaving API response
         # can't turn this into an infinite loop.
         for _ in range(_MAX_PERMISSION_LIST_PAGES):
-            results = (
-                service.permissions()
-                .list(
-                    fileId=resolved_file_id,
-                    supportsAllDrives=True,
-                    pageToken=page_token,
-                    fields=(
-                        "nextPageToken, "
-                        "permissions(id, type, role, emailAddress, displayName)"
-                    ),
-                )
-                .execute()
+            list_request = service.permissions().list(
+                fileId=resolved_file_id,
+                supportsAllDrives=True,
+                pageToken=page_token,
+                fields=(
+                    "nextPageToken, "
+                    "permissions(id, type, role, emailAddress, displayName, "
+                    "permissionDetails(permissionType, role, inherited, "
+                    "inheritedFrom))"
+                ),
             )
+            _attach_resource_key(list_request, resolved_file_id, resource_key)
+            results = list_request.execute()
             new_permissions = results.get("permissions", [])
             permissions.extend(new_permissions)
             # _capped_list_response below will halve this back down to fit
@@ -728,9 +840,21 @@ def google_drive_list_permissions(file_id: str) -> str:
             # may still exist that was never followed, so this can't
             # honestly report a complete list even if the permissions
             # collected so far happen to still fit under the output cap.
-            return _capped_list_response("permissions", permissions, truncated=True)
+            return _capped_list_response(
+                "permissions",
+                permissions,
+                truncated=True,
+                next_page_token=page_token,
+            )
 
-        return _capped_list_response("permissions", permissions)
+        # page_token here is whatever the last page's nextPageToken was
+        # (None if that page was the last one) -- surfacing it lets a
+        # caller resume an early stop (the size-cap break above) from
+        # exactly where this call left off, rather than losing the rest of
+        # the collaborator list the way a silent truncation would.
+        return _capped_list_response(
+            "permissions", permissions, next_page_token=page_token
+        )
     except Exception as e:
         logger.error(f"Error listing permissions: {e}")
         return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
@@ -767,6 +891,7 @@ def google_drive_share_file(
         if not _EMAIL_PATTERN.match(email):
             raise ValueError("email must be a valid email address")
         resolved_file_id = _resolve_file_id(file_id)
+        resource_key = _extract_resource_key(file_id)
 
         service = get_drive_service()
         # The API rejects emailMessage outright when sendNotificationEmail is
@@ -781,7 +906,9 @@ def google_drive_share_file(
         if send_notification and message is not None:
             create_kwargs["emailMessage"] = message
 
-        permission = service.permissions().create(**create_kwargs).execute()
+        create_request = service.permissions().create(**create_kwargs)
+        _attach_resource_key(create_request, resolved_file_id, resource_key)
+        permission = create_request.execute()
 
         return json.dumps(
             {"status": "success", "permission": permission}, ensure_ascii=False
@@ -803,22 +930,19 @@ def google_drive_update_permission(file_id: str, permission_id: str, role: str) 
     try:
         _require_share_role(role)
         resolved_file_id = _resolve_file_id(file_id)
-        resolved_permission_id = require_clean_identifier(
-            permission_id, "permission_id"
-        )
+        resource_key = _extract_resource_key(file_id)
+        resolved_permission_id = _require_drive_id(permission_id, "permission_id")
 
         service = get_drive_service()
-        permission = (
-            service.permissions()
-            .update(
-                fileId=resolved_file_id,
-                permissionId=resolved_permission_id,
-                body={"role": role},
-                supportsAllDrives=True,
-                fields="id, type, role, emailAddress, displayName",
-            )
-            .execute()
+        update_request = service.permissions().update(
+            fileId=resolved_file_id,
+            permissionId=resolved_permission_id,
+            body={"role": role},
+            supportsAllDrives=True,
+            fields="id, type, role, emailAddress, displayName",
         )
+        _attach_resource_key(update_request, resolved_file_id, resource_key)
+        permission = update_request.execute()
 
         return json.dumps(
             {"status": "success", "permission": permission}, ensure_ascii=False
@@ -837,30 +961,31 @@ def google_drive_remove_permission(file_id: str, permission_id: str) -> str:
     """
     try:
         resolved_file_id = _resolve_file_id(file_id)
-        resolved_permission_id = require_clean_identifier(
-            permission_id, "permission_id"
-        )
+        resource_key = _extract_resource_key(file_id)
+        resolved_permission_id = _require_drive_id(permission_id, "permission_id")
         service = get_drive_service()
-        _execute_ignoring_204_ssl_eof(
-            lambda: (
-                service.permissions()
-                .delete(
-                    fileId=resolved_file_id,
-                    permissionId=resolved_permission_id,
-                    supportsAllDrives=True,
-                )
-                .execute()
-            ),
-            lambda: (
-                service.permissions()
-                .get(
-                    fileId=resolved_file_id,
-                    permissionId=resolved_permission_id,
-                    supportsAllDrives=True,
-                )
-                .execute()
-            ),
-        )
+
+        def _delete() -> Any:
+            request = service.permissions().delete(
+                fileId=resolved_file_id,
+                permissionId=resolved_permission_id,
+                supportsAllDrives=True,
+            )
+            return _attach_resource_key(
+                request, resolved_file_id, resource_key
+            ).execute()
+
+        def _verify_deleted() -> Any:
+            request = service.permissions().get(
+                fileId=resolved_file_id,
+                permissionId=resolved_permission_id,
+                supportsAllDrives=True,
+            )
+            return _attach_resource_key(
+                request, resolved_file_id, resource_key
+            ).execute()
+
+        _execute_ignoring_204_ssl_eof(_delete, _verify_deleted)
 
         return json.dumps(
             {

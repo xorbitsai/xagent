@@ -702,6 +702,73 @@ class LanceDBMemoryStore(MemoryStore):
         filters: Optional[dict[str, Any]] = None,
         similarity_threshold: Optional[float] = None,
     ) -> list[MemoryNote]:
+        return self._search(
+            query,
+            k=k,
+            filters=filters,
+            similarity_threshold=similarity_threshold,
+            include_null_vector_fallback=False,
+        )
+
+    def search_with_null_vector_fallback(
+        self,
+        query: str,
+        k: int = 5,
+        filters: Optional[dict[str, Any]] = None,
+        similarity_threshold: Optional[float] = None,
+    ) -> list[MemoryNote]:
+        """Dormant admission primitive that safely supplements ANN results."""
+        return self._search(
+            query,
+            k=k,
+            filters=filters,
+            similarity_threshold=similarity_threshold,
+            include_null_vector_fallback=True,
+        )
+
+    def _lexical_candidates(
+        self,
+        table: Any,
+        query: str,
+        filters: Optional[dict[str, Any]],
+        *,
+        null_vectors_only: bool,
+    ) -> list[MemoryNote]:
+        scan = table.search()
+        if null_vectors_only:
+            scan = scan.where("vector IS NULL")
+        rows = scan.limit(None).to_arrow().to_pylist()
+        other_filters = self._flat_other_filters(filters)
+        needle = query.casefold()
+        ranked: list[tuple[tuple[int, int, str], MemoryNote]] = []
+        for row in rows:
+            text = row.get("text") or ""
+            folded = text.casefold()
+            if needle and needle not in folded:
+                continue
+            try:
+                note = self._dict_to_memory_note(row)
+            except Exception as row_error:
+                logger.warning("Skipping malformed lexical memory row: %s", row_error)
+                continue
+            if filters and not self._matches_filters(note, filters, other_filters):
+                continue
+            match_kind = (
+                0 if folded == needle else 1 if folded.startswith(needle) else 2
+            )
+            ranked.append(((match_kind, -folded.count(needle), str(note.id)), note))
+        ranked.sort(key=lambda item: item[0])
+        return [note for _rank, note in ranked]
+
+    def _search(
+        self,
+        query: str,
+        k: int = 5,
+        filters: Optional[dict[str, Any]] = None,
+        similarity_threshold: Optional[float] = None,
+        *,
+        include_null_vector_fallback: bool,
+    ) -> list[MemoryNote]:
         """Search memory notes by query text with optional filters.
 
         Known limitation (#916): on the vector path, residual filters —
@@ -725,6 +792,7 @@ class LanceDBMemoryStore(MemoryStore):
                 self._collection_name
             )
             results = []
+            ann_search_completed = False
 
             # #822: push user_id + scope-dimension filters into a `where`
             # prefilter so the ANN returns k already-scoped neighbours; the rest
@@ -753,6 +821,7 @@ class LanceDBMemoryStore(MemoryStore):
                                     where_sql, prefilter=True
                                 )
                             vector_df = vector_query.limit(k).to_pandas()
+                            ann_search_completed = True
 
                             for _, row in vector_df.iterrows():
                                 # Check similarity threshold
@@ -827,6 +896,34 @@ class LanceDBMemoryStore(MemoryStore):
                 logger.warning(
                     f"Embedding generation failed, using text search: {embedding_error}"
                 )
+
+            if include_null_vector_fallback:
+                seen_ids: set[str] = set()
+                deduplicated: list[MemoryNote] = []
+                for note in results:
+                    identity = str(note.id)
+                    if identity not in seen_ids:
+                        seen_ids.add(identity)
+                        deduplicated.append(note)
+                results = deduplicated
+                candidates = (
+                    self._lexical_candidates(
+                        table,
+                        query,
+                        filters,
+                        null_vectors_only=ann_search_completed,
+                    )
+                    if len(results) < k
+                    else []
+                )
+                for note in candidates:
+                    identity = str(note.id)
+                    if identity not in seen_ids:
+                        seen_ids.add(identity)
+                        results.append(note)
+                    if len(results) >= k:
+                        break
+                return results[:k]
 
             # Fallback to text search if no vector results or vector search failed
             if not results:

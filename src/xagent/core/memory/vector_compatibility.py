@@ -5,12 +5,13 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass
 from enum import Enum
-from typing import Any, Mapping, Protocol
+from typing import Any, Mapping, Protocol, cast
 
 import pyarrow as pa  # type: ignore
 
 from ..model.model import EmbeddingModelConfig
 from ..tools.core.RAG_tools.LanceDB.schema_manager import _safe_close_table
+from .scope_columns import SCOPE_DIMS_COLUMN, USER_ID_COLUMN, derive_scope_columns
 
 VECTOR_IDENTITY_METADATA_KEY = b"xagent.memory.vector_space"
 DASHSCOPE_DEFAULT_ENDPOINT = (
@@ -52,6 +53,13 @@ class _ArrowSchema(Protocol):
     def metadata(self) -> Mapping[bytes, bytes] | None: ...
 
     def field(self, name: str) -> _ArrowField: ...
+
+
+class _ArrowTable(Protocol):
+    """Typed boundary for the Arrow table returned to LanceDB."""
+
+    @property
+    def schema(self) -> _ArrowSchema: ...
 
 
 class VectorCompatibility(str, Enum):
@@ -176,3 +184,99 @@ def inspect_lancedb_vector_compatibility(
         return classify_vector_compatibility(table.schema, expected_identity)
     finally:
         _safe_close_table(table)
+
+
+def _vector_capable_data(
+    identity: EmbeddingIdentity, existing: Any | None = None
+) -> _ArrowTable:
+    """Build typed memory data carrying one authoritative vector identity."""
+    if existing is None:
+        data = pa.table(
+            {
+                "id": pa.array(["__xagent_schema_seed__"], pa.string()),
+                "text": pa.array([""], pa.string()),
+                "metadata": pa.array(["{}"], pa.string()),
+                "vector": pa.array(
+                    [[0.0] * identity.dimension],
+                    pa.list_(pa.float32(), identity.dimension),
+                ),
+                USER_ID_COLUMN: pa.array([None], pa.int64()),
+                SCOPE_DIMS_COLUMN: pa.array([[]], pa.list_(pa.string())),
+            }
+        )
+    else:
+        names = set(existing.schema.names)
+        missing = {"id", "text", "metadata"} - names
+        if missing:
+            raise ValueError(
+                "vectorless memory table is missing required columns: "
+                + ", ".join(sorted(missing))
+            )
+        columns = {name: existing[name] for name in existing.schema.names}
+        for name in ("id", "text", "metadata"):
+            columns[name] = columns[name].cast(pa.string())
+        columns["vector"] = pa.nulls(
+            existing.num_rows, pa.list_(pa.float32(), identity.dimension)
+        )
+        derived = [
+            derive_scope_columns(value) for value in columns["metadata"].to_pylist()
+        ]
+        columns[USER_ID_COLUMN] = pa.array(
+            [user_id for user_id, _dims in derived], pa.int64()
+        )
+        columns[SCOPE_DIMS_COLUMN] = pa.array(
+            [dims for _user_id, dims in derived], pa.list_(pa.string())
+        )
+        data = pa.table(columns)
+    metadata = dict(
+        (existing.schema.metadata if existing is not None else data.schema.metadata)
+        or {}
+    )
+    metadata[VECTOR_IDENTITY_METADATA_KEY] = json.dumps(
+        identity.as_dict(), sort_keys=True, separators=(",", ":")
+    ).encode()
+    return cast(_ArrowTable, data.replace_schema_metadata(metadata))
+
+
+def create_or_recreate_vector_capable_table(
+    connection: Any,
+    table_name: str,
+    expected_identity: EmbeddingIdentity | EmbeddingModelConfig | Mapping[str, Any],
+) -> VectorCompatibility:
+    """Create a missing table or overwrite a vectorless table with typed data.
+
+    This explicit lifecycle primitive is intentionally not called by request-time
+    store acquisition. Its future lifecycle caller must serialize it before writers
+    start. Open/create failures propagate unchanged.
+    """
+    identity = canonical_embedding_identity(expected_identity)
+    existing = None
+    table = None
+    try:
+        try:
+            table = connection.open_table(table_name)
+        except ValueError as error:
+            if "was not found" not in str(error):
+                raise
+        if table is not None:
+            if "vector" in table.schema.names:
+                return classify_vector_compatibility(table.schema, identity)
+            existing = table.to_arrow()
+        data = _vector_capable_data(identity, existing)
+    finally:
+        _safe_close_table(table)
+
+    created = connection.create_table(
+        table_name,
+        data=data,
+        mode="overwrite" if existing is not None else "create",
+    )
+    try:
+        if existing is None:
+            created.delete("id = '__xagent_schema_seed__'")
+        outcome = classify_vector_compatibility(created.schema, identity)
+        if outcome is not VectorCompatibility.MATCHING:
+            raise RuntimeError("created memory table failed vector compatibility")
+        return outcome
+    finally:
+        _safe_close_table(created)

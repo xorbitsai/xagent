@@ -261,6 +261,153 @@ def test_actor_policy_rejects_invalid_owner(value: object) -> None:
         MCPBuiltinOAuthActorPolicy(resource_owner_key=value)  # type: ignore[arg-type]
 
 
+def test_actor_remote_legacy_classification_queries_each_live_view(db_session) -> None:
+    server = _add_remote_server(db_session.db, db_session.user)
+    query = db_session.db.query
+    queried: list[object] = []
+
+    def recording_query(*entities):
+        queried.extend(entities)
+        return query(*entities)
+
+    db_session.db.query = recording_query  # type: ignore[method-assign]
+
+    resolved = mcp_apps.classify_actor_remote_oauth_server(db_session.db, server)
+
+    assert resolved is not None and resolved["id"] == REMOTE_APP_ID
+    assert PublicMCPApp in queried
+    assert MCPServer in queried
+    assert any(entity is UserMCPServer.id for entity in queried)
+
+
+def test_actor_remote_legacy_non_remote_unpersisted_row_remains_native(
+    db_session,
+) -> None:
+    server = SimpleNamespace(name="uncataloged", transport="stdio", auth=None, id=None)
+
+    assert mcp_apps.classify_actor_remote_oauth_server(db_session.db, server) is None
+
+
+def test_actor_remote_snapshot_freezes_catalog_server_and_owner_view(
+    db_session, monkeypatch
+) -> None:
+    server = _add_remote_server(db_session.db, db_session.user)
+    snapshot = mcp_apps.load_mcp_app_snapshot(db_session.db)
+
+    with db_session.session_factory() as live_db:
+        live_db.query(PublicMCPApp).filter(PublicMCPApp.app_id == REMOTE_APP_ID).update(
+            {"is_visible_in_connector": False}
+        )
+        live_db.query(MCPServer).filter(MCPServer.id == int(server.id)).update(
+            {"name": "changed-live-server"}
+        )
+        live_db.query(UserMCPServer).filter(
+            UserMCPServer.mcpserver_id == int(server.id)
+        ).update({"is_owner": True})
+        live_db.commit()
+
+    monkeypatch.setattr(
+        db_session.db,
+        "query",
+        lambda *_args, **_kwargs: pytest.fail(
+            "snapshot classification queried the database"
+        ),
+    )
+
+    resolved = mcp_apps.classify_actor_remote_oauth_server(
+        db_session.db,
+        server,
+        snapshot=snapshot,
+    )
+
+    assert resolved is not None and resolved["id"] == REMOTE_APP_ID
+
+
+def test_actor_remote_snapshot_rejects_ambiguous_server_identity(db_session) -> None:
+    server = _add_remote_server(db_session.db, db_session.user)
+    duplicate = MCPServer.from_config(
+        {
+            "name": "Actor Remote",
+            "managed": "external",
+            "transport": "streamable_http",
+            "url": "https://mcp.example.com/mcp",
+            "auth": dict(server.auth),
+        }
+    )
+    db_session.db.add(duplicate)
+    db_session.db.commit()
+    snapshot = mcp_apps.load_mcp_app_snapshot(db_session.db)
+
+    with pytest.raises(
+        mcp_apps.RemoteOAuthServerDefinitionError,
+        match="exactly one server definition",
+    ):
+        mcp_apps.classify_actor_remote_oauth_server(
+            db_session.db, server, snapshot=snapshot
+        )
+
+
+@pytest.mark.parametrize("drift", ["owner", "invalid_auth"])
+def test_actor_remote_snapshot_rejects_noncanonical_definition(
+    db_session, drift
+) -> None:
+    server = _add_remote_server(db_session.db, db_session.user)
+    if drift == "owner":
+        db_session.db.query(UserMCPServer).one().is_owner = True
+    else:
+        server.auth = {**server.auth, "scope": "records.write"}
+    db_session.db.commit()
+    snapshot = mcp_apps.load_mcp_app_snapshot(db_session.db)
+
+    with pytest.raises(mcp_apps.RemoteOAuthServerDefinitionError):
+        mcp_apps.classify_actor_remote_oauth_server(
+            db_session.db, server, snapshot=snapshot
+        )
+
+
+def test_actor_remote_snapshot_preserves_only_proven_custom_definition(
+    db_session,
+) -> None:
+    server = MCPServer.from_config(
+        {
+            "name": "custom-remote",
+            "managed": "external",
+            "transport": "streamable_http",
+            "url": "https://custom.example.com/mcp",
+            "auth": {"type": "mcp_oauth"},
+        }
+    )
+    db_session.db.add(server)
+    db_session.db.flush()
+    association = UserMCPServer(
+        user_id=int(db_session.user.id),
+        mcpserver_id=int(server.id),
+        is_owner=True,
+        is_active=True,
+    )
+    db_session.db.add(association)
+    db_session.db.commit()
+    snapshot = mcp_apps.load_mcp_app_snapshot(db_session.db)
+
+    assert (
+        mcp_apps.classify_actor_remote_oauth_server(
+            db_session.db, server, snapshot=snapshot
+        )
+        is None
+    )
+
+    association.is_owner = False
+    db_session.db.commit()
+    unowned_snapshot = mcp_apps.load_mcp_app_snapshot(db_session.db)
+    with pytest.raises(
+        mcp_apps.RemoteOAuthServerDefinitionError,
+        match="catalog identity is unavailable",
+    ):
+        mcp_apps.classify_actor_remote_oauth_server(
+            db_session.db, server, snapshot=unowned_snapshot
+        )
+
+
 @pytest.mark.asyncio
 async def test_actor_remote_prefers_exact_owner_over_workspace_grant(
     db_session,

@@ -355,11 +355,16 @@ def _checkpoint_row_matches_candidate(
     (``resolve_checkpoint_recovery``) rather than here, because only the
     exact-pointer path has a second candidate set to defer to.
 
-    The vocabularies still differ -- this path calls the outcome a mismatch
-    and the reader calls it corrupt (``CheckpointCorruptError``) -- and that
-    difference is still deliberate, because each names the outcome for its
-    own caller. What is no longer true is that the two could drift on *what*
-    they judge.
+    The vocabularies still differ deliberately -- this path calls the
+    outcome a mismatch, the by-primary-key read raises
+    ``CheckpointCorruptError`` for it, and each names the outcome for its
+    own caller -- but they can no longer drift on *what* they judge. One
+    qualification the older wording lacked: what that read's *caller*
+    ultimately sees is not always corrupt either. A read performed under
+    the widened (untagged) partition has its verdict re-probed at the
+    read's boundary and reclassified as a retryable
+    ``CheckpointUnavailableError`` when a run-tagged checkpoint has since
+    appeared (see ``_load_pk_anchored_checkpoint``'s own docstring).
     """
 
     if candidate.run_id is None:
@@ -506,10 +511,19 @@ def resolve_checkpoint_recovery(
             # the same predicate, so a RECOVERABLE verdict still requires a
             # real run-partition match. The by-primary-key *read*
             # (``_load_pk_anchored_checkpoint``, ``trace_handlers.py``) does
-            # not reach this verdict for the same row shape -- it still
-            # raises ``CheckpointCorruptError``, unchanged from before this
-            # predicate existed. That divergence is deliberate; see
-            # task_interaction_anchor.py's module docstring and #2023.
+            # not reach this verdict for the same row shape, and which way
+            # it goes there is decided by the partition that read resolved.
+            # A read bound to a run raises ``CheckpointCorruptError`` for
+            # the row, unchanged. A widened (untagged) read finds the same
+            # row's absent run field a partition match instead and hands
+            # the checkpoint back, so it never reaches a corrupt verdict
+            # for this shape. Only the run-bound read is the comparison
+            # here -- a candidate without a ``run_id`` already returned
+            # above, and a widened read is never run-bound -- and that
+            # divergence remains deliberate. See
+            # ``_load_pk_anchored_checkpoint``'s own docstring for the
+            # boundary, task_interaction_anchor.py's module docstring for
+            # the write direction, and #2023 for the convergence.
             logger.info(
                 "Task %s's checkpoint pointer %s is missing its "
                 "run-partition field; deferring to the legacy event_id scan "

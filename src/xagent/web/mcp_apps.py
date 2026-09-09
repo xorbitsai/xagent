@@ -192,19 +192,26 @@ def _app_to_dict(app: PublicMCPApp) -> Dict[str, Any]:
 
 @dataclass(frozen=True)
 class MCPAppSnapshot:
-    """One catalog/server view for repeated canonical builtin validation."""
+    """One catalog/server/ownership view for repeated canonical validation."""
 
     catalog_apps: tuple[PublicMCPApp, ...]
     servers: tuple[Any, ...]
+    owner_mcpserver_ids: frozenset[int]
 
 
 def load_mcp_app_snapshot(db: Session) -> MCPAppSnapshot:
     """Load the catalog and server rows once for one validation projection."""
-    from .models.mcp import MCPServer
+    from .models.mcp import MCPServer, UserMCPServer
 
     return MCPAppSnapshot(
         catalog_apps=tuple(db.query(PublicMCPApp).all()),
         servers=tuple(db.query(MCPServer).all()),
+        owner_mcpserver_ids=frozenset(
+            int(server_id)
+            for (server_id,) in db.query(UserMCPServer.mcpserver_id)
+            .filter(UserMCPServer.is_owner)
+            .all()
+        ),
     )
 
 
@@ -745,9 +752,16 @@ def ensure_builtin_oauth_server_visibility_for_user(
     return server
 
 
-def _get_app_for_server_name(db: Session, name: str) -> Dict[str, Any] | None:
-    candidates = (
-        db.query(PublicMCPApp)
+def _get_app_for_server_name(
+    db: Session,
+    name: str,
+    *,
+    snapshot: MCPAppSnapshot | None = None,
+) -> Dict[str, Any] | None:
+    candidates: Sequence[PublicMCPApp] = (
+        [app for app in snapshot.catalog_apps if app.app_id == name or app.name == name]
+        if snapshot is not None
+        else db.query(PublicMCPApp)
         .filter((PublicMCPApp.app_id == name) | (PublicMCPApp.name == name))
         .all()
     )
@@ -809,6 +823,7 @@ def classify_actor_remote_oauth_server(
     definition_ownership: RemoteOAuthDefinitionOwnership = (
         RemoteOAuthDefinitionOwnership.UNKNOWN
     ),
+    snapshot: MCPAppSnapshot | None = None,
 ) -> Dict[str, Any] | None:
     """Validate catalog OAuth or preserve a proven custom definition."""
 
@@ -821,21 +836,31 @@ def classify_actor_remote_oauth_server(
         and isinstance(auth, Mapping)
         and auth.get("type") == "mcp_oauth"
     )
-    app_info = _get_app_for_server_name(db, str(getattr(server, "name", "")))
+    app_info = _get_app_for_server_name(
+        db,
+        str(getattr(server, "name", "")),
+        snapshot=snapshot,
+    )
+
+    def has_owner() -> bool:
+        server_id = int(server.id)
+        if snapshot is not None:
+            return server_id in snapshot.owner_mcpserver_ids
+        return (
+            db.query(UserMCPServer.id)
+            .filter(
+                UserMCPServer.mcpserver_id == server_id,
+                UserMCPServer.is_owner,
+            )
+            .first()
+            is not None
+        )
+
     if app_info is None or app_info.get("auth_type") != "mcp_oauth":
         if is_remote_oauth:
             # Native OAuth servers have an owner. Catalog rows do not.
-            has_owner = (
-                db.query(UserMCPServer.id)
-                .filter(
-                    UserMCPServer.mcpserver_id == int(server.id),
-                    UserMCPServer.is_owner,
-                )
-                .first()
-                is not None
-            )
             if (
-                not has_owner
+                not has_owner()
                 and definition_ownership is not RemoteOAuthDefinitionOwnership.TEAM
             ):
                 raise RemoteOAuthServerDefinitionError(
@@ -848,8 +873,10 @@ def classify_actor_remote_oauth_server(
     app_id = str(app_info["id"])
     app_name = str(app_info["name"])
     # Remote catalog identity is the reserved server name, not mutable auth.
-    candidates = (
-        db.query(MCPServer).filter(MCPServer.name.in_((app_id, app_name))).all()
+    candidates: Sequence[Any] = (
+        [row for row in snapshot.servers if row.name in (app_id, app_name)]
+        if snapshot is not None
+        else db.query(MCPServer).filter(MCPServer.name.in_((app_id, app_name))).all()
     )
     if len(candidates) != 1 or int(candidates[0].id) != int(server.id):
         raise RemoteOAuthServerDefinitionError(
@@ -875,15 +902,7 @@ def classify_actor_remote_oauth_server(
         failures.append("url")
     if actual_auth != expected_auth:
         failures.append("auth")
-    if (
-        db.query(UserMCPServer.id)
-        .filter(
-            UserMCPServer.mcpserver_id == int(server.id),
-            UserMCPServer.is_owner,
-        )
-        .first()
-        is not None
-    ):
+    if has_owner():
         failures.append("ownership")
     if failures:
         raise RemoteOAuthServerDefinitionError(

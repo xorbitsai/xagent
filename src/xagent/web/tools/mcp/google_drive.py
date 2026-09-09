@@ -32,6 +32,13 @@ mcp = FastMCP("google-drive-mcp")
 # A Drive/Docs/Sheets/Slides/Forms/Drawings id is always [a-zA-Z0-9_-]+.
 _DRIVE_ID_CHARS = re.compile(r"[a-zA-Z0-9_-]+")
 
+# A real Drive id never contains "/" or "?" -- used by both
+# _parse_trusted_drive_url and _resolve_file_id to decide "is this even
+# URL-shaped" before doing any URL parsing. Precompiled to match every
+# other regex in this module rather than left as a literal pattern string
+# re-evaluated at each of its two call sites.
+_DRIVE_URL_SHAPE_HINT = re.compile(r"[/?]")
+
 # The share-link path prefixes _resolve_file_id recognizes, as one source
 # of truth for both patterns below -- so adding a new Drive-family surface
 # (this PR already added forms/drawings once) means editing this tuple
@@ -206,7 +213,7 @@ def _parse_trusted_drive_url(value: str) -> ParseResult | None:
     if not isinstance(value, str):
         return None
     stripped = value.strip()
-    if not re.search(r"[/?]", stripped):
+    if not _DRIVE_URL_SHAPE_HINT.search(stripped):
         return None
     try:
         parsed = urlparse(stripped)
@@ -298,7 +305,7 @@ def _resolve_file_id(file_id: str, field_name: str = "file_id") -> str:
     stripped = file_id.strip()
     if not stripped:
         raise ValueError(f"{field_name} must be a non-empty id")
-    if not re.search(r"[/?]", stripped):
+    if not _DRIVE_URL_SHAPE_HINT.search(stripped):
         # Shares _require_drive_id's character-class check rather than
         # repeating it inline, so file_id's bare-id validation and
         # permission_id's validation can't silently drift apart the way
@@ -385,19 +392,40 @@ def _attach_resource_key(request: Any, file_id: str, resource_key: str | None) -
     _extract_resource_key only ever returns a truthy ``resource_key`` when
     _resolve_id_from_parsed made the identical decision on the same input
     and _resolve_file_id would therefore have taken the same validated-id
-    branch (see _extract_resource_key's docstring). The CR/LF check here is
-    belt-and-suspenders defense against a future call site breaking that
-    invariant -- raising rather than silently skipping the header, since a
-    silent skip would be a *worse* failure mode than surfacing the
-    violation: a pre-2021 link-shared item that genuinely needs this header
-    would otherwise get a confusing 404 from Drive with no indication a
-    resourcekey was computed but silently dropped, instead of a clear,
-    immediate, actionable local error pointing at the actual bug.
+    branch (see _extract_resource_key's docstring). Note this is narrower
+    than "file_id is always safe everywhere": an untrusted/unresolved
+    file_id can still reach the Drive API as the request's own ``fileId=``
+    path parameter with no header involved at all -- that path is
+    protected separately, by googleapiclient's own URI-template expansion
+    percent-encoding reserved characters (including a literal CR/LF)
+    before it ever reaches the wire, not by anything in this function.
+
+    The CR/LF check below only guards the one thing THIS function builds:
+    the resourcekey header value. It's belt-and-suspenders defense against
+    a future call site breaking the invariant above -- raising, rather
+    than silently skipping the header, since a silent skip would be a
+    *worse* failure mode than surfacing the violation: a pre-2021 link-
+    shared item that genuinely needs this header would otherwise get a
+    confusing 404 from Drive with no indication a resourcekey was computed
+    but silently dropped. Raising here signals a bug in this file's own
+    invariant, not a user-input problem -- logged before raising so it's
+    distinguishable in logs from an ordinary validation error, even though
+    the outer per-tool try/except still turns it into the same JSON error
+    envelope as any other exception.
     """
     if not resource_key:
         return request
     if "\r" in file_id or "\n" in file_id:
-        raise ValueError(f"file_id must not contain CR/LF, got {file_id!r}")
+        logger.error(
+            "_attach_resource_key: file_id contains CR/LF, violating the "
+            "caller invariant this function relies on -- this indicates a "
+            "bug in google_drive.py, not bad user input: %r",
+            file_id,
+        )
+        raise ValueError(
+            "internal error (bug in google_drive.py): file_id must not "
+            f"contain CR/LF, got {file_id!r}"
+        )
     request.headers["X-Goog-Drive-Resource-Keys"] = f"{file_id}/{resource_key}"
     return request
 
@@ -502,7 +530,9 @@ def _capped_list_response(
 
 
 def _capped_permissions_response(
-    pages: list[tuple[str | None, list[Any]]], next_page_token: str | None
+    pages: list[tuple[str | None, list[Any]]],
+    next_page_token: str | None,
+    max_output_length: int | None = None,
 ) -> str:
     """Build google_drive_list_permissions' response, shrinking (if
     needed to fit the output cap) by dropping whole pages from the tail
@@ -536,9 +566,12 @@ def _capped_permissions_response(
     ``pages`` is the ordered list of ``(start_token, items)`` fetched
     this call; ``next_page_token`` is the token for whatever page comes
     after the LAST page in ``pages`` (``None`` if that was Drive's last
-    page).
+    page). ``max_output_length`` lets a caller that already read it (e.g.
+    to drive its own fetch-loop early-exit) pass the same value through
+    instead of this function reading it again independently.
     """
-    max_output_length = get_tool_max_output_length()
+    if max_output_length is None:
+        max_output_length = get_tool_max_output_length()
 
     def _token_after(kept: int) -> str | None:
         return next_page_token if kept == len(pages) else pages[kept][0]
@@ -1208,10 +1241,14 @@ def google_drive_list_permissions(file_id: str, page_token: str | None = None) -
     returned permission ids with google_drive_update_permission or
     google_drive_remove_permission.
     For an item in a Shared Drive with more collaborators than fit in one
-    response, "truncated" is true and the result includes a
+    response, "truncated" is true and the result usually includes a
     "next_page_token" -- pass it back as this call's page_token to
     continue listing from where it left off instead of silently missing
-    the rest.
+    the rest. In the rare case where even the earliest unreturned page
+    alone is too large to fit, "truncated" is true but "next_page_token"
+    is absent -- there's no safe way to resume from partway through a
+    single page, so the remaining collaborators on it can't be listed
+    through this tool.
     A permission whose "permissionDetails" marks it "inherited": true comes
     from a parent folder, not this item directly -- it can't be changed or
     removed here; do that on the folder it's inherited from instead.
@@ -1291,7 +1328,9 @@ def google_drive_list_permissions(file_id: str, page_token: str | None = None) -
         # signals "more data exists beyond what was fetched" without
         # needing a separate branch for the loop-safety-bound case.
 
-        return _capped_permissions_response(pages, current_page_token)
+        return _capped_permissions_response(
+            pages, current_page_token, max_output_length
+        )
     except Exception as e:
         logger.error(f"Error listing permissions: {e}")
         return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)

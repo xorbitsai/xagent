@@ -1140,6 +1140,164 @@ def test_update_slide_rejects_title_when_slide_has_no_title_placeholder(monkeypa
     presentations.batchUpdate.assert_not_called()
 
 
+def test_update_slide_collapses_embedded_newline_in_title(monkeypatch):
+    """Regression guard, symmetric with add_slide's fix: a title is a
+    single-line placeholder — an embedded newline must collapse to a
+    space instead of silently producing a multi-paragraph title."""
+    presentations = Mock()
+    presentations.batchUpdate.return_value.execute.return_value = {}
+    _mock_slides_service(monkeypatch, presentations)
+    _mock_presentation_get(
+        presentations, "slide1", [_placeholder_element("title_obj", "TITLE")]
+    )
+
+    google_slides.google_slides_update_slide(
+        "pres1", "slide1", title="Line one\nLine two"
+    )
+
+    requests = _batch_update_requests(presentations)
+    title_insert = next(
+        r["insertText"]
+        for r in requests
+        if "insertText" in r and r["insertText"]["objectId"] == "title_obj"
+    )
+    assert title_insert["text"] == "Line one Line two"
+
+
+def test_update_slide_normalizes_crlf_and_cr_newlines(monkeypatch):
+    """Regression guard, symmetric with add_slide's fix: text pasted from
+    a Windows editor may use \\r\\n or lone \\r line endings — these must
+    not survive as stray \\r characters embedded in the inserted text."""
+    presentations = Mock()
+    presentations.batchUpdate.return_value.execute.return_value = {}
+    _mock_slides_service(monkeypatch, presentations)
+    _mock_presentation_get(
+        presentations,
+        "slide1",
+        [_placeholder_element("body_obj", "BODY")],
+    )
+
+    google_slides.google_slides_update_slide(
+        "pres1", "slide1", body="Line one\r\nLine two\rLine three"
+    )
+
+    requests = _batch_update_requests(presentations)
+    body_insert = next(
+        r["insertText"]
+        for r in requests
+        if "insertText" in r and r["insertText"]["objectId"] == "body_obj"
+    )
+    assert "\r" not in body_insert["text"]
+    assert body_insert["text"] == "Line one\nLine two\nLine three"
+
+
+def test_update_slide_rejects_whole_call_when_body_becomes_empty_even_with_title(
+    monkeypatch,
+):
+    """Regression guard: a marker-only body must reject the entire call
+    (no batchUpdate at all), not silently apply just the title update and
+    drop the body — the two are meant to be one atomic edit."""
+    presentations = Mock()
+    _mock_slides_service(monkeypatch, presentations)
+    _mock_presentation_get(
+        presentations,
+        "slide1",
+        [
+            _placeholder_element("title_obj", "TITLE", text="Old title"),
+            _placeholder_element("body_obj", "BODY", text="Old body"),
+        ],
+    )
+
+    result = json.loads(
+        google_slides.google_slides_update_slide(
+            "pres1", "slide1", title="New title", body="•   "
+        )
+    )
+
+    assert result["status"] == "error"
+    presentations.batchUpdate.assert_not_called()
+
+
+def test_update_slide_writes_title_into_centered_title_placeholder(monkeypatch):
+    """A TITLE-layout slide's title lands in a CENTERED_TITLE placeholder,
+    not a plain TITLE — update_slide must write to it just the same."""
+    presentations = Mock()
+    presentations.batchUpdate.return_value.execute.return_value = {}
+    _mock_slides_service(monkeypatch, presentations)
+    _mock_presentation_get(
+        presentations,
+        "slide1",
+        [_placeholder_element("title_obj", "CENTERED_TITLE", text="Old")],
+    )
+
+    result = json.loads(
+        google_slides.google_slides_update_slide("pres1", "slide1", title="New title")
+    )
+
+    assert result["status"] == "success"
+    requests = _batch_update_requests(presentations)
+    title_insert = next(
+        r["insertText"]
+        for r in requests
+        if "insertText" in r and r["insertText"]["objectId"] == "title_obj"
+    )
+    assert title_insert["text"] == "New title"
+
+
+def test_update_slide_only_targets_the_first_placeholder_of_a_duplicated_role(
+    monkeypatch,
+):
+    """Documented, accepted limitation: a slide with two BODY placeholders
+    (not reachable via this file's own add_slide, but possible for a slide
+    from another source) silently targets only the first one found. Lock
+    in the current behavior so a future change to iteration order isn't
+    silent."""
+    presentations = Mock()
+    presentations.batchUpdate.return_value.execute.return_value = {}
+    _mock_slides_service(monkeypatch, presentations)
+    _mock_presentation_get(
+        presentations,
+        "slide1",
+        [
+            _placeholder_element("body_obj_1", "BODY", text="First"),
+            _placeholder_element("body_obj_2", "BODY", text="Second"),
+        ],
+    )
+
+    google_slides.google_slides_update_slide("pres1", "slide1", body="New detail")
+
+    requests = _batch_update_requests(presentations)
+    assert not any(
+        r.get("insertText", {}).get("objectId") == "body_obj_2"
+        or r.get("deleteText", {}).get("objectId") == "body_obj_2"
+        for r in requests
+    )
+    body_insert = next(
+        r["insertText"]
+        for r in requests
+        if "insertText" in r and r["insertText"]["objectId"] == "body_obj_1"
+    )
+    assert body_insert["text"] == "New detail"
+
+
+def test_update_slide_resolves_full_presentation_url(monkeypatch):
+    presentations = Mock()
+    presentations.batchUpdate.return_value.execute.return_value = {}
+    _mock_slides_service(monkeypatch, presentations)
+    _mock_presentation_get(
+        presentations, "slide1", [_placeholder_element("title_obj", "TITLE")]
+    )
+
+    url = "https://docs.google.com/presentation/d/abc123/edit#slide=id.p"
+    result = json.loads(
+        google_slides.google_slides_update_slide(url, "slide1", title="T")
+    )
+
+    assert result["status"] == "success"
+    assert presentations.get.call_args.kwargs["presentationId"] == "abc123"
+    assert presentations.batchUpdate.call_args.kwargs["presentationId"] == "abc123"
+
+
 def test_update_slide_returns_error_payload_on_api_failure(monkeypatch):
     presentations = Mock()
     presentations.get.return_value.execute.side_effect = RuntimeError("boom")
@@ -1181,6 +1339,20 @@ def test_delete_slide_rejects_id_that_is_not_a_slide(monkeypatch):
 
     assert result["status"] == "error"
     presentations.batchUpdate.assert_not_called()
+
+
+def test_delete_slide_resolves_full_presentation_url(monkeypatch):
+    presentations = Mock()
+    presentations.batchUpdate.return_value.execute.return_value = {}
+    _mock_slides_service(monkeypatch, presentations)
+    _mock_presentation_get(presentations, "slide1", [])
+
+    url = "https://docs.google.com/presentation/d/abc123/edit#slide=id.p"
+    result = json.loads(google_slides.google_slides_delete_slide(url, "slide1"))
+
+    assert result["status"] == "success"
+    assert presentations.get.call_args.kwargs["presentationId"] == "abc123"
+    assert presentations.batchUpdate.call_args.kwargs["presentationId"] == "abc123"
 
 
 def test_delete_slide_returns_error_payload_on_api_failure(monkeypatch):

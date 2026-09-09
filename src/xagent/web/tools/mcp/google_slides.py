@@ -538,6 +538,15 @@ def google_slides_update_slide(
     try:
         if not title and not body:
             return _error("Provide at least one of 'title' or 'body' to update.")
+
+        title = title.replace("\r\n", "\n").replace("\r", "\n")
+        body = body.replace("\r\n", "\n").replace("\r", "\n")
+        # A title is expected to be a single line; collapse any embedded
+        # newline (and surrounding whitespace) into a space rather than
+        # silently producing a multi-paragraph title placeholder — matches
+        # google_slides_add_slide's handling of title.
+        title = re.sub(r"\s*\n\s*", " ", title)
+
         if title and not title.strip():
             return _error("'title' is whitespace-only; provide real text or omit it.")
         if body and not body.strip():

@@ -35,29 +35,31 @@ AD_SET_FIELDS = (
 AD_FIELDS = "id,name,adset_id,campaign_id,status,effective_status,creative,created_time"
 INSIGHTS_FIELDS = "impressions,clicks,spend,ctr,cpc,cpm,reach,frequency,actions"
 
-_VALID_INSIGHTS_LEVELS = {"account", "campaign", "adset", "ad"}
-_VALID_DATE_PRESETS = {
-    "today",
-    "yesterday",
-    "this_month",
-    "last_month",
-    "this_quarter",
-    "maximum",
-    "data_maximum",
-    "last_3d",
-    "last_7d",
-    "last_14d",
-    "last_28d",
-    "last_30d",
-    "last_90d",
-    "last_week_mon_sun",
-    "last_week_sun_sat",
-    "last_quarter",
-    "last_year",
-    "this_week_mon_sun",
-    "this_week_sun_sat",
-    "this_year",
-}
+_VALID_INSIGHTS_LEVELS = frozenset({"account", "campaign", "adset", "ad"})
+_VALID_DATE_PRESETS = frozenset(
+    {
+        "today",
+        "yesterday",
+        "this_month",
+        "last_month",
+        "this_quarter",
+        "maximum",
+        "data_maximum",
+        "last_3d",
+        "last_7d",
+        "last_14d",
+        "last_28d",
+        "last_30d",
+        "last_90d",
+        "last_week_mon_sun",
+        "last_week_sun_sat",
+        "last_quarter",
+        "last_year",
+        "this_week_mon_sun",
+        "this_week_sun_sat",
+        "this_year",
+    }
+)
 
 # re.ASCII: bare \d matches any Unicode decimal digit (Arabic-Indic,
 # fullwidth, etc.), not just 0-9, which would otherwise let a non-ASCII

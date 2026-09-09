@@ -1350,7 +1350,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "icon": "https://www.google.com/s2/favicons?domain=xero.com&sz=128",
             "transport": "oauth",
             "provider_name": "xero",
-            "category": "Finance",
+            "category": "Operations",
             "oauth_scopes": [
                 "openid",
                 "profile",
@@ -1364,7 +1364,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                 "offline_access",
             ],
             "is_visible_in_connector": True,
-            # Match the existing catalog launcher; inject only the actor's token.
+            # Match SG's database-configured launcher; inject only the actor's token.
             "launch_config": {
                 "command": "npx",
                 "args": ["-y", "@xeroapi/xero-mcp-server@latest"],

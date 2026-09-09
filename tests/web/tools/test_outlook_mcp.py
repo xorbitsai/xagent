@@ -1774,15 +1774,18 @@ def test_update_event_flag_only_all_day_toggle_widens_in_the_events_real_timezon
 ):
     """Regression test: a plain GET (no Prefer header) always reports
     start/end in UTC regardless of the event's actual configured zone -
-    using that UTC-normalized field as "the event's real timezone" for a
-    flag-only is_all_day toggle silently widens the query window in the
-    wrong zone. originalStartTimeZone is the field that reports the real
-    one."""
+    using that UTC clock value's own date as "the event's real calendar
+    day" for a flag-only is_all_day toggle silently widens the query to
+    the wrong day whenever the real zone's offset pushes the instant
+    across a day boundary from its UTC date. originalStartTimeZone
+    reports the real zone; 20:00 UTC is 04:00 the *next* day in
+    Asia/Singapore (+08:00), so the correct widened day is the 28th, not
+    the UTC date's 27th."""
     graph_request = Mock(
         side_effect=[
             {
-                "start": {"dateTime": "2026-08-27T02:00:00", "timeZone": "UTC"},
-                "end": {"dateTime": "2026-08-27T02:30:00", "timeZone": "UTC"},
+                "start": {"dateTime": "2026-08-27T20:00:00", "timeZone": "UTC"},
+                "end": {"dateTime": "2026-08-27T20:30:00", "timeZone": "UTC"},
                 "attendees": [],
                 "isAllDay": False,
                 "originalStartTimeZone": "Asia/Singapore",
@@ -1802,14 +1805,60 @@ def test_update_event_flag_only_all_day_toggle_widens_in_the_events_real_timezon
 
     assert result["status"] == "success"
     calendar_view_call = graph_request.call_args_list[1]
-    # 02:00-02:30 UTC is 10:00-10:30 in Asia/Singapore (+08:00) - the day
-    # bounds must widen around THAT day, not the UTC one.
     assert calendar_view_call.kwargs["params"]["startDateTime"] == (
-        "2026-08-27T00:00:00+08:00"
-    )
-    assert calendar_view_call.kwargs["params"]["endDateTime"] == (
         "2026-08-28T00:00:00+08:00"
     )
+    assert calendar_view_call.kwargs["params"]["endDateTime"] == (
+        "2026-08-29T00:00:00+08:00"
+    )
+
+
+def test_update_event_adding_attendee_queries_the_correct_absolute_window_in_the_events_real_timezone(
+    monkeypatch,
+):
+    """Regression test: even without any is_all_day widening, a plain
+    attendees-only edit's conflict check for the newly-added attendee
+    still needs the existing window's boundaries paired with the event's
+    REAL zone (from originalStartTimeZone), not the UTC clock value a
+    plain GET reports left mislabeled with that real zone's name - that
+    mismatch sends Graph an absolute window off by the real zone's UTC
+    offset."""
+    graph_request = Mock(
+        side_effect=[
+            {
+                "start": {"dateTime": "2026-08-27T02:00:00", "timeZone": "UTC"},
+                "end": {"dateTime": "2026-08-27T02:30:00", "timeZone": "UTC"},
+                "attendees": [],
+                "isAllDay": False,
+                "originalStartTimeZone": "Asia/Singapore",
+            },
+            {"value": [{"scheduleId": "new@example.com", "scheduleItems": []}]},
+            {"id": "updated"},
+        ]
+    )
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_update_event(
+            event_id="self-1",
+            attendees=["new@example.com"],
+        )
+    )
+
+    assert result["status"] == "success"
+    schedule_call = graph_request.call_args_list[1]
+    assert schedule_call.args[:2] == ("POST", "/me/calendar/getSchedule")
+    # 02:00 UTC is 10:00 in Asia/Singapore (+08:00) - the query sent to
+    # Graph must carry that real wall-clock reading paired with the real
+    # zone name, not the raw UTC clock value mislabeled with it.
+    assert schedule_call.kwargs["body"]["startTime"] == {
+        "dateTime": "2026-08-27T10:00:00",
+        "timeZone": "Asia/Singapore",
+    }
+    assert schedule_call.kwargs["body"]["endTime"] == {
+        "dateTime": "2026-08-27T10:30:00",
+        "timeZone": "Asia/Singapore",
+    }
 
 
 def test_update_event_empty_string_attendees_is_treated_as_not_provided(monkeypatch):

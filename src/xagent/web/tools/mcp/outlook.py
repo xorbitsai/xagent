@@ -133,6 +133,39 @@ def _message_body(content: str, content_type: str) -> dict[str, str]:
     return {"contentType": normalized, "content": content}
 
 
+def _utc_field_in_zone(field: dict[str, Any], zone_name: str) -> dict[str, Any]:
+    """Convert a dateTimeTimeZone field from a plain (unprefixed) GET -
+    Microsoft's own docs: "By default, the start/end time is in UTC" -
+    into the equivalent wall-clock value in `zone_name`, computed locally
+    rather than by re-fetching with a Prefer header.
+
+    Needed anywhere `zone_name` comes from `originalStartTimeZone` (the
+    event's real configured zone) rather than from this same field's own
+    "timeZone" (always "UTC" here): pairing that real zone name with the
+    UTC clock value unchanged - e.g. via `_offset_datetime_string` - would
+    silently mislabel a UTC instant as if it were already expressed in
+    the real zone, off by the real zone's UTC offset. This also matters
+    for is_all_day day-bounds widening, which operates on the naive
+    clock value's own date - a UTC-denominated date can name a different
+    calendar day than the instant's real local one, near a day boundary.
+
+    Falls back to `field` unchanged when there's nothing to convert (no
+    dateTime) or `zone_name` doesn't resolve - a wrong zone name here is
+    caught elsewhere (`_resolve_zoneinfo` is also used on the write path),
+    not silently swallowed by this being a no-op.
+    """
+    date_time = field.get("dateTime")
+    if not date_time:
+        return field
+    try:
+        zone = _resolve_zoneinfo(zone_name)
+    except ValueError:
+        return field
+    utc_instant = datetime.fromisoformat(date_time).replace(tzinfo=dt_timezone.utc)
+    local_instant = utc_instant.astimezone(zone).replace(tzinfo=None)
+    return {"dateTime": local_instant.isoformat(), "timeZone": zone_name}
+
+
 def _next_link_path(next_link: str) -> str:
     """Strip GRAPH_BASE_URL from an @odata.nextLink so it can be re-issued
     through `_graph_request` as a plain path+query (the link is always an
@@ -744,6 +777,22 @@ def outlook_update_event(
             existing_timezone = existing.get("originalStartTimeZone")
             if existing_timezone and not existing_timezone.startswith("tzone://"):
                 existing_zone = existing_timezone
+                # existing_start_field/existing_end_field are still the
+                # plain-GET UTC values above - re-express them as the real
+                # zone's own wall-clock reading (computed locally, no
+                # extra round trip) so they're not a UTC clock value
+                # mislabeled with a different zone's name. That mismatch
+                # would misjudge a same-instant resubmission as "moved" in
+                # _key() below, and - separately - would widen an
+                # is_all_day toggle to the wrong calendar day whenever the
+                # real zone's offset pushes the instant across a day
+                # boundary from its UTC date.
+                existing_start_field = _utc_field_in_zone(
+                    existing_start_field, existing_timezone
+                )
+                existing_end_field = _utc_field_in_zone(
+                    existing_end_field, existing_timezone
+                )
             else:
                 existing_zone = existing_start_field.get("timeZone")
 

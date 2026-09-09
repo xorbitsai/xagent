@@ -429,15 +429,29 @@ def _finalize_external_cancel_sync(
         _invalidate_task_cache_after_commit(task_id)
 
 
-async def _broadcast_external_cancel_terminal_event(task_id: int) -> None:
+async def _broadcast_external_cancel_terminal_event(
+    task_id: int,
+    *,
+    run_id: str | None = None,
+    state_version: int | None = None,
+    control_state: str | None = None,
+) -> None:
     from .task_events import publish_task_event
     from .task_execution import create_terminal_task_error_event
+
+    if state_version is None or control_state is None:
+        run_id = None
+        state_version = None
+        control_state = None
 
     try:
         await publish_task_event(
             create_terminal_task_error_event(
                 task_id,
                 EXTERNAL_TURN_INTERRUPTED_MESSAGE,
+                run_id=run_id,
+                state_version=state_version,
+                control_state=control_state,
             ),
             task_id,
         )
@@ -485,4 +499,9 @@ async def cancel_external_task_unserialized(
                 turn_id=turn_id,
             )
         )
-    await _broadcast_external_cancel_terminal_event(task_id)
+    await _broadcast_external_cancel_terminal_event(
+        task_id,
+        run_id=expected_run_id,
+        state_version=expected_state_version + 1,
+        control_state=TaskControlState.FAILED.value,
+    )

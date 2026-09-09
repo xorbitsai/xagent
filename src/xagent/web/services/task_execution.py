@@ -199,6 +199,9 @@ def create_terminal_task_error_event(
     message: str,
     *,
     code: str | None = None,
+    run_id: str | None = None,
+    state_version: int | None = None,
+    control_state: str | None = None,
 ) -> dict[str, Any]:
     """Shape an error event after the exact lease owner commits FAILED.
 
@@ -256,6 +259,12 @@ def create_terminal_task_error_event(
     }
     if code is not None:
         event["code"] = code
+    if run_id is not None:
+        event["task"]["run_id"] = run_id
+    if state_version is not None:
+        event["task"]["state_version"] = state_version
+    if control_state is not None:
+        event["task"]["control_state"] = control_state
     return event
 
 

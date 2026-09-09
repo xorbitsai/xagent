@@ -1118,6 +1118,50 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             },
         },
         {
+            "app_id": "zendesk",
+            "name": "Zendesk",
+            "description": "Connect to Zendesk with an API token to search and manage tickets, reply to customers or add internal notes, and look up users and organizations.",
+            "icon": "https://www.google.com/s2/favicons?domain=zendesk.com&sz=128",
+            "transport": "stdio",
+            "provider_name": None,
+            "category": "Support",
+            "oauth_scopes": None,
+            # Hidden until manually verified against a live account, same
+            # precedent as the intercom row above: it ships customer-facing
+            # *write* tools (reply/internal note/create/update/delete)
+            # discoverable by every user the moment it's visible, and that
+            # verification hasn't happened yet. Flip to True via a
+            # follow-up once done --
+            # no redeploy needed (is_visible_in_connector is not
+            # builtin-protected).
+            "is_visible_in_connector": False,
+            # Key-based (non-oauth), like posthog/stripe/mixpanel: Zendesk
+            # API tokens are self-serve (Admin Center -> Apps and
+            # integrations -> APIs -> Zendesk API -> Add API token), no
+            # review. Zendesk's own docs mark this auth method
+            # "(deprecated)" in favor of OAuth, but it remains fully
+            # supported with no announced removal date -- a private
+            # (non-marketplace) OAuth client would clear the same no-review
+            # bar but adds a full authorization-code exchange this
+            # connector doesn't otherwise need. ZENDESK_SUBDOMAIN is just
+            # the account's subdomain label (e.g. "acme"), validated in
+            # zendesk.py to be a single DNS label before it's interpolated
+            # into the hardcoded "*.zendesk.com" host -- no arbitrary host
+            # is ever accepted. The resolved address is additionally
+            # validated in zendesk.py's _base_url(), the same
+            # resolve-and-reject DNS-rebinding guard posthog.py's
+            # _base_url() applies to its own hardcoded hostnames.
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.zendesk"],
+                "required_env": [
+                    "ZENDESK_SUBDOMAIN",
+                    "ZENDESK_EMAIL",
+                    "ZENDESK_API_TOKEN",
+                ],
+            },
+        },
+        {
             "app_id": "salesforce",
             "name": "Salesforce",
             "description": "Connect to Salesforce to query and manage records (accounts, contacts, leads, opportunities, and custom objects) with SOQL/SOSL, and browse object schemas.",

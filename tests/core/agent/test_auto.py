@@ -21,12 +21,14 @@ from xagent.core.agent import (
     ReActPattern,
 )
 from xagent.core.agent.context.enrichment import MEMORY_CONTEXT_METADATA_KEY
+from xagent.core.agent.grounding import VALUE_KINDS
 from xagent.core.agent.language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
     OUTPUT_LANGUAGE_SOURCE_METADATA_KEY,
     OUTPUT_LANGUAGE_SOURCE_PLAN,
 )
 from xagent.core.agent.pattern.auto.auto import DECISION_TOOL_NAME, _AutoChildRuntime
+from xagent.core.agent.pattern.dag.dag import _DAGStepRuntime
 from xagent.core.model.chat.basic.router import RouterLLM
 from xagent.core.model.chat.exceptions import LLMToolProtocolError
 from xagent.core.model.chat.tool_protocol import (
@@ -1051,12 +1053,26 @@ async def test_auto_decision_prompt_includes_grounding_rule() -> None:
     assert result["success"] is True
     decision_prompt = llm.calls[0]["messages"][-1]["content"]
     assert "quantitative data" in decision_prompt
-    assert "illustrative placeholders" in decision_prompt
+    assert (
+        "a current user request that explicitly asks you to write a template"
+        in decision_prompt
+    )
     assert "invented values" in decision_prompt
     assert decision_prompt.count("## FINAL DELIVERABLE FILE REFERENCES") == 1
     assert decision_prompt.index(
-        "If the answer would need such unsupported specifics"
+        "If the answer would need any value the rule above forbids"
     ) < decision_prompt.index("## FINAL DELIVERABLE FILE REFERENCES")
+    # The routing remedy stays specific to auto's own decision, so it is
+    # worded independently of the shared rule's neutral gap-reporting text.
+    assert (
+        "set existing_context_sufficient=false and choose react, so the agent "
+        "can obtain it with tools" in decision_prompt
+    )
+    # The value kinds are not auto's own wording: the sibling sentence
+    # interpolates the shared constant, so this pins the reference rather
+    # than restating the list.
+    assert f"-- {VALUE_KINDS} -- that no source here supports" in decision_prompt
+    assert "such unsupported specifics" not in decision_prompt
     assert "get_workspace_output_files" not in decision_prompt
     assert "You must classify whether" in decision_prompt
     assert "You must also classify whether" not in decision_prompt
@@ -2470,3 +2486,37 @@ async def test_auto_react_messages_preserve_user_turn_attribution(
     assert source["tool_call_id"] == "ask-1"
     assert source["tool_name"] == tool_name
     assert source["turn_id"] == "turn-42"
+
+
+def test_auto_child_runtime_forwards_dag_turn_resolution() -> None:
+    """A DAG step nested under ``auto`` must keep its turn identity.
+
+    ``_DAGStepRuntime.active_turn_id`` resolves the turn on every access by
+    calling ``parent._dag_turn_id(root_context)``. Under ``auto`` that
+    parent is ``_AutoChildRuntime``, so a missing forward raises
+    ``AttributeError`` from inside the property -- which every caller's
+    ``getattr(runtime, "active_turn_id", None)`` silently converts into an
+    unstamped tool call, costing the step both its trace turn attribution
+    and the same-turn duplicate-write guard (which only fires for calls
+    carrying a turn_id).
+    """
+    context = ExecutionContext()
+    context.add_user_message("Plan this", metadata={"turn_id": "turn-42"})
+    child_runtime = _AutoChildRuntime(
+        parent=PatternRuntime(),
+        auto_pattern=AutoPattern(),
+        root_context=context,
+    )
+    step_runtime = _DAGStepRuntime(
+        parent=child_runtime,
+        # Irrelevant to turn resolution, which reads only parent and
+        # root_context; kept real so the adapter is built as callers build it.
+        dag_pattern=DAGPattern(LLMPlanGenerator()),
+        root_context=context,
+        step_id="step-1",
+    )
+
+    # Read it the way react.py's _with_runtime_turn_id does: a plain getattr
+    # with a default is what hides a raising property, so the assertion has
+    # to go through the same access to catch a regression.
+    assert getattr(step_runtime, "active_turn_id", None) == "turn-42"

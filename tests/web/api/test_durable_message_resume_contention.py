@@ -10,6 +10,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from tests.web.services.task_lease_shared import (
+    live_task_lease as live_task_lease_fixture,
+)
+from xagent.core.agent.runner import UserMessageInjectionOutcome
 from xagent.web.api import websocket as websocket_api
 from xagent.web.api.websocket import (
     ResumeReservationOutcome,
@@ -35,6 +39,8 @@ from xagent.web.services.task_command_transport import (
     get_runner_id,
     max_command_defers,
 )
+
+live_task_lease = live_task_lease_fixture
 
 
 @pytest.fixture()
@@ -107,7 +113,16 @@ def _live_control_environment(
     agent = MagicMock()
     agent.supports_live_control.return_value = True
     agent.get_dag_pattern.return_value = None
-    agent.post_user_message = AsyncMock(return_value=True)
+    # The injection outcome is read two ways downstream: truthiness (did an
+    # exact checkpoint accept the message at all) and identity against
+    # ``POSTED_FRESH`` (did this call write a new turn, as opposed to a
+    # replayed one). A bare ``True`` satisfies the first read but is never
+    # ``is POSTED_FRESH``, so it silently skips the branch that fires only
+    # on identity -- the stub has to be a real enum member to exercise that
+    # branch at all.
+    agent.post_user_message = AsyncMock(
+        return_value=UserMessageInjectionOutcome.POSTED_FRESH
+    )
     if background_manager is None:
         background_manager = MagicMock()
         background_manager.try_reserve_resume.return_value = outcome
@@ -222,6 +237,7 @@ async def test_recovered_delivery_makes_contention_unsafe_to_resend(
 
 @pytest.mark.asyncio
 async def test_dispatcher_reclaims_and_applies_message_after_contention_clears(
+    live_task_lease,
     db_session,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -231,6 +247,7 @@ async def test_dispatcher_reclaims_and_applies_message_after_contention_clears(
     task.runner_id = get_runner_id()
     task.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=1)
     db_session.commit()
+    live_task_lease(db_session, task)
 
     enqueued = enqueue_task_command(
         db_session,
@@ -283,11 +300,30 @@ async def test_dispatcher_reclaims_and_applies_message_after_contention_clears(
         background_manager.release_resume_reservation(int(task.id))
         stored.claim_expires_at = None
         db_session.commit()
-        assert await dispatch_one_task_command(
-            execute_durable_task_command,
-            command_db_id=enqueued.command_id,
-        )
-        await asyncio.sleep(0)
+        # A stub that is truthy but not `is POSTED_FRESH` would let the
+        # dispatch above still report success while silently skipping the
+        # legacy-interaction close below it -- truthiness alone cannot tell
+        # the two apart. Patching with a spy lets us assert
+        # `close_spy.call_count == 1`, which fails if that regression
+        # silently skips the close; `wraps=` is added separately so the
+        # real close still executes for its own side effects (the DB
+        # write), keeping the rest of the test's assertions valid.
+        with patch.object(
+            websocket_api,
+            "close_legacy_resume_interaction_sync",
+            wraps=websocket_api.close_legacy_resume_interaction_sync,
+        ) as close_spy:
+            assert await dispatch_one_task_command(
+                execute_durable_task_command,
+                command_db_id=enqueued.command_id,
+            )
+            await asyncio.sleep(0)
+        assert close_spy.call_count == 1
+        # The call site swallows any internal failure into a warning
+        # (`except Exception: logger.warning(...)`), so call_count alone
+        # cannot tell a successful close from one that raised and was
+        # silently caught. Assert the warning is absent to catch that case.
+        assert "legacy resume interaction close failed" not in caplog.text
 
     db_session.expire_all()
     stored = db_session.get(TaskExecutionCommand, enqueued.command_id)

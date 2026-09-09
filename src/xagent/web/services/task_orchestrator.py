@@ -111,10 +111,12 @@ from .task_lease_service import (
     acquire_task_lease_no_commit,
     fail_and_release_task_lease_no_commit,
     get_runner_id,
+    lock_task_lease_no_commit,
     release_task_lease,
     run_task_lease_heartbeat,
     run_while_task_lease_owned,
     stop_task_lease_heartbeat,
+    task_lease_attempt_predicate,
     validate_preacquired_task_lease_isolated,
 )
 from .task_runtime import mcp_runtime_authorization_policy_required
@@ -1180,6 +1182,7 @@ def _claim_turn_no_commit(
                 Task.id == task_id,
                 Task.status == TaskStatus.RUNNING,
                 Task.runner_id == task_lease.runner_id,
+                task_lease_attempt_predicate(task_lease),
                 Task.run_id == task_lease.run_id,
             )
             .one()
@@ -1291,6 +1294,7 @@ def _reconcile_claimed_turn_after_commit_ack_failure(
                     Task.status == TaskStatus.RUNNING,
                     Task.run_id == claimed.run_id,
                     Task.runner_id == claimed.task_lease.runner_id,
+                    task_lease_attempt_predicate(claimed.task_lease),
                 )
                 .first()
             )
@@ -1561,8 +1565,10 @@ def finish_turn(
                 task_id,
             )
             return False
+        lock_task_lease_no_commit(bg_db, task_lease)
         query = query.filter(
             Task.runner_id == task_lease.runner_id,
+            task_lease_attempt_predicate(task_lease),
             Task.run_id == task_lease.run_id,
         )
         # PostgreSQL locks the exact owned row until release_task_lease commits;
@@ -1791,7 +1797,10 @@ def _schedule_bg(
     )
     from ..api.websocket import manager as websocket_manager
 
+    execution_failed = False
+
     async def _runner() -> None:
+        nonlocal execution_failed
         lease: TaskLease | None = task_lease
         stop_event: asyncio.Event | None = None
         hb_task: asyncio.Task[TaskLeaseHeartbeatOutcome] | None = None
@@ -1934,6 +1943,9 @@ def _schedule_bg(
                     settlement_error = "task execution cancelled"
                 raise
             except Exception as setup_or_run_err:
+                # Handled setup/run failures settle and return normally, so
+                # the done callback cannot infer them from task.exception().
+                execution_failed = True
                 if is_database_pool_timeout(setup_or_run_err):
                     # The failed setup/run checkout already waited for the
                     # exhausted pool. An immediate settlement would perform a
@@ -2180,6 +2192,18 @@ def _schedule_bg(
 
     bg_task = asyncio.create_task(_runner())
     background_task_manager.register_task(task_id, bg_task)
+    if task_source == "trigger":
+        from ...core.utils.setup_metrics import trigger_execution
+
+        started_at = trigger_execution.start()
+        bg_task.add_done_callback(
+            lambda task: trigger_execution.finish(
+                started_at,
+                cancelled=task.cancelled(),
+                failed=not task.cancelled()
+                and (execution_failed or task.exception() is not None),
+            )
+        )
     logger.info(
         "task %s scheduled in background v2 (source=%s, force_fresh=%s)",
         task_id,

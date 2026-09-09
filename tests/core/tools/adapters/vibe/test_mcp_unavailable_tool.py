@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import logging
 import re
 from typing import Any
@@ -25,7 +26,6 @@ def _unavailable_tool(
     *,
     server_name: str = "Google Drive",
     server_id: int | None = 42,
-    allow_users: list[str] | None = None,
     failure_code: str | None = None,
     reason: str | None = None,
     message: str | None = None,
@@ -33,7 +33,6 @@ def _unavailable_tool(
     kwargs: dict[str, Any] = {
         "server_name": server_name,
         "server_id": server_id,
-        "allow_users": allow_users,
         "failure_code": failure_code,
     }
     if reason is not None:
@@ -49,7 +48,6 @@ def _unavailable_config(
     *,
     name: str | None = "Google Drive",
     server_id: int | None = 42,
-    allow_users: list[str] | None = None,
     failure_code: object | None = None,
 ) -> dict:
     config = {
@@ -62,7 +60,6 @@ def _unavailable_config(
             "message": "MCP server credentials are unavailable.",
             "server_id": server_id,
         },
-        "allow_users": allow_users,
     }
     if failure_code is not None:
         config["config"]["failure_code"] = failure_code
@@ -93,19 +90,20 @@ def test_unavailable_tool_empty_server_name_has_stable_fallback():
 
 
 def test_unavailable_tool_metadata_is_mcp_and_server_scoped():
-    tool = _unavailable_tool(allow_users=["7"])
+    tool = _unavailable_tool()
 
     assert tool.metadata.category == ToolCategory.MCP
     assert tool.metadata.source_server == "google_drive"
-    assert tool.metadata.allow_users == ["7"]
+    # The placeholder explains an outage to whoever calls it, so it carries no
+    # allow-list for the runtime to check the caller against.
+    assert tool.metadata.allow_users is None
     assert tool.metadata.read_only is True
     assert tool.metadata.concurrency_safe is True
 
 
 @pytest.mark.asyncio
-async def test_unavailable_tool_async_authorized_returns_clean_error(monkeypatch):
-    monkeypatch.setenv("XAGENT_USER_ID", "7")
-    tool = _unavailable_tool(allow_users=["7"])
+async def test_unavailable_tool_async_returns_clean_error():
+    tool = _unavailable_tool()
 
     result = await tool.run_json_async({})
 
@@ -118,9 +116,8 @@ async def test_unavailable_tool_async_authorized_returns_clean_error(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_unavailable_tool_authorized_returns_classified_failure(monkeypatch):
-    monkeypatch.setenv("XAGENT_USER_ID", "7")
-    tool = _unavailable_tool(allow_users=["7"], failure_code="oauth_token_required")
+async def test_unavailable_tool_returns_classified_failure():
+    tool = _unavailable_tool(failure_code="oauth_token_required")
 
     result = await tool.run_json_async({})
 
@@ -142,10 +139,8 @@ async def test_unavailable_tool_authorized_returns_classified_failure(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_unavailable_tool_accepts_public_runtime_reason_and_message(monkeypatch):
-    monkeypatch.setenv("XAGENT_USER_ID", "7")
+async def test_unavailable_tool_accepts_public_runtime_reason_and_message():
     tool = _unavailable_tool(
-        allow_users=["7"],
         reason="initialize",
         message="MCP server initialization failed.",
     )
@@ -181,9 +176,8 @@ def test_unavailable_tool_supports_public_load_phase_messages(reason, message):
     assert result["content"] == [{"text": message}]
 
 
-def test_unavailable_tool_sync_authorized_returns_clean_error(monkeypatch):
-    monkeypatch.setenv("XAGENT_USER_ID", "7")
-    tool = _unavailable_tool(allow_users=["7"])
+def test_unavailable_tool_sync_returns_clean_error():
+    tool = _unavailable_tool()
 
     result = tool.run_json_sync({})
 
@@ -191,67 +185,102 @@ def test_unavailable_tool_sync_authorized_returns_clean_error(monkeypatch):
     assert "MCP server credentials are unavailable" in result["content"][0]["text"]
 
 
+def test_unavailable_tool_takes_no_caller_allow_list():
+    """Neither the placeholder nor its factory accepts an allow-list.
+
+    Removing only the runtime check would leave the parameter in place, and a
+    construction site passing a list again is exactly how every caller came to
+    be denied; the parameter's absence is what keeps that from coming back.
+    """
+    assert (
+        "allow_users" not in inspect.signature(UnavailableMCPTool.__init__).parameters
+    )
+    assert (
+        "allow_users"
+        not in inspect.signature(ToolFactory._create_unavailable_mcp_tool).parameters
+    )
+    with pytest.raises(TypeError):
+        UnavailableMCPTool(
+            server_name="Google Drive",
+            server_id=42,
+            allow_users=["7"],
+        )
+
+
 @pytest.mark.asyncio
-async def test_unavailable_tool_async_unauthorized_uses_mcp_access_denied(
-    monkeypatch,
-):
+async def test_unavailable_tool_async_reports_the_outage_to_any_caller(monkeypatch):
+    """A caller identity that differs from the server owner changes nothing.
+
+    The placeholder used to check the caller against an allow-list and answer
+    "Access denied" instead of explaining the outage.
+    """
     monkeypatch.setenv("XAGENT_USER_ID", "8")
-    tool = _unavailable_tool(allow_users=["7"])
+    tool = _unavailable_tool()
 
     result = await tool.run_json_async({})
 
     assert result == {
+        "success": False,
+        "status": "error",
+        "is_error": True,
+        "error": "MCP server credentials are unavailable.",
         "content": [
             {
                 "text": (
-                    "Access denied: User 8 is not authorized to use tool "
-                    "mcp_google_drive_42_unavailable"
+                    "MCP server credentials are unavailable. Please reconnect "
+                    "the MCP server credentials and retry."
                 )
             }
         ],
-        "is_error": True,
     }
 
 
-def test_unavailable_tool_return_schema_accepts_access_denied_result(monkeypatch):
+def test_unavailable_tool_return_schema_accepts_the_outage_result(monkeypatch):
     monkeypatch.setenv("XAGENT_USER_ID", "8")
-    tool = _unavailable_tool(allow_users=["7"])
+    tool = _unavailable_tool()
 
     result = tool.run_json_sync({})
     parsed = tool.return_type().model_validate(result)
 
-    assert parsed.error is None
+    assert parsed.error == "MCP server credentials are unavailable."
     assert parsed.is_error is True
 
 
-def test_unavailable_tool_sync_unauthorized_uses_mcp_access_denied(monkeypatch):
+def test_unavailable_tool_sync_reports_the_outage_to_any_caller(monkeypatch):
     monkeypatch.setenv("XAGENT_USER_ID", "8")
-    tool = _unavailable_tool(allow_users=["7"])
+    tool = _unavailable_tool()
 
     result = tool.run_json_sync({})
 
     assert result["is_error"] is True
-    assert "Access denied" in result["content"][0]["text"]
+    assert "Access denied" not in result["content"][0]["text"]
+    assert "MCP server credentials are unavailable" in result["content"][0]["text"]
 
 
-def test_unavailable_tool_missing_user_permission_regression(monkeypatch):
-    monkeypatch.delenv("XAGENT_USER_ID", raising=False)
+@pytest.mark.parametrize(
+    "caller_user_id",
+    [None, "7", "8"],
+    ids=["no_caller_identity", "owning_user", "another_user"],
+)
+def test_unavailable_tool_reports_the_outage_for_every_caller_identity(
+    monkeypatch, caller_user_id
+):
+    """The reported outage does not depend on ``XAGENT_USER_ID``.
 
-    assert _unavailable_tool(allow_users=None).run_json_sync({})["is_error"] is True
-    assert (
-        "MCP server credentials"
-        in _unavailable_tool(allow_users=None).run_json_sync({})["content"][0]["text"]
-    )
-    assert (
-        "Access denied"
-        in _unavailable_tool(allow_users=["7"]).run_json_sync({})["content"][0]["text"]
-    )
-    assert (
-        "MCP server credentials"
-        in _unavailable_tool(allow_users=["system"]).run_json_sync({})["content"][0][
-            "text"
-        ]
-    )
+    A normal server process never writes that variable, so the identity is
+    absent in production; the owning-user and other-user cases only exist
+    because tests can set it.
+    """
+    if caller_user_id is None:
+        monkeypatch.delenv("XAGENT_USER_ID", raising=False)
+    else:
+        monkeypatch.setenv("XAGENT_USER_ID", caller_user_id)
+
+    result = _unavailable_tool().run_json_sync({})
+
+    assert result["is_error"] is True
+    assert "Access denied" not in result["content"][0]["text"]
+    assert "MCP server credentials" in result["content"][0]["text"]
 
 
 def test_mcp_tool_adapter_permission_helper_regression(monkeypatch):
@@ -322,12 +351,10 @@ async def test_factory_builds_unavailable_tools_without_normal_loader(monkeypatc
     ],
 )
 async def test_factory_revalidates_unavailable_failure_code(
-    monkeypatch,
     raw_failure_code,
     expected_failure_code,
 ):
-    monkeypatch.setenv("XAGENT_USER_ID", "7")
-    config = _unavailable_config(allow_users=["7"], failure_code=raw_failure_code)
+    config = _unavailable_config(failure_code=raw_failure_code)
     config["config"]["diagnostic"] = {
         "actor": "internal-actor",
         "resource": "internal-resource",
@@ -343,7 +370,7 @@ async def test_factory_revalidates_unavailable_failure_code(
 
 
 @pytest.mark.asyncio
-async def test_unavailable_config_failure_code_reaches_tool_failure_trace(monkeypatch):
+async def test_unavailable_config_failure_code_reaches_tool_failure_trace():
     class CapturingTracer:
         def __init__(self) -> None:
             self.events: list[dict[str, Any]] = []
@@ -356,8 +383,7 @@ async def test_unavailable_config_failure_code_reaches_tool_failure_trace(monkey
                 }
             )
 
-    monkeypatch.setenv("XAGENT_USER_ID", "7")
-    config = _unavailable_config(allow_users=["7"], failure_code="oauth_token_required")
+    config = _unavailable_config(failure_code="oauth_token_required")
     config["config"]["diagnostic"] = {
         "actor": "internal-actor",
         "resource": "internal-resource",
@@ -410,7 +436,6 @@ async def test_factory_normal_loader_failure_keeps_unavailable_tool(monkeypatch)
 async def test_factory_keeps_successful_tools_and_exposes_each_failed_server(
     monkeypatch,
 ):
-    monkeypatch.setenv("XAGENT_USER_ID", "7")
     healthy_tool = _unavailable_tool(server_name="Healthy result", server_id=99)
 
     async def loader(connections, **kwargs):
@@ -444,21 +469,18 @@ async def test_factory_keeps_successful_tools_and_exposes_each_failed_server(
                 "name": "healthy",
                 "transport": "stdio",
                 "config": {"command": "echo"},
-                "allow_users": ["7"],
             },
             {
                 "id": 12,
                 "name": "broken",
                 "transport": "stdio",
                 "config": {"command": "echo"},
-                "allow_users": ["7"],
             },
             {
                 "id": 13,
                 "name": "partial",
                 "transport": "stdio",
                 "config": {"command": "echo"},
-                "allow_users": ["7"],
             },
         ]
     )

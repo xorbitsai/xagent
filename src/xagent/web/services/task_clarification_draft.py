@@ -474,14 +474,8 @@ def resolve_publishable_clarification(
     3. ``task.runner_id == lease.runner_id and task.run_id == lease.run_id``
        -- the task row must still be owned by the lease that produced the
        result.
-    4. ``lease.attempt_id is None or task.lease_attempt_id == lease.attempt_id``
-       -- ``None`` means the lease cannot prove attempt identity at all and
-       must be treated as "skip this check", never as "matches" (the same
-       reading ``interaction_handoff`` itself uses for the identical
-       sentinel). A concrete mismatch means a later attempt has already
-       claimed the row, and this settlement must be discarded wholesale
-       rather than degrade -- an attempt that is no longer current has no
-       business writing anything at all.
+    4. ``lease.attempt_id is not None and task.lease_attempt_id == lease.attempt_id``
+       -- a missing or superseded acquisition cannot publish a clarification.
 
        Guards 2 through 4 evaluate ``lease_is_fenced``,
        ``task_row_matches_lease_owner`` and ``task_row_matches_lease_attempt``

@@ -111,6 +111,7 @@ class MCPWriteHint(Enum):
 # spells them (camelCase is the protocol's, not this codebase's).
 _READ_ONLY_HINT = "readOnlyHint"
 _DESTRUCTIVE_HINT = "destructiveHint"
+_IDEMPOTENT_HINT = "idempotentHint"
 
 
 def classify_write_hint(raw_annotations: object) -> MCPWriteHint:
@@ -152,6 +153,52 @@ def classify_write_hint(raw_annotations: object) -> MCPWriteHint:
     if raw_annotations.get(_READ_ONLY_HINT) is True:
         return MCPWriteHint.READ_ONLY
     return MCPWriteHint.UNDECLARED
+
+
+def classify_non_idempotent_write(raw_annotations: object) -> bool:
+    """Whether a tool's *raw* wire annotations declare a non-idempotent write.
+
+    The consumer is the same-turn duplicate-write guard, whose enrollment
+    question is not "may this destroy data" but "does repeating this call
+    with identical arguments produce an additional effect". Per the MCP
+    schema that is ``idempotentHint`` (``false`` = repeats have additional
+    effect), not ``destructiveHint`` (``false`` = only additive updates) — a
+    well-annotated create tool is additive and non-idempotent, i.e.
+    ``destructiveHint: false, idempotentHint: false``.
+
+    Reads the wire mapping for the same reason ``classify_write_hint`` does:
+    only an exact boolean is a declaration. True exactly when
+    ``readOnlyHint`` is not exactly ``true`` and either
+
+    * ``idempotentHint`` is exactly ``false`` — the explicit declaration
+      that identical repeats compound, or
+    * ``destructiveHint`` is exactly ``true`` without an exact
+      ``idempotentHint: true`` — an explicit write whose idempotency the
+      server left unstated.
+
+    Everything else is False. An absent hint is never read through its
+    spec default: ``idempotentHint``'s default of false does not enroll an
+    unannotated tool, and ``destructiveHint``'s default of true does not
+    either, so enrollment always needs at least one exact boolean from the
+    server and legitimate identical-args poll loops stay unguarded. Within
+    an explicit ``destructiveHint: true``, though, a *missing*
+    ``idempotentHint`` does enroll: the server declared a write and said
+    nothing about repeats, which is the same reading the previous
+    destructive-only enrollment used. Unlike confirmation-style
+    consumers, deduplication fails OPEN: a contradictory or malformed claim
+    (e.g. read-only plus non-idempotent) reads as "do not enroll", because
+    the harmless failure mode here is executing, not suppressing.
+    """
+    if not isinstance(raw_annotations, Mapping):
+        return False
+    if raw_annotations.get(_READ_ONLY_HINT) is True:
+        return False
+    if raw_annotations.get(_IDEMPOTENT_HINT) is False:
+        return True
+    return (
+        raw_annotations.get(_DESTRUCTIVE_HINT) is True
+        and raw_annotations.get(_IDEMPOTENT_HINT) is not True
+    )
 
 
 @dataclass(frozen=True)
@@ -968,6 +1015,18 @@ class MCPToolAdapter(AbstractBaseTool):
         return classify_write_hint(self._raw_annotations)
 
     @property
+    def non_idempotent_write(self) -> bool:
+        """Whether the server's annotations declare a non-idempotent write.
+
+        Consumed (via ``ToolMetadata.mcp_non_idempotent_write``) by the
+        same-turn duplicate-write guard. Same wire-evidence discipline and
+        trust caveats as ``write_hint``; see
+        ``classify_non_idempotent_write`` for the enrollment predicate and
+        why it fails open.
+        """
+        return classify_non_idempotent_write(self._raw_annotations)
+
+    @property
     def tags(self) -> List[str]:
         """Get tags for this tool."""
         tags = ["mcp"]
@@ -1645,7 +1704,18 @@ class _UnavailableMCPToolResult(BaseModel):
 
 
 class UnavailableMCPTool(AbstractBaseTool):
-    """Server-level MCP tool returned when a selected server is unavailable."""
+    """Server-level MCP tool returned when a selected server is unavailable.
+
+    The tool exists to explain an outage, so it always reports that outage to
+    whoever invokes it: it carries no allow-list and performs no caller check.
+    Its result holds only a constant message plus a ``reason`` and a
+    ``failure_code``. ``failure_code`` is normalized against the public failure
+    allowlist here and dropped when it is not on it; ``reason`` is stored as
+    given, so an allowlisted value is a guarantee callers make, enforced where
+    the unavailable config is built. The server name it is built from is
+    already exposed in the tool listing, so there is nothing here to withhold
+    from a caller.
+    """
 
     read_only = True
     concurrency_safe = True
@@ -1655,7 +1725,6 @@ class UnavailableMCPTool(AbstractBaseTool):
         *,
         server_name: str,
         server_id: Any | None,
-        allow_users: Optional[List[str]] = None,
         failure_code: str | None = None,
         reason: str | None = None,
         message: str = _DEFAULT_UNAVAILABLE_MCP_MESSAGE,
@@ -1666,7 +1735,6 @@ class UnavailableMCPTool(AbstractBaseTool):
 
         self._server_name = server_name
         self._server_id = server_id
-        self._allow_users = allow_users
         self._failure_code = normalize_tool_failure_code(failure_code)
         self._reason = reason
         self._message = message
@@ -1706,9 +1774,6 @@ class UnavailableMCPTool(AbstractBaseTool):
         return None
 
     def _run_unavailable(self) -> Dict[str, Any]:
-        current_user_id = _get_current_mcp_user_id()
-        if not _is_mcp_user_allowed(current_user_id, self._allow_users):
-            return _mcp_access_denied_result(current_user_id, self.name)
         content_message = self._message
         if self._message == _DEFAULT_UNAVAILABLE_MCP_MESSAGE:
             content_message = (

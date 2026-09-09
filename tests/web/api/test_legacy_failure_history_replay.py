@@ -40,6 +40,7 @@ def _running_task(
             title=title,
             description=title,
             status=TaskStatus.RUNNING,
+            lease_attempt_id="test-attempt" if runner_id is not None else None,
             runner_id=runner_id,
             run_id=run_id,
             lease_expires_at=(
@@ -735,6 +736,7 @@ def test_failed_resumed_websocket_result_prefers_diagnostic_error_over_display_t
             "error": raw_error,
         },
         task_lease=TaskLease(
+            attempt_id="test-attempt",
             task_id=task_id,
             runner_id="resume-runner-1730",
             run_id="resume-run-1730",
@@ -769,6 +771,7 @@ def test_lease_failure_writer_persists_safe_provenance(_test_db) -> None:
 
     committed = settle_task_lease_isolated(
         TaskLease(
+            attempt_id="test-attempt",
             task_id=task_id,
             runner_id="runner-1730",
             run_id="run-1730",
@@ -798,6 +801,7 @@ async def test_failed_managed_result_replays_only_safe_history(
         committed = finalize_managed_task_lease_result(
             db,
             TaskLease(
+                attempt_id="test-attempt",
                 task_id=task_id,
                 runner_id="managed-runner-1730",
                 run_id="managed-run-1730",

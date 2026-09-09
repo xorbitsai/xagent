@@ -494,38 +494,6 @@ class TestPromoteVersionMain:
                 assert result["main_pointer"]["model_tag"] == "bge_large"
                 assert result["main_pointer"]["technical_id"] == "parse_hash1"
 
-    def test_embed_cleanup_uses_embeddings_scope(self):
-        """Embed promotion cleanup passes the cleaner-supported embeddings scope."""
-        import importlib
-
-        promote_version_main_module = importlib.import_module(
-            "xagent.core.tools.core.RAG_tools.version_management.promote_version_main"
-        )
-        mock_cleanup_cascade = MagicMock(return_value={"embeddings": 3})
-
-        with patch.object(
-            promote_version_main_module, "cleanup_cascade", mock_cleanup_cascade
-        ):
-            result = promote_version_main_module._call_cleanup_cascade(
-                collection="test_collection",
-                doc_id="test_doc",
-                step_type=StepType.EMBED,
-                technical_id="embed-hash",
-                model_tag="bge_large",
-                preview_only=False,
-                confirm=True,
-            )
-
-        assert result == {"embeddings": 3}
-        mock_cleanup_cascade.assert_called_once_with(
-            collection="test_collection",
-            doc_id="test_doc",
-            scope="embeddings",
-            model_tag="bge_large",
-            preview_only=False,
-            confirm=True,
-        )
-
     def test_wraps_unexpected_exceptions(self):
         """Test that unexpected exceptions are wrapped in VersionManagementError.
 

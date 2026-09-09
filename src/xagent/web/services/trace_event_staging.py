@@ -360,7 +360,10 @@ def is_missing_run_partition_only(
     Both conditions are load-bearing. Dropping the "only" makes a row that
     is wrong in some other way as well look pre-existing; dropping the
     "absent" makes a row carrying a genuinely wrong partition look
-    pre-existing. Each has its own test.
+    pre-existing. Each has its own test. ``is_mismatched_run_partition_only``
+    below answers the complementary question -- the run field present but
+    wrong, rather than absent -- within the same ``{run partition}``-only
+    failure set.
 
     ``failed`` must be the result of ``failed_checkpoint_row_conditions``
     called on this same ``row_data``; nothing in the signature enforces that
@@ -371,4 +374,40 @@ def is_missing_run_partition_only(
 
     return failed == {CHECKPOINT_ROW_RUN_PARTITION} and (
         row_data.get(TASK_RUN_ID_TRACE_FIELD) is None
+    )
+
+
+def is_mismatched_run_partition_only(
+    failed: frozenset[str], row_data: dict[str, Any]
+) -> bool:
+    """True when the only condition ``row_data``'s row failed is the
+    run-partition match, and it failed because the run field holds a
+    different value rather than reading as absent.
+
+    The exact complement of ``is_missing_run_partition_only`` above within
+    ``failed == {CHECKPOINT_ROW_RUN_PARTITION}``: the two are mutually
+    exclusive and together cover every row whose only failed condition is
+    the partition, so a caller that asks both and neither answers true is
+    looking at a row that failed something else as well.
+
+    A row of this shape is not a pre-existing row: the run field was
+    written, and it names a run this row is not being read against.
+    Callers that report an alarm for an inconsistent row and a quiet
+    outcome for a pre-existing one need this half to tell the two apart --
+    the "absent" half above is not the negation of "wrong", because a row
+    failing some *other* condition as well is neither.
+
+    ``is not None`` also counts a falsy-but-present value (``""``, ``0``,
+    ``False``) as mismatched rather than absent, the same way the sibling
+    predicate's ``is None`` would not catch one either. No live writer
+    stores one of those in this field today, so that reading is untested
+    here rather than defended against.
+
+    Same pairing requirement as the predicate above: ``failed`` must be the
+    result of ``failed_checkpoint_row_conditions`` called on this same
+    ``row_data``.
+    """
+
+    return failed == {CHECKPOINT_ROW_RUN_PARTITION} and (
+        row_data.get(TASK_RUN_ID_TRACE_FIELD) is not None
     )

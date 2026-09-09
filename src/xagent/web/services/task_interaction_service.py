@@ -901,10 +901,18 @@ CreateOutcome = (
     | CreateStale
 )
 
-# The full closed vocabulary create() can ever return a reason from. 12
+# The full closed vocabulary create() can ever return a reason from. 13
 # reasons total (the "Created" / None pair is not a reason string and is
 # counted separately). Do not update this number by recounting the set
 # literal below -- it is pinned as part of the vocabulary's contract.
+#
+# handoff_degraded_unclassified names the case where interaction_handoff
+# swallowed one of its six exceptions but the recorded handoff.degraded_as
+# is neither mapped by _DEGRADED_AS_OUTCOME nor set at all -- an
+# unidentified degradation, not a real conflict. It is kept distinct from
+# slot_taken because "an unrecognized failure happened" and "another
+# requester already won the slot" are different facts, and an operator
+# reading the outcome must be able to tell them apart.
 CREATE_OUTCOME_REASON_WORDS: frozenset[str] = frozenset(
     {
         "unknown_kind",
@@ -919,11 +927,12 @@ CREATE_OUTCOME_REASON_WORDS: frozenset[str] = frozenset(
         "idempotency_key_reused",
         "anchor_dangling",
         "run_ended",
+        "handoff_degraded_unclassified",
     }
 )
 
 # The (outcome type, reason) pairs this function body has a code path that
-# returns. 9 of the 12 words in CREATE_OUTCOME_REASON_WORDS are producible
+# returns. 10 of the 13 words in CREATE_OUTCOME_REASON_WORDS are producible
 # by that definition; the other three (checkpoint_unavailable,
 # anchor_dangling, run_ended) stay in the closed word list without a
 # producing code path here today:
@@ -972,7 +981,9 @@ CREATE_OUTCOME_PRODUCIBLE_REASONS: dict[type, frozenset[str]] = {
     ),
     CreateUnauthorized: frozenset({"not_task_principal"}),
     CreateUnavailable: frozenset({"task_missing"}),
-    CreateConflict: frozenset({"slot_taken", "idempotency_key_reused"}),
+    CreateConflict: frozenset(
+        {"slot_taken", "idempotency_key_reused", "handoff_degraded_unclassified"}
+    ),
     CreateStale: frozenset({"anchor_run_mismatch"}),
 }
 
@@ -1485,7 +1496,8 @@ def _assert_write_point_admissible(
 # refuses an out-of-vocabulary task.source before a finalizer would ever
 # call this seam. A caller that cannot provide either property must not
 # use this path. If either exception somehow fires anyway, create() falls
-# back to the single default classification below (slot_taken).
+# back to the single default classification below
+# (handoff_degraded_unclassified).
 _DEGRADED_AS_OUTCOME: dict[type[BaseException], "CreateOutcome"] = {
     InteractionSlotTaken: CreateConflict(reason="slot_taken"),
     InteractionRequestClosed: CreateConflict(reason="idempotency_key_reused"),
@@ -1783,8 +1795,10 @@ def create(
     must not use this path. When ``interaction_handoff``'s ``with`` block
     exits with ``handoff.staged`` still ``None`` and ``handoff.degraded_as``
     is one of these two, or is unrecognized, this function reports
-    ``CreateConflict(reason="slot_taken")``, the single default
-    classification for that state.
+    ``CreateConflict(reason="handoff_degraded_unclassified")``, the single
+    default classification for that state -- kept out of
+    ``"slot_taken"`` because an unidentified degradation and a real
+    conflict are different facts a caller must be able to tell apart.
     """
 
     if (
@@ -1986,7 +2000,11 @@ def create(
         # place handoff.staged itself is read -- and _DEGRADED_AS_OUTCOME
         # maps four of the six to a distinct outcome each. The remaining
         # two (see that dict's own docstring), and an unset/unrecognized
-        # degraded_as, fall through to this default.
+        # degraded_as, fall through to this default. The default now
+        # carries its own reason word, handoff_degraded_unclassified,
+        # rather than reusing slot_taken's: an unidentified degradation is
+        # not the same fact as a real conflict, and the two must stay
+        # distinguishable in the reported outcome.
         #
         # issubclass, not an exact-type key lookup: the ``except _SWALLOWED``
         # clause that produced this value matches subclasses, so a future
@@ -2012,7 +2030,7 @@ def create(
             if handoff.degraded_as is not None
             else None
         )
-        return mapped_outcome or CreateConflict(reason="slot_taken")
+        return mapped_outcome or CreateConflict(reason="handoff_degraded_unclassified")
 
     receipt = CreatedInteractionReceipt(
         interaction_id=handoff.staged.staged_db_id,
@@ -2249,6 +2267,21 @@ def _resolve_read_direction_anchor(
     ``CHECKPOINT_PK_ANCHOR_DANGLING`` -- that constant's registration in
     this module describes only the read direction; the two sides do not
     share a signal budget any more than they share a resolver.
+
+    The same divergence has a second half, on a row missing its run field
+    entirely rather than merely carrying a different one. The partition
+    comparison noted above already reads the stored, always non-null
+    ``resume_run_partition`` against the trace row's own run field, not a
+    task's possibly-null ``run_id``; when that field is absent altogether
+    the comparison still runs, and an absent field never equals a non-null
+    stored value, so this resolver reports ``anchor_dangling`` for every
+    such row. This is exactly why the write-direction resolver
+    (``resolve_interaction_anchor``, ``task_interaction_anchor.py``)
+    deliberately does not widen its own judgment of the same row shape:
+    doing so would only stage anchors this resolver then rejects on the
+    next read as ``anchor_dangling``, not anchors it could resolve.
+    Unifying the two would require changing both sides together, not one
+    alone -- see that resolver's own docstring for the full account.
     """
 
     if row.resume_trace_event_id is None:

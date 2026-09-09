@@ -132,3 +132,50 @@ def test_abstract_base_tool_metadata_exposes_concurrency_fields() -> None:
     # scheduler can read them uniformly across every tool.
     assert "read_only" in PythonExecutorTool().metadata.model_dump()
     assert "concurrency_safe" in PythonExecutorTool().metadata.model_dump()
+
+
+def test_non_idempotent_marker_reaches_metadata_on_a_real_base_tool() -> None:
+    # The duplicate-write guard (#2217) reads its enrollment off metadata, so
+    # a first-party tool's class-level marker has to survive the base
+    # property's construction.
+    class SubmitFormTool(FakeBaseTool):
+        non_idempotent = True
+
+        @property
+        def name(self) -> str:
+            return "submit_form"
+
+    assert SubmitFormTool().metadata.non_idempotent is True
+    assert FunctionTool(_noop, name="plain").metadata.non_idempotent is False
+
+
+def test_sandboxed_wrapper_forwards_the_non_idempotent_marker() -> None:
+    # Sandboxed npx/uvx MCP tools reach the ReAct loop as wrappers that
+    # forward only .metadata; an enrollment signal read off the concrete tool
+    # object would vanish for every one of them.
+    @sandbox_config()
+    class SandboxSubmitTool(FakeBaseTool):
+        non_idempotent = True
+
+        def args_type(self) -> Type[BaseModel]:
+            return BaseModel
+
+        def run_json_sync(self, args: Mapping[str, Any]) -> Any:
+            return {}
+
+        async def run_json_async(self, args: Mapping[str, Any]) -> Any:
+            return {}
+
+        @property
+        def name(self) -> str:
+            return "sandbox_submit"
+
+    wrapped = SandboxedToolWrapper(SandboxSubmitTool(), MagicMock())
+
+    assert wrapped.metadata.non_idempotent is True
+    # And the guard enrolls it through that forwarded metadata alone.
+    from xagent.core.agent.pattern.react.duplicate_write_guard import (
+        tool_requires_duplicate_write_guard,
+    )
+
+    assert tool_requires_duplicate_write_guard(wrapped) is True

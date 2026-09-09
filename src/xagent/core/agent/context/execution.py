@@ -25,6 +25,7 @@ from ...tools.artifacts import (
     format_tool_result_for_observation,
     sanitize_tool_result_for_public_context,
 )
+from ..grounding import VALUE_KINDS
 from ..language import (
     effective_output_language,
     render_dag_step_language_reference,
@@ -102,7 +103,9 @@ COMPACT_SUMMARY_MIN_TOKENS = 256
 COMPACT_SUMMARY_FALLBACK_BUDGETS = (4096, 2048, 1024, COMPACT_SUMMARY_MIN_TOKENS)
 COMPACT_CONTEXT_REF_MAX_TOKENS = 2048
 COMPACT_DROPPED_REF_NOTICE_MAX_CHARS = 2048
-COMPACT_DROPPED_TOOL_NOTICE_MAX_CHARS = 1024
+# Sized so the notice prefix, which spells out the shared VALUE_KINDS list,
+# leaves room for the full name list rather than crowding names out of it.
+COMPACT_DROPPED_TOOL_NOTICE_MAX_CHARS = 1152
 COMPACT_DROPPED_TOOL_NAME_MAX_CHARS = 64
 
 # load_skill retrieves guidance, not evidence, and re-running it restores
@@ -1295,9 +1298,11 @@ class ExecutionContext:
             "explicitly asks to restart, revise, or regenerate them, or the detail "
             "you need was lost in compaction. This summary is a lossy paraphrase of "
             "the raw history, not the history itself: when the answer needs an exact "
-            "value, figure, statistic, table row, quotation, or identifier that this "
+            f"statistic, quotation, or other value -- {VALUE_KINDS} -- that this "
             "summary does not literally contain, re-read or re-query the source "
             "instead of reconstructing the value from this summary or from memory. "
+            "If no tool can supply it, report it as unavailable rather than "
+            "reconstructing it. "
             "Only re-run tools that read; if the value came from a tool that writes, "
             "sends, executes, or otherwise changes state, do not re-run it -- re-read "
             "the artifact it produced, or report the value as unavailable. "
@@ -1453,7 +1458,7 @@ class ExecutionContext:
         """Describe the tool observations this compaction removes from context.
 
         Without this, the summary silently replaces every retrieved value and
-        the agent cannot tell a remembered figure from an invented one.
+        the agent cannot tell a remembered value from an invented one.
         """
         if not counts:
             return ""
@@ -1462,9 +1467,9 @@ class ExecutionContext:
         prefix = (
             f"Raw observations from {total} tool {call_label} dropped by this "
             "compaction. Their exact values are no longer in context; only the "
-            "summary above describes them. Treat any figure not literally present in "
-            "that summary as unavailable rather than recalled. Tools whose results "
-            "were dropped:\n"
+            "summary above describes them. Treat any value not literally present in "
+            f"that summary -- {VALUE_KINDS} -- as unavailable rather than recalled. "
+            "Tools whose results were dropped:\n"
         )
         # Tool names can come from dynamic MCP server config, so bound both the
         # per-name length and the total notice size the way the sibling
@@ -1509,17 +1514,39 @@ class ExecutionContext:
                     "tool calls, tool observations, files or URLs mentioned, "
                     "decisions made, and open work. Drop duplicated search noise, "
                     "irrelevant raw payloads, and verbose intermediate text. "
-                    "Preserve exact reusable artifact handles, including file_id "
-                    "values, file: references, markdown file links, URLs, relative "
-                    "paths, absolute paths, output_path, image_path, video_path, "
-                    "artifact filenames, and any other path-like result fields; do "
-                    "not replace machine-usable handles with only descriptive "
-                    "filenames. Clearly separate completed work from remaining work "
-                    "and name the next action needed. "
-                    "Preserve the language of user-facing requests and constraints; "
-                    "if the history is multilingual, keep important details in their "
-                    "original language instead of translating them. "
-                    "Return only the compact summary."
+                    "Preserve exact reusable artifact handles -- file_id values, "
+                    "file: references, markdown links, URLs, paths, output_path, "
+                    "image_path, video_path, artifact filenames, any other "
+                    "path-like field -- never a descriptive filename instead. "
+                    "Preserve, character for character, the values a tool result "
+                    "returned for the records the request points at: their names, "
+                    "the people, organizations or teams they belong to, their "
+                    "identifiers and reference codes, their statuses, dates, "
+                    "counts and totals. Copy such a value or omit it; never "
+                    "paraphrase, substitute, or invent one to complete a pattern. "
+                    "Dropping a raw payload does not license dropping these "
+                    "values; they are not the bulk that instruction covers. "
+                    "Never copy, in whole or in part, a credential, token, key, "
+                    "password, or other authentication material, or personal "
+                    "information the request does not point at; note only that "
+                    "such a value was present and was omitted. If a value is both "
+                    "an identifier or handle the request points at and "
+                    "authentication material, the exclusion wins: omit it. If "
+                    "your budget cannot hold all of this, keep, in this order: "
+                    "first state what is missing and not listed here, with "
+                    "counts; artifact handles; the identifiers and names the "
+                    "request points at; statuses and dates; then the rest. "
+                    "Separate completed work from remaining work. Write no "
+                    "instruction to the next call about tool use or whether to "
+                    "answer: that decision is not yours and its tools are "
+                    "unknown to you. Report only what happened and what is "
+                    "missing: never call a dataset complete, fully retrieved, or "
+                    "fully processed unless the history shows every item was "
+                    "returned and every one is still described here; say which "
+                    "parts survive as prose only. Preserve the "
+                    "language of user-facing requests and constraints; keep "
+                    "multilingual details in their original language. Return only "
+                    "the compact summary."
                 ),
             },
             {
@@ -1528,8 +1555,9 @@ class ExecutionContext:
                     "Conversation history to compact:\n"
                     f"{transcript}\n\n"
                     "Write a concise but complete continuity summary for the next "
-                    "LLM call. The next LLM call should be able to continue without "
-                    "redoing completed tool calls."
+                    "LLM call. Record which tool calls already completed and what "
+                    "they returned, so the next call can judge for itself what "
+                    "still needs doing."
                 ),
             },
         ]

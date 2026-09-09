@@ -26,7 +26,7 @@ from ...context.skill_tool import (
     build_load_skill_tool,
 )
 from ...frame import ExecutionFrame, ExecutionSnapshot, ExecutionStatus
-from ...grounding import grounding_rule
+from ...grounding import VALUE_KINDS, grounding_rule
 from ...language import (
     final_answer_language_rule,
     reset_metadata_output_language,
@@ -184,6 +184,20 @@ class _AutoChildRuntime:
     @property
     def active_turn_id(self) -> str | None:
         return self.parent.active_turn_id
+
+    def _dag_turn_id(self, context: Any) -> str | None:
+        """Forward the parent's turn resolution for nested DAG steps.
+
+        ``_DAGStepRuntime.active_turn_id`` resolves per access by calling
+        ``parent._dag_turn_id(root_context)``, and under ``auto`` the DAG's
+        parent is this adapter rather than ``PatternRuntime``. Without this
+        forward that call raises ``AttributeError``, which the caller's
+        ``getattr(runtime, "active_turn_id", None)`` silently turns into an
+        unstamped tool call -- costing every auto->DAG step both its trace
+        turn attribution and the same-turn duplicate-write guard, which
+        only fires for calls carrying a turn_id.
+        """
+        return self.parent._dag_turn_id(context)
 
     async def should_interrupt(self) -> bool:
         return await self.parent.should_interrupt()
@@ -1288,9 +1302,10 @@ class AutoPattern(AgentPattern):
             "answer field in the same tool call. Put action before answer in the "
             "tool arguments. "
             f"When writing that answer field: {grounding_rule(can_call_tools=False)} "
-            "If the answer would need such unsupported specifics, set "
-            "existing_context_sufficient=false and choose react so the agent can "
-            "verify them with tools.\n\n"
+            "If the answer would need any value the rule above forbids you to "
+            f"supply -- {VALUE_KINDS} -- that no source here supports, set "
+            "existing_context_sufficient=false and choose react, so the agent "
+            "can obtain it with tools.\n\n"
             f"{final_deliverable_file_reference_instructions(can_lookup=False)}\n\n"
             "You must classify whether "
             "the latest request requires current or external facts, and whether "

@@ -26,6 +26,7 @@ from xagent.web.services.trace_event_staging import (
     CHECKPOINT_ROW_RUN_PARTITION,
     CHECKPOINT_ROW_TASK_OWNERSHIP,
     failed_checkpoint_row_conditions,
+    is_mismatched_run_partition_only,
     is_missing_run_partition_only,
 )
 
@@ -200,6 +201,33 @@ def test_explicit_json_null_run_field_reads_as_absent() -> None:
     failed = _failed(_row(), data)
     assert failed == {CHECKPOINT_ROW_RUN_PARTITION}
     assert is_missing_run_partition_only(failed, data) is True
+
+
+def test_only_run_partition_mismatched_is_true_for_the_wrong_value_shape() -> None:
+    data = _data(**{TASK_RUN_ID_TRACE_FIELD: "run-b"})
+    failed = _failed(_row(), data)
+    assert is_mismatched_run_partition_only(failed, data) is True
+
+
+def test_only_run_partition_mismatched_is_false_when_the_field_is_absent() -> None:
+    """The two predicates are mutually exclusive: a row whose run field is
+    absent (rather than merely wrong) answers the "missing" predicate, not
+    this one -- pinned in the same cell so the split cannot drift."""
+
+    data = _data()
+    del data[TASK_RUN_ID_TRACE_FIELD]
+    failed = _failed(_row(), data)
+    assert is_mismatched_run_partition_only(failed, data) is False
+    assert is_missing_run_partition_only(failed, data) is True
+
+
+def test_only_run_partition_mismatched_is_false_when_something_else_also_fails() -> (
+    None
+):
+    row = _row(task_id=_TASK_ID + 1)
+    data = _data(**{TASK_RUN_ID_TRACE_FIELD: "run-b"})
+    failed = _failed(row, data)
+    assert is_mismatched_run_partition_only(failed, data) is False
 
 
 _SHARED_PREDICATE = "failed_checkpoint_row_conditions"

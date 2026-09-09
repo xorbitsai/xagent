@@ -31,10 +31,11 @@ from xagent.web.tools.config import (
 )
 
 
-def test_token_request_refresh_defaults_to_none():
+def test_token_request_refresh_and_auth_type_default_to_none():
     request = TokenRequest(provider="google", user_id=1)
 
     assert request.refresh is None
+    assert request.auth_type is None
 
 
 def test_resolver_contract_repr_hides_token_and_generation():
@@ -288,7 +289,7 @@ def _assert_unavailable_mcp_config(
         assert "failure_code" not in config["config"]
     expected_user_id = str(server.user_mcpservers[0].user_id)
     assert config["user_id"] == expected_user_id
-    assert config["allow_users"] == [expected_user_id]
+    assert "allow_users" not in config
     assert "runtime_input_schema" not in config
     assert "runtime_bindings" not in config
     assert "allow_delegated_authorization" not in config
@@ -426,10 +427,12 @@ async def test_hook_request_receives_provider_resource_and_scope_verbatim(db_ses
     scope = object()
     resource = "https://MCP.EXAMPLE.com:443/mcp/%7Euser/?Q=1#Fragment"
     _add_oauth_server(db, user, launch_config=_launch_config(resource=resource))
-    seen: list[tuple[str, str | None, object | None]] = []
+    seen: list[tuple[str, str | None, object | None, str | None]] = []
 
     async def resolver(request: TokenRequest) -> ResolvedToken | None:
-        seen.append((request.provider, request.resource, request.scope))
+        seen.append(
+            (request.provider, request.resource, request.scope, request.auth_type)
+        )
         if request.provider == "resolver-google-drive":
             return ResolvedToken(
                 access_token="hook-token",
@@ -443,9 +446,13 @@ async def test_hook_request_receives_provider_resource_and_scope_verbatim(db_ses
         db, user, execution_scope=scope
     ).get_mcp_server_configs()
 
+    # These catalog OAuth apps have no `auth` object of their own; the
+    # transport ("oauth") itself implies OAuth, so the request always
+    # reports the fixed "builtin_oauth" auth_type rather than something
+    # derived from a per-connector auth config.
     assert seen == [
-        ("google", resource, scope),
-        ("resolver-google-drive", resource, scope),
+        ("google", resource, scope, "builtin_oauth"),
+        ("resolver-google-drive", resource, scope, "builtin_oauth"),
     ]
     assert _access_token_env(configs[0]) == "hook-token"
 
@@ -1888,6 +1895,7 @@ async def test_hook_preserves_valid_generation_during_normalization(
     resolved = await _tool_config(db, user)._resolve_oauth_token_from_hook(
         providers=["google"],
         resource=None,
+        auth_type=None,
     )
 
     assert resolved is not None
@@ -1963,6 +1971,7 @@ async def test_hook_is_skipped_when_user_id_is_none(db_session):
     resolved = await cfg._resolve_oauth_token_from_hook(
         providers=["google"],
         resource=None,
+        auth_type=None,
     )
 
     assert resolved is None
@@ -2339,16 +2348,29 @@ async def test_remote_hook_near_expiry_token_is_used_but_not_cached(db_session):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("auth", "expected_auth_type"),
+    [
+        (
+            {"type": "mcp_oauth", "resource": "https://auth.example/resource"},
+            "mcp_oauth",
+        ),
+        (None, "none"),
+    ],
+    ids=["mcp-oauth", "no-auth-declared"],
+)
 async def test_remote_hook_owns_connection_and_preserves_non_auth_snapshot(
     db_session,
     caplog,
+    auth,
+    expected_auth_type,
 ):
     db, user = db_session
     scope = object()
     server = _add_remote_server(
         db,
         user,
-        auth={"type": "mcp_oauth", "resource": "https://auth.example/resource"},
+        auth=auth,
         headers={"X-Static": "static", "authorization": "Bearer static-token"},
         runtime_bindings=_remote_runtime_bindings(),
         allow_delegated_authorization=True,
@@ -2387,8 +2409,16 @@ async def test_remote_hook_owns_connection_and_preserves_non_auth_snapshot(
         configs = await cfg.get_mcp_server_configs()
 
     assert [
-        (request.provider, request.resource, request.scope) for request in requests
-    ] == [("records", " https://selector.example/resource ", scope)]
+        (request.provider, request.resource, request.scope, request.auth_type)
+        for request in requests
+    ] == [
+        (
+            "records",
+            " https://selector.example/resource ",
+            scope,
+            expected_auth_type,
+        )
+    ]
     assert configs[0]["config"]["headers"] == {
         "X-Static": "static",
         "X-Runtime": "runtime",
@@ -2664,12 +2694,23 @@ async def test_remote_hook_failure_code_property_error_is_sanitized(db_session):
     assert "resolver-internal-secret" not in public_output
 
 
+@pytest.mark.parametrize(
+    ("auth", "expected_auth_type"),
+    [
+        (None, "none"),
+        ({"type": "mcp_oauth", "resource": "https://mcp.example/api"}, "mcp_oauth"),
+    ],
+    ids=["auth-none", "auth-mcp-oauth"],
+)
 @pytest.mark.asyncio
-async def test_remote_hook_consecutive_refreshes_advance_failed_generation(db_session):
+async def test_remote_hook_consecutive_refreshes_advance_failed_generation(
+    db_session, auth, expected_auth_type
+):
     db, user = db_session
     server = _add_remote_server(
         db,
         user,
+        auth=auth,
         headers={"X-Static": "static", "Authorization": "Bearer static-token"},
     )
     requests: list[TokenRequest] = []
@@ -2690,6 +2731,7 @@ async def test_remote_hook_consecutive_refreshes_advance_failed_generation(db_se
 
     assert requests[1].provider == requests[0].provider == "records"
     assert requests[1].resource == requests[0].resource == server.url
+    assert requests[1].auth_type == requests[0].auth_type == expected_auth_type
     assert requests[1].refresh == web_tools_config.OAuthRefreshContext(
         reason="invalid_token",
         resource_metadata_url=(
@@ -3090,7 +3132,7 @@ async def test_remote_hook_refresh_classification_reaches_tool_failure_trace(
             inputSchema={"type": "object", "properties": {}},
         ),
         connection=connection,
-        allow_users=configs[0]["allow_users"],
+        allow_users=None,
     )
     request = httpx.Request("POST", "https://mcp.example/api")
     response = httpx.Response(

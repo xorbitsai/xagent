@@ -566,8 +566,9 @@ class TestTaskTracker:
         engine.dispose()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("takeover", ["runner", "attempt"])
     async def test_runner_fence_rejects_same_run_takeover_at_every_db_boundary(
-        self, monkeypatch, tmp_path
+        self, monkeypatch, tmp_path, takeover
     ):
         """A stale tracker must not seed or write after runner ownership changes."""
         from xagent.web.models import database
@@ -593,6 +594,7 @@ class TestTaskTracker:
                         status=TaskStatus.RUNNING,
                         run_id="run-a",
                         runner_id="runner-a",
+                        lease_attempt_id="attempt-a",
                         input_tokens=4,
                         output_tokens=2,
                         total_tokens=6,
@@ -613,12 +615,14 @@ class TestTaskTracker:
                 update_interval_seconds=60,
                 expected_run_id="run-a",
                 expected_runner_id="runner-a",
+                expected_attempt_id="attempt-a",
             )
             final_tracker = TaskTracker(
                 task_id=124,
                 update_interval_seconds=60,
                 expected_run_id="run-a",
                 expected_runner_id="runner-a",
+                expected_attempt_id="attempt-a",
             )
             await periodic_tracker.start_tracking()
             await final_tracker.start_tracking()
@@ -627,7 +631,10 @@ class TestTaskTracker:
                 for task_id in (123, 124, 125):
                     replacement = takeover_db.get(Task, task_id)
                     assert replacement is not None
-                    replacement.runner_id = "runner-b"
+                    if takeover == "runner":
+                        replacement.runner_id = "runner-b"
+                    else:
+                        replacement.lease_attempt_id = "attempt-b"
                     replacement.input_tokens = 100
                     replacement.output_tokens = 50
                     replacement.total_tokens = 150
@@ -641,6 +648,7 @@ class TestTaskTracker:
                 task_id=125,
                 expected_run_id="run-a",
                 expected_runner_id="runner-a",
+                expected_attempt_id="attempt-a",
             )
             with pytest.raises(ValueError, match="Task 125.*not found"):
                 await seed_tracker.start_tracking()
@@ -654,7 +662,9 @@ class TestTaskTracker:
                 replacement = verify_db.get(Task, task_id)
                 assert replacement is not None
                 assert replacement.run_id == "run-a"
-                assert replacement.runner_id == "runner-b"
+                assert replacement.runner_id == (
+                    "runner-b" if takeover == "runner" else "runner-a"
+                )
                 assert replacement.input_tokens == 100
                 assert replacement.output_tokens == 50
                 assert replacement.total_tokens == 150
@@ -734,6 +744,7 @@ class TestTaskTracker:
                     status=TaskStatus.RUNNING,
                     run_id="run-a",
                     runner_id="runner-a",
+                    lease_attempt_id="attempt-a",
                     input_tokens=4,
                     output_tokens=2,
                     total_tokens=6,
@@ -761,6 +772,7 @@ class TestTaskTracker:
                 update_interval_seconds=60,
                 expected_run_id="run-a",
                 expected_runner_id="runner-a",
+                expected_attempt_id="attempt-a",
             )
             await tracker.start_tracking()
             add_token_usage(input_tokens=16, output_tokens=8)

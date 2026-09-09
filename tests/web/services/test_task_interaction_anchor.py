@@ -245,8 +245,12 @@ def test_ta2_dangling_pointer_is_absence_and_counted(
 
 
 # ---------------------------------------------------------------------------
-# The row exists but fails one of six self-consistency conditions ->
-# corrupt. Six parametrized cells, one broken condition each.
+# The row exists but fails one of the self-consistency conditions -> corrupt.
+# Five parametrized cells, one broken condition each. A run-partition break
+# is not one of these cells: a row whose run field names the wrong run has
+# its own cell below (test_ta13), separate from a row whose run field is
+# absent entirely (test_legacy_type_row_without_run_partition_field_...
+# and test_current_type_row_without_run_partition_field_..., further down).
 # ---------------------------------------------------------------------------
 
 _CONDITION_BREAKS: dict[str, dict[str, Any]] = {
@@ -254,7 +258,6 @@ _CONDITION_BREAKS: dict[str, dict[str, Any]] = {
     "event_type": {"event_type": "system_update_partial"},
     "build_partition": {"build_id": "build-x"},
     "checkpoint_type": {"checkpoint_type": "not_a_checkpoint_type"},
-    "run_partition": {"run_partition": "run-b"},
     "execution_identity": {"execution_id": "execution-mismatch"},
 }
 
@@ -289,11 +292,126 @@ def test_ta3_corrupt_conditions(
     assert ir.counters_snapshot() == {}
     # Step 4's judgment-table entry is a logger.error call -- same rationale
     # as the dangling-pointer case's warning pin above, applied uniformly
-    # across all six parametrized conditions since they all fall through
+    # across all five parametrized conditions since they all fall through
     # the same log call site.
     errors = [r for r in caplog.records if r.levelno == logging.ERROR]
     assert len(errors) == 1, caplog.records
     assert errors[0].msg == "task %s's checkpoint pointer %s failed anchor validation"
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# A row whose only failed condition is the run-partition match, but whose
+# run field names a different run than the task's own, reports its own
+# reason rather than the generic corrupt one used above -- the direct
+# reason resolve_interaction_anchor's write direction keeps for this shape
+# instead of adopting the read direction's retryable re-probe. The outcome
+# is still "no anchor, nothing published this round", three-way mutually
+# exclusive with the missing-field shape (which reclassifies as absence,
+# tested separately below) and the generic corrupt shape (tested above).
+# ---------------------------------------------------------------------------
+
+
+def test_ta13_run_tag_present_but_mismatched_reports_its_own_reason(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(
+        logging.ERROR, logger="xagent.web.services.task_interaction_anchor"
+    )
+    engine = _engine(tmp_path)
+    db = _session_factory(engine)()
+    task, _row = _build_scenario(db, run_partition="run-b")
+
+    result = resolve_interaction_anchor(db, task)
+
+    assert result is None
+    assert ops_signals.INTERACTION_ANCHOR_CORRUPT in ops_signals.active_degradations()
+    # Same signal name as the generic corrupt cells above -- reused, not a
+    # new one -- and still no counter for this outcome.
+    assert ir.counters_snapshot() == {}
+    detail = ops_signals.active_degradations()[ops_signals.INTERACTION_ANCHOR_CORRUPT]
+    assert "a different run" in detail
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1, caplog.records
+    assert errors[0].msg == (
+        "task %s's checkpoint pointer %s names a checkpoint from "
+        "another run; no interaction anchor to resolve"
+    )
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# The dedicated mismatched-run-tag reason above applies only when the run
+# partition is the *sole* failed condition. A row that also fails another
+# condition (here, ownership) still reports the generic corrupt reason --
+# the mirror-image boundary of
+# test_cross_task_row_without_run_partition_field_still_classifies_corrupt
+# below, which pins the same boundary on the missing-field side.
+# ---------------------------------------------------------------------------
+
+
+def test_ta14_any_other_failed_condition_keeps_the_generic_corrupt_reason(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(
+        logging.ERROR, logger="xagent.web.services.task_interaction_anchor"
+    )
+    engine = _engine(tmp_path)
+    db = _session_factory(engine)()
+    other = _make_task(db, run_id=None)
+    task, _row = _build_scenario(db, row_task_id=other.id, run_partition="run-b")
+
+    result = resolve_interaction_anchor(db, task)
+
+    assert result is None
+    assert ops_signals.INTERACTION_ANCHOR_CORRUPT in ops_signals.active_degradations()
+    assert ir.counters_snapshot() == {}
+    detail = ops_signals.active_degradations()[ops_signals.INTERACTION_ANCHOR_CORRUPT]
+    assert "a different run" not in detail
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1, caplog.records
+    assert errors[0].msg == "task %s's checkpoint pointer %s failed anchor validation"
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# Step 4 (the six self-consistency conditions, including the run-partition
+# match) must run before step 5 (the legacy-checkpoint-type check) even
+# when the row's only failure is the mismatched run tag, not just when it
+# is the missing-field shape -- the module docstring's ordering note
+# ("Step 4 must run before step 5") does not carve out an exception for
+# legacy-type rows on this side either. This cell is the mismatched-run-tag
+# counterpart of that ordering pin.
+# ---------------------------------------------------------------------------
+
+
+def test_ta13b_legacy_checkpoint_type_with_mismatched_run_tag_still_reports_mismatch(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(
+        logging.ERROR, logger="xagent.web.services.task_interaction_anchor"
+    )
+    engine = _engine(tmp_path)
+    db = _session_factory(engine)()
+    legacy_type = next(iter(LEGACY_CHECKPOINT_TYPES))
+    task, _row = _build_scenario(db, checkpoint_type=legacy_type, run_partition="run-b")
+
+    result = resolve_interaction_anchor(db, task)
+
+    assert result is None
+    assert ops_signals.INTERACTION_ANCHOR_CORRUPT in ops_signals.active_degradations()
+    # The legacy-type absence path (step 5) increments a counter; the
+    # mismatched-run-tag path (step 4) does not. If step 5 ran first, this
+    # would read {ir.COUNTER_ANCHOR_ABSENT_LEGACY_CHECKPOINT_TYPE: 1} instead.
+    assert ir.counters_snapshot() == {}
+    detail = ops_signals.active_degradations()[ops_signals.INTERACTION_ANCHOR_CORRUPT]
+    assert "a different run" in detail
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1, caplog.records
+    assert errors[0].msg == (
+        "task %s's checkpoint pointer %s names a checkpoint from "
+        "another run; no interaction anchor to resolve"
+    )
     db.close()
 
 
@@ -700,6 +818,11 @@ def _outcome_corrupt(db: Session) -> Task:
     return task
 
 
+def _outcome_run_tag_mismatch(db: Session) -> Task:
+    task, _row = _build_scenario(db, run_partition="run-b")
+    return task
+
+
 def _outcome_missing_partition_legacy_type(db: Session) -> Task:
     legacy_type = next(iter(LEGACY_CHECKPOINT_TYPES))
     task, _row = _build_scenario(db, checkpoint_type=legacy_type, run_partition=None)
@@ -734,6 +857,7 @@ _OUTCOME_CELLS: dict[str, tuple[Any, dict[str, int]]] = {
         {ir.COUNTER_ANCHOR_UNAVAILABLE_DANGLING_POINTER: 1},
     ),
     "step4_corrupt": (_outcome_corrupt, {}),
+    "step4d_run_tag_mismatch": (_outcome_run_tag_mismatch, {}),
     "step4b_missing_partition_legacy_type": (
         _outcome_missing_partition_legacy_type,
         {ir.COUNTER_ANCHOR_ABSENT_LEGACY_CHECKPOINT_TYPE: 1},
@@ -759,7 +883,7 @@ def test_ta12_outcome_counter_matrix(tmp_path: Path, outcome: str) -> None:
 
     resolve_interaction_anchor(db, task)
 
-    if outcome == "step4_corrupt":
+    if outcome in {"step4_corrupt", "step4d_run_tag_mismatch"}:
         assert ops_signals.INTERACTION_ANCHOR_CORRUPT in (
             ops_signals.active_degradations()
         )
@@ -797,10 +921,14 @@ def _anchor_production_uses(source: str) -> bool:
 
 
 def test_ta11_resolve_interaction_anchor_has_zero_production_callers() -> None:
-    """This is a fresh assertion, not an extension of
-    ``test_interaction_staging_production_gate.py``'s gate: that gate scans
-    only for ``stage_interaction_request`` and ``interaction_handoff`` by
-    name (``GATED_NAMES``), and this function is not one of them.
+    """This is a fresh assertion, not an extension of an existing
+    ``GATED_NAMES``-style production-caller gate: both
+    ``test_task_interaction_service_create_gate.py`` and
+    ``test_clarification_publication_gate.py`` scan for their own
+    module's names only (``create``/``respond`` on
+    ``task_interaction_service``, and the clarification-draft
+    primitives, respectively), and ``resolve_interaction_anchor`` is not
+    one of them.
 
     The zero here is scoped to this module's introduction, not a permanent
     invariant to preserve by construction: the change that wires the first

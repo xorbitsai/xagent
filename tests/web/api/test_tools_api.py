@@ -7,6 +7,7 @@ which lists all tools that can be used by agents.
 
 import logging
 import tempfile
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -19,7 +20,9 @@ from xagent.core.tools.adapters.vibe.config import (
 from xagent.web.api.auth import auth_router
 from xagent.web.api.tools import _create_tool_info, tools_router
 from xagent.web.models.database import Base, get_db, get_engine, init_db
-from xagent.web.models.tool_config import ToolConfig, ToolUsage
+from xagent.web.models.task import Task, TraceEvent
+from xagent.web.models.tool_config import ToolConfig
+from xagent.web.models.user import User
 
 
 def override_get_db():
@@ -243,6 +246,10 @@ class _AvailableToolsRouteHarness:
             def query(self, model: object) -> Query:
                 return Query(model)
 
+        monkeypatch.setattr(
+            "xagent.web.api.tools._tool_usage_query", lambda _db: Query("tool_usage")
+        )
+
         class SandboxManager:
             async def get_or_create_lease_provider(
                 self, _scope: str, _user_id: str
@@ -334,7 +341,7 @@ async def test_available_tools_cleanup_failure_follows_complete_route_body(
         "sound_effect",
         "music",
         "response_shape",
-        ToolUsage.__name__,
+        "tool_usage",
         ToolConfig.__name__,
         "user_overrides",
         "close",
@@ -563,6 +570,32 @@ class TestToolsAvailableAPI:
 
         data = response.json()
         tools = data["tools"]
+
+        counted_tool = tools[0]["name"]
+        with next(get_db()) as db:
+            user = db.query(User).filter(User.username == "admin").one()
+            task = Task(user_id=user.id, title="Tool usage")
+            db.add(task)
+            db.flush()
+            db.add(
+                TraceEvent(
+                    task_id=task.id,
+                    event_id="tool-usage-list-event",
+                    event_type="tool_execution_end",
+                    timestamp=datetime.now(timezone.utc),
+                    data={"tool_name": counted_tool, "success": True},
+                )
+            )
+            db.commit()
+        response = client.get(
+            "/api/tools/available", headers={"Authorization": f"Bearer {token}"}
+        )
+        assert response.status_code == 200
+        tools = response.json()["tools"]
+        assert (
+            next(tool for tool in tools if tool["name"] == counted_tool)["usage_count"]
+            == 1
+        )
 
         # Each tool should have usage_count field
         for tool in tools:

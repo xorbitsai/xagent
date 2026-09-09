@@ -8,14 +8,16 @@ from typing import Any, cast
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy.orm import Session
+from sqlalchemy import case, func
+from sqlalchemy.orm import Query, Session
 
 from ...config import get_uploads_dir
 from ...core.tools.adapters.vibe.config import run_with_tool_runtime_cleanup
 from ..auth_dependencies import get_current_user
 from ..init_tool_configs import get_default_tool_configs
 from ..models.database import get_db
-from ..models.tool_config import ToolConfig, ToolUsage
+from ..models.task import TraceEvent
+from ..models.tool_config import ToolConfig
 from ..models.user import User
 from ..services.tool_credentials import (
     TOOL_CREDENTIAL_SPECS,
@@ -30,6 +32,24 @@ from ..services.tool_credentials import (
 from ..tools.config import WebToolConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _tool_usage_query(db: Session) -> Query[Any]:
+    """Count persisted completion events, shared by the list and usage endpoints."""
+    tool_name = TraceEvent.data["tool_name"].as_string()
+    query: Query[Any] = (
+        db.query(
+            tool_name.label("tool_name"),
+            func.count(TraceEvent.id).label("usage_count"),
+        )
+        .filter(
+            TraceEvent.event_type == "tool_execution_end",
+            tool_name.isnot(None),
+            tool_name != "",
+        )
+        .group_by(tool_name)
+    )
+    return query
 
 
 def _require_user_id(current_user: User) -> int:
@@ -394,7 +414,7 @@ async def get_available_tools(
 
         usage_map: defaultdict[str, int] = defaultdict(int)
         try:
-            usage_stats: list[Any] = db.query(ToolUsage).all()
+            usage_stats = await asyncio.to_thread(lambda: _tool_usage_query(db).all())
             for stat in usage_stats:
                 usage_map[stat.tool_name] = stat.usage_count
         except Exception as e:
@@ -647,7 +667,17 @@ async def get_tool_usage(db: Session = Depends(get_db)) -> list[dict[str, Any]]:
     try:
         # Run synchronous database queries in thread pool to avoid blocking event loop
         def _get_tool_usage_sync() -> list[dict[str, Any]]:
-            usage_stats = db.query(ToolUsage).all()
+            # Completion payloads carry a boolean; older events omit it on success.
+            success = func.coalesce(TraceEvent.data["success"].as_boolean(), True)
+            usage_stats = (
+                _tool_usage_query(db)
+                .add_columns(
+                    func.sum(case((success, 1), else_=0)).label("success_count"),
+                    func.sum(case((success, 0), else_=1)).label("error_count"),
+                    func.max(TraceEvent.timestamp).label("last_used_at"),
+                )
+                .all()
+            )
 
             result = []
             for stat in usage_stats:

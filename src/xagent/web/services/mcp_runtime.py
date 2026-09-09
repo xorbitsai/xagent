@@ -600,9 +600,46 @@ def _is_mcp_oauth_http_server(server: Any, auth_config: Any) -> bool:
     # Runtime classification of a *connected* server from its decrypted auth,
     # a different layer than the catalog auth_type (mcp_apps.classify_app_auth):
     # this also covers user-added custom HTTP servers that were never catalog
-    # entries, so it stays independent by design.
+    # entries, so it stays independent by design. Keep in sync with
+    # connector_auth_type() below: that function reports "mcp_oauth" for the
+    # same shape of ``auth`` this function treats as mcp_oauth (transport is
+    # not part of connector_auth_type's own check, since it only classifies
+    # the declared auth, not whether the transport is HTTP).
     return (
         getattr(server, "transport", None) in HTTP_MCP_TRANSPORTS
         and isinstance(auth_config, dict)
         and auth_config.get("type") == "mcp_oauth"
     )
+
+
+def connector_auth_type(server: Any) -> str | None:
+    """Return the connector's declared auth type without decrypting it.
+
+    ``"none"`` when the connector declares no authentication (``auth`` absent,
+    JSON null, an empty object, ``{"type": null}``, or an explicit
+    ``{"type": "none"}``); the declared ``type`` string otherwise; ``None``
+    when the shape is not recognisable (non-``dict`` ``auth``, or a ``type``
+    that is a non-string or the empty string). Callers must treat ``None`` as
+    unknown, not as "no credential".
+
+    ``"none"`` means only that the connector declares no ``auth`` JSON; it does
+    not mean the connector carries no credential, because static ``headers``
+    (e.g. ``Authorization``) are sent regardless and are not inspected here.
+
+    Reads the raw (encrypted-at-rest) ``auth`` JSON rather than the decrypted
+    form used by ``_is_mcp_oauth_http_server`` above: ``type`` is not one of
+    the sensitive fields encryption touches (see ``SENSITIVE_AUTH_FIELDS`` in
+    ``xagent.core.tools.core.mcp.model``), so no decryption is needed to
+    classify it.
+    """
+    auth = getattr(server, "auth", None)
+    if auth is None:
+        return "none"
+    if not isinstance(auth, dict):
+        return None
+    raw = auth.get("type")
+    if raw is None:
+        return "none"
+    if not isinstance(raw, str) or not raw:
+        return None
+    return raw

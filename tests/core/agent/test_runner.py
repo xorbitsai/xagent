@@ -315,6 +315,27 @@ def test_user_message_injection_outcome_truthiness_contract() -> None:
     assert UserMessageInjectionOutcome.POSTED_REPLAY
 
 
+def test_user_message_injection_outcome_member_set_has_not_drifted() -> None:
+    """A fourth member added here falls through the ``is
+    UserMessageInjectionOutcome.POSTED_FRESH`` guards in ``a2a.py`` and
+    ``websocket.py`` silently -- see ``task_interaction_close.py`` for what
+    that means for an interaction row left open. The three guard sites are
+    not equally exposed to it, though: the deferred WebSocket guard is
+    documented defense-in-depth there, since it can only ever re-name a row
+    an earlier attempt already retired.
+
+    Relative to ``test_user_message_injection_outcome_truthiness_contract``
+    above, this test's only unique catch is a member being added -- a
+    rename or removal already raises ``AttributeError`` there. A member's
+    value changing is the reverse case: caught there, not here.
+    """
+    assert {member.name for member in UserMessageInjectionOutcome} == {
+        "NOT_POSTED",
+        "POSTED_FRESH",
+        "POSTED_REPLAY",
+    }
+
+
 @pytest.mark.asyncio
 async def test_runner_treats_canonical_empty_checkpoint_as_authoritative() -> None:
     checkpoint_store = EmptyCanonicalCheckpointStore()

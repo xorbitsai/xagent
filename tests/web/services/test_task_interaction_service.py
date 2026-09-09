@@ -145,13 +145,18 @@ from xagent.web.models.user import User
 from xagent.web.services import task_interaction_service as svc
 from xagent.web.services.ops_signals import (
     CHECKPOINT_PK_ANCHOR_DANGLING,
+    INTERACTION_HANDOFF_DEGRADED,
     INTERACTION_READ_PAYLOAD_UNREADABLE,
     INTERACTION_READ_PROTOCOL_UNRECOGNIZED,
     active_degradations,
     clear_degradation,
 )
 from xagent.web.services.task_clarification_draft import CLARIFICATION_REQUEST_TTL
-from xagent.web.services.task_interaction_staging import InteractionAnchor
+from xagent.web.services.task_interaction_staging import (
+    InteractionAnchor,
+    InteractionAttemptMismatch,
+    InteractionOriginUnknown,
+)
 from xagent.web.services.task_lease_service import TASK_RUN_ID_TRACE_FIELD, TaskLease
 
 
@@ -181,10 +186,10 @@ def _clean_degradation_registry():
 # CreateOutcome's vocabulary guards (two pinned numbers, still plain dicts
 # in the source -- do not recompute them here):
 #
-#   - CreateOutcome reason word list: 12 words total (seam_not_wired was
+#   - CreateOutcome reason word list: 13 words total (seam_not_wired was
 #     deleted along with CreateNotWired once this seam's call body landed).
 #   - CreateOutcome pairs this function body has a code path that returns:
-#     9. Producible here means exactly that -- a code path exists in
+#     10. Producible here means exactly that -- a code path exists in
 #     create()'s own body -- not that the path is reachable from any wired
 #     production caller (see CREATE_OUTCOME_PRODUCIBLE_REASONS's own
 #     docstring for the two entries that stay in this set despite being
@@ -227,15 +232,15 @@ def test_respond_outcome_union_has_exactly_the_eight_known_variants() -> None:
     }
 
 
-def test_create_outcome_reason_word_list_has_exactly_12_words() -> None:
-    assert len(svc.CREATE_OUTCOME_REASON_WORDS) == 12
+def test_create_outcome_reason_word_list_has_exactly_13_words() -> None:
+    assert len(svc.CREATE_OUTCOME_REASON_WORDS) == 13
 
 
-def test_create_outcome_producible_pairs_are_exactly_9() -> None:
+def test_create_outcome_producible_pairs_are_exactly_10() -> None:
     total = sum(
         len(reasons) for reasons in svc.CREATE_OUTCOME_PRODUCIBLE_REASONS.values()
     )
-    assert total == 9
+    assert total == 10
 
 
 def test_create_outcome_producible_reasons_are_a_subset_of_the_full_word_list() -> None:
@@ -1522,23 +1527,29 @@ def _make_trace_event(
     db: Session,
     *,
     task_id: int,
-    run_partition: str = "run-a",
+    run_partition: str | None = "run-a",
     execution_id: str = "exec-1",
     event_type: str = str(CHECKPOINT_EVENT_TYPE),
     checkpoint_type: str = "agent_execution_checkpoint",
     build_id: str | None = None,
 ) -> int:
+    # ``run_partition=None`` omits the run-field key entirely rather than
+    # writing it as ``None`` -- the two are equivalent under
+    # ``row_data.get(TASK_RUN_ID_TRACE_FIELD)``, but an absent key is the
+    # actual shape a pre-run-partition-field checkpoint row carries.
+    data: dict[str, Any] = {
+        "checkpoint_type": checkpoint_type,
+        "execution_id": execution_id,
+    }
+    if run_partition is not None:
+        data[TASK_RUN_ID_TRACE_FIELD] = run_partition
     event = TraceEvent(
         task_id=task_id,
         event_id=f"trace-event-{task_id}",
         event_type=event_type,
         timestamp=_now(),
         build_id=build_id,
-        data={
-            TASK_RUN_ID_TRACE_FIELD: run_partition,
-            "checkpoint_type": checkpoint_type,
-            "execution_id": execution_id,
-        },
+        data=data,
     )
     db.add(event)
     db.commit()
@@ -2046,6 +2057,30 @@ def test_t3_prime_anchor_dangling_for_each_remaining_validity_condition(
         resume_event_id=resume_event_id,
     )
 
+    view = svc.materialize_compatibility_view(_db, _seeded_task)
+    assert view.tier == "unanswerable"
+    assert view.reason == "anchor_dangling"
+    assert CHECKPOINT_PK_ANCHOR_DANGLING in active_degradations()
+
+
+def test_t3_prime_anchor_dangling_when_the_trace_row_has_no_run_field(
+    _db: Session, _seeded_task: int
+) -> None:
+    """A trace row with no run field at all -- not merely a different one,
+    the shape above already covers that -- paired with the interaction
+    row's stored ``resume_run_partition``, which is non-null by construction
+    (the column is ``nullable=False`` with a ``<> ''`` CHECK). A missing
+    run field never equals a non-null stored value, so this comparison
+    always fails for this shape. This is the concrete row the write
+    direction's resolver (``resolve_interaction_anchor``,
+    ``task_interaction_anchor.py``) does not widen its own judgment to
+    accept: doing so would only stage anchors that read back
+    ``anchor_dangling`` here, not anchors this reader could resolve."""
+
+    trace_event_id = _make_trace_event(_db, task_id=_seeded_task, run_partition=None)
+    _make_active_interaction_row(
+        _db, task_id=_seeded_task, resume_trace_event_id=trace_event_id
+    )
     view = svc.materialize_compatibility_view(_db, _seeded_task)
     assert view.tier == "unanswerable"
     assert view.reason == "anchor_dangling"
@@ -5762,13 +5797,14 @@ def test_degraded_as_subclass_maps_to_the_parents_outcome(
     _db: Session, _system_call_ctx: dict[str, Any]
 ) -> None:
     """A future subclass of a mapped swallowed type must classify as its
-    parent does, not fall through to the slot_taken default.
+    parent does, not fall through to the handoff_degraded_unclassified
+    default.
     InteractionRunPartitionMismatch is the discriminating choice: its
     outcome (CreateStale) is the one the default can never produce, so an
     exact-type lookup's failure is visible in the outcome itself.
 
     Mutation: restoring `_DEGRADED_AS_OUTCOME.get(handoff.degraded_as)`
-    turns this red with CreateConflict(slot_taken)."""
+    turns this red with CreateConflict(handoff_degraded_unclassified)."""
 
     from xagent.web.services import task_interaction_staging as staging_module
     from xagent.web.services.task_interaction_staging import (
@@ -5792,6 +5828,68 @@ def test_degraded_as_subclass_maps_to_the_parents_outcome(
     assert outcome == svc.CreateStale(reason="anchor_run_mismatch")
     assert real_stage is staging_module.stage_interaction_request
     assert _db.query(TaskInteractionRequest).count() == 0
+
+
+@pytest.mark.parametrize(
+    "unmapped_exc",
+    [
+        pytest.param(InteractionOriginUnknown, id="origin_unknown"),
+        pytest.param(InteractionAttemptMismatch, id="attempt_mismatch"),
+    ],
+)
+def test_unmapped_degraded_as_maps_to_the_unclassified_outcome(
+    _db: Session,
+    _system_call_ctx: dict[str, Any],
+    unmapped_exc: type[Exception],
+) -> None:
+    """An unrecognized degradation gets its own reason word, not the
+    real-conflict one. InteractionOriginUnknown and
+    InteractionAttemptMismatch are exactly the two swallowed exceptions
+    _DEGRADED_AS_OUTCOME does not map, so both exercise the default
+    classification, which now reports handoff_degraded_unclassified rather
+    than reusing slot_taken. Both are covered because the default is the
+    only place either type's outcome is decided -- neither is reachable
+    from a wired caller (see _DEGRADED_AS_OUTCOME's own comment), so this
+    test is the only statement of what create() reports for them.
+
+    The registered degradation is asserted on top of the outcome because
+    the two pin different facts. The detail assertions pin that the
+    swallow registered its degradation signal at all and that the signal
+    names the exception type that fired: deleting register_degradation
+    from interaction_handoff's except clause leaves the outcome assertion
+    green but makes the active_degradations() lookup below raise
+    KeyError. No assertion here pins the handoff.degraded_as assignment
+    itself; test_handoff_degraded_as_is_set_directly_on_a_slot_taken_swallow
+    covers that. A patch below that silently failed to intercept is
+    caught by the outcome and row-count assertions rather than by the
+    detail: the real stage_interaction_request would succeed, taking the
+    same path as test_system_principal_creates_a_fresh_row and yielding
+    CreateCreated plus one persisted row.
+
+    Mutation: reverting the default classification's reason back to
+    `CreateConflict(reason="slot_taken")` turns this red."""
+
+    from xagent.web.services import task_interaction_staging as staging_module
+
+    ctx = _system_call_ctx
+    real_stage = staging_module.stage_interaction_request
+    forced_message = f"forced for test_unmapped_degraded_as ({unmapped_exc.__name__})"
+
+    def _raise_unmapped(*args: Any, **kwargs: Any) -> Any:
+        raise unmapped_exc(forced_message)
+
+    with mock.patch.object(
+        staging_module, "stage_interaction_request", side_effect=_raise_unmapped
+    ):
+        outcome = _system_create(_db, ctx, request_idempotency_key="sys-key-unmapped")
+
+    assert outcome == svc.CreateConflict(reason="handoff_degraded_unclassified")
+    assert real_stage is staging_module.stage_interaction_request  # patch released
+    assert _db.query(TaskInteractionRequest).count() == 0
+
+    detail = active_degradations()[INTERACTION_HANDOFF_DEGRADED]
+    assert unmapped_exc.__name__ in detail
+    assert forced_message in detail
 
 
 def test_swallowed_exception_types_are_mutually_unrelated() -> None:
@@ -5898,13 +5996,21 @@ def test_handoff_degraded_as_is_set_directly_on_a_slot_taken_swallow(
 ) -> None:
     """Unlike the outcome-level test above, this checks
     InteractionHandoff.degraded_as itself, at the staging primitive's own
-    layer -- discriminating power the outcome-level test lacks for this one
-    exception, since CreateConflict(slot_taken) is also this function's
-    fallback for an unset/unrecognized degraded_as, so an outcome-only
-    check cannot tell "correctly mapped" from "fell through to the
-    default". Deleting the `handoff.degraded_as = type(exc)` assignment in
-    interaction_handoff's except block turns this test red without
-    changing the outcome-level test's result at all."""
+    layer, pinning the `handoff.degraded_as = type(exc)` assignment
+    directly rather than through create()'s downstream mapping. Before the
+    default classification got its own reason word
+    (handoff_degraded_unclassified), CreateConflict(slot_taken) was also
+    this function's fallback for an unset/unrecognized degraded_as, so the
+    outcome alone could not tell "correctly mapped" from "fell through to
+    the default" for this one exception -- only this primitive-level check
+    could. That degeneracy is gone now that the default reports a
+    different word, so the outcome-level test above has the same
+    discriminating power for this exception today. Deleting the
+    `handoff.degraded_as = type(exc)` assignment in interaction_handoff's
+    except block turns both this test and the outcome-level test red
+    (verified; every other test that exercises a mapped swallowed
+    exception turns red too, since the same assignment backs all of
+    them)."""
 
     from xagent.web.services.task_interaction_staging import InteractionSlotTaken
 

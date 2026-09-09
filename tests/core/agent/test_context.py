@@ -21,7 +21,11 @@ from xagent.core.agent.context.enrichment import (
     _lookup_relevant_memories_with_context,
     enrich_context_with_memory,
 )
-from xagent.core.agent.context.execution import CLOCK_TIMEZONE_METADATA_KEY
+from xagent.core.agent.context.execution import (
+    CLOCK_TIMEZONE_METADATA_KEY,
+    COMPACT_DROPPED_TOOL_NOTICE_MAX_NAMES,
+)
+from xagent.core.agent.grounding import VALUE_KINDS
 from xagent.core.agent.language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
     detect_prose_script_mismatch,
@@ -1042,13 +1046,16 @@ def test_compact_truncate_preserves_tool_call_pair_boundary() -> None:
     assert ctx.messages[2].tool_call_id == "call-2"
 
 
-def test_compact_with_llm_summarizes_history_and_preserves_current_user() -> None:
-    class CompactLLM:
-        model_name = "compact-test"
+def _ctx_with_one_dropped_tool_result(user_message: str) -> ExecutionContext:
+    """Return a context holding exactly one compactable tool observation.
 
+    The threshold of 1 makes the next compaction fire, and the single
+    ``read_file`` result is the only evidence it drops, so both the summary
+    trailer and the compaction prompt can be read off the same setup.
+    """
     ctx = ExecutionContext()
     ctx.compact_config.threshold = 1
-    ctx.add_user_message("current request")
+    ctx.add_user_message(user_message)
     ctx.add_assistant_message(
         "",
         tool_calls=[
@@ -1056,6 +1063,14 @@ def test_compact_with_llm_summarizes_history_and_preserves_current_user() -> Non
         ],
     )
     ctx.add_tool_result("read_file", {"output": "x" * 200}, tool_call_id="call-1")
+    return ctx
+
+
+def test_compact_with_llm_summarizes_history_and_preserves_current_user() -> None:
+    class CompactLLM:
+        model_name = "compact-test"
+
+    ctx = _ctx_with_one_dropped_tool_result("current request")
     llm = CompactLLM()
 
     request = ctx.build_llm_compact_request_if_needed()
@@ -1068,7 +1083,9 @@ def test_compact_with_llm_summarizes_history_and_preserves_current_user() -> Non
     assert "completed work from remaining work" in prompt[0]["content"]
     prompt_text = prompt[1]["content"]
     assert "Tool read_file returned" in str(prompt_text)
-    assert "without redoing completed tool calls" in str(prompt_text)
+    assert "so the next call can judge for itself what still needs doing" in str(
+        prompt_text
+    )
 
     result = ctx.compact_with_llm_response(
         {
@@ -1090,12 +1107,178 @@ def test_compact_with_llm_summarizes_history_and_preserves_current_user() -> Non
     assert "current execution state" in ctx.messages[0].content
     assert "do not repeat completed tool calls" in ctx.messages[0].content
     assert "lost in compaction" in ctx.messages[0].content
+    # The trailer's own value-kind scope has to be the rule's, not a
+    # narrower list of its own: this is the text the next call reads when
+    # deciding whether to re-fetch a value or recall it.
+    assert (
+        f"exact statistic, quotation, or other value -- {VALUE_KINDS} --"
+        in ctx.messages[0].content
+    )
     assert "re-read or re-query the source" in ctx.messages[0].content
     assert "Only re-run tools that read" in ctx.messages[0].content
     assert "- read_file" in ctx.messages[0].content
     assert result.metadata["dropped_tool_result_count"] == 1
     assert ctx.messages[1].role == "user"
     assert ctx.messages[1].content == "current request"
+
+
+def _build_llm_compact_prompt_texts() -> tuple[str, str]:
+    ctx = _ctx_with_one_dropped_tool_result("Build a KPI report")
+    request = ctx.build_llm_compact_request_if_needed()
+    assert request is not None
+    prompt = request["messages"]
+    return prompt[0]["content"], str(prompt[1]["content"])
+
+
+def test_compact_prompt_forbids_instructing_the_next_call() -> None:
+    """The summary must not tell the next call what to do.
+
+    Both observed fabrication-incident summaries put a "do not call tools
+    again" or "output the final answer" instruction in their own Next
+    Action slot; the next call's tool set is not known to the summarizer.
+    """
+    system, user = _build_llm_compact_prompt_texts()
+
+    assert "Write no instruction to the next call" in system
+    for phrase in (
+        "name the next action needed",
+        "without redoing completed tool calls",
+        "without making additional tool calls",
+        "do not call tools",
+        "produce the final answer",
+    ):
+        assert phrase not in system
+        assert phrase not in user
+
+
+def test_compact_prompt_forbids_unearned_completeness_claims() -> None:
+    """A dataset must not be called complete unless every part still is.
+
+    The fabrication incident's second turn claimed "the complete dataset of
+    443 clients" when four of the nine fetched pages' raw payloads had
+    already been dropped by an earlier compaction; the pages were returned,
+    but were no longer described anywhere in the summary.
+    """
+    system, _ = _build_llm_compact_prompt_texts()
+
+    assert (
+        "never call a dataset complete, fully retrieved, or fully processed" in system
+    )
+    assert (
+        "unless the history shows every item was returned and every one is "
+        "still described here" in system
+    )
+    assert "say which parts survive as prose only" in system
+
+
+def test_compact_prompt_requires_verbatim_values_for_the_requested_records() -> None:
+    """Fact-carrying values for records the request points at must be copied.
+
+    The fabrication incident's second turn dropped every team name, client
+    name, and client code from its summary while still claiming the
+    underlying dataset was complete.
+    """
+    system, _ = _build_llm_compact_prompt_texts()
+
+    assert "character for character" in system
+    assert "for the records the request points at" in system
+    for kind in (
+        "their names",
+        "identifiers and reference codes",
+        "their statuses, dates, counts and totals",
+    ):
+        assert kind in system
+
+
+def test_compact_prompt_excludes_credentials_and_unrelated_personal_data() -> None:
+    """Verbatim retention must not extend to credentials or stray PII."""
+    system, _ = _build_llm_compact_prompt_texts()
+
+    assert "Never copy, in whole or in part" in system
+    for kind in ("credential", "token", "key", "password", "authentication material"):
+        assert kind in system
+    assert "personal information the request does not point at" in system
+    assert "note only that such a value was present and was omitted" in system
+
+
+def test_compact_prompt_excludes_credentials_even_when_also_an_identifier() -> None:
+    """A value that is both a requested identifier and a credential is excluded.
+
+    Verbatim retention (records the request points at) and the credential
+    exclusion can both apply to the same value, e.g. an API key listed
+    alongside a connector's identifier; the prompt must say which one wins.
+    """
+    system, _ = _build_llm_compact_prompt_texts()
+
+    assert (
+        "If a value is both an identifier or handle the request points at and "
+        "authentication material, the exclusion wins: omit it." in system
+    )
+
+
+def test_compact_prompt_forbids_inventing_values_to_complete_a_pattern() -> None:
+    """The summarizer must not pattern-complete a paginated list.
+
+    The fabrication incident's invented rows were patterned: sequential
+    reference codes, alphabetically ordered names. Prohibiting pattern
+    completion at the summarizer addresses the same failure one layer
+    earlier than the answering model.
+    """
+    system, _ = _build_llm_compact_prompt_texts()
+
+    assert "never paraphrase, substitute, or invent one to complete a pattern" in system
+
+
+def test_compact_prompt_subordinates_payload_dropping_to_value_preservation() -> None:
+    """Dropping a raw payload must not be read as licensing dropping its values.
+
+    The instruction to drop "irrelevant raw payloads" and the instruction to
+    preserve fact-carrying values sit two sentences apart; this states which
+    one governs a value the request points at.
+    """
+    system, _ = _build_llm_compact_prompt_texts()
+
+    assert "Dropping a raw payload does not license dropping these values" in system
+    assert "they are not the bulk that instruction covers" in system
+    assert "irrelevant raw payloads" in system
+
+
+def test_compact_prompt_ranks_what_to_keep_when_the_budget_is_short() -> None:
+    """When the budget is too small for everything, priority order is explicit.
+
+    At the smallest fallback budget (``COMPACT_SUMMARY_MIN_TOKENS``), a
+    silent partial summary is the same defect as the incident: a claim of
+    completeness with no signal that anything was left out.
+    """
+    system, _ = _build_llm_compact_prompt_texts()
+
+    assert "keep, in this order:" in system
+    tail = system[system.index("keep, in this order:") :]
+    order = [
+        "first state what is missing and not listed here, with counts",
+        "artifact handles",
+        "the identifiers and names the request points at",
+        "statuses and dates",
+        "then the rest",
+    ]
+    positions = [tail.index(item) for item in order]
+    assert positions == sorted(positions)
+
+
+def test_compact_prompt_does_not_grow_past_its_measured_ceiling() -> None:
+    """The prompt must not grow a sentence at a time without an explicit trade.
+
+    330 is a growth ceiling, not a derived limit: the prompt measured 327
+    words when the cap was set, and the cap sits three words above that,
+    deliberately less than one sentence, so the next sentence added here
+    hits the cap and has to drop something to fit. Nothing enforces a
+    prompt length at runtime. ``COMPACT_SUMMARY_MIN_TOKENS`` does not: it
+    bounds the summary the model writes (``_llm_compact_max_tokens`` passes
+    it as ``max_tokens``), never the length of the prompt asking for it.
+    """
+    system, _ = _build_llm_compact_prompt_texts()
+
+    assert len(system.split()) <= 330
 
 
 def test_compact_with_llm_reports_dropped_tool_results_by_name() -> None:
@@ -1130,6 +1313,10 @@ def test_compact_with_llm_reports_dropped_tool_results_by_name() -> None:
     assert "4 tool calls were dropped" in notice
     assert "- web_search x3" in notice
     assert "- read_file" in notice
+    assert (
+        f"Treat any value not literally present in that summary -- {VALUE_KINDS} --"
+        in notice
+    )
     assert "unavailable rather than recalled" in notice
     assert result.metadata["dropped_tool_result_count"] == 4
     assert result.metadata["dropped_tool_results_by_name"] == {
@@ -1296,6 +1483,47 @@ def test_compact_with_llm_caps_and_clamps_dropped_tool_names() -> None:
     assert "additional distinct tool names omitted" in notice
     assert long_name not in notice
     assert len(notice) < 4000
+    assert result.metadata["dropped_tool_result_count"] == len(tool_names)
+
+
+def test_compact_with_llm_lists_a_full_page_of_long_tool_names() -> None:
+    """The char budget has to hold the names, not just the notice prefix.
+
+    That prefix spells out the shared value-kind list, and an MCP server
+    contributes names much longer than a builtin tool's. A budget sized
+    without that headroom drops names the run actually used while the
+    per-name cap is nowhere near reached.
+    """
+    ctx = ExecutionContext()
+    ctx.compact_config.threshold = 1
+    ctx.add_user_message("Run many MCP tools")
+    tool_names = [
+        f"mcp_analytics_server_report_row_{index:02d}"
+        for index in range(COMPACT_DROPPED_TOOL_NOTICE_MAX_NAMES)
+    ]
+    # 34 is the longest name the budget fits a full page of; shorter names
+    # would still fit a budget that left no room for the prefix.
+    assert all(len(name) == 34 for name in tool_names)
+    for index, tool_name in enumerate(tool_names):
+        call_id = f"call-{index}"
+        ctx.add_assistant_message(
+            "",
+            tool_calls=[
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": tool_name},
+                }
+            ],
+        )
+        ctx.add_tool_result(tool_name, {"output": f"rows {index}"}, call_id)
+
+    result = ctx.compact_with_llm_response({"content": "Ran many MCP tools."})
+
+    notice = ctx.messages[0].content
+    for tool_name in tool_names:
+        assert f"- {tool_name}" in notice
+    assert "additional" not in notice
     assert result.metadata["dropped_tool_result_count"] == len(tool_names)
 
 

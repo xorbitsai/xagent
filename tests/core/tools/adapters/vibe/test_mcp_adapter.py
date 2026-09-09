@@ -28,6 +28,7 @@ from xagent.core.tools.adapters.vibe.mcp_adapter import (
     _compact_json,
     _exception_indicates_http_401,
     _mcp_return_value_as_string,
+    classify_non_idempotent_write,
     classify_write_hint,
     load_mcp_tools_as_agent_tools,
 )
@@ -3219,6 +3220,78 @@ def test_annotations_reach_the_common_metadata_contract():
     # The scheduler's own read-only flag is a different, local guarantee and
     # must not be moved by an untrusted remote claim.
     assert read_only.metadata.read_only is False
+
+
+def _non_idempotent_flags_from_wire(*annotations: object) -> list[bool]:
+    """Classify through the same wire path the write-hint tests use."""
+    tools = _tools_with_raw_annotations(_listing(*annotations))
+    return [
+        _build_mcp_tool_adapter("srv", SimpleNamespace(), tool).non_idempotent_write
+        for tool in tools
+    ]
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        # The #2217 incident shape: a well-annotated create tool. Additive
+        # (destructive false), explicitly non-idempotent -- must enroll.
+        (
+            {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False},
+            True,
+        ),
+        ({"idempotentHint": False}, True),
+        # Destructive with no idempotency declaration keeps enrolling.
+        ({"destructiveHint": True}, True),
+        ({"readOnlyHint": False, "destructiveHint": True}, True),
+        # An explicit idempotency promise wins over destructive: repeats are
+        # declared to have no additional effect, so there is nothing to guard.
+        ({"destructiveHint": True, "idempotentHint": True}, False),
+        ({"idempotentHint": True}, False),
+        # Read-only tools never enroll, even against a contradictory
+        # idempotency claim -- deduplication fails open on contradictions.
+        ({"readOnlyHint": True, "idempotentHint": False}, False),
+        ({"readOnlyHint": True, "destructiveHint": True}, False),
+        # Coercible non-booleans are not declarations.
+        ({"idempotentHint": "false"}, False),
+        ({"idempotentHint": 0}, False),
+        ({"destructiveHint": "true"}, False),
+        ({"destructiveHint": 1}, False),
+        # Nothing declared at all stays exempt (UNDECLARED poll loops).
+        ({"readOnlyHint": False}, False),
+        ({"idempotentHint": None, "destructiveHint": None}, False),
+        ({"title": "Echo"}, False),
+        ({}, False),
+        (None, False),
+    ],
+)
+def test_non_idempotent_write_classifies_wire_annotations(raw, expected):
+    """Enrollment needs an explicit non-idempotent-write declaration."""
+    assert _non_idempotent_flags_from_wire(raw) == [expected]
+
+
+@pytest.mark.parametrize("malformed", ["idempotent", 1, [], "false"])
+def test_non_mapping_annotations_are_not_non_idempotent(malformed):
+    assert classify_non_idempotent_write(malformed) is False
+
+
+def test_non_idempotent_write_reaches_the_common_metadata_contract():
+    """The duplicate-write guard reads this off ``metadata`` because tool
+    wrappers (e.g. the sandbox wrapper) forward only ``.metadata``."""
+    tools = _tools_with_raw_annotations(
+        _listing(
+            {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False},
+            {"destructiveHint": True, "idempotentHint": True},
+            None,
+        )
+    )
+    create_tool, idempotent_destructive, undeclared = (
+        _build_mcp_tool_adapter("srv", SimpleNamespace(), tool) for tool in tools
+    )
+
+    assert create_tool.metadata.mcp_non_idempotent_write is True
+    assert idempotent_destructive.metadata.mcp_non_idempotent_write is False
+    assert undeclared.metadata.mcp_non_idempotent_write is False
 
 
 def test_misaligned_listing_yields_no_declarations(monkeypatch):

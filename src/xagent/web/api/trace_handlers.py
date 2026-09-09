@@ -29,7 +29,6 @@ from ...web.models.database import get_db
 from ...web.models.task import Task, TaskStatus
 from ...web.models.task import TraceEvent as DatabaseTraceEvent
 from ...web.models.task_interaction import TaskInteractionRequest
-from ...web.models.tool_config import ToolUsage
 from ...web.services.interaction_rollout import (
     COUNTER_CHECKPOINT_READ_PARTITION_WIDENED,
     increment_counter,
@@ -46,6 +45,8 @@ from ...web.services.task_interaction_schema import interaction_requests_table_e
 from ...web.services.task_lease_service import (
     TASK_RUN_ID_TRACE_FIELD,
     current_task_lease,
+    lock_task_lease_no_commit,
+    task_lease_attempt_predicate,
 )
 from ...web.services.trace_event_staging import (
     checkpoint_run_partition_filter,
@@ -982,6 +983,29 @@ class DatabaseTraceHandler(BaseTraceHandler):
 
             # Serialize data to ensure JSON compatibility
             data = self._serialize_data_for_json(event.data or {})
+            lease = current_task_lease() if self.build_id is None else None
+            is_legacy_checkpoint = (
+                event_type_str == "system_update_general"
+                and isinstance(data, dict)
+                and data.get("checkpoint_type") == CHECKPOINT_TYPE
+            )
+            # Checkpoints use the conditional pointer UPDATE below: it rolls
+            # back the staged row on a fence miss and retains the established
+            # missing-task classification. Other legacy traces need a lock
+            # before their projection is staged.
+            if not is_legacy_checkpoint and lease is not None:
+                if lease.task_id != self.task_id or not lock_task_lease_no_commit(
+                    db, lease
+                ):
+                    if (
+                        db.query(Task.id).filter(Task.id == self.task_id).first()
+                        is None
+                    ):
+                        db.rollback()
+                        if not event.require_persisted:
+                            return
+                        raise RuntimeError(f"Task {self.task_id} no longer exists")
+                    raise RuntimeError("Trace event producer lost its task lease")
             if event_type_str in {
                 "tool_execution_start",
                 "tool_execution_end",
@@ -1035,6 +1059,7 @@ class DatabaseTraceHandler(BaseTraceHandler):
                         Task.id == self.task_id,
                         Task.status == TaskStatus.RUNNING,
                         Task.runner_id == checkpoint_lease.runner_id,
+                        task_lease_attempt_predicate(checkpoint_lease),
                         Task.run_id == checkpoint_lease.run_id,
                     )
                     .values(
@@ -1078,38 +1103,6 @@ class DatabaseTraceHandler(BaseTraceHandler):
                         f"Task {self.task_id} lease changed before checkpoint "
                         f"{event.id} could be persisted"
                     )
-
-            # Update tool usage statistics if this is a tool execution event
-            if event_type_str == "tool_execution_end":
-                tool_name = data.get("tool_name") if isinstance(data, dict) else None
-                if tool_name:
-                    try:
-                        tool_usage: Any = (
-                            db.query(ToolUsage)
-                            .filter(ToolUsage.tool_name == tool_name)
-                            .first()
-                        )
-                        if not tool_usage:
-                            tool_usage = ToolUsage(
-                                tool_name=tool_name,
-                                usage_count=0,
-                                success_count=0,
-                                error_count=0,
-                            )
-                            db.add(tool_usage)
-
-                        tool_usage.usage_count += 1
-                        # We assume success for tool_execution_end events as errors are typically handled separately
-                        # and react pattern emits this event on success
-                        if isinstance(data, dict) and data.get("success", True):
-                            tool_usage.success_count += 1
-                        else:
-                            tool_usage.error_count += 1
-
-                        tool_usage.last_used_at = timestamp
-                        logger.debug(f"Updated usage stats for tool {tool_name}")
-                    except Exception as e:
-                        logger.error(f"Failed to update tool usage stats: {e}")
 
             db.commit()
 

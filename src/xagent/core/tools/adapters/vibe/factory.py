@@ -963,7 +963,6 @@ class ToolFactory:
         *,
         server_name: object,
         server_id: object = None,
-        allow_users: object = None,
         reason: object = None,
         message: object = None,
         failure_code: object = None,
@@ -975,7 +974,6 @@ class ToolFactory:
         kwargs: dict[str, Any] = {
             "server_name": server_name if isinstance(server_name, str) else "",
             "server_id": server_id,
-            "allow_users": allow_users if isinstance(allow_users, list) else None,
             "failure_code": normalize_tool_failure_code(failure_code),
         }
         if isinstance(reason, str):
@@ -1008,7 +1006,6 @@ class ToolFactory:
                 cls._create_unavailable_mcp_tool(
                     server_name=failure.server_name,
                     server_id=server_id,
-                    allow_users=config.get("allow_users"),
                     reason=failure.phase.value,
                     message=mcp_load_failure_message(failure.phase),
                 )
@@ -1048,12 +1045,10 @@ class ToolFactory:
                 if isinstance(inner_config, dict) and inner_config.get("unavailable"):
                     try:
                         server_name = config.get("name")
-                        allow_users = config.get("allow_users")
                         unavailable_tools.append(
                             ToolFactory._create_unavailable_mcp_tool(
                                 server_name=server_name,
                                 server_id=inner_config.get("server_id"),
-                                allow_users=allow_users,
                                 reason=inner_config.get("reason"),
                                 message=inner_config.get("message"),
                                 failure_code=inner_config.get("failure_code"),
@@ -1087,7 +1082,6 @@ class ToolFactory:
                                 ToolFactory._create_unavailable_mcp_tool(
                                     server_name=config.get("name"),
                                     server_id=config.get("id"),
-                                    allow_users=config.get("allow_users"),
                                     reason="invalid_config",
                                     message="MCP server configuration is unavailable.",
                                 )
@@ -1099,7 +1093,6 @@ class ToolFactory:
                                 ToolFactory._create_unavailable_mcp_tool(
                                     server_name=server_name,
                                     server_id=config.get("id"),
-                                    allow_users=config.get("allow_users"),
                                     reason="invalid_config",
                                     message="MCP server configuration is unavailable.",
                                 )
@@ -1111,7 +1104,6 @@ class ToolFactory:
                                 ToolFactory._create_unavailable_mcp_tool(
                                     server_name=server_name,
                                     server_id=config.get("id"),
-                                    allow_users=config.get("allow_users"),
                                     reason="invalid_config",
                                     message="MCP server configuration is unavailable.",
                                 )
@@ -1176,7 +1168,6 @@ class ToolFactory:
                             ToolFactory._create_unavailable_mcp_tool(
                                 server_name=server_name,
                                 server_id=config.get("id"),
-                                allow_users=config.get("allow_users"),
                                 reason="loader_failed",
                                 message="MCP server tools could not be loaded.",
                             )
@@ -1262,7 +1253,6 @@ class ToolFactory:
                         cls._create_unavailable_mcp_tool(
                             server_name=getattr(server, "name", ""),
                             server_id=getattr(server, "id", None),
-                            allow_users=[str(user_id)] if user_id is not None else None,
                             reason="runtime_connection_failed",
                             message="MCP server configuration is unavailable.",
                         )
@@ -1274,7 +1264,6 @@ class ToolFactory:
                     configs_by_name[server_name] = {
                         "id": getattr(server, "id", None),
                         "name": server_name,
-                        "allow_users": [str(user_id)] if user_id is not None else None,
                     }
                     continue
                 diagnostic = build.diagnostic or {}
@@ -1287,7 +1276,6 @@ class ToolFactory:
                     cls._create_unavailable_mcp_tool(
                         server_name=getattr(server, "name", ""),
                         server_id=getattr(server, "id", None),
-                        allow_users=[str(user_id)] if user_id is not None else None,
                         reason=diagnostic.get("code", "runtime_connection_unavailable"),
                         message="MCP server configuration is unavailable.",
                     )
@@ -1313,7 +1301,6 @@ class ToolFactory:
                     cls._create_unavailable_mcp_tool(
                         server_name=server_name,
                         server_id=config.get("id"),
-                        allow_users=config.get("allow_users"),
                         reason="loader_failed",
                         message="MCP server tools could not be loaded.",
                     )

@@ -601,9 +601,15 @@ class TestToolFactoryMCPIntegration:
         assert "BearerSecretError" not in str(exc_info.value)
 
     @patch("xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools")
-    async def test_create_mcp_tools_scopes_loader_failure_to_requested_user(
+    async def test_create_mcp_tools_loader_failure_reports_the_outage_to_any_caller(
         self, mock_load_mcp, test_db, sample_stdio_config, monkeypatch
     ):
+        """A loader failure must surface as an outage, not as an access denial.
+
+        The database path used to build the placeholder with an allow-list of
+        the requesting user, so a caller identity that did not match answered
+        "Access denied" instead of naming the failure.
+        """
         manager = DatabaseMCPServerManager(test_db)
         manager.add_server(manager.create_config(**sample_stdio_config))
         server = (
@@ -624,7 +630,9 @@ class TestToolFactoryMCPIntegration:
 
         monkeypatch.setenv("XAGENT_USER_ID", "2")
         result = tools[0].run_json_sync({})
-        assert "Access denied" in result["content"][0]["text"]
+        assert "Access denied" not in result["content"][0]["text"]
+        assert result["reason"] == "loader_failed"
+        assert result["error"] == "MCP server tools could not be loaded."
 
     @patch("xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools")
     async def test_create_mcp_tools_no_connections(self, mock_load_mcp, test_db):

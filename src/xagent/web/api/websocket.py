@@ -211,10 +211,13 @@ from ..services.task_lease_service import (
     acquire_task_lease_cancellation_safe,
     acquire_task_lease_no_commit,
     bind_task_lease_context,
+    lock_task_lease_no_commit,
+    registered_task_lease,
     release_task_lease_no_commit,
     run_task_lease_heartbeat,
     run_while_task_lease_owned,
     stop_task_lease_heartbeat,
+    task_lease_attempt_predicate,
 )
 from ..services.task_runtime import (
     SELECTED_FILE_IDS_AGENT_CONFIG_KEY,
@@ -1080,6 +1083,13 @@ def _persist_agent_outbound_event(task_id: int, event: Dict[str, Any]) -> None:
             parent_event_id=None,
             data=data,
         )
+        from ..services.task_lease_service import current_task_lease
+
+        lease = current_task_lease()
+        if lease is not None and (
+            lease.task_id != task_id or not lock_task_lease_no_commit(db, lease)
+        ):
+            raise TaskLeaseLostError("Outbound event producer lost its task lease")
         db.add(trace_event)
 
         if bool(data.get("expect_response")):
@@ -1104,8 +1114,10 @@ def _persist_agent_outbound_event(task_id: int, event: Dict[str, Any]) -> None:
                 )
 
         db.commit()
-    except Exception:
+    except Exception as exc:
         db.rollback()
+        if isinstance(exc, TaskLeaseLostError):
+            raise
         logger.exception(
             "Failed to persist agent outbound message for task %s", task_id
         )
@@ -2389,7 +2401,7 @@ def _task_run_id(task: Any) -> str | None:
 
 
 def _task_lease_snapshot(task: Any) -> TaskLease | None:
-    """Detach the exact active run identity needed by live-control writes."""
+    """Detach a routing key; resolve its registered holder before live writes."""
 
     task_id = getattr(task, "id", None)
     runner_id = getattr(task, "runner_id", None)
@@ -2397,10 +2409,9 @@ def _task_lease_snapshot(task: Any) -> TaskLease | None:
     if task_id is None or runner_id is None or run_id is None:
         return None
     return TaskLease(
-        # attempt_id is left at its None default on purpose: every field here
-        # comes from the task row, so reading lease_attempt_id from that same
-        # row would make any later attempt check compare a value against
-        # itself. See TaskLease's docstring in task_lease_service.py.
+        # Routing observation only. The async caller resolves this key to
+        # a registered acquisition before binding it to an execution writer.
+        attempt_id=getattr(task, "lease_attempt_id", None),
         task_id=int(task_id),
         runner_id=str(runner_id),
         run_id=str(run_id),
@@ -2482,9 +2493,11 @@ def _finalize_task_execution_result_isolated(
                 task_updated = None
                 late_result = True
             else:
+                lock_task_lease_no_commit(finalize_db, task_lease)
                 task_updated = (
                     task_query.filter(
                         Task.runner_id == task_lease.runner_id,
+                        task_lease_attempt_predicate(task_lease),
                         Task.run_id == task_lease.run_id,
                     )
                     .with_for_update()
@@ -3220,11 +3233,13 @@ def _finalize_resumed_task(
     metadata_committed = False
     cleanup_claims: tuple[SupersededObjectCleanupClaim, ...] = ()
     try:
+        lock_task_lease_no_commit(db, task_lease)
         task = (
             db.query(Task)
             .filter(
                 Task.id == task_id,
                 Task.runner_id == task_lease.runner_id,
+                task_lease_attempt_predicate(task_lease),
                 Task.run_id == task_lease.run_id,
             )
             .with_for_update()
@@ -3729,6 +3744,7 @@ async def execute_resume_background(
                 task_id=int(task_id),
                 expected_run_id=lease.run_id,
                 expected_runner_id=lease.runner_id,
+                expected_attempt_id=lease.attempt_id,
             )
             await resume_tracker.start_tracking()
             agent_service.set_interrupt_checker(
@@ -6615,7 +6631,9 @@ async def _handle_chat_message_unserialized(
             task_status = routing.status
             task_run_id = routing.run_id
             live_task_lease = (
-                routing.task_lease if task_status == TaskStatus.RUNNING else None
+                registered_task_lease(routing.task_lease)
+                if task_status == TaskStatus.RUNNING
+                else None
             )
             agent_service = None
             supports_live_control = False

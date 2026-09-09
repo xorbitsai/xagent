@@ -16,6 +16,8 @@ from typing import Any, Dict, List, Optional
 
 import pytest
 
+from xagent.core.tools.core.RAG_tools.core.exceptions import VersionManagementError
+from xagent.core.tools.core.RAG_tools.core.schemas import StepType
 from xagent.core.tools.core.RAG_tools.kb.collection_handle import (
     LanceDBCollectionHandle,
 )
@@ -594,6 +596,9 @@ class _FakeVectorIndexStoreWithCleanup(_FakeVectorIndexStore):
             "scope": scope,
             "is_admin": is_admin,
             "user_id": user_id,
+            "new_parse_hash": new_parse_hash,
+            "old_parse_hash": old_parse_hash,
+            "model_tag": model_tag,
         }
         return dict(self.cleanup_return)
 
@@ -700,6 +705,69 @@ class TestCleanupCascadeHandle:
         )
         assert fake_vis.last_cleanup_args is not None
         assert fake_vis.last_cleanup_args["scope"] == "chunk"
+
+    # ── _call_cleanup_cascade_for_step: the step_type → scope mapping ─────────
+    # Nothing executed this helper before: promote_version_main's own tests
+    # patch it out, and the cleanup_*_cascade tests above go in one level down.
+
+    @pytest.mark.parametrize(
+        ("step_type", "expected_scope"),
+        [(StepType.PARSE, "parse"), (StepType.CHUNK, "chunk")],
+    )
+    def test_cascade_for_step_maps_step_type_to_scope(
+        self, step_type: StepType, expected_scope: str
+    ) -> None:
+        """parse/chunk steps route to their scope and carry both hashes."""
+        handle, fake_vis = make_handle_with_cleanup_store("step_scope_coll")
+
+        handle._call_cleanup_cascade_for_step(
+            "doc1",
+            step_type,
+            technical_id="newhash",
+            old_technical_id="oldhash",
+            preview_only=True,
+        )
+
+        assert fake_vis.last_cleanup_args is not None
+        assert fake_vis.last_cleanup_args["scope"] == expected_scope
+        assert fake_vis.last_cleanup_args["new_parse_hash"] == "newhash"
+        assert fake_vis.last_cleanup_args["old_parse_hash"] == "oldhash"
+
+    def test_cascade_for_step_embed_passes_model_tag(self) -> None:
+        """The embed step routes to the embeddings scope and forwards model_tag."""
+        handle, fake_vis = make_handle_with_cleanup_store("step_embed_coll")
+
+        handle._call_cleanup_cascade_for_step(
+            "doc1",
+            StepType.EMBED,
+            technical_id="embed-hash",
+            model_tag="bge_large",
+            preview_only=True,
+        )
+
+        assert fake_vis.last_cleanup_args is not None
+        assert fake_vis.last_cleanup_args["scope"] == "embeddings"
+        assert fake_vis.last_cleanup_args["model_tag"] == "bge_large"
+
+    def test_cascade_for_step_embed_without_model_tag_raises(self) -> None:
+        """Embed cleanup cannot pick a table without a model tag."""
+        handle, fake_vis = make_handle_with_cleanup_store("step_embed_bad_coll")
+
+        with pytest.raises(VersionManagementError, match="model_tag is required"):
+            handle._call_cleanup_cascade_for_step(
+                "doc1", StepType.EMBED, technical_id="embed-hash"
+            )
+
+        assert fake_vis.last_cleanup_args is None, "no cleanup may be attempted"
+
+    def test_cascade_for_step_rejects_unknown_step_type(self) -> None:
+        """An unmapped step_type is refused, and names itself in the error."""
+        handle, fake_vis = make_handle_with_cleanup_store("step_bad_coll")
+
+        with pytest.raises(VersionManagementError, match="Invalid step_type: bogus"):
+            handle._call_cleanup_cascade_for_step("doc1", "bogus", technical_id="hash")
+
+        assert fake_vis.last_cleanup_args is None, "no cleanup may be attempted"
 
 
 # ── Task 6: promote_version_main handle tests ─────────────────────────────────

@@ -57,7 +57,11 @@ INTERACTION_RUN_PARTITION_MISMATCH_DEGRADED = (
 # identity checks that make it a valid anchor -- with one shape excluded: a
 # row that fails only the partition check, and only because the field is
 # absent, is a pre-existing row rather than a corrupt one and increments a
-# counter instead (see that resolver's own judgment table). Deliberately not
+# counter instead (see that resolver's own judgment table). A second shape
+# narrows the reason without excluding it: a row that fails only the
+# partition check because the field names a different run still registers
+# this same signal, carrying its own detail string distinct from the
+# generic corrupt one (also in that judgment table). Deliberately not
 # paired with a clear site, the same reasoning as INTERACTION_ROLLOUT_UNKNOWN_TASK_SOURCE
 # above: a corrupt anchor is a property of a persisted trace_events row, and
 # no in-process registry can observe that row being fixed. Auto-clearing

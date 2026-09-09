@@ -181,6 +181,20 @@ def test_build_graph_recurrence_rejects_bymonthday_with_byday_on_monthly():
         )
 
 
+def test_build_graph_recurrence_rejects_bymonthday_with_byday_on_yearly():
+    """Same gap as the MONTHLY case above, for YEARLY: BYMONTH+BYMONTHDAY+
+    BYDAY together (e.g. "Nov 15th, but only if a Thursday") is valid RFC
+    5545 but has no relativeYearly/absoluteYearly equivalent - silently
+    keeping only BYMONTH+BYDAY would drop the BYMONTHDAY constraint and
+    translate it into a materially different "4th Thursday of November"
+    recurrence with no warning."""
+    with pytest.raises(ValueError, match="BYMONTHDAY and BYDAY"):
+        outlook._build_graph_recurrence(
+            "FREQ=YEARLY;BYMONTH=11;BYMONTHDAY=15;BYDAY=4TH",
+            "2026-08-15T07:00:00+08:00",
+        )
+
+
 def test_build_graph_recurrence_rejects_out_of_range_bymonthday():
     with pytest.raises(ValueError, match="BYMONTHDAY must be between 1 and 31"):
         outlook._build_graph_recurrence(
@@ -314,7 +328,7 @@ def test_build_graph_recurrence_rejects_leftover_byday_on_daily():
     connector's daily pattern has no way to honor it - it must be rejected
     rather than silently ignored, which would translate the rule into a
     materially broader "every day" recurrence with no warning."""
-    with pytest.raises(ValueError, match="unsupported recurrence pattern"):
+    with pytest.raises(ValueError, match="does not translate BYDAY"):
         outlook._build_graph_recurrence(
             "FREQ=DAILY;BYDAY=MO", "2026-08-11T07:00:00+08:00"
         )
@@ -576,6 +590,34 @@ def test_update_event_fails_loudly_when_prefer_header_get_has_no_start(monkeypat
 
     assert result["status"] == "error"
     assert "could not determine the event's start time" in result["message"]
+
+
+def test_update_event_fails_loudly_when_prefer_header_is_silently_ignored(
+    monkeypatch,
+):
+    """Graph's own documented no-Prefer-header default is exactly
+    timeZone: "UTC" - if the second GET (which asked for a specific
+    non-UTC zone via the Prefer header) still comes back as UTC, that's a
+    strong signal the header wasn't honored. Silently trusting it anyway
+    would reintroduce the exact BYDAY-from-UTC-day bug this two-GET flow
+    exists to fix - it must fail loudly instead."""
+    graph_request = Mock(
+        side_effect=[
+            {"originalStartTimeZone": "Asia/Manila"},
+            {"start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "UTC"}},
+        ]
+    )
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_update_event(
+            event_id="existing-1",
+            recurrence="FREQ=WEEKLY;COUNT=5",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "Prefer header wasn't honored" in result["message"]
 
 
 def test_update_event_rejects_invalid_recurrence_without_calling_graph(monkeypatch):

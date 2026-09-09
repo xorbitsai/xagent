@@ -414,6 +414,12 @@ def _build_graph_recurrence(
             "interval": interval,
             "dayOfMonth": day_of_month,
         }
+    elif freq == "YEARLY" and "BYMONTHDAY" in parts and "BYDAY" in parts:
+        raise ValueError(
+            "unsupported recurrence pattern: FREQ=YEARLY with both "
+            'BYMONTHDAY and BYDAY (e.g. "Nov 15th, but only if a '
+            "Thursday\") has no equivalent in Outlook's recurrence model"
+        )
     elif freq == "YEARLY" and "BYDAY" in parts:
         index, days = _parse_relative_byday(parts["BYDAY"])
         month = _int_rrule_component(parts, "BYMONTH", anchor.month, 1, 12)
@@ -766,6 +772,25 @@ def outlook_update_event(
                         "could not determine the event's start time to "
                         "validate the recurrence rule; pass start_datetime "
                         "explicitly"
+                    )
+                # Graph's own documented no-Prefer-header default is
+                # exactly `timeZone: "UTC"` - if the response still comes
+                # back as UTC despite asking for a specific non-UTC zone,
+                # that's a strong, specific signal the Prefer header above
+                # wasn't honored (rather than merely echoed back in a
+                # different-but-equivalent format), so this fails loudly
+                # instead of silently reintroducing the UTC-day bug this
+                # whole two-GET flow exists to fix.
+                if (
+                    existing_timezone == "UTC"
+                    and original_timezone.strip().upper() != "UTC"
+                ):
+                    raise ValueError(
+                        "could not re-fetch the event's start expressed in "
+                        f"its own timezone ({original_timezone!r}) - Graph "
+                        "returned it in UTC again as if the Prefer header "
+                        "wasn't honored; pass start_datetime and timezone "
+                        "explicitly to set a recurrence rule on this event"
                     )
                 effective_timezone = existing_timezone
             payload["recurrence"] = _build_graph_recurrence(

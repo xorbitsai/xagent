@@ -470,13 +470,26 @@ def google_calendar_update_events(
 
         # First get the existing event
         event = service.events().get(calendarId="primary", eventId=event_id).execute()
+        # Captured before any of the reassignments below can overwrite
+        # event["start"]/["end"] - events().update() replaces the whole
+        # resource, so wholesale-replacing "start"/"end" with a bare
+        # {"dateTime": ...} below would otherwise silently strip the
+        # event's existing timeZone (not just for the recurrence fallback
+        # further down, but for a plain reschedule with no recurrence
+        # involved at all).
+        existing_start_timezone = event.get("start", {}).get("timeZone")
+        existing_end_timezone = event.get("end", {}).get("timeZone")
 
         if summary:
             event["summary"] = summary
         if start_time:
             event["start"] = {"dateTime": start_time}
+            if existing_start_timezone and not timezone:
+                event["start"]["timeZone"] = existing_start_timezone
         if end_time:
             event["end"] = {"dateTime": end_time}
+            if existing_end_timezone and not timezone:
+                event["end"]["timeZone"] = existing_end_timezone
         if timezone:
             event.setdefault("start", {})["timeZone"] = timezone
             event.setdefault("end", {})["timeZone"] = timezone
@@ -500,7 +513,7 @@ def google_calendar_update_events(
             # a whole-day occurrence, unlike a timed event's recurrence,
             # which it documents timeZone as required for.
             is_all_day = "T" not in effective_start
-            effective_timezone = timezone or event.get("start", {}).get("timeZone")
+            effective_timezone = timezone or existing_start_timezone
             if not is_all_day and not effective_timezone:
                 raise ValueError(
                     "timezone is required to set a recurrence rule on this "

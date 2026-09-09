@@ -235,6 +235,98 @@ def test_update_events_reuses_the_existing_events_own_timezone(monkeypatch):
     assert result["status"] == "success"
     _, kwargs = service.events.return_value.update.call_args
     assert kwargs["body"]["start"]["timeZone"] == "Asia/Manila"
+    assert kwargs["body"]["end"]["timeZone"] == "Asia/Manila"
+
+
+def test_update_events_reuses_existing_timezone_even_when_moving_the_event(
+    monkeypatch,
+):
+    """Regression test: passing start_time (to move the event) together
+    with recurrence, but no explicit timezone, must still fall back to the
+    event's own existing timeZone - not be treated as if the event has
+    none just because start_time's reassignment happens to overwrite
+    event["start"] before the fallback is read."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "Asia/Manila"},
+        "end": {"dateTime": "2026-08-26T07:15:00", "timeZone": "Asia/Manila"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-08-27T07:00:00",
+            end_time="2026-08-27T07:15:00",
+            recurrence="FREQ=DAILY;UNTIL=20260911T235959Z",
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["body"]["start"]["timeZone"] == "Asia/Manila"
+    assert kwargs["body"]["end"]["timeZone"] == "Asia/Manila"
+
+
+def test_update_events_preserves_existing_timezone_on_a_plain_reschedule(monkeypatch):
+    """Regression test: events().update() replaces the whole resource, so
+    rescheduling (start_time/end_time) without recurrence and without
+    re-passing timezone must not silently strip the event's existing
+    timeZone from Google's stored event - even though no recurrence logic
+    is involved in this call at all."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "Asia/Manila"},
+        "end": {"dateTime": "2026-08-26T07:15:00", "timeZone": "Asia/Manila"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-08-27T07:00:00",
+            end_time="2026-08-27T07:15:00",
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["body"]["start"] == {
+        "dateTime": "2026-08-27T07:00:00",
+        "timeZone": "Asia/Manila",
+    }
+    assert kwargs["body"]["end"] == {
+        "dateTime": "2026-08-27T07:15:00",
+        "timeZone": "Asia/Manila",
+    }
+
+
+def test_update_events_explicit_timezone_overrides_existing_one_on_reschedule(
+    monkeypatch,
+):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "Asia/Manila"},
+        "end": {"dateTime": "2026-08-26T07:15:00", "timeZone": "Asia/Manila"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-08-27T07:00:00",
+            end_time="2026-08-27T07:15:00",
+            timezone="America/New_York",
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["body"]["start"]["timeZone"] == "America/New_York"
+    assert kwargs["body"]["end"]["timeZone"] == "America/New_York"
 
 
 def test_update_events_preserves_existing_exdate_when_replacing_the_rrule(
@@ -346,6 +438,7 @@ def test_update_events_all_day_recurrence_with_utc_until_does_not_error(monkeypa
     _, kwargs = service.events.return_value.update.call_args
     assert kwargs["body"]["recurrence"] == ["RRULE:FREQ=DAILY;UNTIL=20260911T235959Z"]
     assert "timeZone" not in kwargs["body"]["start"]
+    assert "timeZone" not in kwargs["body"]["end"]
 
 
 def test_update_events_rejects_recurrence_when_no_start_information_exists(

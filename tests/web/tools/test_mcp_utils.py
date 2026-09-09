@@ -279,6 +279,32 @@ def test_parse_rrule_rejects_non_integer_count():
         utils.parse_rrule("FREQ=DAILY;COUNT=abc", "2026-08-26T07:00:00+08:00")
 
 
+def test_parse_rrule_rejects_signed_interval():
+    """RFC 5545 defines INTERVAL as `1*DIGIT` - plain unsigned digits only.
+    Python's int() is more permissive than that grammar (accepts a leading
+    "+"/"-"), and the raw string (not the parsed int) is what reaches
+    Google's API almost verbatim - so a value int() accepts but RFC 5545
+    doesn't must still be rejected here, not just range-checked once
+    parsed."""
+    with pytest.raises(ValueError, match="INTERVAL must be an integer"):
+        utils.parse_rrule("FREQ=DAILY;INTERVAL=+2", "2026-08-26T07:00:00+08:00")
+
+
+def test_parse_rrule_rejects_underscore_separated_count():
+    """Python's int() accepts PEP 515 "_" digit separators ("1_0" == 10),
+    which isn't valid RFC 5545 RRULE syntax and would reach Google's API as
+    literal, malformed text."""
+    with pytest.raises(ValueError, match="COUNT must be an integer"):
+        utils.parse_rrule("FREQ=DAILY;COUNT=1_0", "2026-08-26T07:00:00+08:00")
+
+
+def test_parse_rrule_accepts_interval_with_leading_zeros():
+    """Unlike a sign or underscore separator, leading zeros ARE valid under
+    RFC 5545's `1*DIGIT` grammar and must still be accepted."""
+    parts = utils.parse_rrule("FREQ=DAILY;INTERVAL=007", "2026-08-26T07:00:00+08:00")
+    assert parts["INTERVAL"] == "007"
+
+
 def test_parse_rrule_rejects_until_and_count_together():
     """RFC 5545 treats UNTIL and COUNT as mutually exclusive ways to end a
     series - dateutil's own rrulestr validation does not catch this

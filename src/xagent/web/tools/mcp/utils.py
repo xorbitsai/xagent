@@ -159,6 +159,9 @@ def ensure_rrule_prefix(rrule_text: str) -> str:
     return f"RRULE:{_strip_rrule_prefix(rrule_text).upper()}"
 
 
+_DIGITS_ONLY_RE = re.compile(r"[0-9]+")
+
+
 def parse_rrule(
     rrule_text: str,
     dtstart: str | datetime,
@@ -229,32 +232,33 @@ def parse_rrule(
             "recurrence rule must not specify both UNTIL and COUNT - RFC "
             "5545 treats these as mutually exclusive ways to end a series"
         )
-    if "INTERVAL" in parts:
-        try:
-            interval_value = int(parts["INTERVAL"])
-        except ValueError:
-            raise ValueError(
-                f"invalid recurrence rule: INTERVAL must be an integer, "
-                f"got {parts['INTERVAL']!r}"
-            ) from None
-        if interval_value < 1:
-            raise ValueError(
-                "invalid recurrence rule: INTERVAL must be a positive "
-                f"integer, got {interval_value}"
-            )
-    if "COUNT" in parts:
-        try:
-            count_value = int(parts["COUNT"])
-        except ValueError:
-            raise ValueError(
-                f"invalid recurrence rule: COUNT must be an integer, got "
-                f"{parts['COUNT']!r}"
-            ) from None
-        if count_value < 1:
-            raise ValueError(
-                "invalid recurrence rule: COUNT must be a positive integer, "
-                f"got {count_value}"
-            )
+    # RFC 5545 defines INTERVAL/COUNT as `1*DIGIT` - plain unsigned digits,
+    # nothing else. Python's int() is more permissive (a leading "+"/"-",
+    # PEP 515 "_" digit separators), and `parts` holds the ORIGINAL string,
+    # which reaches Google's API close to verbatim (only re-cased, not
+    # reconstructed from the parsed int) - so validating only the parsed
+    # value and not the string's own shape would let something like
+    # "INTERVAL=1_0" or "COUNT=+5" slip through to the live API as invalid
+    # RRULE text.
+    if "INTERVAL" in parts and not _DIGITS_ONLY_RE.fullmatch(parts["INTERVAL"]):
+        raise ValueError(
+            f"invalid recurrence rule: INTERVAL must be an integer, "
+            f"got {parts['INTERVAL']!r}"
+        )
+    if "COUNT" in parts and not _DIGITS_ONLY_RE.fullmatch(parts["COUNT"]):
+        raise ValueError(
+            f"invalid recurrence rule: COUNT must be an integer, got {parts['COUNT']!r}"
+        )
+    if "INTERVAL" in parts and int(parts["INTERVAL"]) < 1:
+        raise ValueError(
+            "invalid recurrence rule: INTERVAL must be a positive integer, "
+            f"got {int(parts['INTERVAL'])}"
+        )
+    if "COUNT" in parts and int(parts["COUNT"]) < 1:
+        raise ValueError(
+            "invalid recurrence rule: COUNT must be a positive integer, "
+            f"got {int(parts['COUNT'])}"
+        )
 
     if isinstance(dtstart, datetime):
         anchor = dtstart

@@ -1127,6 +1127,79 @@ def test_bare_meta_login_skips_facebook_but_still_connects_instagram(
     assert "Facebook Pages" not in server_names
 
 
+def test_bare_meta_login_skips_whatsapp(db_session, monkeypatch):
+    """None of WhatsApp's scopes (business_management, whatsapp_business_*)
+    is in the meta provider's default_scopes; they live solely on the app row
+    -- same situation as Facebook's pages_read_user_content -- so a bare Meta
+    login must not activate its UserMCPServer, or every WhatsApp tool call
+    would fail against an under-scoped grant while reporting "connected"
+    (APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT)."""
+    db, user = db_session
+    db.add(
+        PublicMCPApp(
+            app_id="whatsapp",
+            name="WhatsApp Business",
+            description="WhatsApp Business connector",
+            transport="oauth",
+            provider_name="meta",
+            category="Communication",
+            oauth_scopes=[
+                "business_management",
+                "whatsapp_business_management",
+                "whatsapp_business_messaging",
+            ],
+            is_visible_in_connector=True,
+            launch_config={
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.whatsapp"],
+                "env_mapping": {"META_ACCESS_TOKEN": "access_token"},
+            },
+        )
+    )
+    db.commit()
+
+    state = create_access_token(
+        data={"type": "oauth_state", "user_id": user.id, "provider": "meta"},
+        expires_delta=timedelta(minutes=10),
+    )
+    request = SimpleNamespace(query_params={"code": "code", "state": state})
+
+    post = Mock(
+        return_value=MockResponse(
+            {"access_token": "short-token", "token_type": "bearer", "expires_in": 3600}
+        )
+    )
+
+    def get(url, **kwargs):
+        if url.endswith("/oauth/access_token"):
+            return MockResponse(
+                {
+                    "access_token": "long-token",
+                    "token_type": "bearer",
+                    "expires_in": 5184000,
+                }
+            )
+        return MockResponse({"id": "meta-user-1", "email": "alice@example.com"})
+
+    monkeypatch.setattr(auth_api.requests, "post", post)
+    monkeypatch.setattr(auth_api.requests, "get", Mock(side_effect=get))
+
+    response = generic_oauth_callback("meta", request, db, _meta_provider())
+    assert response.status_code == 200
+
+    # The bare grant is still created -- neither app-scoped server is.
+    oauth_account = (
+        db.query(UserOAuth)
+        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "meta")
+        .one()
+    )
+    assert oauth_account.access_token == "long-token"
+
+    server_names = {s.name for s in db.query(MCPServer).all()}
+    assert "WhatsApp Business" not in server_names
+    assert "Facebook Pages" not in server_names
+
+
 async def test_disconnecting_facebook_preserves_shared_bare_meta_grant_for_instagram(
     db_session, monkeypatch
 ):

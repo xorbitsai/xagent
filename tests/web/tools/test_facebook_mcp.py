@@ -65,6 +65,7 @@ def test_auth_status_uses_injected_meta_token(monkeypatch):
         },
         params={"fields": "id,name,email"},
         data=None,
+        json=None,
         timeout=30,
     )
 

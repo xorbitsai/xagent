@@ -75,12 +75,16 @@ def user_token() -> str:
     return token
 
 
-def graph_headers(token: str, *, form: bool = False) -> dict[str, str]:
+def graph_headers(
+    token: str, *, form: bool = False, as_json: bool = False
+) -> dict[str, str]:
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/json",
     }
-    if form:
+    if as_json:
+        headers["Content-Type"] = "application/json"
+    elif form:
         headers["Content-Type"] = "application/x-www-form-urlencoded"
     return headers
 
@@ -99,14 +103,34 @@ def graph_request(
     token: str | None = None,
     params: dict[str, Any] | None = None,
     data: dict[str, Any] | None = None,
+    json_body: dict[str, Any] | None = None,
 ) -> Any:
+    """Issue a Graph API request and return the decoded JSON body.
+
+    ``data`` is sent form-encoded (the shape the Pages/Instagram endpoints
+    take). ``json_body`` is sent as an ``application/json`` body instead --
+    the WhatsApp Cloud API's ``/{phone_number_id}/messages`` endpoint takes
+    nested objects (``template.components``, ``text.body``) that
+    form-encoding can't express. The two are mutually exclusive. ``json=``
+    is always passed to ``requests`` (as ``None`` when unused); `requests`
+    only substitutes a JSON body ``if not data and json is not None``, so a
+    stray ``json=None`` alongside a real ``data=`` value never changes what
+    goes over the wire.
+    """
+    if data is not None and json_body is not None:
+        raise ValueError("graph_request takes either data or json_body, not both")
     request_token = token or user_token()
     response = requests.request(
         method=method,
         url=f"{GRAPH_BASE_URL}{path}",
-        headers=graph_headers(request_token, form=method.upper() != "GET"),
+        headers=graph_headers(
+            request_token,
+            form=method.upper() != "GET",
+            as_json=json_body is not None,
+        ),
         params=params,
         data=data,
+        json=json_body,
         timeout=DEFAULT_TIMEOUT_SECONDS,
     )
 

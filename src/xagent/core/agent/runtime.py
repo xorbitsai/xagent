@@ -909,7 +909,9 @@ class PatternRuntime:
                 )
             )
 
-    async def on_tool_start(self, *, tool_call: dict[str, Any]) -> None:
+    async def on_tool_start(
+        self, *, tool_call: dict[str, Any], metered: bool = True
+    ) -> None:
         # Count one billable action per tool invocation, at invocation time.
         # Deliberately NOT gated on tool success: success is derived from the
         # tool's own return value, and custom MCP tools are user-controlled, so
@@ -918,12 +920,21 @@ class PatternRuntime:
         # (the MCP/compute round + the LLM turn that chose it) regardless of
         # outcome, so the non-gameable, resource-aligned signal is "it ran".
         # Fires once per tool, including each tool in a concurrent batch.
-        try:
-            from ..model.chat.token_context import add_tool_call_usage
+        #
+        # metered=False is reserved for calls that did NOT consume an
+        # execution round: the same-turn duplicate-write guard hands the model
+        # a suppression envelope and never runs the tool, so billing it would
+        # contradict the resource-aligned rationale above. The flag is a
+        # call-site contract (the guard passes it explicitly), never a field
+        # on tool_call — a tool-controlled payload must not be able to dodge
+        # metering.
+        if metered:
+            try:
+                from ..model.chat.token_context import add_tool_call_usage
 
-            add_tool_call_usage(1)
-        except Exception:
-            logger.debug("tool-call metering failed", exc_info=True)
+                add_tool_call_usage(1)
+            except Exception:
+                logger.debug("tool-call metering failed", exc_info=True)
         data = {
             "tool_name": tool_call.get("name"),
             "tool_params": tool_call.get("args", {}),

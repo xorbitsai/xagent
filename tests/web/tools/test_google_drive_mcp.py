@@ -211,6 +211,22 @@ def test_resolve_file_id_still_matches_a_real_id_starting_with_e():
 
 
 @pytest.mark.parametrize(
+    "url",
+    [
+        # A malformed path segment must be rejected outright, not silently
+        # truncated to the leading run of valid characters -- without an
+        # end-anchor, ".../file/d/ABC.DEF/view" would capture just "ABC"
+        # (the id charset stops at the "."), acting on a wrong, truncated
+        # id instead of returning the whole URL unresolved.
+        "https://drive.google.com/file/d/ABC.DEF/view",
+        "https://drive.google.com/drive/folders/ABC.DEF",
+    ],
+)
+def test_resolve_file_id_rejects_malformed_path_segment_instead_of_truncating(url):
+    assert google_drive._resolve_file_id(url) == url
+
+
+@pytest.mark.parametrize(
     ("url", "expected"),
     [
         # A scheme-less trusted-host link whose query value itself embeds
@@ -369,10 +385,59 @@ def test_resolve_file_id_supports_usercontent_host():
             "?resourcekey=0-Rkey123",
             None,
         ),
+        # A trusted-host URL whose path isn't a recognized share-link
+        # shape at all (not even the excluded "/d/e/" one) must not have a
+        # resourcekey extracted either -- _resolve_file_id can't derive a
+        # real fileId from it, so a resourcekey extracted here would only
+        # ever be attached to a request whose fileId is the unresolved raw
+        # URL. Broader than the "/d/e/" case above: this is any
+        # unrecognized path, not just a deliberately-excluded known one.
+        ("https://drive.google.com/drive/my-drive?resourcekey=0-Rkey123", None),
+        # The legacy "?id=" query-fallback share-link shape must still
+        # extract a resourcekey normally -- the widened exclusion guard
+        # must not accidentally reject this legitimate, already-supported
+        # shape along with the unrecognized-path case above.
+        (
+            "https://drive.google.com/open?id=abc123&resourcekey=0-Rkey123",
+            "0-Rkey123",
+        ),
     ],
 )
 def test_extract_resource_key(value, expected):
     assert google_drive._extract_resource_key(value) == expected
+
+
+@pytest.mark.parametrize(
+    "malicious_file_id",
+    [
+        "evil\r\nX-Injected-Header: 1",
+        "evil\rX-Injected-Header: 1",
+        "evil\nX-Injected-Header: 1",
+    ],
+)
+def test_attach_resource_key_refuses_a_file_id_containing_crlf(malicious_file_id):
+    """Belt-and-suspenders defense: _extract_resource_key's guard should
+    make this unreachable in practice (a resourcekey is only ever
+    extracted alongside a _DRIVE_ID_CHARS-validated file_id), but this
+    function has no other way to signal "don't attach" than silently
+    skipping -- confirms it does, rather than building a header value most
+    HTTP clients (http.client raises ValueError on a raw CR/LF in a header
+    value) would reject anyway."""
+    request = Mock()
+    request.headers = {}
+
+    result = google_drive._attach_resource_key(request, malicious_file_id, "0-Rkey123")
+
+    assert result.headers == {}
+
+
+def test_attach_resource_key_attaches_normally_for_a_clean_file_id():
+    request = Mock()
+    request.headers = {}
+
+    result = google_drive._attach_resource_key(request, "abc123", "0-Rkey123")
+
+    assert result.headers == {"X-Goog-Drive-Resource-Keys": "abc123/0-Rkey123"}
 
 
 @pytest.mark.parametrize("bad_role", ["owner", "organizer", ""])
@@ -1460,6 +1525,47 @@ def test_share_file_grants_role_to_email(monkeypatch):
     assert kwargs["sendNotificationEmail"] is True
     assert kwargs["emailMessage"] == "hi"
     assert kwargs["supportsAllDrives"] is True
+
+
+def test_share_file_grants_role_to_group(monkeypatch):
+    service = _mock_drive_service(monkeypatch)
+    service.permissions.return_value.create.return_value.execute.return_value = {
+        "id": "perm1",
+        "type": "group",
+        "role": "reader",
+        "emailAddress": "team@x.com",
+    }
+
+    result = json.loads(
+        google_drive.google_drive_share_file(
+            "fid", "team@x.com", role="reader", entity_type="group"
+        )
+    )
+
+    assert result["status"] == "success"
+    kwargs = service.permissions.return_value.create.call_args.kwargs
+    assert kwargs["body"] == {
+        "type": "group",
+        "role": "reader",
+        "emailAddress": "team@x.com",
+    }
+
+
+@pytest.mark.parametrize("bad_entity_type", ["domain", "anyone", ""])
+def test_share_file_rejects_entity_type_outside_user_or_group(
+    monkeypatch, bad_entity_type
+):
+    service = _mock_drive_service(monkeypatch)
+
+    result = json.loads(
+        google_drive.google_drive_share_file(
+            "fid", "a@x.com", entity_type=bad_entity_type
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "entity_type" in result["message"]
+    service.permissions.return_value.create.assert_not_called()
 
 
 def test_share_file_attaches_resource_key_header(monkeypatch):

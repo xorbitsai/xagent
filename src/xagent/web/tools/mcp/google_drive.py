@@ -61,9 +61,14 @@ _DRIVE_PATH_ALTERNATION = "|".join(_DRIVE_PATH_PREFIXES)
 # match rather than confidently return the wrong string ("e"). Applied only
 # to a URL's parsed .path (see _resolve_file_id) rather than searched over
 # the whole raw string, so a match can't come from an unrelated substring
-# elsewhere in the URL (e.g. a query value).
+# elsewhere in the URL (e.g. a query value). The trailing "(?=/|$)" requires
+# the captured id to run all the way to the next path separator (or the end
+# of the path) -- without it, a malformed segment like ".../file/d/ABC.DEF/
+# view" would silently capture just "ABC" (the id charset stops at the
+# "."), acting on a truncated, wrong id instead of falling through to the
+# "not a recognized shape" branch and returning the whole URL unresolved.
 _DRIVE_PATH_ID_PATTERN = re.compile(
-    rf"/(?:{_DRIVE_PATH_ALTERNATION})/(?!e/)({_DRIVE_ID_CHARS.pattern})"
+    rf"/(?:{_DRIVE_PATH_ALTERNATION})/(?!e/)({_DRIVE_ID_CHARS.pattern})(?=/|$)"
 )
 
 # Same alternation as _DRIVE_PATH_ID_PATTERN, built from the same
@@ -291,27 +296,38 @@ def _extract_resource_key(file_id: str) -> str | None:
     puts on the share link itself.
 
     Shares _parse_trusted_drive_url with _resolve_file_id rather than
-    keeping its own copy of the host/userinfo trust logic, and applies the
-    same "/d/e/" published-to-web path-shape exclusion _resolve_file_id
-    enforces (a share-link shape with no real Drive fileId in it at all --
-    _resolve_file_id refuses to resolve an id for it, so a resourcekey
-    extracted here would only ever be attached to a request whose fileId
-    is that same untrusted, unresolved raw string) -- so the two
-    functions' trust decisions for identical input can't silently diverge
-    the way they did before this was factored out. Kept as its own
-    function rather than folding into _resolve_file_id and returning a
-    tuple: _resolve_file_id's plain-string return is relied on by every
-    call site and by the full existing test suite, and widening its
-    contract for a value that's usually None (only pre-2021 link-shared
-    items carry a resourcekey at all) isn't worth that blast radius.
+    keeping its own copy of the host/userinfo trust logic, and mirrors
+    _resolve_file_id's exact three-branch decision (path-id match, then
+    shape-exclusion, then the legacy "?id=" query fallback) rather than a
+    looser approximation of it -- covering not just the published-to-web
+    "/d/e/" exclusion but any other trusted-host URL whose path isn't a
+    recognized share-link shape at all. This guarantees that whenever this
+    function returns a resourcekey, _resolve_file_id on the same input
+    took the identical branch and returned a real, _DRIVE_ID_CHARS-
+    validated fileId -- never the raw unresolved URL string -- which is
+    also what keeps _attach_resource_key's header value free of characters
+    (including a literal CR/LF) the fileId half was never validated
+    against. Kept as its own function rather than folding into
+    _resolve_file_id and returning a tuple: _resolve_file_id's plain-string
+    return is relied on by every call site and by the full existing test
+    suite, and widening its contract for a value that's usually None (only
+    pre-2021 link-shared items carry a resourcekey at all) isn't worth that
+    blast radius.
     """
     parsed = _parse_trusted_drive_url(file_id)
     if parsed is None:
         return None
-    if _DRIVE_PATH_SHAPE_PATTERN.search(
-        parsed.path
-    ) and not _DRIVE_PATH_ID_PATTERN.search(parsed.path):
-        return None
+    if not _DRIVE_PATH_ID_PATTERN.search(parsed.path):
+        if _DRIVE_PATH_SHAPE_PATTERN.search(parsed.path):
+            # Recognized-but-excluded shape (e.g. published-to-web "/d/e/")
+            # -- _resolve_file_id refuses to resolve an id for this shape
+            # at all, never falling through to the "?id=" query check
+            # either (see its own comment on that exact point), so neither
+            # should this.
+            return None
+        query_id = parse_qs(parsed.query).get("id")
+        if not (query_id and _DRIVE_ID_CHARS.fullmatch(query_id[0])):
+            return None
     resource_key = parse_qs(parsed.query).get("resourcekey")
     if not resource_key:
         return None
@@ -337,8 +353,21 @@ def _attach_resource_key(request: Any, file_id: str, resource_key: str | None) -
     google_drive_download.py's ``request.headers.update(...)`` pattern.
     Returns ``request`` so the call site can build/attach/execute in one
     expression.
+
+    ``file_id`` is expected to already be _DRIVE_ID_CHARS-clean by this
+    point -- every call site passes the result of _resolve_file_id, and
+    _extract_resource_key only ever returns a truthy ``resource_key`` when
+    _resolve_file_id would have taken the same validated-id branch on the
+    same input (see _extract_resource_key's docstring). The CR/LF check
+    here is belt-and-suspenders defense against a future call site breaking
+    that invariant, not the primary guard against it: this function has no
+    way to signal "skip the header" other than silently doing so, so a
+    literal CR/LF in ``file_id`` still reaching here would otherwise build
+    a header value most HTTP clients reject outright (http.client raises
+    ValueError on a raw CR/LF in a header value) rather than the clean,
+    actionable error this connector's own validation would give.
     """
-    if resource_key:
+    if resource_key and "\r" not in file_id and "\n" not in file_id:
         request.headers["X-Goog-Drive-Resource-Keys"] = f"{file_id}/{resource_key}"
     return request
 
@@ -673,6 +702,9 @@ def google_drive_search(query: str = "", max_results: int = 10) -> str:
     """
     Search for files in Google Drive.
     Use query parameter for Google Drive search syntax (e.g. "name contains 'meeting'").
+    The result's "truncated" field is true if the output was too large and
+    some matching files were cut to fit -- treat the "files" list as
+    possibly incomplete in that case rather than the full result set.
     """
     try:
         page_size = clamp_limit(max_results, max_limit=1000)
@@ -709,6 +741,13 @@ def google_drive_get_file_content(file_id: str, mime_type: str = "text/plain") -
     PDF, an Office format, an image, or any other binary content, use
     google_drive_download_file instead, which writes the real bytes to a
     file instead of decoding them as text.
+    The result's "encoding" field is "utf-8" for ordinary text, or "base64"
+    for the rare case where content typed as text still wasn't valid UTF-8
+    (e.g. a legacy-encoded file) -- check this before treating "content" as
+    literal text, since a base64 string decoded and displayed as-is is
+    unreadable. "truncated" is true if the output was too large and
+    "content" was cut to fit -- treat it as possibly incomplete in that
+    case rather than the full file.
     """
     try:
         if not _is_text_mime_type(mime_type):
@@ -1132,9 +1171,10 @@ def google_drive_list_permissions(file_id: str, page_token: str | None = None) -
     returned permission ids with google_drive_update_permission or
     google_drive_remove_permission.
     For an item in a Shared Drive with more collaborators than fit in one
-    response, the result includes a "next_page_token" -- pass it back as
-    this call's page_token to continue listing from where it left off
-    instead of silently missing the rest.
+    response, "truncated" is true and the result includes a
+    "next_page_token" -- pass it back as this call's page_token to
+    continue listing from where it left off instead of silently missing
+    the rest.
     A permission whose "permissionDetails" marks it "inherited": true comes
     from a parent folder, not this item directly -- it can't be changed or
     removed here; do that on the folder it's inherited from instead.
@@ -1227,26 +1267,34 @@ def google_drive_share_file(
     role: str = "reader",
     send_notification: bool = True,
     message: str | None = None,
+    entity_type: str = "user",
 ) -> str:
     """
-    Grant a user (by email) access to a Drive file or folder, making it
-    visible to someone outside this conversation. This is an external
-    action -- confirm the target file, the email, and the role with the
-    user before calling it.
+    Grant a user or Google Group (by email) access to a Drive file or
+    folder, making it visible to someone outside this conversation. This
+    is an external action -- confirm the target file, the email, the
+    role, and whether it's a user or group with the user before calling
+    it.
     role: "reader" (can view), "commenter" (can view and comment), or
     "writer" (can edit). Sharing a folder gives that access to everything
-    inside it. When send_notification is True, Google emails the person
-    being added; message is included in that email if given. If
+    inside it. entity_type: "user" (default) for an individual's email
+    address, or "group" for a Google Group's email address -- a group's
+    role semantics are otherwise identical to a user's. When
+    send_notification is True, Google emails the person or group being
+    added; message is included in that email if given. If
     send_notification is False, message is silently discarded (Google's
     API rejects a notification message when no notification is sent) --
     the response won't flag this, so don't rely on the message being
     delivered without also checking send_notification.
-    This grants access to a specific email only; it can't create "anyone
-    with the link" link-sharing. google_drive_remove_permission can still
-    revoke an existing link-shared permission if one is already present.
+    This grants access to a specific user or group only; it can't create
+    "anyone with the link" link-sharing or share with an entire domain.
+    google_drive_remove_permission can still revoke an existing
+    link-shared permission if one is already present.
     """
     try:
         _require_share_role(role)
+        if entity_type not in ("user", "group"):
+            raise ValueError('entity_type must be "user" or "group"')
         require_clean_identifier(email, "email")
         if not _EMAIL_PATTERN.match(email):
             raise ValueError("email must be a valid email address")
@@ -1258,7 +1306,7 @@ def google_drive_share_file(
         # false, so it's only included when a notification is actually going out.
         create_kwargs: dict[str, Any] = {
             "fileId": resolved_file_id,
-            "body": {"type": "user", "role": role, "emailAddress": email},
+            "body": {"type": entity_type, "role": role, "emailAddress": email},
             "sendNotificationEmail": send_notification,
             "supportsAllDrives": True,
             "fields": "id, type, role, emailAddress, displayName",

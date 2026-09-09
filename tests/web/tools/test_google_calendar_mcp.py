@@ -147,6 +147,28 @@ def test_create_events_rejects_invalid_recurrence_without_calling_the_api(
     service.events.return_value.insert.assert_not_called()
 
 
+def test_create_events_rejects_explicit_empty_recurrence(monkeypatch):
+    """Regression test: every other optional field in this function treats
+    an explicitly-passed value as meaningful; recurrence="" must not be
+    silently treated the same as not mentioning recurrence at all."""
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Standup",
+            start_time="2026-08-26T09:00:00+08:00",
+            end_time="2026-08-26T09:15:00+08:00",
+            timezone="Asia/Shanghai",
+            recurrence="",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "must not be empty" in result["message"]
+    service.events.return_value.insert.assert_not_called()
+
+
 def test_create_events_without_recurrence_has_no_recurrence_key(monkeypatch):
     service = _fake_service({"id": "created"})
     monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
@@ -386,6 +408,30 @@ def test_update_events_rejects_invalid_recurrence_without_calling_the_api(
     service.events.return_value.update.assert_not_called()
 
 
+def test_update_events_rejects_explicit_empty_recurrence(monkeypatch):
+    """Regression test: recurrence="" must not be silently treated the
+    same as not passing recurrence at all."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00+08:00"},
+        "end": {"dateTime": "2026-08-26T07:15:00+08:00"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            timezone="Asia/Shanghai",
+            recurrence="",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "must not be empty" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
 def test_update_events_derives_recurrence_start_from_all_day_events_date_field(
     monkeypatch,
 ):
@@ -430,6 +476,66 @@ def test_update_events_all_day_recurrence_with_utc_until_does_not_error(monkeypa
     result = json.loads(
         calendar.google_calendar_update_events(
             event_id="existing-1",
+            recurrence="FREQ=DAILY;UNTIL=20260911T235959Z",
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["body"]["recurrence"] == ["RRULE:FREQ=DAILY;UNTIL=20260911T235959Z"]
+    assert "timeZone" not in kwargs["body"]["start"]
+    assert "timeZone" not in kwargs["body"]["end"]
+
+
+def test_update_events_explicit_timezone_on_all_day_event_does_not_send_malformed_payload(
+    monkeypatch,
+):
+    """Confirmed bug: passing timezone while updating an all-day event
+    (with or without touching recurrence) used to unconditionally stamp
+    event["start"]/["end"] with timeZone before the all-day check, mixing
+    "date" and "timeZone" in the same object - a malformed EventDateTime.
+    timezone must still be usable to localize the UNTIL comparison for an
+    all-day event's recurrence, just never written into the payload."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"date": "2026-08-26"},
+        "end": {"date": "2026-08-27"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            timezone="Asia/Shanghai",
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["body"]["start"] == {"date": "2026-08-26"}
+    assert kwargs["body"]["end"] == {"date": "2026-08-27"}
+
+
+def test_update_events_explicit_timezone_localizes_all_day_recurrence_without_writing_it(
+    monkeypatch,
+):
+    """Same as above, but with recurrence also set: the explicit timezone
+    must still be used to correctly localize the UNTIL comparison (instead
+    of falling back to a blind UTC default), while still never being
+    written into the all-day event's date-only start/end."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"date": "2026-08-26"},
+        "end": {"date": "2026-08-27"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            timezone="Asia/Shanghai",
             recurrence="FREQ=DAILY;UNTIL=20260911T235959Z",
         )
     )

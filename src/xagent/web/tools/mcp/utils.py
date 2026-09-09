@@ -221,7 +221,18 @@ def parse_rrule(
         if "=" not in chunk:
             raise ValueError(f"invalid recurrence rule component: {chunk!r}")
         key, _, value = chunk.partition("=")
-        parts[key.strip().upper()] = value.strip()
+        key = key.strip().upper()
+        if key in parts:
+            # A duplicate key (e.g. "FREQ=DAILY;FREQ=WEEKLY") would
+            # otherwise just silently overwrite the first occurrence in
+            # `parts` for local validation, while the raw text - still
+            # containing BOTH occurrences - reaches Google's API close to
+            # verbatim, where its behavior is unspecified rather than
+            # matching whatever this function validated.
+            raise ValueError(
+                f"invalid recurrence rule: {key} is specified more than once"
+            )
+        parts[key] = value.strip()
     if "FREQ" not in parts:
         raise ValueError(
             "recurrence rule must include FREQ, e.g. "

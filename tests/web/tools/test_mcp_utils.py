@@ -161,6 +161,16 @@ def test_parse_rrule_rejects_malformed_component():
         utils.parse_rrule("FREQ=DAILY;BOGUS", "2026-08-26T07:00:00+08:00")
 
 
+def test_parse_rrule_rejects_duplicate_keys():
+    """A duplicate key (e.g. FREQ specified twice) would otherwise
+    silently keep only the last occurrence in the returned dict for local
+    validation, while the raw text - still containing BOTH occurrences -
+    reaches Google's API close to verbatim, where its behavior is
+    unspecified rather than matching whatever this function validated."""
+    with pytest.raises(ValueError, match="FREQ is specified more than once"):
+        utils.parse_rrule("FREQ=DAILY;FREQ=WEEKLY", "2026-08-26T07:00:00+08:00")
+
+
 def test_parse_rrule_rejects_unparseable_rule():
     """A syntactically plausible but semantically invalid rule (an unknown
     FREQ value) must be rejected, not silently accepted as valid RFC 5545

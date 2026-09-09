@@ -1,8 +1,9 @@
+import calendar as _stdlib_calendar
 import json
 import logging
 import os
 import re
-from datetime import date
+from datetime import date, datetime, timedelta
 from typing import Any
 from urllib.parse import quote
 
@@ -168,7 +169,7 @@ def _resolve_timezone(timezone: str) -> Any:
     raise ValueError(f"unknown timezone for recurrence rule: {timezone}")
 
 
-def _rrule_until_to_date(until: str, zone: Any) -> str:
+def _rrule_until_to_date(until: str, zone: Any, anchor: datetime) -> str:
     """Convert an RRULE UNTIL value ('20260911T235959Z' or a bare
     '20260911') into the 'YYYY-MM-DD' form Graph's recurrenceRange wants,
     expressed in `zone`.
@@ -178,14 +179,29 @@ def _rrule_until_to_date(until: str, zone: Any) -> str:
     UTC calendar date directly) matters whenever the UTC UNTIL instant
     crosses local midnight, or a valid final local occurrence would be
     silently excluded.
+
+    But Graph's `endDate` range is day-granular - Graph includes the
+    WHOLE end_date day, not a specific instant within it - while every
+    occurrence in this series actually happens at `anchor`'s own local
+    time-of-day, not UNTIL's. So whenever UNTIL's local time-of-day falls
+    EARLIER in the day than the series' own occurrence time, the
+    occurrence that would land on that same calendar day is genuinely
+    past the aware UNTIL cutoff instant, yet Graph would still include it
+    since it only ever checks the calendar date - `endDate` is backed off
+    by one day in that case so Graph actually excludes it, rather than
+    silently running the series one occurrence past what UNTIL specified.
     """
     try:
         parsed = _date_parser.isoparse(until.strip())
     except ValueError as exc:
         raise ValueError(f"invalid UNTIL value in recurrence rule: {until}") from exc
-    if parsed.tzinfo is not None:
-        parsed = parsed.astimezone(zone)
-    return parsed.date().isoformat()
+    if parsed.tzinfo is None:
+        return parsed.date().isoformat()
+    parsed = parsed.astimezone(zone)
+    end_date = parsed.date()
+    if parsed.time() < anchor.astimezone(zone).time():
+        end_date -= timedelta(days=1)
+    return end_date.isoformat()
 
 
 _WEEKDAY_INDEX_TO_GRAPH_DAY = (
@@ -258,7 +274,12 @@ def _parse_relative_byday(byday: str) -> tuple[str, list[str]]:
         if day_code not in seen_days:
             seen_days.add(day_code)
             days.append(_RRULE_DAY_TO_GRAPH[day_code])
-    assert ordinal is not None
+    if ordinal is None:
+        raise RuntimeError(
+            f"no BYDAY ordinal found while parsing {byday!r} - every code "
+            "in the loop above either sets one or raises, so this "
+            "shouldn't be reachable"
+        )
     return _ORDINAL_TO_GRAPH_INDEX[ordinal], days
 
 
@@ -297,11 +318,75 @@ def _int_rrule_component(
             f"a single value for {key}, got {parts[key]!r}"
         ) from None
     if not low <= value <= high:
+        if key == "BYMONTHDAY" and value < low:
+            # A negative BYMONTHDAY (e.g. -1 for "the last day of the
+            # month") is valid RFC 5545 syntax, not a malformed rule - it's
+            # rejected because this connector has no Graph equivalent for
+            # it, which "invalid recurrence rule" would misleadingly imply.
+            raise ValueError(
+                f"unsupported recurrence pattern: BYMONTHDAY must be "
+                f"between {low} and {high} for this connector, got "
+                f"{value} (RFC 5545 allows negative values like -1 for "
+                '"the last day of the month", but this connector doesn\'t '
+                "support translating those)"
+            )
         raise ValueError(
             f"invalid recurrence rule: {key} must be between {low} and "
             f"{high} for this connector, got {value}"
         )
     return value
+
+
+def _validate_day_of_month(day_of_month: int, month: int | None) -> None:
+    """Reject a BYMONTHDAY value Microsoft Graph would silently clamp to a
+    different day instead of reproducing faithfully.
+
+    Graph's documented behavior for `dayOfMonth` past a given month's
+    actual length is to clamp to that month's last day - not skip the
+    occurrence the way RFC 5545 itself does (BYMONTHDAY=31 on a MONTHLY
+    rule skips every 30-day month entirely; BYMONTHDAY=29 on a YEARLY
+    February rule skips every non-leap year). Silently letting either
+    through would translate the rule into a materially different,
+    recurring divergence with no warning - it's rejected here instead.
+
+    `month` is None for `absoluteMonthly` (the pattern applies to every
+    month, so only a day valid in EVERY month - including February - is
+    safe) and 1-12 for `absoluteYearly` (the pattern applies to one
+    specific month each year, so the check is against that month's own
+    length, accounting for February's leap-year variability across
+    different years).
+    """
+    if month is None:
+        if day_of_month > 28:
+            raise ValueError(
+                "unsupported recurrence pattern: FREQ=MONTHLY with "
+                f"BYMONTHDAY={day_of_month} has no exact Outlook "
+                "equivalent - Graph clamps a day past a short month's "
+                "length to that month's last day instead of skipping the "
+                "month the way RFC 5545 does, so only BYMONTHDAY 1-28 "
+                "(valid in every month, including February) is supported "
+                "here"
+            )
+        return
+    # A leap year (2000) vs. a non-leap one (2001) bracket this month's
+    # possible lengths across different years - the two only ever differ
+    # for February.
+    max_possible_day = _stdlib_calendar.monthrange(2000, month)[1]
+    min_guaranteed_day = _stdlib_calendar.monthrange(2001, month)[1]
+    if day_of_month > max_possible_day:
+        raise ValueError(
+            f"invalid recurrence rule: BYMONTHDAY={day_of_month} does not "
+            f"exist in month {month}"
+        )
+    if day_of_month > min_guaranteed_day:
+        raise ValueError(
+            "unsupported recurrence pattern: FREQ=YEARLY;BYMONTH="
+            f"{month};BYMONTHDAY={day_of_month} has no exact Outlook "
+            "equivalent - Graph clamps to that month's last day in years "
+            "where this day doesn't exist (e.g. Feb 29 in a non-leap "
+            "year) instead of skipping that year's occurrence the way "
+            "RFC 5545 does"
+        )
 
 
 def _build_graph_recurrence(
@@ -339,14 +424,11 @@ def _build_graph_recurrence(
     anchor = _date_parser.isoparse(start_datetime)
     if anchor.tzinfo is None:
         anchor = anchor.replace(tzinfo=zone)
+    # parse_rrule already guarantees INTERVAL is a positive integer
+    # whenever it's present at all, so there's nothing left to check here.
     parts = parse_rrule(recurrence, anchor)
     freq = parts["FREQ"].upper()
     interval = int(parts.get("INTERVAL", "1"))
-    if interval < 1:
-        raise ValueError(
-            f"invalid recurrence rule: INTERVAL must be a positive integer, "
-            f"got {parts.get('INTERVAL')!r}"
-        )
     start_date = anchor.date().isoformat()
 
     if freq in _FREQ_RECOGNIZED_KEYS:
@@ -409,6 +491,7 @@ def _build_graph_recurrence(
         # covers "repeat monthly on the 15th" (BYMONTHDAY=15) as well as
         # plain "repeat monthly" (no BYMONTHDAY at all).
         day_of_month = _int_rrule_component(parts, "BYMONTHDAY", anchor.day, 1, 31)
+        _validate_day_of_month(day_of_month, month=None)
         pattern = {
             "type": "absoluteMonthly",
             "interval": interval,
@@ -435,6 +518,7 @@ def _build_graph_recurrence(
         # derived from DTSTART's own month/day.
         month = _int_rrule_component(parts, "BYMONTH", anchor.month, 1, 12)
         day_of_month = _int_rrule_component(parts, "BYMONTHDAY", anchor.day, 1, 31)
+        _validate_day_of_month(day_of_month, month=month)
         pattern = {
             "type": "absoluteYearly",
             "interval": interval,
@@ -453,7 +537,7 @@ def _build_graph_recurrence(
         range_: dict[str, Any] = {
             "type": "endDate",
             "startDate": start_date,
-            "endDate": _rrule_until_to_date(parts["UNTIL"], zone),
+            "endDate": _rrule_until_to_date(parts["UNTIL"], zone, anchor),
         }
     elif "COUNT" in parts:
         range_ = {
@@ -680,7 +764,7 @@ def outlook_create_event(
             payload["location"] = {"displayName": location}
         if attendees:
             payload["attendees"] = _attendee_list(attendees)
-        if recurrence:
+        if recurrence is not None:
             payload["recurrence"] = _build_graph_recurrence(
                 recurrence, start_datetime, timezone
             )
@@ -708,7 +792,8 @@ def outlook_update_event(
     """Update an existing Outlook calendar event.
     recurrence works like it does in outlook_create_event: a single RFC
     5545 RRULE string turns this event into a repeating series, or
-    replaces its existing one.
+    replaces its existing one - there is no way to clear an existing
+    recurrence back to a single event through this parameter.
     """
     try:
         payload: dict[str, Any] = {}

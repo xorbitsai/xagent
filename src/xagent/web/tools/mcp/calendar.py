@@ -324,11 +324,11 @@ def google_calendar_create_events(
     end_time: str,
     description: str | None = None,
     location: str | None = None,
-    recurrence: str | None = None,
-    timezone: str | None = None,
     attendees: list[str] | None = None,
     notify_attendees: bool = False,
     add_google_meet: bool = False,
+    timezone: str | None = None,
+    recurrence: str | None = None,
 ) -> str:
     """
     Create a new event in Google Calendar.
@@ -359,7 +359,7 @@ def google_calendar_create_events(
     """
     requested_conference = False
     try:
-        if recurrence and not timezone:
+        if recurrence is not None and not timezone:
             raise ValueError(
                 "timezone is required when recurrence is set (Google expands "
                 "a recurring event's occurrences in this timezone)"
@@ -384,7 +384,7 @@ def google_calendar_create_events(
             event["description"] = description
         if location:
             event["location"] = location
-        if recurrence:
+        if recurrence is not None:
             event["recurrence"] = _normalize_rrule(recurrence, start_time, timezone)
         _merge_attendees(event, attendees)
         requested_conference = _apply_conference_request(event, add_google_meet)
@@ -429,11 +429,11 @@ def google_calendar_update_events(
     end_time: str | None = None,
     description: str | None = None,
     location: str | None = None,
-    recurrence: str | None = None,
-    timezone: str | None = None,
     attendees: list[str] | None = None,
     notify_attendees: bool = False,
     add_google_meet: bool = False,
+    timezone: str | None = None,
+    recurrence: str | None = None,
 ) -> str:
     """
     Update an existing event in Google Calendar.
@@ -441,7 +441,9 @@ def google_calendar_update_events(
     recurrence works like it does in google_calendar_create_events: a
     single RFC 5545 RRULE string turns this event into a repeating series,
     or replaces its existing one. Any EXDATE/RDATE lines already on the
-    event (e.g. a previously-cancelled single occurrence) are kept.
+    event (e.g. a previously-cancelled single occurrence) are kept -
+    there is no way to clear an existing recurrence back to a single
+    event through this parameter.
     timezone is an IANA timezone name; Google requires one for recurring
     events. If recurrence is set and timezone is omitted, the event's own
     existing timeZone is reused; if the event has none either, this call
@@ -490,29 +492,31 @@ def google_calendar_update_events(
             event["end"] = {"dateTime": end_time}
             if existing_end_timezone and not timezone:
                 event["end"]["timeZone"] = existing_end_timezone
-        if timezone:
+
+        # An all-day event's start is a bare "date" (no "T"), never a
+        # "dateTime" - Google doesn't attach (or require) a timeZone to a
+        # whole-day occurrence. Determined from the CURRENT start value
+        # (after any start_time reassignment above), so moving an all-day
+        # event to a specific dateTime in this same call correctly stops
+        # treating it as all-day.
+        current_start_value = event.get("start", {}).get("dateTime") or event.get(
+            "start", {}
+        ).get("date")
+        is_all_day = current_start_value is not None and "T" not in current_start_value
+
+        if timezone and not is_all_day:
             event.setdefault("start", {})["timeZone"] = timezone
             event.setdefault("end", {})["timeZone"] = timezone
         if description:
             event["description"] = description
         if location:
             event["location"] = location
-        if recurrence:
-            effective_start = (
-                start_time
-                or event.get("start", {}).get("dateTime")
-                or event.get("start", {}).get("date")
-            )
-            if not effective_start:
+        if recurrence is not None:
+            if not current_start_value:
                 raise ValueError(
                     "could not determine the event's start time or date to "
                     "validate the recurrence rule; pass start_time explicitly"
                 )
-            # An all-day event's start is a bare "date" (no "T"), never a
-            # "dateTime" - Google doesn't attach (or require) a timeZone to
-            # a whole-day occurrence, unlike a timed event's recurrence,
-            # which it documents timeZone as required for.
-            is_all_day = "T" not in effective_start
             effective_timezone = timezone or existing_start_timezone
             if not is_all_day and not effective_timezone:
                 raise ValueError(
@@ -520,7 +524,7 @@ def google_calendar_update_events(
                     "event (Google expands a recurring event's occurrences "
                     "in this timezone, and the event doesn't already have one)"
                 )
-            if effective_timezone:
+            if effective_timezone and not is_all_day:
                 event["start"]["timeZone"] = effective_timezone
                 event["end"]["timeZone"] = effective_timezone
             # An all-day event's naive date anchor still needs *some*
@@ -533,7 +537,7 @@ def google_calendar_update_events(
                 "UTC" if is_all_day else None
             )
             new_rrule = _normalize_rrule(
-                recurrence, effective_start, localization_timezone
+                recurrence, current_start_value, localization_timezone
             )[0]
             event["recurrence"] = _merge_recurrence(event.get("recurrence"), new_rrule)
         _merge_attendees(event, attendees)

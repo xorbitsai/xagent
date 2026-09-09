@@ -36,6 +36,36 @@ def test_build_graph_recurrence_stamps_the_given_timezone():
     assert recurrence["range"]["recurrenceTimeZone"] == "Asia/Manila"
 
 
+def test_build_graph_recurrence_until_backs_off_end_date_when_occurrence_lands_later():
+    """Confirmed bug: Graph's recurrenceRange(type=endDate) includes the
+    WHOLE endDate day regardless of time-of-day, but every occurrence in
+    the series happens at the anchor's own local time (09:00 Shanghai
+    here), not UNTIL's. 2026-09-11T00:00:00Z is 2026-09-11 08:00 Shanghai
+    local - earlier in the day than the series' 09:00 occurrence time, so
+    that Friday's occurrence is genuinely past the true UTC cutoff and
+    must be excluded by backing endDate off to the 10th, or Graph would
+    silently run the series one occurrence past what UNTIL specified."""
+    recurrence = outlook._build_graph_recurrence(
+        "FREQ=WEEKLY;UNTIL=20260911T000000Z",
+        "2026-08-14T09:00:00",
+        "Asia/Shanghai",
+    )
+    assert recurrence["range"]["endDate"] == "2026-09-10"
+
+
+def test_build_graph_recurrence_until_keeps_end_date_when_occurrence_lands_earlier():
+    """Same scenario, but UNTIL's local time-of-day (20:00 Shanghai) falls
+    AFTER the series' own occurrence time (09:00) on the same calendar day
+    - that day's occurrence is still within the true cutoff, so no
+    back-off is needed."""
+    recurrence = outlook._build_graph_recurrence(
+        "FREQ=WEEKLY;UNTIL=20260911T120000Z",
+        "2026-08-14T09:00:00",
+        "Asia/Shanghai",
+    )
+    assert recurrence["range"]["endDate"] == "2026-09-11"
+
+
 def test_build_graph_recurrence_weekly_with_explicit_byday():
     recurrence = outlook._build_graph_recurrence(
         "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;UNTIL=20260911T235959Z",
@@ -203,13 +233,69 @@ def test_build_graph_recurrence_rejects_out_of_range_bymonthday():
 
 
 def test_build_graph_recurrence_rejects_negative_bymonthday():
-    """RRULE allows BYMONTHDAY=-1 ("the last day of the month"), but
-    Graph's dayOfMonth field only accepts 1-31 - this must be rejected
-    with a clear error rather than sent to Graph as a bare -1."""
-    with pytest.raises(ValueError, match="BYMONTHDAY must be between 1 and 31"):
+    """RRULE allows BYMONTHDAY=-1 ("the last day of the month") as valid
+    syntax, but Graph's dayOfMonth field only accepts 1-31 - this must be
+    rejected as unsupported-by-this-connector (not as malformed RRULE
+    syntax, which "invalid recurrence rule" would misleadingly imply)
+    rather than sent to Graph as a bare -1."""
+    with pytest.raises(
+        ValueError,
+        match="unsupported recurrence pattern: BYMONTHDAY must be between 1 and 31",
+    ):
         outlook._build_graph_recurrence(
             "FREQ=MONTHLY;BYMONTHDAY=-1", "2026-08-15T07:00:00+08:00"
         )
+
+
+@pytest.mark.parametrize("day", [29, 30, 31])
+def test_build_graph_recurrence_rejects_bymonthday_graph_would_clamp_on_monthly(day):
+    """Confirmed via Microsoft's own docs: Graph's absoluteMonthly clamps a
+    dayOfMonth past a short month's length to that month's last day (e.g.
+    31 in April becomes April 30) instead of skipping the month the way
+    RFC 5545 does - so any day not valid in EVERY month (including
+    February) must be rejected rather than silently diverging."""
+    with pytest.raises(ValueError, match="only BYMONTHDAY 1-28"):
+        outlook._build_graph_recurrence(
+            f"FREQ=MONTHLY;BYMONTHDAY={day}", "2026-08-15T07:00:00+08:00"
+        )
+
+
+def test_build_graph_recurrence_accepts_bymonthday_28_on_monthly():
+    """28 is valid in every month (including non-leap February), so it
+    must still be accepted - the fix above must not overreach."""
+    recurrence = outlook._build_graph_recurrence(
+        "FREQ=MONTHLY;BYMONTHDAY=28", "2026-08-15T07:00:00+08:00"
+    )
+    assert recurrence["pattern"]["dayOfMonth"] == 28
+
+
+def test_build_graph_recurrence_rejects_bymonthday_29_on_yearly_february():
+    """FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=29 ("Feb 29 every year") would
+    have Graph clamp to Feb 28 in every non-leap year, silently dropping
+    the "only on a leap year" semantics RFC 5545 actually specifies."""
+    with pytest.raises(ValueError, match="Feb 29 in a non-leap year"):
+        outlook._build_graph_recurrence(
+            "FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=29", "2026-08-15T07:00:00+08:00"
+        )
+
+
+def test_build_graph_recurrence_rejects_bymonthday_that_never_exists_in_month():
+    """BYMONTH=4;BYMONTHDAY=31 has no equivalent in ANY year (April never
+    has 31 days) - a different, more clear-cut error than the "sometimes
+    valid" Feb 29 case above."""
+    with pytest.raises(ValueError, match="does not exist in month 4"):
+        outlook._build_graph_recurrence(
+            "FREQ=YEARLY;BYMONTH=4;BYMONTHDAY=31", "2026-08-15T07:00:00+08:00"
+        )
+
+
+def test_build_graph_recurrence_accepts_bymonthday_30_on_yearly_april():
+    """April always has exactly 30 days in every year - no leap-year-style
+    divergence is possible, so this must still be accepted."""
+    recurrence = outlook._build_graph_recurrence(
+        "FREQ=YEARLY;BYMONTH=4;BYMONTHDAY=30", "2026-08-15T07:00:00+08:00"
+    )
+    assert recurrence["pattern"]["dayOfMonth"] == 30
 
 
 def test_build_graph_recurrence_rejects_out_of_range_bymonth():
@@ -416,6 +502,27 @@ def test_create_event_rejects_invalid_recurrence_without_calling_graph(monkeypat
     )
 
     assert result["status"] == "error"
+    graph_request.assert_not_called()
+
+
+def test_create_event_rejects_explicit_empty_recurrence(monkeypatch):
+    """Regression test: outlook_create_event now aligns with
+    outlook_update_event's `is not None` semantic for recurrence -
+    recurrence="" must not be silently treated the same as omitting it."""
+    graph_request = Mock()
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_create_event(
+            subject="Standup",
+            start_datetime="2026-08-26T09:00:00",
+            end_datetime="2026-08-26T09:15:00",
+            recurrence="",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "must not be empty" in result["message"]
     graph_request.assert_not_called()
 
 

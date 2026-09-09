@@ -39,8 +39,7 @@ def test_transport_config_sets_both_allowlist_vars_when_workspace_has_a_task(
     assert transport_config["env"]["XAGENT_LINKEDIN_IMAGE_ALLOWED_DIRS"] == expected_dir
     assert transport_config["env"]["XAGENT_GMAIL_FILE_ALLOWED_DIRS"] == expected_dir
     assert (
-        transport_config["env"]["XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS"]
-        == expected_dir
+        transport_config["env"]["XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS"] == expected_dir
     )
     assert transport_config["env"]["XAGENT_GOOGLE_DRIVE_OUTPUT_DIR"] == expected_dir
 

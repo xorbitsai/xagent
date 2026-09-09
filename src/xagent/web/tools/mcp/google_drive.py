@@ -1150,9 +1150,7 @@ def google_drive_upload_file(
             if file_size == 0:
                 raise ValueError(f"File is empty: {file_path}")
 
-            media = MediaIoBaseUpload(
-                fh, mimetype=resolved_mime_type, resumable=True
-            )
+            media = MediaIoBaseUpload(fh, mimetype=resolved_mime_type, resumable=True)
 
             file = (
                 service.files()

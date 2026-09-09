@@ -275,6 +275,7 @@ class ExecutionContext:
         tool_call_id: str | None = None,
         *,
         context_refs: Any = (),
+        insert_before_last_user: bool = False,
     ) -> Message:
         public_result, supersedes_scope = split_tool_result_supersedes_scope(result)
         public_result, embedded_refs = split_tool_result_context_references(
@@ -305,13 +306,31 @@ class ExecutionContext:
         if supersedes_scope:
             metadata["supersedes_scope"] = supersedes_scope
             self._compact_superseded_tool_messages(supersedes_scope)
-        return self.add_message(
-            "tool",
-            content,
+        message = Message(
+            role="tool",
+            content=content,
             tool_call_id=tool_call_id,
             metadata=metadata,
             context_refs=tuple(all_context_refs),
         )
+        if insert_before_last_user:
+            # Keep the tool result adjacent to its assistant tool-call turn
+            # when a user message was injected in between (legacy waiting
+            # checkpoint heal): OpenAI-style chat requires tool messages to
+            # immediately follow the assistant message that declared them,
+            # and _sanitize_tool_message_pairs drops the whole assistant turn
+            # if a user message breaks the run (xorbitsai/xagent#2223).
+            self.messages.insert(self._last_user_message_index(), message)
+        else:
+            self.messages.append(message)
+        return message
+
+    def _last_user_message_index(self) -> int:
+        """Index of the last user message; appends after system/task text."""
+        for index in range(len(self.messages) - 1, -1, -1):
+            if self.messages[index].role == "user":
+                return index
+        return len(self.messages)
 
     def _compact_superseded_tool_messages(self, scope: str) -> None:
         """Keep stale observations durable while removing them from live prompts."""

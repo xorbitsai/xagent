@@ -59,9 +59,11 @@ _VALID_DATE_PRESETS = {
     "this_year",
 }
 
-_ACT_PREFIXED_ID_PATTERN = re.compile(r"^act_\d+\Z")
-_NUMERIC_ID_PATTERN = re.compile(r"^\d+\Z")
-_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}\Z")
+# re.ASCII: bare \d matches any Unicode decimal digit (Arabic-Indic,
+# fullwidth, etc.), not just 0-9, which would otherwise let a non-ASCII
+# "numeric" id slip past validation and into a Graph API request.
+_NUMERIC_ID_PATTERN = re.compile(r"^\d+\Z", re.ASCII)
+_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}\Z", re.ASCII)
 
 
 def _normalize_ad_account_id(ad_account_id: str) -> str:
@@ -101,17 +103,20 @@ def _insights_object_id(object_id: str) -> str:
     """Validate an insights target id: either an "act_<digits>" ad account,
     or a bare numeric campaign/ad set/ad id -- matching exactly the id shapes
     the other meta_ads_* tools return, so callers never have to reformat one.
+
+    Delegates to _normalize_ad_account_id/_numeric_id for the actual "digits,
+    optionally act_-prefixed" check rather than a third copy of that regex,
+    so the two id shapes stay validated by exactly one rule each.
     """
     value = str(object_id).strip()
     if not value:
         raise ValueError("object_id is required")
-    if value.startswith("act_"):
-        if not _ACT_PREFIXED_ID_PATTERN.match(value):
-            raise ValueError("object_id must be 'act_<digits>' or a numeric id")
-        return value
-    if not _NUMERIC_ID_PATTERN.match(value):
-        raise ValueError("object_id must be 'act_<digits>' or a numeric id")
-    return value
+    try:
+        if value.startswith("act_"):
+            return _normalize_ad_account_id(value)
+        return _numeric_id(value, "object_id")
+    except ValueError:
+        raise ValueError("object_id must be 'act_<digits>' or a numeric id") from None
 
 
 def _graph_path(*segments: str) -> str:

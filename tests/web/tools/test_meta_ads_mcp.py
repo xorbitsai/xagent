@@ -110,6 +110,22 @@ def test_get_ad_account_rejects_non_numeric_id(monkeypatch):
     mock_request.assert_not_called()
 
 
+def test_get_ad_account_rejects_non_ascii_digits(monkeypatch):
+    """Bare \\d in a regex matches any Unicode decimal digit, not just
+    ASCII 0-9 -- these Arabic-Indic digits must not slip past validation."""
+    monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
+    mock_request = Mock()
+    monkeypatch.setattr(meta_ads.requests, "request", mock_request)
+
+    result = _payload(meta_ads.meta_ads_get_ad_account("act_١٢٣"))
+
+    assert result == {
+        "status": "error",
+        "message": "ad_account_id must be numeric, optionally prefixed with 'act_'",
+    }
+    mock_request.assert_not_called()
+
+
 def test_list_campaigns_builds_expected_path(monkeypatch):
     monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
     mock_request = Mock(return_value=MockResponse({"data": [{"id": "campaign-1"}]}))

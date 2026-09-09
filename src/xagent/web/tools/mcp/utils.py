@@ -204,6 +204,27 @@ def attendees_were_given(attendees: list[str] | str | None) -> bool:
     return attendees is not None and attendees != ""
 
 
+def attendees_to_add(
+    attendees: list[str] | str | None, existing_attendee_emails: set[str]
+) -> list[str]:
+    """The newly-added addresses from an update's `attendees` argument,
+    normalized and deduped, that aren't already in
+    `existing_attendee_emails` - what actually needs writing when
+    `attendees` only ever adds attendees and never removes any. Returns
+    [] for anything `attendees_were_given` treats as not-provided (None,
+    ""), matching its own convention, as well as for a caller-supplied
+    list/string that turns out to name only people already on the event.
+    """
+    if not attendees_were_given(attendees):
+        return []
+    assert attendees is not None  # narrows for mypy; attendees_were_given implies this
+    return [
+        address
+        for address in normalize_addresses(attendees)
+        if address.lower() not in existing_attendee_emails
+    ]
+
+
 def attendees_needing_check(
     normalized_attendees: list[str],
     existing_attendee_emails: set[str],
@@ -284,6 +305,27 @@ def datetime_key_for_comparison(value: str | None) -> datetime | str | None:
         return value
 
 
+def reject_reversed_window(start_value: str, end_value: str) -> None:
+    """Raise ValueError when `end_value` is not after `start_value`, for a
+    brand-new event window a caller is about to create - catching an
+    obviously backwards request locally rather than forwarding it to the
+    provider API as-is.
+
+    Deliberately permissive when either side doesn't parse to a real,
+    comparable instant (stays silent rather than rejecting) - matching
+    this module's other datetime comparisons, which treat "can't tell"
+    as "don't block", not "assume invalid".
+    """
+    start_key = datetime_key_for_comparison(start_value)
+    end_key = datetime_key_for_comparison(end_value)
+    if (
+        isinstance(start_key, datetime)
+        and isinstance(end_key, datetime)
+        and end_key <= start_key
+    ):
+        raise ValueError(f"end ({end_value!r}) must be after start ({start_value!r}).")
+
+
 # Microsoft Graph timeZone values come in two shapes depending on how/where
 # an event was created: IANA names (e.g. "Asia/Singapore", which Graph also
 # accepts on write) and legacy Windows names (e.g. "Pacific Standard Time",
@@ -304,13 +346,17 @@ _WINDOWS_TO_IANA: dict[str, str] = {
     "FLE Standard Time": "Europe/Kyiv",
     "Turkey Standard Time": "Europe/Istanbul",
     "Russian Standard Time": "Europe/Moscow",
+    "Kaliningrad Standard Time": "Europe/Kaliningrad",
     "Arabic Standard Time": "Asia/Baghdad",
+    "Syria Standard Time": "Asia/Damascus",
     "Arab Standard Time": "Asia/Riyadh",
     "Israel Standard Time": "Asia/Jerusalem",
     "Jordan Standard Time": "Asia/Amman",
     "Middle East Standard Time": "Asia/Beirut",
     "Egypt Standard Time": "Africa/Cairo",
     "South Africa Standard Time": "Africa/Johannesburg",
+    "E. Africa Standard Time": "Africa/Nairobi",
+    "Mauritius Standard Time": "Indian/Mauritius",
     "Iran Standard Time": "Asia/Tehran",
     "Arabian Standard Time": "Asia/Dubai",
     "Azerbaijan Standard Time": "Asia/Baku",
@@ -324,11 +370,16 @@ _WINDOWS_TO_IANA: dict[str, str] = {
     "Nepal Standard Time": "Asia/Kathmandu",
     "Central Asia Standard Time": "Asia/Almaty",
     "Bangladesh Standard Time": "Asia/Dhaka",
+    "Ekaterinburg Standard Time": "Asia/Yekaterinburg",
     "Myanmar Standard Time": "Asia/Yangon",
     "SE Asia Standard Time": "Asia/Bangkok",
+    "Novosibirsk Standard Time": "Asia/Novosibirsk",
     "China Standard Time": "Asia/Shanghai",
+    "North Asia Standard Time": "Asia/Krasnoyarsk",
     "Singapore Standard Time": "Asia/Singapore",
     "Taipei Standard Time": "Asia/Taipei",
+    "Ulaanbaatar Standard Time": "Asia/Ulaanbaatar",
+    "North Asia East Standard Time": "Asia/Irkutsk",
     "W. Australia Standard Time": "Australia/Perth",
     "Tokyo Standard Time": "Asia/Tokyo",
     "Korea Standard Time": "Asia/Seoul",
@@ -338,9 +389,12 @@ _WINDOWS_TO_IANA: dict[str, str] = {
     "AUS Eastern Standard Time": "Australia/Sydney",
     "West Pacific Standard Time": "Pacific/Port_Moresby",
     "Tasmania Standard Time": "Australia/Hobart",
+    "Yakutsk Standard Time": "Asia/Yakutsk",
     "Central Pacific Standard Time": "Pacific/Guadalcanal",
+    "Vladivostok Standard Time": "Asia/Vladivostok",
     "New Zealand Standard Time": "Pacific/Auckland",
     "Fiji Standard Time": "Pacific/Fiji",
+    "Magadan Standard Time": "Asia/Magadan",
     "Tonga Standard Time": "Pacific/Tongatapu",
     "Samoa Standard Time": "Pacific/Apia",
     "Line Islands Standard Time": "Pacific/Kiritimati",
@@ -454,10 +508,25 @@ def offset_datetime_string(value: str, tz_name: str) -> str:
     caller actually meant.
 
     Raises ``ValueError`` (via ``resolve_zoneinfo``) rather than falling
-    back to UTC when ``tz_name`` can't be resolved.
+    back to UTC when ``tz_name`` can't be resolved - and also raises if
+    ``value`` turns out to already carry its own offset/``Z``, rather
+    than silently relabeling those same clock digits with `tz_name`'s
+    offset instead of converting them (``.replace(tzinfo=...)`` changes
+    what zone a datetime is interpreted in without changing the instant
+    it names, e.g. turning "10:00 UTC" into "10:00 <tz_name>" - a real
+    shift, not a no-op, whenever the two offsets differ). No public tool
+    parameter is documented as requiring a naive value, so a caller
+    passing one with an offset already attached is a real, reachable
+    input here, not just a theoretical one.
     """
-    naive = datetime.fromisoformat(value)
-    return naive.replace(tzinfo=resolve_zoneinfo(tz_name)).isoformat()
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is not None:
+        raise ValueError(
+            f"{value!r} already carries a UTC offset; pass a naive "
+            "datetime string (no trailing 'Z' or +HH:MM) together with "
+            "its timezone name instead of embedding an offset in both."
+        )
+    return parsed.replace(tzinfo=resolve_zoneinfo(tz_name)).isoformat()
 
 
 def naive_day_bounds(date_value: str, *, days: int = 1) -> tuple[str, str]:

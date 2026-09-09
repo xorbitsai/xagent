@@ -10,11 +10,12 @@ from googleapiclient.errors import HttpError  # type: ignore
 from mcp.server.fastmcp import FastMCP
 
 from .utils import attendees_needing_check as _attendees_needing_check
-from .utils import attendees_were_given as _attendees_were_given
+from .utils import attendees_to_add as _attendees_to_add
 from .utils import calendar_day_bounds as _calendar_day_bounds
 from .utils import conflict_response as _conflict_response
 from .utils import datetime_key_for_comparison as _datetime_key_for_comparison
 from .utils import normalize_addresses as _normalize_addresses
+from .utils import reject_reversed_window as _reject_reversed_window
 from .utils import setup_proxy_env, success_with_capped_dict
 from .utils import unchecked_extra as _unchecked_extra
 from .utils import windows_overlap as _windows_overlap
@@ -30,6 +31,43 @@ mcp = FastMCP("calendar-mcp")
 # freebusy.query accepts at most this many calendars per call
 # (Google's calendarExpansionMax).
 _MAX_ATTENDEES_PER_FREEBUSY_QUERY = 50
+
+
+def _is_insufficient_scope_error(exc: Any) -> bool:
+    """Whether `exc` is specifically "the access token doesn't have the
+    scope this call needs", not just any 403.
+
+    Google's error body can carry this reason on either of two fields,
+    and both show up in practice: the legacy `error.errors[].reason ==
+    "insufficientPermissions"`, and a newer `error.details[].reason ==
+    "ACCESS_TOKEN_SCOPE_INSUFFICIENT"` (an ErrorInfo entry) that a real
+    Calendar API 403 for this exact case carries ALONGSIDE the legacy
+    one, not instead of it. `HttpError._get_reason` picks one field per
+    a fixed priority order (`detail` > `details` > `errors` > `message`)
+    to build `exc.error_details`/`str(exc)` - when both are present,
+    `details` wins and the legacy reason string is dropped entirely from
+    the formatted message. So a plain substring check on `str(exc)` can
+    silently stop matching real scope errors the moment Google's backend
+    starts including both. Check the parsed body directly instead of
+    trusting which one HttpError's own formatting happens to surface.
+    """
+    try:
+        data = json.loads(exc.content.decode("utf-8"))
+    except (ValueError, AttributeError):
+        return False
+    error = data.get("error") if isinstance(data, dict) else None
+    if not isinstance(error, dict):
+        return False
+    for entry in error.get("errors") or []:
+        if isinstance(entry, dict) and entry.get("reason") == "insufficientPermissions":
+            return True
+    for entry in error.get("details") or []:
+        if (
+            isinstance(entry, dict)
+            and entry.get("reason") == "ACCESS_TOKEN_SCOPE_INSUFFICIENT"
+        ):
+            return True
+    return False
 
 
 def _find_conflicts(
@@ -132,7 +170,7 @@ def _find_conflicts(
                 .execute()
             )
         except HttpError as exc:
-            if exc.resp.status == 403 and "insufficientPermissions" in str(exc):
+            if exc.resp.status == 403 and _is_insufficient_scope_error(exc):
                 # This connection's OAuth token predates the
                 # calendar.freebusy scope (see the
                 # 20260907_add_calendar_freebusy_scope migration) and
@@ -472,6 +510,7 @@ def google_calendar_create_events(
     """
     requested_conference = False
     try:
+        _reject_reversed_window(start_time, end_time)
         service = get_calendar_service()
         normalized_attendees = _normalize_addresses(attendees) if attendees else []
 
@@ -588,8 +627,6 @@ def google_calendar_update_events(
         # First get the existing event
         event = service.events().get(calendarId="primary", eventId=event_id).execute()
 
-        attendees_given = _attendees_were_given(attendees)
-
         existing_is_all_day = "date" in (event.get("start") or {}) or "date" in (
             event.get("end") or {}
         )
@@ -640,17 +677,7 @@ def google_calendar_update_events(
         # is always existing-plus-newly-added, never a caller-supplied
         # subset that could silently drop someone. `added_attendees` (the
         # ones actually new) is what the write step appends below.
-        if attendees_given:
-            assert (
-                attendees is not None
-            )  # narrows for mypy; attendees_given implies this
-            added_attendees = [
-                address
-                for address in _normalize_addresses(attendees)
-                if address.lower() not in existing_attendee_emails
-            ]
-        else:
-            added_attendees = []
+        added_attendees = _attendees_to_add(attendees, existing_attendee_emails)
         # Preserve the casing already on the event - only the membership
         # check below needs to be case-insensitive, not what gets
         # queried/reported back to the caller.

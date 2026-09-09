@@ -235,6 +235,23 @@ def test_create_event_ignore_conflicts_skips_the_check_entirely(monkeypatch):
     assert graph_request.call_args.args[:2] == ("POST", "/me/events")
 
 
+def test_create_event_rejects_a_reversed_window(monkeypatch):
+    graph_request = Mock()
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_create_event(
+            subject="Kickoff",
+            start_datetime="2026-08-27T10:30:00",
+            end_datetime="2026-08-27T10:00:00",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "must be after" in result["message"]
+    graph_request.assert_not_called()
+
+
 def test_update_event_excludes_the_event_being_moved_from_its_own_conflicts(
     monkeypatch,
 ):

@@ -168,6 +168,18 @@ def test_attendees_were_given_treats_empty_list_as_provided():
     assert utils.attendees_were_given("a@x.com") is True
 
 
+def test_attendees_to_add_filters_out_existing_and_normalizes():
+    assert utils.attendees_to_add(
+        ["Old@Example.com", "new@example.com"], {"old@example.com"}
+    ) == ["new@example.com"]
+
+
+def test_attendees_to_add_returns_empty_for_not_provided_or_empty():
+    assert utils.attendees_to_add(None, {"old@example.com"}) == []
+    assert utils.attendees_to_add("", {"old@example.com"}) == []
+    assert utils.attendees_to_add([], {"old@example.com"}) == []
+
+
 def test_unchecked_extra_empty_when_nothing_unchecked():
     assert utils.unchecked_extra([], None) == {}
     assert utils.unchecked_extra([], "some reason") == {}
@@ -200,3 +212,60 @@ def test_attendees_needing_check_same_or_overlapping_window_checks_only_new():
         {"old@x.com"},
         moved_to_a_disjoint_window=False,
     ) == ["new@x.com"]
+
+
+def test_reject_reversed_window_raises_when_end_is_not_after_start():
+    with pytest.raises(ValueError, match="must be after"):
+        utils.reject_reversed_window(
+            "2026-08-27T10:30:00+00:00", "2026-08-27T10:00:00+00:00"
+        )
+    with pytest.raises(ValueError, match="must be after"):
+        utils.reject_reversed_window(
+            "2026-08-27T10:00:00+00:00", "2026-08-27T10:00:00+00:00"
+        )
+
+
+def test_reject_reversed_window_allows_a_forward_window():
+    utils.reject_reversed_window(
+        "2026-08-27T10:00:00+00:00", "2026-08-27T10:30:00+00:00"
+    )
+
+
+def test_reject_reversed_window_is_permissive_on_unparseable_input():
+    """Can't-tell must never read as "reject" - only a confirmed reversal
+    should raise."""
+    utils.reject_reversed_window("not-a-date", "also-not-a-date")
+
+
+def test_resolve_zone_name_covers_graphs_additional_time_zones():
+    """Regression test: `_WINDOWS_TO_IANA` was missing several of the
+    Windows names for zones Microsoft's own dateTimeTimeZone docs list
+    under "Additional time zones" (e.g. Kaliningrad, Ekaterinburg) - an
+    event whose originalStartTimeZone happened to be one of these
+    previously hard-failed every single-boundary update and conflict
+    check outright."""
+    assert utils.resolve_zone_name("Kaliningrad Standard Time") == "Europe/Kaliningrad"
+    assert utils.resolve_zone_name("Ekaterinburg Standard Time") == "Asia/Yekaterinburg"
+    assert utils.resolve_zone_name("Vladivostok Standard Time") == "Asia/Vladivostok"
+
+
+def test_offset_datetime_string_attaches_the_zone_offset_to_a_naive_value():
+    assert (
+        utils.offset_datetime_string("2026-08-27T10:00:00", "Asia/Singapore")
+        == "2026-08-27T10:00:00+08:00"
+    )
+
+
+def test_offset_datetime_string_rejects_input_that_already_carries_an_offset():
+    """Regression test: no public tool parameter is documented as requiring
+    a naive value, so a caller passing one with a trailing 'Z' or an
+    explicit offset is a real, reachable mistake - not a theoretical one.
+    `.replace(tzinfo=...)` doesn't convert an aware datetime, it just
+    relabels the same clock digits under a different zone, silently
+    shifting the real instant by however much the two offsets differ
+    (e.g. "10:00:00Z" relabeled as Asia/Shanghai reads as 10:00 Shanghai
+    time - actually 8 hours earlier). Must fail loudly instead."""
+    with pytest.raises(ValueError, match="already carries a UTC offset"):
+        utils.offset_datetime_string("2026-08-27T10:00:00Z", "Asia/Shanghai")
+    with pytest.raises(ValueError, match="already carries a UTC offset"):
+        utils.offset_datetime_string("2026-08-27T10:00:00+00:00", "Asia/Shanghai")

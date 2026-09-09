@@ -863,6 +863,33 @@ class _FakeHttpResp:
 
 
 def _insufficient_scope_error() -> HttpError:
+    """A real Google API 403 for this case carries the reason on BOTH the
+    legacy `errors[].reason` field and a newer `details[].reason`
+    ErrorInfo entry at once - not one or the other. `HttpError`'s own
+    `_get_reason()` picks `details` over `errors` whenever both are
+    present, dropping the legacy reason from `str(exc)` entirely, which
+    is exactly what makes a naive `"insufficientPermissions" in str(exc)`
+    substring check unreliable (see `_is_insufficient_scope_error`)."""
+    return HttpError(
+        _FakeHttpResp(403),
+        (
+            b'{"error": {"code": 403, '
+            b'"message": "Request had insufficient authentication scopes.", '
+            b'"errors": [{"message": "Insufficient Permission", '
+            b'"domain": "global", "reason": "insufficientPermissions"}], '
+            b'"status": "PERMISSION_DENIED", '
+            b'"details": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo", '
+            b'"reason": "ACCESS_TOKEN_SCOPE_INSUFFICIENT", '
+            b'"domain": "googleapis.com", '
+            b'"metadata": {"service": "calendar-json.googleapis.com", '
+            b'"method": "calendar.v3.Freebusy.Query"}}]}}'
+        ),
+    )
+
+
+def _legacy_only_insufficient_scope_error() -> HttpError:
+    """Older/less-instrumented responses may still carry only the legacy
+    field - must keep matching this shape too, not just the dual one."""
     return HttpError(
         _FakeHttpResp(403),
         (
@@ -1073,6 +1100,21 @@ def test_create_events_ignore_conflicts_skips_the_check_entirely(fake_service):
     assert result["status"] == "success"
     assert fake_service._events.list_calls == []
     assert len(fake_service._events.insert_calls) == 1
+
+
+def test_create_events_rejects_a_reversed_window(fake_service):
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Kickoff",
+            start_time="2026-08-27T10:30:00+08:00",
+            end_time="2026-08-27T10:00:00+08:00",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "must be after" in result["message"]
+    assert fake_service._events.list_calls == []
+    assert fake_service._events.insert_calls == []
 
 
 def test_update_events_excludes_the_event_being_moved_from_its_own_conflicts(
@@ -1476,6 +1518,53 @@ def test_freebusy_missing_scope_degrades_to_unchecked_instead_of_erroring(
     assert result["unchecked_attendees"] == ["chelsea@example.com"]
     assert "reconnect" in result["unchecked_reason"].lower()
     assert len(fake_service._events.insert_calls) == 1
+
+
+def test_freebusy_missing_scope_legacy_only_body_still_degrades(fake_service):
+    """The dual-format body is what a real Calendar API 403 actually
+    carries, but a response with only the legacy `errors[]` field must
+    still be recognized - not just the newer `details[]` shape."""
+    fake_service._freebusy = FakeFreebusy(
+        raise_error=_legacy_only_insufficient_scope_error()
+    )
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Kickoff",
+            start_time="2026-08-27T10:00:00+08:00",
+            end_time="2026-08-27T10:30:00+08:00",
+            attendees=["chelsea@example.com"],
+        )
+    )
+
+    assert result["status"] == "success"
+    assert result["unchecked_attendees"] == ["chelsea@example.com"]
+
+
+def test_is_insufficient_scope_error_matches_details_only_body():
+    """Regression test for the actual bug: HttpError._get_reason() prefers
+    `details` over `errors` whenever a response carries both, dropping
+    "insufficientPermissions" from str(exc) entirely - a plain substring
+    check on str(exc) would miss this. Must check the parsed body's
+    fields directly instead."""
+    details_only = HttpError(
+        _FakeHttpResp(403),
+        (b'{"error": {"details": [{"reason": "ACCESS_TOKEN_SCOPE_INSUFFICIENT"}]}}'),
+    )
+    assert calendar._is_insufficient_scope_error(details_only) is True
+
+
+def test_is_insufficient_scope_error_rejects_unrelated_403():
+    other = HttpError(
+        _FakeHttpResp(403),
+        b'{"error": {"errors": [{"reason": "forbiddenForNonOrganizer"}]}}',
+    )
+    assert calendar._is_insufficient_scope_error(other) is False
+
+
+def test_is_insufficient_scope_error_tolerates_malformed_body():
+    malformed = HttpError(_FakeHttpResp(403), b"not json")
+    assert calendar._is_insufficient_scope_error(malformed) is False
 
 
 def test_freebusy_other_http_errors_still_propagate(fake_service):

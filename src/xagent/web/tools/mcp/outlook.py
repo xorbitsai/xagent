@@ -8,12 +8,14 @@ import requests
 from mcp.server.fastmcp import FastMCP
 
 from .utils import attendees_needing_check as _attendees_needing_check
+from .utils import attendees_to_add as _attendees_to_add
 from .utils import attendees_were_given as _attendees_were_given
 from .utils import conflict_response as _conflict_response
 from .utils import datetime_key_for_comparison as _datetime_key_for_comparison
 from .utils import naive_day_bounds as _naive_day_bounds
 from .utils import normalize_addresses as _normalize_addresses
 from .utils import offset_datetime_string as _offset_datetime_string
+from .utils import reject_reversed_window as _reject_reversed_window
 from .utils import resolve_zoneinfo as _resolve_zoneinfo
 from .utils import setup_proxy_env
 from .utils import timezones_could_differ as _timezones_could_differ
@@ -511,6 +513,10 @@ def outlook_create_event(
     has explicitly confirmed a conflict is fine.
     """
     try:
+        # Both sides share the same `timezone`, so comparing them as naive
+        # values (no offset attached) is already a valid relative
+        # comparison - it doesn't matter which real zone that is.
+        _reject_reversed_window(start_datetime, end_datetime)
         normalized_attendees = _normalize_addresses(attendees) if attendees else []
 
         unchecked_attendees: list[str] = []
@@ -741,17 +747,7 @@ def outlook_update_event(
         # docstring), so the effective set for conflict-checking purposes
         # is always existing-plus-newly-added, never a caller-supplied
         # subset that could silently drop someone.
-        if attendees_given:
-            assert (
-                attendees is not None
-            )  # narrows for mypy; attendees_given implies this
-            added_attendees = [
-                address
-                for address in _normalize_addresses(attendees)
-                if address.lower() not in existing_attendee_emails
-            ]
-        else:
-            added_attendees = []
+        added_attendees = _attendees_to_add(attendees, existing_attendee_emails)
         # Preserve the casing already on the event - only the
         # membership check below needs to be case-insensitive, not
         # what gets queried/reported back to the caller.

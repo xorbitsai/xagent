@@ -547,6 +547,146 @@ def test_update_events_explicit_timezone_localizes_all_day_recurrence_without_wr
     assert "timeZone" not in kwargs["body"]["end"]
 
 
+def test_update_events_all_day_recurrence_actually_uses_the_given_timezone_not_utc(
+    monkeypatch,
+):
+    """Regression test distinguishing "localizes with the given timezone"
+    from "always falls back to UTC regardless of what's passed": the
+    all-day anchor is 2026-09-12 and UNTIL is 2026-09-11T20:00:00Z. Read
+    as Asia/Shanghai (+8), the anchor is 2026-09-11 16:00 UTC, which is
+    BEFORE the 20:00 UTC UNTIL - not-before-start, so this succeeds. If
+    the code silently used UTC instead of the given timezone to localize
+    the anchor, it would read as 2026-09-12 00:00 UTC - AFTER UNTIL - and
+    wrongly reject this as "UNTIL before the start time"."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"date": "2026-09-12"},
+        "end": {"date": "2026-09-13"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            timezone="Asia/Shanghai",
+            recurrence="FREQ=DAILY;UNTIL=20260911T200000Z",
+        )
+    )
+
+    assert result["status"] == "success"
+
+
+def test_update_events_rejects_end_time_only_on_an_all_day_event(monkeypatch):
+    """Confirmed bug: passing only end_time (a timed RFC3339 value) on an
+    all-day event left start as a bare "date" while end became a
+    "dateTime" - Google requires start and end to be the same kind, so
+    this mismatched payload would be rejected by the real API. Caught
+    here instead, with a clear error telling the caller to pass both."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"date": "2026-08-26"},
+        "end": {"date": "2026-08-27"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            end_time="2026-08-28T10:00:00Z",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "must both be provided together" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_events_rejects_start_time_only_on_an_all_day_event(monkeypatch):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"date": "2026-08-26"},
+        "end": {"date": "2026-08-27"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-08-26T10:00:00Z",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "must both be provided together" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_events_rejects_bare_date_start_time_on_a_timed_event(monkeypatch):
+    """Confirmed bug: a bare date (no "T") passed as start_time on an
+    already-timed event flips is_all_day true for start alone, while end
+    (untouched) stays a "dateTime" - the same shape-mismatch class of bug
+    as the all-day case above, just approached from the opposite
+    direction and via undocumented misuse of start_time's RFC3339
+    contract."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T09:00:00+08:00", "timeZone": "Asia/Shanghai"},
+        "end": {"dateTime": "2026-08-26T09:15:00+08:00", "timeZone": "Asia/Shanghai"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-08-27",
+            timezone="Asia/Shanghai",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "must both be provided together" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_events_converts_all_day_event_to_timed_when_both_are_provided(
+    monkeypatch,
+):
+    """The one legitimate way to convert an all-day event to a timed one:
+    both start_time and end_time given together, so start/end stay the
+    same kind throughout."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"date": "2026-08-26"},
+        "end": {"date": "2026-08-27"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-08-26T09:00:00",
+            end_time="2026-08-26T10:00:00",
+            timezone="Asia/Shanghai",
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["body"]["start"] == {
+        "dateTime": "2026-08-26T09:00:00",
+        "timeZone": "Asia/Shanghai",
+    }
+    assert kwargs["body"]["end"] == {
+        "dateTime": "2026-08-26T10:00:00",
+        "timeZone": "Asia/Shanghai",
+    }
+
+
 def test_update_events_rejects_recurrence_when_no_start_information_exists(
     monkeypatch,
 ):

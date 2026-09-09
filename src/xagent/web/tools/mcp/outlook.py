@@ -534,10 +534,32 @@ def _build_graph_recurrence(
         )
 
     if "UNTIL" in parts:
+        end_date = _rrule_until_to_date(parts["UNTIL"], zone, anchor)
+        if end_date < start_date:
+            # start_date is derived from `anchor` in whatever tzinfo it
+            # already carries (its own embedded offset, if any - only a
+            # naive anchor gets `zone`), while end_date is derived by
+            # projecting UNTIL into `zone` specifically. These only ever
+            # disagree when start_datetime's own offset disagrees with
+            # the separately-passed `timezone` - a documented edge case
+            # this connector doesn't fully reconcile - but this specific
+            # consequence (an inverted range Graph would reject outright)
+            # is worse than the usual wrong-weekday symptom of that edge
+            # case, so it's caught here with a clear local error instead
+            # of reaching Graph as a malformed request.
+            raise ValueError(
+                "invalid recurrence rule: the computed recurrence end "
+                f"date ({end_date}) is before its start date "
+                f"({start_date}) - this usually means start_datetime's "
+                "own UTC offset disagrees with the separately-passed "
+                "timezone; pass a naive start_datetime (no embedded "
+                "offset) so timezone alone determines it, or make sure "
+                "the two agree"
+            )
         range_: dict[str, Any] = {
             "type": "endDate",
             "startDate": start_date,
-            "endDate": _rrule_until_to_date(parts["UNTIL"], zone, anchor),
+            "endDate": end_date,
         }
     elif "COUNT" in parts:
         range_ = {

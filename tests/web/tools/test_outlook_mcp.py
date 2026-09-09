@@ -343,6 +343,22 @@ def test_build_graph_recurrence_rejects_invalid_rrule():
         outlook._build_graph_recurrence("FREQ=FORTNIGHTLY", "2026-08-11T07:00:00+08:00")
 
 
+def test_build_graph_recurrence_rejects_end_date_before_start_date():
+    """Confirmed bug: start_date is derived from `start_datetime`'s OWN
+    embedded UTC offset (+08:00 here), while endDate is derived by
+    projecting UNTIL into the separately-passed `timezone` (left at its
+    "UTC" default) - when the two disagree and UNTIL is only barely after
+    the anchor's own instant, the calendar-date components can invert,
+    producing a `range` Graph would reject outright (endDate before
+    startDate). This must be caught locally with a clear error instead of
+    reaching Graph as a malformed request."""
+    with pytest.raises(ValueError, match="end date .* is before its start date"):
+        outlook._build_graph_recurrence(
+            "FREQ=DAILY;UNTIL=20260825T230100Z",
+            "2026-08-26T07:00:00+08:00",
+        )
+
+
 def test_build_graph_recurrence_relative_monthly():
     """FREQ=MONTHLY;BYDAY=2TU ("the second Tuesday of every month") has no
     BYMONTHDAY equivalent but does map onto Graph's relativeMonthly type."""

@@ -503,6 +503,26 @@ def google_calendar_update_events(
             "start", {}
         ).get("date")
         is_all_day = current_start_value is not None and "T" not in current_start_value
+        # Google requires start and end to be the SAME kind (both a bare
+        # "date" or both a "dateTime") - never a mix. Passing only one of
+        # start_time/end_time to convert an all-day event to a timed one
+        # (or vice versa) would otherwise silently leave the other side in
+        # its old shape, producing a payload Google's API would reject.
+        current_end_value = event.get("end", {}).get("dateTime") or event.get(
+            "end", {}
+        ).get("date")
+        end_is_all_day = current_end_value is not None and "T" not in current_end_value
+        if (
+            current_start_value is not None
+            and current_end_value is not None
+            and is_all_day != end_is_all_day
+        ):
+            raise ValueError(
+                "start_time and end_time must both be provided together "
+                "when converting between an all-day event and a timed "
+                "event; a Google Calendar event's start and end must both "
+                "be a bare date or both a dateTime, never a mix"
+            )
 
         if timezone and not is_all_day:
             event.setdefault("start", {})["timeZone"] = timezone

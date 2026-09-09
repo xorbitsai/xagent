@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections import Counter
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
@@ -116,6 +117,8 @@ COMPACT_DROPPED_TOOL_NOTICE_MAX_NAMES = 20
 # Wire name: request_context keys reach metadata verbatim, so renaming this
 # breaks the clients that populate it.
 CLOCK_TIMEZONE_METADATA_KEY = "timezone"
+
+logger = logging.getLogger(__name__)
 
 
 def estimate_provider_prompt_tokens(
@@ -320,7 +323,38 @@ class ExecutionContext:
             # immediately follow the assistant message that declared them,
             # and _sanitize_tool_message_pairs drops the whole assistant turn
             # if a user message breaks the run (xorbitsai/xagent#2223).
-            self.messages.insert(self._last_user_message_index(), message)
+            insert_index = self._last_user_message_index()
+            # The heal shape is assistant[tool_calls] -> tool* -> user(answer):
+            # the cancellation must extend the contiguous tool run before the
+            # answer. Walk back over any tool messages to find the assistant
+            # turn that owns the run; anything else (no user message, user at
+            # start, user->user, assistant without tool_calls) violates the
+            # placement contract and falls back to append so the sanitizer
+            # cannot drop an earlier turn.
+            anchor_index = insert_index - 1
+            while (
+                anchor_index >= 0
+                and self.messages[anchor_index].role == "tool"
+            ):
+                anchor_index -= 1
+            anchor = (
+                self.messages[anchor_index] if anchor_index >= 0 else None
+            )
+            if (
+                insert_index >= len(self.messages)
+                or anchor is None
+                or anchor.role != "assistant"
+                or not anchor.tool_calls
+            ):
+                logger.warning(
+                    "insert_before_last_user placement contract violated: "
+                    "last user message at index %d is not preceded by an "
+                    "assistant tool-call turn; appending tool result instead",
+                    insert_index,
+                )
+                self.messages.append(message)
+            else:
+                self.messages.insert(insert_index, message)
         else:
             self.messages.append(message)
         return message

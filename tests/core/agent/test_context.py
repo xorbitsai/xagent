@@ -597,6 +597,62 @@ def test_add_messages() -> None:
     assert tool.metadata["raw_result"]["output"] == "done"
 
 
+def test_add_tool_result_insert_before_last_user_without_user_message_falls_back(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    ctx = ExecutionContext()
+    ctx.add_assistant_message(
+        "",
+        tool_calls=[
+            {"id": "call-1", "type": "function", "function": {"name": "read_file"}}
+        ],
+    )
+
+    with caplog.at_level("WARNING"):
+        tool = ctx.add_tool_result(
+            "read_file", {"output": "done"}, tool_call_id="call-1",
+            insert_before_last_user=True,
+        )
+
+    assert ctx.messages[-1] is tool
+    assert "placement contract" in caplog.text
+
+
+def test_add_tool_result_insert_before_last_user_without_tool_call_turn_falls_back() -> (
+    None
+):
+    ctx = ExecutionContext()
+    ctx.add_user_message("first")
+    ctx.add_user_message("second")
+
+    tool = ctx.add_tool_result(
+        "read_file", {"output": "done"}, tool_call_id="call-1",
+        insert_before_last_user=True,
+    )
+
+    assert ctx.messages[-1] is tool
+
+
+def test_add_tool_result_insert_before_last_user_keeps_tool_call_adjacency() -> None:
+    ctx = ExecutionContext()
+    ctx.add_assistant_message(
+        "",
+        tool_calls=[
+            {"id": "call-1", "type": "function", "function": {"name": "read_file"}}
+        ],
+    )
+    ctx.add_user_message("answer")
+
+    tool = ctx.add_tool_result(
+        "read_file", {"output": "done"}, tool_call_id="call-1",
+        insert_before_last_user=True,
+    )
+
+    assert ctx.messages[-2] is tool
+    assert ctx.messages[-1].role == "user"
+    assert ctx.messages[-1].content == "answer"
+
+
 def test_artifact_tool_result_sanitizes_file_refs_in_raw_context_metadata() -> None:
     ctx = ExecutionContext()
 

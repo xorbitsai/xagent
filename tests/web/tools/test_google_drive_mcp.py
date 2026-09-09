@@ -162,6 +162,13 @@ def test_resolve_file_id_rejects_userinfo_bearing_authority(url):
         "https://evil.com@drive.google.com/x?id=ATTACKER_ID",
         r"https://evil.com\@drive.google.com/x?id=ATTACKER_ID",
         "https://docs.google.com/spreadsheets/d/e/2PACX-1vTabc123xyz/pubhtml",
+        # A trusted-host URL whose path isn't a recognized share-link
+        # shape at all (not even an excluded one) -- both functions must
+        # agree this doesn't resolve to a real id.
+        "https://drive.google.com/drive/my-drive",
+        # A malformed path segment the end-anchor now rejects instead of
+        # truncating -- both functions must agree on that too.
+        "https://drive.google.com/file/d/ABC.DEF/view",
     ],
 )
 def test_resolve_file_id_and_extract_resource_key_agree_on_untrusted_input(url):
@@ -418,17 +425,18 @@ def test_extract_resource_key(value, expected):
 def test_attach_resource_key_refuses_a_file_id_containing_crlf(malicious_file_id):
     """Belt-and-suspenders defense: _extract_resource_key's guard should
     make this unreachable in practice (a resourcekey is only ever
-    extracted alongside a _DRIVE_ID_CHARS-validated file_id), but this
-    function has no other way to signal "don't attach" than silently
-    skipping -- confirms it does, rather than building a header value most
-    HTTP clients (http.client raises ValueError on a raw CR/LF in a header
-    value) would reject anyway."""
+    extracted alongside a _DRIVE_ID_CHARS-validated file_id), but if a
+    future call site ever breaks that invariant, this must raise rather
+    than silently skip the header -- a silent skip would send a request
+    that legitimately needed the header without it, surfacing later as a
+    confusing 404 instead of an immediate, actionable local error."""
     request = Mock()
     request.headers = {}
 
-    result = google_drive._attach_resource_key(request, malicious_file_id, "0-Rkey123")
+    with pytest.raises(ValueError, match="CR/LF"):
+        google_drive._attach_resource_key(request, malicious_file_id, "0-Rkey123")
 
-    assert result.headers == {}
+    assert request.headers == {}
 
 
 def test_attach_resource_key_attaches_normally_for_a_clean_file_id():
@@ -457,6 +465,17 @@ def test_require_share_role_error_message_is_not_a_tuple_repr():
 @pytest.mark.parametrize("good_role", ["reader", "commenter", "writer"])
 def test_require_share_role_accepts_allowed_roles(good_role):
     assert google_drive._require_share_role(good_role) == good_role
+
+
+@pytest.mark.parametrize("bad_entity_type", ["domain", "anyone", ""])
+def test_require_entity_type_rejects_types_outside_the_allowed_set(bad_entity_type):
+    with pytest.raises(ValueError, match="entity_type"):
+        google_drive._require_entity_type(bad_entity_type)
+
+
+@pytest.mark.parametrize("good_entity_type", ["user", "group"])
+def test_require_entity_type_accepts_allowed_types(good_entity_type):
+    assert google_drive._require_entity_type(good_entity_type) == good_entity_type
 
 
 _FOLDER_URL_WITH_ID = "https://drive.google.com/drive/folders/abc123"

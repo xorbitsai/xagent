@@ -106,6 +106,14 @@ _DRIVE_URL_HOSTS = frozenset(
 # this connector chooses to expose.
 _SHARE_ROLES = ("reader", "commenter", "writer")
 
+# "domain" and "anyone" are deliberately excluded, matching
+# google_drive_share_file's own docstring ("can't share with an entire
+# domain" / no "anyone with the link" support): both grant access to a much
+# broader audience than "one specific user or group", which is a distinct
+# product decision this connector doesn't make on the model's behalf, the
+# same reasoning _SHARE_ROLES above already applies to "owner"/"organizer".
+_SHARE_ENTITY_TYPES = ("user", "group")
+
 # Same shape as api/auth.py's EMAIL_PATTERN, kept as its own local copy
 # rather than imported: this module runs as its own subprocess per MCP tool
 # call (see get_drive_service's callers), and auth.py is a ~3800-line
@@ -213,6 +221,39 @@ def _parse_trusted_drive_url(value: str) -> ParseResult | None:
     return parsed
 
 
+def _resolve_id_from_parsed(
+    parsed: ParseResult, query_params: dict[str, list[str]] | None = None
+) -> str | None:
+    """Given an already-trusted, parsed Drive URL (see
+    _parse_trusted_drive_url), return the real fileId it resolves to, or
+    ``None`` if it doesn't resolve to one at all -- a recognized-but-
+    excluded path shape (e.g. the published-to-web "/d/e/" form), or a
+    path/query that doesn't match any known share-link shape.
+
+    The single source of truth for "does this URL resolve to a real
+    fileId", shared by _resolve_file_id and _extract_resource_key so their
+    answers to that question can't independently drift -- they did,
+    twice: once for the "/d/e/" exclusion specifically (fixed by factoring
+    out _parse_trusted_drive_url for the host/userinfo trust decision),
+    and once for any other unrecognized path shape (fixed by factoring out
+    this function for the id-resolution decision itself). A caller that
+    already has ``parsed.query`` parsed for its own purposes (e.g.
+    _extract_resource_key, which needs it again for "resourcekey") can
+    pass ``query_params`` to avoid parsing it a second time here.
+    """
+    match = _DRIVE_PATH_ID_PATTERN.search(parsed.path)
+    if match:
+        return match.group(1)
+    if _DRIVE_PATH_SHAPE_PATTERN.search(parsed.path):
+        return None
+    if query_params is None:
+        query_params = parse_qs(parsed.query)
+    query_id = query_params.get("id")
+    if query_id and _DRIVE_ID_CHARS.fullmatch(query_id[0]):
+        return query_id[0]
+    return None
+
+
 def _resolve_file_id(file_id: str, field_name: str = "file_id") -> str:
     """Return the id captured out of a Drive/Docs/Sheets/Slides share link,
     or ``file_id`` itself (stripped) when it's already a bare id -- or, for
@@ -236,9 +277,9 @@ def _resolve_file_id(file_id: str, field_name: str = "file_id") -> str:
     ``.../files/`` collection endpoint instead of a specific file.
 
     Once the host is confirmed trusted (see _parse_trusted_drive_url), the
-    id is extracted from the parsed URL's own ``.path``/``.query`` -- not
-    searched over the whole raw string -- so a URL whose overall host is
-    allowed but whose query *value* merely contains a matching shape
+    id is extracted via _resolve_id_from_parsed -- not searched over the
+    whole raw string -- so a URL whose overall host is allowed but whose
+    query *value* merely contains a matching shape
     (".../search?q=/file/d/<id>") can't have that unrelated substring
     extracted as if it were the URL's own resource id. A path recognized
     as a share-link shape that _DRIVE_PATH_ID_PATTERN deliberately
@@ -270,15 +311,8 @@ def _resolve_file_id(file_id: str, field_name: str = "file_id") -> str:
     parsed = _parse_trusted_drive_url(stripped)
     if parsed is None:
         return stripped
-    match = _DRIVE_PATH_ID_PATTERN.search(parsed.path)
-    if match:
-        return match.group(1)
-    if _DRIVE_PATH_SHAPE_PATTERN.search(parsed.path):
-        return stripped
-    query_id = parse_qs(parsed.query).get("id")
-    if query_id and _DRIVE_ID_CHARS.fullmatch(query_id[0]):
-        return query_id[0]
-    return stripped
+    resolved = _resolve_id_from_parsed(parsed)
+    return resolved if resolved is not None else stripped
 
 
 def _extract_resource_key(file_id: str) -> str | None:
@@ -295,15 +329,15 @@ def _extract_resource_key(file_id: str) -> str | None:
     place it's ever exposed is the "?resourcekey=" query parameter Drive
     puts on the share link itself.
 
-    Shares _parse_trusted_drive_url with _resolve_file_id rather than
-    keeping its own copy of the host/userinfo trust logic, and mirrors
-    _resolve_file_id's exact three-branch decision (path-id match, then
-    shape-exclusion, then the legacy "?id=" query fallback) rather than a
-    looser approximation of it -- covering not just the published-to-web
-    "/d/e/" exclusion but any other trusted-host URL whose path isn't a
-    recognized share-link shape at all. This guarantees that whenever this
+    Shares _parse_trusted_drive_url and _resolve_id_from_parsed with
+    _resolve_file_id rather than keeping its own copy of either the host/
+    userinfo trust logic or the id-resolution decision -- covering not
+    just the published-to-web "/d/e/" exclusion but any other trusted-host
+    URL whose path isn't a recognized share-link shape at all. Sharing
+    _resolve_id_from_parsed (rather than each function keeping its own
+    copy of that three-branch decision) guarantees that whenever this
     function returns a resourcekey, _resolve_file_id on the same input
-    took the identical branch and returned a real, _DRIVE_ID_CHARS-
+    made the identical decision and returned a real, _DRIVE_ID_CHARS-
     validated fileId -- never the raw unresolved URL string -- which is
     also what keeps _attach_resource_key's header value free of characters
     (including a literal CR/LF) the fileId half was never validated
@@ -317,18 +351,10 @@ def _extract_resource_key(file_id: str) -> str | None:
     parsed = _parse_trusted_drive_url(file_id)
     if parsed is None:
         return None
-    if not _DRIVE_PATH_ID_PATTERN.search(parsed.path):
-        if _DRIVE_PATH_SHAPE_PATTERN.search(parsed.path):
-            # Recognized-but-excluded shape (e.g. published-to-web "/d/e/")
-            # -- _resolve_file_id refuses to resolve an id for this shape
-            # at all, never falling through to the "?id=" query check
-            # either (see its own comment on that exact point), so neither
-            # should this.
-            return None
-        query_id = parse_qs(parsed.query).get("id")
-        if not (query_id and _DRIVE_ID_CHARS.fullmatch(query_id[0])):
-            return None
-    resource_key = parse_qs(parsed.query).get("resourcekey")
+    query_params = parse_qs(parsed.query)
+    if _resolve_id_from_parsed(parsed, query_params) is None:
+        return None
+    resource_key = query_params.get("resourcekey")
     if not resource_key:
         return None
     candidate = resource_key[0]
@@ -357,18 +383,22 @@ def _attach_resource_key(request: Any, file_id: str, resource_key: str | None) -
     ``file_id`` is expected to already be _DRIVE_ID_CHARS-clean by this
     point -- every call site passes the result of _resolve_file_id, and
     _extract_resource_key only ever returns a truthy ``resource_key`` when
-    _resolve_file_id would have taken the same validated-id branch on the
-    same input (see _extract_resource_key's docstring). The CR/LF check
-    here is belt-and-suspenders defense against a future call site breaking
-    that invariant, not the primary guard against it: this function has no
-    way to signal "skip the header" other than silently doing so, so a
-    literal CR/LF in ``file_id`` still reaching here would otherwise build
-    a header value most HTTP clients reject outright (http.client raises
-    ValueError on a raw CR/LF in a header value) rather than the clean,
-    actionable error this connector's own validation would give.
+    _resolve_id_from_parsed made the identical decision on the same input
+    and _resolve_file_id would therefore have taken the same validated-id
+    branch (see _extract_resource_key's docstring). The CR/LF check here is
+    belt-and-suspenders defense against a future call site breaking that
+    invariant -- raising rather than silently skipping the header, since a
+    silent skip would be a *worse* failure mode than surfacing the
+    violation: a pre-2021 link-shared item that genuinely needs this header
+    would otherwise get a confusing 404 from Drive with no indication a
+    resourcekey was computed but silently dropped, instead of a clear,
+    immediate, actionable local error pointing at the actual bug.
     """
-    if resource_key and "\r" not in file_id and "\n" not in file_id:
-        request.headers["X-Goog-Drive-Resource-Keys"] = f"{file_id}/{resource_key}"
+    if not resource_key:
+        return request
+    if "\r" in file_id or "\n" in file_id:
+        raise ValueError(f"file_id must not contain CR/LF, got {file_id!r}")
+    request.headers["X-Goog-Drive-Resource-Keys"] = f"{file_id}/{resource_key}"
     return request
 
 
@@ -397,6 +427,13 @@ def _require_share_role(role: str) -> str:
         allowed = ", ".join(_SHARE_ROLES)
         raise ValueError(f"role must be one of {allowed}")
     return role
+
+
+def _require_entity_type(entity_type: str) -> str:
+    if entity_type not in _SHARE_ENTITY_TYPES:
+        allowed = ", ".join(_SHARE_ENTITY_TYPES)
+        raise ValueError(f"entity_type must be one of {allowed}")
+    return entity_type
 
 
 def _default_halve(value: Any) -> Any:
@@ -1293,8 +1330,7 @@ def google_drive_share_file(
     """
     try:
         _require_share_role(role)
-        if entity_type not in ("user", "group"):
-            raise ValueError('entity_type must be "user" or "group"')
+        _require_entity_type(entity_type)
         require_clean_identifier(email, "email")
         if not _EMAIL_PATTERN.match(email):
             raise ValueError("email must be a valid email address")

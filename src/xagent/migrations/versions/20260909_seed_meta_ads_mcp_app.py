@@ -1,7 +1,7 @@
 """seed built-in Meta Ads MCP connector
 
 Revision ID: 20260909_seed_meta_ads_mcp_app
-Revises: 20260901_seed_zendesk_mcp_app
+Revises: 20260909_actor_mcp_connections
 Create Date: 2026-09-09 00:00:00.000000
 
 """
@@ -13,7 +13,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "20260909_seed_meta_ads_mcp_app"
-down_revision: Union[str, None] = "20260901_seed_zendesk_mcp_app"
+down_revision: Union[str, None] = "20260909_actor_mcp_connections"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

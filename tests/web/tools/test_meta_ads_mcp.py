@@ -375,3 +375,22 @@ def test_graph_api_error_logging_redacts_the_token(monkeypatch, caplog):
 
     assert "user-token" not in caplog.text
     assert "[redacted]" in caplog.text
+
+
+def test_generic_exception_logging_also_redacts_the_token(monkeypatch, caplog):
+    """_log_error covers the generic `except Exception` branch too, not just
+    GraphAPIError -- an unexpected failure that happens to embed the token
+    in its message must not leak it into logs either."""
+    monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
+    monkeypatch.setattr(
+        meta_ads.requests,
+        "request",
+        Mock(side_effect=RuntimeError("boom: token was user-token")),
+    )
+
+    with caplog.at_level("ERROR", logger="meta-ads-mcp"):
+        result = _payload(meta_ads.meta_ads_auth_status())
+
+    assert result["status"] == "error"
+    assert "user-token" not in caplog.text
+    assert "[redacted]" in caplog.text

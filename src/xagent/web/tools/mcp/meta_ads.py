@@ -127,16 +127,27 @@ def _equal_filter(field: str, value: str) -> dict[str, str]:
     return {"field": field, "operator": "EQUAL", "value": value}
 
 
-def _log_graph_error(message: str, error: GraphAPIError) -> None:
-    """Log a GraphAPIError with the same token redaction its JSON response
+def _log_error(message: str, error: Exception) -> None:
+    """Log an exception with the same token redaction the JSON response
     gets, instead of the raw str(error) -- which can otherwise write the
-    access token straight to application logs before graph_error_response()
-    has a chance to redact it (the Graph API can echo the token back in an
-    OAuth error message)."""
+    access token straight to application logs (the Graph API can echo it
+    back in an OAuth error message, and a non-GraphAPIError failure could
+    still be wrapping raw response text). Covers both GraphAPIError (whose
+    sensitive_values may include a page-scoped token beyond the env one)
+    and plain exceptions (getattr falls back to just the env token via
+    redact_secrets's own default).
+
+    Deliberately does NOT pass exc_info=True: logging's exception formatter
+    renders the traceback from the original exception object itself, whose
+    last line is `type(error).__name__: str(error)` -- the exact unredacted
+    string this function exists to scrub. Attaching it would silently
+    reopen the same leak on every call.
+    """
+    sensitive_values = getattr(error, "sensitive_values", None)
     logger.error(
         "%s: %s",
         message,
-        meta_graph.redact_secrets(str(error), sensitive_values=error.sensitive_values),
+        meta_graph.redact_secrets(str(error), sensitive_values=sensitive_values),
     )
 
 
@@ -150,10 +161,10 @@ def meta_ads_auth_status() -> str:
             user={"id": me.get("id"), "name": me.get("name")},
         )
     except GraphAPIError as e:
-        _log_graph_error("Error checking Meta Ads auth status", e)
+        _log_error("Error checking Meta Ads auth status", e)
         return _graph_error(e)
     except Exception as e:
-        logger.error("Error checking Meta Ads auth status: %s", e)
+        _log_error("Error checking Meta Ads auth status", e)
         return _error(str(e))
 
 
@@ -173,10 +184,10 @@ def meta_ads_list_ad_accounts(limit: int = 25) -> str:
             next_link=(result.get("paging") or {}).get("next"),
         )
     except GraphAPIError as e:
-        _log_graph_error("Error listing Meta ad accounts", e)
+        _log_error("Error listing Meta ad accounts", e)
         return _graph_error(e)
     except Exception as e:
-        logger.error("Error listing Meta ad accounts: %s", e)
+        _log_error("Error listing Meta ad accounts", e)
         return _error(str(e))
 
 
@@ -191,10 +202,10 @@ def meta_ads_get_ad_account(ad_account_id: str) -> str:
         )
         return _success(ad_account=result)
     except GraphAPIError as e:
-        _log_graph_error(f"Error getting Meta ad account {ad_account_id}", e)
+        _log_error(f"Error getting Meta ad account {ad_account_id}", e)
         return _graph_error(e)
     except Exception as e:
-        logger.error("Error getting Meta ad account %s: %s", ad_account_id, e)
+        _log_error(f"Error getting Meta ad account {ad_account_id}", e)
         return _error(str(e))
 
 
@@ -213,10 +224,10 @@ def meta_ads_list_campaigns(ad_account_id: str, limit: int = 25) -> str:
             next_link=(result.get("paging") or {}).get("next"),
         )
     except GraphAPIError as e:
-        _log_graph_error(f"Error listing campaigns for {ad_account_id}", e)
+        _log_error(f"Error listing campaigns for {ad_account_id}", e)
         return _graph_error(e)
     except Exception as e:
-        logger.error("Error listing campaigns for %s: %s", ad_account_id, e)
+        _log_error(f"Error listing campaigns for {ad_account_id}", e)
         return _error(str(e))
 
 
@@ -242,10 +253,10 @@ def meta_ads_list_ad_sets(
             next_link=(result.get("paging") or {}).get("next"),
         )
     except GraphAPIError as e:
-        _log_graph_error(f"Error listing ad sets for {ad_account_id}", e)
+        _log_error(f"Error listing ad sets for {ad_account_id}", e)
         return _graph_error(e)
     except Exception as e:
-        logger.error("Error listing ad sets for %s: %s", ad_account_id, e)
+        _log_error(f"Error listing ad sets for {ad_account_id}", e)
         return _error(str(e))
 
 
@@ -278,10 +289,10 @@ def meta_ads_list_ads(
             next_link=(result.get("paging") or {}).get("next"),
         )
     except GraphAPIError as e:
-        _log_graph_error(f"Error listing ads for {ad_account_id}", e)
+        _log_error(f"Error listing ads for {ad_account_id}", e)
         return _graph_error(e)
     except Exception as e:
-        logger.error("Error listing ads for %s: %s", ad_account_id, e)
+        _log_error(f"Error listing ads for {ad_account_id}", e)
         return _error(str(e))
 
 
@@ -336,10 +347,10 @@ def meta_ads_get_insights(
             next_link=(result.get("paging") or {}).get("next"),
         )
     except GraphAPIError as e:
-        _log_graph_error(f"Error getting Meta Ads insights for {object_id}", e)
+        _log_error(f"Error getting Meta Ads insights for {object_id}", e)
         return _graph_error(e)
     except Exception as e:
-        logger.error("Error getting Meta Ads insights for %s: %s", object_id, e)
+        _log_error(f"Error getting Meta Ads insights for {object_id}", e)
         return _error(str(e))
 
 

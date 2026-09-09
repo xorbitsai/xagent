@@ -113,6 +113,29 @@ def test_resolve_file_id_rejects_userinfo_bearing_authority(url):
 @pytest.mark.parametrize(
     "url",
     [
+        # Untrusted/ambiguous URLs _resolve_file_id refuses to resolve an
+        # id for. _resolve_file_id and _extract_resource_key share
+        # _parse_trusted_drive_url specifically so their trust decisions
+        # for the same input can't drift apart the way they once did (see
+        # _parse_trusted_drive_url's docstring) -- this asserts that
+        # agreement directly, from one shared list, rather than only
+        # exercising each function's own hand-picked cases.
+        "https://evil.com/x?id=ATTACKER_CHOSEN_ID",
+        "https://evil.com@drive.google.com/x?id=ATTACKER_ID",
+        r"https://evil.com\@drive.google.com/x?id=ATTACKER_ID",
+        "https://docs.google.com/spreadsheets/d/e/2PACX-1vTabc123xyz/pubhtml",
+    ],
+)
+def test_resolve_file_id_and_extract_resource_key_agree_on_untrusted_input(url):
+    separator = "&" if "?" in url else "?"
+    resource_key_url = f"{url}{separator}resourcekey=0-Rkey123"
+    assert google_drive._resolve_file_id(resource_key_url) == resource_key_url
+    assert google_drive._extract_resource_key(resource_key_url) is None
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
         "drive.google.com/file/d/abc123/view",
         "drive.google.com/drive/folders/abc123",
         "docs.google.com/open?id=abc123",
@@ -289,10 +312,25 @@ def test_resolve_file_id_supports_usercontent_host():
             "https://evil.com@drive.google.com/file/d/abc123/view?resourcekey=0-Rkey123",
             None,
         ),
-        # A resourcekey value containing characters outside the id
-        # charset is rejected rather than passed through unvalidated into
-        # a header value.
-        ("https://drive.google.com/file/d/abc123/view?resourcekey=bad key", None),
+        # A resourcekey isn't restricted to the fileId character class --
+        # kb.py's own CloudFile.resourceKey field validates only
+        # "^[^\r\n]*$" (see test_kb_ingest_cloud_accepts_punctuation_in_
+        # drive_identifiers in test_kb_dir.py), so punctuation like a
+        # colon must be preserved rather than silently discarded.
+        (
+            "https://drive.google.com/file/d/abc123/view?resourcekey=resource:key_1-2",
+            "resource:key_1-2",
+        ),
+        # Published-to-web links ("/d/e/") have no real Drive fileId in
+        # them at all -- _resolve_file_id refuses to resolve an id for
+        # this exact shape, so a resourcekey must not be extracted for it
+        # either; doing so would attach a resourcekey header to a request
+        # whose fileId is the unresolved raw URL.
+        (
+            "https://docs.google.com/spreadsheets/d/e/2PACX-1vTabc123xyz/pubhtml"
+            "?resourcekey=0-Rkey123",
+            None,
+        ),
     ],
 )
 def test_extract_resource_key(value, expected):
@@ -494,6 +532,47 @@ def test_create_folder_resolves_parent_id_url_and_supports_shared_drives(monkeyp
     assert kwargs["body"]["parents"] == ["abc123"]
     assert kwargs["supportsAllDrives"] is True
     assert kwargs["fields"] == "id, name, webViewLink, mimeType"
+
+
+def test_create_file_attaches_resource_key_header_for_parent(monkeypatch):
+    """A pre-2021 link-shared parent folder needs its own resourcekey
+    attached the same way every other file_id-taking tool does, or
+    files.create 404s resolving a parent that genuinely exists."""
+    service = _mock_drive_service(monkeypatch)
+    create_request = service.files.return_value.create.return_value
+    create_request.headers = {}
+    create_request.execute.return_value = {"id": "new1", "name": "notes.txt"}
+
+    url = "https://drive.google.com/drive/folders/abc123?resourcekey=0-Rkey123"
+    google_drive.google_drive_create_file("notes.txt", "hello", parent_id=url)
+
+    assert create_request.headers == {"X-Goog-Drive-Resource-Keys": "abc123/0-Rkey123"}
+
+
+def test_create_folder_attaches_resource_key_header_for_parent(monkeypatch):
+    service = _mock_drive_service(monkeypatch)
+    create_request = service.files.return_value.create.return_value
+    create_request.headers = {}
+    create_request.execute.return_value = {"id": "new1", "name": "Subfolder"}
+
+    url = "https://drive.google.com/drive/folders/abc123?resourcekey=0-Rkey123"
+    google_drive.google_drive_create_folder("Subfolder", parent_id=url)
+
+    assert create_request.headers == {"X-Goog-Drive-Resource-Keys": "abc123/0-Rkey123"}
+
+
+def test_create_file_omits_resource_key_header_without_parent_id(monkeypatch):
+    """No parent_id at all must not call _attach_resource_key with a None
+    resolved_parent_id (which would otherwise build a nonsensical
+    "None/None" header value)."""
+    service = _mock_drive_service(monkeypatch)
+    create_request = service.files.return_value.create.return_value
+    create_request.headers = {}
+    create_request.execute.return_value = {"id": "new1", "name": "notes.txt"}
+
+    google_drive.google_drive_create_file("notes.txt", "hello")
+
+    assert create_request.headers == {}
 
 
 def test_create_file_validates_parent_id_before_building_service(monkeypatch):
@@ -1017,11 +1096,55 @@ def test_list_permissions_accepts_a_caller_supplied_page_token(monkeypatch):
 
 
 def test_list_permissions_returns_next_page_token_when_stopped_early(monkeypatch):
-    """When pagination stops early (either because accumulated size
-    already exceeds the output cap, or the loop-safety bound was hit) a
-    nextPageToken may still exist -- it must be surfaced so a caller can
-    resume the listing instead of the rest of the collaborators being
-    silently lost."""
+    """When pagination stops early because accumulated size already
+    exceeds the output cap, a nextPageToken may still exist -- it must be
+    surfaced so a caller can resume the listing instead of the rest of
+    the collaborators being silently lost.
+
+    Uses two pages (a small one that fits, then a huge one that doesn't)
+    rather than one huge page: the response must resume from the *first
+    dropped whole page*'s own start token, not from whatever nextPageToken
+    the last-fetched page happened to report -- otherwise a caller who
+    followed that resumed token would skip the second page's contents
+    entirely, since size-capping already dropped every one of its items
+    from this response.
+    """
+    monkeypatch.setattr(google_drive, "get_tool_max_output_length", lambda: 3000)
+    service = _mock_drive_service(monkeypatch)
+    small_page = [{"id": "perm0", "type": "user", "role": "reader"}]
+    huge_page = [
+        {
+            "id": f"perm{i}",
+            "type": "user",
+            "role": "reader",
+            "emailAddress": f"user{i}@example.com",
+            "displayName": "x" * 200,
+        }
+        for i in range(2000)
+    ]
+    service.permissions.return_value.list.return_value.execute.side_effect = [
+        {"permissions": small_page, "nextPageToken": "page2"},
+        {"permissions": huge_page, "nextPageToken": "page3"},
+    ]
+
+    result = json.loads(google_drive.google_drive_list_permissions("fid"))
+
+    assert result["truncated"] is True
+    # Resumes from page2 (the huge page's own start token) -- not page3
+    # (which would skip everything on page2, since none of it survived
+    # size-capping in this response).
+    assert result["next_page_token"] == "page2"
+    assert [p["id"] for p in result["permissions"]] == ["perm0"]
+
+
+def test_list_permissions_omits_resume_token_when_a_single_page_overflows_alone(
+    monkeypatch,
+):
+    """If even the single earliest page doesn't fit under the cap on its
+    own, there is no page-granular resume point to offer honestly (Drive's
+    pageToken can't resume from the middle of a page) -- next_page_token
+    must be omitted rather than pointing at the next page and silently
+    skipping whatever this response had to cut from the current one."""
     monkeypatch.setattr(google_drive, "get_tool_max_output_length", lambda: 3000)
     service = _mock_drive_service(monkeypatch)
     huge_page = [
@@ -1042,7 +1165,8 @@ def test_list_permissions_returns_next_page_token_when_stopped_early(monkeypatch
     result = json.loads(google_drive.google_drive_list_permissions("fid"))
 
     assert result["truncated"] is True
-    assert result["next_page_token"] == "page2"
+    assert "next_page_token" not in result
+    assert 0 < len(result["permissions"]) < len(huge_page)
 
 
 def test_list_permissions_omits_next_page_token_when_list_is_complete(monkeypatch):

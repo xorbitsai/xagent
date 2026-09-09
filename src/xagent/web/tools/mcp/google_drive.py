@@ -6,7 +6,7 @@ import os
 import re
 from collections.abc import Callable
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import ParseResult, parse_qs, urlparse
 
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build  # type: ignore[import-not-found]
@@ -150,6 +150,62 @@ _TEXT_PLAIN_EXPORT_FALLBACK = {
 }
 
 
+def _parse_trusted_drive_url(value: str) -> ParseResult | None:
+    """Return the parsed URL if ``value`` is URL-shaped, parses cleanly,
+    carries no userinfo ambiguity, and its host is in _DRIVE_URL_HOSTS --
+    otherwise ``None``.
+
+    This is the one place that decides "is this a URL this connector
+    trusts as its own Drive share link", shared by _resolve_file_id and
+    _extract_resource_key so that decision can't drift between them.
+    Before this was factored out, the two functions each carried their
+    own copy of this logic, and they *did* silently disagree: a
+    published-to-web "/d/e/" link that _resolve_file_id correctly refuses
+    to resolve an id for was nonetheless treated as trusted enough by
+    _extract_resource_key to pull a resourcekey out of -- the id-shape
+    exclusion lived only in _resolve_file_id's copy. Sharing this parse
+    step means a future fix to the trust decision (a new excluded shape,
+    another parser-differential case, etc.) applies to both call sites at
+    once instead of needing to be found and re-applied twice.
+
+    urlparse only populates ``.scheme``/``.netloc`` for a string with an
+    explicit "scheme://" prefix (or at least a leading "//"): a scheme-less
+    "evil.com/file/d/<id>/view" (at least as natural a shape for an
+    attacker to plant in text an agent reads as a full https:// URL) would
+    otherwise parse with no netloc and slip past a naive urlparse(value)
+    check. Retrying with a "//" prefix only when the *first* parse found no
+    netloc (rather than keying off whether "//" occurs anywhere in the
+    string) correctly handles a scheme-less link that itself contains a
+    nested "https://" further in, e.g. in a "continue=" query value.
+
+    A userinfo-bearing authority ("evil.com@drive.google.com", or the same
+    thing with a literal backslash before the "@") is inherently
+    ambiguous: Python's parser (correctly, per RFC 3986) treats everything
+    before the last "@" as userinfo and resolves .hostname to the part
+    after it, so this would pass the trusted-host check below -- but a
+    WHATWG-based parser (e.g. a browser rendering this same string to a
+    human, or a different URL consumer downstream) can disagree about
+    which side is the real destination. Reject outright rather than trust
+    a parse that other consumers of the same string might not agree with.
+    """
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    if not re.search(r"[/?]", stripped):
+        return None
+    try:
+        parsed = urlparse(stripped)
+        if not parsed.netloc:
+            parsed = urlparse(f"//{stripped}")
+    except ValueError:
+        return None
+    if parsed.username is not None:
+        return None
+    if parsed.hostname not in _DRIVE_URL_HOSTS:
+        return None
+    return parsed
+
+
 def _resolve_file_id(file_id: str, field_name: str = "file_id") -> str:
     """Return the id captured out of a Drive/Docs/Sheets/Slides share link,
     or ``file_id`` itself (stripped) when it's already a bare id -- or, for
@@ -172,32 +228,22 @@ def _resolve_file_id(file_id: str, field_name: str = "file_id") -> str:
     would otherwise reach the Drive API as a request against the bare
     ``.../files/`` collection endpoint instead of a specific file.
 
-    urlparse only populates ``.scheme``/``.netloc`` for a string with an
-    explicit "scheme://" prefix (or at least a leading "//"): a scheme-less
-    "evil.com/file/d/<id>/view" (at least as natural a shape for an
-    attacker to plant in text an agent reads as a full https:// URL) would
-    otherwise parse with no netloc and slip past a naive urlparse(value)
-    check. Retrying with a "//" prefix only when the *first* parse found no
-    netloc (rather than keying off whether "//" occurs anywhere in the
-    string) correctly handles a scheme-less link that itself contains a
-    nested "https://" further in, e.g. in a "continue=" query value.
-
-    Once the host is confirmed trusted, the id is extracted from the
-    parsed URL's own ``.path``/``.query`` -- not searched over the whole
-    raw string -- so a URL whose overall host is allowed but whose query
-    *value* merely contains a matching shape (".../search?q=/file/d/<id>")
-    can't have that unrelated substring extracted as if it were the URL's
-    own resource id. A path recognized as a share-link shape that
-    _DRIVE_PATH_ID_PATTERN deliberately excludes (the published-to-web
-    "/d/e/" form) is rejected outright rather than falling through to the
-    "?id=" query check -- otherwise appending "?id=<anything>" to an
-    excluded link would trivially re-derive an id the path exclusion just
-    refused to give up. A query "id=" value is validated against the same
-    id character class as the path form: unlike a path segment, Drive's own
-    client library does not percent-encode "." before sending it, so an
-    unvalidated "id=.." would reach the API as a literal ".." path segment,
-    which dot-segment normalization can collapse into an unrelated
-    endpoint.
+    Once the host is confirmed trusted (see _parse_trusted_drive_url), the
+    id is extracted from the parsed URL's own ``.path``/``.query`` -- not
+    searched over the whole raw string -- so a URL whose overall host is
+    allowed but whose query *value* merely contains a matching shape
+    (".../search?q=/file/d/<id>") can't have that unrelated substring
+    extracted as if it were the URL's own resource id. A path recognized
+    as a share-link shape that _DRIVE_PATH_ID_PATTERN deliberately
+    excludes (the published-to-web "/d/e/" form) is rejected outright
+    rather than falling through to the "?id=" query check -- otherwise
+    appending "?id=<anything>" to an excluded link would trivially
+    re-derive an id the path exclusion just refused to give up. A query
+    "id=" value is validated against the same id character class as the
+    path form: unlike a path segment, Drive's own client library does not
+    percent-encode "." before sending it, so an unvalidated "id=.." would
+    reach the API as a literal ".." path segment, which dot-segment
+    normalization can collapse into an unrelated endpoint.
     """
     if not isinstance(file_id, str):
         raise ValueError(f"{field_name} must be a string")
@@ -205,28 +251,17 @@ def _resolve_file_id(file_id: str, field_name: str = "file_id") -> str:
     if not stripped:
         raise ValueError(f"{field_name} must be a non-empty id")
     if not re.search(r"[/?]", stripped):
-        if not _DRIVE_ID_CHARS.fullmatch(stripped):
-            raise ValueError(f"{field_name} must look like a Drive id")
-        return stripped
-    try:
-        parsed = urlparse(stripped)
-        if not parsed.netloc:
-            parsed = urlparse(f"//{stripped}")
-    except ValueError:
-        return stripped
-    if parsed.username is not None:
-        # A userinfo-bearing authority ("evil.com@drive.google.com", or the
-        # same thing with a literal backslash before the "@") is inherently
-        # ambiguous: Python's parser (correctly, per RFC 3986) treats
-        # everything before the last "@" as userinfo and resolves
-        # .hostname to the part after it, so this would pass the trusted-
-        # host check below -- but a WHATWG-based parser (e.g. a browser
-        # rendering this same string to a human, or a different URL
-        # consumer downstream) can disagree about which side is the real
-        # destination. Reject outright rather than trust a parse that
-        # other consumers of the same string might not agree with.
-        return stripped
-    if parsed.hostname not in _DRIVE_URL_HOSTS:
+        # Shares _require_drive_id's character-class check rather than
+        # repeating it inline, so file_id's bare-id validation and
+        # permission_id's validation can't silently drift apart the way
+        # _resolve_file_id/_extract_resource_key's trust logic once did
+        # (see _parse_trusted_drive_url). require_clean_identifier's own
+        # empty/whitespace check is a no-op here -- stripped is already
+        # non-empty and already stripped -- so the only error this can
+        # raise is the character-class one.
+        return _require_drive_id(stripped, field_name)
+    parsed = _parse_trusted_drive_url(stripped)
+    if parsed is None:
         return stripped
     match = _DRIVE_PATH_ID_PATTERN.search(parsed.path)
     if match:
@@ -253,32 +288,45 @@ def _extract_resource_key(file_id: str) -> str | None:
     place it's ever exposed is the "?resourcekey=" query parameter Drive
     puts on the share link itself.
 
-    Deliberately a standalone function that re-derives the trusted-host/
-    userinfo checks rather than folding this into _resolve_file_id and
-    returning a tuple: _resolve_file_id's plain-string return is relied on
-    by every call site and by the full existing test suite, and widening
-    its contract for a value that's usually None (only pre-2021 link-shared
+    Shares _parse_trusted_drive_url with _resolve_file_id rather than
+    keeping its own copy of the host/userinfo trust logic, and applies the
+    same "/d/e/" published-to-web path-shape exclusion _resolve_file_id
+    enforces (a share-link shape with no real Drive fileId in it at all --
+    _resolve_file_id refuses to resolve an id for it, so a resourcekey
+    extracted here would only ever be attached to a request whose fileId
+    is that same untrusted, unresolved raw string) -- so the two
+    functions' trust decisions for identical input can't silently diverge
+    the way they did before this was factored out. Kept as its own
+    function rather than folding into _resolve_file_id and returning a
+    tuple: _resolve_file_id's plain-string return is relied on by every
+    call site and by the full existing test suite, and widening its
+    contract for a value that's usually None (only pre-2021 link-shared
     items carry a resourcekey at all) isn't worth that blast radius.
     """
-    if not isinstance(file_id, str):
+    parsed = _parse_trusted_drive_url(file_id)
+    if parsed is None:
         return None
-    stripped = file_id.strip()
-    if not re.search(r"[/?]", stripped):
-        return None
-    try:
-        parsed = urlparse(stripped)
-        if not parsed.netloc:
-            parsed = urlparse(f"//{stripped}")
-    except ValueError:
-        return None
-    if parsed.username is not None:
-        return None
-    if parsed.hostname not in _DRIVE_URL_HOSTS:
+    if _DRIVE_PATH_SHAPE_PATTERN.search(
+        parsed.path
+    ) and not _DRIVE_PATH_ID_PATTERN.search(parsed.path):
         return None
     resource_key = parse_qs(parsed.query).get("resourcekey")
-    if not resource_key or not _DRIVE_ID_CHARS.fullmatch(resource_key[0]):
+    if not resource_key:
         return None
-    return resource_key[0]
+    candidate = resource_key[0]
+    # A real resourcekey isn't restricted to _DRIVE_ID_CHARS's fileId
+    # charset -- kb.py's own CloudFile.resourceKey field (api/kb.py:3319)
+    # deliberately validates only `^[^\r\n]*$`, rejecting nothing but
+    # CR/LF (header-injection safety) rather than inventing a narrower
+    # grammar; tests/web/api/test_kb_dir.py's
+    # test_kb_ingest_cloud_accepts_punctuation_in_drive_identifiers asserts
+    # exactly this for a resourceKey containing a colon. Matching that
+    # precedent here avoids silently discarding a legitimate resourcekey
+    # (and getting a confusing 404) just because it contains a character
+    # this connector didn't anticipate.
+    if not candidate or "\r" in candidate or "\n" in candidate:
+        return None
+    return candidate
 
 
 def _attach_resource_key(request: Any, file_id: str, resource_key: str | None) -> Any:
@@ -383,6 +431,79 @@ def _capped_list_response(
         return json.dumps(response, ensure_ascii=False)
 
     return _capped_response(_build, items, truncated)
+
+
+def _capped_permissions_response(
+    pages: list[tuple[str | None, list[Any]]], next_page_token: str | None
+) -> str:
+    """Build google_drive_list_permissions' response, shrinking (if
+    needed to fit the output cap) by dropping whole pages from the tail
+    before ever cutting an individual page's items.
+
+    A flat item-level cut (_capped_list_response's default halving)
+    can't be paired safely with a resumable page token: Drive's
+    ``pageToken`` only resumes at a page boundary, so if size-capping
+    dropped items from *inside* an already-fetched page, a
+    next_page_token that only ever points past whole pages would skip
+    those dropped items forever, even though they were already fetched
+    from the API this call. Dropping only whole pages avoids that: the
+    first dropped page's own start token is always available as the
+    resume point, so a caller who follows next_page_token is guaranteed
+    to see every permission again (at worst once more, never zero
+    times).
+
+    If even the single earliest remaining page doesn't fit under the cap
+    on its own, this falls back to _capped_list_response's plain
+    item-level cut of just that page's contents -- and deliberately never
+    passes a next_page_token through to it in that case. This isn't an
+    oversight: at that point every candidate token is unsafe to offer --
+    ``pages[1][0]`` (the next already-fetched page's start) would skip
+    whatever this fallback had to cut from the *current* page, and this
+    page's own start token would just refetch the same too-big page
+    again. A cut inside one page has no page-granular resume point that
+    doesn't silently skip something, so omitting the token entirely is
+    the honest answer, not a simplification worth "fixing" by wiring one
+    of those back in.
+
+    ``pages`` is the ordered list of ``(start_token, items)`` fetched
+    this call; ``next_page_token`` is the token for whatever page comes
+    after the LAST page in ``pages`` (``None`` if that was Drive's last
+    page).
+    """
+    max_output_length = get_tool_max_output_length()
+
+    def _token_after(kept: int) -> str | None:
+        return next_page_token if kept == len(pages) else pages[kept][0]
+
+    def _render(items: list[Any], truncated: bool, token: str | None) -> str:
+        response: dict[str, Any] = {
+            "status": "success",
+            "permissions": items,
+            "truncated": truncated,
+        }
+        if token:
+            response["next_page_token"] = token
+        return json.dumps(response, ensure_ascii=False)
+
+    truncated = next_page_token is not None
+    kept = len(pages)
+    permissions = [item for _, items in pages for item in items]
+    response = _render(permissions, truncated, _token_after(kept))
+
+    while len(response) > max_output_length and kept > 1:
+        kept -= 1
+        truncated = True
+        permissions = [item for _, items in pages[:kept] for item in items]
+        response = _render(permissions, truncated, _token_after(kept))
+
+    if len(response) > max_output_length:
+        # Only the earliest remaining page is left and it alone doesn't
+        # fit -- fall through to the same plain item-level halving every
+        # other capped list response uses (no page-granular token to
+        # offer here regardless, see the docstring above).
+        response = _capped_list_response("permissions", permissions, truncated=True)
+
+    return response
 
 
 def _halve_base64(value: str) -> str:
@@ -572,8 +693,12 @@ def google_drive_create_file(
     """
     try:
         file_metadata: dict[str, Any] = {"name": name, "mimeType": mime_type}
+        resolved_parent_id = None
+        parent_resource_key = None
         if parent_id:
-            file_metadata["parents"] = [_resolve_file_id(parent_id, "parent_id")]
+            resolved_parent_id = _resolve_file_id(parent_id, "parent_id")
+            parent_resource_key = _extract_resource_key(parent_id)
+            file_metadata["parents"] = [resolved_parent_id]
 
         service = get_drive_service()
         fh = io.BytesIO(content.encode("utf-8"))
@@ -582,16 +707,17 @@ def google_drive_create_file(
         upload_mime_type = "text/plain" if "google-apps" in mime_type else mime_type
         media = MediaIoBaseUpload(fh, mimetype=upload_mime_type, resumable=True)
 
-        file = (
-            service.files()
-            .create(
-                body=file_metadata,
-                media_body=media,
-                supportsAllDrives=True,
-                fields="id, name, webViewLink, mimeType",
-            )
-            .execute()
+        create_request = service.files().create(
+            body=file_metadata,
+            media_body=media,
+            supportsAllDrives=True,
+            fields="id, name, webViewLink, mimeType",
         )
+        if resolved_parent_id is not None:
+            _attach_resource_key(
+                create_request, resolved_parent_id, parent_resource_key
+            )
+        file = create_request.execute()
 
         return json.dumps({"status": "success", "file": file}, ensure_ascii=False)
     except Exception as e:
@@ -609,19 +735,24 @@ def google_drive_create_folder(name: str, parent_id: str | None = None) -> str:
             "name": name,
             "mimeType": "application/vnd.google-apps.folder",
         }
+        resolved_parent_id = None
+        parent_resource_key = None
         if parent_id:
-            file_metadata["parents"] = [_resolve_file_id(parent_id, "parent_id")]
+            resolved_parent_id = _resolve_file_id(parent_id, "parent_id")
+            parent_resource_key = _extract_resource_key(parent_id)
+            file_metadata["parents"] = [resolved_parent_id]
 
         service = get_drive_service()
-        folder = (
-            service.files()
-            .create(
-                body=file_metadata,
-                supportsAllDrives=True,
-                fields="id, name, webViewLink, mimeType",
-            )
-            .execute()
+        create_request = service.files().create(
+            body=file_metadata,
+            supportsAllDrives=True,
+            fields="id, name, webViewLink, mimeType",
         )
+        if resolved_parent_id is not None:
+            _attach_resource_key(
+                create_request, resolved_parent_id, parent_resource_key
+            )
+        folder = create_request.execute()
 
         return json.dumps({"status": "success", "folder": folder}, ensure_ascii=False)
     except Exception as e:
@@ -723,11 +854,11 @@ def _execute_ignoring_204_ssl_eof(
 @mcp.tool()
 def google_drive_delete_file(file_id: str) -> str:
     """
-    Delete a file or folder in Google Drive.
+    Delete a file or folder in Google Drive. This is an external action --
+    confirm with the user before calling it.
     Note: this skips the trash and permanently deletes the file -- there is
-    no separate "move to trash" tool on this connector, so confirm with the
-    user that permanent deletion (not just removing it from view) is what
-    they want before calling this.
+    no separate "move to trash" tool on this connector, so make sure
+    permanent deletion (not just removing it from view) is what they want.
     """
     try:
         resolved_file_id = _resolve_file_id(file_id)
@@ -784,8 +915,17 @@ def google_drive_list_permissions(file_id: str, page_token: str | None = None) -
         resource_key = _extract_resource_key(file_id)
         service = get_drive_service()
         max_output_length = get_tool_max_output_length()
-        permissions: list[Any] = []
+        # Each fetched page is kept alongside the token that fetched it
+        # (see _capped_permissions_response): if the response must shrink
+        # to fit the output cap, only whole pages are dropped from the
+        # tail, so the surfaced next_page_token always resumes at a page
+        # boundary Drive will refetch from scratch -- never at a point
+        # *inside* a page whose later items a flat item-level cut
+        # (_capped_list_response's default halving) would have silently
+        # discarded after page_token had already advanced past them.
+        pages: list[tuple[str | None, list[Any]]] = []
         approx_length = 0
+        current_page_token = page_token
         # For an item in a Shared Drive, Drive returns at most 100
         # permissions per page when pageSize isn't set (a non-Shared-Drive
         # item always returns everything in one page); follow
@@ -796,7 +936,7 @@ def google_drive_list_permissions(file_id: str, page_token: str | None = None) -
             list_request = service.permissions().list(
                 fileId=resolved_file_id,
                 supportsAllDrives=True,
-                pageToken=page_token,
+                pageToken=current_page_token,
                 fields=(
                     "nextPageToken, "
                     "permissions(id, type, role, emailAddress, displayName, "
@@ -807,54 +947,45 @@ def google_drive_list_permissions(file_id: str, page_token: str | None = None) -
             _attach_resource_key(list_request, resolved_file_id, resource_key)
             results = list_request.execute()
             new_permissions = results.get("permissions", [])
-            permissions.extend(new_permissions)
-            # _capped_list_response below will halve this back down to fit
-            # the output limit regardless, so once there's already enough
-            # data to exceed it, fetching further pages is pure waste: more
-            # blocking network round-trips for permissions that get thrown
-            # away immediately after. Tracked incrementally (each new page's
-            # items serialized once, not the whole accumulated list every
-            # iteration) to stay O(n) rather than O(n^2) for a long
-            # permission list; ensure_ascii=False so this length estimate
-            # isn't inflated relative to what _capped_list_response will
-            # actually measure -- with the default ensure_ascii=True, a
-            # non-ASCII displayName/emailAddress (CJK, accented, emoji names
-            # are common on a Shared Drive) would each be escaped to a
+            pages.append((current_page_token, new_permissions))
+            # _capped_permissions_response below will drop whole pages
+            # back off to fit the output limit regardless, so once
+            # there's already enough data to exceed it, fetching further
+            # pages is pure waste: more blocking network round-trips for
+            # permissions that get thrown away immediately after. Tracked
+            # incrementally (each new page's items serialized once, not
+            # the whole accumulated list every iteration) to stay O(n)
+            # rather than O(n^2) for a long permission list;
+            # ensure_ascii=False so this length estimate isn't inflated
+            # relative to what _capped_permissions_response will actually
+            # measure -- with the default ensure_ascii=True, a non-ASCII
+            # displayName/emailAddress (CJK, accented, emoji names are
+            # common on a Shared Drive) would each be escaped to a
             # 6+-byte \uXXXX sequence here even though the real response
             # keeps them as 1-2 bytes, overestimating this list as needing
             # to stop paginating even though the true payload would still
-            # fit -- and _capped_list_response would then measure the true,
-            # smaller size and leave truncated=False, silently under-
-            # reporting collaborators while claiming a complete result.
+            # fit -- and _capped_permissions_response would then measure
+            # the true, smaller size and leave truncated=False, silently
+            # under-reporting collaborators while claiming a complete
+            # result.
             approx_length += sum(
                 len(json.dumps(p, ensure_ascii=False)) for p in new_permissions
             )
-            page_token = results.get("nextPageToken")
-            if not page_token:
+            next_token = results.get("nextPageToken")
+            current_page_token = next_token
+            if not next_token:
                 break
             if approx_length > max_output_length:
                 break
-        else:
-            # The loop ran out of iterations without either a natural
-            # "no more pages" or "already too big" stop -- a nextPageToken
-            # may still exist that was never followed, so this can't
-            # honestly report a complete list even if the permissions
-            # collected so far happen to still fit under the output cap.
-            return _capped_list_response(
-                "permissions",
-                permissions,
-                truncated=True,
-                next_page_token=page_token,
-            )
+        # current_page_token is None only when the loop broke because
+        # Drive reported no further pages. If the loop instead exhausted
+        # _MAX_PERMISSION_LIST_PAGES without ever seeing a falsy
+        # nextPageToken, current_page_token still holds that last (truthy)
+        # token -- so, same as the early size-cap break, it correctly
+        # signals "more data exists beyond what was fetched" without
+        # needing a separate branch for the loop-safety-bound case.
 
-        # page_token here is whatever the last page's nextPageToken was
-        # (None if that page was the last one) -- surfacing it lets a
-        # caller resume an early stop (the size-cap break above) from
-        # exactly where this call left off, rather than losing the rest of
-        # the collaborator list the way a silent truncation would.
-        return _capped_list_response(
-            "permissions", permissions, next_page_token=page_token
-        )
+        return _capped_permissions_response(pages, current_page_token)
     except Exception as e:
         logger.error(f"Error listing permissions: {e}")
         return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)

@@ -374,4 +374,4 @@ def test_revision_metadata() -> None:
     migration = _load_migration_module()
 
     assert migration.revision == "20260907_add_calendar_freebusy_scope"
-    assert migration.down_revision == "20260901_seed_zendesk_mcp_app"
+    assert migration.down_revision == "370740d9125a"

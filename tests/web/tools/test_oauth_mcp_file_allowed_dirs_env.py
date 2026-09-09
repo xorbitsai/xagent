@@ -38,6 +38,10 @@ def test_transport_config_sets_both_allowlist_vars_when_workspace_has_a_task(
     assert transport_config["env"]["XAGENT_SLACK_FILE_ALLOWED_DIRS"] == expected_dir
     assert transport_config["env"]["XAGENT_LINKEDIN_IMAGE_ALLOWED_DIRS"] == expected_dir
     assert transport_config["env"]["XAGENT_GMAIL_FILE_ALLOWED_DIRS"] == expected_dir
+    assert (
+        transport_config["env"]["XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS"]
+        == expected_dir
+    )
     assert transport_config["env"]["XAGENT_GOOGLE_DRIVE_OUTPUT_DIR"] == expected_dir
 
 
@@ -57,6 +61,7 @@ def test_transport_config_omits_allowlist_vars_without_a_task_id():
     assert "XAGENT_SLACK_FILE_ALLOWED_DIRS" not in transport_config["env"]
     assert "XAGENT_LINKEDIN_IMAGE_ALLOWED_DIRS" not in transport_config["env"]
     assert "XAGENT_GMAIL_FILE_ALLOWED_DIRS" not in transport_config["env"]
+    assert "XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS" not in transport_config["env"]
     assert "XAGENT_GOOGLE_DRIVE_OUTPUT_DIR" not in transport_config["env"]
 
 
@@ -90,6 +95,9 @@ def test_drive_output_dir_excludes_external_dirs_unlike_the_read_allowlists(
     assert str(external_dir.resolve()) in transport_config["env"][
         "XAGENT_SLACK_FILE_ALLOWED_DIRS"
     ].split(",")
+    assert str(external_dir.resolve()) in transport_config["env"][
+        "XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS"
+    ].split(",")
 
 
 def test_drive_output_dir_omitted_when_only_external_dirs_are_configured(
@@ -112,4 +120,7 @@ def test_drive_output_dir_omitted_when_only_external_dirs_are_configured(
     assert "XAGENT_GOOGLE_DRIVE_OUTPUT_DIR" not in transport_config["env"]
     assert str(external_dir.resolve()) in transport_config["env"][
         "XAGENT_SLACK_FILE_ALLOWED_DIRS"
+    ].split(",")
+    assert str(external_dir.resolve()) in transport_config["env"][
+        "XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS"
     ].split(",")

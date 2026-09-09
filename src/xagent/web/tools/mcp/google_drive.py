@@ -743,6 +743,84 @@ def _unique_output_path(output_dir: Path, filename: str) -> Path:
     return candidate
 
 
+def _allowed_file_dirs() -> list[Path]:
+    raw_dirs = os.environ.get("XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS", "")
+    if not raw_dirs.strip():
+        return [Path.cwd().resolve()]
+    return [
+        Path(stripped).expanduser().resolve()
+        for raw_dir in raw_dirs.split(",")
+        if (stripped := raw_dir.strip())
+    ]
+
+
+def _resolve_allowed_file_path(file_path: str) -> Path:
+    """Restrict google_drive_upload_file to files under an allowlisted
+    directory, the same defense gmail_send_messages's attachments and
+    slack_upload_file use — without it an agent could be tricked into
+    exfiltrating arbitrary host files through this tool.
+
+    Pass an absolute path — a relative path resolves against this
+    process's own working directory, not the allowed directory, and will
+    not find a file written to the task workspace."""
+    local_path = Path(file_path).expanduser()
+    if not local_path.is_absolute():
+        local_path = Path.cwd() / local_path
+    local_path = local_path.resolve()
+
+    if not local_path.is_file():
+        raise FileNotFoundError(f"File not found: {file_path}")
+
+    allowed_dirs = _allowed_file_dirs()
+    for allowed_dir in allowed_dirs:
+        if local_path.is_relative_to(allowed_dir):
+            return local_path
+
+    # The absolute host path is deliberately kept out of the raised message:
+    # it reaches the caller/LLM unfiltered via the error payload below, and
+    # host filesystem layout has no business in a model transcript. Full
+    # detail (including the allowed directories) is logged server-side.
+    logger.warning(
+        "Rejected google drive upload path %s outside allowed directories: %s",
+        local_path,
+        ", ".join(str(path) for path in allowed_dirs),
+    )
+    raise PermissionError(
+        "file path is outside the allowed directories; ask the user for a "
+        "file inside the task workspace or another allowed location"
+    )
+
+
+# Extensions that are unambiguously binary formats. google_drive_create_file
+# takes its content as a str that gets utf-8 encoded — passing a PDF/image/
+# Office file's real bytes through that parameter is not possible without
+# corrupting them (see google_drive_create_file's docstring), so a caller
+# whose *name* carries one of these extensions almost certainly meant to
+# upload real binary content and should be steered to
+# google_drive_upload_file instead of silently getting a text/plain file
+# named "report.pdf".
+_BINARY_NAME_EXTENSIONS = {
+    ".pdf",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".bmp",
+    ".doc",
+    ".docx",
+    ".xls",
+    ".xlsx",
+    ".ppt",
+    ".pptx",
+    ".zip",
+    ".mp3",
+    ".mp4",
+    ".mov",
+    ".avi",
+}
+
+
 def get_drive_service() -> Any:
     token = os.environ.get("GOOGLE_ACCESS_TOKEN")
     refresh_token = os.environ.get("GOOGLE_REFRESH_TOKEN")
@@ -1021,15 +1099,112 @@ def google_drive_download_file(
 
 
 @mcp.tool()
+def google_drive_upload_file(
+    file_path: str, name: str = "", mime_type: str = "", parent_id: str | None = None
+) -> str:
+    """
+    Upload a local file's real bytes to Google Drive — use this (not
+    google_drive_create_file) for a PDF, image, Office document, or any
+    other binary content, including a file this agent already generated
+    into the task workspace (e.g. an exported PDF report).
+
+    file_path: path to a file already on disk, e.g. something written to
+    the task workspace. Must be inside an allowed directory (automatically
+    scoped to the current task workspace) so this tool cannot be used to
+    exfiltrate arbitrary files from the host. Pass an absolute path — a
+    relative path resolves against this process's own working directory,
+    not the allowed directory, and will not find a file written to the
+    task workspace.
+    name: the file name to give it in Drive; defaults to file_path's own
+    basename.
+    mime_type: defaults to a guess from the file's extension, falling back
+    to "application/octet-stream" when it can't be guessed. Only needed
+    when the extension is missing or misleading.
+    """
+    try:
+        local_path = _resolve_allowed_file_path(file_path)
+
+        resolved_name = name.strip() or local_path.name
+        resolved_mime_type = (
+            mime_type.strip()
+            or mimetypes.guess_type(local_path.name)[0]
+            or "application/octet-stream"
+        )
+
+        service = get_drive_service()
+        file_metadata: dict[str, Any] = {
+            "name": resolved_name,
+            "mimeType": resolved_mime_type,
+        }
+        if parent_id:
+            file_metadata["parents"] = [parent_id]
+
+        # Size is checked and the upload reads from the same open handle
+        # (rather than a separate local_path.stat() call before opening) so
+        # the file that was allowlist-checked is the exact file read from —
+        # a fresh by-path stat/open after the check would reopen a window
+        # for a symlink swapped in between the two (same reasoning as
+        # slack_upload_file's matching comment).
+        with local_path.open("rb") as fh:
+            file_size = os.fstat(fh.fileno()).st_size
+            if file_size == 0:
+                raise ValueError(f"File is empty: {file_path}")
+
+            media = MediaIoBaseUpload(
+                fh, mimetype=resolved_mime_type, resumable=True
+            )
+
+            file = (
+                service.files()
+                .create(
+                    body=file_metadata,
+                    media_body=media,
+                    fields="id, name, webViewLink, mimeType",
+                )
+                .execute()
+            )
+
+        return json.dumps({"status": "success", "file": file})
+    except Exception as e:
+        logger.error(f"Error uploading file: {e}")
+        return json.dumps({"status": "error", "message": str(e)})
+
+
+@mcp.tool()
 def google_drive_create_file(
     name: str, content: str, mime_type: str = "text/plain", parent_id: str | None = None
 ) -> str:
     """
-    Create a new file in Google Drive.
+    Create a new Drive file from plain text or HTML content.
     If you want to create a Google Doc, use mime_type="application/vnd.google-apps.document"
     and pass plain text or HTML in the content. For normal text files, use "text/plain".
+
+    content is always treated as text (it is UTF-8 encoded before upload) —
+    this tool cannot create a real PDF, image, or Office-format binary; a
+    name like "report.pdf" would get a file with that name but text/plain
+    content, not an actual PDF. To upload an already-generated file's real
+    bytes (a PDF exported earlier, an image, a .docx, etc.), use
+    google_drive_upload_file with the file's path instead.
     """
     try:
+        suffix = Path(name).suffix.lower()
+        if suffix in _BINARY_NAME_EXTENSIONS and "google-apps" not in mime_type:
+            return json.dumps(
+                {
+                    "status": "error",
+                    "message": (
+                        f"'{name}' looks like a binary file ({suffix}), but "
+                        "google_drive_create_file only writes text content — "
+                        "uploading it here would produce a text/plain file "
+                        "with that name, not a real "
+                        f"{suffix.lstrip('.')}. If you already generated "
+                        "this file (e.g. as a task output), use "
+                        "google_drive_upload_file with its file path to "
+                        "upload the real binary content instead."
+                    ),
+                }
+            )
+
         file_metadata: dict[str, Any] = {"name": name, "mimeType": mime_type}
         resolved_parent_id = None
         parent_resource_key = None

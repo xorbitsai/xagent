@@ -33,6 +33,18 @@ def _output_dir_env(tmp_path, monkeypatch):
     return tmp_path
 
 
+@pytest.fixture(autouse=True)
+def _upload_allowed_dirs_env(tmp_path, monkeypatch):
+    """Scope google_drive_upload_file's read allowlist to an isolated
+    per-test directory, mirroring _output_dir_env above for the write
+    side — otherwise the default (cwd) allowlist would make tests
+    order-dependent on whatever the real working directory holds."""
+    allowed_dir = tmp_path / "workspace"
+    allowed_dir.mkdir()
+    monkeypatch.setenv("XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS", str(allowed_dir))
+    return allowed_dir
+
+
 def _mock_drive_service_with_files(monkeypatch, files_mock):
     service = Mock()
     service.files.return_value = files_mock
@@ -2474,3 +2486,211 @@ def test_download_file_returns_error_payload_on_api_failure(monkeypatch):
 
     assert result["status"] == "error"
     assert "boom" in result["message"]
+
+
+# ---------------------------------------------------------------------------
+# google_drive_upload_file
+# ---------------------------------------------------------------------------
+
+
+def test_upload_file_sends_real_binary_content(monkeypatch, tmp_path):
+    """Regression guard for the actual production bug: uploading an
+    already-generated PDF must send its real bytes with a real
+    application/pdf mimeType — not a text/plain placeholder string, which
+    is all google_drive_create_file's str content parameter can carry."""
+    allowed_dir = tmp_path / "workspace"
+    local_pdf = allowed_dir / "Regional_Performance_Summary.pdf"
+    local_pdf.write_bytes(b"%PDF-1.4 fake pdf bytes")
+
+    files = Mock()
+    files.create.return_value.execute.return_value = {
+        "id": "new-file-id",
+        "name": "Regional_Performance_Summary.pdf",
+        "mimeType": "application/pdf",
+        "webViewLink": "https://drive.google.com/file/d/new-file-id/view",
+    }
+    _mock_drive_service_with_files(monkeypatch, files)
+
+    result = json.loads(google_drive.google_drive_upload_file(str(local_pdf)))
+
+    assert result["status"] == "success"
+    assert result["file"]["mimeType"] == "application/pdf"
+
+    _, kwargs = files.create.call_args
+    assert kwargs["body"] == {
+        "name": "Regional_Performance_Summary.pdf",
+        "mimeType": "application/pdf",
+    }
+    media = kwargs["media_body"]
+    assert media.mimetype() == "application/pdf"
+    assert media.size() == len(b"%PDF-1.4 fake pdf bytes")
+
+
+def test_upload_file_accepts_explicit_name_and_mime_type(monkeypatch, tmp_path):
+    allowed_dir = tmp_path / "workspace"
+    local_file = allowed_dir / "data.bin"
+    local_file.write_bytes(b"\x00\x01\x02")
+
+    files = Mock()
+    files.create.return_value.execute.return_value = {"id": "f1"}
+    _mock_drive_service_with_files(monkeypatch, files)
+
+    result = json.loads(
+        google_drive.google_drive_upload_file(
+            str(local_file), name="custom.dat", mime_type="application/octet-stream"
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = files.create.call_args
+    assert kwargs["body"]["name"] == "custom.dat"
+    assert kwargs["body"]["mimeType"] == "application/octet-stream"
+
+
+def test_upload_file_defaults_mime_type_when_unguessable(monkeypatch, tmp_path):
+    allowed_dir = tmp_path / "workspace"
+    local_file = allowed_dir / "mystery_file_no_extension"
+    local_file.write_bytes(b"some bytes")
+
+    files = Mock()
+    files.create.return_value.execute.return_value = {"id": "f1"}
+    _mock_drive_service_with_files(monkeypatch, files)
+
+    result = json.loads(google_drive.google_drive_upload_file(str(local_file)))
+
+    assert result["status"] == "success"
+    _, kwargs = files.create.call_args
+    assert kwargs["body"]["mimeType"] == "application/octet-stream"
+
+
+def test_upload_file_includes_parent_id_when_given(monkeypatch, tmp_path):
+    allowed_dir = tmp_path / "workspace"
+    local_file = allowed_dir / "report.pdf"
+    local_file.write_bytes(b"content")
+
+    files = Mock()
+    files.create.return_value.execute.return_value = {"id": "f1"}
+    _mock_drive_service_with_files(monkeypatch, files)
+
+    result = json.loads(
+        google_drive.google_drive_upload_file(str(local_file), parent_id="folder-1")
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = files.create.call_args
+    assert kwargs["body"]["parents"] == ["folder-1"]
+
+
+def test_upload_file_rejects_path_outside_allowed_directories(monkeypatch, tmp_path):
+    outside_file = tmp_path / "outside.pdf"
+    outside_file.write_bytes(b"content")
+
+    files = Mock()
+    _mock_drive_service_with_files(monkeypatch, files)
+
+    result = json.loads(google_drive.google_drive_upload_file(str(outside_file)))
+
+    assert result["status"] == "error"
+    assert "allowed directories" in result["message"]
+    files.create.assert_not_called()
+
+
+def test_upload_file_rejects_missing_file(monkeypatch, tmp_path):
+    allowed_dir = tmp_path / "workspace"
+    missing_path = allowed_dir / "does_not_exist.pdf"
+
+    files = Mock()
+    _mock_drive_service_with_files(monkeypatch, files)
+
+    result = json.loads(google_drive.google_drive_upload_file(str(missing_path)))
+
+    assert result["status"] == "error"
+    files.create.assert_not_called()
+
+
+def test_upload_file_rejects_empty_file(monkeypatch, tmp_path):
+    allowed_dir = tmp_path / "workspace"
+    empty_file = allowed_dir / "empty.pdf"
+    empty_file.write_bytes(b"")
+
+    files = Mock()
+    _mock_drive_service_with_files(monkeypatch, files)
+
+    result = json.loads(google_drive.google_drive_upload_file(str(empty_file)))
+
+    assert result["status"] == "error"
+    assert "empty" in result["message"].lower()
+    files.create.assert_not_called()
+
+
+def test_upload_file_returns_error_payload_on_api_failure(monkeypatch, tmp_path):
+    allowed_dir = tmp_path / "workspace"
+    local_file = allowed_dir / "report.pdf"
+    local_file.write_bytes(b"content")
+
+    files = Mock()
+    files.create.return_value.execute.side_effect = RuntimeError("boom")
+    _mock_drive_service_with_files(monkeypatch, files)
+
+    result = json.loads(google_drive.google_drive_upload_file(str(local_file)))
+
+    assert result["status"] == "error"
+    assert "boom" in result["message"]
+
+
+# ---------------------------------------------------------------------------
+# google_drive_create_file — binary-content guard
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "name", ["report.pdf", "photo.PNG", "deck.pptx", "archive.zip"]
+)
+def test_create_file_rejects_binary_looking_names(monkeypatch, name):
+    """Regression guard for the actual production bug: google_drive_create_file
+    can only write text (content is utf-8 encoded), so a caller naming the
+    file like a binary format must be steered to google_drive_upload_file
+    instead of silently getting a text/plain file with a misleading name."""
+    files = Mock()
+    _mock_drive_service_with_files(monkeypatch, files)
+
+    result = json.loads(google_drive.google_drive_create_file(name, "some text"))
+
+    assert result["status"] == "error"
+    assert "google_drive_upload_file" in result["message"]
+    files.create.assert_not_called()
+
+
+def test_create_file_still_allows_binary_looking_name_for_google_doc_export(
+    monkeypatch,
+):
+    """A Google Workspace document conversion legitimately takes plain
+    text/HTML content regardless of the target doc's display name, so the
+    binary-extension guard must not block it."""
+    files = Mock()
+    files.create.return_value.execute.return_value = {"id": "f1"}
+    _mock_drive_service_with_files(monkeypatch, files)
+
+    result = json.loads(
+        google_drive.google_drive_create_file(
+            "backup.pdf",
+            "<p>hello</p>",
+            mime_type="application/vnd.google-apps.document",
+        )
+    )
+
+    assert result["status"] == "success"
+    files.create.assert_called_once()
+
+
+def test_create_file_allows_plain_text_names(monkeypatch):
+    files = Mock()
+    files.create.return_value.execute.return_value = {"id": "f1"}
+    _mock_drive_service_with_files(monkeypatch, files)
+
+    result = json.loads(
+        google_drive.google_drive_create_file("notes.txt", "hello world")
+    )
+
+    assert result["status"] == "success"
+    files.create.assert_called_once()

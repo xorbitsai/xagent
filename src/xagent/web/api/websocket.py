@@ -64,6 +64,13 @@ from ...core.execution_scope import (
     resolve_execution_scope_off_turn,
 )
 from ...core.file_ref import FILE_REF_MODEL_INSTRUCTIONS, build_file_ref
+from ...core.runtime_performance import (
+    increment_counter as increment_performance_counter,
+)
+from ...core.runtime_performance import (
+    observe_duration,
+    observe_value,
+)
 from ..models.chat_message import TaskChatMessage
 from ..models.database import (
     get_db,
@@ -5189,6 +5196,16 @@ class ConnectionManager:
         """Return a stable snapshot of a task's current connections."""
         return self.active_connections.get(task_id, []).copy()
 
+    def has_connections_for_task(self, task_id: int) -> bool:
+        """Return whether a task currently has a registered connection."""
+
+        return bool(self.active_connections.get(task_id))
+
+    def connection_count(self) -> int:
+        """Return the current number of task WebSocket registrations."""
+
+        return len(self._connection_task_ids)
+
     def is_connection_registered(self, websocket: WebSocket, task_id: int) -> bool:
         """Return whether a connection is still owned by the given task."""
         return self._connection_task_ids.get(websocket) == task_id
@@ -5206,16 +5223,42 @@ class ConnectionManager:
         await websocket.send_text(json.dumps(versioned_message))
 
     async def broadcast_to_task(self, message: dict, task_id: int) -> None:
-        if self.connections_for_task(task_id):
+        has_connections = self.has_connections_for_task(task_id)
+        increment_performance_counter(
+            "xagent.websocket.broadcast.calls",
+            attributes={"outcome": "connected" if has_connections else "empty"},
+        )
+        if not has_connections:
+            return
+
+        with observe_duration("xagent.websocket.broadcast.duration"):
             versioned_message = await _with_current_task_control_state(
                 message,
                 fallback_task_id=task_id,
             )
-            for connection in self.connections_for_task(task_id):
+            # Registrations can change while message enrichment yields. Take
+            # the delivery snapshot afterwards so newly connected clients are
+            # included; membership is checked again before every send below.
+            connections = self.connections_for_task(task_id)
+            observe_value(
+                "xagent.websocket.broadcast.fanout",
+                len(connections),
+                unit="{connection}",
+            )
+            encoded_message = json.dumps(versioned_message)
+            for connection in connections:
                 if not self.is_connection_registered(connection, task_id):
                     continue
                 try:
-                    await connection.send_text(json.dumps(versioned_message))
+                    observe_value(
+                        "xagent.websocket.payload.size",
+                        # json.dumps defaults to ensure_ascii=True, so character
+                        # count equals encoded byte count without another copy.
+                        len(encoded_message),
+                        unit="By",
+                    )
+                    await connection.send_text(encoded_message)
+                    increment_performance_counter("xagent.websocket.messages.sent")
                 except (
                     BrokenResourceError,
                     ClosedResourceError,
@@ -5223,10 +5266,18 @@ class ConnectionManager:
                     WebSocketDisconnect,
                     RuntimeError,
                 ) as e:
+                    increment_performance_counter(
+                        "xagent.websocket.send.errors",
+                        attributes={"error.type": "connection"},
+                    )
                     # Network connection error, remove disconnected connection
                     logger.warning(f"Connection error for task {task_id}: {e}")
                     self.disconnect(connection)
                 except Exception as e:
+                    increment_performance_counter(
+                        "xagent.websocket.send.errors",
+                        attributes={"error.type": "unexpected"},
+                    )
                     # Other errors should not be silently handled, log and re-raise
                     logger.error(
                         f"Unexpected error broadcasting to task {task_id}: {e}"

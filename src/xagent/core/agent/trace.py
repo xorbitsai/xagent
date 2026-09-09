@@ -9,6 +9,7 @@ from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Set, cast
 from uuid import uuid4
 
+from ..runtime_performance import increment_counter, observe_duration
 from ..utils.security import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
@@ -1255,6 +1256,10 @@ class Tracer:
         require_persisted: bool = False,
     ) -> str:
         """Record a trace event and return its ID."""
+        increment_counter(
+            "xagent.trace.events",
+            attributes={"event.type": event_type.value},
+        )
         logger.info(
             f"trace_event called: {event_type.value} for task {task_id}, step {step_id} with data keys: {list(data.keys()) if data else []}"
         )
@@ -1275,16 +1280,26 @@ class Tracer:
         handler_errors: List[Exception] = []
         # Snapshot: a handler removed mid-dispatch must not shift its
         # successors out of this iteration.
-        for i, handler in enumerate(list(self.handlers)):
-            try:
-                logger.info(f"Calling handler {i}: {type(handler).__name__}")
-                await handler.handle_event(event)
-                logger.info(f"Handler {i} completed successfully")
-            except Exception as e:
-                if require_persisted:
-                    handler_errors.append(e)
-                else:
-                    logger.warning(f"Trace handler {i} failed: {e}")
+        with observe_duration("xagent.trace.dispatch.duration"):
+            for i, handler in enumerate(list(self.handlers)):
+                handler_name = type(handler).__name__
+                try:
+                    logger.info(f"Calling handler {i}: {handler_name}")
+                    with observe_duration(
+                        "xagent.trace.handler.duration",
+                        attributes={"handler": handler_name},
+                    ):
+                        await handler.handle_event(event)
+                    logger.info(f"Handler {i} completed successfully")
+                except Exception as e:
+                    increment_counter(
+                        "xagent.trace.handler.errors",
+                        attributes={"handler": handler_name},
+                    )
+                    if require_persisted:
+                        handler_errors.append(e)
+                    else:
+                        logger.warning(f"Trace handler {i} failed: {e}")
 
         if require_persisted:
             if handler_errors:

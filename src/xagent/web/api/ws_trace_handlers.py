@@ -1,6 +1,5 @@
 """WebSocket trace handlers for real-time updates."""
 
-import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
@@ -11,6 +10,11 @@ from ...core.agent.trace import (
     TraceEvent,
     TraceHandler,
     TraceScope,
+)
+from ...core.runtime_performance import (
+    increment_counter,
+    observe_duration,
+    run_in_thread_with_telemetry,
 )
 from ..services.trace_event_types import (
     LEGACY_GENERAL_ERROR_EVENT_TYPE,
@@ -354,6 +358,10 @@ class WebSocketTraceHandler(TraceHandler):
 
     async def handle_event(self, event: TraceEvent) -> None:
         """Send trace event to WebSocket clients using unified stream format."""
+        with observe_duration("xagent.websocket.trace_handler.duration"):
+            await self._handle_event(event)
+
+    async def _handle_event(self, event: TraceEvent) -> None:
         try:
             # Debug: Log the event being handled (reduced verbosity)
             logger.debug(
@@ -364,10 +372,12 @@ class WebSocketTraceHandler(TraceHandler):
             await self._load_task_description()
 
             # Convert trace event to unified stream format
-            stream_event = self._convert_trace_event_to_stream_event(event)
+            with observe_duration("xagent.websocket.trace_serialization.duration"):
+                stream_event = self._convert_trace_event_to_stream_event(event)
             if stream_event:
                 stream_data = stream_event.get("data")
-                if isinstance(stream_data, dict) and await asyncio.to_thread(
+                if isinstance(stream_data, dict) and await run_in_thread_with_telemetry(
+                    "websocket_prior_user_message_check",
                     self._has_prior_user_message_turn,
                     str(stream_event.get("event_type") or ""),
                     stream_data,
@@ -377,11 +387,19 @@ class WebSocketTraceHandler(TraceHandler):
 
             # Send to all connected WebSocket clients for this task
             if stream_event:
+                increment_counter(
+                    "xagent.websocket.trace.events",
+                    attributes={"outcome": "broadcast"},
+                )
                 logger.debug(
                     f"WebSocketTraceHandler sending stream event: {stream_event.get('event_type')} (id: {stream_event.get('event_id')}) to task {self.task_id}"
                 )
                 await manager.broadcast_to_task(stream_event, self.task_id)
             else:
+                increment_counter(
+                    "xagent.websocket.trace.events",
+                    attributes={"outcome": "dropped"},
+                )
                 logger.debug(
                     f"WebSocketTraceHandler no stream event to send for event: {event.event_type.value}"
                 )
@@ -398,7 +416,10 @@ class WebSocketTraceHandler(TraceHandler):
 
         try:
             # Run synchronous database operations in a thread pool to avoid blocking event loop
-            await asyncio.to_thread(self._sync_load_task_description)
+            await run_in_thread_with_telemetry(
+                "websocket_task_description_load",
+                self._sync_load_task_description,
+            )
         except Exception as e:
             logger.warning(
                 f"Failed to load task description for task {self.task_id}: {e}"

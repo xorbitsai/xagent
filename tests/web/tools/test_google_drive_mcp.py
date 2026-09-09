@@ -2694,3 +2694,57 @@ def test_create_file_allows_plain_text_names(monkeypatch):
 
     assert result["status"] == "success"
     files.create.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "name,mime_type",
+    [
+        ("report", "application/pdf"),
+        ("report.txt", "application/pdf"),
+        ("photo", "image/png"),
+        ("data.bin", "application/octet-stream"),
+    ],
+)
+def test_create_file_rejects_binary_mime_type_even_with_a_non_flagged_name(
+    monkeypatch, name, mime_type
+):
+    """Regression guard: the name-extension check alone isn't enough — a
+    caller that declares an explicit binary mime_type (rather than naming
+    the file like a binary format) must be rejected too, since content is
+    always UTF-8-encoded text regardless of what mime_type claims. Without
+    this, a caller could bypass the binary-looking-name guard entirely by
+    using a name with no extension, a .txt extension, or an extension
+    outside the hardcoded binary set, while still declaring a binary
+    mime_type — producing the exact declared-type-vs-content mismatch this
+    guard exists to prevent."""
+    files = Mock()
+    _mock_drive_service(monkeypatch, files)
+
+    result = json.loads(
+        google_drive.google_drive_create_file(name, "some text", mime_type=mime_type)
+    )
+
+    assert result["status"] == "error"
+    assert "google_drive_upload_file" in result["message"]
+    files.create.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "mime_type", ["text/plain", "text/csv", "application/json", "application/rtf"]
+)
+def test_create_file_allows_text_safe_mime_types(monkeypatch, mime_type):
+    """The new mime_type-based check must not reject legitimate text-safe
+    formats that don't start with "text/" (application/json,
+    application/rtf) — it should reuse the same text-safety notion as
+    google_drive_get_file_content's _is_text_mime_type, not a narrower
+    one."""
+    files = Mock()
+    files.create.return_value.execute.return_value = {"id": "f1"}
+    _mock_drive_service(monkeypatch, files)
+
+    result = json.loads(
+        google_drive.google_drive_create_file("data.json", "{}", mime_type=mime_type)
+    )
+
+    assert result["status"] == "success"
+    files.create.assert_called_once()

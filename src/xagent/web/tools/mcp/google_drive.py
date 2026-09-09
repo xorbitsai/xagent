@@ -1186,19 +1186,34 @@ def google_drive_create_file(
     """
     try:
         suffix = Path(name).suffix.lower()
-        if suffix in _BINARY_NAME_EXTENSIONS and "google-apps" not in mime_type:
+        is_google_doc_conversion = "google-apps" in mime_type
+        # Two independent signals catch two different mistakes: a caller
+        # that left mime_type at its text/plain default but named the file
+        # like a binary format (the original production bug), and a caller
+        # that explicitly declared a binary mime_type regardless of what
+        # the name looks like — content can only ever be UTF-8 text
+        # (see the encode() below), so a non-text mime_type is just as much
+        # a mismatch as a binary-looking name, even with an unrecognized or
+        # absent extension.
+        name_looks_binary = suffix in _BINARY_NAME_EXTENSIONS
+        mime_type_is_binary = not _is_text_mime_type(mime_type)
+        if not is_google_doc_conversion and (name_looks_binary or mime_type_is_binary):
+            reason = (
+                f"'{name}' looks like a binary file ({suffix})"
+                if name_looks_binary
+                else f"mime_type '{mime_type}' is not a text format"
+            )
             return json.dumps(
                 {
                     "status": "error",
                     "message": (
-                        f"'{name}' looks like a binary file ({suffix}), but "
-                        "google_drive_create_file only writes text content — "
-                        "uploading it here would produce a text/plain file "
-                        "with that name, not a real "
-                        f"{suffix.lstrip('.')}. If you already generated "
-                        "this file (e.g. as a task output), use "
-                        "google_drive_upload_file with its file path to "
-                        "upload the real binary content instead."
+                        f"{reason}, but google_drive_create_file only "
+                        "writes text content — uploading it here would "
+                        "produce a mislabeled text file, not real binary "
+                        "data. If you already generated this file (e.g. as "
+                        "a task output), use google_drive_upload_file with "
+                        "its file path to upload the real binary content "
+                        "instead."
                     ),
                 }
             )

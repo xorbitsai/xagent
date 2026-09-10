@@ -117,19 +117,25 @@ def _find_conflicts(
     unchecked_attendees: list[str] = []
 
     if check_organizer:
-        organizer_events = (
-            service.events()
-            .list(
-                calendarId="primary",
-                timeMin=time_min,
-                timeMax=time_max,
-                singleEvents=True,
-                orderBy="startTime",
+        organizer_events: list[dict[str, Any]] = []
+        page_token: str | None = None
+        while True:
+            page = (
+                service.events()
+                .list(
+                    calendarId="primary",
+                    timeMin=time_min,
+                    timeMax=time_max,
+                    singleEvents=True,
+                    orderBy="startTime",
+                    pageToken=page_token,
+                )
+                .execute()
             )
-            .execute()
-            .get("items")
-            or []
-        )
+            organizer_events.extend(page.get("items") or [])
+            page_token = page.get("nextPageToken")
+            if not page_token:
+                break
         for item in organizer_events:
             if item.get("status") == "cancelled":
                 continue

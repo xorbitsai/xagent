@@ -833,6 +833,11 @@ class FakeEvents:
         update_result: dict[str, Any] | None = None,
     ):
         self._list_result = list_result if list_result is not None else {"items": []}
+        # Keyed by the request's own pageToken (None for the first page) -
+        # lets a test simulate a multi-page events.list response instead
+        # of always returning the same page regardless of pageToken. Only
+        # used when set; _list_result covers every single-page test.
+        self._list_results_by_page_token: dict[str | None, dict[str, Any]] | None = None
         self._get_result = get_result or {}
         self._insert_result = insert_result or {"id": "created"}
         self._update_result = update_result or {"id": "updated"}
@@ -842,6 +847,8 @@ class FakeEvents:
 
     def list(self, **kwargs: Any) -> _Exec:
         self.list_calls.append(kwargs)
+        if self._list_results_by_page_token is not None:
+            return _Exec(self._list_results_by_page_token[kwargs.get("pageToken")])
         return _Exec(self._list_result)
 
     def get(self, **kwargs: Any) -> _Exec:
@@ -994,6 +1001,33 @@ def test_create_events_detects_organizer_conflict_same_timezone(fake_service):
     assert len(result["conflicts"]) == 1
     assert result["conflicts"][0]["summary"] == "1:1 with Hazel"
     assert fake_service._events.insert_calls == []
+
+
+def test_create_events_follows_pagination_to_find_a_conflict_on_a_later_page(
+    fake_service,
+):
+    """Regression test: events.list() caps a single response at a limited
+    page size and signals more with nextPageToken - stopping after the
+    first page (as an earlier version of this check did) would silently
+    place a busy event on a later page outside the check entirely,
+    letting a real conflict through undetected."""
+    fake_service._events._list_results_by_page_token = {
+        None: {"items": [], "nextPageToken": "page-2"},
+        "page-2": {"items": [_confirmed_event(event_id="other-1")]},
+    }
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Kickoff",
+            start_time="2026-08-27T10:00:00+08:00",
+            end_time="2026-08-27T10:30:00+08:00",
+        )
+    )
+
+    assert result["status"] == "conflict"
+    assert result["conflicts"][0]["summary"] == "1:1 with Hazel"
+    page_tokens = [call.get("pageToken") for call in fake_service._events.list_calls]
+    assert page_tokens == [None, "page-2"]
 
 
 def test_create_events_ignores_transparent_organizer_event(fake_service):

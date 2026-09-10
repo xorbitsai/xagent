@@ -96,6 +96,12 @@ _TEXT_SAFE_MIME_TYPES = {
     # rejecting a genuinely binary file that happens to declare one of
     # these types, which none do.
     "application/x-sql",
+    # Newer Python/OS mime databases (confirmed: CI's Ubuntu + Python 3.12,
+    # unlike this file's own dev/test host) resolve ".sql" to the
+    # IANA-registered "application/sql" instead of the older unofficial
+    # "application/x-sql" -- both point at the same plain-text format, so
+    # both are listed rather than picking one and hoping every host agrees.
+    "application/sql",
     "application/x-httpd-php",
     "application/vnd.dart",
     # Found by a broader sweep of common script/config/source extensions

@@ -747,6 +747,7 @@ def test_simple_upload_max_bytes_is_at_or_below_graphs_4mb_limit():
     "mime_type",
     [
         "application/x-sql",
+        "application/sql",
         "application/x-httpd-php",
         "application/vnd.dart",
         "application/x-tex",
@@ -868,35 +869,60 @@ def test_upload_text_file_allows_ambiguous_extensions_that_collide_with_binary_m
 
 
 @pytest.mark.parametrize(
-    "file_path",
+    "file_path,simulated_mime_type",
     [
-        "deploy.ps1",
-        "schema.sql",
-        "index.php",
-        "main.dart",
-        "paper.tex",
-        "build.csh",
-        "layout.tpl",
+        ("schema.sql", "application/x-sql"),
+        ("schema.sql", "application/sql"),
+        ("index.php", "application/x-httpd-php"),
+        ("main.dart", "application/vnd.dart"),
+        ("paper.tex", "application/x-tex"),
+        ("build.csh", "application/x-csh"),
+        ("layout.tpl", "application/vnd.groove-tool-template"),
     ],
 )
 def test_upload_text_file_allows_source_extensions_with_non_text_mime_guess(
-    monkeypatch, file_path
+    monkeypatch, file_path, simulated_mime_type
 ):
     """Regression guard: a reviewer-verified false-positive class --
-    ".ps1" was mistakenly placed in the hand-maintained binary-extension
-    fallback set (PowerShell scripts are genuine text), and ".sql"/".php"/
-    ".dart"/".tex"/".csh"/".tpl" resolve via mimetypes on at least some
-    hosts to non-text application/* types (application/x-sql,
-    application/x-httpd-php, application/vnd.dart, application/x-tex,
-    application/x-csh, application/vnd.groove-tool-template) that were
-    missing from the text-safe allowlist. None of these six collide with
-    a real binary format the way .ts/.bat/.scm/.sc do, so they belong in
-    _TEXT_SAFE_MIME_TYPES rather than the ambiguous-extension carve-out."""
+    ".sql"/".php"/".dart"/".tex"/".csh"/".tpl" resolve via mimetypes on at
+    least some hosts to non-text application/* types that were missing
+    from the text-safe allowlist. None of these collide with a real binary
+    format the way .ts/.bat/.scm/.sc do, so they belong in
+    _TEXT_SAFE_MIME_TYPES rather than the ambiguous-extension carve-out.
+
+    The mimetype each extension actually resolves to is host- and Python-
+    version-dependent (confirmed directly: this file's own dev host and a
+    CI run on a different OS/Python disagreed on ".sql" -- "application/
+    x-sql" locally, "application/sql" on CI) -- monkeypatching
+    mimetypes.guess_type to a fixed value per case makes this test
+    deterministic instead of silently depending on whichever mime.types
+    database happens to be installed on whatever machine runs it.
+    """
+    monkeypatch.setattr(
+        onedrive.mimetypes, "guess_type", lambda name: (simulated_mime_type, None)
+    )
     monkeypatch.setattr(
         onedrive.requests, "request", Mock(return_value=MockResponse({"id": "f1"}))
     )
 
     result = json.loads(onedrive.onedrive_upload_text_file(file_path, "some text"))
+
+    assert result["status"] == "success"
+
+
+def test_upload_text_file_allows_ps1_regardless_of_host_mimetypes(monkeypatch):
+    """Regression guard: ".ps1" was mistakenly placed in the hand-
+    maintained binary-extension fallback set in an earlier commit
+    (PowerShell scripts are genuine text) and is now in
+    _AMBIGUOUS_TEXT_EXTENSIONS instead -- unlike the mime-type-allowlist
+    cases above, this must hold regardless of what mimetypes.guess_type
+    returns for it on any given host, which is exactly what the ambiguous-
+    extension short-circuit guarantees."""
+    monkeypatch.setattr(
+        onedrive.requests, "request", Mock(return_value=MockResponse({"id": "f1"}))
+    )
+
+    result = json.loads(onedrive.onedrive_upload_text_file("deploy.ps1", "some text"))
 
     assert result["status"] == "success"
 

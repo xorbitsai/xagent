@@ -1351,10 +1351,8 @@ async def test_console_cap_does_not_shrink_the_persisted_payload(
     assert persistence_handler.received[0] is original_payload
     assert persistence_handler.received[0] == expected_content
 
-    # Console side: the log line is still capped. ``Tracer.trace_event``
-    # itself logs several diagnostic lines through the same module logger
-    # (dispatch bookkeeping), so filter down to the one line
-    # ``ConsoleTraceHandler._handle_system_event`` actually renders.
+    # Dispatch bookkeeping is DEBUG-only; INFO keeps the console event.
+    assert len(caplog.records) == 1
     console_records = [
         r for r in caplog.records if r.getMessage().startswith("[SYSTEM]")
     ]
@@ -1409,3 +1407,49 @@ async def test_console_handler_caps_every_scope(
     message_bytes = len(message.encode("utf-8"))
     assert message_bytes <= 50_000 + 200, f"log line not bounded: {message_bytes}"
     assert "[truncated" in message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scope", ["TASK", "STEP", "ACTION", "SYSTEM"])
+async def test_console_handler_skips_disabled_payload_rendering(
+    scope: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+    from unittest.mock import Mock
+
+    from xagent.core.agent import trace
+
+    renderer = Mock(side_effect=AssertionError("disabled log rendered payload"))
+    monkeypatch.setattr(trace, "_render_event_data_for_log", renderer)
+    event = trace.TraceEvent(
+        trace.TraceEventType(
+            getattr(trace.TraceScope, scope),
+            trace.TraceAction.INFO,
+            trace.TraceCategory.GENERAL,
+        ),
+        data={"snapshot": "must remain untouched"},
+        task_id="task",
+        step_id="step",
+    )
+    with caplog.at_level(logging.WARNING, logger=trace.__name__):
+        await trace.ConsoleTraceHandler().handle_event(event)
+    renderer.assert_not_called()
+    assert not caplog.records
+
+
+@pytest.mark.asyncio
+async def test_dispatch_diagnostics_available_at_debug(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging
+
+    from xagent.core.agent.trace import SYSTEM_INFO, ConsoleTraceHandler, Tracer
+
+    tracer = Tracer()
+    tracer.add_handler(ConsoleTraceHandler())
+    with caplog.at_level(logging.DEBUG, logger="xagent.core.agent.trace"):
+        await tracer.trace_event(SYSTEM_INFO, data={"key": "value"})
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("with data keys: ['key']" in message for message in messages)
+    assert "Calling handler 0: ConsoleTraceHandler" in messages
+    assert "Handler 0 completed successfully" in messages

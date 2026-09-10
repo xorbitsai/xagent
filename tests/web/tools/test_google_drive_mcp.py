@@ -2844,12 +2844,16 @@ def test_create_file_allows_plain_text_names(monkeypatch):
         "script.tcl",
         "types.dtd",
         "file.scm",
+        "Program.cs",
+        "AppDelegate.m",
+        "AppDelegate.mm",
+        "icon.svg",
     ],
 )
 def test_create_file_allows_script_source_extensions(monkeypatch, name):
-    """Regression guard: none of these genuinely-text script/source
-    extensions belong in _KNOWN_BINARY_EXTENSIONS, so google_drive_create_file
-    must accept them with the default text/plain mime_type. An earlier,
+    """Regression guard: all of these genuinely-text script/source
+    extensions must be in _KNOWN_TEXT_EXTENSIONS, so google_drive_create_file
+    accepts them with the default text/plain mime_type. An earlier,
     since-reverted implementation delegated this check to
     mimetypes.guess_type(), whose answer for exactly these extensions
     depends on whatever mime.types database is installed on the host (a
@@ -2877,6 +2881,8 @@ def test_create_file_allows_script_source_extensions(monkeypatch, name):
         "application/x-latex",
         "application/xml-dtd",
         "application/vnd.dart",
+        "application/x-protobuf",
+        "application/graphql",
     ],
 )
 def test_create_file_allows_unambiguous_text_application_mime_types(
@@ -2886,7 +2892,11 @@ def test_create_file_allows_unambiguous_text_application_mime_types(
     format is ever declared with them — so an explicit mime_type of one of
     these must be accepted even for a name with no matching extension
     override, unlike ".bat"/".ts"/".scm" which stay name-only because
-    their mime type collides with a genuine binary format."""
+    their mime type collides with a genuine binary format. Regression
+    guard: .proto/.graphql were already accepted by *name*, but
+    application/x-protobuf/application/graphql were missing from the
+    mime_type allowlist, so declaring the mime_type explicitly instead of
+    relying on the name was wrongly rejected."""
     files = Mock()
     files.create.return_value.execute.return_value = {"id": "f1"}
     _mock_drive_service_with_files(monkeypatch, files)
@@ -2943,10 +2953,10 @@ def test_create_file_rejects_binary_mime_type_even_with_a_non_flagged_name(
     the file like a binary format) must be rejected too, since content is
     always UTF-8-encoded text regardless of what mime_type claims. Without
     this, a caller could bypass the binary-looking-name guard entirely by
-    using a name with no extension, a .txt extension, or an extension not
-    in _KNOWN_BINARY_EXTENSIONS, while still declaring a binary mime_type —
-    producing the exact declared-type-vs-content mismatch this guard
-    exists to prevent."""
+    using a name with no extension, a .txt extension, or an extension
+    that's in _KNOWN_TEXT_EXTENSIONS, while still declaring a binary
+    mime_type — producing the exact declared-type-vs-content mismatch this
+    guard exists to prevent."""
     files = Mock()
     _mock_drive_service_with_files(monkeypatch, files)
 
@@ -3067,6 +3077,23 @@ def test_create_file_strips_name_before_checking_the_extension(monkeypatch):
     assert result["status"] == "error"
     assert "google_drive_upload_file" in result["message"]
     files.create.assert_not_called()
+
+
+def test_create_file_sends_the_stripped_name_to_drive(monkeypatch):
+    """Regression guard: a trailing-space name that otherwise passes the
+    guard (a recognized text extension) must not carry that whitespace
+    through into the actual Drive file_metadata["name"] -- the guard's
+    internal stripping (inside _name_looks_binary) only affected the
+    suffix check, not what name was actually sent, unlike
+    google_drive_upload_file's matching `name.strip() or ...`."""
+    files = Mock()
+    files.create.return_value.execute.return_value = {"id": "f1"}
+    _mock_drive_service_with_files(monkeypatch, files)
+
+    result = json.loads(google_drive.google_drive_create_file(" notes.txt ", "hello"))
+
+    assert result["status"] == "success"
+    assert files.create.call_args.kwargs["body"]["name"] == "notes.txt"
 
 
 @pytest.mark.parametrize(

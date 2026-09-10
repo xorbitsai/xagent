@@ -679,10 +679,16 @@ def _capped_content_response(
 # YAML/JS and the "+json"/"+xml" structured-syntax suffixes (RFC 6839, e.g.
 # "application/ld+json", "application/atom+xml") are included for the same
 # reason — genuinely text under the hood, just not "text/"-prefixed by
-# convention. The script/source-format entries (x-sh, x-sql, x-tex, ...)
-# are each an unambiguous registered mime type for a genuinely-text format
-# — no unrelated binary format is ever declared with them — so accepting
-# them here is always safe, however the caller arrived at declaring one.
+# convention. The script/source-format entries (x-sh, x-sql, x-tex, ...,
+# x-protobuf, graphql) are each an unambiguous registered mime type for a
+# genuinely-text format — no unrelated binary format is ever declared with
+# them — so accepting them here is always safe, however the caller arrived
+# at declaring one. Thrift/Avro are deliberately NOT included here even
+# though their .thrift/.avsc *extensions* are in _KNOWN_TEXT_EXTENSIONS
+# below (an IDL/schema file is always text) — unlike protobuf, a generic
+# Thrift/Avro mime type can legitimately describe an actual binary-encoded
+# payload, the same ambiguity ".bat"/".ts"/".scm" have at the extension
+# level (see _KNOWN_TEXT_EXTENSIONS's own note on those).
 _TEXT_MIME_TYPES = {
     "application/json",
     "application/xml",
@@ -700,6 +706,8 @@ _TEXT_MIME_TYPES = {
     "application/x-latex",
     "application/xml-dtd",
     "application/vnd.dart",
+    "application/x-protobuf",
+    "application/graphql",
 }
 _TEXT_MIME_TYPE_SUFFIXES = ("+xml", "+json", "+yaml")
 
@@ -858,6 +866,16 @@ def _resolve_upload_file_path(file_path: str) -> Path:
 # text" by the old design's logic) in a minimal CI/production container.
 # A fixed, in-source list is the only way to get identical behavior
 # everywhere this code runs.
+#
+# ".bat", ".ts", and ".scm" are included as text (batch script,
+# TypeScript, Scheme source) even though each also names a real,
+# unrelated binary format elsewhere (a Windows .exe-like executable, an
+# MPEG-2 transport stream, a Lotus ScreenCam recording) -- a judgment
+# call in favor of what an agent generating files is overwhelmingly more
+# likely to mean, resolved per-extension since no mime-type rule can
+# distinguish the two (see _TEXT_MIME_TYPES's matching note on why
+# Thrift/Avro's mime types, unlike protobuf's, are excluded there for
+# the same reason).
 _KNOWN_TEXT_PLAIN_EXTENSIONS = {
     ".txt", ".md", ".markdown", ".rst", ".adoc", ".rtf", ".log", ".lock",
     ".gitignore", ".gitattributes", ".editorconfig", ".dockerignore",
@@ -868,17 +886,18 @@ _KNOWN_TEXT_DATA_EXTENSIONS = {
     ".xsl", ".xslt", ".proto", ".graphql", ".gql", ".thrift", ".avsc",
 }  # fmt: skip
 _KNOWN_TEXT_WEB_EXTENSIONS = {
-    ".html", ".htm", ".css", ".scss", ".sass", ".less",
+    ".html", ".htm", ".css", ".scss", ".sass", ".less", ".svg",
     ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx",
     ".vue", ".svelte", ".astro",
 }  # fmt: skip
 _KNOWN_TEXT_SOURCE_EXTENSIONS = {
     ".py", ".rb", ".php", ".java", ".c", ".h", ".cpp", ".hpp", ".cc",
-    ".cxx", ".go", ".rs", ".swift", ".kt", ".kts", ".scala", ".groovy",
-    ".lua", ".r", ".jl", ".pl", ".pm", ".hs", ".fs", ".fsx", ".ml",
-    ".mli", ".clj", ".cljs", ".erl", ".ex", ".exs", ".nim", ".zig", ".v",
-    ".d", ".dart", ".elm", ".cr", ".tcl", ".scm", ".rkt", ".lisp", ".el",
-    ".asm", ".s", ".pas", ".f90", ".for", ".vb", ".vbs", ".cabal", ".nix",
+    ".cxx", ".cs", ".m", ".mm", ".go", ".rs", ".swift", ".kt", ".kts",
+    ".scala", ".groovy", ".lua", ".r", ".jl", ".pl", ".pm", ".hs", ".fs",
+    ".fsx", ".ml", ".mli", ".clj", ".cljs", ".erl", ".ex", ".exs", ".nim",
+    ".zig", ".v", ".d", ".dart", ".elm", ".cr", ".tcl", ".scm", ".rkt",
+    ".lisp", ".el", ".asm", ".s", ".pas", ".f90", ".for", ".vb", ".vbs",
+    ".cabal", ".nix",
 }  # fmt: skip
 _KNOWN_TEXT_SCRIPT_EXTENSIONS = {
     ".sh", ".bash", ".zsh", ".csh", ".ksh", ".fish",
@@ -1310,6 +1329,15 @@ def google_drive_create_file(
     google_drive_upload_file with the file's path instead.
     """
     try:
+        # Stripped once here so every downstream use agrees: the
+        # binary-name guard below and the actual Drive file_metadata["name"]
+        # sent. _name_looks_binary already stripped internally for its own
+        # suffix check, but without also reassigning `name` itself, a
+        # trailing-space name like "notes.txt " would pass the guard (the
+        # suffix check sees ".txt") yet still land in Drive with the
+        # literal trailing space intact — inconsistent with
+        # google_drive_upload_file's matching `name.strip()`.
+        name = name.strip()
         # Normalized (case/whitespace/;params stripped) once here so every
         # downstream use agrees: the guard checks below, the Drive
         # file_metadata["mimeType"] actually sent, and the upload's own

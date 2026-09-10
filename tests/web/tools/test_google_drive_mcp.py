@@ -2744,6 +2744,30 @@ def test_create_file_allows_plain_text_names(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    "name", ["deploy.sh", "backup.csh", "run.bat", "query.sql", "app.ts"]
+)
+def test_create_file_allows_script_extensions_mimetypes_misclassifies(
+    monkeypatch, name
+):
+    """Regression guard: mimetypes.guess_type() maps these genuinely-text
+    script/source extensions to non-text-safe mime types for unrelated
+    reasons (.sh -> application/x-sh, .csh -> application/x-csh, .bat ->
+    application/x-msdownload, .sql -> application/x-sql, .ts -> video/mp2t
+    — a well-known collision between TypeScript source and MPEG transport
+    streams). Switching _name_looks_binary from the old hardcoded
+    _BINARY_NAME_EXTENSIONS set to mimetypes introduced a false-positive
+    rejection of these — the override list must close it back up."""
+    files = Mock()
+    files.create.return_value.execute.return_value = {"id": "f1"}
+    _mock_drive_service_with_files(monkeypatch, files)
+
+    result = json.loads(google_drive.google_drive_create_file(name, "some text"))
+
+    assert result["status"] == "success"
+    files.create.assert_called_once()
+
+
+@pytest.mark.parametrize(
     "name,mime_type",
     [
         ("report", "application/pdf"),

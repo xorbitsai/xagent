@@ -796,6 +796,18 @@ def _resolve_upload_file_path(file_path: str) -> Path:
     )
 
 
+# mimetypes.guess_type() gets these particular extensions wrong for our
+# purposes: each is a plain-text script/source format that happens to share
+# its extension with an unrelated (or Windows-executable) registered mime
+# type, so mimetypes' answer is misleading rather than merely unknown.
+# ".ts" is the sharpest case -- TypeScript source vs. an MPEG-2 transport
+# stream -- but plain shells and SQL collide the same way. This list is
+# short and closed (extensions mimetypes actively gets wrong), unlike
+# _BINARY_NAME_EXTENSIONS' old job of enumerating every binary format,
+# which is what made that list incomplete in the first place.
+_TEXT_EXTENSION_OVERRIDES = {".sh", ".csh", ".bat", ".sql", ".ts"}
+
+
 def _name_looks_binary(name: str) -> bool:
     """Whether ``name``'s extension maps to a known non-text format.
 
@@ -812,6 +824,8 @@ def _name_looks_binary(name: str) -> bool:
     is the complementary signal that catches an explicitly-declared binary
     type regardless of what the name looks like.
     """
+    if Path(name).suffix.lower() in _TEXT_EXTENSION_OVERRIDES:
+        return False
     guessed_mime_type, _ = mimetypes.guess_type(name)
     return guessed_mime_type is not None and not _is_text_mime_type(guessed_mime_type)
 

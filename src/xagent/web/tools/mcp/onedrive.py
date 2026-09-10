@@ -1,7 +1,9 @@
 import base64
 import json
 import logging
+import mimetypes
 import os
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
@@ -19,6 +21,31 @@ mcp = FastMCP("onedrive-mcp")
 
 GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
 DEFAULT_TIMEOUT_SECONDS = 30
+# Microsoft Graph's simple content PUT only accepts files up to 4 MiB;
+# anything larger must go through a resumable upload session instead (see
+# _upload_large_file_content).
+_SIMPLE_UPLOAD_MAX_BYTES = 4 * 1024 * 1024
+# Chunk size for the upload-session path. Must be a multiple of 320 KiB
+# (327,680 bytes) per Graph's requirement for every non-final chunk; 5 MiB
+# is exactly 16 * 320 KiB.
+_UPLOAD_SESSION_CHUNK_SIZE = 5 * 1024 * 1024
+
+_UPLOAD_ALLOWED_DIRS_ENV_VAR = "XAGENT_ONEDRIVE_FILE_ALLOWED_DIRS"
+
+# Extensions of unambiguously binary formats a caller might plausibly name
+# a text-upload target after. Mirrors google_drive.py's equivalent guard —
+# onedrive_upload_text_file's content is always UTF-8 text (see below), so
+# a binary-looking target name is always a caller mistake, not a valid use.
+_KNOWN_BINARY_EXTENSIONS = {
+    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".xlsm", ".ppt", ".pptx",
+    ".odt", ".ods", ".odp", ".epub", ".mobi",
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff",
+    ".heic", ".heif", ".ico", ".psd",
+    ".mp3", ".wav", ".ogg", ".flac", ".m4a", ".aac",
+    ".mp4", ".mov", ".avi", ".mkv", ".webm", ".wmv",
+    ".zip", ".7z", ".rar", ".tar", ".gz", ".tgz", ".bz2",
+    ".exe", ".dll", ".so", ".dylib", ".dmg", ".bin", ".iso", ".apk",
+}  # fmt: skip
 
 
 def _success(**payload: Any) -> str:
@@ -117,6 +144,93 @@ def _decode_bytes(content: bytes) -> tuple[str | None, str | None]:
         return None, base64.b64encode(content).decode("ascii")
 
 
+def _name_looks_binary(name: str) -> bool:
+    return Path(name).suffix.lower() in _KNOWN_BINARY_EXTENSIONS
+
+
+def _allowed_upload_dirs() -> list[Path]:
+    raw_dirs = os.environ.get(_UPLOAD_ALLOWED_DIRS_ENV_VAR, "")
+    if not raw_dirs.strip():
+        return [Path.cwd().resolve()]
+    return [
+        Path(stripped).expanduser().resolve()
+        for raw_dir in raw_dirs.split(",")
+        if (stripped := raw_dir.strip())
+    ]
+
+
+def _resolve_upload_file_path(file_path: str) -> Path:
+    """Restrict onedrive_upload_file to files under an allowlisted
+    directory, mirroring slack_upload_file's/google_drive_upload_file's
+    defense -- without it an agent could be tricked into exfiltrating
+    arbitrary host files through this tool.
+
+    Containment is checked before existence, so a path that is both
+    outside the allowlist and nonexistent reports the allowlist message,
+    not "not found" -- the latter would leak whether that host path
+    exists at all to a caller who has no business finding out.
+    """
+    local_path = Path(file_path).expanduser()
+    if not local_path.is_absolute():
+        local_path = Path.cwd() / local_path
+    local_path = local_path.resolve()
+
+    allowed_dirs = _allowed_upload_dirs()
+    if not any(local_path.is_relative_to(d) for d in allowed_dirs):
+        logger.warning(
+            "Rejected onedrive_upload_file path %s outside allowed directories: %s",
+            local_path,
+            ", ".join(str(path) for path in allowed_dirs),
+        )
+        raise PermissionError(
+            "file_path is outside the allowed upload directories; ask the "
+            "user for a file inside the task workspace or another allowed "
+            "location"
+        )
+
+    if not local_path.is_file():
+        raise FileNotFoundError(f"File not found: {file_path}")
+    return local_path
+
+
+def _upload_large_file_content(
+    remote_path: str, data: bytes, mime_type: str
+) -> dict[str, Any]:
+    """Upload ``data`` too large for the simple content PUT (Graph's 4 MiB
+    cap) via a resumable upload session, in 320 KiB-aligned chunks."""
+    session = _graph_request(
+        "POST",
+        f"{_item_path(remote_path)}/createUploadSession",
+        body={"item": {"@microsoft.graph.conflictBehavior": "replace"}},
+    )
+    upload_url = session.get("uploadUrl")
+    if not upload_url:
+        raise RuntimeError("OneDrive did not return an upload session URL")
+
+    total = len(data)
+    result: dict[str, Any] = {}
+    for start in range(0, total, _UPLOAD_SESSION_CHUNK_SIZE):
+        end = min(start + _UPLOAD_SESSION_CHUNK_SIZE, total)
+        # The upload session URL is itself pre-authenticated (a token in
+        # its query string) -- Graph 401s a chunk request that also carries
+        # our own Authorization header, so this goes straight through
+        # requests.put rather than _graph_request (which always attaches
+        # one), and content type is irrelevant to the session endpoint.
+        response = requests.put(
+            upload_url,
+            data=data[start:end],
+            headers={
+                "Content-Length": str(end - start),
+                "Content-Range": f"bytes {start}-{end - 1}/{total}",
+            },
+            timeout=DEFAULT_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        if response.content:
+            result = response.json()
+    return result
+
+
 @mcp.tool()
 def onedrive_get_profile() -> str:
     """Get the current Microsoft 365 user profile for OneDrive operations."""
@@ -206,8 +320,27 @@ def onedrive_upload_text_file(
     file_path: str,
     content: str,
 ) -> str:
-    """Upload or overwrite a UTF-8 text file in OneDrive by path."""
+    """
+    Upload or overwrite a UTF-8 text file in OneDrive by path.
+
+    content is always treated as text (it is UTF-8 encoded before upload)
+    -- this tool cannot create a real PDF, image, or Office-format binary;
+    naming the target "report.pdf" would produce a file with that name but
+    plain-text content, not an actual PDF. To upload an already-generated
+    local file's real bytes (a PDF, image, .docx, etc.), use
+    onedrive_upload_file with that file's path instead.
+    """
     try:
+        if _name_looks_binary(file_path):
+            return _error(
+                f"'{file_path}' looks like a binary file, but "
+                "onedrive_upload_text_file only writes text content -- "
+                "uploading it here would produce a mislabeled text file, "
+                "not real binary data. If you already have this file on "
+                "disk (e.g. as a task output), use onedrive_upload_file "
+                "with its local path to upload the real binary content "
+                "instead."
+            )
         result = _graph_request(
             "PUT",
             _content_path(file_path),
@@ -217,6 +350,60 @@ def onedrive_upload_text_file(
         return _success(item=result)
     except Exception as e:
         logger.error("Error uploading OneDrive text file %s: %s", file_path, e)
+        return _error(str(e))
+
+
+@mcp.tool()
+def onedrive_upload_file(
+    file_path: str, remote_path: str = "", mime_type: str = ""
+) -> str:
+    """
+    Upload a local file's real bytes to OneDrive -- use this (not
+    onedrive_upload_text_file) for a PDF, image, Office document, or any
+    other binary content, including a file this agent already generated
+    into the task workspace (e.g. an exported PDF report).
+
+    file_path: path to a file already on disk, e.g. something written to
+    the task workspace. Must be inside an allowed directory (automatically
+    scoped to the current task workspace) so this tool cannot be used to
+    exfiltrate arbitrary files from the host. Pass an absolute path — a
+    relative path resolves against this process's own working directory,
+    not the allowed directory, and will not find a file written to the
+    task workspace.
+    remote_path: the OneDrive path to upload to (e.g. "Documents/report.pdf"),
+    overwriting any existing file there; defaults to the local file's own
+    name at the OneDrive root.
+    mime_type: defaults to a guess from the file's extension, falling back
+    to "application/octet-stream" when it can't be guessed.
+    """
+    try:
+        local_path = _resolve_upload_file_path(file_path)
+        resolved_remote_path = remote_path.strip() or local_path.name
+        resolved_mime_type = (
+            mime_type.strip()
+            or mimetypes.guess_type(local_path.name)[0]
+            or "application/octet-stream"
+        )
+
+        data = local_path.read_bytes()
+        if not data:
+            raise ValueError(f"File is empty: {file_path}")
+
+        if len(data) <= _SIMPLE_UPLOAD_MAX_BYTES:
+            result = _graph_request(
+                "PUT",
+                _content_path(resolved_remote_path),
+                extra_headers={"Content-Type": resolved_mime_type},
+                data=data,
+            )
+        else:
+            result = _upload_large_file_content(
+                resolved_remote_path, data, resolved_mime_type
+            )
+
+        return _success(item=result)
+    except Exception as e:
+        logger.error("Error uploading OneDrive file %s: %s", file_path, e)
         return _error(str(e))
 
 

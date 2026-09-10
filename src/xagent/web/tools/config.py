@@ -3699,7 +3699,8 @@ class WebToolConfig(BaseToolConfig):
                 env["XAGENT_LINKEDIN_IMAGE_ALLOWED_DIRS"] = allowed_file_dirs
                 env["XAGENT_SLACK_FILE_ALLOWED_DIRS"] = allowed_file_dirs
                 env["XAGENT_GMAIL_FILE_ALLOWED_DIRS"] = allowed_file_dirs
-            # Distinct from the three read allowlists above: Google Drive's
+                env["XAGENT_ONEDRIVE_FILE_ALLOWED_DIRS"] = allowed_file_dirs
+            # Distinct from the four read allowlists above: Google Drive's
             # download tool writes NEW files into the task workspace, so it
             # gets its own single-value, task-dir-only var rather than
             # reusing the read-allowlist shape (see

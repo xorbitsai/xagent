@@ -960,6 +960,41 @@ def test_get_file_content_normalizes_mime_type_before_detecting_the_default(
     )
 
 
+def test_get_file_content_google_apps_detection_requires_the_real_prefix(monkeypatch):
+    """Regression guard: matches google_drive_create_file's own fix for the
+    same class of bug -- a crafted mimeType that merely *contains* the
+    substring "application/vnd.google-apps" somewhere after a ";" (e.g.
+    from a file uploaded via google_drive_upload_file, whose mime_type
+    isn't allowlist-restricted the way create_file's is) must not be
+    misdetected as a Workspace document and routed into export_media,
+    which would 400 for a regular file. The old bare `"..." in
+    file_mime_type` substring check would have matched this; the real
+    mimeType here normalizes (splits at ";") to plain "text/plain"."""
+    service = _mock_drive_service(monkeypatch)
+    service.files.return_value.get.return_value.execute.return_value = {
+        "id": "f1",
+        "name": "weird.txt",
+        "mimeType": "text/plain; charset=application/vnd.google-apps",
+    }
+    service.files.return_value.get_media.return_value = "media-request"
+
+    class _FakeDownloader:
+        def __init__(self, fh, _request):
+            self._fh = fh
+
+        def next_chunk(self):
+            self._fh.write(b"hello")
+            return None, True
+
+    monkeypatch.setattr(google_drive, "MediaIoBaseDownload", _FakeDownloader)
+
+    result = json.loads(google_drive.google_drive_get_file_content("f1"))
+
+    assert result["status"] == "success"
+    service.files.return_value.export_media.assert_not_called()
+    service.files.return_value.get_media.assert_called_once()
+
+
 def test_get_file_content_respects_explicit_mime_type_for_spreadsheet(monkeypatch):
     """An explicit (non-default) mime_type must be honored as-is rather
     than the text/plain->text/csv smart-fallback mapping overriding it.
@@ -2180,6 +2215,31 @@ def test_download_file_writes_regular_binary_file(monkeypatch, tmp_path):
     files.export_media.assert_not_called()
 
 
+def test_download_file_google_apps_detection_requires_the_real_prefix(
+    monkeypatch, tmp_path
+):
+    """Regression guard: same class of bug as google_drive_create_file's
+    own fix -- a crafted mimeType that merely *contains* the substring
+    "application/vnd.google-apps" (e.g. from a file uploaded via
+    google_drive_upload_file, whose mime_type isn't allowlist-restricted)
+    must not be misdetected as a Workspace document and routed into
+    export_media, which would 400 for a regular file with real bytes."""
+    files = Mock()
+    files.get.return_value.execute.return_value = {
+        "id": "f1",
+        "name": "weird.bin",
+        "mimeType": "application/octet-stream; x=application/vnd.google-apps",
+    }
+    _mock_drive_service_with_files(monkeypatch, files)
+    _patch_downloader(monkeypatch, b"real bytes")
+
+    result = json.loads(google_drive.google_drive_download_file("f1"))
+
+    assert result["status"] == "success"
+    files.get_media.assert_called_once_with(fileId="f1", supportsAllDrives=True)
+    files.export_media.assert_not_called()
+
+
 def test_download_file_exports_workspace_doc_with_extension_appended(
     monkeypatch, tmp_path
 ):
@@ -2547,6 +2607,21 @@ def test_upload_allowed_dirs_strips_whitespace_around_entries(tmp_path, monkeypa
 
 def test_upload_allowed_dirs_falls_back_to_cwd_when_unset(monkeypatch):
     monkeypatch.delenv("XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS", raising=False)
+
+    assert google_drive._upload_allowed_dirs() == [Path.cwd().resolve()]
+
+
+@pytest.mark.parametrize("raw_value", [",", " , ", ",,,"])
+def test_upload_allowed_dirs_falls_back_to_cwd_when_value_has_no_real_entries(
+    monkeypatch, raw_value
+):
+    """Regression guard: the env var being non-blank (so the "unset"
+    shortcut above doesn't apply) but normalizing to zero real directory
+    entries must still fall back to CWD, not silently return [] -- an
+    empty allowlist would make every google_drive_upload_file call fail
+    with "outside the allowed directories" instead of the documented
+    fail-open default."""
+    monkeypatch.setenv("XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS", raw_value)
 
     assert google_drive._upload_allowed_dirs() == [Path.cwd().resolve()]
 
@@ -3252,6 +3327,24 @@ def test_create_file_rejects_binary_extensions_not_in_the_text_allowlist(
     _mock_drive_service_with_files(monkeypatch, files)
 
     result = json.loads(google_drive.google_drive_create_file(name, "some text"))
+
+    assert result["status"] == "error"
+    assert "google_drive_upload_file" in result["message"]
+    files.create.assert_not_called()
+
+
+def test_create_file_treats_explicit_empty_mime_type_as_omitted(monkeypatch):
+    """Regression guard: a caller that explicitly passes mime_type="" (as
+    opposed to omitting the argument or passing None) must get the exact
+    same default behavior as an omitted mime_type -- the name-based guard
+    still applies, not the "explicit mime_type overrides the guard"
+    behavior an empty string could otherwise be mistaken for."""
+    files = Mock()
+    _mock_drive_service_with_files(monkeypatch, files)
+
+    result = json.loads(
+        google_drive.google_drive_create_file("report.pdf", "some text", mime_type="")
+    )
 
     assert result["status"] == "error"
     assert "google_drive_upload_file" in result["message"]

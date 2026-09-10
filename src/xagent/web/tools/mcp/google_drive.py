@@ -865,13 +865,19 @@ def _upload_allowed_dirs() -> list[Path]:
     migrated to a shared helper (a fast-follow, not part of this fix).
     """
     raw_dirs = os.environ.get(_UPLOAD_ALLOWED_DIRS_ENV_VAR, "")
-    if not raw_dirs.strip():
-        return [Path.cwd().resolve()]
-    return [
+    parsed_dirs = [
         Path(stripped).expanduser().resolve()
         for raw_dir in raw_dirs.split(",")
         if (stripped := raw_dir.strip())
     ]
+    # Falls back to CWD not just when the env var is entirely unset/blank,
+    # but also when it normalizes to no real entries (e.g. "," or " , ") --
+    # otherwise this would return [] and _resolve_upload_file_path's `any(
+    # local_path.is_relative_to(d) for d in allowed_dirs)` is vacuously
+    # False for every path, turning the documented fail-open CWD default
+    # into an unintended fail-closed "everything rejected" for a malformed
+    # value, rather than the same fallback a fully-empty var gets.
+    return parsed_dirs or [Path.cwd().resolve()]
 
 
 def _resolve_upload_file_path(file_path: str) -> Path:
@@ -1135,7 +1141,7 @@ def google_drive_get_file_content(file_id: str, mime_type: str = "text/plain") -
                 "which has no content to read."
             )
 
-        if "application/vnd.google-apps" in file_mime_type:
+        if _is_google_workspace_mime_type(file_mime_type):
             # Export Google Workspace document. The tool's "text/plain"
             # default is reasonable for the common Docs/Slides case, but
             # several other Workspace types either have no text/plain
@@ -1252,7 +1258,7 @@ def google_drive_download_file(
         file_mime_type = file_metadata.get("mimeType", "")
         drive_name = file_metadata.get("name") or resolved_file_id
 
-        if "application/vnd.google-apps" in file_mime_type:
+        if _is_google_workspace_mime_type(file_mime_type):
             if not mime_type:
                 return json.dumps(
                     {

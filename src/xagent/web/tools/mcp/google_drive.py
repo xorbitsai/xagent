@@ -657,14 +657,9 @@ def _capped_content_response(
 # "application/ld+json", "application/atom+xml") are included for the same
 # reason — genuinely text under the hood, just not "text/"-prefixed by
 # convention. The script/source-format entries (x-sh, x-sql, x-tex, ...)
-# are mimetypes.guess_type()'s own registered mime type for that extension
-# — each is unambiguous (no unrelated binary format shares it), unlike
-# ".bat"/".ts"/".scm", which mimetypes maps to a mime type ALSO used by a
-# real binary format (application/x-msdownload is .exe too; video/mp2t is
-# a real MPEG transport stream; application/vnd.lotus-screencam is a real
-# ScreenCam recording) — those three can only be resolved per-extension,
-# not by mime type alone, and are handled by _TEXT_EXTENSION_OVERRIDES
-# below instead.
+# are each an unambiguous registered mime type for a genuinely-text format
+# — no unrelated binary format is ever declared with them — so accepting
+# them here is always safe, however the caller arrived at declaring one.
 _TEXT_MIME_TYPES = {
     "application/json",
     "application/xml",
@@ -817,44 +812,65 @@ def _resolve_upload_file_path(file_path: str) -> Path:
     )
 
 
-# Extensions where mimetypes.guess_type()'s answer is genuinely ambiguous
-# -- the mime type it returns is ALSO the real, registered type of an
-# unrelated binary format, so no mime-type-based rule (however broad)
-# can tell them apart; only the extension itself disambiguates, and only
-# by judgment call. ".bat" shares "application/x-msdownload" with ".exe"
-# (a real Windows binary); ".ts" shares "video/mp2t" with an actual MPEG-2
-# transport stream; ".scm" shares "application/vnd.lotus-screencam" with
-# an actual Lotus ScreenCam recording. Each is resolved here in favor of
-# the plain-text source format, since that's overwhelmingly what an
-# agent generating files is likely to mean by these extensions. Every
-# other misclassified script/source extension (.sh, .sql, .tex, .dart,
-# .tcl, .dtd, ...) instead has an unambiguous mime type and is handled by
-# widening _TEXT_MIME_TYPES above -- which also fixes the case where a
-# caller declares that same mime_type explicitly instead of relying on
-# the name, something a purely name-keyed override list can't reach.
-_TEXT_EXTENSION_OVERRIDES = {".bat", ".ts", ".scm"}
+# Extensions of unambiguously binary formats a caller might plausibly name
+# a file after. Deliberately NOT delegated to mimetypes.guess_type(): that
+# function's result for anything beyond a small hardcoded core depends on
+# whatever mime.types database happens to be installed on the *host* --
+# verified directly, this list's own entries for .docx/.xlsx/.pptx/.7z/
+# .epub/.odt/.xlsm (and even .sql/.tex/.dart/.tcl/.dtd, which must NOT be
+# in this list -- see _TEXT_MIME_TYPES above) come from an incidental
+# /etc/apache2/mime.types on one development machine and are silently
+# ABSENT in a minimal CI/production container, making guess_type()'s
+# verdict for the same file name differ between environments. A fixed,
+# in-source list is the only way to get identical behavior everywhere
+# this code runs, at the cost of needing an occasional addition here when
+# a new common binary format shows up (the previous mimetypes-based
+# design "solved" that at the price of being wrong by default on any host
+# without a system mime database).
+_KNOWN_BINARY_IMAGE_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff",
+    ".heic", ".heif", ".ico", ".psd", ".ai",
+}  # fmt: skip
+_KNOWN_BINARY_AUDIO_EXTENSIONS = {
+    ".mp3", ".wav", ".ogg", ".flac", ".m4a", ".aac", ".wma",
+}  # fmt: skip
+_KNOWN_BINARY_VIDEO_EXTENSIONS = {
+    ".mp4", ".mov", ".avi", ".mkv", ".webm", ".wmv", ".flv", ".m4v",
+}  # fmt: skip
+_KNOWN_BINARY_DOCUMENT_EXTENSIONS = {
+    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".xlsm", ".ppt", ".pptx",
+    ".odt", ".ods", ".odp", ".epub", ".mobi", ".azw", ".azw3",
+}  # fmt: skip
+_KNOWN_BINARY_ARCHIVE_EXTENSIONS = {
+    ".zip", ".7z", ".rar", ".tar", ".gz", ".tgz", ".bz2", ".xz",
+}  # fmt: skip
+_KNOWN_BINARY_EXECUTABLE_EXTENSIONS = {
+    ".exe", ".dll", ".so", ".dylib", ".msi", ".apk", ".deb", ".rpm",
+    ".iso", ".dmg", ".bin", ".class", ".jar",
+}  # fmt: skip
+_KNOWN_BINARY_EXTENSIONS = (
+    _KNOWN_BINARY_IMAGE_EXTENSIONS
+    | _KNOWN_BINARY_AUDIO_EXTENSIONS
+    | _KNOWN_BINARY_VIDEO_EXTENSIONS
+    | _KNOWN_BINARY_DOCUMENT_EXTENSIONS
+    | _KNOWN_BINARY_ARCHIVE_EXTENSIONS
+    | _KNOWN_BINARY_EXECUTABLE_EXTENSIONS
+)
 
 
 def _name_looks_binary(name: str) -> bool:
-    """Whether ``name``'s extension maps to a known non-text format.
+    """Whether ``name``'s extension is a known binary format.
 
-    Delegates to the standard ``mimetypes`` table rather than a small
-    hand-maintained extension list — that table already covers hundreds of
-    binary formats (Office/OOXML, images, audio/video, archives, and more
-    obscure ones like ``.7z``/``.heic``/``.odt``) that a short bespoke list
-    would inevitably miss one of. Used by google_drive_create_file to catch
-    a caller naming the file like a binary format even though its content
-    can only ever be literal UTF-8 text.
+    ``Path.suffix`` already resolves a compound extension like ".tar.gz"
+    to just its last component (".gz"), which is itself in
+    _KNOWN_BINARY_EXTENSIONS — no separate ".tar.gz" entry is needed.
 
-    An unrecognized or absent extension returns False (mimetypes has no
-    opinion either way) — google_drive_create_file's mime_type-based check
-    is the complementary signal that catches an explicitly-declared binary
-    type regardless of what the name looks like.
+    An unrecognized extension returns False — google_drive_create_file's
+    mime_type-based check is the complementary signal that catches an
+    explicitly-declared binary type regardless of what the name looks
+    like.
     """
-    if Path(name).suffix.lower() in _TEXT_EXTENSION_OVERRIDES:
-        return False
-    guessed_mime_type, _ = mimetypes.guess_type(name)
-    return guessed_mime_type is not None and not _is_text_mime_type(guessed_mime_type)
+    return Path(name).suffix.lower() in _KNOWN_BINARY_EXTENSIONS
 
 
 def get_drive_service() -> Any:
@@ -1250,8 +1266,8 @@ def google_drive_create_file(
         # A Google Workspace conversion is exempt from both checks below
         # (Docs/Sheets/Slides always take text/HTML source regardless of
         # the target doc's name), so short-circuit here rather than
-        # computing _name_looks_binary's mimetypes.guess_type() call and
-        # the mime-type check on every such call for nothing.
+        # computing _name_looks_binary and the mime-type check on every
+        # such call for nothing.
         if not is_google_doc_conversion:
             # Two independent signals catch two different mistakes: a
             # caller that left mime_type at its text/plain default but

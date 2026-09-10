@@ -2759,22 +2759,16 @@ def test_create_file_allows_plain_text_names(monkeypatch):
         "file.scm",
     ],
 )
-def test_create_file_allows_script_extensions_mimetypes_misclassifies(
-    monkeypatch, name
-):
-    """Regression guard: mimetypes.guess_type() maps these genuinely-text
-    script/source extensions to non-text-safe mime types for unrelated
-    reasons — some because the type is a real registered mime type for an
-    unambiguous text format (.sh -> application/x-sh, .sql ->
-    application/x-sql, .tex/.latex -> application/x-tex/x-latex, .dart ->
-    application/vnd.dart, .tcl -> application/x-tcl, .dtd ->
-    application/xml-dtd), others because the type is ALSO shared with a
-    real binary format (.bat -> application/x-msdownload, same as .exe;
-    .ts -> video/mp2t, a real MPEG transport stream; .scm ->
-    application/vnd.lotus-screencam, a real ScreenCam recording).
-    Switching _name_looks_binary from the old hardcoded
-    _BINARY_NAME_EXTENSIONS set to mimetypes introduced false-positive
-    rejections of all of these — must not regress again."""
+def test_create_file_allows_script_source_extensions(monkeypatch, name):
+    """Regression guard: none of these genuinely-text script/source
+    extensions belong in _KNOWN_BINARY_EXTENSIONS, so google_drive_create_file
+    must accept them with the default text/plain mime_type. An earlier,
+    since-reverted implementation delegated this check to
+    mimetypes.guess_type(), whose answer for exactly these extensions
+    depends on whatever mime.types database is installed on the host (a
+    system /etc/apache2/mime.types on one dev machine, absent in CI) —
+    that's why this list must stay a fixed, in-source set rather than a
+    call out to the platform."""
     files = Mock()
     files.create.return_value.execute.return_value = {"id": "f1"}
     _mock_drive_service_with_files(monkeypatch, files)
@@ -2862,10 +2856,10 @@ def test_create_file_rejects_binary_mime_type_even_with_a_non_flagged_name(
     the file like a binary format) must be rejected too, since content is
     always UTF-8-encoded text regardless of what mime_type claims. Without
     this, a caller could bypass the binary-looking-name guard entirely by
-    using a name with no extension, a .txt extension, or an extension
-    mimetypes doesn't recognize as binary, while still declaring a binary
-    mime_type — producing the exact declared-type-vs-content mismatch this
-    guard exists to prevent."""
+    using a name with no extension, a .txt extension, or an extension not
+    in _KNOWN_BINARY_EXTENSIONS, while still declaring a binary mime_type —
+    producing the exact declared-type-vs-content mismatch this guard
+    exists to prevent."""
     files = Mock()
     _mock_drive_service_with_files(monkeypatch, files)
 
@@ -2914,12 +2908,11 @@ def test_create_file_allows_text_safe_mime_types(monkeypatch, mime_type):
     ],
 )
 def test_create_file_rejects_previously_unlisted_binary_extensions(monkeypatch, name):
-    """Regression guard: reviewer-flagged gap in the old hand-maintained
-    _BINARY_NAME_EXTENSIONS blocklist — these extensions were never in that
-    18-entry set, so with the default text/plain mime_type they used to
-    sail straight through the guard and get silently created as
-    mislabeled text files. The mimetypes-based check must catch all of
-    them without needing a per-format entry added by hand."""
+    """Regression guard: reviewer-flagged gap in the original 18-entry
+    binary-extension set — these were missing from it, so with the
+    default text/plain mime_type they used to sail straight through the
+    guard and get silently created as mislabeled text files.
+    _KNOWN_BINARY_EXTENSIONS must include all of them."""
     files = Mock()
     _mock_drive_service_with_files(monkeypatch, files)
 

@@ -1163,34 +1163,32 @@ class ConsoleTraceHandler(BaseTraceHandler):
     persistence handlers keep the untrimmed payload.
     """
 
-    async def _handle_task_event(self, event: TraceEvent) -> None:
-        """Handle task-level events."""
+    async def handle_event(self, event: TraceEvent) -> None:
+        """Skip console dispatch and payload rendering when INFO is disabled."""
         if not logger.isEnabledFor(logging.INFO):
             return
+        await super().handle_event(event)
+
+    async def _handle_task_event(self, event: TraceEvent) -> None:
+        """Handle task-level events."""
         logger.info(
             f"[TASK] {event.event_type.action.value.upper()} {event.event_type.category.value.upper()} - Task {event.task_id} - {_render_event_data_for_log(event.data)}"
         )
 
     async def _handle_step_event(self, event: TraceEvent) -> None:
         """Handle step-level events."""
-        if not logger.isEnabledFor(logging.INFO):
-            return
         logger.info(
             f"[STEP] {event.event_type.action.value.upper()} {event.event_type.category.value.upper()} - Step {event.step_id} - {_render_event_data_for_log(event.data)}"
         )
 
     async def _handle_action_event(self, event: TraceEvent) -> None:
         """Handle action-level events."""
-        if not logger.isEnabledFor(logging.INFO):
-            return
         logger.info(
             f"[ACTION] {event.event_type.action.value.upper()} {event.event_type.category.value.upper()} - Step {event.step_id} - {_render_event_data_for_log(event.data)}"
         )
 
     async def _handle_system_event(self, event: TraceEvent) -> None:
         """Handle system-level events."""
-        if not logger.isEnabledFor(logging.INFO):
-            return
         logger.info(
             f"[SYSTEM] {event.event_type.action.value.upper()} {event.event_type.category.value.upper()} - {_render_event_data_for_log(event.data)}"
         )

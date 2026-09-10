@@ -1351,8 +1351,7 @@ async def test_console_cap_does_not_shrink_the_persisted_payload(
     assert persistence_handler.received[0] is original_payload
     assert persistence_handler.received[0] == expected_content
 
-    # Dispatch bookkeeping is DEBUG-only; INFO keeps the console event.
-    assert len(caplog.records) == 1
+    # The console payload is bounded independently of persistence.
     console_records = [
         r for r in caplog.records if r.getMessage().startswith("[SYSTEM]")
     ]
@@ -1438,18 +1437,26 @@ async def test_console_handler_skips_disabled_payload_rendering(
 
 
 @pytest.mark.asyncio
-async def test_dispatch_diagnostics_available_at_debug(
+@pytest.mark.parametrize("level", ["INFO", "DEBUG"])
+async def test_dispatch_diagnostics_are_debug_only(
+    level: str,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     import logging
 
-    from xagent.core.agent.trace import SYSTEM_INFO, ConsoleTraceHandler, Tracer
+    from xagent.core.agent import trace
 
-    tracer = Tracer()
-    tracer.add_handler(ConsoleTraceHandler())
-    with caplog.at_level(logging.DEBUG, logger="xagent.core.agent.trace"):
-        await tracer.trace_event(SYSTEM_INFO, data={"key": "value"})
+    tracer = trace.Tracer()
+    # A silent handler isolates dispatch bookkeeping from console event logs.
+    tracer.add_handler(trace.BaseTraceHandler())
+    with caplog.at_level(getattr(logging, level), logger=trace.__name__):
+        await tracer.trace_event(trace.SYSTEM_INFO, data={"key": "value"})
+    if level == "INFO":
+        assert not caplog.records
+        return
+    assert caplog.records
+    assert all(record.levelno == logging.DEBUG for record in caplog.records)
     messages = [record.getMessage() for record in caplog.records]
     assert any("with data keys: ['key']" in message for message in messages)
-    assert "Calling handler 0: ConsoleTraceHandler" in messages
+    assert "Calling handler 0: BaseTraceHandler" in messages
     assert "Handler 0 completed successfully" in messages

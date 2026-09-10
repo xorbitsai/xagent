@@ -402,13 +402,129 @@ def test_upload_large_file_content_never_leaks_upload_url_on_chunk_failure(
         assert sentinel_url not in record.getMessage()
 
 
+def test_upload_large_file_content_redacts_url_even_if_echoed_in_response_body(
+    monkeypatch, caplog
+):
+    """Regression guard: the redaction must not rely on the URL only ever
+    appearing in requests' own HTTPError message -- an intervening proxy
+    or WAF error page that happens to echo the request URL into the
+    response *body* must be scrubbed too, since the body is appended
+    verbatim to the raised error."""
+    sentinel_url = "https://upload.example/session-with-a-secret-token-abc123"
+    total_size = onedrive._UPLOAD_SESSION_CHUNK_SIZE + 10
+    fh = io.BytesIO(b"\x00" * total_size)
+
+    monkeypatch.setattr(
+        onedrive.requests,
+        "request",
+        Mock(return_value=MockResponse({"uploadUrl": sentinel_url})),
+    )
+    waf_body = f"Blocked: request to {sentinel_url} was denied".encode()
+    error_response = MockResponse({}, status_code=403, content=waf_body)
+    _patch_session(monkeypatch, _FakeSession(put=Mock(return_value=error_response)))
+
+    with caplog.at_level("WARNING"):
+        with pytest.raises(RuntimeError) as exc_info:
+            onedrive._upload_large_file_content(
+                "big.bin", fh, total_size, "application/octet-stream"
+            )
+
+    assert sentinel_url not in str(exc_info.value)
+    assert "Blocked" in str(exc_info.value)
+
+
+def test_upload_large_file_content_never_leaks_upload_url_on_transport_failure(
+    monkeypatch, caplog
+):
+    """Regression guard: a chunk PUT that fails at the transport layer
+    (connection error, timeout, TLS failure) before any HTTP response
+    exists at all raises a requests exception whose own default message
+    embeds the full request URL (verified directly against a real failed
+    request) -- a sanitize step that only covers the "got a non-2xx
+    response" path would miss this entirely. Every exception the chunk
+    loop can raise must have the URL scrubbed, not just HTTPError."""
+    sentinel_url = "https://upload.example/session-with-a-secret-token-abc123"
+    total_size = onedrive._UPLOAD_SESSION_CHUNK_SIZE + 10
+    fh = io.BytesIO(b"\x00" * total_size)
+
+    monkeypatch.setattr(
+        onedrive.requests,
+        "request",
+        Mock(return_value=MockResponse({"uploadUrl": sentinel_url})),
+    )
+    transport_error = requests.ConnectionError(
+        f"HTTPSConnectionPool(...): Max retries exceeded with url: "
+        f"{sentinel_url} (Caused by ...)"
+    )
+    _patch_session(monkeypatch, _FakeSession(put=Mock(side_effect=transport_error)))
+
+    with caplog.at_level("WARNING"):
+        with pytest.raises(RuntimeError) as exc_info:
+            onedrive._upload_large_file_content(
+                "big.bin", fh, total_size, "application/octet-stream"
+            )
+
+    assert sentinel_url not in str(exc_info.value)
+    for record in caplog.records:
+        assert sentinel_url not in record.getMessage()
+
+
+def test_upload_large_file_content_treats_cleanup_404_as_fine(monkeypatch, caplog):
+    """Regression guard: a 404 on the cancellation DELETE means the session
+    is already gone (expired, or already completed/cancelled) -- exactly
+    the outcome cleanup wants, not a failure of it, so it must not warn."""
+    total_size = onedrive._UPLOAD_SESSION_CHUNK_SIZE + 10
+    fh = io.BytesIO(b"\x00" * total_size)
+
+    monkeypatch.setattr(
+        onedrive.requests,
+        "request",
+        Mock(return_value=MockResponse({"uploadUrl": "https://upload.example/s"})),
+    )
+    error_response = MockResponse(
+        {"error": {"message": "boom"}}, status_code=500, content=b'{"error": "boom"}'
+    )
+    delete_404_response = MockResponse({}, status_code=404)
+    _patch_session(
+        monkeypatch,
+        _FakeSession(
+            put=Mock(return_value=error_response),
+            delete=Mock(return_value=delete_404_response),
+        ),
+    )
+
+    with caplog.at_level("WARNING"):
+        with pytest.raises(RuntimeError, match="boom"):
+            onedrive._upload_large_file_content(
+                "big.bin", fh, total_size, "application/octet-stream"
+            )
+
+    assert not any(
+        "cancellation returned" in record.getMessage() for record in caplog.records
+    )
+
+
+def test_upload_large_file_content_rejects_non_positive_total(monkeypatch):
+    """Regression guard: total=0 would make `range(0, 0, chunk_size)` skip
+    the loop entirely, silently returning the empty `result` this function
+    initializes before ever running the "did OneDrive confirm this"
+    check -- not reachable through onedrive_upload_file today, but this
+    function should refuse to silently no-op if called directly."""
+    monkeypatch.setattr(onedrive.requests, "request", Mock())
+
+    with pytest.raises(ValueError, match="must be positive"):
+        onedrive._upload_large_file_content(
+            "big.bin", io.BytesIO(b""), 0, "application/octet-stream"
+        )
+
+
 def test_upload_large_file_content_warns_without_leaking_url_when_cleanup_fails(
     monkeypatch, caplog
 ):
     """Regression guard: if the best-effort cancellation DELETE itself
     raises (e.g. a network-level requests exception, whose own message
-    commonly embeds the request URL), the warning log must not include
-    that exception's message/traceback -- only its type."""
+    commonly embeds the request URL), the warning log must have that URL
+    scrubbed out of the logged message rather than leaking it verbatim."""
     sentinel_url = "https://upload.example/session-with-a-secret-token-abc123"
     total_size = onedrive._UPLOAD_SESSION_CHUNK_SIZE + 10
     fh = io.BytesIO(b"\x00" * total_size)
@@ -703,19 +819,23 @@ def test_upload_text_file_rejects_additional_binary_extensions(monkeypatch, file
     mock_request.assert_not_called()
 
 
-@pytest.mark.parametrize("file_path", ["app.ts", "deploy.bat", "session.scm"])
+@pytest.mark.parametrize(
+    "file_path", ["app.ts", "deploy.bat", "session.scm", "worksheet.sc"]
+)
 def test_upload_text_file_allows_ambiguous_extensions_that_collide_with_binary_mimetypes(
     monkeypatch, file_path
 ):
     """Regression guard for a bug introduced by switching from a fixed
     extension allowlist to mimetype-driven detection: mimetypes.guess_type
     resolves ".ts" to "video/mp2t", ".bat" to "application/x-msdownload",
-    and ".scm" to "application/vnd.lotus-screencam" -- none of which are
-    text-safe -- even though all three extensions are overwhelmingly used
+    ".scm" to "application/vnd.lotus-screencam", and ".sc" to
+    "application/vnd.ibm.secure-container" -- none of which are
+    text-safe -- even though all four extensions are overwhelmingly used
     for genuine text/source content (TypeScript, Windows batch scripts,
-    Scheme source) in practice. Without an explicit carve-out, onedrive_
-    upload_text_file would reject these with no working alternative (
-    onedrive_upload_file needs an existing local file, not raw text)."""
+    Scheme source, Scala worksheets) in practice. Without an explicit
+    carve-out, onedrive_upload_text_file would reject these with no
+    working alternative (onedrive_upload_file needs an existing local
+    file, not raw text)."""
     monkeypatch.setattr(
         onedrive.requests, "request", Mock(return_value=MockResponse({"id": "f1"}))
     )
@@ -726,7 +846,16 @@ def test_upload_text_file_allows_ambiguous_extensions_that_collide_with_binary_m
 
 
 @pytest.mark.parametrize(
-    "file_path", ["deploy.ps1", "schema.sql", "index.php", "main.dart"]
+    "file_path",
+    [
+        "deploy.ps1",
+        "schema.sql",
+        "index.php",
+        "main.dart",
+        "paper.tex",
+        "build.csh",
+        "layout.tpl",
+    ],
 )
 def test_upload_text_file_allows_source_extensions_with_non_text_mime_guess(
     monkeypatch, file_path
@@ -734,12 +863,13 @@ def test_upload_text_file_allows_source_extensions_with_non_text_mime_guess(
     """Regression guard: a reviewer-verified false-positive class --
     ".ps1" was mistakenly placed in the hand-maintained binary-extension
     fallback set (PowerShell scripts are genuine text), and ".sql"/".php"/
-    ".dart" resolve via mimetypes on at least some hosts to non-text
-    application/* types (application/x-sql, application/x-httpd-php,
-    application/vnd.dart) that were missing from the text-safe allowlist.
-    None of these three collide with a real binary format the way
-    .ts/.bat/.scm do, so they belong in _TEXT_SAFE_MIME_TYPES rather than
-    the ambiguous-extension carve-out."""
+    ".dart"/".tex"/".csh"/".tpl" resolve via mimetypes on at least some
+    hosts to non-text application/* types (application/x-sql,
+    application/x-httpd-php, application/vnd.dart, application/x-tex,
+    application/x-csh, application/vnd.groove-tool-template) that were
+    missing from the text-safe allowlist. None of these six collide with
+    a real binary format the way .ts/.bat/.scm/.sc do, so they belong in
+    _TEXT_SAFE_MIME_TYPES rather than the ambiguous-extension carve-out."""
     monkeypatch.setattr(
         onedrive.requests, "request", Mock(return_value=MockResponse({"id": "f1"}))
     )

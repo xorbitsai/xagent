@@ -98,6 +98,16 @@ _TEXT_SAFE_MIME_TYPES = {
     "application/x-sql",
     "application/x-httpd-php",
     "application/vnd.dart",
+    # Found by a broader sweep of common script/config/source extensions
+    # against stdlib mimetypes after .sql/.php/.dart turned up the same
+    # class of gap -- each of these is a real host mapping for a plain
+    # text format: ".tex" -> "application/x-tex" (LaTeX source), ".csh"
+    # -> "application/x-csh" (C shell script), ".tpl" -> "application/
+    # vnd.groove-tool-template" (an obscure, effectively dead format;
+    # ".tpl" is otherwise universal for text templates in practice).
+    "application/x-tex",
+    "application/x-csh",
+    "application/vnd.groove-tool-template",
 }
 _TEXT_SAFE_MIME_SUFFIXES = ("+json", "+xml", "+yaml")
 
@@ -114,15 +124,17 @@ def _is_text_mime_type(mime_type: str) -> bool:
 # format that collides with an extension overwhelmingly used for genuine
 # text/source content -- verified directly: ".ts" -> "video/mp2t" (MPEG
 # transport stream, not TypeScript), ".bat" -> "application/x-msdownload",
-# ".scm" -> "application/vnd.lotus-screencam" (not Scheme source). Treating
-# the mimetype guess as authoritative for these three would flag an
-# ordinary source/script file as binary with no working upload path at all
-# (onedrive_upload_text_file rejects it, and onedrive_upload_file needs an
-# existing local *file*, not raw text content) -- so the mime-type signal
-# is ignored for exactly these extensions and _name_looks_binary treats
-# them as text unless a caller's own filename collides with one of the
-# entries in the fallback set below (it doesn't -- none share a suffix).
-_AMBIGUOUS_TEXT_EXTENSIONS = {".ts", ".bat", ".scm"}
+# ".scm" -> "application/vnd.lotus-screencam" (not Scheme source), ".sc"
+# -> "application/vnd.ibm.secure-container" (an obscure, effectively dead
+# IBM format, not Scala/SuperCollider source). Treating the mimetype guess
+# as authoritative for these four would flag an ordinary source/script
+# file as binary with no working upload path at all (onedrive_upload_text_file
+# rejects it, and onedrive_upload_file needs an existing local *file*, not
+# raw text content) -- so the mime-type signal is ignored for exactly
+# these extensions and _name_looks_binary treats them as text unless a
+# caller's own filename collides with one of the entries in the fallback
+# set below (it doesn't -- none share a suffix).
+_AMBIGUOUS_TEXT_EXTENSIONS = {".ts", ".bat", ".scm", ".sc"}
 
 # Extensions of unambiguously binary formats that resolve to no mime type
 # at all (neither _MIME_TYPE_OVERRIDES nor a bare stdlib mimetypes install
@@ -173,7 +185,7 @@ def _graph_headers(extra_headers: dict[str, str] | None = None) -> dict[str, str
     return headers
 
 
-def _raise_for_status_with_body(response: Any, *, sanitize_url: bool = False) -> None:
+def _raise_for_status_with_body(response: Any) -> None:
     """Like response.raise_for_status(), but a non-2xx status raises a
     RuntimeError with Graph's own error body appended -- a bare HTTPError's
     default message carries only the status line, not the JSON error detail
@@ -182,27 +194,11 @@ def _raise_for_status_with_body(response: Any, *, sanitize_url: bool = False) ->
     _upload_large_file_content, which can't go through _graph_request itself
     -- see its own Authorization-header note) so a future change to the
     message format only needs to happen once.
-
-    sanitize_url must be True whenever ``response`` came from a request
-    whose own URL is sensitive -- Graph's preauthenticated upload-session
-    uploadUrl (see _upload_large_file_content) is itself usable for
-    PUT/GET/DELETE without the OAuth bearer token, so it must never reach
-    a caller-facing error message or a log line. requests.HTTPError's
-    default message embeds the full request URL (via
-    response.raise_for_status()'s own f-string), so that path is skipped
-    entirely here rather than trusted to omit it.
     """
-    if response.status_code < 400:
-        return
-    response_text = response.text.strip()
-    if sanitize_url:
-        message = f"OneDrive returned HTTP {response.status_code}"
-        if response_text:
-            message = f"{message} - {response_text}"
-        raise RuntimeError(message)
     try:
         response.raise_for_status()
     except requests.HTTPError as exc:
+        response_text = response.text.strip()
         message = str(exc)
         if response_text:
             message = f"{message} - {response_text}"
@@ -355,6 +351,15 @@ def _upload_large_file_content(
     mid-upload failure means the whole file is re-sent from byte 0 on the
     next call, not resumed from where it left off.
     """
+    if total <= 0:
+        # Not reachable through onedrive_upload_file today (it rejects an
+        # empty file before choosing a path, and anything <= 0 bytes would
+        # take the simple-PUT branch regardless) -- guarded directly here
+        # too since `for start in range(0, 0, chunk_size)` would otherwise
+        # silently skip the whole loop and return the empty `result` this
+        # function initializes below, bypassing the "did OneDrive actually
+        # confirm this" check that only runs inside the loop.
+        raise ValueError(f"total must be positive, got {total}")
     session = _graph_request(
         "POST",
         f"{_item_path(remote_path)}/createUploadSession",
@@ -407,11 +412,7 @@ def _upload_large_file_content(
                     },
                     timeout=_BINARY_UPLOAD_TIMEOUT_SECONDS,
                 )
-                # sanitize_url=True: this is Graph's preauthenticated
-                # upload-session URL (see the Authorization-header note
-                # above), so the failure path must never format it into an
-                # error message the caller/LLM or the logs would see.
-                _raise_for_status_with_body(response, sanitize_url=True)
+                _raise_for_status_with_body(response)
                 # Only the final chunk's response carries the completed
                 # item; Graph's intermediate (202) responses return upload-
                 # progress info, not the item -- checked explicitly
@@ -442,7 +443,24 @@ def _upload_large_file_content(
                             "OneDrive did not confirm the upload completed "
                             f"(final response: {result!r})"
                         )
-        except Exception:
+        except Exception as exc:
+            # Redact upload_url out of the failure's own message before it
+            # goes anywhere else -- this catches every source uniformly
+            # (an HTTP error response whose body happens to echo the
+            # request URL via an intervening proxy/WAF, and -- the gap a
+            # status-code-keyed sanitize flag on the PUT call alone would
+            # miss -- a transport-level failure before any response
+            # existed at all: requests/urllib3's own ConnectionError/
+            # Timeout/SSLError messages embed the full request URL,
+            # verified directly against a real failed request). A plain
+            # `except requests.HTTPError` (or a flag passed only to the
+            # PUT's own status check) would leave those other paths
+            # unsanitized, so this wraps every exception the chunk loop
+            # can raise instead of trusting each one individually to avoid
+            # the URL.
+            redacted_message = str(exc).replace(
+                upload_url, "<redacted-upload-session-url>"
+            )
             # Best-effort: free the abandoned session immediately instead
             # of leaving it for Graph's own ~15-minute expiry. A failure
             # here must never mask the real error above, and uses the
@@ -454,34 +472,36 @@ def _upload_large_file_content(
                     upload_url, timeout=DEFAULT_TIMEOUT_SECONDS
                 )
             except Exception as cleanup_exc:
-                # Logged by type only, deliberately not the exception's own
-                # message/traceback (exc_info) or str(cleanup_exc) -- a
-                # network-level requests exception (e.g. ConnectionError)
-                # commonly embeds the request URL in its own message, which
-                # for this call is the same sensitive upload_url the
-                # sanitize_url note above exists to keep out of the logs.
+                cleanup_message = str(cleanup_exc).replace(
+                    upload_url, "<redacted-upload-session-url>"
+                )
                 logger.warning(
-                    "Failed to cancel abandoned OneDrive upload session (%s)",
-                    type(cleanup_exc).__name__,
+                    "Failed to cancel abandoned OneDrive upload session: %s",
+                    cleanup_message,
                 )
             else:
                 # requests does not raise for an HTTP error status on its
                 # own -- a 429/5xx here would otherwise look like a
                 # successful cancellation while the session (and its
                 # partial upload) actually lingers until Graph's own
-                # expiry. Status only, no body: nothing about the response
-                # is expected to carry the upload_url, but there's no
-                # reason to risk it for a log line that only needs the
-                # status.
-                if not (200 <= cancel_response.status_code < 300):
+                # expiry. A 404 is also treated as fine (not warned on):
+                # it means the session is already gone -- expired, or
+                # completed/cancelled by a previous attempt -- which is
+                # the outcome this cleanup wants, not a failure of it.
+                # Status only, no body: nothing about the response is
+                # expected to carry the upload_url, but there's no reason
+                # to risk it for a log line that only needs the status.
+                if (
+                    not (200 <= cancel_response.status_code < 300)
+                    and cancel_response.status_code != 404
+                ):
                     logger.warning(
                         "OneDrive upload session cancellation returned "
                         "HTTP %s instead of success",
                         cancel_response.status_code,
                     )
-            raise
+            raise RuntimeError(redacted_message) from exc
 
-    return result
     return result
 
 

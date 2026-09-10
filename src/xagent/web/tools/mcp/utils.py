@@ -216,8 +216,19 @@ def conflict_response(
     may pass that error's own `unchecked_attendees` through here too - at
     that point the write is already correctly blocked by the known
     conflict, so being honest about who else couldn't be checked is safe.
+
+    `conflicts` is uncapped input (an organizer with a busy shared
+    calendar, or a wide window, can turn up far more overlapping events
+    than a caller needs to see) - unlike every other response path here,
+    which routes through `success_with_capped_dict`, this shape has
+    multiple top-level fields under a non-"success" status that function
+    doesn't support, so the payload is capped locally instead: only
+    `conflicts` (the one field that can actually grow large) is halved,
+    repeatedly, until the JSON fits `get_tool_max_output_length()` -
+    small fields like `hint`/`unchecked_attendees` are left untouched as
+    long as there's a bigger field left to shrink first.
     """
-    payload = {
+    payload: dict[str, Any] = {
         "status": "conflict",
         "message": f"{len(conflicts)} existing event(s) overlap {start} - {end}",
         "conflicts": conflicts,
@@ -230,16 +241,18 @@ def conflict_response(
             "they still want this slot."
         ),
     }
-    return json.dumps(payload, ensure_ascii=False)
+    response = json.dumps(payload, ensure_ascii=False)
+    max_output_length = get_tool_max_output_length()
+    if len(response) <= max_output_length:
+        return response
 
-
-def unchecked_extra(unchecked_attendees: list[str]) -> dict[str, Any]:
-    """Extra fields for a status="success" envelope when some attendees
-    ended up unchecked - empty (nothing to add) when there's nothing to
-    report."""
-    if not unchecked_attendees:
-        return {}
-    return {"unchecked_attendees": unchecked_attendees}
+    remaining = conflicts
+    while remaining and len(response) > max_output_length:
+        remaining = remaining[: len(remaining) // 2]
+        payload["conflicts"] = remaining
+        payload["truncated"] = True
+        response = json.dumps(payload, ensure_ascii=False)
+    return response
 
 
 def attendees_were_given(attendees: list[str] | str | None) -> bool:
@@ -359,127 +372,39 @@ def reject_reversed_window(start_value: str, end_value: str) -> None:
         return
 
 
-# Microsoft Graph timeZone values come in two shapes depending on how/where
-# an event was created: IANA names (e.g. "Asia/Singapore", which Graph also
-# accepts on write) and legacy Windows names (e.g. "Pacific Standard Time",
-# from desktop Outlook or an Exchange org defaulting to them). zoneinfo only
-# understands the former. This is the standard (CLDR) Windows-to-IANA
-# mapping, restricted to the zone list Graph's own dateTimeTimeZone docs
-# enumerate as supported - not exhaustive of every Windows zone that has
-# ever existed, but covers every zone Graph itself claims to support.
-_WINDOWS_TO_IANA: dict[str, str] = {
-    "UTC": "UTC",
-    "GMT Standard Time": "Europe/London",
-    "Greenwich Standard Time": "Atlantic/Reykjavik",
-    "W. Europe Standard Time": "Europe/Berlin",
-    "Central Europe Standard Time": "Europe/Budapest",
-    "Central European Standard Time": "Europe/Warsaw",
-    "Romance Standard Time": "Europe/Paris",
-    "E. Europe Standard Time": "Europe/Bucharest",
-    "GTB Standard Time": "Europe/Bucharest",
-    "FLE Standard Time": "Europe/Kyiv",
-    "Turkey Standard Time": "Europe/Istanbul",
-    "Russian Standard Time": "Europe/Moscow",
-    "Kaliningrad Standard Time": "Europe/Kaliningrad",
-    "Arabic Standard Time": "Asia/Baghdad",
-    "Syria Standard Time": "Asia/Damascus",
-    "Arab Standard Time": "Asia/Riyadh",
-    "Israel Standard Time": "Asia/Jerusalem",
-    "Jordan Standard Time": "Asia/Amman",
-    "Middle East Standard Time": "Asia/Beirut",
-    "Egypt Standard Time": "Africa/Cairo",
-    "South Africa Standard Time": "Africa/Johannesburg",
-    "E. Africa Standard Time": "Africa/Nairobi",
-    "Mauritius Standard Time": "Indian/Mauritius",
-    "Iran Standard Time": "Asia/Tehran",
-    "Arabian Standard Time": "Asia/Dubai",
-    "Azerbaijan Standard Time": "Asia/Baku",
-    "Georgian Standard Time": "Asia/Tbilisi",
-    "Caucasus Standard Time": "Asia/Yerevan",
-    "Afghanistan Standard Time": "Asia/Kabul",
-    "Pakistan Standard Time": "Asia/Karachi",
-    "West Asia Standard Time": "Asia/Tashkent",
-    "India Standard Time": "Asia/Kolkata",
-    "Sri Lanka Standard Time": "Asia/Colombo",
-    "Nepal Standard Time": "Asia/Kathmandu",
-    "Central Asia Standard Time": "Asia/Almaty",
-    "Bangladesh Standard Time": "Asia/Dhaka",
-    "Ekaterinburg Standard Time": "Asia/Yekaterinburg",
-    "Myanmar Standard Time": "Asia/Yangon",
-    "SE Asia Standard Time": "Asia/Bangkok",
-    "Novosibirsk Standard Time": "Asia/Novosibirsk",
-    "China Standard Time": "Asia/Shanghai",
-    "North Asia Standard Time": "Asia/Krasnoyarsk",
-    "Singapore Standard Time": "Asia/Singapore",
-    "Taipei Standard Time": "Asia/Taipei",
-    "Ulaanbaatar Standard Time": "Asia/Ulaanbaatar",
-    "North Asia East Standard Time": "Asia/Irkutsk",
-    "W. Australia Standard Time": "Australia/Perth",
-    "Tokyo Standard Time": "Asia/Tokyo",
-    "Korea Standard Time": "Asia/Seoul",
-    "Cen. Australia Standard Time": "Australia/Adelaide",
-    "AUS Central Standard Time": "Australia/Darwin",
-    "E. Australia Standard Time": "Australia/Brisbane",
-    "AUS Eastern Standard Time": "Australia/Sydney",
-    "West Pacific Standard Time": "Pacific/Port_Moresby",
-    "Tasmania Standard Time": "Australia/Hobart",
-    "Yakutsk Standard Time": "Asia/Yakutsk",
-    "Central Pacific Standard Time": "Pacific/Guadalcanal",
-    "Vladivostok Standard Time": "Asia/Vladivostok",
-    "New Zealand Standard Time": "Pacific/Auckland",
-    "Fiji Standard Time": "Pacific/Fiji",
-    "Magadan Standard Time": "Asia/Magadan",
-    "Tonga Standard Time": "Pacific/Tongatapu",
-    "Samoa Standard Time": "Pacific/Apia",
-    "Line Islands Standard Time": "Pacific/Kiritimati",
-    "Dateline Standard Time": "Etc/GMT+12",
-    "Hawaiian Standard Time": "Pacific/Honolulu",
-    "Alaskan Standard Time": "America/Anchorage",
-    "Pacific Standard Time (Mexico)": "America/Santa_Isabel",
-    "Pacific Standard Time": "America/Los_Angeles",
-    "US Mountain Standard Time": "America/Phoenix",
-    "Mountain Standard Time (Mexico)": "America/Chihuahua",
-    "Mountain Standard Time": "America/Denver",
-    "Central America Standard Time": "America/Guatemala",
-    "Central Standard Time": "America/Chicago",
-    "Central Standard Time (Mexico)": "America/Mexico_City",
-    "Canada Central Standard Time": "America/Regina",
-    "SA Pacific Standard Time": "America/Bogota",
-    "Eastern Standard Time": "America/New_York",
-    "US Eastern Standard Time": "America/Indiana/Indianapolis",
-    "Venezuela Standard Time": "America/Caracas",
-    "Paraguay Standard Time": "America/Asuncion",
-    "Atlantic Standard Time": "America/Halifax",
-    "Central Brazilian Standard Time": "America/Cuiaba",
-    "SA Western Standard Time": "America/La_Paz",
-    "Pacific SA Standard Time": "America/Santiago",
-    "Newfoundland Standard Time": "America/St_Johns",
-    "E. South America Standard Time": "America/Sao_Paulo",
-    "Argentina Standard Time": "America/Argentina/Buenos_Aires",
-    "SA Eastern Standard Time": "America/Cayenne",
-    "Greenland Standard Time": "America/Godthab",
-    "Montevideo Standard Time": "America/Montevideo",
-    "Bahia Standard Time": "America/Bahia",
-    "Azores Standard Time": "Atlantic/Azores",
-    "Cape Verde Standard Time": "Atlantic/Cape_Verde",
-    "Morocco Standard Time": "Africa/Casablanca",
-    "Namibia Standard Time": "Africa/Windhoek",
-    "W. Central Africa Standard Time": "Africa/Lagos",
-}
+def require_offset_datetime(value: str, field_name: str) -> None:
+    """Raise ValueError when `value` parses to a real instant but doesn't
+    carry a UTC offset or "Z" suffix.
 
+    A caller-supplied boundary that's naive isn't just non-compliant with
+    the documented RFC3339 contract: this module's own internal instants
+    (e.g. an existing event's boundary via `_event_boundary`) are always
+    offset-bearing, so a naive value compared against one raises
+    `TypeError` deep inside a downstream comparison (see
+    `window_delta_segments`'s aware-vs-naive guard) - which conservatively
+    falls back to using the naive value as-is, so it eventually reaches
+    the provider API's timeMin/timeMax and fails there with an opaque
+    error instead of this clear, actionable one.
 
-def resolve_zone_name(name: str) -> str:
-    """Map a Graph timeZone value to a name zoneinfo can load.
-
-    Returns the input unchanged when it isn't a recognized legacy Windows
-    zone name - it's then assumed to already be IANA-shaped, which
-    zoneinfo can load directly.
+    Silent (no-op) when `value` doesn't parse to a real instant at all -
+    that's a different failure a caller will already hit downstream with
+    its own clear error, not this function's job to preempt.
     """
-    return _WINDOWS_TO_IANA.get(name, name)
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return
+    if parsed.tzinfo is None:
+        raise ValueError(
+            f"{field_name} ({value!r}) must include a UTC offset or 'Z' "
+            "suffix (RFC3339), e.g. '2026-08-27T10:00:00+00:00' or "
+            "'2026-08-27T10:00:00Z'."
+        )
 
 
 def resolve_zoneinfo(name: str) -> ZoneInfo:
-    """Resolve a Graph timeZone value (Windows or IANA) to a real
+    """Resolve a Google Calendar timeZone value (an IANA Time Zone
+    Database name, per Google's own EventDateTime docs) to a real
     ``ZoneInfo``, for use anywhere a working zone is required (not just a
     best-effort comparison) - e.g. attaching a real UTC offset to a naive
     datetime string.
@@ -490,10 +415,10 @@ def resolve_zoneinfo(name: str) -> ZoneInfo:
     helper exists to prevent.
     """
     try:
-        return ZoneInfo(resolve_zone_name(name))
+        return ZoneInfo(name)
     except (ZoneInfoNotFoundError, ValueError) as exc:
         raise ValueError(
-            f"Timezone {name!r} isn't a recognized IANA or Windows zone name."
+            f"Timezone {name!r} isn't a recognized IANA zone name."
         ) from exc
 
 

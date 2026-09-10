@@ -19,8 +19,8 @@ from .utils import merge_scope_error as _merge_scope_error
 from .utils import normalize_addresses as _normalize_addresses
 from .utils import offset_datetime_string as _offset_datetime_string
 from .utils import reject_reversed_window as _reject_reversed_window
+from .utils import require_offset_datetime as _require_offset_datetime
 from .utils import setup_proxy_env, success_with_capped_dict
-from .utils import unchecked_extra as _unchecked_extra
 from .utils import window_delta_segments as _window_delta_segments
 
 logging.basicConfig(level=logging.INFO)
@@ -135,7 +135,20 @@ def _find_conflicts(
                 continue
             if item.get("transparency") == "transparent":
                 continue
-            if exclude_event_id and item.get("id") == exclude_event_id:
+            # A recurring event's instances (from singleEvents=True
+            # expansion) carry their OWN id, never the master's - e.g.
+            # "<masterId>_<recurrenceStamp>" - so excluding only by `id`
+            # never matches when `exclude_event_id` names the master
+            # itself (the normal way to address a recurring series).
+            # `recurringEventId` is the field Google's own Events
+            # resource documents as reporting the master's id on each
+            # instance; without also checking it, rescheduling or adding
+            # an attendee to a recurring event's master would report the
+            # event as conflicting with its own instances.
+            if exclude_event_id and exclude_event_id in (
+                item.get("id"),
+                item.get("recurringEventId"),
+            ):
                 continue
             # NOTE: declining an invite (attendees[].responseStatus ==
             # "declined" for the organizer's own self entry) is NOT used
@@ -498,7 +511,9 @@ def _error_message(exc: Exception, requested_conference: bool) -> str:
     return message
 
 
-def _event_response(event: dict[str, Any], **extra_fields: Any) -> str:
+def _event_response(
+    event: dict[str, Any], unchecked_attendees: list[str] | None = None
+) -> str:
     conference_data = event.get("conferenceData") or {}
 
     hangout_link = event.get("hangoutLink")
@@ -540,7 +555,8 @@ def _event_response(event: dict[str, Any], **extra_fields: Any) -> str:
     # capping never has to reason about them.
     response = json.loads(success_with_capped_dict("event", event))
     response.update(extra)
-    response.update(extra_fields)
+    if unchecked_attendees:
+        response["unchecked_attendees"] = unchecked_attendees
     return json.dumps(response, ensure_ascii=False)
 
 
@@ -562,7 +578,10 @@ def google_calendar_create_events(
     attendees, if given, are checked for scheduling conflicts together with the organizer's own
     calendar; a conflict returns status="conflict" instead of creating the event. Pass
     ignore_conflicts=True to create it anyway once the user has explicitly confirmed a conflict is
-    fine. Adding attendees does not, by itself, email them; set notify_attendees=True to have Google
+    fine. This also skips the whole check outright (not just the conflict result) whenever it can't
+    run at all -- e.g. a connector token missing a needed OAuth scope -- rather than failing loudly;
+    only pass it once the user has actually confirmed they want to proceed without checking, not as a
+    blanket way to route around an unrelated error. Adding attendees does not, by itself, email them; set notify_attendees=True to have Google
     Calendar send them a native invite immediately. Confirm the recipient list with the user before
     setting notify_attendees=True.
     Set add_google_meet=True to attach a real Google Meet video-conference link to the event. The
@@ -577,6 +596,8 @@ def google_calendar_create_events(
     requested_conference = False
     try:
         _reject_reversed_window(start_time, end_time)
+        _require_offset_datetime(start_time, "start_time")
+        _require_offset_datetime(end_time, "end_time")
         service = get_calendar_service()
         normalized_attendees = _normalize_addresses(attendees) if attendees else []
 
@@ -622,7 +643,7 @@ def google_calendar_create_events(
             **_api_call_kwargs(event, notify_attendees),
         )
         created_event = request.execute()
-        return _event_response(created_event, **_unchecked_extra(unchecked_attendees))
+        return _event_response(created_event, unchecked_attendees=unchecked_attendees)
 
     except Exception as e:
         logger.error(f"Error creating event: {e}")
@@ -666,8 +687,12 @@ def google_calendar_update_events(
     start_time and end_time must be RFC3339 formatted if provided.
     If the update moves the event to a new time, or adds attendees, that change is checked for
     conflicts the same way google_calendar_create_events is; pass ignore_conflicts=True to skip the
-    check once the user has explicitly confirmed a conflict is fine. Editing other fields (summary,
-    description, location) without moving the event is never blocked.
+    check once the user has explicitly confirmed a conflict is fine. This also skips the whole check
+    outright (not just the conflict result) whenever it can't run at all -- e.g. a connector token
+    missing a needed OAuth scope, including the one needed to widen an all-day event's own boundary
+    -- rather than failing loudly; only pass it once the user has actually confirmed they want to
+    proceed without checking, not as a blanket way to route around an unrelated error. Editing other
+    fields (summary, description, location) without moving the event is never blocked.
     attendees is a list of email addresses to add to the event; attendees already on the event are
     kept, and there is no way to remove an attendee through this parameter. Adding attendees does
     not, by itself, email anyone; set notify_attendees=True to have Google Calendar send a native
@@ -687,10 +712,35 @@ def google_calendar_update_events(
     """
     requested_conference = False
     try:
+        if start_time is not None:
+            _require_offset_datetime(start_time, "start_time")
+        if end_time is not None:
+            _require_offset_datetime(end_time, "end_time")
         service = get_calendar_service()
 
         # First get the existing event
         event = service.events().get(calendarId="primary", eventId=event_id).execute()
+
+        existing_attendees_raw = [
+            a["email"]
+            for a in (event.get("attendees") or [])
+            if isinstance(a, dict) and a.get("email")
+        ]
+        existing_attendee_emails = {
+            address.lower() for address in existing_attendees_raw
+        }
+        # attendees only ever ADDS: there's no way to remove an existing
+        # attendee through this parameter (matching this tool's own
+        # docstring). `added_attendees` (genuinely new) and
+        # `existing_attendees_raw` (retained) are checked separately
+        # below - a retained attendee only needs checking against the
+        # portion of a moved window that's actually new territory, while
+        # a newly-added one needs the whole effective window checked.
+        # Computed this early (rather than right before its first use)
+        # specifically so the all-day timezone-lookup gate below can key
+        # off whether anything is *actually* new, not just whether
+        # `attendees` was given at all.
+        added_attendees = _attendees_to_add(attendees, existing_attendee_emails)
 
         existing_is_all_day = "date" in (event.get("start") or {}) or "date" in (
             event.get("end") or {}
@@ -709,15 +759,22 @@ def google_calendar_update_events(
             )
 
         # The calendar's own timezone is only needed to widen an all-day
-        # boundary (see _event_boundary) so a moved window or an
-        # added/retained attendee gets checked against the right absolute
-        # instant - fetch it lazily so a plain timed-event update, or a
+        # boundary (see _event_boundary) so a moved window or a genuinely
+        # new attendee gets checked against the right absolute instant -
+        # fetch it lazily so a plain timed-event update, or a
         # summary/location/description-only edit of an all-day event that
         # never touches its window or attendees, doesn't pay for an extra
         # API call (or a scope-403 that would otherwise block an edit
         # that never needed timezone precision at all) it has no use for.
+        # Keyed off `added_attendees` (genuinely new), not the raw
+        # `attendees` argument - naming only addresses already on the
+        # event adds nothing to check, and a resubmission that never
+        # moves the window makes any retained attendee's delta segment
+        # trivially empty regardless of timezone precision (both sides
+        # of that comparison fall back to the same assumption
+        # consistently), so neither actually needs the real zone either.
         needs_real_calendar_timezone = existing_is_all_day and (
-            bool(start_time) or bool(end_time) or bool(attendees)
+            bool(start_time) or bool(end_time) or bool(added_attendees)
         )
         try:
             calendar_timezone = (
@@ -757,22 +814,28 @@ def google_calendar_update_events(
             existing_end_key,
         )
 
-        existing_attendees_raw = [
-            a["email"]
-            for a in (event.get("attendees") or [])
-            if isinstance(a, dict) and a.get("email")
-        ]
-        existing_attendee_emails = {
-            address.lower() for address in existing_attendees_raw
-        }
-        # attendees only ever ADDS: there's no way to remove an existing
-        # attendee through this parameter (matching this tool's own
-        # docstring). `added_attendees` (genuinely new) and
-        # `existing_attendees_raw` (retained) are checked separately
-        # below - a retained attendee only needs checking against the
-        # portion of a moved window that's actually new territory, while
-        # a newly-added one needs the whole effective window checked.
-        added_attendees = _attendees_to_add(attendees, existing_attendee_emails)
+        # The organizer's own calendar is already checked above via
+        # check_organizer (events.list, excluded by id/recurringEventId) -
+        # freebusy.query has no concept of "exclude this event", so if the
+        # organizer's own email also shows up among the attendees being
+        # freebusy-checked (just added now, or already on the event from
+        # an earlier call), that query would always find this very
+        # event's own busy block on their calendar and report a false
+        # self-conflict. Excluded only from the freebusy-checked copies
+        # below, never from `added_attendees` itself - a caller that
+        # explicitly asked to add the organizer as an attendee must still
+        # have them actually written to the event.
+        organizer_email = (event.get("organizer") or {}).get("email")
+        attendees_to_check = (
+            [a for a in added_attendees if a.lower() != organizer_email.lower()]
+            if organizer_email
+            else added_attendees
+        )
+        existing_attendees_to_check = (
+            [a for a in existing_attendees_raw if a.lower() != organizer_email.lower()]
+            if organizer_email
+            else existing_attendees_raw
+        )
 
         unchecked_attendees: list[str] = []
         if not ignore_conflicts and effective_start and effective_end:
@@ -786,12 +849,12 @@ def google_calendar_update_events(
                 # the organizer, who's excluded by event id rather than
                 # by window, so `window_changed` alone (not a
                 # disjoint-move test) decides whether to re-check them.
-                if check_organizer or added_attendees:
+                if check_organizer or attendees_to_check:
                     conflicts, unchecked = _find_conflicts(
                         service,
                         effective_start,
                         effective_end,
-                        added_attendees,
+                        attendees_to_check,
                         exclude_event_id=event_id,
                         check_organizer=check_organizer,
                     )
@@ -807,7 +870,7 @@ def google_calendar_update_events(
                 # a partial nudge that extends past the old window on one
                 # or both sides, or the whole new window for a fully
                 # disjoint move) can hide a real conflict for them.
-                if existing_attendees_raw:
+                if existing_attendees_to_check:
                     for seg_start, seg_end in _window_delta_segments(
                         existing_start_key,
                         existing_end_key,
@@ -818,7 +881,7 @@ def google_calendar_update_events(
                             service,
                             seg_start.isoformat(),
                             seg_end.isoformat(),
-                            existing_attendees_raw,
+                            existing_attendees_to_check,
                             exclude_event_id=event_id,
                             check_organizer=False,
                         )
@@ -864,7 +927,7 @@ def google_calendar_update_events(
             **_api_call_kwargs(event, notify_attendees),
         )
         updated_event = request.execute()
-        return _event_response(updated_event, **_unchecked_extra(unchecked_attendees))
+        return _event_response(updated_event, unchecked_attendees=unchecked_attendees)
 
     except Exception as e:
         logger.error(f"Error updating event: {e}")

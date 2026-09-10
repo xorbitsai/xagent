@@ -1,3 +1,4 @@
+import json
 import re
 
 import pytest
@@ -180,14 +181,6 @@ def test_attendees_to_add_returns_empty_for_not_provided_or_empty():
     assert utils.attendees_to_add([], {"old@example.com"}) == []
 
 
-def test_unchecked_extra_empty_when_nothing_unchecked():
-    assert utils.unchecked_extra([]) == {}
-
-
-def test_unchecked_extra_includes_attendees_when_given():
-    assert utils.unchecked_extra(["a@x.com"]) == {"unchecked_attendees": ["a@x.com"]}
-
-
 def _key(value: str):
     return utils.datetime_key_for_comparison(value)
 
@@ -333,16 +326,22 @@ def test_reject_reversed_window_is_permissive_when_aware_and_naive_are_mixed():
     utils.reject_reversed_window("2026-08-27T10:30:00Z", "2026-08-27T10:00:00")
 
 
-def test_resolve_zone_name_covers_graphs_additional_time_zones():
-    """Regression test: `_WINDOWS_TO_IANA` was missing several of the
-    Windows names for zones Microsoft's own dateTimeTimeZone docs list
-    under "Additional time zones" (e.g. Kaliningrad, Ekaterinburg) - an
-    event whose originalStartTimeZone happened to be one of these
-    previously hard-failed every single-boundary update and conflict
-    check outright."""
-    assert utils.resolve_zone_name("Kaliningrad Standard Time") == "Europe/Kaliningrad"
-    assert utils.resolve_zone_name("Ekaterinburg Standard Time") == "Asia/Yekaterinburg"
-    assert utils.resolve_zone_name("Vladivostok Standard Time") == "Asia/Vladivostok"
+def test_require_offset_datetime_rejects_a_naive_value():
+    with pytest.raises(ValueError, match="start_time"):
+        utils.require_offset_datetime("2026-08-27T10:30:00", "start_time")
+
+
+def test_require_offset_datetime_accepts_an_offset_or_z_suffixed_value():
+    utils.require_offset_datetime("2026-08-27T10:30:00+08:00", "start_time")
+    utils.require_offset_datetime("2026-08-27T10:30:00Z", "start_time")
+
+
+def test_require_offset_datetime_is_permissive_on_unparseable_input():
+    """A value that doesn't even parse is a different failure a caller
+    will already hit downstream with its own clear error - not this
+    function's job to preempt with a possibly-confusing offset-specific
+    message."""
+    utils.require_offset_datetime("not-a-date", "start_time")
 
 
 def test_offset_datetime_string_attaches_the_zone_offset_to_a_naive_value():
@@ -365,3 +364,49 @@ def test_offset_datetime_string_rejects_input_that_already_carries_an_offset():
         utils.offset_datetime_string("2026-08-27T10:00:00Z", "Asia/Shanghai")
     with pytest.raises(ValueError, match="already carries a UTC offset"):
         utils.offset_datetime_string("2026-08-27T10:00:00+00:00", "Asia/Shanghai")
+
+
+def test_conflict_response_uncapped_when_it_fits(monkeypatch):
+    monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "50000")
+    conflicts = [{"calendar": "organizer", "summary": "1:1", "start": "a", "end": "b"}]
+    response = json.loads(
+        utils.conflict_response(
+            conflicts, [], "2026-08-27T10:00:00", "2026-08-27T10:30:00"
+        )
+    )
+    assert response["conflicts"] == conflicts
+    assert "truncated" not in response
+
+
+def test_conflict_response_caps_an_oversized_conflicts_list(monkeypatch):
+    """Regression test: unlike every other response path in this module,
+    conflict_response used to return an uncapped payload - a busy shared
+    calendar or wide window can turn up far more overlapping events than
+    fit the platform's output budget. Only `conflicts` (the field that
+    can actually grow large) should be halved to fit; small fields like
+    `hint`/`unchecked_attendees` must survive untouched."""
+    monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "2000")
+    conflicts = [
+        {
+            "calendar": f"person{i}@example.com",
+            "summary": "Busy block " + "x" * 50,
+            "start": "2026-08-27T10:00:00+00:00",
+            "end": "2026-08-27T10:30:00+00:00",
+        }
+        for i in range(100)
+    ]
+    response = json.loads(
+        utils.conflict_response(
+            conflicts,
+            ["unreachable@example.com"],
+            "2026-08-27T10:00:00",
+            "2026-08-27T10:30:00",
+        )
+    )
+
+    assert response["status"] == "conflict"
+    assert response["truncated"] is True
+    assert len(response["conflicts"]) < len(conflicts)
+    assert response["conflicts"] == conflicts[: len(response["conflicts"])]
+    assert response["unchecked_attendees"] == ["unreachable@example.com"]
+    assert len(json.dumps(response, ensure_ascii=False)) <= 2000

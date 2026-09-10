@@ -1120,6 +1120,47 @@ def test_create_events_rejects_a_reversed_window(fake_service):
     assert fake_service._events.insert_calls == []
 
 
+def test_create_events_rejects_an_offsetless_start_time(fake_service):
+    """Regression test: an offsetless start_time compared naive-against-
+    aware deep inside a downstream comparison would previously fall
+    through to Google's own freebusy/events.list APIs (which require an
+    RFC3339 offset on timeMin/timeMax) and fail there with an opaque
+    error, instead of this clear, actionable one raised up front."""
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Kickoff",
+            start_time="2026-08-27T10:00:00",  # no offset
+            end_time="2026-08-27T10:30:00+08:00",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "start_time" in result["message"]
+    assert fake_service._events.insert_calls == []
+
+
+def test_update_events_rejects_an_offsetless_start_time(fake_service):
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+        "attendees": [{"email": "existing@example.com"}],
+    }
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-27T10:00:00",  # no offset
+            end_time="2026-08-27T10:30:00+08:00",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "start_time" in result["message"]
+    assert fake_service._events.update_calls == []
+    assert fake_service._freebusy.query_calls == []
+
+
 def test_update_events_excludes_the_event_being_moved_from_its_own_conflicts(
     fake_service,
 ):
@@ -1144,6 +1185,47 @@ def test_update_events_excludes_the_event_being_moved_from_its_own_conflicts(
     result = json.loads(
         calendar.google_calendar_update_events(
             event_id="self-1",
+            start_time="2026-08-27T10:00:00+08:00",
+            end_time="2026-08-27T10:30:00+08:00",
+        )
+    )
+
+    assert result["status"] == "conflict"
+    assert [c["summary"] for c in result["conflicts"]] == ["Board sync"]
+
+
+def test_update_events_excludes_a_recurring_events_own_instances_from_its_conflicts(
+    fake_service,
+):
+    """Regression test: events.list(singleEvents=True) expands a recurring
+    event into instances that carry their OWN id
+    ("<masterId>_<recurrenceStamp>"), never the master's - rescheduling
+    the master itself (the normal way to address a recurring series)
+    must not report it as conflicting with its own instances just
+    because `id` alone never matches `exclude_event_id`. recurringEventId
+    is the field that actually names the master on each instance."""
+    fake_service._events._get_result = {
+        "id": "series-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+    }
+    fake_service._events._list_result = {
+        "items": [
+            {
+                "id": "series-1_20260827T010000Z",
+                "recurringEventId": "series-1",
+                "summary": "Weekly sync (this instance)",
+                "status": "confirmed",
+                "start": {"dateTime": "2026-08-27T10:00:00+08:00"},
+                "end": {"dateTime": "2026-08-27T10:30:00+08:00"},
+            },
+            _confirmed_event(event_id="other-1", summary="Board sync"),
+        ]
+    }
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="series-1",
             start_time="2026-08-27T10:00:00+08:00",
             end_time="2026-08-27T10:30:00+08:00",
         )
@@ -1223,6 +1305,50 @@ def test_update_events_same_window_only_checks_newly_added_attendee(fake_service
         for item in call["body"]["items"]
     }
     assert queried_emails == {"new@example.com"}
+
+
+def test_update_events_adding_the_organizer_as_an_attendee_does_not_self_conflict(
+    fake_service,
+):
+    """Regression test: freebusy.query has no concept of "exclude this
+    event", unlike the organizer-calendar path (excluded by id/
+    recurringEventId). Adding the organizer's own email as a "new"
+    attendee would otherwise be checked via freebusy and always find
+    this very event's own busy block on their calendar - the organizer's
+    own availability is already covered by the organizer-calendar check,
+    so they must be excluded from the freebusy batch."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T10:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T10:30:00+08:00"},
+        "attendees": [],
+        "organizer": {"email": "me@example.com"},
+    }
+    fake_service._events._list_result = {"items": []}
+    fake_service._freebusy = FakeFreebusy(
+        {
+            "calendars": {
+                "me@example.com": {
+                    "busy": [
+                        {
+                            "start": "2026-08-27T10:00:00+08:00",
+                            "end": "2026-08-27T10:30:00+08:00",
+                        }
+                    ]
+                },
+            }
+        }
+    )
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            attendees=["me@example.com"],
+        )
+    )
+
+    assert result["status"] == "success"
+    assert fake_service._freebusy.query_calls == []
 
 
 def test_update_events_treats_existing_attendee_case_insensitively(fake_service):
@@ -2197,19 +2323,23 @@ def test_update_events_respects_sibling_timezone_on_an_offsetless_datetime(
     that offsetless value as if it belonged to some other zone (e.g. the
     calendar's, or UTC) would misjudge a same-instant resubmission as a
     real time change and run the organizer check against the event's own
-    now-"moved" window."""
+    now-"moved" window. The sibling zone here (Asia/Singapore, +08:00) is
+    deliberately NOT the code's own UTC fallback, so this only passes if
+    the sibling timeZone field is actually read rather than ignored -
+    falling back to UTC would compute a different instant and treat this
+    resubmission as a real move."""
     fake_service._events._get_result = {
         "id": "self-1",
-        "start": {"dateTime": "2026-08-27T02:00:00", "timeZone": "UTC"},
-        "end": {"dateTime": "2026-08-27T02:30:00", "timeZone": "UTC"},
+        "start": {"dateTime": "2026-08-27T02:00:00", "timeZone": "Asia/Singapore"},
+        "end": {"dateTime": "2026-08-27T02:30:00", "timeZone": "Asia/Singapore"},
         "attendees": [{"email": "existing@example.com"}],
     }
 
     result = json.loads(
         calendar.google_calendar_update_events(
             event_id="self-1",
-            start_time="2026-08-27T10:00:00+08:00",  # same instant, different offset
-            end_time="2026-08-27T10:30:00+08:00",
+            start_time="2026-08-27T02:00:00+08:00",  # same instant, explicit offset
+            end_time="2026-08-27T02:30:00+08:00",
             location="Room 4",
         )
     )
@@ -2281,6 +2411,40 @@ def test_update_events_missing_scope_still_reports_an_already_confirmed_conflict
     assert result["status"] == "conflict"
     assert result["conflicts"][0]["summary"] == "1:1 with Hazel"
     assert result["unchecked_attendees"] == ["outsider@gmail.com"]
+
+
+def test_update_events_missing_scope_on_retained_attendees_still_reports_the_first_calls_conflict(
+    fake_service,
+):
+    """Regression test for the multi-call accumulation path specifically
+    (as opposed to a single _find_conflicts call's own internal one): a
+    real conflict found by the FIRST call (organizer, via events.list,
+    which needs no extra scope) must survive being merged with a SECOND,
+    separate call's InsufficientScopeError (the retained-attendee delta
+    segment, via freebusy.query) at google_calendar_update_events' own
+    accumulation layer - not just within a single _find_conflicts call."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+        "attendees": [{"email": "existing@example.com"}],
+    }
+    fake_service._events._list_result = {
+        "items": [_confirmed_event(event_id="other-1")]
+    }
+    fake_service._freebusy = FakeFreebusy(raise_error=_insufficient_scope_error())
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-27T14:00:00+08:00",  # disjoint move
+            end_time="2026-08-27T14:30:00+08:00",
+        )
+    )
+
+    assert result["status"] == "conflict"
+    assert result["conflicts"][0]["summary"] == "1:1 with Hazel"
+    assert result["unchecked_attendees"] == ["existing@example.com"]
 
 
 def test_update_events_missing_scope_can_be_bypassed_with_ignore_conflicts(

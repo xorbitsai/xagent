@@ -2718,7 +2718,7 @@ def test_create_file_rejects_binary_mime_type_even_with_a_non_flagged_name(
     mime_type — producing the exact declared-type-vs-content mismatch this
     guard exists to prevent."""
     files = Mock()
-    _mock_drive_service(monkeypatch, files)
+    _mock_drive_service_with_files(monkeypatch, files)
 
     result = json.loads(
         google_drive.google_drive_create_file(name, "some text", mime_type=mime_type)
@@ -2740,7 +2740,7 @@ def test_create_file_allows_text_safe_mime_types(monkeypatch, mime_type):
     one."""
     files = Mock()
     files.create.return_value.execute.return_value = {"id": "f1"}
-    _mock_drive_service(monkeypatch, files)
+    _mock_drive_service_with_files(monkeypatch, files)
 
     result = json.loads(
         google_drive.google_drive_create_file("data.json", "{}", mime_type=mime_type)

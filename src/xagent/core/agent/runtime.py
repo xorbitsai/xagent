@@ -393,42 +393,66 @@ class PatternRuntime:
             provider_payload: dict[str, Any] = {}
             protocol_error_payload: dict[str, Any] = {}
             saw_payload_chunk = False
-            async for chunk in stream_chat(**kwargs):
-                # Buffered streams and synchronous callbacks may never suspend.
-                # Give API requests and cancellation callbacks a scheduling turn
-                # before consuming the next chunk, including protocol errors.
-                await asyncio.sleep(0)
-                await self._raise_if_interrupted("interrupted during LLM stream")
-                self._raise_for_stream_error(chunk)
-                is_protocol_error = (
-                    callable(getattr(chunk, "is_protocol_error", None))
-                    and chunk.is_protocol_error()
-                )
-                if (
-                    getattr(chunk, "type", None) == ChunkType.PROTOCOL_ERROR
-                    or is_protocol_error
-                ):
-                    payload = getattr(chunk, "protocol_error", None)
-                    if isinstance(payload, dict):
-                        protocol_error_payload.update(payload)
-                    saw_payload_chunk = True
+            stream = aiter(stream_chat(**kwargs))
+            loop_completed = False
+            try:
+                async for chunk in stream:
+                    # Buffered streams and synchronous callbacks may never suspend.
+                    # Give API requests and cancellation callbacks a scheduling turn
+                    # before checking interruption or provider errors. Keep this above
+                    # the protocol-error continue so every chunk yields; cancellation
+                    # deliberately takes precedence over a concurrently received error.
+                    await asyncio.sleep(0)
+                    await self._raise_if_interrupted("interrupted during LLM stream")
+                    self._raise_for_stream_error(chunk)
+                    is_protocol_error = (
+                        callable(getattr(chunk, "is_protocol_error", None))
+                        and chunk.is_protocol_error()
+                    )
+                    if (
+                        getattr(chunk, "type", None) == ChunkType.PROTOCOL_ERROR
+                        or is_protocol_error
+                    ):
+                        payload = getattr(chunk, "protocol_error", None)
+                        if isinstance(payload, dict):
+                            protocol_error_payload.update(payload)
+                        saw_payload_chunk = True
+                        if on_chunk is not None:
+                            await self._maybe_await(on_chunk(chunk))
+                        continue
+                    text_delta = self._chunk_text_delta(chunk)
+                    if text_delta:
+                        saw_payload_chunk = True
+                        content_parts.append(text_delta)
+                    chunk_tool_calls = self._chunk_tool_calls(chunk)
+                    if chunk_tool_calls:
+                        saw_payload_chunk = True
+                        self._merge_tool_call_chunks(tool_call_chunks, chunk_tool_calls)
+                    chunk_usage = self._chunk_usage(chunk)
+                    if chunk_usage:
+                        self._merge_usage(usage_payload, chunk_usage)
+                    self._merge_provider_payload(provider_payload, chunk)
                     if on_chunk is not None:
                         await self._maybe_await(on_chunk(chunk))
-                    continue
-                text_delta = self._chunk_text_delta(chunk)
-                if text_delta:
-                    saw_payload_chunk = True
-                    content_parts.append(text_delta)
-                chunk_tool_calls = self._chunk_tool_calls(chunk)
-                if chunk_tool_calls:
-                    saw_payload_chunk = True
-                    self._merge_tool_call_chunks(tool_call_chunks, chunk_tool_calls)
-                chunk_usage = self._chunk_usage(chunk)
-                if chunk_usage:
-                    self._merge_usage(usage_payload, chunk_usage)
-                self._merge_provider_payload(provider_payload, chunk)
-                if on_chunk is not None:
-                    await self._maybe_await(on_chunk(chunk))
+                loop_completed = True
+            finally:
+                close = getattr(stream, "aclose", None)
+                if callable(close):
+                    try:
+                        # A checker can cancel this consumer itself. Deliver that
+                        # pending cancellation before entering async cleanup, but
+                        # close in this same task for task-affine generators.
+                        try:
+                            await asyncio.sleep(0)
+                        finally:
+                            await close()
+                    except Exception as exc:
+                        if loop_completed:
+                            raise
+                        # Preserve the original provider/callback error on abort.
+                        logger.warning(
+                            "LLM stream close failed (%s)", type(exc).__name__
+                        )
 
             content = "".join(content_parts)
             tool_calls = [

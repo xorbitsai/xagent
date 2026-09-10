@@ -222,6 +222,152 @@ async def test_buffered_stream_can_be_stopped_between_chunks(interrupt: bool) ->
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode",
+    ["complete", "provider_error", "callback_error", "cancel", "interrupt", "checker"],
+)
+async def test_stream_is_closed_before_runtime_returns(mode: str) -> None:
+    closed = asyncio.Event()
+    stop = asyncio.Event()
+
+    class RetainedStream:
+        def __init__(self) -> None:
+            # Keep a reference so GC cannot hide missing explicit cleanup.
+            self.stream = self.generate()
+
+        def stream_chat(self, **_: Any) -> Any:
+            return self.stream
+
+        async def generate(self) -> Any:
+            owner = asyncio.current_task()
+            try:
+                yield StreamChunk(type=ChunkType.TOKEN, delta="first")
+                yield StreamChunk(
+                    type=ChunkType.ERROR
+                    if mode == "provider_error"
+                    else ChunkType.TOKEN,
+                    content="provider failed",
+                    delta="second",
+                )
+            finally:
+                assert asyncio.current_task() is owner
+                await asyncio.sleep(0)
+                closed.set()
+
+    runtime = PatternRuntime(
+        interrupt_checker=lambda: "checker stopped" if stop.is_set() else False
+    )
+    llm = RetainedStream()
+    received = []
+
+    def on_chunk(chunk: StreamChunk) -> None:
+        received.append(chunk.delta)
+        if mode == "callback_error":
+            raise ValueError("callback failed")
+        loop = asyncio.get_running_loop()
+        if mode == "cancel":
+            loop.call_soon(call.cancel)
+        elif mode == "interrupt":
+            loop.call_soon(runtime.request_interrupt, "requested stop")
+        elif mode == "checker":
+            # No explicit cancel/request_interrupt: exercise the checker path.
+            loop.call_soon(stop.set)
+
+    call = asyncio.create_task(runtime.run_streaming_llm_call(llm, on_chunk=on_chunk))
+    try:
+        if mode == "complete":
+            assert await call == "firstsecond"
+        else:
+            exception = {
+                "provider_error": RuntimeError,
+                "callback_error": ValueError,
+                "cancel": asyncio.CancelledError,
+                "interrupt": LLMCallInterrupted,
+                "checker": LLMCallInterrupted,
+            }[mode]
+            with pytest.raises(exception) as error:
+                await call
+            if mode == "checker":
+                assert str(error.value) == "checker stopped"
+            assert received == ["first"]
+        assert closed.is_set()
+        assert not runtime._active_llm_tasks
+    finally:
+        await llm.stream.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source_error", [False, True])
+async def test_stream_close_error_does_not_mask_source_error(
+    source_error: bool,
+) -> None:
+    class BrokenClose:
+        def stream_chat(self, **_: Any) -> Any:
+            return self
+
+        def __aiter__(self) -> Any:
+            return self
+
+        async def __anext__(self) -> Any:
+            if source_error:
+                raise ValueError("source failed")
+            raise StopAsyncIteration
+
+        async def aclose(self) -> None:
+            await asyncio.sleep(0)
+            raise RuntimeError("close failed")
+
+    expected = ValueError if source_error else RuntimeError
+    message = "source failed" if source_error else "close failed"
+    with pytest.raises(expected, match=message):
+        await PatternRuntime().run_streaming_llm_call(BrokenClose())
+
+
+@pytest.mark.asyncio
+async def test_stream_without_aclose_remains_supported() -> None:
+    class Iterator:
+        def __init__(self) -> None:
+            self.done = False
+
+        def __aiter__(self) -> Any:
+            return self
+
+        async def __anext__(self) -> StreamChunk:
+            if self.done:
+                raise StopAsyncIteration
+            self.done = True
+            return StreamChunk(type=ChunkType.TOKEN, delta="answer")
+
+    class LLM:
+        def stream_chat(self, **_: Any) -> Any:
+            return Iterator()
+
+    assert await PatternRuntime().run_streaming_llm_call(LLM()) == "answer"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interrupt", [False, True])
+async def test_cancellation_wins_over_concurrent_provider_error(
+    interrupt: bool,
+) -> None:
+    runtime = PatternRuntime()
+
+    class ErrorStream:
+        async def stream_chat(self, **_: Any) -> Any:
+            loop = asyncio.get_running_loop()
+            if interrupt:
+                loop.call_soon(runtime.request_interrupt, "requested stop")
+            else:
+                loop.call_soon(call.cancel)
+            yield StreamChunk(type=ChunkType.ERROR, content="provider failed")
+
+    call = asyncio.create_task(runtime.run_streaming_llm_call(ErrorStream()))
+    expected = LLMCallInterrupted if interrupt else asyncio.CancelledError
+    with pytest.raises(expected):
+        await call
+
+
+@pytest.mark.asyncio
 async def test_buffered_protocol_error_keeps_usage_and_yields() -> None:
     from xagent.core.model.chat.tool_protocol import TOOL_PROTOCOL_ERROR_KEY
 

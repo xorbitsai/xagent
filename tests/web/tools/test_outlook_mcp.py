@@ -1140,6 +1140,39 @@ def test_create_event_missing_schedule_scope_rejects_the_write(monkeypatch):
     assert "reconnect" in result["message"].lower()
 
 
+def test_create_event_missing_schedule_scope_still_reports_an_already_confirmed_conflict(
+    monkeypatch,
+):
+    """Regression test: a real conflict already confirmed before the scope
+    error hit (here, the organizer's own calendar, which doesn't need the
+    schedule scope at all) must not be silently discarded just because a
+    later, unrelated attendee check then hit the same missing-scope 403 -
+    reporting a known conflict is always safe, and blindly rejecting
+    instead would tell the caller to retry with ignore_conflicts=true,
+    which would then book straight over the real conflict nobody ever
+    mentioned."""
+    graph_request = Mock(
+        side_effect=[
+            {"value": [_busy_event(event_id="other-1", subject="Board sync")]},
+            outlook._GraphRequestError("403 Forbidden", status_code=403),
+        ]
+    )
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_create_event(
+            subject="Kickoff",
+            start_datetime="2026-08-27T10:00:00",
+            end_datetime="2026-08-27T10:30:00",
+            attendees=["chelsea@example.com"],
+        )
+    )
+
+    assert result["status"] == "conflict"
+    assert result["conflicts"][0]["summary"] == "Board sync"
+    assert result["unchecked_attendees"] == ["chelsea@example.com"]
+
+
 def test_create_event_missing_schedule_scope_can_be_bypassed_with_ignore_conflicts(
     monkeypatch,
 ):
@@ -1959,9 +1992,46 @@ def test_send_message_normalizes_and_dedupes_recipients(monkeypatch):
 
 def test_update_event_missing_schedule_scope_rejects_the_write(monkeypatch):
     """A whole-batch 403 while checking the newly-added attendee is our own
-    credential's problem, not a per-attendee visibility gap - the write
-    must be rejected outright, even though the organizer's own calendar
-    already turned up a real conflict."""
+    credential's problem, not a per-attendee visibility gap - with nothing
+    else already confirmed, the write must be rejected outright."""
+    graph_request = Mock(
+        side_effect=[
+            {
+                "start": {"dateTime": "2026-08-27T10:00:00", "timeZone": "UTC"},
+                "end": {"dateTime": "2026-08-27T10:30:00", "timeZone": "UTC"},
+                "attendees": [],
+                "isAllDay": False,
+            },
+            {"value": []},
+            outlook._GraphRequestError("403 Forbidden", status_code=403),
+        ]
+    )
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_update_event(
+            event_id="self-1",
+            start_datetime="2026-08-27T14:00:00",
+            end_datetime="2026-08-27T14:30:00",
+            attendees=["outsider@gmail.com"],
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "reconnect" in result["message"].lower()
+
+
+def test_update_event_missing_schedule_scope_still_reports_an_already_confirmed_conflict(
+    monkeypatch,
+):
+    """Regression test: a real conflict already confirmed before the scope
+    error hit (here, the organizer's own calendar, which doesn't need the
+    schedule scope at all) must not be silently discarded just because a
+    later, unrelated attendee check then hit the same missing-scope 403 -
+    reporting a known conflict is always safe, and blindly rejecting
+    instead would tell the caller to retry with ignore_conflicts=true,
+    which would then book straight over the real conflict nobody ever
+    mentioned."""
     graph_request = Mock(
         side_effect=[
             {
@@ -1985,8 +2055,9 @@ def test_update_event_missing_schedule_scope_rejects_the_write(monkeypatch):
         )
     )
 
-    assert result["status"] == "error"
-    assert "reconnect" in result["message"].lower()
+    assert result["status"] == "conflict"
+    assert result["conflicts"][0]["summary"] == "Board sync"
+    assert result["unchecked_attendees"] == ["outsider@gmail.com"]
 
 
 def test_update_event_missing_schedule_scope_can_be_bypassed_with_ignore_conflicts(

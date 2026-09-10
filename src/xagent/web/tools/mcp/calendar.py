@@ -10,6 +10,7 @@ from googleapiclient.discovery import build  # type: ignore
 from googleapiclient.errors import HttpError  # type: ignore
 from mcp.server.fastmcp import FastMCP
 
+from .utils import InsufficientScopeError
 from .utils import attendees_to_add as _attendees_to_add
 from .utils import calendar_day_bounds as _calendar_day_bounds
 from .utils import conflict_response as _conflict_response
@@ -101,12 +102,15 @@ def _find_conflicts(
     to exclude the event's own footprint on attendee calendars.
 
     Returns (conflicts, unchecked_attendees). A missing-scope 403 covering
-    the whole call raises ValueError instead of degrading to unchecked -
+    the whole call raises `InsufficientScopeError` (carrying whatever was
+    already confirmed in `conflicts`/`unchecked_attendees` before the
+    error) instead of degrading to unchecked and returning normally -
     that's OUR OWN credential's problem, not a per-attendee visibility
     gap, and writing an event whose availability was never actually
     checked would defeat the point of this feature. Every entry that
-    does end up in `unchecked_attendees` is the self-explanatory kind
-    (absent from the response, or its own per-attendee error).
+    does end up in `unchecked_attendees` on a normal return is the
+    self-explanatory kind (absent from the response, or its own
+    per-attendee error).
     """
     conflicts: list[dict[str, Any]] = []
     unchecked_attendees: list[str] = []
@@ -184,13 +188,24 @@ def _find_conflicts(
                 # unchecked below) - proceeding to write an event whose
                 # availability was never actually checked would defeat
                 # the entire point of this feature, so reject instead of
-                # silently booking over a possible conflict.
-                raise ValueError(
+                # silently booking over a possible conflict. Carrying
+                # `conflicts` (e.g. an organizer conflict already found
+                # above, before this batch ever ran) lets a caller still
+                # report it rather than silently discarding a known
+                # problem just because this later, unrelated check also
+                # failed.
+                raise InsufficientScopeError(
                     "Missing the calendar.freebusy permission needed to "
                     "check attendee availability - reconnect the Google "
                     "Calendar connector to grant it, or pass "
                     "ignore_conflicts=true if the user has confirmed "
-                    "they want to proceed without this check."
+                    "they want to proceed without this check.",
+                    conflicts,
+                    # Every attendee from this failed batch onward is
+                    # unchecked - every remaining batch would hit this
+                    # same scope error too, so there's nothing left to
+                    # gain by attempting them.
+                    unchecked_attendees + attendees[offset:],
                 ) from exc
             raise
 
@@ -566,9 +581,20 @@ def google_calendar_create_events(
 
         unchecked_attendees: list[str] = []
         if not ignore_conflicts:
-            conflicts, unchecked_attendees = _find_conflicts(
-                service, start_time, end_time, normalized_attendees
-            )
+            try:
+                conflicts, unchecked_attendees = _find_conflicts(
+                    service, start_time, end_time, normalized_attendees
+                )
+            except InsufficientScopeError as exc:
+                # A real conflict (e.g. on the organizer's own calendar,
+                # which doesn't need the freebusy scope) can already have
+                # been confirmed before a later attendee batch hit this
+                # scope error - reporting it is always safe regardless of
+                # what else couldn't be checked, so only reject the write
+                # outright when nothing was confirmed yet.
+                if not exc.conflicts:
+                    raise
+                conflicts, unchecked_attendees = exc.conflicts, exc.unchecked_attendees
             if conflicts:
                 return _conflict_response(
                     conflicts,
@@ -690,12 +716,21 @@ def google_calendar_update_events(
             )
 
         # The calendar's own timezone is only needed to widen an all-day
-        # boundary (see _event_boundary) - fetch it lazily so a plain
-        # timed-event update doesn't pay for an extra API call it has no
-        # use for.
+        # boundary (see _event_boundary) so a moved window or an
+        # added/retained attendee gets checked against the right absolute
+        # instant - fetch it lazily so a plain timed-event update, or a
+        # summary/location/description-only edit of an all-day event that
+        # never touches its window or attendees, doesn't pay for an extra
+        # API call (or a scope-403 that would otherwise block an edit
+        # that never needed timezone precision at all) it has no use for.
+        needs_real_calendar_timezone = existing_is_all_day and (
+            bool(start_time) or bool(end_time) or bool(attendees)
+        )
         try:
             calendar_timezone = (
-                _primary_calendar_timezone(service) if existing_is_all_day else "UTC"
+                _primary_calendar_timezone(service)
+                if needs_real_calendar_timezone
+                else "UTC"
             )
         except ValueError:
             if not ignore_conflicts:
@@ -744,50 +779,63 @@ def google_calendar_update_events(
             check_organizer = window_changed
             all_conflicts: list[dict[str, Any]] = []
 
-            # A newly-added attendee has no footprint on this event at
-            # all, so the FULL effective window is safe (and necessary)
-            # to check for them - same call also covers the organizer,
-            # who's excluded by event id rather than by window, so
-            # `window_changed` alone (not a disjoint-move test) decides
-            # whether to re-check them.
-            if check_organizer or added_attendees:
-                conflicts, unchecked = _find_conflicts(
-                    service,
-                    effective_start,
-                    effective_end,
-                    added_attendees,
-                    exclude_event_id=event_id,
-                    check_organizer=check_organizer,
-                )
-                all_conflicts.extend(conflicts)
-                unchecked_attendees.extend(unchecked)
-
-            # A retained attendee's own busy block for THIS event covers
-            # the entire OLD window - querying that overlap can't tell
-            # "busy because of this event" from a real conflict. Only the
-            # portion of the new window that's genuinely new territory
-            # (window_delta_segments - empty for an unchanged/shrunk
-            # window, up to two segments for a partial nudge that extends
-            # past the old window on one or both sides, or the whole new
-            # window for a fully disjoint move) can hide a real conflict
-            # for them.
-            if existing_attendees_raw:
-                for seg_start, seg_end in _window_delta_segments(
-                    existing_start_key,
-                    existing_end_key,
-                    effective_start_key,
-                    effective_end_key,
-                ):
+            try:
+                # A newly-added attendee has no footprint on this event
+                # at all, so the FULL effective window is safe (and
+                # necessary) to check for them - same call also covers
+                # the organizer, who's excluded by event id rather than
+                # by window, so `window_changed` alone (not a
+                # disjoint-move test) decides whether to re-check them.
+                if check_organizer or added_attendees:
                     conflicts, unchecked = _find_conflicts(
                         service,
-                        seg_start.isoformat(),
-                        seg_end.isoformat(),
-                        existing_attendees_raw,
+                        effective_start,
+                        effective_end,
+                        added_attendees,
                         exclude_event_id=event_id,
-                        check_organizer=False,
+                        check_organizer=check_organizer,
                     )
                     all_conflicts.extend(conflicts)
                     unchecked_attendees.extend(unchecked)
+
+                # A retained attendee's own busy block for THIS event
+                # covers the entire OLD window - querying that overlap
+                # can't tell "busy because of this event" from a real
+                # conflict. Only the portion of the new window that's
+                # genuinely new territory (window_delta_segments - empty
+                # for an unchanged/shrunk window, up to two segments for
+                # a partial nudge that extends past the old window on one
+                # or both sides, or the whole new window for a fully
+                # disjoint move) can hide a real conflict for them.
+                if existing_attendees_raw:
+                    for seg_start, seg_end in _window_delta_segments(
+                        existing_start_key,
+                        existing_end_key,
+                        effective_start_key,
+                        effective_end_key,
+                    ):
+                        conflicts, unchecked = _find_conflicts(
+                            service,
+                            seg_start.isoformat(),
+                            seg_end.isoformat(),
+                            existing_attendees_raw,
+                            exclude_event_id=event_id,
+                            check_organizer=False,
+                        )
+                        all_conflicts.extend(conflicts)
+                        unchecked_attendees.extend(unchecked)
+            except InsufficientScopeError as exc:
+                # A real conflict can already have been confirmed by an
+                # earlier call above (or earlier in this same call, e.g.
+                # an organizer conflict found before the attendee batch
+                # that hit this scope error) - reporting it is always
+                # safe regardless of what else couldn't be checked, so
+                # only reject the write outright when nothing was
+                # confirmed yet.
+                all_conflicts.extend(exc.conflicts)
+                unchecked_attendees.extend(exc.unchecked_attendees)
+                if not all_conflicts:
+                    raise
 
             if all_conflicts:
                 return _conflict_response(

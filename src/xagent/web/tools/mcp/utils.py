@@ -11,6 +11,35 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from ....config import get_tool_max_output_length
 
 
+class InsufficientScopeError(ValueError):
+    """Raised by a connector's ``_find_conflicts`` on a whole-batch
+    missing-scope error (see that function's own docstring for why this
+    is raised at all rather than degrading to unchecked).
+
+    Carries whatever ``conflicts``/``unchecked_attendees`` had already
+    been confirmed before the error - a caller accumulating results
+    across multiple ``_find_conflicts`` calls for one create/update (e.g.
+    one call for newly-added attendees, another per delta segment for
+    retained attendees) needs this to still report an already-confirmed
+    real conflict (found before the error, in this call or an earlier
+    one) instead of silently discarding it just because a *later*,
+    unrelated check also hit the same scope problem. Reporting a known
+    conflict is always safe regardless of what else couldn't be checked;
+    only the "nothing confirmed yet, can't tell if this is safe" case
+    should still reject the write outright.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        conflicts: list[dict[str, Any]],
+        unchecked_attendees: list[str],
+    ) -> None:
+        super().__init__(message)
+        self.conflicts = conflicts
+        self.unchecked_attendees = unchecked_attendees
+
+
 def require_clean_identifier(value: str, field_name: str) -> str:
     """Reject an empty or whitespace-padded id rather than silently fixing it.
 
@@ -153,12 +182,17 @@ def conflict_response(
     returns instead of creating/updating an event, so the calling agent
     reports the conflict to the user rather than silently double-booking.
 
-    `unchecked_attendees` here is always the self-explanatory kind (an
+    `unchecked_attendees` is usually the self-explanatory kind (an
     attendee absent from the provider's response, or its own per-attendee
     error) - a missing-OAuth-scope 403 covering the whole call is instead
-    raised as a ValueError before this response is ever built, since
+    raised as `InsufficientScopeError` before ever reaching here, since
     writing an event whose availability could never actually be checked
-    would defeat the point of this feature.
+    would defeat the point of this feature. The one exception: a caller
+    that catches `InsufficientScopeError` because `conflicts` was already
+    non-empty (a real conflict was confirmed before the scope error hit)
+    may pass that error's own `unchecked_attendees` through here too - at
+    that point the write is already correctly blocked by the known
+    conflict, so being honest about who else couldn't be checked is safe.
     """
     payload = {
         "status": "conflict",

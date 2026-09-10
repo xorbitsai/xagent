@@ -1604,6 +1604,35 @@ def test_freebusy_missing_scope_can_be_bypassed_with_ignore_conflicts(fake_servi
     assert len(fake_service._events.insert_calls) == 1
 
 
+def test_freebusy_missing_scope_still_reports_an_already_confirmed_conflict(
+    fake_service,
+):
+    """Regression test: a real conflict already confirmed before the scope
+    error hit (here, the organizer's own calendar, which doesn't need the
+    freebusy scope at all) must not be silently discarded just because a
+    later, unrelated attendee check then hit the same missing-scope 403 -
+    reporting a known conflict is always safe, and blindly rejecting
+    instead would tell the caller to retry with ignore_conflicts=true,
+    which would then book straight over the real conflict nobody ever
+    mentioned."""
+    fake_service._events._list_result = {"items": [_confirmed_event()]}
+    fake_service._freebusy = FakeFreebusy(raise_error=_insufficient_scope_error())
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Kickoff",
+            start_time="2026-08-27T10:00:00+08:00",
+            end_time="2026-08-27T10:30:00+08:00",
+            attendees=["chelsea@example.com"],
+        )
+    )
+
+    assert result["status"] == "conflict"
+    assert result["conflicts"][0]["summary"] == "1:1 with Hazel"
+    assert result["unchecked_attendees"] == ["chelsea@example.com"]
+    assert fake_service._events.insert_calls == []
+
+
 def test_freebusy_missing_scope_legacy_only_body_still_rejects(fake_service):
     """The dual-format body is what a real Calendar API 403 actually
     carries, but a response with only the legacy `errors[]` field must
@@ -1847,6 +1876,35 @@ def test_update_events_calendar_timezone_lookup_missing_scope_rejects_the_write(
     assert result["status"] == "error"
     assert "reconnect" in result["message"].lower()
     assert fake_service._events.update_calls == []
+
+
+def test_update_events_summary_only_edit_of_all_day_event_never_looks_up_calendar_timezone(
+    fake_service,
+):
+    """Regression test: a summary/location/description-only edit of an
+    all-day event never moves its window or touches attendees, so it has
+    no use for the calendar's real timezone - looking it up anyway would
+    needlessly block this benign edit behind a calendar.calendars.readonly
+    scope-403 for every pre-migration token, a far bigger blast radius
+    than the migration's stated purpose (all-day conflict checks)."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"date": "2026-08-27"},
+        "end": {"date": "2026-08-28"},
+        "attendees": [],
+    }
+    fake_service._calendars = FakeCalendars(raise_error=_insufficient_scope_error())
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            summary="Renamed",
+        )
+    )
+
+    assert result["status"] == "success"
+    assert fake_service._calendars.get_calls == []
+    assert len(fake_service._events.update_calls) == 1
 
 
 def test_update_events_calendar_timezone_lookup_missing_scope_falls_back_with_ignore_conflicts(
@@ -2138,9 +2196,42 @@ def test_update_events_respects_sibling_timezone_on_an_offsetless_datetime(
 
 def test_update_events_missing_scope_rejects_the_write(fake_service):
     """A whole-batch 403 while checking the newly-added attendee is our own
-    credential's problem, not a per-attendee visibility gap - the write
-    must be rejected outright, even though the organizer's own calendar
-    already turned up a real conflict."""
+    credential's problem, not a per-attendee visibility gap - with nothing
+    else already confirmed, the write must be rejected outright."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+        "attendees": [],
+    }
+    fake_service._events._list_result = {"items": []}
+    fake_service._freebusy = FakeFreebusy(raise_error=_insufficient_scope_error())
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-27T10:00:00+08:00",
+            end_time="2026-08-27T10:30:00+08:00",
+            attendees=["outsider@gmail.com"],
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "reconnect" in result["message"].lower()
+    assert fake_service._events.update_calls == []
+
+
+def test_update_events_missing_scope_still_reports_an_already_confirmed_conflict(
+    fake_service,
+):
+    """Regression test: a real conflict already confirmed before the scope
+    error hit (here, the organizer's own calendar, which doesn't need the
+    freebusy scope at all) must not be silently discarded just because a
+    later, unrelated attendee check then hit the same missing-scope 403 -
+    reporting a known conflict is always safe, and blindly rejecting
+    instead would tell the caller to retry with ignore_conflicts=true,
+    which would then book straight over the real conflict nobody ever
+    mentioned."""
     fake_service._events._get_result = {
         "id": "self-1",
         "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
@@ -2161,9 +2252,9 @@ def test_update_events_missing_scope_rejects_the_write(fake_service):
         )
     )
 
-    assert result["status"] == "error"
-    assert "reconnect" in result["message"].lower()
-    assert fake_service._events.update_calls == []
+    assert result["status"] == "conflict"
+    assert result["conflicts"][0]["summary"] == "1:1 with Hazel"
+    assert result["unchecked_attendees"] == ["outsider@gmail.com"]
 
 
 def test_update_events_missing_scope_can_be_bypassed_with_ignore_conflicts(

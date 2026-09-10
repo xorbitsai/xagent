@@ -14,6 +14,7 @@ from .utils import attendees_to_add as _attendees_to_add
 from .utils import attendees_were_given as _attendees_were_given
 from .utils import conflict_response as _conflict_response
 from .utils import datetime_key_for_comparison as _datetime_key_for_comparison
+from .utils import merge_scope_error as _merge_scope_error
 from .utils import naive_day_bounds as _naive_day_bounds
 from .utils import normalize_addresses as _normalize_addresses
 from .utils import offset_datetime_string as _offset_datetime_string
@@ -578,26 +579,41 @@ def outlook_create_event(
 
         unchecked_attendees: list[str] = []
         if not ignore_conflicts:
+            # An all-day event occupies the *whole* calendar day(s) it
+            # lands on, not just the literal clock-time slot given -
+            # widen the query window to that before checking, or a
+            # conflict elsewhere that day would be missed. Graph itself
+            # doesn't require start/end to already be day-aligned for
+            # isAllDay=True, so a caller passing e.g. business hours with
+            # is_all_day=True must still get the whole day checked.
+            query_start, query_end = start_datetime, end_datetime
+            if is_all_day:
+                query_start, _ = _naive_day_bounds(start_datetime)
+                end_of_its_day, next_day_start = _naive_day_bounds(end_datetime)
+                # end_datetime may already BE a well-formed exclusive day
+                # boundary (exactly midnight) - naive_day_bounds always
+                # treats its input as a day that needs widening to [that
+                # midnight, next midnight), so applying it unconditionally
+                # would push an already-correct boundary one whole day
+                # too far.
+                query_end = (
+                    end_datetime
+                    if datetime.fromisoformat(end_datetime)
+                    == datetime.fromisoformat(end_of_its_day)
+                    else next_day_start
+                )
             try:
                 conflicts, unchecked_attendees = _find_conflicts(
-                    start_datetime, end_datetime, timezone, normalized_attendees
+                    query_start, query_end, timezone, normalized_attendees
                 )
             except InsufficientScopeError as exc:
-                # A real conflict (e.g. on the organizer's own calendar,
-                # which doesn't need the schedule scope) can already have
-                # been confirmed before a later attendee batch hit this
-                # scope error - reporting it is always safe regardless of
-                # what else couldn't be checked, so only reject the write
-                # outright when nothing was confirmed yet.
-                if not exc.conflicts:
-                    raise
-                conflicts, unchecked_attendees = exc.conflicts, exc.unchecked_attendees
+                conflicts, unchecked_attendees = _merge_scope_error(exc, [], [])
             if conflicts:
                 return _conflict_response(
                     conflicts,
                     unchecked_attendees,
-                    start_datetime,
-                    end_datetime,
+                    query_start,
+                    query_end,
                 )
 
         payload: dict[str, Any] = {
@@ -913,12 +929,17 @@ def outlook_update_event(
         # asked to write), not a conflict-check decision the caller can
         # opt out of. Matches google_calendar_update_events, and this
         # tool's own create path, both of which validate regardless of
-        # ignore_conflicts too.
+        # ignore_conflicts too. Only worth checking when this call is
+        # actually about to write a (possibly partly-existing) window -
+        # an attendees/subject-only edit that never moves either boundary
+        # would otherwise re-validate the event's already-stored,
+        # unchanged start/end and could reject an unrelated field edit
+        # over pre-existing data this call never touches.
         existing_end = existing_end_field.get("dateTime")
         existing_start = existing_start_field.get("dateTime")
         effective_start = start_datetime or existing_start
         effective_end = end_datetime or existing_end
-        if effective_start and effective_end:
+        if (start_datetime or end_datetime) and effective_start and effective_end:
             _reject_reversed_window(effective_start, effective_end)
 
         unchecked_attendees: list[str] = []
@@ -1110,17 +1131,9 @@ def outlook_update_event(
                         all_conflicts.extend(conflicts)
                         unchecked_attendees.extend(unchecked)
             except InsufficientScopeError as exc:
-                # A real conflict can already have been confirmed by an
-                # earlier call above (or earlier in this same call, e.g.
-                # an organizer conflict found before the attendee batch
-                # that hit this scope error) - reporting it is always
-                # safe regardless of what else couldn't be checked, so
-                # only reject the write outright when nothing was
-                # confirmed yet.
-                all_conflicts.extend(exc.conflicts)
-                unchecked_attendees.extend(exc.unchecked_attendees)
-                if not all_conflicts:
-                    raise
+                all_conflicts, unchecked_attendees = _merge_scope_error(
+                    exc, all_conflicts, unchecked_attendees
+                )
 
             if all_conflicts:
                 # narrows for mypy: a conflict can only have been found by

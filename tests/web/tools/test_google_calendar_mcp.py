@@ -2163,6 +2163,32 @@ def test_update_events_treats_equivalent_timestamp_formats_as_unchanged(
     assert fake_service._events.update_calls[0]["sendUpdates"] == "none"
 
 
+def test_update_events_summary_only_edit_never_revalidates_the_existing_window(
+    fake_service,
+):
+    """Regression test: an update that never touches start_time/end_time
+    isn't about to write any window at all, so it must not re-validate
+    the event's already-stored start/end - a zero-duration or malformed
+    pre-existing window (e.g. from another client/tool) would otherwise
+    reject an unrelated summary edit that never asked to change the
+    time."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T10:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T10:00:00+08:00"},  # zero-duration
+        "attendees": [],
+    }
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            summary="Renamed",
+        )
+    )
+
+    assert result["status"] == "success"
+
+
 def test_update_events_respects_sibling_timezone_on_an_offsetless_datetime(
     fake_service,
 ):

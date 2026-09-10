@@ -309,6 +309,49 @@ def test_create_event_rejects_a_reversed_window(monkeypatch):
     graph_request.assert_not_called()
 
 
+def test_create_event_widens_all_day_conflict_check_to_the_full_day(monkeypatch):
+    """Regression test: Graph doesn't require start/end to already be
+    day-aligned for isAllDay=True, so a caller passing a literal
+    business-hours slot with is_all_day=True must still get the WHOLE
+    day checked for conflicts - a conflict earlier or later that same
+    day would otherwise be silently missed."""
+    graph_request = Mock(
+        side_effect=[
+            {
+                "value": [
+                    {
+                        "id": "other-1",
+                        "subject": "Early standup",
+                        "isCancelled": False,
+                        "showAs": "busy",
+                        "start": {"dateTime": "2026-08-27T08:00:00"},
+                        "end": {"dateTime": "2026-08-27T08:30:00"},
+                    }
+                ]
+            },
+        ]
+    )
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_create_event(
+            subject="Company holiday",
+            start_datetime="2026-08-27T09:00:00",
+            end_datetime="2026-08-27T17:00:00",
+            is_all_day=True,
+        )
+    )
+
+    assert result["status"] == "conflict"
+    calendar_view_call = graph_request.call_args_list[0]
+    assert calendar_view_call.kwargs["params"]["startDateTime"] == (
+        "2026-08-27T00:00:00+00:00"
+    )
+    assert calendar_view_call.kwargs["params"]["endDateTime"] == (
+        "2026-08-28T00:00:00+00:00"
+    )
+
+
 def test_update_event_excludes_the_event_being_moved_from_its_own_conflicts(
     monkeypatch,
 ):
@@ -1477,6 +1520,34 @@ def test_update_event_treats_equivalent_timestamp_formats_as_unchanged(monkeypat
     assert result["status"] == "success"
     # Only the existing-event GET and the PATCH - no calendarView/getSchedule.
     assert graph_request.call_count == 2
+
+
+def test_update_event_subject_only_edit_never_revalidates_the_existing_window(
+    monkeypatch,
+):
+    """Regression test: an update that never touches start_datetime/
+    end_datetime isn't about to write any window at all, so it must not
+    re-validate the event's already-stored start/end - a zero-duration
+    or malformed pre-existing window would otherwise reject an unrelated
+    subject edit that never asked to change the time."""
+    graph_request = Mock(
+        return_value={
+            "start": {"dateTime": "2026-08-27T10:00:00", "timeZone": "UTC"},
+            "end": {"dateTime": "2026-08-27T10:00:00", "timeZone": "UTC"},
+            "attendees": [],
+            "isAllDay": False,
+        }
+    )
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_update_event(
+            event_id="self-1",
+            subject="Renamed",
+        )
+    )
+
+    assert result["status"] == "success"
 
 
 def test_create_event_calendarview_query_carries_an_explicit_offset(monkeypatch):

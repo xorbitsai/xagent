@@ -15,6 +15,7 @@ from .utils import attendees_to_add as _attendees_to_add
 from .utils import calendar_day_bounds as _calendar_day_bounds
 from .utils import conflict_response as _conflict_response
 from .utils import datetime_key_for_comparison as _datetime_key_for_comparison
+from .utils import merge_scope_error as _merge_scope_error
 from .utils import normalize_addresses as _normalize_addresses
 from .utils import offset_datetime_string as _offset_datetime_string
 from .utils import reject_reversed_window as _reject_reversed_window
@@ -586,15 +587,7 @@ def google_calendar_create_events(
                     service, start_time, end_time, normalized_attendees
                 )
             except InsufficientScopeError as exc:
-                # A real conflict (e.g. on the organizer's own calendar,
-                # which doesn't need the freebusy scope) can already have
-                # been confirmed before a later attendee batch hit this
-                # scope error - reporting it is always safe regardless of
-                # what else couldn't be checked, so only reject the write
-                # outright when nothing was confirmed yet.
-                if not exc.conflicts:
-                    raise
-                conflicts, unchecked_attendees = exc.conflicts, exc.unchecked_attendees
+                conflicts, unchecked_attendees = _merge_scope_error(exc, [], [])
             if conflicts:
                 return _conflict_response(
                     conflicts,
@@ -746,7 +739,14 @@ def google_calendar_update_events(
         existing_end = _event_boundary(event.get("end"), calendar_timezone)
         effective_start = start_time or existing_start
         effective_end = end_time or existing_end
-        if effective_start and effective_end:
+        if (start_time or end_time) and effective_start and effective_end:
+            # Only worth checking when this call is actually about to
+            # write a (possibly partly-existing) window - an
+            # attendees/summary-only edit that never moves either
+            # boundary would otherwise re-validate the event's
+            # already-stored, unchanged start/end and could reject an
+            # unrelated field edit over pre-existing data this call
+            # never touches.
             _reject_reversed_window(effective_start, effective_end)
         existing_start_key = _datetime_key_for_comparison(existing_start)
         existing_end_key = _datetime_key_for_comparison(existing_end)
@@ -825,17 +825,9 @@ def google_calendar_update_events(
                         all_conflicts.extend(conflicts)
                         unchecked_attendees.extend(unchecked)
             except InsufficientScopeError as exc:
-                # A real conflict can already have been confirmed by an
-                # earlier call above (or earlier in this same call, e.g.
-                # an organizer conflict found before the attendee batch
-                # that hit this scope error) - reporting it is always
-                # safe regardless of what else couldn't be checked, so
-                # only reject the write outright when nothing was
-                # confirmed yet.
-                all_conflicts.extend(exc.conflicts)
-                unchecked_attendees.extend(exc.unchecked_attendees)
-                if not all_conflicts:
-                    raise
+                all_conflicts, unchecked_attendees = _merge_scope_error(
+                    exc, all_conflicts, unchecked_attendees
+                )
 
             if all_conflicts:
                 return _conflict_response(

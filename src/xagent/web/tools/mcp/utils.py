@@ -40,6 +40,30 @@ class InsufficientScopeError(ValueError):
         self.unchecked_attendees = unchecked_attendees
 
 
+def merge_scope_error(
+    exc: InsufficientScopeError,
+    conflicts: list[dict[str, Any]],
+    unchecked_attendees: list[str],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Fold an `InsufficientScopeError` caught mid-accumulation into the
+    running `conflicts`/`unchecked_attendees` a connector's create/update
+    tool is building up (potentially across more than one `_find_conflicts`
+    call) - merging the error's own already-confirmed findings in first, so
+    a real conflict found before the error is never lost regardless of
+    which of possibly several calls actually raised.
+
+    Re-raises `exc` itself (preserving its original traceback/cause) when
+    the merged `conflicts` is still empty: nothing was confirmed yet, so
+    there is no already-known problem safe to report instead of rejecting
+    the write outright.
+    """
+    conflicts = [*conflicts, *exc.conflicts]
+    unchecked_attendees = [*unchecked_attendees, *exc.unchecked_attendees]
+    if not conflicts:
+        raise exc
+    return conflicts, unchecked_attendees
+
+
 def require_clean_identifier(value: str, field_name: str) -> str:
     """Reject an empty or whitespace-padded id rather than silently fixing it.
 

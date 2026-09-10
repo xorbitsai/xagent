@@ -443,11 +443,6 @@ def _build_graph_recurrence(
     parts = parse_rrule(recurrence, anchor)
     freq = parts["FREQ"].upper()
     interval = int(parts.get("INTERVAL", "1"))
-    if interval > _GRAPH_INT32_MAX:
-        raise ValueError(
-            f"invalid recurrence rule: INTERVAL must be at most "
-            f"{_GRAPH_INT32_MAX} for this connector, got {interval}"
-        )
     start_date = anchor.date().isoformat()
 
     if freq in _FREQ_RECOGNIZED_KEYS:
@@ -578,10 +573,11 @@ def _build_graph_recurrence(
             "month": month,
         }
     elif freq == "YEARLY":
-        # Truly unqualified (no BYMONTH/BYMONTHDAY/BYDAY at all) - RFC
-        # 5545's own default derives both from DTSTART's month/day, which
-        # is faithful here since there's no selector to be scoped
-        # incorrectly.
+        # No BYMONTHDAY/BYDAY selector present (BYMONTH alone, or nothing
+        # at all) - RFC 5545's own default derives the day (and, if
+        # BYMONTH is also absent, the month) from DTSTART, which is
+        # faithful here since there's no BYMONTHDAY/BYDAY selector that
+        # could be scoped to the wrong month.
         month = _int_rrule_component(parts, "BYMONTH", anchor.month, 1, 12)
         day_of_month = _int_rrule_component(parts, "BYMONTHDAY", anchor.day, 1, 31)
         _validate_day_of_month(day_of_month, month=month)
@@ -597,6 +593,17 @@ def _build_graph_recurrence(
             "only translates DAILY, WEEKLY, MONTHLY (BYMONTHDAY or a "
             "numbered BYDAY), and YEARLY (BYMONTH/BYMONTHDAY or a numbered "
             "BYDAY) into an Outlook recurrence"
+        )
+
+    # Checked only once FREQ (and the rest of `pattern`) is confirmed
+    # supported above - otherwise an unsupported FREQ combined with an
+    # out-of-range INTERVAL would surface this less fundamental error
+    # first, sending the caller on a second round-trip to find the real
+    # problem.
+    if interval > _GRAPH_INT32_MAX:
+        raise ValueError(
+            f"invalid recurrence rule: INTERVAL must be at most "
+            f"{_GRAPH_INT32_MAX} for this connector, got {interval}"
         )
 
     if "UNTIL" in parts:
@@ -838,11 +845,15 @@ def outlook_create_event(
     e.g. 'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;UNTIL=20260911T235959Z' for
     "every weekday until Sep 11, 2026". Graph has no direct RRULE input,
     so this is translated into its own structured recurrence - only
-    DAILY, WEEKLY, MONTHLY, and YEARLY rules are supported (MONTHLY's
-    BYMONTHDAY and YEARLY's BYMONTH/BYMONTHDAY are optional, defaulting to
-    the start date's own day/month per RFC 5545; either can instead use a
-    numbered BYDAY, e.g. 'FREQ=MONTHLY;BYDAY=2TU' for "the second Tuesday
-    of every month"); anything else is rejected with a clear error rather
+    DAILY, WEEKLY, MONTHLY, and YEARLY rules are supported. MONTHLY's
+    BYMONTHDAY is optional, defaulting to the start date's own day per RFC
+    5545 (or use a numbered BYDAY instead, e.g. 'FREQ=MONTHLY;BYDAY=2TU'
+    for "the second Tuesday of every month"). YEARLY's BYMONTH/BYMONTHDAY
+    default from the start date only when NEITHER BYMONTHDAY nor BYDAY is
+    given at all; if either is given, BYMONTH must be given too (Graph's
+    yearly patterns are always scoped to one specific month, unlike RFC
+    5545's own BYMONTHDAY-without-BYMONTH, which spans every month);
+    anything else is rejected with a clear error rather
     than silently producing the wrong pattern.
     """
     try:

@@ -187,14 +187,21 @@ def parse_rrule(
     Outlook start time) - skipping the format-then-reparse round trip that
     passing `.isoformat()` back in would otherwise cost.
 
-    ``timezone``, if given, localizes a naive ``dtstart`` (e.g. an all-day
-    Google event's bare "date", or an Outlook naive dateTime with no
-    embedded offset) before validation. This matters beyond cosmetics:
-    RFC 5545 requires DTSTART and UNTIL to either both be timezone-aware or
-    both be "floating" - a naive DTSTART paired with the (very common)
-    "Z"-suffixed/aware UNTIL is otherwise rejected by dateutil with a
-    confusingly-worded error, and the UNTIL-not-before-dtstart check above
-    can't run at all without an aware anchor to compare against.
+    ``timezone``, if given, localizes a naive ``dtstart``. For a genuine
+    all-day event - ``dtstart`` passed as a bare-date string with no "T",
+    e.g. Google's own all-day "date" field - this only happens when
+    needed to compare against an aware UNTIL; a naive/bare-date UNTIL is
+    correctly left floating to match the still-naive anchor instead,
+    since RFC 5545's DATE value type legitimately pairs a floating DTSTART
+    with a floating UNTIL. For anything else (a full dateTime string,
+    aware or not, or an already-`datetime` object), the
+    anchor is always localized when naive - RFC 5545's DATE-TIME value
+    type requires UNTIL to be aware too, so if it isn't, that's an actual
+    mismatch dateutil's own validation below correctly rejects, the same
+    way it already does for a dtstart string that carries its own offset.
+    Either way, the UNTIL-not-before-dtstart check
+    below still runs - it compares whenever anchor and UNTIL share the
+    same awareness, aware-vs-aware or naive-vs-naive alike.
 
     The returned dict (rather than the parsed rrule object) is what
     callers actually build a provider payload from: Google takes the RRULE
@@ -282,6 +289,16 @@ def parse_rrule(
                 f"invalid UNTIL value in recurrence rule: {parts['UNTIL']!r}"
             ) from exc
 
+    # A bare-date dtstart string (no "T", e.g. Google's own all-day "date"
+    # field) is the same signal calendar.py itself already uses to detect
+    # an all-day event - RFC 5545's DATE value type, which legitimately
+    # pairs with an equally bare-date (floating) UNTIL. Anything else - a
+    # full dateTime string (with or without its own offset) or an
+    # already-`datetime` object (as Outlook's caller always passes,
+    # already localized aware) - represents DATE-TIME, which RFC 5545
+    # requires UNTIL to match: aware, not floating.
+    dtstart_is_bare_date = isinstance(dtstart, str) and "T" not in dtstart
+
     if isinstance(dtstart, datetime):
         anchor = dtstart
     else:
@@ -291,22 +308,22 @@ def parse_rrule(
             raise ValueError(
                 f"invalid start time for recurrence rule: {dtstart}"
             ) from exc
-    # RFC 5545 requires DTSTART and UNTIL to have the SAME value type -
-    # both aware (e.g. Google's common "Z"-suffixed UNTIL) or both
-    # "floating"/naive (a bare, no-time UNTIL like "20260911", which is
-    # exactly how an all-day event's own UNTIL is legitimately written).
-    # Localizing a naive anchor is only ever needed to MATCH an aware
-    # UNTIL - doing it unconditionally (whenever `timezone` happens to be
-    # given, as for an all-day event) would instead create a mismatch in
-    # the opposite direction for a bare-date UNTIL, which needs the anchor
-    # to stay naive/floating, not become aware.
-    if (
-        anchor.tzinfo is None
-        and timezone is not None
-        and until_dt is not None
-        and until_dt.tzinfo is not None
-    ):
-        anchor = anchor.replace(tzinfo=resolve_zoneinfo(timezone))
+    if anchor.tzinfo is None and timezone is not None:
+        if dtstart_is_bare_date:
+            # All-day: only localize if needed to compare against an
+            # aware UNTIL - localizing unconditionally would instead
+            # create a mismatch in the opposite direction for a
+            # legitimately floating, bare-date UNTIL.
+            if until_dt is not None and until_dt.tzinfo is not None:
+                anchor = anchor.replace(tzinfo=resolve_zoneinfo(timezone))
+        else:
+            # Timed: always localize. If UNTIL is naive/bare-date here,
+            # that's an actual RFC 5545 value-type mismatch (a DATE-TIME
+            # DTSTART requires an aware UNTIL) - localizing the anchor
+            # anyway makes dateutil's own validation below correctly
+            # reject it, the same way it always has for an
+            # already-aware-string dtstart.
+            anchor = anchor.replace(tzinfo=resolve_zoneinfo(timezone))
     try:
         _rrulestr(f"RRULE:{body}", dtstart=anchor)
     except (ValueError, TypeError) as exc:

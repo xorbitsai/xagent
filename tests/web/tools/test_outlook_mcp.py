@@ -389,6 +389,25 @@ def test_build_graph_recurrence_accepts_interval_at_graph_int32_boundary():
     assert recurrence["pattern"]["interval"] == 2147483647
 
 
+def test_build_graph_recurrence_accepts_count_at_graph_int32_boundary():
+    recurrence = outlook._build_graph_recurrence(
+        "FREQ=DAILY;COUNT=2147483647", "2026-08-15T07:00:00+08:00"
+    )
+    assert recurrence["range"]["numberOfOccurrences"] == 2147483647
+
+
+def test_build_graph_recurrence_reports_unsupported_freq_before_int32_bound():
+    """An unsupported FREQ combined with an out-of-range INTERVAL must
+    surface the more fundamental "unsupported FREQ" error first - fixing
+    an out-of-range INTERVAL alone would still leave the caller with an
+    unsupported rule, so reporting the Int32 bound first would send them
+    on a second round-trip to find the real problem."""
+    with pytest.raises(ValueError, match="unsupported recurrence pattern"):
+        outlook._build_graph_recurrence(
+            "FREQ=HOURLY;INTERVAL=2147483648", "2026-08-15T07:00:00+08:00"
+        )
+
+
 def test_build_graph_recurrence_resolves_windows_style_timezone():
     """Graph commonly reports Windows-style timezone identifiers (e.g. for
     events created via Outlook desktop/web rather than this tool), which

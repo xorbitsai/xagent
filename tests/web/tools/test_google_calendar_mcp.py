@@ -516,6 +516,37 @@ def test_update_events_all_day_recurrence_with_bare_date_until_does_not_error(
     assert kwargs["body"]["recurrence"] == ["RRULE:FREQ=DAILY;UNTIL=20260911"]
 
 
+def test_update_events_rejects_bare_date_until_on_a_timed_event(monkeypatch):
+    """Confirmed bug: fixing the all-day case above (a bare-date UNTIL
+    must be ACCEPTED for a DATE DTSTART) by only conditionally localizing
+    the anchor made a TIMED event's naive dateTime string (paired with a
+    separate timeZone field, not its own embedded offset) skip
+    localization too whenever UNTIL was also naive/bare-date - so the
+    mismatch (a DATE-TIME DTSTART needs an aware UNTIL) silently stopped
+    being caught for this one dtstart shape, even though it was still
+    correctly caught for an offset-carrying dtstart string. A bare-date
+    UNTIL must still be rejected for any timed event, regardless of
+    whether its dtstart string carries its own offset or relies on a
+    separate timeZone field."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "Asia/Manila"},
+        "end": {"dateTime": "2026-08-26T07:15:00", "timeZone": "Asia/Manila"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=DAILY;UNTIL=20260911",
+        )
+    )
+
+    assert result["status"] == "error"
+    service.events.return_value.update.assert_not_called()
+
+
 def test_update_events_explicit_timezone_on_all_day_event_does_not_send_malformed_payload(
     monkeypatch,
 ):

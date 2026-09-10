@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 import tempfile
 
@@ -276,3 +277,66 @@ def test_add_record_without_embedding_into_vector_table(temp_db_dir):
     assert {"withvec", "novec"} <= ids
     # The vector-less row still round-trips through get().
     assert store.get("novec").success
+
+
+def test_add_scope_columns_preserves_arrow_metadata(temp_db_dir):
+    """_add_scope_columns keeps schema/field metadata and back-fills scope columns.
+
+    Builds an Arrow table whose schema carries schema-level metadata and whose
+    ``id`` field carries field metadata, then runs the additive migration
+    directly. The old ``pa.table(columns)`` reconstruction dropped both, so
+    the metadata assertions below fail on the pre-fix implementation.
+    """
+    store = _store(temp_db_dir, None)
+    schema_metadata = {b"custom-key": b"custom-value"}
+    id_field_metadata = {b"field-key": b"field-value"}
+    fields = [
+        pa.field("id", pa.string(), metadata=id_field_metadata),
+        pa.field("text", pa.string()),
+        pa.field("metadata", pa.string()),
+        pa.field("vector", pa.list_(pa.float32(), 2)),
+    ]
+    schema = pa.schema(fields, metadata=schema_metadata)
+    metadata_row = json.dumps({"user_id": 7, "execution_scope_d1": "x"})
+    existing = pa.table(
+        {
+            "id": pa.array(["a", "b"], pa.string()),
+            "text": pa.array(["alpha", "beta"], pa.string()),
+            "metadata": pa.array([metadata_row, "{}"], pa.string()),
+            "vector": pa.array(
+                [[0.1, 0.2], [0.3, 0.4]], pa.list_(pa.float32(), 2)
+            ),
+        },
+        schema=schema,
+    )
+
+    migrated = store._add_scope_columns(existing)
+
+    # Schema- and field-level metadata survive the additive migration.
+    assert migrated.schema.metadata == existing.schema.metadata
+    assert migrated.schema.field("id").metadata == existing.schema.field(
+        "id"
+    ).metadata
+    # Existing column data is unchanged; the vector column is preserved as-is.
+    assert migrated.column("id").to_pylist() == ["a", "b"]
+    assert migrated.column("text").to_pylist() == ["alpha", "beta"]
+    assert migrated.column("metadata").to_pylist() == [metadata_row, "{}"]
+    assert migrated.column("vector").to_pylist() == existing.column(
+        "vector"
+    ).to_pylist()
+    # The derived scope columns are present with correct types and values.
+    assert "user_id" in migrated.schema.names
+    assert "scope_dims" in migrated.schema.names
+    assert migrated.schema.field("user_id").type == pa.int64()
+    assert migrated.schema.field("scope_dims").type == pa.list_(pa.string())
+    assert migrated.column("user_id").to_pylist() == [7, None]
+    assert migrated.column("scope_dims").to_pylist() == [["d1=x"], []]
+    # Column order: existing columns in order, then user_id, then scope_dims.
+    assert migrated.schema.names == [
+        "id",
+        "text",
+        "metadata",
+        "vector",
+        "user_id",
+        "scope_dims",
+    ]

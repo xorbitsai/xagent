@@ -615,9 +615,7 @@ def google_calendar_update_events(
             ):
                 event["start"] = event.get("start") or {}
                 event["start"]["timeZone"] = timezone
-            if current_end_value is None or not _has_own_utc_offset(
-                current_end_value
-            ):
+            if current_end_value is None or not _has_own_utc_offset(current_end_value):
                 event["end"] = event.get("end") or {}
                 event["end"]["timeZone"] = timezone
         if description:

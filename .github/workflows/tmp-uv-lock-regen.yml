@@ -1,0 +1,21 @@
+name: tmp-uv-lock-regen
+
+on:
+  push:
+    branches:
+      - fix/recurring-calendar-events
+
+jobs:
+  regen:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: uv lock
+      - uses: actions/upload-artifact@v4
+        with:
+          name: uv-lock
+          path: uv.lock

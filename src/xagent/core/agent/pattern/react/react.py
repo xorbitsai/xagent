@@ -73,7 +73,12 @@ from ....file_ref import (
 from ....model.chat.exceptions import LLMToolProtocolError
 from ....model.chat.tool_protocol import get_tool_protocol_error
 from ....tools.adapters.vibe.interaction_types import INTERACTION_TYPES
+from ....tools.adapters.vibe.mcp_approval_gate import (
+    ToolCallExecutionContext,
+    bind_tool_call_execution_context,
+)
 from ....tools.user_interaction import (
+    ToolInteractionSettlement,
     tool_result_waits_for_user,
     user_interaction_resume_callable,
 )
@@ -159,10 +164,21 @@ class ToolCallRecord:
     status: str
     result: Any = None
     error: str | None = None
+    # Terminal outcome supplied by a resumable tool callback. Kept separate
+    # from ``status`` so existing completed/failed ledger readers remain
+    # backward-compatible.
+    settlement_status: str | None = None
     # The durable turn the call ran in (see _with_runtime_turn_id). None when
     # the embedding provides no turn tracking, and for records restored from
     # checkpoints written before the field existed.
     turn_id: str | None = None
+    # The turn that delivered a terminal settlement. This is separate from
+    # ``turn_id`` so the original call keeps its execution identity while the
+    # duplicate-write guard can protect the one resumed turn that follows it.
+    settlement_turn_id: str | None = None
+    # The ReAct step that issued the call. Persisted so a rebuilt runtime can
+    # resume the exact gate identity instead of inventing a new execution slot.
+    step_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -173,7 +189,10 @@ class ToolCallRecord:
             "status": self.status,
             "result": self.result,
             "error": self.error,
+            "settlement_status": self.settlement_status,
             "turn_id": self.turn_id,
+            "settlement_turn_id": self.settlement_turn_id,
+            "step_id": self.step_id,
         }
 
     @classmethod
@@ -186,7 +205,18 @@ class ToolCallRecord:
             status=str(data.get("status", "pending")),
             result=data.get("result"),
             error=data.get("error"),
+            settlement_status=(
+                str(data["settlement_status"])
+                if data.get("settlement_status") is not None
+                else None
+            ),
             turn_id=str(data["turn_id"]) if data.get("turn_id") else None,
+            settlement_turn_id=(
+                str(data["settlement_turn_id"])
+                if data.get("settlement_turn_id") is not None
+                else None
+            ),
+            step_id=str(data["step_id"]) if data.get("step_id") else None,
         )
 
 
@@ -1895,25 +1925,211 @@ class ReActPattern(AgentPattern):
                 )
                 continue
 
-            resumed = resume(
-                interaction_id=pending.get("interaction_id", ""),
-                response=pending.get("response", ""),
-            )
-            if inspect.isawaitable(resumed):
-                await resumed
-
-            # Keep the response retryable until the tool acknowledges delivery.
-            self.pending_tool_interaction_responses.pop(0)
-            await runtime.checkpoint(
-                "tool_interaction_response_delivered",
+            record = self._validate_tool_interaction_settlement_target(
+                pending=pending,
                 context=context,
-                pattern=self,
-                metadata={
-                    "tool_name": tool_name,
-                    "tool_call_id": pending.get("tool_call_id", ""),
-                    "interaction_id": pending.get("interaction_id", ""),
-                },
             )
+            tool_call_id = str(pending.get("tool_call_id") or "")
+            resume_call = {
+                "id": tool_call_id,
+                "name": tool_name,
+                "turn_id": record.turn_id,
+                "step_id": record.step_id,
+            }
+            with bind_tool_call_execution_context(
+                self._mcp_gate_execution_context(resume_call, context, runtime)
+            ):
+                resumed = resume(
+                    interaction_id=pending.get("interaction_id", ""),
+                    response=pending.get("response", ""),
+                )
+                if inspect.isawaitable(resumed):
+                    resumed = await resumed
+            if resumed is not None and not isinstance(
+                resumed, ToolInteractionSettlement
+            ):
+                raise TypeError(
+                    "resume_user_interaction must return "
+                    "ToolInteractionSettlement or None"
+                )
+
+            ledger_before = copy.deepcopy(self.tool_ledger)
+            messages = getattr(context, "messages", None)
+            messages_before = (
+                copy.deepcopy(messages) if isinstance(messages, list) else None
+            )
+            force_final_before = self.force_final_answer_next
+            popped = False
+            try:
+                if isinstance(resumed, ToolInteractionSettlement):
+                    self._project_tool_interaction_settlement(
+                        record=record,
+                        settlement=resumed,
+                        context=context,
+                        runtime=runtime,
+                    )
+
+                # The checkpoint must contain the terminal projection and no
+                # pending callback. If persistence fails, restore the entire
+                # in-memory transaction so replay starts from the last durable
+                # waiting state.
+                self.pending_tool_interaction_responses.pop(0)
+                popped = True
+                await runtime.checkpoint(
+                    "tool_interaction_response_delivered",
+                    context=context,
+                    pattern=self,
+                    metadata={
+                        "tool_name": tool_name,
+                        "tool_call_id": pending.get("tool_call_id", ""),
+                        "interaction_id": pending.get("interaction_id", ""),
+                        "settlement_status": (
+                            resumed.status
+                            if isinstance(resumed, ToolInteractionSettlement)
+                            else None
+                        ),
+                    },
+                )
+            except BaseException:
+                self.tool_ledger = ledger_before
+                if messages_before is not None and isinstance(messages, list):
+                    messages[:] = messages_before
+                self.force_final_answer_next = force_final_before
+                if popped:
+                    self.pending_tool_interaction_responses.insert(0, pending)
+                raise
+
+    def _validate_tool_interaction_settlement_target(
+        self,
+        *,
+        pending: dict[str, str],
+        context: Any,
+    ) -> ToolCallRecord:
+        """Validate every durable identity before a resume callback can run."""
+
+        tool_call_id = str(pending.get("tool_call_id") or "")
+        record = self.tool_ledger.get(tool_call_id)
+        if record is None:
+            raise RuntimeError(
+                "Cannot settle resumed tool interaction without its original "
+                f"ledger record: {tool_call_id or '<missing>'}"
+            )
+        pending_tool_name = str(pending.get("tool_name") or "")
+        if pending_tool_name != record.tool_name:
+            raise RuntimeError(
+                "Resumed tool interaction does not match its original ledger "
+                f"record: {pending_tool_name!r} != {record.tool_name!r}"
+            )
+        if record.status != "waiting_for_user":
+            raise RuntimeError(
+                "Cannot resume a tool call that is not waiting for user input: "
+                f"{tool_call_id!r} is {record.status!r} with settlement "
+                f"{record.settlement_status!r}."
+            )
+        messages = getattr(context, "messages", None)
+        if not isinstance(messages, list):
+            raise RuntimeError("Execution context does not expose a message list.")
+        matches = [
+            message
+            for message in messages
+            if getattr(message, "role", None) == "tool"
+            and getattr(message, "tool_call_id", None) == tool_call_id
+        ]
+        if len(matches) != 1:
+            raise RuntimeError(
+                "Expected exactly one tool result for resumed tool call "
+                f"{tool_call_id!r}; found {len(matches)}."
+            )
+        return record
+
+    def _project_tool_interaction_settlement(
+        self,
+        *,
+        record: ToolCallRecord,
+        settlement: ToolInteractionSettlement,
+        context: Any,
+        runtime: PatternRuntime,
+    ) -> None:
+        """Project a resumed outcome onto its original tool protocol slot."""
+
+        result = settlement.projected_result()
+        self._replace_tool_result(
+            context=context,
+            tool_name=record.tool_name,
+            tool_call_id=record.tool_call_id,
+            result=result,
+        )
+        tool_call: dict[str, Any] = {
+            "id": record.tool_call_id,
+            "name": record.tool_name,
+            "args": copy.deepcopy(record.args),
+        }
+        if record.turn_id:
+            tool_call["turn_id"] = record.turn_id
+
+        if settlement.status == "succeeded":
+            self._record_tool_call(
+                tool_call,
+                status="completed",
+                result=result,
+                settlement_status=settlement.status,
+                settlement_turn_id=getattr(runtime, "active_turn_id", None),
+            )
+        else:
+            error = str(
+                settlement.error
+                or (result.get("error") if isinstance(result, dict) else result)
+            )
+            self._record_tool_call(
+                tool_call,
+                status="failed",
+                result=result,
+                error=error,
+                settlement_status=settlement.status,
+                settlement_turn_id=getattr(runtime, "active_turn_id", None),
+            )
+        # Recompute for every entry in a multi-interaction delivery batch.
+        self.force_final_answer_next = settlement.status in {
+            "rejected",
+            "dispatch_unknown",
+        }
+
+    @staticmethod
+    def _replace_tool_result(
+        *,
+        context: Any,
+        tool_name: str,
+        tool_call_id: str,
+        result: Any,
+    ) -> None:
+        """Replace the waiting observation without creating a second tool row."""
+
+        messages = getattr(context, "messages", None)
+        if not isinstance(messages, list):
+            raise RuntimeError("Execution context does not expose a message list.")
+        matching_indexes = [
+            index
+            for index, message in enumerate(messages)
+            if getattr(message, "role", None) == "tool"
+            and getattr(message, "tool_call_id", None) == tool_call_id
+        ]
+        if len(matching_indexes) != 1:
+            raise RuntimeError(
+                "Expected exactly one tool result for resumed tool call "
+                f"{tool_call_id!r}; found {len(matching_indexes)}."
+            )
+
+        replacement = context.add_tool_result(
+            tool_name=tool_name,
+            result=result,
+            tool_call_id=tool_call_id,
+        )
+        if not messages or messages[-1] is not replacement:
+            raise RuntimeError(
+                "Execution context did not append the replacement result."
+            )
+        messages.pop()
+        messages[matching_indexes[0]] = replacement
 
     def _normalize_llm_response(self, response: Any) -> dict[str, Any]:
         if isinstance(response, str):
@@ -2900,7 +3116,9 @@ class ReActPattern(AgentPattern):
 
         async def _guarded(tool_call: dict[str, Any]) -> Any:
             async with semaphore:
-                return await self._execute_tool_safely(tool_call, tools, runtime)
+                return await self._execute_tool_safely(
+                    tool_call, tools, runtime, context=context
+                )
 
         raw_results = await asyncio.gather(
             *(_guarded(tool_call) for tool_call in batch),
@@ -3114,7 +3332,9 @@ class ReActPattern(AgentPattern):
                     pattern=self,
                     metadata={"tool_call": tool_call},
                 )
-                result = await self._execute_tool_safely(tool_call, tools, runtime)
+                result = await self._execute_tool_safely(
+                    tool_call, tools, runtime, context=context
+                )
                 self._backfill_result(tool_call, result, context)
                 self.pending_tool_calls = self.pending_tool_calls[1:]
                 if tool_result_waits_for_user(result):
@@ -3696,18 +3916,17 @@ class ReActPattern(AgentPattern):
     ) -> dict[str, Any] | None:
         """Return the suppression envelope when this call repeats a completed write.
 
-        The comparison key is (turn_id, tool_name, args_hash), each side
+        The comparison key is (guard turn id, tool name, args hash), each side
         computed from the same post-transform ``tool_call`` that
         ``_record_tool_call`` hashes and ``_execute_tool`` executes — so two
         calls compare equal exactly when their executions would be identical.
-        The turn_id equality is what makes the guard strictly per-turn: the
-        runner stamps a fresh turn_id on every user message (initial and
-        injected), and ``active_turn_id`` is re-resolved from the latest user
-        message at each pattern start — so an explicit repeat requested in a
-        later turn always executes, while an intra-turn resume of the
-        checkpointed ledger keeps suppressing the replay. A call with no
-        stamped turn_id is never guarded: without a turn to scope to,
-        suppression could outlive a turn, so an unknowable turn fails open.
+        An ordinary completion uses its original ``turn_id``. A resumed
+        success uses ``settlement_turn_id``, the approval turn that received
+        that result. This keeps duplicate suppression active for subsequent
+        planning in the resumed turn without rewriting the original call's
+        identity or suppressing a new request in a later turn. A call with no
+        guard turn id is never guarded: without a turn to scope to, suppression
+        could outlive a turn, so an unknowable turn fails open.
 
         Serial execution makes the check-then-record window safe for guarded
         tools: they are non-idempotent by declaration, so
@@ -3735,7 +3954,12 @@ class ReActPattern(AgentPattern):
         for record in self.tool_ledger.values():
             if record.status != "completed":
                 continue
-            if record.turn_id != turn_id:
+            guard_turn_id = (
+                record.settlement_turn_id
+                if record.settlement_status == "succeeded"
+                else record.turn_id
+            )
+            if guard_turn_id != turn_id:
                 continue
             if record.tool_name != tool_name or record.args_hash != args_hash:
                 continue
@@ -3835,9 +4059,12 @@ class ReActPattern(AgentPattern):
                 return result
             await runtime.on_tool_start(tool_call=tool_call)
             try:
-                result = await runtime.run_tool_call(
-                    lambda: self._execute_tool(tool_call, tools)
-                )
+                with bind_tool_call_execution_context(
+                    self._mcp_gate_execution_context(tool_call, context, runtime)
+                ):
+                    result = await runtime.run_tool_call(
+                        lambda: self._execute_tool(tool_call, tools)
+                    )
             except ToolCallInterrupted as exc:
                 await runtime.on_tool_cancelled(
                     tool_call=tool_call,
@@ -3974,6 +4201,33 @@ class ReActPattern(AgentPattern):
             "dag_step_id": str(step_id),
         }
 
+    @staticmethod
+    def _mcp_gate_execution_context(
+        tool_call: dict[str, Any], context: Any, runtime: PatternRuntime
+    ) -> ToolCallExecutionContext:
+        metadata = getattr(context, "metadata", None)
+        metadata = metadata if isinstance(metadata, dict) else {}
+        dag_step_id = metadata.get("dag_step_id")
+        task_source = metadata.get("task_source")
+        run_id = metadata.get("run_id")
+        return ToolCallExecutionContext(
+            task_source=str(task_source) if task_source else None,
+            task_id=str(
+                getattr(context, "execution_id", None)
+                or getattr(runtime, "execution_id", None)
+                or ""
+            )
+            or None,
+            run_id=str(run_id) if run_id else None,
+            turn_id=str(tool_call.get("turn_id")) if tool_call.get("turn_id") else None,
+            tool_call_id=str(tool_call.get("id") or ""),
+            pattern="dag" if dag_step_id else "react",
+            react_step_id=(
+                str(tool_call.get("step_id")) if tool_call.get("step_id") else None
+            ),
+            dag_step_id=str(dag_step_id) if dag_step_id else None,
+        )
+
     def _with_runtime_turn_id(
         self, tool_call: dict[str, Any], runtime: PatternRuntime
     ) -> dict[str, Any]:
@@ -4018,6 +4272,8 @@ class ReActPattern(AgentPattern):
         status: str,
         result: Any = None,
         error: str | None = None,
+        settlement_status: str | None = None,
+        settlement_turn_id: str | None = None,
     ) -> None:
         tool_call_id = str(tool_call.get("id") or f"tool_call_{len(self.tool_ledger)}")
         args = self._tool_call_args_dict(tool_call)
@@ -4030,7 +4286,12 @@ class ReActPattern(AgentPattern):
             status=status,
             result=result,
             error=error,
+            settlement_status=settlement_status,
             turn_id=self._tool_call_turn_id(tool_call),
+            settlement_turn_id=(
+                str(settlement_turn_id) if settlement_turn_id else None
+            ),
+            step_id=(str(tool_call["step_id"]) if tool_call.get("step_id") else None),
         )
 
     @staticmethod

@@ -14,6 +14,7 @@ from xagent.core.tools.adapters.vibe.config import (
     MCPFailurePolicy,
     RequiredMCPUnavailableError,
 )
+from xagent.core.tools.adapters.vibe.connector_runtime import ConnectorRef
 from xagent.core.tools.adapters.vibe.factory import ToolFactory
 from xagent.core.tools.adapters.vibe.mcp_adapter import (
     MCPFailurePhase,
@@ -430,6 +431,7 @@ class TestToolFactoryMCPIntegration:
         manager = DatabaseMCPServerManager(test_db)
         config = manager.create_config(**sample_stdio_config)
         manager.add_server(config)
+        server = test_db.query(MCPServer).filter_by(name=config.name).one()
 
         # Create MCP tools
         tools = await ToolFactory.create_mcp_tools(test_db)
@@ -442,6 +444,10 @@ class TestToolFactoryMCPIntegration:
         call_args = mock_load_mcp.call_args
         connections_arg = call_args[0][0]  # First positional argument
         assert sample_stdio_config["name"] in connections_arg
+        assert "id" not in connections_arg[sample_stdio_config["name"]]
+        assert call_args.kwargs["connector_refs"] == {
+            sample_stdio_config["name"]: ConnectorRef("mcp", server.id)
+        }
 
     @patch("xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools")
     async def test_create_mcp_tools_exposes_unavailable_oauth_and_loads_other_servers(

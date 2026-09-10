@@ -220,10 +220,11 @@ async def test_snapshot_path_skips_task_and_user_queries() -> None:
             await execute_task_background(
                 task_id=42,
                 user_message="hi",
-                context={},
+                context={"task_source": "spoofed", "run_id": "spoofed-run"},
                 agent_manager=agent_manager,
                 task_owner_user_id=1,
                 task_setup_snapshot=snapshot,
+                expected_run_id="run-snapshot",
             )
         except Exception:
             # Downstream finalize stubs may raise; the query counts
@@ -244,6 +245,9 @@ async def test_snapshot_path_skips_task_and_user_queries() -> None:
     ]
     assert forwarded_snapshot is snapshot
     assert forwarded_snapshot.task.source == "trigger"
+    forwarded_context = agent_manager.execute_task.await_args.kwargs["context"]
+    assert forwarded_context["task_source"] == "trigger"
+    assert forwarded_context["run_id"] == "run-snapshot"
 
 
 @pytest.mark.asyncio

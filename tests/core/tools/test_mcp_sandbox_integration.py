@@ -127,7 +127,8 @@ class TestLoadMcpToolsAsAgentTools:
                 sandbox=sandbox,
             )
 
-        assert result.tools == (wrapped_tool,)
+        assert len(result.tools) == 1
+        assert result.tools[0].target is wrapped_tool
         assert result.loaded_servers == ("demo",)
         assert result.failures == ()
         mock_list.assert_awaited_once_with(sandbox, connection)
@@ -162,7 +163,8 @@ class TestLoadMcpToolsAsAgentTools:
                 sandbox=MagicMock(),
             )
 
-        assert result.tools == (direct_tool,)
+        assert len(result.tools) == 1
+        assert result.tools[0].target is direct_tool
         assert result.loaded_servers == ("demo",)
         assert result.failures == ()
         mock_direct.assert_awaited_once()
@@ -266,7 +268,8 @@ class TestLoadMcpToolsAsAgentTools:
                 {"demo": connection}, sandbox=sandbox
             )
 
-        assert result.tools == (wrapped_tool,)
+        assert len(result.tools) == 1
+        assert result.tools[0].target is wrapped_tool
         assert result.loaded_servers == ("demo",)
         assert len(result.failures) == 1
         assert result.failures[0].phase is MCPFailurePhase.SANDBOX_TOOL_WRAP

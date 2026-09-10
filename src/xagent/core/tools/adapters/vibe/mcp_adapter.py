@@ -44,11 +44,13 @@ from .connector_runtime import (
     RUNTIME_INPUT_CONTEXT,
     TARGET_MCP_META,
     TARGET_TOOL_ARGUMENTS,
+    ConnectorRef,
     binding_source_value,
     binding_target,
     connector_runtime_from_config,
     runtime_bindings_from_config,
 )
+from .mcp_approval_gate import gate_mcp_tools
 from .sandboxed_tool.sandboxed_mcp_tool_helper import (
     load_sandboxed_mcp_tools,
     should_sandbox_mcp_connection,
@@ -2127,6 +2129,7 @@ async def load_mcp_tools_as_agent_tools(
     visibility: Optional[ToolVisibility] = None,
     allow_users: Optional[List[str]] = None,
     sandbox: Sandbox | None = None,
+    connector_refs: Mapping[str, ConnectorRef] | None = None,
 ) -> MCPLoadResult:
     """Load MCP tools from multiple servers and convert to Agent tools.
 
@@ -2259,7 +2262,14 @@ async def load_mcp_tools_as_agent_tools(
                 server_tools = direct_result.tools
                 failures.extend(direct_result.failures)
 
-            agent_tools.extend(server_tools)
+            # Both direct adapters and sandbox wrappers reach this host-side
+            # boundary before any connector dispatch.
+            agent_tools.extend(
+                gate_mcp_tools(
+                    server_tools,
+                    connector_ref=(connector_refs or {}).get(server_name),
+                )
+            )
             if server_tools:
                 loaded_servers.append(server_name)
             logger.info(f"Found {len(server_tools)} tools from server {server_name}")

@@ -73,11 +73,7 @@ from ...core.runtime_performance import (
     observe_value,
 )
 from ..models.chat_message import TaskChatMessage
-from ..models.database import (
-    get_db,
-    get_session_local,
-    release_db_connection_if_clean,
-)
+from ..models.database import get_db, get_session_local, release_db_connection_if_clean
 from ..models.task import Task, TaskStatus
 from ..models.uploaded_file import UploadedFile
 from ..models.user import User
@@ -246,9 +242,7 @@ from ..services.uploaded_file_store import (
     snapshot_uploaded_file_version,
     stage_uploaded_file_from_local_path,
 )
-from ..services.workforce_runtime import (
-    sync_workforce_run_status,
-)
+from ..services.workforce_runtime import sync_workforce_run_status
 from ..tracing import create_ephemeral_tracer
 from ..user_isolated_memory import UserContext
 from ..utils.db_timezone import safe_timestamp_to_unix
@@ -2843,10 +2837,17 @@ async def execute_task_background(
             # Execute the next turn under the same task/thread id.
             actual_task_id = str(task_id)
             task_for_agent = llm_user_message or user_message
+            agent_context = dict(context_dict)
+            agent_context["task_source"] = getattr(snapshot.task, "source", None)
+            run_id = task_lease.run_id if task_lease is not None else expected_run_id
+            if run_id is not None:
+                agent_context["run_id"] = run_id
+            else:
+                agent_context.pop("run_id", None)
             result = await agent_manager.execute_task(
                 agent_service=agent_service,
                 task=task_for_agent,
-                context=context,
+                context=agent_context,
                 task_id=actual_task_id,
                 tracking_task_id=str(task_id),
                 db_session=None,
@@ -3394,6 +3395,7 @@ async def execute_resume_background(
     # forgets to pass its own run id would silently claim a lease under a
     # run nobody else knows about instead of failing loudly.
     expected_run_id: str | None = None,
+    task_source: str | None = None,
     resolved_execution_scope: Union[
         ExecutionScope, None, ExecutionScopeNotProvided
     ] = EXECUTION_SCOPE_NOT_PROVIDED,
@@ -3774,8 +3776,14 @@ async def execute_resume_background(
             ExecutionScopeContext(execution_scope),
             bind_task_lease_context(lease),
         ):
+            resume_kwargs = {
+                "metadata": {
+                    "task_source": task_source,
+                    "run_id": lease.run_id,
+                }
+            }
             result = await run_while_task_lease_owned(
-                agent_service.resume_execution_by_id(str(task_id)),
+                agent_service.resume_execution_by_id(str(task_id), **resume_kwargs),
                 lease_heartbeat_task,
             )
 
@@ -5789,9 +5797,7 @@ def _enqueue_websocket_task_command_sync(
                 f"Task {task_id} is actor-marked; generic task commands are unsupported"
             )
         if kind == TaskCommandKind.MESSAGE:
-            from ..services.chat_history_service import (
-                inspect_user_message_delivery,
-            )
+            from ..services.chat_history_service import inspect_user_message_delivery
 
             existing_delivery = inspect_user_message_delivery(
                 db,
@@ -6275,10 +6281,7 @@ def _prepare_websocket_turn_sync(
         execution_context["files"] = deepcopy(display_file_refs)
         persisted_attachments = _normalize_attachments_for_persistence(file_info_list)
 
-        from ..services.task_orchestrator import (
-            TaskTurnOrchestrator,
-            TaskTurnPayload,
-        )
+        from ..services.task_orchestrator import TaskTurnOrchestrator, TaskTurnPayload
 
         turn_payload = TaskTurnPayload(
             transcript_message=display_user_message,
@@ -6714,9 +6717,7 @@ async def _handle_chat_message_unserialized(
                 resolved_execution_scope = await run_db_io_cancellation_safe(
                     lambda: resolve_execution_scope(task_id)
                 )
-                from ..services.task_setup_snapshot import (
-                    load_task_setup_snapshot_sync,
-                )
+                from ..services.task_setup_snapshot import load_task_setup_snapshot_sync
 
                 task_setup_snapshot = await run_db_io_cancellation_safe(
                     lambda: load_task_setup_snapshot_sync(
@@ -6728,6 +6729,7 @@ async def _handle_chat_message_unserialized(
                 )
                 if task_setup_snapshot is None:
                     raise ValueError(f"Task {task_id} is no longer available")
+                resume_task_source = getattr(task_setup_snapshot.task, "source", None)
                 agent_service = await get_agent_manager().get_agent_for_task(
                     task_id,
                     None,
@@ -6961,6 +6963,7 @@ async def _handle_chat_message_unserialized(
                             # is what a resume wants: those pointers are the
                             # anchor it is resuming from.
                             expected_run_id=handoff_snapshot.run_id,
+                            task_source=resume_task_source,
                             previous_task=previous_task,
                             resolved_execution_scope=resolved_execution_scope,
                             pending_user_message=(
@@ -7716,10 +7719,7 @@ async def handle_execute_task(
             request.task_id,
         )
 
-        from ..services.task_orchestrator import (
-            TaskTurnOrchestrator,
-            TaskTurnPayload,
-        )
+        from ..services.task_orchestrator import TaskTurnOrchestrator, TaskTurnPayload
 
         background_task = await TaskTurnOrchestrator.schedule_existing_task_execution(
             task_id=request.task_id,
@@ -9534,6 +9534,7 @@ async def _handle_resume_task_unserialized(
                         agent_service=agent_service,
                         task_owner_user_id=task_owner_user_id,
                         expected_run_id=resume_snapshot.run_id,
+                        task_source=getattr(task_setup_snapshot.task, "source", None),
                         previous_task=previous_task,
                         # Not `resolved_execution_scope`: that value is the
                         # off-turn downgrade used above to obtain

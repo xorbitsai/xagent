@@ -10,7 +10,10 @@ from mcp.types import Tool as MCPTool
 
 from xagent.core.agent.runtime import PatternRuntime
 from xagent.core.tools.adapters.vibe.base import ToolCategory
-from xagent.core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
+from xagent.core.tools.adapters.vibe.connector_runtime import (
+    ConnectorRef,
+    ConnectorRuntimeError,
+)
 from xagent.core.tools.adapters.vibe.factory import ToolFactory
 from xagent.core.tools.adapters.vibe.mcp_adapter import (
     MCPFailurePhase,
@@ -430,6 +433,39 @@ async def test_factory_normal_loader_failure_keeps_unavailable_tool(monkeypatch)
         "mcp_google_drive_42_unavailable",
         "mcp_normal_unavailable",
     ]
+
+
+@pytest.mark.asyncio
+async def test_factory_passes_persisted_connector_ref_outside_transport_config(
+    monkeypatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    async def loader(connections, **kwargs):
+        captured["connections"] = connections
+        captured["connector_refs"] = kwargs.get("connector_refs")
+        return MCPLoadResult(tools=(), loaded_servers=("linkedin",), failures=())
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools",
+        loader,
+    )
+
+    await ToolFactory._create_mcp_tools_from_configs(
+        [
+            {
+                "id": 41,
+                "name": "linkedin",
+                "transport": "stdio",
+                "config": {"command": "linkedin-mcp"},
+            }
+        ]
+    )
+
+    assert captured["connections"] == {
+        "linkedin": {"transport": "stdio", "command": "linkedin-mcp"}
+    }
+    assert captured["connector_refs"] == {"linkedin": ConnectorRef("mcp", 41)}
 
 
 @pytest.mark.asyncio

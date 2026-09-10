@@ -20,15 +20,6 @@ class MockResponse:
             raise RuntimeError(self.text or f"HTTP {self.status_code}")
 
 
-def test_sanitize_post_text_escapes_ascii_parentheses():
-    text = "🤖 Claude (Anthropic) — Prompt-to-prototype thinking"
-
-    assert (
-        linkedin._sanitize_post_text(text)
-        == "🤖 Claude \\(Anthropic\\) — Prompt-to-prototype thinking"
-    )
-
-
 @pytest.mark.asyncio
 async def test_create_post_schema_accepts_optional_image_path():
     tools = await linkedin.list_tools()
@@ -58,13 +49,14 @@ async def test_create_post_without_image_keeps_text_only_flow(monkeypatch):
     monkeypatch.setattr(linkedin.requests, "post", mock_post)
     monkeypatch.setattr(linkedin.requests, "put", mock_put)
 
-    result = await linkedin.call_tool("create_post", {"text": "hello"})
+    approved_text = "Unicode: 你好 (approved) \\ literal"
+    result = await linkedin.call_tool("create_post", {"text": approved_text})
 
     assert result[0].text == "Post created successfully! URN: urn:li:share:post-1"
     mock_put.assert_not_called()
     assert mock_post.call_count == 1
     post_body = mock_post.call_args.kwargs["json"]
-    assert post_body["commentary"] == "hello"
+    assert post_body["commentary"] == approved_text
     assert "content" not in post_body
 
 

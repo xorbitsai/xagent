@@ -48,10 +48,7 @@ from xagent.web.api.websocket import (
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
 from xagent.web.services.client_error_messages import CLIENT_SAFE_TASK_FAILURE
-from xagent.web.services.task_lease_service import (
-    TaskLease,
-    TaskLeaseHeartbeatOutcome,
-)
+from xagent.web.services.task_lease_service import TaskLease, TaskLeaseHeartbeatOutcome
 
 
 def _make_task_orm() -> Task:
@@ -411,8 +408,9 @@ async def test_resumed_turn_re_resolves_scope() -> None:
     seen: dict[str, Any] = {}
     agent_service = MagicMock()
 
-    async def _resume(task_id: str) -> dict:
+    async def _resume(task_id: str, **kwargs: Any) -> dict:
         seen["scope_at_resume"] = get_execution_scope()
+        seen["resume_metadata"] = kwargs.get("metadata")
         return {"status": "completed", "success": True, "output": "ok"}
 
     agent_service.resume_execution_by_id = AsyncMock(side_effect=_resume)
@@ -476,11 +474,16 @@ async def test_resumed_turn_re_resolves_scope() -> None:
             task_id=42,
             agent_service=agent_service,
             task_owner_user_id=1,
+            task_source="slack",
         )
 
     agent_service.resume_execution_by_id.assert_awaited_once()
     assert resolver_calls == ["42"]
     assert seen["scope_at_resume"] is scope
+    assert seen["resume_metadata"] == {
+        "task_source": "slack",
+        "run_id": "scope-run",
+    }
     assert get_execution_scope() is None
 
 
@@ -550,7 +553,9 @@ async def test_resume_background_adopts_preacquired_lease_without_reacquiring() 
 
     acquire.assert_not_called()
     start_heartbeat.assert_not_called()
-    agent_service.resume_execution_by_id.assert_awaited_once_with("42")
+    agent_service.resume_execution_by_id.assert_awaited_once_with(
+        "42", metadata={"task_source": None, "run_id": "run-a"}
+    )
     assert heartbeat_task.done()
 
 
@@ -1809,7 +1814,7 @@ async def test_resume_lease_loss_cancels_execution_without_stale_side_effects() 
         async def interrupt_reason_for_quota(self) -> None:
             return None
 
-    async def resume(_task_id: str) -> dict[str, Any]:
+    async def resume(_task_id: str, **_: Any) -> dict[str, Any]:
         resume_started.set()
         try:
             await asyncio.Event().wait()
@@ -1861,7 +1866,9 @@ async def test_resume_lease_loss_cancels_execution_without_stale_side_effects() 
         )
 
     assert resume_cancelled.is_set()
-    agent_service.resume_execution_by_id.assert_awaited_once_with("42")
+    agent_service.resume_execution_by_id.assert_awaited_once_with(
+        "42", metadata={"task_source": None, "run_id": "run-a"}
+    )
     finalize.assert_not_called()
     settle.assert_not_called()
     assert [

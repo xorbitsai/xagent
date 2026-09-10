@@ -11,11 +11,7 @@ import logging
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Optional,
-)
+from typing import TYPE_CHECKING, Any, Optional
 
 from sqlalchemy.orm import Session
 
@@ -33,7 +29,7 @@ from .config import (
     normalize_tool_allowlist,
     run_with_tool_runtime_cleanup,
 )
-from .connector_runtime import ConnectorRuntimeError
+from .connector_runtime import CONNECTOR_TYPE_MCP, ConnectorRef, ConnectorRuntimeError
 from .output_filter_wrapper import OutputFilteredToolWrapper
 from .selection_spec import ToolSelectionSpec
 
@@ -1066,6 +1062,7 @@ class ToolFactory:
             normal_tools: list[Tool] = []
             if normal_configs:
                 connections: dict[str, Any] = {}
+                connector_refs: dict[str, ConnectorRef] = {}
                 configs_by_name: dict[str, dict[str, Any]] = {}
                 try:
                     # Convert configs to connection format
@@ -1144,6 +1141,11 @@ class ToolFactory:
                                 ].split()
 
                         connections[server_name] = connection_config
+                        server_id = config.get("id")
+                        if type(server_id) is int and server_id > 0:
+                            connector_refs[server_name] = ConnectorRef(
+                                CONNECTOR_TYPE_MCP, server_id
+                            )
                         configs_by_name[server_name] = config
 
                     # Load MCP tools
@@ -1151,6 +1153,7 @@ class ToolFactory:
                         load_result = await load_mcp_tools_as_agent_tools(
                             connections,
                             sandbox=sandbox,
+                            connector_refs=connector_refs,
                         )  # type: ignore[arg-type]
                         normal_tools = list(load_result.tools)
                         unavailable_tools.extend(
@@ -1227,6 +1230,7 @@ class ToolFactory:
             env_source_overrides = load_user_env_sources(db, user_id)
 
             connections: dict[str, Any] = {}
+            connector_refs: dict[str, ConnectorRef] = {}
             configs_by_name: dict[str, dict[str, Any]] = {}
             unavailable_tools: list[Tool] = []
             for server in query.all():
@@ -1261,6 +1265,11 @@ class ToolFactory:
                 if build.connection is not None:
                     server_name = str(server.name)
                     connections[server_name] = build.connection
+                    server_id = getattr(server, "id", None)
+                    if type(server_id) is int and server_id > 0:
+                        connector_refs[server_name] = ConnectorRef(
+                            CONNECTOR_TYPE_MCP, server_id
+                        )
                     configs_by_name[server_name] = {
                         "id": getattr(server, "id", None),
                         "name": server_name,
@@ -1290,7 +1299,9 @@ class ToolFactory:
 
             # Load MCP tools
             try:
-                load_result = await load_mcp_tools_as_agent_tools(connections)
+                load_result = await load_mcp_tools_as_agent_tools(
+                    connections, connector_refs=connector_refs
+                )
             except ConnectorRuntimeError:
                 raise
             except Exception as e:

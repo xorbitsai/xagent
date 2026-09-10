@@ -865,6 +865,11 @@ class AgentRunner:
         if metadata is None:
             return
         if restored:
+            # These fields select authorization policy and fence resumed external
+            # effects. Current host-owned values must replace checkpointed values.
+            for key in ("task_source", "run_id"):
+                if key in metadata:
+                    context.metadata[key] = metadata[key]
             # Symmetric with the fresh-context branch below: the current run's
             # metadata is authoritative for the modality preference, so an
             # absent key clears any checkpointed value rather than keeping it.

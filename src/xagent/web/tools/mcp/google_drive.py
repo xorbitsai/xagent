@@ -656,7 +656,15 @@ def _capped_content_response(
 # YAML/JS and the "+json"/"+xml" structured-syntax suffixes (RFC 6839, e.g.
 # "application/ld+json", "application/atom+xml") are included for the same
 # reason — genuinely text under the hood, just not "text/"-prefixed by
-# convention.
+# convention. The script/source-format entries (x-sh, x-sql, x-tex, ...)
+# are mimetypes.guess_type()'s own registered mime type for that extension
+# — each is unambiguous (no unrelated binary format shares it), unlike
+# ".bat"/".ts"/".scm", which mimetypes maps to a mime type ALSO used by a
+# real binary format (application/x-msdownload is .exe too; video/mp2t is
+# a real MPEG transport stream; application/vnd.lotus-screencam is a real
+# ScreenCam recording) — those three can only be resolved per-extension,
+# not by mime type alone, and are handled by _TEXT_EXTENSION_OVERRIDES
+# below instead.
 _TEXT_MIME_TYPES = {
     "application/json",
     "application/xml",
@@ -665,19 +673,32 @@ _TEXT_MIME_TYPES = {
     "application/ecmascript",
     "application/x-yaml",
     "application/yaml",
+    "application/csv",
+    "application/x-sh",
+    "application/x-csh",
+    "application/x-tcl",
+    "application/x-sql",
+    "application/x-tex",
+    "application/x-latex",
+    "application/xml-dtd",
+    "application/vnd.dart",
 }
 _TEXT_MIME_TYPE_SUFFIXES = ("+xml", "+json", "+yaml")
 
 
-def _is_text_mime_type(mime_type: str) -> bool:
-    """Whether ``mime_type`` denotes content safe to treat as UTF-8 text.
-
-    Normalizes case and strips any ``;charset=...``-style parameter before
-    comparing — callers (especially an LLM) commonly include one (e.g.
-    "application/json; charset=utf-8", "TEXT/PLAIN") without meaning
-    anything other than the plain type.
+def _normalize_mime_type(mime_type: str) -> str:
+    """Lowercase and strip any ``;charset=...``-style parameter — callers
+    (especially an LLM) commonly include one (e.g. "application/json;
+    charset=utf-8", "TEXT/PLAIN") without meaning anything other than the
+    plain type. Shared by every mime_type comparison in this module so
+    they all treat the same input the same way.
     """
-    normalized = mime_type.strip().split(";", 1)[0].strip().lower()
+    return mime_type.strip().split(";", 1)[0].strip().lower()
+
+
+def _is_text_mime_type(mime_type: str) -> bool:
+    """Whether ``mime_type`` denotes content safe to treat as UTF-8 text."""
+    normalized = _normalize_mime_type(mime_type)
     return (
         normalized.startswith("text/")
         or normalized in _TEXT_MIME_TYPES
@@ -695,7 +716,7 @@ def _is_google_workspace_mime_type(mime_type: str) -> bool:
     value that merely contains that text somewhere (e.g. a crafted
     "application/pdf; x=google-apps").
     """
-    return mime_type.strip().lower().startswith("application/vnd.google-apps.")
+    return _normalize_mime_type(mime_type).startswith("application/vnd.google-apps.")
 
 
 _UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.() -]")
@@ -796,16 +817,22 @@ def _resolve_upload_file_path(file_path: str) -> Path:
     )
 
 
-# mimetypes.guess_type() gets these particular extensions wrong for our
-# purposes: each is a plain-text script/source format that happens to share
-# its extension with an unrelated (or Windows-executable) registered mime
-# type, so mimetypes' answer is misleading rather than merely unknown.
-# ".ts" is the sharpest case -- TypeScript source vs. an MPEG-2 transport
-# stream -- but plain shells and SQL collide the same way. This list is
-# short and closed (extensions mimetypes actively gets wrong), unlike
-# _BINARY_NAME_EXTENSIONS' old job of enumerating every binary format,
-# which is what made that list incomplete in the first place.
-_TEXT_EXTENSION_OVERRIDES = {".sh", ".csh", ".bat", ".sql", ".ts"}
+# Extensions where mimetypes.guess_type()'s answer is genuinely ambiguous
+# -- the mime type it returns is ALSO the real, registered type of an
+# unrelated binary format, so no mime-type-based rule (however broad)
+# can tell them apart; only the extension itself disambiguates, and only
+# by judgment call. ".bat" shares "application/x-msdownload" with ".exe"
+# (a real Windows binary); ".ts" shares "video/mp2t" with an actual MPEG-2
+# transport stream; ".scm" shares "application/vnd.lotus-screencam" with
+# an actual Lotus ScreenCam recording. Each is resolved here in favor of
+# the plain-text source format, since that's overwhelmingly what an
+# agent generating files is likely to mean by these extensions. Every
+# other misclassified script/source extension (.sh, .sql, .tex, .dart,
+# .tcl, .dtd, ...) instead has an unambiguous mime type and is handled by
+# widening _TEXT_MIME_TYPES above -- which also fixes the case where a
+# caller declares that same mime_type explicitly instead of relying on
+# the name, something a purely name-keyed override list can't reach.
+_TEXT_EXTENSION_OVERRIDES = {".bat", ".ts", ".scm"}
 
 
 def _name_looks_binary(name: str) -> bool:
@@ -1220,17 +1247,26 @@ def google_drive_create_file(
         # confusing rejection.
         mime_type = mime_type.strip() or "text/plain"
         is_google_doc_conversion = _is_google_workspace_mime_type(mime_type)
-        # Two independent signals catch two different mistakes: a caller
-        # that left mime_type at its text/plain default but named the file
-        # like a binary format (the original production bug), and a caller
-        # that explicitly declared a binary mime_type regardless of what
-        # the name looks like — content can only ever be UTF-8 text
-        # (see the encode() below), so a non-text mime_type is just as much
-        # a mismatch as a binary-looking name, even with an unrecognized or
-        # absent extension.
-        name_looks_binary = _name_looks_binary(name)
-        mime_type_is_binary = not _is_text_mime_type(mime_type)
-        if not is_google_doc_conversion and (name_looks_binary or mime_type_is_binary):
+        # A Google Workspace conversion is exempt from both checks below
+        # (Docs/Sheets/Slides always take text/HTML source regardless of
+        # the target doc's name), so short-circuit here rather than
+        # computing _name_looks_binary's mimetypes.guess_type() call and
+        # the mime-type check on every such call for nothing.
+        if not is_google_doc_conversion:
+            # Two independent signals catch two different mistakes: a
+            # caller that left mime_type at its text/plain default but
+            # named the file like a binary format (the original production
+            # bug), and a caller that explicitly declared a binary
+            # mime_type regardless of what the name looks like — content
+            # can only ever be UTF-8 text (see the encode() below), so a
+            # non-text mime_type is just as much a mismatch as a
+            # binary-looking name, even with an unrecognized or absent
+            # extension.
+            name_looks_binary = _name_looks_binary(name)
+            mime_type_is_binary = not _is_text_mime_type(mime_type)
+        else:
+            name_looks_binary = mime_type_is_binary = False
+        if name_looks_binary or mime_type_is_binary:
             if name_looks_binary:
                 message = (
                     f"'{name}' looks like a binary file, but "

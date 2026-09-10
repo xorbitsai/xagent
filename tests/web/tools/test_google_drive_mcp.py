@@ -2744,19 +2744,37 @@ def test_create_file_allows_plain_text_names(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "name", ["deploy.sh", "backup.csh", "run.bat", "query.sql", "app.ts"]
+    "name",
+    [
+        "deploy.sh",
+        "backup.csh",
+        "run.bat",
+        "query.sql",
+        "app.ts",
+        "notes.tex",
+        "doc.latex",
+        "main.dart",
+        "script.tcl",
+        "types.dtd",
+        "file.scm",
+    ],
 )
 def test_create_file_allows_script_extensions_mimetypes_misclassifies(
     monkeypatch, name
 ):
     """Regression guard: mimetypes.guess_type() maps these genuinely-text
     script/source extensions to non-text-safe mime types for unrelated
-    reasons (.sh -> application/x-sh, .csh -> application/x-csh, .bat ->
-    application/x-msdownload, .sql -> application/x-sql, .ts -> video/mp2t
-    — a well-known collision between TypeScript source and MPEG transport
-    streams). Switching _name_looks_binary from the old hardcoded
-    _BINARY_NAME_EXTENSIONS set to mimetypes introduced a false-positive
-    rejection of these — the override list must close it back up."""
+    reasons — some because the type is a real registered mime type for an
+    unambiguous text format (.sh -> application/x-sh, .sql ->
+    application/x-sql, .tex/.latex -> application/x-tex/x-latex, .dart ->
+    application/vnd.dart, .tcl -> application/x-tcl, .dtd ->
+    application/xml-dtd), others because the type is ALSO shared with a
+    real binary format (.bat -> application/x-msdownload, same as .exe;
+    .ts -> video/mp2t, a real MPEG transport stream; .scm ->
+    application/vnd.lotus-screencam, a real ScreenCam recording).
+    Switching _name_looks_binary from the old hardcoded
+    _BINARY_NAME_EXTENSIONS set to mimetypes introduced false-positive
+    rejections of all of these — must not regress again."""
     files = Mock()
     files.create.return_value.execute.return_value = {"id": "f1"}
     _mock_drive_service_with_files(monkeypatch, files)
@@ -2765,6 +2783,66 @@ def test_create_file_allows_script_extensions_mimetypes_misclassifies(
 
     assert result["status"] == "success"
     files.create.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "mime_type",
+    [
+        "application/csv",
+        "application/x-sh",
+        "application/x-csh",
+        "application/x-sql",
+        "application/x-tex",
+        "application/x-latex",
+        "application/xml-dtd",
+        "application/vnd.dart",
+    ],
+)
+def test_create_file_allows_unambiguous_text_application_mime_types(
+    monkeypatch, mime_type
+):
+    """These application/* mime types are unambiguous — no real binary
+    format is ever declared with them — so an explicit mime_type of one of
+    these must be accepted even for a name with no matching extension
+    override, unlike ".bat"/".ts"/".scm" which stay name-only because
+    their mime type collides with a genuine binary format."""
+    files = Mock()
+    files.create.return_value.execute.return_value = {"id": "f1"}
+    _mock_drive_service_with_files(monkeypatch, files)
+
+    result = json.loads(
+        google_drive.google_drive_create_file("notes", "some text", mime_type=mime_type)
+    )
+
+    assert result["status"] == "success"
+    files.create.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "name,mime_type",
+    [
+        ("script.bat", "application/x-msdownload"),
+        ("stream.ts", "video/mp2t"),
+        ("recording.scm", "application/vnd.lotus-screencam"),
+    ],
+)
+def test_create_file_still_rejects_the_real_binary_side_of_an_ambiguous_extension(
+    monkeypatch, name, mime_type
+):
+    """Regression guard for the other half of the .bat/.ts/.scm judgment
+    call: widening the mime-type allowlist for unambiguous text formats
+    must not accidentally also widen it for these three, whose mime type
+    is shared with a real binary format — a caller correctly declaring
+    the real (non-text) type for one of these must still be rejected."""
+    files = Mock()
+    _mock_drive_service_with_files(monkeypatch, files)
+
+    result = json.loads(
+        google_drive.google_drive_create_file(name, "some text", mime_type=mime_type)
+    )
+
+    assert result["status"] == "error"
+    files.create.assert_not_called()
 
 
 @pytest.mark.parametrize(

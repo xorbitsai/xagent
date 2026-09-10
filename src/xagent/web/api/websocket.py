@@ -4408,6 +4408,13 @@ class BackgroundTaskManager:
             task.cancel()
             raise RuntimeError("Background task manager is shutting down")
         self.running_tasks[task_id] = task
+        # Execution may run in a lease-guard child task, whose finally block
+        # cannot remove this still-running outer owner. Release the registration
+        # when its actual owner finishes, including failure or early cancellation.
+        # Fence by identity so an old completion cannot remove a newer run.
+        task.add_done_callback(
+            lambda finished: self.cleanup_task(task_id, expected_task=finished)
+        )
         logger.info(f"Registered background task for task {task_id}")
 
     def resume_admission_state(

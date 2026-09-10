@@ -1466,7 +1466,6 @@ def google_drive_create_file(
         # as before. Empty/whitespace-only is treated as omitted too, so a
         # caller that explicitly passes "" gets the same default rather
         # than a confusing rejection.
-        explicit_mime_type = mime_type is not None and mime_type.strip() != ""
         # Normalized (case/whitespace/;params stripped) once here so every
         # downstream use agrees: the guard checks below, the Drive
         # file_metadata["mimeType"] actually sent, and the upload's own
@@ -1475,9 +1474,18 @@ def google_drive_create_file(
         # already normalized internally) but then have that same
         # non-canonical string land in Drive's metadata instead of the
         # canonical form the guard just validated.
-        mime_type = (
-            _normalize_mime_type(mime_type) if explicit_mime_type else "text/plain"
-        )
+        #
+        # The `mime_type is not None` check is spelled out again here
+        # (rather than reusing a separately-assigned bool) so mypy can
+        # narrow `mime_type` to `str` for the _normalize_mime_type call --
+        # a bool computed from that same condition doesn't carry the
+        # narrowing through to this branch.
+        if mime_type is not None and mime_type.strip() != "":
+            explicit_mime_type = True
+            mime_type = _normalize_mime_type(mime_type)
+        else:
+            explicit_mime_type = False
+            mime_type = "text/plain"
         is_google_doc_conversion = _is_google_workspace_mime_type(mime_type)
         # A Google Workspace conversion is exempt from both checks below
         # (Docs/Sheets/Slides always take text/HTML source regardless of

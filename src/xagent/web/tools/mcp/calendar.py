@@ -63,11 +63,16 @@ def _merge_recurrence(
 def _is_bare_date(value: str) -> bool:
     """Whether a caller-supplied start_time/end_time string is a bare
     "date" (Google's all-day form, e.g. "2026-08-26") rather than a
-    "dateTime" - checked case-insensitively since RFC3339 permits a
-    lowercase "t" date/time separator too, and a bare date never contains
-    any letters at all, so this can't misfire the other way.
+    "dateTime".
+
+    Checked structurally (exactly three hyphen-separated all-digit parts)
+    rather than by the absence of a "T"/"t" date/time separator: RFC3339
+    also permits a space in place of "T" for readability, so
+    "2026-08-26 07:00:00" contains no "t" either and would otherwise be
+    misclassified as a bare date.
     """
-    return "t" not in value.lower()
+    parts = value.strip().split("-")
+    return len(parts) == 3 and all(part.isdigit() for part in parts)
 
 
 def _has_own_utc_offset(dt_string: str) -> bool:

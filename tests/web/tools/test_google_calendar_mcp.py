@@ -207,6 +207,31 @@ def test_create_events_creates_an_all_day_event_from_bare_dates(monkeypatch):
     assert kwargs["body"]["end"] == {"date": "2026-09-02"}
 
 
+def test_create_events_treats_a_space_separated_datetime_as_timed_not_all_day(
+    monkeypatch,
+):
+    """Confirmed bug: RFC3339 permits a space in place of "T" as the
+    date/time separator ("2026-09-01 10:00:00"), so a check that only
+    looked for the absence of "t" misclassified this as a bare date,
+    silently dropping the time-of-day and sending Google a malformed
+    {"date": "2026-09-01 10:00:00"}."""
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Timed with a space separator",
+            start_time="2026-09-01 10:00:00",
+            end_time="2026-09-01 11:00:00",
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.insert.call_args
+    assert kwargs["body"]["start"] == {"dateTime": "2026-09-01 10:00:00"}
+    assert kwargs["body"]["end"] == {"dateTime": "2026-09-01 11:00:00"}
+
+
 def test_create_events_rejects_mixed_bare_date_and_datetime(monkeypatch):
     service = _fake_service({"id": "created"})
     monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)

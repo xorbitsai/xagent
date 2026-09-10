@@ -260,6 +260,21 @@ def test_parse_rrule_all_day_bare_date_until_before_start_is_still_rejected():
         )
 
 
+def test_parse_rrule_rejects_space_separated_dtstart_paired_with_bare_date_until():
+    """Confirmed bug: RFC3339 permits a space in place of "T" as the
+    date/time separator, so a check that only looked for the absence of
+    "t" misclassified a timed dtstart like "2026-08-26 07:00:00" as an
+    all-day DATE. That let it silently pair with a floating (bare-date)
+    UNTIL instead of being rejected as the DATE-TIME-dtstart/floating-
+    UNTIL mismatch it actually is."""
+    with pytest.raises(ValueError):
+        utils.parse_rrule(
+            "FREQ=DAILY;UNTIL=20260911",
+            "2026-08-26 07:00:00",
+            timezone="Asia/Shanghai",
+        )
+
+
 def test_parse_rrule_timezone_localizes_naive_dtstart_for_utc_until():
     """Confirmed bug: unlike the previous test (no timezone given), passing
     a resolvable IANA timezone must localize a naive dtstart so it can be

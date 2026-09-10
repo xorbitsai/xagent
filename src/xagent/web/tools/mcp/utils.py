@@ -289,22 +289,27 @@ def parse_rrule(
                 f"invalid UNTIL value in recurrence rule: {parts['UNTIL']!r}"
             ) from exc
 
-    # A bare-date dtstart string (no "T", e.g. Google's own all-day "date"
-    # field) is the same signal calendar.py itself already uses to detect
-    # an all-day event - RFC 5545's DATE value type, which legitimately
-    # pairs with an equally bare-date (floating) UNTIL. Anything else - a
-    # full dateTime string (with or without its own offset) or an
-    # already-`datetime` object (as Outlook's caller always passes,
-    # already localized aware) - represents DATE-TIME, which RFC 5545
-    # requires UNTIL to match: aware, not floating.
-    # RFC3339 (section 5.6) permits a lowercase "t" as the date/time
-    # separator too, and dateutil's isoparse accepts it - checking case-
-    # insensitively (bare dates never contain any letters at all, so this
-    # can't misfire the other way) so a lowercase-t dtstart isn't wrongly
-    # treated as a bare date, which would disable the anchor localization
-    # this check exists to gate and let a genuine DATE-TIME + floating-
-    # UNTIL mismatch slip past validation.
-    dtstart_is_bare_date = isinstance(dtstart, str) and "t" not in dtstart.lower()
+    # A bare-date dtstart string (e.g. Google's own all-day "date" field,
+    # "2026-08-26") is the same signal calendar.py itself already uses to
+    # detect an all-day event - RFC 5545's DATE value type, which
+    # legitimately pairs with an equally bare-date (floating) UNTIL.
+    # Anything else - a full dateTime string (with or without its own
+    # offset) or an already-`datetime` object (as Outlook's caller always
+    # passes, already localized aware) - represents DATE-TIME, which RFC
+    # 5545 requires UNTIL to match: aware, not floating.
+    # Checked structurally (exactly three hyphen-separated all-digit
+    # parts) rather than by the absence of a "T"/"t" separator: RFC3339
+    # also permits a space in place of "T" for readability, so a
+    # dtstart like "2026-08-26 07:00:00" contains no "t" either and would
+    # otherwise be misclassified as a bare date, disabling the anchor
+    # localization this check exists to gate and letting a genuine
+    # DATE-TIME + floating-UNTIL mismatch slip past validation.
+    dtstart_is_bare_date = False
+    if isinstance(dtstart, str):
+        dtstart_parts = dtstart.strip().split("-")
+        dtstart_is_bare_date = len(dtstart_parts) == 3 and all(
+            part.isdigit() for part in dtstart_parts
+        )
 
     if isinstance(dtstart, datetime):
         anchor = dtstart

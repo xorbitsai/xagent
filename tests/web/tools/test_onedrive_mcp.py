@@ -366,6 +366,112 @@ def test_upload_large_file_content_enriches_chunk_error_with_response_body(
     )
 
 
+def test_upload_large_file_content_never_leaks_upload_url_on_chunk_failure(
+    monkeypatch, caplog
+):
+    """Regression guard: Graph's preauthenticated upload-session URL is
+    itself usable for PUT/GET/DELETE without the OAuth bearer token, so a
+    rejected chunk must never format requests' own HTTPError (whose default
+    message embeds the full request URL) into the error the caller/LLM
+    sees or into a log line."""
+    sentinel_url = "https://upload.example/session-with-a-secret-token-abc123"
+    total_size = onedrive._UPLOAD_SESSION_CHUNK_SIZE + 10
+    fh = io.BytesIO(b"\x00" * total_size)
+
+    monkeypatch.setattr(
+        onedrive.requests,
+        "request",
+        Mock(return_value=MockResponse({"uploadUrl": sentinel_url})),
+    )
+    error_response = MockResponse(
+        {"error": {"message": "range conflict"}},
+        status_code=416,
+        content=b'{"error": {"message": "range conflict"}}',
+    )
+    _patch_session(monkeypatch, _FakeSession(put=Mock(return_value=error_response)))
+
+    with caplog.at_level("WARNING"):
+        with pytest.raises(RuntimeError) as exc_info:
+            onedrive._upload_large_file_content(
+                "big.bin", fh, total_size, "application/octet-stream"
+            )
+
+    assert sentinel_url not in str(exc_info.value)
+    assert "range conflict" in str(exc_info.value)
+    for record in caplog.records:
+        assert sentinel_url not in record.getMessage()
+
+
+def test_upload_large_file_content_warns_without_leaking_url_when_cleanup_fails(
+    monkeypatch, caplog
+):
+    """Regression guard: if the best-effort cancellation DELETE itself
+    raises (e.g. a network-level requests exception, whose own message
+    commonly embeds the request URL), the warning log must not include
+    that exception's message/traceback -- only its type."""
+    sentinel_url = "https://upload.example/session-with-a-secret-token-abc123"
+    total_size = onedrive._UPLOAD_SESSION_CHUNK_SIZE + 10
+    fh = io.BytesIO(b"\x00" * total_size)
+
+    monkeypatch.setattr(
+        onedrive.requests,
+        "request",
+        Mock(return_value=MockResponse({"uploadUrl": sentinel_url})),
+    )
+    error_response = MockResponse({}, status_code=500, content=b"{}")
+    cleanup_error = requests.ConnectionError(f"Failed to reach {sentinel_url}")
+    _patch_session(
+        monkeypatch,
+        _FakeSession(
+            put=Mock(return_value=error_response),
+            delete=Mock(side_effect=cleanup_error),
+        ),
+    )
+
+    with caplog.at_level("WARNING"):
+        with pytest.raises(RuntimeError):
+            onedrive._upload_large_file_content(
+                "big.bin", fh, total_size, "application/octet-stream"
+            )
+
+    for record in caplog.records:
+        assert sentinel_url not in record.getMessage()
+        assert sentinel_url not in caplog.text
+
+
+def test_upload_large_file_content_warns_on_failed_cleanup_status(monkeypatch, caplog):
+    """Regression guard: requests doesn't raise on its own for an HTTP
+    error status -- a 429/5xx response to the cancellation DELETE must not
+    be silently treated as a successful cancellation."""
+    total_size = onedrive._UPLOAD_SESSION_CHUNK_SIZE + 10
+    fh = io.BytesIO(b"\x00" * total_size)
+
+    monkeypatch.setattr(
+        onedrive.requests,
+        "request",
+        Mock(return_value=MockResponse({"uploadUrl": "https://upload.example/s"})),
+    )
+    error_response = MockResponse(
+        {"error": {"message": "boom"}}, status_code=500, content=b'{"error": "boom"}'
+    )
+    delete_failure_response = MockResponse({}, status_code=429)
+    _patch_session(
+        monkeypatch,
+        _FakeSession(
+            put=Mock(return_value=error_response),
+            delete=Mock(return_value=delete_failure_response),
+        ),
+    )
+
+    with caplog.at_level("WARNING"):
+        with pytest.raises(RuntimeError, match="boom"):
+            onedrive._upload_large_file_content(
+                "big.bin", fh, total_size, "application/octet-stream"
+            )
+
+    assert any("429" in record.getMessage() for record in caplog.records)
+
+
 def test_upload_large_file_content_fails_on_a_non_first_chunk(monkeypatch):
     """Regression guard: earlier test coverage only ever failed the first
     chunk of a session — verifying a mid-sequence failure also propagates
@@ -610,6 +716,30 @@ def test_upload_text_file_allows_ambiguous_extensions_that_collide_with_binary_m
     Scheme source) in practice. Without an explicit carve-out, onedrive_
     upload_text_file would reject these with no working alternative (
     onedrive_upload_file needs an existing local file, not raw text)."""
+    monkeypatch.setattr(
+        onedrive.requests, "request", Mock(return_value=MockResponse({"id": "f1"}))
+    )
+
+    result = json.loads(onedrive.onedrive_upload_text_file(file_path, "some text"))
+
+    assert result["status"] == "success"
+
+
+@pytest.mark.parametrize(
+    "file_path", ["deploy.ps1", "schema.sql", "index.php", "main.dart"]
+)
+def test_upload_text_file_allows_source_extensions_with_non_text_mime_guess(
+    monkeypatch, file_path
+):
+    """Regression guard: a reviewer-verified false-positive class --
+    ".ps1" was mistakenly placed in the hand-maintained binary-extension
+    fallback set (PowerShell scripts are genuine text), and ".sql"/".php"/
+    ".dart" resolve via mimetypes on at least some hosts to non-text
+    application/* types (application/x-sql, application/x-httpd-php,
+    application/vnd.dart) that were missing from the text-safe allowlist.
+    None of these three collide with a real binary format the way
+    .ts/.bat/.scm do, so they belong in _TEXT_SAFE_MIME_TYPES rather than
+    the ambiguous-extension carve-out."""
     monkeypatch.setattr(
         onedrive.requests, "request", Mock(return_value=MockResponse({"id": "f1"}))
     )

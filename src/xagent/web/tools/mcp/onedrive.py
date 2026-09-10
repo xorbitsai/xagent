@@ -85,6 +85,19 @@ _TEXT_SAFE_MIME_TYPES = {
     "application/x-yaml",
     "application/yaml",
     "application/csv",
+    # Each of these is a real host mime.types mapping for a mainstream
+    # source/script language, verified directly against this file's
+    # extension list: ".sql" -> "application/x-sql" and ".dart" ->
+    # "application/vnd.dart" resolve this way even without any system
+    # mime.types file; ".php" -> "application/x-httpd-php" is the common
+    # Apache mapping present on many production hosts (not reproduced on
+    # every host, but a false negative here -- treating real PHP/SQL/Dart
+    # source as binary -- is worse than the false positive of never
+    # rejecting a genuinely binary file that happens to declare one of
+    # these types, which none do.
+    "application/x-sql",
+    "application/x-httpd-php",
+    "application/vnd.dart",
 }
 _TEXT_SAFE_MIME_SUFFIXES = ("+json", "+xml", "+yaml")
 
@@ -125,7 +138,12 @@ _KNOWN_BINARY_EXTENSIONS_WITHOUT_MIME_GUESS = {
     ".dylib", ".dmg", ".iso", ".apk", ".rpm", ".crx",
     ".woff", ".woff2", ".ttf", ".otf",
     ".parquet", ".sqlite", ".sqlite3", ".db", ".db3",
-    ".numbers", ".pages", ".key", ".blend", ".indd", ".ps1",
+    ".numbers", ".pages", ".key", ".blend", ".indd",
+    # NOT ".ps1" -- PowerShell scripts are genuine UTF-8 text (same mistake
+    # class as _AMBIGUOUS_TEXT_EXTENSIONS above, just self-inflicted here
+    # rather than a real mimetypes collision): mimetypes.guess_type(".ps1")
+    # returns None on every host tested, which this set previously treated
+    # as "therefore binary" without checking what the format actually is.
 }  # fmt: skip
 
 
@@ -155,7 +173,7 @@ def _graph_headers(extra_headers: dict[str, str] | None = None) -> dict[str, str
     return headers
 
 
-def _raise_for_status_with_body(response: Any) -> None:
+def _raise_for_status_with_body(response: Any, *, sanitize_url: bool = False) -> None:
     """Like response.raise_for_status(), but a non-2xx status raises a
     RuntimeError with Graph's own error body appended -- a bare HTTPError's
     default message carries only the status line, not the JSON error detail
@@ -164,11 +182,27 @@ def _raise_for_status_with_body(response: Any) -> None:
     _upload_large_file_content, which can't go through _graph_request itself
     -- see its own Authorization-header note) so a future change to the
     message format only needs to happen once.
+
+    sanitize_url must be True whenever ``response`` came from a request
+    whose own URL is sensitive -- Graph's preauthenticated upload-session
+    uploadUrl (see _upload_large_file_content) is itself usable for
+    PUT/GET/DELETE without the OAuth bearer token, so it must never reach
+    a caller-facing error message or a log line. requests.HTTPError's
+    default message embeds the full request URL (via
+    response.raise_for_status()'s own f-string), so that path is skipped
+    entirely here rather than trusted to omit it.
     """
+    if response.status_code < 400:
+        return
+    response_text = response.text.strip()
+    if sanitize_url:
+        message = f"OneDrive returned HTTP {response.status_code}"
+        if response_text:
+            message = f"{message} - {response_text}"
+        raise RuntimeError(message)
     try:
         response.raise_for_status()
     except requests.HTTPError as exc:
-        response_text = response.text.strip()
         message = str(exc)
         if response_text:
             message = f"{message} - {response_text}"
@@ -373,7 +407,11 @@ def _upload_large_file_content(
                     },
                     timeout=_BINARY_UPLOAD_TIMEOUT_SECONDS,
                 )
-                _raise_for_status_with_body(response)
+                # sanitize_url=True: this is Graph's preauthenticated
+                # upload-session URL (see the Authorization-header note
+                # above), so the failure path must never format it into an
+                # error message the caller/LLM or the logs would see.
+                _raise_for_status_with_body(response, sanitize_url=True)
                 # Only the final chunk's response carries the completed
                 # item; Graph's intermediate (202) responses return upload-
                 # progress info, not the item -- checked explicitly
@@ -412,12 +450,35 @@ def _upload_large_file_content(
             # so it shouldn't compound a slow failure with another wait as
             # long as a multi-megabyte upload's own timeout.
             try:
-                http.delete(upload_url, timeout=DEFAULT_TIMEOUT_SECONDS)
-            except Exception:
-                logger.warning(
-                    "Failed to cancel abandoned OneDrive upload session",
-                    exc_info=True,
+                cancel_response = http.delete(
+                    upload_url, timeout=DEFAULT_TIMEOUT_SECONDS
                 )
+            except Exception as cleanup_exc:
+                # Logged by type only, deliberately not the exception's own
+                # message/traceback (exc_info) or str(cleanup_exc) -- a
+                # network-level requests exception (e.g. ConnectionError)
+                # commonly embeds the request URL in its own message, which
+                # for this call is the same sensitive upload_url the
+                # sanitize_url note above exists to keep out of the logs.
+                logger.warning(
+                    "Failed to cancel abandoned OneDrive upload session (%s)",
+                    type(cleanup_exc).__name__,
+                )
+            else:
+                # requests does not raise for an HTTP error status on its
+                # own -- a 429/5xx here would otherwise look like a
+                # successful cancellation while the session (and its
+                # partial upload) actually lingers until Graph's own
+                # expiry. Status only, no body: nothing about the response
+                # is expected to carry the upload_url, but there's no
+                # reason to risk it for a log line that only needs the
+                # status.
+                if not (200 <= cancel_response.status_code < 300):
+                    logger.warning(
+                        "OneDrive upload session cancellation returned "
+                        "HTTP %s instead of success",
+                        cancel_response.status_code,
+                    )
             raise
 
     return result

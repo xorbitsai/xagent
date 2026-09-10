@@ -1879,7 +1879,21 @@ def test_is_insufficient_scope_error_tolerates_non_list_error_fields():
 
 
 def test_freebusy_other_http_errors_still_propagate(fake_service):
-    other_error = HttpError(_FakeHttpResp(500), b'{"error": {"message": "boom"}}')
+    """A 500 whose body happens to carry a scope-shaped reason must NOT be
+    treated as the missing-scope case - the gate is `status == 403` AND a
+    matching reason, not the reason alone. A body with no "errors"/
+    "details" field at all (as an arbitrary 500 body typically has) would
+    fail the reason check regardless of status, so it can't tell an
+    intact `status == 403` gate from a broken one; this fixture's body
+    would match the reason check, so it actually exercises the status
+    gate."""
+    other_error = HttpError(
+        _FakeHttpResp(500),
+        (
+            b'{"error": {"message": "boom", '
+            b'"errors": [{"reason": "insufficientPermissions"}]}}'
+        ),
+    )
     fake_service._freebusy = FakeFreebusy(raise_error=other_error)
 
     result = json.loads(
@@ -1892,6 +1906,7 @@ def test_freebusy_other_http_errors_still_propagate(fake_service):
     )
 
     assert result["status"] == "error"
+    assert "reconnect" not in result["message"].lower()
 
 
 def test_freebusy_attendee_absent_from_response_is_marked_unchecked(fake_service):
@@ -1949,6 +1964,12 @@ def test_update_events_checks_conflicts_for_an_all_day_event(fake_service):
     )
 
     assert result["status"] == "conflict"
+    # The fake calendar's own timezone also happens to be UTC, so a
+    # skipped lookup (needs_real_calendar_timezone wrongly False, falling
+    # through to the hardcoded "UTC" literal) would produce this exact
+    # same timeMin/timeMax undetected - assert the lookup actually ran,
+    # not just that its result looks right.
+    assert fake_service._calendars.get_calls
     query_call = fake_service._freebusy.query_calls[0]
     assert query_call["body"]["timeMin"] == "2026-08-27T00:00:00+00:00"
     assert query_call["body"]["timeMax"] == "2026-08-28T00:00:00+00:00"
@@ -2035,6 +2056,40 @@ def test_update_events_widens_all_day_boundary_in_the_calendars_own_timezone(
     assert query_call["body"]["timeMin"] == "2026-08-27T00:00:00+08:00"
     assert query_call["body"]["timeMax"] == "2026-08-28T00:00:00+08:00"
     assert fake_service._calendars.get_calls  # actually looked it up
+
+
+def test_update_events_organizer_only_new_attendee_on_all_day_event_widens_correctly(
+    fake_service,
+):
+    """Regression test: adding ONLY the organizer as a new attendee on an
+    all-day event, with the window otherwise unchanged, must still look
+    up the calendar's real timezone before checking their calendar - the
+    organizer-check that `organizer_newly_added` triggers on its own
+    (attendees_to_check ends up empty, the organizer is filtered out of
+    it) needs a correctly-widened window just as much as an ordinary new
+    attendee would, not one silently defaulted to UTC."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"date": "2026-08-27"},
+        "end": {"date": "2026-08-28"},
+        "attendees": [],
+        "organizer": {"email": "me@example.com"},
+    }
+    fake_service._calendars = FakeCalendars(timezone="Asia/Singapore")
+    fake_service._events._list_result = {"items": []}
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            attendees=["me@example.com"],
+        )
+    )
+
+    assert result["status"] == "success"
+    assert fake_service._calendars.get_calls  # actually looked it up
+    list_call = fake_service._events.list_calls[0]
+    assert list_call["timeMin"] == "2026-08-27T00:00:00+08:00"
+    assert list_call["timeMax"] == "2026-08-28T00:00:00+08:00"
 
 
 def test_update_events_calendar_timezone_lookup_missing_scope_rejects_the_write(
@@ -2505,6 +2560,45 @@ def test_update_events_missing_scope_on_retained_attendees_still_reports_the_fir
     assert result["status"] == "conflict"
     assert result["conflicts"][0]["summary"] == "1:1 with Hazel"
     assert result["unchecked_attendees"] == ["existing@example.com"]
+
+
+def test_update_events_missing_scope_in_first_call_still_checks_retained_attendees(
+    fake_service,
+):
+    """Regression test: when the FIRST _find_conflicts call (newly-added
+    attendees + organizer) raises InsufficientScopeError but already
+    carries an already-confirmed organizer conflict, the accumulation
+    layer must still attempt the SECOND call (retained attendees' delta
+    segments) rather than returning immediately - otherwise a retained
+    attendee is silently dropped from the response entirely: neither
+    reported as conflicting nor as unchecked, contradicting the whole
+    feature's guarantee that an unverified attendee is always surfaced."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+        "attendees": [{"email": "existing@example.com"}],
+    }
+    fake_service._events._list_result = {
+        "items": [_confirmed_event(event_id="other-1")]
+    }
+    fake_service._freebusy = FakeFreebusy(raise_error=_insufficient_scope_error())
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-27T14:00:00+08:00",  # disjoint move
+            end_time="2026-08-27T14:30:00+08:00",
+            attendees=["new@example.com"],
+        )
+    )
+
+    assert result["status"] == "conflict"
+    assert result["conflicts"][0]["summary"] == "1:1 with Hazel"
+    assert set(result["unchecked_attendees"]) == {
+        "new@example.com",
+        "existing@example.com",
+    }
 
 
 def test_update_events_missing_scope_can_be_bypassed_with_ignore_conflicts(

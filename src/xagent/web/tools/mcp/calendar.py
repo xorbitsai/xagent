@@ -789,9 +789,14 @@ def google_calendar_update_events(
         # filtered out) and `check_organizer` alone wouldn't have been
         # true for an unmoved window, so no conflict check would run for
         # them at all, silently missing a real conflict on their calendar.
-        organizer_newly_added = organizer_email_lower is not None and any(
-            a.lower() == organizer_email_lower for a in added_attendees
-        )
+        # Recovered as a length comparison rather than a separate scan -
+        # `added_attendees` is already case-insensitively deduplicated
+        # (via normalize_addresses), so at most one entry can match
+        # `organizer_email_lower` - which also keeps this fact and
+        # `attendees_to_check`'s own filtering from drifting apart (both
+        # the timezone-lookup gate below and the organizer-check gate
+        # further down must account for this consistently).
+        organizer_newly_added = len(attendees_to_check) != len(added_attendees)
 
         existing_is_all_day = "date" in (event.get("start") or {}) or "date" in (
             event.get("end") or {}
@@ -810,22 +815,29 @@ def google_calendar_update_events(
             )
 
         # The calendar's own timezone is only needed to widen an all-day
-        # boundary (see _event_boundary) so a moved window or a genuinely
-        # new attendee gets checked against the right absolute instant -
-        # fetch it lazily so a plain timed-event update, or a
-        # summary/location/description-only edit of an all-day event that
-        # never touches its window or attendees, doesn't pay for an extra
-        # API call (or a scope-403 that would otherwise block an edit
-        # that never needed timezone precision at all) it has no use for.
-        # Keyed off `added_attendees` (genuinely new), not the raw
-        # `attendees` argument - naming only addresses already on the
-        # event adds nothing to check, and a resubmission that never
-        # moves the window makes any retained attendee's delta segment
-        # trivially empty regardless of timezone precision (both sides
-        # of that comparison fall back to the same assumption
-        # consistently), so neither actually needs the real zone either.
+        # boundary (see _event_boundary) so a moved window, a genuinely
+        # new attendee, or the organizer-calendar check gets checked
+        # against the right absolute instant - fetch it lazily so a
+        # plain timed-event update, or a summary/location/description-
+        # only edit of an all-day event that never touches its window or
+        # attendees, doesn't pay for an extra API call (or a scope-403
+        # that would otherwise block an edit that never needed timezone
+        # precision at all) it has no use for. `organizer_newly_added`
+        # is included alongside `attendees_to_check` (genuinely new,
+        # organizer excluded) since it independently triggers
+        # `check_organizer` below, which also needs a correctly-widened
+        # window - omitting it here would run that check against a
+        # wrong-timezone (UTC-defaulted) boundary instead of failing
+        # loudly or skipping it. A resubmission that never moves the
+        # window makes any retained attendee's delta segment trivially
+        # empty regardless of timezone precision (both sides of that
+        # comparison fall back to the same assumption consistently), so
+        # that case alone still doesn't need the real zone.
         needs_real_calendar_timezone = existing_is_all_day and (
-            bool(start_time) or bool(end_time) or bool(attendees_to_check)
+            bool(start_time)
+            or bool(end_time)
+            or bool(attendees_to_check)
+            or organizer_newly_added
         )
         try:
             calendar_timezone = (
@@ -878,15 +890,27 @@ def google_calendar_update_events(
             # freebusy path for them.
             check_organizer = window_changed or organizer_newly_added
             all_conflicts: list[dict[str, Any]] = []
+            # Tracks the most recent InsufficientScopeError seen across
+            # EITHER block below, re-raised only once both blocks have
+            # had their chance to run and nothing was confirmed by
+            # either. The two blocks check disjoint attendee sets (newly
+            # added vs. retained), so one block hitting a scope error
+            # must not skip the other - otherwise a retained attendee's
+            # delta-segment check would silently never run at all
+            # (neither confirmed as conflicting nor reported as
+            # unchecked) whenever the first block happens to fail with
+            # an already-confirmed conflict in hand (which is exactly
+            # the case that stops `_merge_scope_error` from re-raising).
+            pending_scope_error: InsufficientScopeError | None = None
 
-            try:
-                # A newly-added attendee has no footprint on this event
-                # at all, so the FULL effective window is safe (and
-                # necessary) to check for them - same call also covers
-                # the organizer, who's excluded by event id rather than
-                # by window, so `window_changed` alone (not a
-                # disjoint-move test) decides whether to re-check them.
-                if check_organizer or attendees_to_check:
+            # A newly-added attendee has no footprint on this event
+            # at all, so the FULL effective window is safe (and
+            # necessary) to check for them - same call also covers
+            # the organizer, who's excluded by event id rather than
+            # by window, so `window_changed` alone (not a
+            # disjoint-move test) decides whether to re-check them.
+            if check_organizer or attendees_to_check:
+                try:
                     conflicts, unchecked = _find_conflicts(
                         service,
                         effective_start,
@@ -897,23 +921,28 @@ def google_calendar_update_events(
                     )
                     all_conflicts.extend(conflicts)
                     unchecked_attendees.extend(unchecked)
+                except InsufficientScopeError as exc:
+                    all_conflicts.extend(exc.conflicts)
+                    unchecked_attendees.extend(exc.unchecked_attendees)
+                    pending_scope_error = exc
 
-                # A retained attendee's own busy block for THIS event
-                # covers the entire OLD window - querying that overlap
-                # can't tell "busy because of this event" from a real
-                # conflict. Only the portion of the new window that's
-                # genuinely new territory (window_delta_segments - empty
-                # for an unchanged/shrunk window, up to two segments for
-                # a partial nudge that extends past the old window on one
-                # or both sides, or the whole new window for a fully
-                # disjoint move) can hide a real conflict for them.
-                if existing_attendees_to_check:
-                    for seg_start, seg_end in _window_delta_segments(
-                        existing_start_key,
-                        existing_end_key,
-                        effective_start_key,
-                        effective_end_key,
-                    ):
+            # A retained attendee's own busy block for THIS event
+            # covers the entire OLD window - querying that overlap
+            # can't tell "busy because of this event" from a real
+            # conflict. Only the portion of the new window that's
+            # genuinely new territory (window_delta_segments - empty
+            # for an unchanged/shrunk window, up to two segments for
+            # a partial nudge that extends past the old window on one
+            # or both sides, or the whole new window for a fully
+            # disjoint move) can hide a real conflict for them.
+            if existing_attendees_to_check:
+                for seg_start, seg_end in _window_delta_segments(
+                    existing_start_key,
+                    existing_end_key,
+                    effective_start_key,
+                    effective_end_key,
+                ):
+                    try:
                         conflicts, unchecked = _find_conflicts(
                             service,
                             seg_start.isoformat(),
@@ -924,10 +953,17 @@ def google_calendar_update_events(
                         )
                         all_conflicts.extend(conflicts)
                         unchecked_attendees.extend(unchecked)
-            except InsufficientScopeError as exc:
-                all_conflicts, unchecked_attendees = _merge_scope_error(
-                    exc, all_conflicts, unchecked_attendees
-                )
+                    except InsufficientScopeError as exc:
+                        all_conflicts.extend(exc.conflicts)
+                        unchecked_attendees.extend(exc.unchecked_attendees)
+                        pending_scope_error = exc
+                        # Every remaining segment would hit this same
+                        # scope error too - nothing left to gain by
+                        # attempting them.
+                        break
+
+            if pending_scope_error is not None and not all_conflicts:
+                raise pending_scope_error
 
             if all_conflicts:
                 return _conflict_response(

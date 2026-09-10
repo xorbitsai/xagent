@@ -2881,7 +2881,6 @@ def test_create_file_allows_script_source_extensions(monkeypatch, name):
         "application/x-latex",
         "application/xml-dtd",
         "application/vnd.dart",
-        "application/x-protobuf",
         "application/graphql",
     ],
 )
@@ -2891,12 +2890,12 @@ def test_create_file_allows_unambiguous_text_application_mime_types(
     """These application/* mime types are unambiguous — no real binary
     format is ever declared with them — so an explicit mime_type of one of
     these must be accepted even for a name with no matching extension
-    override, unlike ".bat"/".ts"/".scm" which stay name-only because
-    their mime type collides with a genuine binary format. Regression
-    guard: .proto/.graphql were already accepted by *name*, but
-    application/x-protobuf/application/graphql were missing from the
-    mime_type allowlist, so declaring the mime_type explicitly instead of
-    relying on the name was wrongly rejected."""
+    override, unlike ".bat"/".ts"/".scm"/protobuf/Thrift/Avro which stay
+    name-only because their mime type collides with a genuine binary
+    format. Regression guard: .graphql was already accepted by *name*, but
+    application/graphql was missing from the mime_type allowlist, so
+    declaring the mime_type explicitly instead of relying on the name was
+    wrongly rejected."""
     files = Mock()
     files.create.return_value.execute.return_value = {"id": "f1"}
     _mock_drive_service_with_files(monkeypatch, files)
@@ -2915,16 +2914,20 @@ def test_create_file_allows_unambiguous_text_application_mime_types(
         ("script.bat", "application/x-msdownload"),
         ("stream.ts", "video/mp2t"),
         ("recording.scm", "application/vnd.lotus-screencam"),
+        ("message", "application/x-protobuf"),
+        ("data", "application/vnd.apache.thrift.binary"),
+        ("data", "application/vnd.apache.avro+binary"),
     ],
 )
 def test_create_file_still_rejects_the_real_binary_side_of_an_ambiguous_extension(
     monkeypatch, name, mime_type
 ):
-    """Regression guard for the other half of the .bat/.ts/.scm judgment
-    call: widening the mime-type allowlist for unambiguous text formats
-    must not accidentally also widen it for these three, whose mime type
-    is shared with a real binary format — a caller correctly declaring
-    the real (non-text) type for one of these must still be rejected."""
+    """Regression guard for the other half of the .bat/.ts/.scm/protobuf/
+    Thrift/Avro judgment call: widening the mime-type allowlist for
+    unambiguous text formats must not accidentally also widen it for
+    these, whose mime type is shared with (or, for protobuf/Thrift/Avro,
+    commonly IS) a real binary payload — a caller correctly declaring the
+    real (non-text) type must still be rejected."""
     files = Mock()
     _mock_drive_service_with_files(monkeypatch, files)
 

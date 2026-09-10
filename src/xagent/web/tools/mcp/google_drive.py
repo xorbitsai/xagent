@@ -680,15 +680,17 @@ def _capped_content_response(
 # "application/ld+json", "application/atom+xml") are included for the same
 # reason — genuinely text under the hood, just not "text/"-prefixed by
 # convention. The script/source-format entries (x-sh, x-sql, x-tex, ...,
-# x-protobuf, graphql) are each an unambiguous registered mime type for a
-# genuinely-text format — no unrelated binary format is ever declared with
-# them — so accepting them here is always safe, however the caller arrived
-# at declaring one. Thrift/Avro are deliberately NOT included here even
-# though their .thrift/.avsc *extensions* are in _KNOWN_TEXT_EXTENSIONS
-# below (an IDL/schema file is always text) — unlike protobuf, a generic
-# Thrift/Avro mime type can legitimately describe an actual binary-encoded
-# payload, the same ambiguity ".bat"/".ts"/".scm" have at the extension
-# level (see _KNOWN_TEXT_EXTENSIONS's own note on those).
+# graphql) are each an unambiguous registered mime type for a genuinely-text
+# format — no unrelated binary format is ever declared with them — so
+# accepting them here is always safe, however the caller arrived at
+# declaring one. Thrift/Avro/protobuf are deliberately NOT included here
+# even though their .thrift/.avsc/.proto *extensions* are in
+# _KNOWN_TEXT_EXTENSIONS below (an IDL/schema file is always text) —
+# unlike graphql, a generic Thrift/Avro/protobuf mime type (e.g.
+# "application/x-protobuf") can legitimately describe an actual
+# binary-encoded message payload in real-world use (Prometheus
+# remote-write, gRPC-Web, ...), the same ambiguity ".bat"/".ts"/".scm" have
+# at the extension level (see _KNOWN_TEXT_EXTENSIONS's own note on those).
 _TEXT_MIME_TYPES = {
     "application/json",
     "application/xml",
@@ -706,7 +708,6 @@ _TEXT_MIME_TYPES = {
     "application/x-latex",
     "application/xml-dtd",
     "application/vnd.dart",
-    "application/x-protobuf",
     "application/graphql",
 }
 _TEXT_MIME_TYPE_SUFFIXES = ("+xml", "+json", "+yaml")
@@ -884,6 +885,7 @@ _KNOWN_TEXT_PLAIN_EXTENSIONS = {
 _KNOWN_TEXT_DATA_EXTENSIONS = {
     ".json", ".xml", ".yaml", ".yml", ".csv", ".tsv", ".dtd", ".xsd",
     ".xsl", ".xslt", ".proto", ".graphql", ".gql", ".thrift", ".avsc",
+    ".ipynb", ".jsonl", ".ndjson", ".geojson",
 }  # fmt: skip
 _KNOWN_TEXT_WEB_EXTENSIONS = {
     ".html", ".htm", ".css", ".scss", ".sass", ".less", ".svg",
@@ -1234,10 +1236,11 @@ def google_drive_upload_file(
     the task workspace. Must be inside an allowed directory (automatically
     scoped to the current task workspace), which is meant to keep this
     tool from reading arbitrary host files — not an absolute guarantee
-    (see _resolve_upload_file_path's symlink-timing note below). Pass an
-    absolute path — a relative path resolves against this process's own
-    working directory, not the allowed directory, and will not find a
-    file written to the task workspace.
+    (see this function's own symlink-timing comment on the `with
+    local_path.open("rb")` line below). Pass an absolute path — a relative
+    path resolves against this process's own working directory, not the
+    allowed directory, and will not find a file written to the task
+    workspace.
     name: the file name to give it in Drive; defaults to file_path's own
     basename.
     mime_type: defaults to a guess from the file's extension via the
@@ -1254,8 +1257,12 @@ def google_drive_upload_file(
         local_path = _resolve_upload_file_path(file_path)
 
         resolved_name = name.strip() or local_path.name
+        # Normalized the same way google_drive_create_file's mime_type is,
+        # so an explicit "Application/PDF" or "application/pdf; foo=bar"
+        # doesn't land on Drive uncanonicalized just because this tool
+        # (unlike create_file) has no text-safety gate to normalize for.
         resolved_mime_type = (
-            mime_type.strip()
+            _normalize_mime_type(mime_type)
             or mimetypes.guess_type(local_path.name)[0]
             or "application/octet-stream"
         )

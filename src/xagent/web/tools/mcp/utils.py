@@ -271,6 +271,17 @@ def parse_rrule(
             f"got {int(parts['COUNT'])}"
         )
 
+    # Parsed before the anchor is localized below, since whether to
+    # localize at all now depends on UNTIL's own value type.
+    until_dt = None
+    if "UNTIL" in parts:
+        try:
+            until_dt = _date_parser.isoparse(parts["UNTIL"])
+        except ValueError as exc:
+            raise ValueError(
+                f"invalid UNTIL value in recurrence rule: {parts['UNTIL']!r}"
+            ) from exc
+
     if isinstance(dtstart, datetime):
         anchor = dtstart
     else:
@@ -280,7 +291,21 @@ def parse_rrule(
             raise ValueError(
                 f"invalid start time for recurrence rule: {dtstart}"
             ) from exc
-    if anchor.tzinfo is None and timezone is not None:
+    # RFC 5545 requires DTSTART and UNTIL to have the SAME value type -
+    # both aware (e.g. Google's common "Z"-suffixed UNTIL) or both
+    # "floating"/naive (a bare, no-time UNTIL like "20260911", which is
+    # exactly how an all-day event's own UNTIL is legitimately written).
+    # Localizing a naive anchor is only ever needed to MATCH an aware
+    # UNTIL - doing it unconditionally (whenever `timezone` happens to be
+    # given, as for an all-day event) would instead create a mismatch in
+    # the opposite direction for a bare-date UNTIL, which needs the anchor
+    # to stay naive/floating, not become aware.
+    if (
+        anchor.tzinfo is None
+        and timezone is not None
+        and until_dt is not None
+        and until_dt.tzinfo is not None
+    ):
         anchor = anchor.replace(tzinfo=resolve_zoneinfo(timezone))
     try:
         _rrulestr(f"RRULE:{body}", dtstart=anchor)
@@ -289,23 +314,15 @@ def parse_rrule(
 
     # dateutil's rrulestr above does NOT catch this: an UNTIL before dtstart
     # parses fine and just silently yields zero occurrences - a "recurring"
-    # event that never actually recurs, reported as success. Only checked
-    # when both sides are timezone-aware (guaranteed for every caller that
-    # passes `timezone` above for a naive dtstart, or that already had an
-    # aware one); an aware-vs-naive comparison would raise TypeError rather
-    # than answer the question, so it's skipped rather than guessed at.
-    if "UNTIL" in parts:
-        try:
-            until_dt = _date_parser.isoparse(parts["UNTIL"])
-        except ValueError as exc:
-            raise ValueError(
-                f"invalid UNTIL value in recurrence rule: {parts['UNTIL']!r}"
-            ) from exc
-        if (
-            anchor.tzinfo is not None
-            and until_dt.tzinfo is not None
-            and until_dt < anchor
-        ):
+    # event that never actually recurs, reported as success. Comparable
+    # whenever anchor and until_dt share the same awareness (both aware, or
+    # both naive/floating - a plain datetime comparison works fine either
+    # way); an aware-vs-naive mismatch would raise TypeError rather than
+    # answer the question, so THAT combination is skipped rather than
+    # guessed at (dateutil's rrulestr call above already rejects it before
+    # this point is ever reached, in fact).
+    if until_dt is not None and (until_dt.tzinfo is None) == (anchor.tzinfo is None):
+        if until_dt < anchor:
             raise ValueError(
                 f"recurrence UNTIL ({parts['UNTIL']}) is before the start "
                 "time; this recurrence would never actually happen"

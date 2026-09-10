@@ -225,6 +225,57 @@ def test_build_graph_recurrence_rejects_bymonthday_with_byday_on_yearly():
         )
 
 
+def test_build_graph_recurrence_rejects_yearly_bymonthday_without_bymonth():
+    """Confirmed bug: FREQ=YEARLY;BYMONTHDAY=15 with no BYMONTH means "the
+    15th of every month, every year" under RFC 5545 (confirmed against
+    dateutil) - Outlook's absoluteYearly pattern always requires a single
+    specific month and has no way to represent that, so defaulting the
+    month from DTSTART silently narrowed a 12x/year series down to a
+    single yearly occurrence with no warning."""
+    with pytest.raises(
+        ValueError, match="without BYMONTH means this day of EVERY month"
+    ):
+        outlook._build_graph_recurrence(
+            "FREQ=YEARLY;BYMONTHDAY=15", "2026-06-01T09:00:00"
+        )
+
+
+def test_build_graph_recurrence_rejects_yearly_byday_without_bymonth():
+    """Confirmed bug: FREQ=YEARLY;BYDAY=1MO with no BYMONTH means a single
+    year-wide ordinal weekday under RFC 5545 (e.g. "the first Monday of
+    the year" - confirmed against dateutil), not an ordinal scoped to
+    whatever month DTSTART happens to fall in. Outlook's relativeYearly
+    pattern always requires a specific month and has no way to represent
+    "year-wide", so defaulting the month from DTSTART silently produced a
+    different (and wrong) date with no warning."""
+    with pytest.raises(ValueError, match="without BYMONTH means a single year-wide"):
+        outlook._build_graph_recurrence("FREQ=YEARLY;BYDAY=1MO", "2026-06-01T09:00:00")
+
+
+def test_build_graph_recurrence_accepts_yearly_selectors_with_explicit_bymonth():
+    """The fix above must not overreach - an explicit BYMONTH still works
+    for both the BYMONTHDAY and BYDAY yearly variants."""
+    r1 = outlook._build_graph_recurrence(
+        "FREQ=YEARLY;BYMONTH=6;BYMONTHDAY=15", "2026-06-01T09:00:00"
+    )
+    assert r1["pattern"] == {
+        "type": "absoluteYearly",
+        "interval": 1,
+        "dayOfMonth": 15,
+        "month": 6,
+    }
+    r2 = outlook._build_graph_recurrence(
+        "FREQ=YEARLY;BYMONTH=6;BYDAY=1MO", "2026-06-01T09:00:00"
+    )
+    assert r2["pattern"] == {
+        "type": "relativeYearly",
+        "interval": 1,
+        "daysOfWeek": ["monday"],
+        "index": "first",
+        "month": 6,
+    }
+
+
 def test_build_graph_recurrence_rejects_out_of_range_bymonthday():
     with pytest.raises(ValueError, match="BYMONTHDAY must be between 1 and 31"):
         outlook._build_graph_recurrence(
@@ -312,6 +363,32 @@ def test_build_graph_recurrence_rejects_non_positive_interval():
         )
 
 
+def test_build_graph_recurrence_rejects_interval_beyond_graph_int32():
+    """Confirmed bug: RFC 5545's INTERVAL grammar has no upper bound, but
+    Graph types recurrencePattern.interval as a signed Int32 - a value
+    beyond that (valid RFC 5545 text the shared parser's digit-only/
+    positivity checks accept) used to reach Graph as-is and fail remotely
+    with an opaque error instead of a clear local one."""
+    with pytest.raises(ValueError, match="INTERVAL must be at most 2147483647"):
+        outlook._build_graph_recurrence(
+            "FREQ=DAILY;INTERVAL=2147483648", "2026-08-15T07:00:00+08:00"
+        )
+
+
+def test_build_graph_recurrence_rejects_count_beyond_graph_int32():
+    with pytest.raises(ValueError, match="COUNT must be at most 2147483647"):
+        outlook._build_graph_recurrence(
+            "FREQ=DAILY;COUNT=2147483648", "2026-08-15T07:00:00+08:00"
+        )
+
+
+def test_build_graph_recurrence_accepts_interval_at_graph_int32_boundary():
+    recurrence = outlook._build_graph_recurrence(
+        "FREQ=DAILY;INTERVAL=2147483647", "2026-08-15T07:00:00+08:00"
+    )
+    assert recurrence["pattern"]["interval"] == 2147483647
+
+
 def test_build_graph_recurrence_resolves_windows_style_timezone():
     """Graph commonly reports Windows-style timezone identifiers (e.g. for
     events created via Outlook desktop/web rather than this tool), which
@@ -322,6 +399,18 @@ def test_build_graph_recurrence_resolves_windows_style_timezone():
         "FREQ=DAILY", "2026-08-26T07:00:00", "Pacific Standard Time"
     )
     assert recurrence["range"]["recurrenceTimeZone"] == "Pacific Standard Time"
+
+
+def test_build_graph_recurrence_resolves_a_previously_unmapped_windows_timezone():
+    """Confirmed bug: the old hand-written map only covered ~18 common
+    business timezones and left every other valid Windows zone name
+    (e.g. "Aleutian Standard Time", a real, Microsoft-documented Graph
+    timezone) failing here, blocking a real recurrence-only update for
+    any event created in one of the ~120 unmapped zones."""
+    recurrence = outlook._build_graph_recurrence(
+        "FREQ=DAILY", "2026-08-26T07:00:00", "Aleutian Standard Time"
+    )
+    assert recurrence["range"]["recurrenceTimeZone"] == "Aleutian Standard Time"
 
 
 def test_build_graph_recurrence_rejects_unmapped_timezone():
@@ -406,6 +495,35 @@ def test_build_graph_recurrence_relative_pattern_rejects_mixed_ordinals():
         outlook._build_graph_recurrence(
             "FREQ=MONTHLY;BYDAY=2TU,3WE", "2026-08-11T07:00:00+08:00"
         )
+
+
+def test_build_graph_recurrence_relative_pattern_rejects_same_ordinal_multi_day():
+    """Confirmed bug: RFC 5545's BYDAY=2TU,2WE means "the second Tuesday
+    AND the second Wednesday" (two independent occurrences per month,
+    confirmed against dateutil's rrule), but Microsoft's own
+    recurrencePattern docs state that a relative pattern with more than
+    one daysOfWeek value "falls on the first day that satisfies the
+    pattern" - a single occurrence. Silently sending this to Graph would
+    produce a materially narrower series with no error raised anywhere,
+    so it must be rejected instead."""
+    with pytest.raises(ValueError, match="more than one distinct weekday"):
+        outlook._build_graph_recurrence(
+            "FREQ=MONTHLY;BYDAY=2TU,2WE", "2026-08-11T07:00:00+08:00"
+        )
+    with pytest.raises(ValueError, match="more than one distinct weekday"):
+        outlook._build_graph_recurrence(
+            "FREQ=YEARLY;BYMONTH=11;BYDAY=2TU,2WE", "2026-08-11T07:00:00+08:00"
+        )
+
+
+def test_build_graph_recurrence_relative_pattern_allows_duplicate_same_day():
+    """A same-day duplicate (e.g. "2TU,2TU") isn't a multi-day pattern
+    once deduped - must still be accepted, not conflated with the
+    multi-day rejection above."""
+    recurrence = outlook._build_graph_recurrence(
+        "FREQ=MONTHLY;BYDAY=2TU,2TU", "2026-08-11T07:00:00+08:00"
+    )
+    assert recurrence["pattern"]["daysOfWeek"] == ["tuesday"]
 
 
 def test_build_graph_recurrence_relative_pattern_rejects_missing_ordinal():

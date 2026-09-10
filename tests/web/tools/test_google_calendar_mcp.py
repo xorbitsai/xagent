@@ -487,6 +487,35 @@ def test_update_events_all_day_recurrence_with_utc_until_does_not_error(monkeypa
     assert "timeZone" not in kwargs["body"]["end"]
 
 
+def test_update_events_all_day_recurrence_with_bare_date_until_does_not_error(
+    monkeypatch,
+):
+    """Confirmed bug: a bare (no-time) UNTIL is the RFC 5545-correct value
+    type for a DATE (all-day) DTSTART - RFC 5545 requires UNTIL to match
+    DTSTART's own value type. The earlier fix for the "Z"-suffixed-UNTIL
+    case unconditionally localized the naive all-day anchor, which broke
+    this opposite, equally valid case by creating a NEW aware/naive
+    mismatch instead."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"date": "2026-08-26"},
+        "end": {"date": "2026-08-27"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=DAILY;UNTIL=20260911",
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["body"]["recurrence"] == ["RRULE:FREQ=DAILY;UNTIL=20260911"]
+
+
 def test_update_events_explicit_timezone_on_all_day_event_does_not_send_malformed_payload(
     monkeypatch,
 ):

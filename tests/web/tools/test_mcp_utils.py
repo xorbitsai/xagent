@@ -238,6 +238,28 @@ def test_parse_rrule_naive_dtstart_with_utc_until_is_rejected_by_dateutil_itself
         )
 
 
+def test_parse_rrule_all_day_bare_date_until_is_accepted():
+    """Confirmed bug: a bare (no-time) UNTIL is the RFC 5545-correct value
+    type for a DATE (all-day) DTSTART, but localizing a naive anchor
+    whenever `timezone` was given - added to fix the "Z"-suffixed-UNTIL
+    case above - broke this opposite case by forcing the anchor aware
+    while UNTIL stayed naive, a new mismatch. The anchor must only be
+    localized when UNTIL itself is aware."""
+    parts = utils.parse_rrule(
+        "FREQ=DAILY;UNTIL=20260911", "2026-08-26", timezone="Asia/Shanghai"
+    )
+    assert parts["UNTIL"] == "20260911"
+
+
+def test_parse_rrule_all_day_bare_date_until_before_start_is_still_rejected():
+    """The before-start guard must still catch this now-naive-vs-naive
+    comparison, not just the aware-vs-aware case."""
+    with pytest.raises(ValueError, match="before the start time"):
+        utils.parse_rrule(
+            "FREQ=DAILY;UNTIL=20260101", "2026-08-26", timezone="Asia/Shanghai"
+        )
+
+
 def test_parse_rrule_timezone_localizes_naive_dtstart_for_utc_until():
     """Confirmed bug: unlike the previous test (no timezone given), passing
     a resolvable IANA timezone must localize a naive dtstart so it can be

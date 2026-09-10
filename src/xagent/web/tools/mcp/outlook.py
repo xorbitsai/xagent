@@ -11,6 +11,7 @@ import requests
 from dateutil import parser as _date_parser
 from dateutil import tz as _tz
 from mcp.server.fastmcp import FastMCP
+from tzlocal.windows_tz import win_tz as _WINDOWS_TZ_TO_IANA
 
 from .utils import parse_rrule, setup_proxy_env
 
@@ -122,40 +123,22 @@ _RRULE_DAY_TO_GRAPH = {
 }
 
 
-# dateutil.tz.gettz only resolves IANA names ("Asia/Manila"). This tool
-# always writes IANA names itself, but an event fetched from Graph (the
-# outlook_update_event recurrence-without-start_datetime path) can carry a
-# Windows-style identifier instead, whenever the event was created by a
-# different client (Outlook desktop/web default to these). Not exhaustive -
-# just the common business timezones - so an unmapped Windows name still
-# fails with a clear, actionable error rather than resolving silently wrong.
-_WINDOWS_TZ_TO_IANA = {
-    "UTC": "UTC",
-    "Pacific Standard Time": "America/Los_Angeles",
-    "Mountain Standard Time": "America/Denver",
-    "Central Standard Time": "America/Chicago",
-    "Eastern Standard Time": "America/New_York",
-    "GMT Standard Time": "Europe/London",
-    "Central Europe Standard Time": "Europe/Warsaw",
-    "W. Europe Standard Time": "Europe/Berlin",
-    "Romance Standard Time": "Europe/Paris",
-    "China Standard Time": "Asia/Shanghai",
-    "Taipei Standard Time": "Asia/Taipei",
-    "Tokyo Standard Time": "Asia/Tokyo",
-    "Korea Standard Time": "Asia/Seoul",
-    "Singapore Standard Time": "Asia/Singapore",
-    "SE Asia Standard Time": "Asia/Bangkok",
-    "India Standard Time": "Asia/Kolkata",
-    "AUS Eastern Standard Time": "Australia/Sydney",
-    "New Zealand Standard Time": "Pacific/Auckland",
-}
-
-
 def _resolve_timezone(timezone: str) -> Any:
     """Resolve a timezone name to a dateutil tzinfo, trying it as an IANA
-    name first (what this tool itself always writes) and falling back to a
-    short list of common Windows-style identifiers (what Graph often
-    reports for events created by other clients) before giving up."""
+    name first (what this tool itself always writes) and falling back to
+    the full CLDR Windows<->IANA mapping (what Graph often reports for
+    events created by other clients, e.g. Outlook desktop/web) before
+    giving up.
+
+    A hand-written subset of this table (~18 entries) previously covered
+    only common business timezones and left every other valid Windows
+    zone (e.g. "Aleutian Standard Time") failing here - safely, with a
+    clear error, but blocking a real recurrence-only update for any event
+    whose creator used one of the ~120 unmapped zones. `tzlocal.windows_tz`
+    is the same CLDR-derived table (~139 entries) `tzlocal` itself uses
+    for Windows-local-timezone detection, already a transitive dependency
+    via `celery` and now a direct one.
+    """
     if not timezone.strip():
         raise ValueError("timezone must not be blank")
     zone = _tz.gettz(timezone)
@@ -227,9 +210,9 @@ _ORDINAL_TO_GRAPH_INDEX = {1: "first", 2: "second", 3: "third", 4: "fourth", -1:
 
 
 def _parse_relative_byday(byday: str) -> tuple[str, list[str]]:
-    """Parse a numbered BYDAY value (e.g. "2TU" for "the second Tuesday", or
-    "-1FR,-1SA" for "the last Friday and Saturday") into the (index,
-    daysOfWeek) pair Graph's relativeMonthly/relativeYearly pattern needs.
+    """Parse a numbered BYDAY value (e.g. "2TU" for "the second Tuesday") into
+    the (index, daysOfWeek) pair Graph's relativeMonthly/relativeYearly
+    pattern needs.
 
     Every code must carry the same numeric ordinal - Graph's `index` field
     applies to the whole pattern, not per-day, so "2TU,3WE" ("second
@@ -239,6 +222,18 @@ def _parse_relative_byday(byday: str) -> tuple[str, list[str]]:
     "MO") means something different under RFC 5545 (every such weekday in
     the period, not one specific occurrence) and is rejected rather than
     guessed at.
+
+    More than one DISTINCT weekday sharing the same ordinal (e.g.
+    "2TU,2WE", "the second Tuesday AND the second Wednesday") is rejected
+    too, for a different reason: RFC 5545 means two independent
+    occurrences per period (confirmed against dateutil's rrule, the
+    reference implementation this codebase already validates against),
+    but Microsoft's own recurrencePattern docs state that when a relative
+    monthly/yearly pattern's `daysOfWeek` lists more than one day, "the
+    event falls on the first day that satisfies the pattern" - a single
+    occurrence, not one per listed day. Sending this rule to Graph as-is
+    would silently produce a materially narrower series (missing every
+    other listed weekday) with no error surfaced anywhere.
     """
     ordinal: int | None = None
     days: list[str] = []
@@ -280,8 +275,26 @@ def _parse_relative_byday(byday: str) -> tuple[str, list[str]]:
             "in the loop above either sets one or raises, so this "
             "shouldn't be reachable"
         )
+    if len(days) > 1:
+        raise ValueError(
+            f"unsupported recurrence pattern: BYDAY={byday!r} specifies "
+            "more than one distinct weekday for the same relative "
+            "ordinal - Outlook's relativeMonthly/relativeYearly pattern "
+            "picks only the first listed day satisfying the pattern each "
+            "period, not one occurrence per day, so this would silently "
+            "produce a narrower series than requested"
+        )
     return _ORDINAL_TO_GRAPH_INDEX[ordinal], days
 
+
+# RFC 5545's `1*DIGIT` grammar for INTERVAL/COUNT has no upper bound, but
+# Graph types `recurrencePattern.interval` and `recurrenceRange.
+# numberOfOccurrences` as signed Int32 - a value beyond this (valid RFC
+# 5545 text the shared parser's digit-only/positivity checks happily
+# accept) would otherwise reach Graph as an out-of-range JSON integer and
+# get rejected remotely with an opaque error, instead of this connector's
+# own clear local one.
+_GRAPH_INT32_MAX = 2_147_483_647
 
 # Components every FREQ recognizes in this connector, on top of whatever a
 # specific FREQ branch below consumes - checked once a pattern is built, so
@@ -425,10 +438,16 @@ def _build_graph_recurrence(
     if anchor.tzinfo is None:
         anchor = anchor.replace(tzinfo=zone)
     # parse_rrule already guarantees INTERVAL is a positive integer
-    # whenever it's present at all, so there's nothing left to check here.
+    # whenever it's present at all, so there's nothing left to check here
+    # beyond the Graph-specific Int32 bound below.
     parts = parse_rrule(recurrence, anchor)
     freq = parts["FREQ"].upper()
     interval = int(parts.get("INTERVAL", "1"))
+    if interval > _GRAPH_INT32_MAX:
+        raise ValueError(
+            f"invalid recurrence rule: INTERVAL must be at most "
+            f"{_GRAPH_INT32_MAX} for this connector, got {interval}"
+        )
     start_date = anchor.date().isoformat()
 
     if freq in _FREQ_RECOGNIZED_KEYS:
@@ -504,6 +523,25 @@ def _build_graph_recurrence(
             "Thursday\") has no equivalent in Outlook's recurrence model"
         )
     elif freq == "YEARLY" and "BYDAY" in parts:
+        if "BYMONTH" not in parts:
+            # Without BYMONTH, RFC 5545 makes this a single YEAR-WIDE
+            # ordinal weekday (e.g. "the first Monday of the year" -
+            # confirmed against dateutil's rrule, the reference
+            # implementation this codebase already validates against) -
+            # not one scoped to whatever month DTSTART happens to fall
+            # in. Outlook's relativeYearly pattern always requires a
+            # specific month, with no way to express "year-wide" at all,
+            # so defaulting the month from the anchor would silently
+            # narrow the series to a single month instead of representing
+            # (or rejecting) the actual RFC 5545 semantics.
+            raise ValueError(
+                "unsupported recurrence pattern: FREQ=YEARLY;BYDAY=... "
+                "without BYMONTH means a single year-wide ordinal weekday "
+                "under RFC 5545 (e.g. 'the first Monday of the year'), "
+                "which Outlook's relativeYearly pattern - always scoped "
+                "to one specific month - has no way to represent; add an "
+                "explicit BYMONTH to scope it to a single month instead"
+            )
         index, days = _parse_relative_byday(parts["BYDAY"])
         month = _int_rrule_component(parts, "BYMONTH", anchor.month, 1, 12)
         pattern = {
@@ -513,9 +551,37 @@ def _build_graph_recurrence(
             "index": index,
             "month": month,
         }
+    elif freq == "YEARLY" and "BYMONTHDAY" in parts:
+        if "BYMONTH" not in parts:
+            # Same reasoning as the BYDAY branch above: without BYMONTH,
+            # RFC 5545 expands BYMONTHDAY across EVERY month, every year
+            # (confirmed against dateutil), not just DTSTART's own month.
+            # Outlook's absoluteYearly pattern always requires a specific
+            # month and can't represent "every month", so defaulting to
+            # the anchor's month would silently narrow a 12x/year series
+            # down to a single yearly occurrence with no warning.
+            raise ValueError(
+                "unsupported recurrence pattern: FREQ=YEARLY;BYMONTHDAY="
+                "... without BYMONTH means this day of EVERY month, every "
+                "year, under RFC 5545 - Outlook's absoluteYearly pattern "
+                "has no way to represent that; use FREQ=MONTHLY instead "
+                "for that meaning, or add an explicit BYMONTH to scope "
+                "this rule to a single month"
+            )
+        month = _int_rrule_component(parts, "BYMONTH", anchor.month, 1, 12)
+        day_of_month = _int_rrule_component(parts, "BYMONTHDAY", anchor.day, 1, 31)
+        _validate_day_of_month(day_of_month, month=month)
+        pattern = {
+            "type": "absoluteYearly",
+            "interval": interval,
+            "dayOfMonth": day_of_month,
+            "month": month,
+        }
     elif freq == "YEARLY":
-        # Same RFC 5545 default as above: an omitted BYMONTH/BYMONTHDAY is
-        # derived from DTSTART's own month/day.
+        # Truly unqualified (no BYMONTH/BYMONTHDAY/BYDAY at all) - RFC
+        # 5545's own default derives both from DTSTART's month/day, which
+        # is faithful here since there's no selector to be scoped
+        # incorrectly.
         month = _int_rrule_component(parts, "BYMONTH", anchor.month, 1, 12)
         day_of_month = _int_rrule_component(parts, "BYMONTHDAY", anchor.day, 1, 31)
         _validate_day_of_month(day_of_month, month=month)
@@ -562,10 +628,16 @@ def _build_graph_recurrence(
             "endDate": end_date,
         }
     elif "COUNT" in parts:
+        count = int(parts["COUNT"])
+        if count > _GRAPH_INT32_MAX:
+            raise ValueError(
+                f"invalid recurrence rule: COUNT must be at most "
+                f"{_GRAPH_INT32_MAX} for this connector, got {count}"
+            )
         range_ = {
             "type": "numbered",
             "startDate": start_date,
-            "numberOfOccurrences": int(parts["COUNT"]),
+            "numberOfOccurrences": count,
         }
     else:
         range_ = {"type": "noEnd", "startDate": start_date}

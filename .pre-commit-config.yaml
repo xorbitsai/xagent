@@ -24,6 +24,7 @@ repos:
           - types-beautifulsoup4
           - types-requests
           - types-python-dateutil
+          - tzlocal
           - httpx
           - fastapi
           - uvicorn

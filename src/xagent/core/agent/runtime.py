@@ -394,6 +394,10 @@ class PatternRuntime:
             protocol_error_payload: dict[str, Any] = {}
             saw_payload_chunk = False
             async for chunk in stream_chat(**kwargs):
+                # Buffered streams and synchronous callbacks may never suspend.
+                # Give API requests and cancellation callbacks a scheduling turn
+                # before consuming the next chunk, including protocol errors.
+                await asyncio.sleep(0)
                 await self._raise_if_interrupted("interrupted during LLM stream")
                 self._raise_for_stream_error(chunk)
                 is_protocol_error = (

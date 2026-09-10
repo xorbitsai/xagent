@@ -180,6 +180,76 @@ class StreamingLLM:
         yield StreamChunk(type=ChunkType.END)
 
 
+@pytest.mark.asyncio
+async def test_buffered_stream_yields_to_other_callbacks_between_chunks() -> None:
+    runtime = PatternRuntime()
+    observed = []
+    received = []
+    loop = asyncio.get_running_loop()
+
+    def on_chunk(chunk: StreamChunk) -> None:
+        received.append(chunk)
+        loop.call_soon(lambda: observed.append(len(received)))
+
+    result = await runtime.run_streaming_llm_call(StreamingLLM(), on_chunk=on_chunk)
+
+    assert result == "hello world"
+    assert observed == [1, 2, 3]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interrupt", [False, True])
+async def test_buffered_stream_can_be_stopped_between_chunks(interrupt: bool) -> None:
+    runtime = PatternRuntime()
+    received = []
+    loop = asyncio.get_running_loop()
+
+    def on_chunk(chunk: StreamChunk) -> None:
+        received.append(chunk.delta)
+        if interrupt:
+            loop.call_soon(runtime.request_interrupt, "stop buffered stream")
+        else:
+            loop.call_soon(call.cancel)
+
+    call = asyncio.create_task(
+        runtime.run_streaming_llm_call(StreamingLLM(), on_chunk=on_chunk)
+    )
+    expected = LLMCallInterrupted if interrupt else asyncio.CancelledError
+    with pytest.raises(expected):
+        await call
+    assert received == ["hello"]
+    assert not runtime._active_llm_tasks
+
+
+@pytest.mark.asyncio
+async def test_buffered_protocol_error_keeps_usage_and_yields() -> None:
+    from xagent.core.model.chat.tool_protocol import TOOL_PROTOCOL_ERROR_KEY
+
+    class ProtocolStream:
+        async def stream_chat(self, **_: Any) -> Any:
+            yield StreamChunk(
+                type=ChunkType.PROTOCOL_ERROR,
+                protocol_error={"code": "invalid_tool_call"},
+            )
+            yield StreamChunk(type=ChunkType.USAGE, usage={"total_tokens": 10})
+
+    observed = []
+    received = []
+
+    def on_chunk(chunk: StreamChunk) -> None:
+        received.append(chunk.type)
+        asyncio.get_running_loop().call_soon(lambda: observed.append(len(received)))
+
+    result = await PatternRuntime().run_streaming_llm_call(
+        ProtocolStream(), on_chunk=on_chunk
+    )
+    assert observed == [1, 2]
+    assert result[TOOL_PROTOCOL_ERROR_KEY] == {"code": "invalid_tool_call"}
+    assert result["usage"] == {"total_tokens": 10}
+    assert result["content"] == ""
+    assert result["tool_calls"] == []
+
+
 class StreamingLLMWithUsage:
     async def stream_chat(self, **_: Any) -> Any:
         yield StreamChunk(type=ChunkType.TOKEN, delta="hello")

@@ -102,6 +102,273 @@ def test_resolve_id_from_url_rejects_non_string():
         utils.resolve_id_from_url(12345, _TEST_URL_ID_PATTERN, "document_id")
 
 
+def test_parse_rrule_extracts_components():
+    parts = utils.parse_rrule(
+        "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;UNTIL=20260911T235959Z",
+        "2026-08-26T07:00:00+08:00",
+    )
+    assert parts == {
+        "FREQ": "WEEKLY",
+        "BYDAY": "MO,TU,WE,TH,FR",
+        "UNTIL": "20260911T235959Z",
+    }
+
+
+def test_parse_rrule_accepts_and_strips_rrule_prefix():
+    parts = utils.parse_rrule("RRULE:FREQ=DAILY;COUNT=5", "2026-08-26T07:00:00+08:00")
+    assert parts == {"FREQ": "DAILY", "COUNT": "5"}
+
+
+def test_ensure_rrule_prefix_adds_prefix_and_uppercases():
+    assert utils.ensure_rrule_prefix("FREQ=DAILY;COUNT=5") == "RRULE:FREQ=DAILY;COUNT=5"
+
+
+def test_ensure_rrule_prefix_keeps_existing_prefix_and_uppercases():
+    assert (
+        utils.ensure_rrule_prefix("rrule:freq=weekly;byday=mo,tu")
+        == "RRULE:FREQ=WEEKLY;BYDAY=MO,TU"
+    )
+
+
+def test_ensure_rrule_prefix_normalizes_lowercase_rrule():
+    """RFC 5545's RRULE grammar has no case-sensitive free-text values, so
+    a fully lowercase rule (which parse_rrule's dateutil-backed validation
+    tolerates) must still reach the calendar API canonicalized to
+    uppercase - not sent verbatim in whatever case an LLM happened to
+    produce."""
+    assert (
+        utils.ensure_rrule_prefix(
+            "freq=weekly;byday=mo,tu,we,th,fr;until=20260911t235959z"
+        )
+        == "RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;UNTIL=20260911T235959Z"
+    )
+
+
+def test_parse_rrule_rejects_empty_string():
+    with pytest.raises(ValueError, match="must not be empty"):
+        utils.parse_rrule("", "2026-08-26T07:00:00+08:00")
+    with pytest.raises(ValueError, match="must not be empty"):
+        utils.parse_rrule("RRULE:", "2026-08-26T07:00:00+08:00")
+
+
+def test_parse_rrule_rejects_missing_freq():
+    with pytest.raises(ValueError, match="FREQ"):
+        utils.parse_rrule("BYDAY=MO,TU", "2026-08-26T07:00:00+08:00")
+
+
+def test_parse_rrule_rejects_malformed_component():
+    with pytest.raises(ValueError, match="invalid recurrence rule component"):
+        utils.parse_rrule("FREQ=DAILY;BOGUS", "2026-08-26T07:00:00+08:00")
+
+
+def test_parse_rrule_rejects_duplicate_keys():
+    """A duplicate key (e.g. FREQ specified twice) would otherwise
+    silently keep only the last occurrence in the returned dict for local
+    validation, while the raw text - still containing BOTH occurrences -
+    reaches Google's API close to verbatim, where its behavior is
+    unspecified rather than matching whatever this function validated."""
+    with pytest.raises(ValueError, match="FREQ is specified more than once"):
+        utils.parse_rrule("FREQ=DAILY;FREQ=WEEKLY", "2026-08-26T07:00:00+08:00")
+
+
+def test_parse_rrule_rejects_unparseable_rule():
+    """A syntactically plausible but semantically invalid rule (an unknown
+    FREQ value) must be rejected, not silently accepted as valid RFC 5545
+    - this is exactly the class of bug the connector shipped with before:
+    a recurrence rule that only ever looks valid, never actually works."""
+    with pytest.raises(ValueError, match="invalid recurrence rule"):
+        utils.parse_rrule("FREQ=FORTNIGHTLY", "2026-08-26T07:00:00+08:00")
+
+
+def test_parse_rrule_rejects_bad_dtstart():
+    with pytest.raises(ValueError, match="invalid start time"):
+        utils.parse_rrule("FREQ=DAILY", "not-a-date")
+
+
+def test_parse_rrule_accepts_a_datetime_object_directly():
+    """A caller that already has a datetime (e.g. after localizing a naive
+    Outlook start time) shouldn't need to format it back into a string
+    just to have it reparsed here."""
+    from datetime import datetime, timezone
+
+    parts = utils.parse_rrule(
+        "FREQ=DAILY;UNTIL=20260911T235959Z",
+        datetime(2026, 8, 26, 7, 0, 0, tzinfo=timezone.utc),
+    )
+    assert parts == {"FREQ": "DAILY", "UNTIL": "20260911T235959Z"}
+
+
+def test_parse_rrule_rejects_until_before_dtstart():
+    """dateutil's own rrulestr validation does NOT catch this - an UNTIL
+    before dtstart parses fine and just silently yields zero occurrences,
+    which would otherwise report status=success for a "recurring" event
+    that never actually recurs. This must be checked explicitly."""
+    from datetime import datetime, timezone
+
+    with pytest.raises(ValueError, match="before the start time"):
+        utils.parse_rrule(
+            "FREQ=DAILY;UNTIL=20260101T000000Z",
+            datetime(2026, 6, 1, tzinfo=timezone.utc),
+        )
+
+
+def test_parse_rrule_allows_until_after_dtstart():
+    from datetime import datetime, timezone
+
+    parts = utils.parse_rrule(
+        "FREQ=DAILY;UNTIL=20260601T000000Z",
+        datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+    assert parts["UNTIL"] == "20260601T000000Z"
+
+
+def test_parse_rrule_naive_dtstart_with_utc_until_is_rejected_by_dateutil_itself():
+    """A naive dtstart combined with a "Z"-suffixed (UTC/aware) UNTIL is
+    already rejected by dateutil's own rrulestr validation before this
+    function's explicit UNTIL-vs-dtstart check ever runs - documented here
+    so the anchor.tzinfo guard in that check (added for exactly this kind
+    of aware/naive mismatch) isn't mistaken for dead code: dateutil catches
+    this shape first, with its own message."""
+    from datetime import datetime
+
+    with pytest.raises(ValueError, match="invalid recurrence rule"):
+        utils.parse_rrule(
+            "FREQ=DAILY;UNTIL=20260101T000000Z",
+            datetime(2026, 6, 1),
+        )
+
+
+def test_parse_rrule_all_day_bare_date_until_is_accepted():
+    """Confirmed bug: a bare (no-time) UNTIL is the RFC 5545-correct value
+    type for a DATE (all-day) DTSTART, but localizing a naive anchor
+    whenever `timezone` was given - added to fix the "Z"-suffixed-UNTIL
+    case above - broke this opposite case by forcing the anchor aware
+    while UNTIL stayed naive, a new mismatch. The anchor must only be
+    localized when UNTIL itself is aware."""
+    parts = utils.parse_rrule(
+        "FREQ=DAILY;UNTIL=20260911", "2026-08-26", timezone="Asia/Shanghai"
+    )
+    assert parts["UNTIL"] == "20260911"
+
+
+def test_parse_rrule_all_day_bare_date_until_before_start_is_still_rejected():
+    """The before-start guard must still catch this now-naive-vs-naive
+    comparison, not just the aware-vs-aware case."""
+    with pytest.raises(ValueError, match="before the start time"):
+        utils.parse_rrule(
+            "FREQ=DAILY;UNTIL=20260101", "2026-08-26", timezone="Asia/Shanghai"
+        )
+
+
+def test_parse_rrule_timezone_localizes_naive_dtstart_for_utc_until():
+    """Confirmed bug: unlike the previous test (no timezone given), passing
+    a resolvable IANA timezone must localize a naive dtstart so it can be
+    compared against a "Z"-suffixed UNTIL instead of dateutil rejecting the
+    aware/naive mismatch."""
+    parts = utils.parse_rrule(
+        "FREQ=DAILY;UNTIL=20260911T235959Z",
+        "2026-08-26T07:00:00",
+        timezone="Asia/Shanghai",
+    )
+    assert parts["UNTIL"] == "20260911T235959Z"
+
+
+def test_parse_rrule_timezone_still_rejects_until_before_dtstart():
+    with pytest.raises(ValueError, match="before the start time"):
+        utils.parse_rrule(
+            "FREQ=DAILY;UNTIL=20260101T000000Z",
+            "2026-08-26T07:00:00",
+            timezone="Asia/Shanghai",
+        )
+
+
+def test_parse_rrule_rejects_unknown_timezone():
+    with pytest.raises(ValueError, match="unknown timezone"):
+        utils.parse_rrule(
+            "FREQ=DAILY;UNTIL=20260911T235959Z",
+            "2026-08-26T07:00:00",
+            timezone="Not/ARealZone",
+        )
+
+
+def test_parse_rrule_rejects_non_positive_interval():
+    with pytest.raises(ValueError, match="INTERVAL must be a positive integer"):
+        utils.parse_rrule("FREQ=DAILY;INTERVAL=0", "2026-08-26T07:00:00+08:00")
+
+
+def test_parse_rrule_rejects_non_integer_interval():
+    with pytest.raises(ValueError, match="INTERVAL must be an integer"):
+        utils.parse_rrule("FREQ=DAILY;INTERVAL=abc", "2026-08-26T07:00:00+08:00")
+
+
+def test_parse_rrule_rejects_non_positive_count():
+    with pytest.raises(ValueError, match="COUNT must be a positive integer"):
+        utils.parse_rrule("FREQ=DAILY;COUNT=0", "2026-08-26T07:00:00+08:00")
+
+
+def test_parse_rrule_rejects_non_integer_count():
+    with pytest.raises(ValueError, match="COUNT must be an integer"):
+        utils.parse_rrule("FREQ=DAILY;COUNT=abc", "2026-08-26T07:00:00+08:00")
+
+
+def test_parse_rrule_rejects_signed_interval():
+    """RFC 5545 defines INTERVAL as `1*DIGIT` - plain unsigned digits only.
+    Python's int() is more permissive than that grammar (accepts a leading
+    "+"/"-"), and the raw string (not the parsed int) is what reaches
+    Google's API almost verbatim - so a value int() accepts but RFC 5545
+    doesn't must still be rejected here, not just range-checked once
+    parsed."""
+    with pytest.raises(ValueError, match="INTERVAL must be an integer"):
+        utils.parse_rrule("FREQ=DAILY;INTERVAL=+2", "2026-08-26T07:00:00+08:00")
+
+
+def test_parse_rrule_rejects_underscore_separated_count():
+    """Python's int() accepts PEP 515 "_" digit separators ("1_0" == 10),
+    which isn't valid RFC 5545 RRULE syntax and would reach Google's API as
+    literal, malformed text."""
+    with pytest.raises(ValueError, match="COUNT must be an integer"):
+        utils.parse_rrule("FREQ=DAILY;COUNT=1_0", "2026-08-26T07:00:00+08:00")
+
+
+def test_parse_rrule_accepts_interval_with_leading_zeros():
+    """Unlike a sign or underscore separator, leading zeros ARE valid under
+    RFC 5545's `1*DIGIT` grammar and must still be accepted."""
+    parts = utils.parse_rrule("FREQ=DAILY;INTERVAL=007", "2026-08-26T07:00:00+08:00")
+    assert parts["INTERVAL"] == "007"
+
+
+def test_parse_rrule_rejects_until_and_count_together():
+    """RFC 5545 treats UNTIL and COUNT as mutually exclusive ways to end a
+    series - dateutil's own rrulestr validation does not catch this
+    (COUNT simply wins), so it must be checked explicitly."""
+    with pytest.raises(ValueError, match="must not specify both UNTIL and COUNT"):
+        utils.parse_rrule(
+            "FREQ=DAILY;UNTIL=20260911T235959Z;COUNT=5",
+            "2026-08-26T07:00:00+08:00",
+        )
+
+
+def test_parse_rrule_rejects_embedded_newline():
+    """A newline could smuggle an extra RRULE/EXDATE/RDATE line into the
+    calendar API request past this connector's single-RRULE validation."""
+    with pytest.raises(ValueError, match="embedded newlines"):
+        utils.parse_rrule(
+            "FREQ=DAILY\nEXDATE:20260101T000000Z",
+            "2026-08-26T07:00:00+08:00",
+        )
+
+
+def test_resolve_zoneinfo_returns_zoneinfo_for_valid_iana_name():
+    from zoneinfo import ZoneInfo
+
+    assert utils.resolve_zoneinfo("Asia/Shanghai") == ZoneInfo("Asia/Shanghai")
+
+
+def test_resolve_zoneinfo_rejects_unknown_timezone():
+    with pytest.raises(ValueError, match="unknown timezone"):
+        utils.resolve_zoneinfo("Not/ARealZone")
+
+
 def test_url_path_id_output_survives_requests_url_normalization():
     """Confirms the actual exploit this guards against: a naively
     interpolated ".." collapses the path via requests' own URL

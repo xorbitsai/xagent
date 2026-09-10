@@ -7235,6 +7235,15 @@ wheels = [
 ]
 
 [[package]]
+name = "types-python-dateutil"
+version = "2.9.0.20260807"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/c8/4e/b3fa538f9cb38dfece0d6ccf6d3d0d925bdedb144fb9c8129dfc007cd003/types_python_dateutil-2.9.0.20260807.tar.gz", hash = "sha256:e0b8a90d464c8684c66b7b8e4556d9074afdddcc56ca45323f0987134f9e7034", size = 17618, upload-time = "2026-08-07T04:17:13.491Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e4/5e/3715867caea2f4cea56ccb04c851cde23ed063449c3b004c7a047f20dd48/types_python_dateutil-2.9.0.20260807-py3-none-any.whl", hash = "sha256:54aa3707350ed7a9cc0776fd2f6739679d6967d11b40150985e81edcb86df4db", size = 18486, upload-time = "2026-08-07T04:17:12.504Z" },
+]
+
+[[package]]
 name = "types-pyyaml"
 version = "6.0.12.20250915"
 source = { registry = "https://pypi.org/simple" }
@@ -7817,6 +7826,7 @@ dependencies = [
     { name = "pydantic" },
     { name = "pypdf" },
     { name = "pypinyin" },
+    { name = "python-dateutil" },
     { name = "python-dotenv" },
     { name = "python-jose", extra = ["cryptography"] },
     { name = "pyyaml" },
@@ -7946,6 +7956,7 @@ dev = [
     { name = "ruff" },
     { name = "types-docker" },
     { name = "types-openpyxl" },
+    { name = "types-python-dateutil" },
     { name = "types-pyyaml" },
     { name = "types-requests" },
     { name = "types-setuptools" },
@@ -7965,6 +7976,7 @@ sandbox = [
 static-type-check = [
     { name = "types-docker" },
     { name = "types-openpyxl" },
+    { name = "types-python-dateutil" },
     { name = "types-pyyaml" },
     { name = "types-requests" },
     { name = "types-setuptools" },

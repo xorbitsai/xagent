@@ -1064,7 +1064,13 @@ async def test_recovery_dispatches_committed_message_across_run_rotation(
     runtime_manager = MagicMock(
         get_agent_for_task=AsyncMock(return_value=runtime_agent)
     )
-    resume = AsyncMock()
+    allow_resume_to_finish = asyncio.Event()
+
+    async def hold_resume(*args, **kwargs) -> None:
+        await allow_resume_to_finish.wait()
+
+    resume = AsyncMock(side_effect=hold_resume)
+    resume_task = None
 
     with (
         patch(
@@ -1073,19 +1079,25 @@ async def test_recovery_dispatches_committed_message_across_run_rotation(
         ),
         patch.object(websocket_api, "execute_resume_background", new=resume),
     ):
-        assert await dispatch_one_task_command(
-            execute_durable_task_command,
-            command_db_id=enqueued.command_id,
-        )
-        resume_task = websocket_api.background_task_manager.resume_tasks.get(
-            int(task.id)
-        )
-        assert resume_task is not None
-        await resume_task
-        websocket_api.background_task_manager.cleanup_task(
-            int(task.id),
-            expected_task=resume_task,
-        )
+        try:
+            assert await dispatch_one_task_command(
+                execute_durable_task_command,
+                command_db_id=enqueued.command_id,
+            )
+            # A completed mock can already have been unregistered by the time
+            # command dispatch returns. Hold execution to inspect live ownership.
+            resume_task = websocket_api.background_task_manager.resume_tasks.get(
+                int(task.id)
+            )
+            assert resume_task is not None
+            assert not resume_task.done()
+        finally:
+            allow_resume_to_finish.set()
+            if resume_task is not None:
+                await asyncio.wait_for(resume_task, timeout=1)
+
+    assert int(task.id) not in websocket_api.background_task_manager.resume_tasks
+    assert int(task.id) not in websocket_api.background_task_manager.running_tasks
 
     db_session.expire_all()
     messages = (

@@ -1,4 +1,102 @@
-"""Bounded, opt-in HTTP/WebSocket load runner; see docs/runtime-baseline.md."""
+"""Bounded, opt-in HTTP/WebSocket runtime baseline runner.
+
+Exercises real task creation, execute_task over one WebSocket per task, event
+consumption and persisted completion status, alongside independent login and
+/health probes. This measures performance; it does not isolate runtime workers.
+
+Safety and setup:
+  Use a dedicated test deployment, database/storage root and account. Login
+  replaces the account's refresh token. Tasks persist, consume model quota and
+  may invoke tools with external side effects. Use controlled local model/tool
+  services without external credentials and check account concurrency quotas.
+  This script does not create accounts, configure models, load .env, start/stop
+  the backend, retry requests, cancel server tasks, or delete data.
+  Set XAGENT_BENCH_USERNAME and XAGENT_BENCH_PASSWORD via your local environment
+  (use a secret manager or hidden prompt for the password).
+
+Fixed workload:
+  Save a task JSON file, replacing TEST_MODEL_ID with a configured test model:
+    {
+      "title": "runtime-baseline",
+      "description": "Reply with exactly BASELINE_OK. Do not use tools.",
+      "execution_mode": "flash",
+      "llm_ids": ["TEST_MODEL_ID", "TEST_MODEL_ID", "TEST_MODEL_ID", "TEST_MODEL_ID"]
+    }
+  Pin all four model slots, or an agent_id with a recorded published config;
+  avoid automatic routing. The short prompt validates the harness, not the
+  multi-round workload. To reproduce that workload, configure a local model
+  with fixed delays, response sizes and tool-call rounds, plus harmless local
+  tools/MCP. Record their source revisions; this script does not emulate them.
+
+Example (from the repository root, using the existing aiohttp dependency):
+  python scripts/runtime_baseline.py --base-url http://127.0.0.1:8001
+    --task-payload /absolute/path/to/task.json
+    --output /absolute/path/to/new-baseline-directory
+    --confirm-test-environment --stages 0,10,50 --duration 120
+    --tasks-per-minute 12 --probe-rate 1 --task-timeout 300
+    --prometheus-url http://127.0.0.1:9090
+  Join the example lines into one command. The output directory must be new.
+  Start small: --stages 0,1 --duration 10 --tasks-per-minute 6. Increase only
+  after validating the workload. Stages are concurrency CAPS, not measured
+  active-task counts: 62 arrivals/minute with 150-second tasks gives roughly
+  155 steady-state tasks, not 630. Check actual running-task gauges.
+
+Scheduling and failure handling:
+  Each stage submits for --duration seconds, then drains client operations;
+  probes continue through drain with separate connection capacity. Fixed-rate
+  arrivals exceeding in-flight limits or generator scheduling capacity are
+  recorded as shed, never queued indefinitely or replayed as a catch-up burst.
+  --probe-inflight applies separately to login and health; size it for the
+  intended rate and anticipated latency. Any probe shedding means the requested
+  load was not met. Run the generator in a separate process, preferably host.
+  The first task failure stops new tasks and skips later stages. Known uncertain
+  IDs and unknown_creations are retained: a timed-out/failed POST can already
+  have committed. Inspect server state before rerunning. Disconnecting a socket
+  or cancelling this script is NOT server-side task cancellation.
+
+Reports and interpretation:
+  report.json contains config, payload SHA-256, stage timestamps, per-attempt
+  timings/outcomes, task IDs, summaries, throughput and optional raw Prometheus
+  series. report.md summarizes p95/p99 and outcomes. Credentials, tokens, task
+  contents, response bodies and exception messages are not written by the
+  runner. Prometheus labels can contain deployment identifiers; use a dedicated
+  test monitoring endpoint. completed means the runner finished, not an SLO pass.
+  Task latency includes creation, WebSocket execution and status confirmation;
+  login/health include connection and response handling. Scheduler lag is
+  separate. Task timeout covers the whole operation; HTTP timeout defaults to
+  60 seconds. Throughput uses submission PLUS drain time. Failed/timed-out
+  attempts remain in latency statistics (timeouts are censored lower bounds);
+  shed attempts have no latency sample. Empty percentiles are unavailable, not
+  zero. Collect hundreds of probes per stage; small-sample p99 is near the max.
+  Warm up separately and repeat at least three times. Record server Git SHA,
+  lockfile hash, DB version/pool limits, worker count, CPU/memory limits, model/
+  tool revisions and delay/round/payload settings, generator configuration and
+  OTel export/scrape intervals. Separate cold starts from steady-state runs.
+
+Monitoring:
+  Enable backend runtime OTel export first. --prometheus-url is a read-only
+  Prometheus origin, NOT the OTLP endpoint. All xagent_* series are captured at
+  15-second resolution after --metrics-settle (default 30 seconds); increase it
+  for slower export/scrape intervals. metrics_ended_at includes late post-drain
+  exports; align analysis with the separate stage start/end timestamps.
+  Missing/error/empty data is unavailable, not zero lag. Preserve instance
+  labels; do not average worker percentiles. Example PromQL (filter job/instance
+  to the test deployment; assumes standard Collector suffix translation):
+    histogram_quantile(0.99, sum by (le, job, instance) (
+      rate(xagent_event_loop_lag_milliseconds_bucket[2m])))
+    histogram_quantile(0.95, sum by (le, job, instance, operation) (
+      rate(xagent_thread_pool_queue_wait_duration_milliseconds_bucket[2m])))
+    histogram_quantile(0.95, sum by (le, job, instance) (
+      rate(xagent_trace_database_commit_duration_milliseconds_bucket[2m])))
+  Compare client tails with loop lag, pool queue/execution times, trace encoding/
+  commit, WebSocket broadcast and running-task gauges in the same window. Use
+  separate host/container tools for CPU/RSS/GIL; metrics are not a CPU profiler.
+
+Harness verification:
+  PYTHONPATH=src:. pytest tests/test_runtime_baseline.py -q
+  Tests use an ephemeral local HTTP/WebSocket fixture, not the user's backend,
+  database or model services. Fixture timings are not XAgent capacity evidence.
+"""
 
 from __future__ import annotations
 
@@ -390,7 +488,9 @@ async def run(args):
 
 
 def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--task-payload", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)

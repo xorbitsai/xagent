@@ -8,7 +8,12 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build  # type: ignore
 from mcp.server.fastmcp import FastMCP
 
-from .utils import setup_proxy_env, success_with_capped_dict
+from .utils import (
+    ensure_rrule_prefix,
+    parse_rrule,
+    setup_proxy_env,
+    success_with_capped_dict,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("calendar-mcp")
@@ -17,6 +22,31 @@ logger = logging.getLogger("calendar-mcp")
 setup_proxy_env()
 
 mcp = FastMCP("calendar-mcp")
+
+
+def _normalize_rrule(
+    recurrence: str, dtstart: str, timezone: str | None = None
+) -> list[str]:
+    """Validate `recurrence` and return it as the single-item RRULE list
+    Google's `events` resource expects, with the "RRULE:" prefix added if
+    the caller omitted it.
+
+    `timezone`, when given, localizes a naive `dtstart` (e.g. an RFC3339
+    dateTime with no UTC offset) before validation, so it can be compared
+    against a "Z"-suffixed UNTIL without dateutil rejecting the mismatch.
+    """
+    parse_rrule(recurrence, dtstart, timezone)
+    return [ensure_rrule_prefix(recurrence)]
+
+
+def _is_bare_date(value: str) -> bool:
+    """Whether a caller-supplied start_time/end_time string is a bare
+    "date" (Google's all-day form, e.g. "2026-08-26") rather than a
+    "dateTime" - checked case-insensitively since RFC3339 permits a
+    lowercase "t" date/time separator too, and a bare date never contains
+    any letters at all, so this can't misfire the other way.
+    """
+    return "t" not in value.lower()
 
 
 def get_calendar_service() -> Any:
@@ -287,10 +317,26 @@ def google_calendar_create_events(
     attendees: list[str] | None = None,
     notify_attendees: bool = False,
     add_google_meet: bool = False,
+    timezone: str | None = None,
+    recurrence: str | None = None,
 ) -> str:
     """
     Create a new event in Google Calendar.
-    start_time and end_time must be RFC3339 formatted (e.g., '2024-01-01T10:00:00Z' or '2024-01-01T10:00:00-07:00').
+    start_time and end_time must be RFC3339 formatted (e.g., '2024-01-01T10:00:00Z' or '2024-01-01T10:00:00-07:00'),
+    or both a bare date (e.g. '2024-01-01') to create an all-day event -
+    they must both be the same kind, never a mix.
+    recurrence, if given, is a single RFC 5545 RRULE string describing a
+    repeating series for this event (the "RRULE:" prefix is optional), e.g.
+    'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;UNTIL=20260911T235959Z' for "every
+    weekday until Sep 11, 2026". It's validated before being sent to
+    Google and rejected with a clear error if it can't be parsed, rather
+    than silently landing as inert text with no actual recurrence.
+    timezone is an IANA timezone name (e.g. 'America/Los_Angeles'). Google
+    requires it for recurring events specifically (it's what the
+    recurrence is expanded in), so it's required here whenever recurrence
+    is set; it's optional otherwise. When start_time/end_time have no UTC
+    offset, timezone also localizes them so recurrence's UNTIL can be
+    compared against them correctly.
     attendees is a list of email addresses to add to the event. Adding attendees does not, by
     itself, email them; set notify_attendees=True to have Google Calendar send them a native
     invite immediately. Confirm the recipient list with the user before setting notify_attendees=True.
@@ -305,22 +351,48 @@ def google_calendar_create_events(
     """
     requested_conference = False
     try:
+        start_is_all_day = _is_bare_date(start_time)
+        end_is_all_day = _is_bare_date(end_time)
+        if start_is_all_day != end_is_all_day:
+            raise ValueError(
+                "start_time and end_time must both be a bare date or both "
+                "a dateTime, never a mix - a Google Calendar event's start "
+                "and end must be the same kind"
+            )
+        if recurrence is not None and not start_is_all_day and not timezone:
+            raise ValueError(
+                "timezone is required when recurrence is set (Google expands "
+                "a recurring event's occurrences in this timezone)"
+            )
+
         service = get_calendar_service()
 
         event: dict[str, Any] = {
             "summary": summary,
-            "start": {
-                "dateTime": start_time,
-            },
-            "end": {
-                "dateTime": end_time,
-            },
+            "start": (
+                {"date": start_time} if start_is_all_day else {"dateTime": start_time}
+            ),
+            "end": {"date": end_time} if end_is_all_day else {"dateTime": end_time},
         }
+        if timezone and not start_is_all_day:
+            event["start"]["timeZone"] = timezone
+            event["end"]["timeZone"] = timezone
 
         if description:
             event["description"] = description
         if location:
             event["location"] = location
+        if recurrence is not None:
+            # An all-day event's naive date anchor still needs *some*
+            # timezone to compare against an aware ("Z"-suffixed) UNTIL -
+            # RFC 5545 requires DTSTART and UNTIL to either both be aware
+            # or both floating, regardless of whether Google itself cares
+            # about a timeZone for a date-only event. UTC is only used
+            # here for that comparison; it's never written to the event.
+            localization_timezone = timezone or ("UTC" if start_is_all_day else None)
+            event["recurrence"] = _normalize_rrule(
+                recurrence, start_time, localization_timezone
+            )
         _merge_attendees(event, attendees)
         requested_conference = _apply_conference_request(event, add_google_meet)
 

@@ -39,6 +39,210 @@ def _fake_service(execute_result: dict, existing_event: dict | None = None):
     return service
 
 
+def test_create_events_sets_recurrence(monkeypatch):
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Daily Catch up with Bright",
+            start_time="2026-08-26T07:00:00+08:00",
+            end_time="2026-08-26T07:15:00+08:00",
+            recurrence="FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;UNTIL=20260911T235959Z",
+            timezone="Asia/Shanghai",
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.insert.call_args
+    assert kwargs["body"]["recurrence"] == [
+        "RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;UNTIL=20260911T235959Z"
+    ]
+    assert kwargs["body"]["start"]["timeZone"] == "Asia/Shanghai"
+    assert kwargs["body"]["end"]["timeZone"] == "Asia/Shanghai"
+
+
+def test_create_events_requires_timezone_when_recurrence_is_set(monkeypatch):
+    """Google documents timeZone as required specifically for recurring
+    events (it's what the recurrence is expanded in) - this must be
+    rejected here rather than silently sent to Google without one."""
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Standup",
+            start_time="2026-08-26T09:00:00+08:00",
+            end_time="2026-08-26T09:15:00+08:00",
+            recurrence="FREQ=DAILY",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "timezone is required" in result["message"]
+    service.events.return_value.insert.assert_not_called()
+
+
+def test_create_events_accepts_recurrence_with_explicit_prefix(monkeypatch):
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Standup",
+            start_time="2026-08-26T09:00:00+08:00",
+            end_time="2026-08-26T09:15:00+08:00",
+            recurrence="RRULE:FREQ=DAILY;COUNT=10",
+            timezone="Asia/Shanghai",
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.insert.call_args
+    assert kwargs["body"]["recurrence"] == ["RRULE:FREQ=DAILY;COUNT=10"]
+
+
+def test_create_events_normalizes_lowercase_recurrence(monkeypatch):
+    """Regression test: dateutil's validation is lenient about case, so a
+    lowercase RRULE must still be canonicalized to uppercase before
+    reaching Google's API - not sent verbatim in whatever case an LLM
+    happened to produce."""
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_create_events(
+        summary="Standup",
+        start_time="2026-08-26T09:00:00+08:00",
+        end_time="2026-08-26T09:15:00+08:00",
+        recurrence="freq=daily;count=10",
+        timezone="Asia/Shanghai",
+    )
+
+    _, kwargs = service.events.return_value.insert.call_args
+    assert kwargs["body"]["recurrence"] == ["RRULE:FREQ=DAILY;COUNT=10"]
+
+
+def test_create_events_rejects_invalid_recurrence_without_calling_the_api(
+    monkeypatch,
+):
+    """A rule that can't be parsed must be reported as an error, not sent
+    to Google where it would either be rejected opaquely or - the
+    originally reported failure mode - silently accepted as inert text
+    with no actual recurrence."""
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Standup",
+            start_time="2026-08-26T09:00:00+08:00",
+            end_time="2026-08-26T09:15:00+08:00",
+            recurrence="FREQ=FORTNIGHTLY",
+            timezone="Asia/Shanghai",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "invalid recurrence rule" in result["message"]
+    service.events.return_value.insert.assert_not_called()
+
+
+def test_create_events_rejects_explicit_empty_recurrence(monkeypatch):
+    """Regression test: every other optional field in this function treats
+    an explicitly-passed value as meaningful; recurrence="" must not be
+    silently treated the same as not mentioning recurrence at all."""
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Standup",
+            start_time="2026-08-26T09:00:00+08:00",
+            end_time="2026-08-26T09:15:00+08:00",
+            timezone="Asia/Shanghai",
+            recurrence="",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "must not be empty" in result["message"]
+    service.events.return_value.insert.assert_not_called()
+
+
+def test_create_events_without_recurrence_has_no_recurrence_key(monkeypatch):
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_create_events(
+        summary="One-off",
+        start_time="2026-08-26T09:00:00+08:00",
+        end_time="2026-08-26T09:15:00+08:00",
+    )
+
+    _, kwargs = service.events.return_value.insert.call_args
+    assert "recurrence" not in kwargs["body"]
+
+
+def test_create_events_creates_an_all_day_event_from_bare_dates(monkeypatch):
+    """Confirmed bug: a bare-date start_time/end_time (e.g. "2026-09-01",
+    no time component) used to be silently written under the "dateTime"
+    key regardless - {"dateTime": "2026-09-01"} is not valid RFC3339 and
+    Google's real API would reject it. Must be written under "date"
+    instead, with no timeZone stamped onto it."""
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="All day thing",
+            start_time="2026-09-01",
+            end_time="2026-09-02",
+            timezone="Asia/Shanghai",
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.insert.call_args
+    assert kwargs["body"]["start"] == {"date": "2026-09-01"}
+    assert kwargs["body"]["end"] == {"date": "2026-09-02"}
+
+
+def test_create_events_rejects_mixed_bare_date_and_datetime(monkeypatch):
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Mixed",
+            start_time="2026-09-01",
+            end_time="2026-09-02T10:00:00",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "must both be a bare date or both a dateTime" in result["message"]
+    service.events.return_value.insert.assert_not_called()
+
+
+def test_create_events_all_day_recurrence_does_not_require_timezone(monkeypatch):
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="All day recurring",
+            start_time="2026-09-01",
+            end_time="2026-09-02",
+            recurrence="FREQ=DAILY;UNTIL=20260911",
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.insert.call_args
+    assert kwargs["body"]["recurrence"] == ["RRULE:FREQ=DAILY;UNTIL=20260911"]
+    assert "timeZone" not in kwargs["body"]["start"]
+
+
 def test_create_event_without_attendees_or_meet_sends_conference_version_and_no_invites(
     monkeypatch,
 ):

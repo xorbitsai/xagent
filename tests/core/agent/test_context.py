@@ -2650,6 +2650,8 @@ def test_oversized_content_is_replaced_whole_not_sliced() -> None:
     # Byte-identical across builds: nothing in the notice comes from the
     # clock or a request id.
     assert transcript == second["messages"][-1]["content"]
+
+
 # ---------------------------------------------------------------------------
 # Supersedes-scope resilience (xorbitsai/xagent#2238)
 # ---------------------------------------------------------------------------

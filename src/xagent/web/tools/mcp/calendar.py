@@ -4,6 +4,7 @@ import os
 import uuid
 from typing import Any
 
+from dateutil import parser as _date_parser
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build  # type: ignore
 from mcp.server.fastmcp import FastMCP
@@ -39,6 +40,26 @@ def _normalize_rrule(
     return [ensure_rrule_prefix(recurrence)]
 
 
+def _merge_recurrence(
+    existing_recurrence: list[str] | None, new_rrule: str
+) -> list[str]:
+    """Build the `recurrence` list for an update: replace the RRULE line(s)
+    with `new_rrule`, but keep any EXDATE/RDATE/EXRULE lines already on the
+    event (e.g. a previously-cancelled single occurrence) intact.
+
+    Google's `recurrence` field is a flat list of RRULE/EXRULE/RDATE/EXDATE
+    lines, not just the RRULE - overwriting the whole list with only the
+    new RRULE would silently resurrect any occurrence the user had already
+    cancelled.
+    """
+    preserved = [
+        line
+        for line in existing_recurrence or []
+        if not line.strip().upper().startswith("RRULE:")
+    ]
+    return [new_rrule, *preserved]
+
+
 def _is_bare_date(value: str) -> bool:
     """Whether a caller-supplied start_time/end_time string is a bare
     "date" (Google's all-day form, e.g. "2026-08-26") rather than a
@@ -47,6 +68,19 @@ def _is_bare_date(value: str) -> bool:
     any letters at all, so this can't misfire the other way.
     """
     return "t" not in value.lower()
+
+
+def _has_own_utc_offset(dt_string: str) -> bool:
+    """Whether an RFC3339 dateTime string carries its own explicit UTC
+    offset or "Z" suffix, as opposed to a naive local time meant to be
+    paired with a separate timeZone field. Used to avoid stamping a
+    possibly-different reused timeZone onto a value that's already
+    fully self-describing.
+    """
+    try:
+        return _date_parser.isoparse(dt_string).tzinfo is not None
+    except ValueError:
+        return False
 
 
 def get_calendar_service() -> Any:
@@ -439,10 +473,26 @@ def google_calendar_update_events(
     attendees: list[str] | None = None,
     notify_attendees: bool = False,
     add_google_meet: bool = False,
+    timezone: str | None = None,
+    recurrence: str | None = None,
 ) -> str:
     """
     Update an existing event in Google Calendar.
-    start_time and end_time must be RFC3339 formatted if provided.
+    start_time and end_time must be RFC3339 formatted if provided, or
+    both a bare date (e.g. '2024-01-01') to convert the event to/from
+    all-day - if only one of the two is given, it must match the kind
+    (dateTime vs. bare date) the event already has on its other side.
+    recurrence works like it does in google_calendar_create_events: a
+    single RFC 5545 RRULE string turns this event into a repeating series,
+    or replaces its existing one. Any EXDATE/RDATE lines already on the
+    event (e.g. a previously-cancelled single occurrence) are kept -
+    there is no way to clear an existing recurrence back to a single
+    event through this parameter.
+    timezone is an IANA timezone name; Google requires one for recurring
+    events. If recurrence is set and timezone is omitted, the event's own
+    existing timeZone is reused; if the event has none either, this call
+    is rejected with a clear error rather than sending an incomplete
+    request to Google.
     attendees is a list of email addresses to add to the event; attendees already on the event are
     kept, and there is no way to remove an attendee through this parameter. Adding attendees does
     not, by itself, email anyone; set notify_attendees=True to have Google Calendar send a native
@@ -466,17 +516,123 @@ def google_calendar_update_events(
 
         # First get the existing event
         event = service.events().get(calendarId="primary", eventId=event_id).execute()
+        # Captured before any of the reassignments below can overwrite
+        # event["start"]/["end"] - events().update() replaces the whole
+        # resource, so wholesale-replacing "start"/"end" with a bare
+        # {"dateTime": ...} below would otherwise silently strip the
+        # event's existing timeZone (not just for the recurrence fallback
+        # further down, but for a plain reschedule with no recurrence
+        # involved at all).
+        existing_start_timezone = event.get("start", {}).get("timeZone")
+        existing_end_timezone = event.get("end", {}).get("timeZone")
 
         if summary:
             event["summary"] = summary
         if start_time:
-            event["start"] = {"dateTime": start_time}
+            if _is_bare_date(start_time):
+                event["start"] = {"date": start_time}
+            else:
+                event["start"] = {"dateTime": start_time}
+                # Only fall back to the event's existing timeZone when the
+                # new value doesn't already carry its own UTC offset -
+                # otherwise the two could disagree (e.g. a "-07:00"
+                # dateTime alongside a reused "Asia/Manila" timeZone), an
+                # internally-contradictory EventDateTime.
+                if (
+                    existing_start_timezone
+                    and not timezone
+                    and not _has_own_utc_offset(start_time)
+                ):
+                    event["start"]["timeZone"] = existing_start_timezone
         if end_time:
-            event["end"] = {"dateTime": end_time}
+            if _is_bare_date(end_time):
+                event["end"] = {"date": end_time}
+            else:
+                event["end"] = {"dateTime": end_time}
+                if (
+                    existing_end_timezone
+                    and not timezone
+                    and not _has_own_utc_offset(end_time)
+                ):
+                    event["end"]["timeZone"] = existing_end_timezone
+
+        # An all-day event's start is a bare "date" (no "T"), never a
+        # "dateTime" - Google doesn't attach (or require) a timeZone to a
+        # whole-day occurrence. Determined from the CURRENT start value
+        # (after any start_time reassignment above, which now correctly
+        # writes "date" for a bare-date start_time), so moving an all-day
+        # event to a specific dateTime in this same call correctly stops
+        # treating it as all-day.
+        current_start_value = event.get("start", {}).get("dateTime") or event.get(
+            "start", {}
+        ).get("date")
+        is_all_day = current_start_value is not None and _is_bare_date(
+            current_start_value
+        )
+        # Google requires start and end to be the SAME kind (both a bare
+        # "date" or both a "dateTime") - never a mix. Passing only one of
+        # start_time/end_time to convert an all-day event to a timed one
+        # (or vice versa) would otherwise silently leave the other side in
+        # its old shape, producing a payload Google's API would reject.
+        current_end_value = event.get("end", {}).get("dateTime") or event.get(
+            "end", {}
+        ).get("date")
+        end_is_all_day = current_end_value is not None and _is_bare_date(
+            current_end_value
+        )
+        if (
+            current_start_value is not None
+            and current_end_value is not None
+            and is_all_day != end_is_all_day
+        ):
+            raise ValueError(
+                "start_time and end_time must both be provided together "
+                "when converting between an all-day event and a timed "
+                "event; a Google Calendar event's start and end must both "
+                "be a bare date or both a dateTime, never a mix"
+            )
+
+        if timezone and not is_all_day:
+            event.setdefault("start", {})["timeZone"] = timezone
+            event.setdefault("end", {})["timeZone"] = timezone
         if description:
             event["description"] = description
         if location:
             event["location"] = location
+        if recurrence is not None:
+            if not current_start_value:
+                raise ValueError(
+                    "could not determine the event's start time or date to "
+                    "validate the recurrence rule; pass start_time explicitly"
+                )
+            effective_timezone = timezone or existing_start_timezone
+            if not is_all_day and not effective_timezone:
+                raise ValueError(
+                    "timezone is required to set a recurrence rule on this "
+                    "event (Google expands a recurring event's occurrences "
+                    "in this timezone, and the event doesn't already have one)"
+                )
+            if effective_timezone and not is_all_day:
+                # .setdefault, not direct indexing: a malformed fetched
+                # event missing "start"/"end" entirely (Google always
+                # returns both in practice, but this avoids a raw
+                # KeyError leaking through as an opaque error message if
+                # it ever doesn't) still gets a clean dict to write into.
+                event.setdefault("start", {})["timeZone"] = effective_timezone
+                event.setdefault("end", {})["timeZone"] = effective_timezone
+            # An all-day event's naive date anchor still needs *some*
+            # timezone to compare against an aware ("Z"-suffixed) UNTIL -
+            # RFC 5545 requires DTSTART and UNTIL to either both be aware or
+            # both be floating, regardless of whether Google itself cares
+            # about a timeZone for a date-only event. UTC is only used here
+            # for that comparison; it's never written to the event.
+            localization_timezone = effective_timezone or (
+                "UTC" if is_all_day else None
+            )
+            new_rrule = _normalize_rrule(
+                recurrence, current_start_value, localization_timezone
+            )[0]
+            event["recurrence"] = _merge_recurrence(event.get("recurrence"), new_rrule)
         _merge_attendees(event, attendees)
         requested_conference = _apply_conference_request(event, add_google_meet)
 

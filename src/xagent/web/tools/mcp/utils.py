@@ -1,9 +1,7 @@
 import json
-import logging
 import os
 import re
 import urllib.request
-from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
@@ -159,73 +157,6 @@ def resolve_id_from_url(value: str, pattern: re.Pattern[str], field_name: str) -
     if match:
         return match.group(1)
     return value.strip()
-
-
-def allowed_file_dirs(env_var: str) -> list[Path]:
-    """Parse ``env_var``'s comma-separated directory allowlist, falling
-    back to the current working directory when it's unset.
-
-    Written to be reusable by any MCP connector tool that reads a local
-    file by path (each would pass its own env var name), but currently
-    only google_drive.py's upload tool calls this — gmail.py and slack.py
-    still carry their own private, near-identical copies of this same
-    logic rather than having been migrated to call it.
-    """
-    raw_dirs = os.environ.get(env_var, "")
-    if not raw_dirs.strip():
-        return [Path.cwd().resolve()]
-    return [
-        Path(stripped).expanduser().resolve()
-        for raw_dir in raw_dirs.split(",")
-        if (stripped := raw_dir.strip())
-    ]
-
-
-def resolve_allowed_file_path(
-    file_path: str,
-    env_var: str,
-    logger: logging.Logger,
-    not_found_label: str = "File",
-) -> Path:
-    """Resolve ``file_path`` and ensure it falls under one of ``env_var``'s
-    allowlisted directories — without this, a tool could be tricked into
-    reading/uploading arbitrary host files.
-
-    Pass an absolute path — a relative path resolves against this
-    process's own working directory, not the allowed directory, and will
-    not find a file written to the task workspace.
-
-    Containment is checked *before* existence, so a path that is both
-    outside the allowlist and nonexistent reports the allowlist message,
-    not "not found" — the latter would leak whether that host path exists
-    at all to a caller who has no business finding out.
-    """
-    local_path = Path(file_path).expanduser()
-    if not local_path.is_absolute():
-        local_path = Path.cwd() / local_path
-    local_path = local_path.resolve()
-
-    allowed_dirs = allowed_file_dirs(env_var)
-    if not any(local_path.is_relative_to(d) for d in allowed_dirs):
-        # The absolute host path is deliberately kept out of the raised
-        # message: it reaches the caller/LLM unfiltered via the error
-        # payload otherwise, and host filesystem layout has no business in
-        # a model transcript. Full detail (including the allowed
-        # directories) is logged server-side.
-        logger.warning(
-            "Rejected file path %s outside allowed directories: %s",
-            local_path,
-            ", ".join(str(path) for path in allowed_dirs),
-        )
-        raise PermissionError(
-            "file path is outside the allowed directories; ask the user "
-            "for a file inside the task workspace or another allowed "
-            "location"
-        )
-
-    if not local_path.is_file():
-        raise FileNotFoundError(f"{not_found_label} not found: {file_path}")
-    return local_path
 
 
 def setup_proxy_env() -> None:

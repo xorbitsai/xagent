@@ -1,5 +1,6 @@
 import base64
 import json
+import os
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -2528,6 +2529,185 @@ def test_download_file_returns_error_payload_on_api_failure(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# _resolve_upload_file_path / _upload_allowed_dirs
+# ---------------------------------------------------------------------------
+
+
+def test_upload_allowed_dirs_strips_whitespace_around_entries(tmp_path, monkeypatch):
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+    monkeypatch.setenv("XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS", f"  {dir_a} ,{dir_b}  ")
+
+    result = google_drive._upload_allowed_dirs()
+
+    assert result == [dir_a.resolve(), dir_b.resolve()]
+
+
+def test_upload_allowed_dirs_falls_back_to_cwd_when_unset(monkeypatch):
+    monkeypatch.delenv("XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS", raising=False)
+
+    assert google_drive._upload_allowed_dirs() == [Path.cwd().resolve()]
+
+
+def test_resolve_upload_file_path_accepts_file_inside_allowed_dir(
+    _upload_allowed_dirs_env,
+):
+    target = _upload_allowed_dirs_env / "report.pdf"
+    target.write_bytes(b"content")
+
+    result = google_drive._resolve_upload_file_path(str(target))
+
+    assert result == target.resolve()
+
+
+def test_resolve_upload_file_path_rejects_path_outside_allowed_dirs(
+    tmp_path, _upload_allowed_dirs_env
+):
+    outside = tmp_path / "outside.pdf"
+    outside.write_bytes(b"content")
+
+    with pytest.raises(PermissionError, match="allowed directories"):
+        google_drive._resolve_upload_file_path(str(outside))
+
+
+def test_resolve_upload_file_path_does_not_leak_host_path_or_existence(
+    tmp_path, _upload_allowed_dirs_env
+):
+    """Regression guard: a path outside the allowlist must report the same
+    "outside allowed directories" message whether or not it actually
+    exists on disk — the message must never embed the absolute host path,
+    which would otherwise let the error itself be used as an oracle for
+    probing the host filesystem's layout."""
+    missing_outside = tmp_path / "does_not_exist.pdf"
+
+    with pytest.raises(PermissionError) as exc_info:
+        google_drive._resolve_upload_file_path(str(missing_outside))
+
+    assert "allowed directories" in str(exc_info.value)
+    assert str(tmp_path) not in str(exc_info.value)
+
+
+def test_resolve_upload_file_path_rejects_dot_dot_traversal(
+    tmp_path, _upload_allowed_dirs_env
+):
+    (tmp_path / "secret.txt").write_text("secret")
+
+    with pytest.raises(PermissionError, match="allowed directories"):
+        google_drive._resolve_upload_file_path(
+            str(_upload_allowed_dirs_env / ".." / "secret.txt")
+        )
+
+
+def test_resolve_upload_file_path_rejects_prefix_confusable_sibling_dir(
+    tmp_path, monkeypatch
+):
+    """Regression guard: an allowed dir "ws" must not accidentally admit a
+    sibling "ws_evil" just because it starts with the same string —
+    containment has to be a real path-relative check (is_relative_to), not
+    a naive string prefix comparison."""
+    allowed = tmp_path / "ws"
+    allowed.mkdir()
+    evil = tmp_path / "ws_evil"
+    evil.mkdir()
+    outside = evil / "secret.txt"
+    outside.write_text("secret")
+    monkeypatch.setenv("XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS", str(allowed))
+
+    with pytest.raises(PermissionError, match="allowed directories"):
+        google_drive._resolve_upload_file_path(str(outside))
+
+
+def test_resolve_upload_file_path_rejects_symlink_escaping_allowed_dir(
+    tmp_path, _upload_allowed_dirs_env
+):
+    """A symlink physically located inside the allowed directory but
+    pointing outside it must not grant access to its target — resolve()
+    follows the symlink to its real location before the containment check
+    runs, so the escape is caught rather than trusted because the link
+    itself lives in an allowed place."""
+    secret_dir = tmp_path / "secret"
+    secret_dir.mkdir()
+    secret_file = secret_dir / "secret.txt"
+    secret_file.write_text("secret")
+    link = _upload_allowed_dirs_env / "escape_link.txt"
+    link.symlink_to(secret_file)
+
+    with pytest.raises(PermissionError, match="allowed directories"):
+        google_drive._resolve_upload_file_path(str(link))
+
+
+def test_resolve_upload_file_path_rejects_relative_path_resolved_against_cwd(
+    tmp_path, monkeypatch, _upload_allowed_dirs_env
+):
+    """A relative file_path resolves against this process's own cwd, not
+    the allowed directory — so it must be rejected when cwd isn't itself
+    inside the allowlist, exactly as the docstring warns."""
+    other_cwd = tmp_path / "somewhere_else"
+    other_cwd.mkdir()
+    (other_cwd / "report.pdf").write_bytes(b"content")
+    monkeypatch.chdir(other_cwd)
+
+    with pytest.raises(PermissionError, match="allowed directories"):
+        google_drive._resolve_upload_file_path("report.pdf")
+
+
+def test_resolve_upload_file_path_rejects_missing_file_inside_allowed_dir(
+    _upload_allowed_dirs_env,
+):
+    with pytest.raises(FileNotFoundError, match="report.pdf"):
+        google_drive._resolve_upload_file_path(
+            str(_upload_allowed_dirs_env / "report.pdf")
+        )
+
+
+def test_upload_file_tool_rejects_file_outside_allowlist_via_symlink(
+    monkeypatch, tmp_path, _upload_allowed_dirs_env
+):
+    """Tool-level regression guard (not just the _resolve_upload_file_path
+    unit above): a symlink placed inside the allowed dir but pointing at a
+    secret file elsewhere must make google_drive_upload_file itself return
+    an error, not silently upload the secret's contents."""
+    secret_dir = tmp_path / "secret"
+    secret_dir.mkdir()
+    secret_file = secret_dir / "secret.txt"
+    secret_file.write_text("secret")
+    link = _upload_allowed_dirs_env / "escape_link.txt"
+    link.symlink_to(secret_file)
+    _mock_drive_service(monkeypatch)
+
+    result = json.loads(google_drive.google_drive_upload_file(str(link)))
+
+    assert result["status"] == "error"
+    assert "allowed directories" in result["message"]
+
+
+def test_upload_file_tool_falls_back_to_cwd_when_allowlist_env_unset(
+    monkeypatch, tmp_path
+):
+    """Minor #6 regression guard: with XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS
+    unset, the tool must still work for a file inside the process's own
+    cwd (the documented fail-open default), rather than erroring."""
+    monkeypatch.delenv("XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS", raising=False)
+    monkeypatch.chdir(tmp_path)
+    local_file = tmp_path / "notes.txt"
+    local_file.write_text("hello")
+
+    files = Mock()
+    files.create.return_value.execute.return_value = {
+        "id": "new-file-id",
+        "name": "notes.txt",
+        "mimeType": "text/plain",
+    }
+    _mock_drive_service_with_files(monkeypatch, files)
+
+    result = json.loads(google_drive.google_drive_upload_file(str(local_file)))
+
+    assert result["status"] == "success"
+
+
+# ---------------------------------------------------------------------------
 # google_drive_upload_file
 # ---------------------------------------------------------------------------
 
@@ -2723,6 +2903,34 @@ def test_upload_file_rejects_missing_file(monkeypatch, _upload_allowed_dirs_env)
     assert result["status"] == "error"
     assert "not found" in result["message"].lower()
     files.create.assert_not_called()
+
+
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="root ignores file permission bits, so chmod 000 wouldn't block the read",
+)
+def test_upload_file_does_not_leak_host_path_on_open_failure(
+    monkeypatch, _upload_allowed_dirs_env
+):
+    """Regression guard for the OSError path-leak: a permission error (or a
+    TOCTOU race) from local_path.open() must not surface the absolute host
+    path in the caller-facing message -- that would undermine the same
+    scrubbing _resolve_upload_file_path's own allowlist error provides."""
+    local_file = _upload_allowed_dirs_env / "noperm.pdf"
+    local_file.write_bytes(b"content")
+    local_file.chmod(0o000)
+    try:
+        files = Mock()
+        _mock_drive_service_with_files(monkeypatch, files)
+
+        result = json.loads(google_drive.google_drive_upload_file(str(local_file)))
+
+        assert result["status"] == "error"
+        assert str(local_file) not in result["message"]
+        assert str(_upload_allowed_dirs_env) not in result["message"]
+        files.create.assert_not_called()
+    finally:
+        local_file.chmod(0o644)
 
 
 def test_upload_file_validates_parent_id_before_building_service(
@@ -3050,6 +3258,90 @@ def test_create_file_rejects_binary_extensions_not_in_the_text_allowlist(
     files.create.assert_not_called()
 
 
+@pytest.mark.parametrize("name", [".pdf", "..pdf", "...pdf"])
+def test_create_file_rejects_dotfile_style_binary_names(monkeypatch, name):
+    """Regression guard: Path(name).suffix is '' for a name that's
+    entirely a leading dot plus extension (pathlib's dotfile convention),
+    which would make the old suffix check treat it as extensionless (and
+    therefore accepted) -- exactly the mislabeling this guard exists to
+    catch. _name_looks_binary uses _split_stem_suffix instead, which
+    doesn't have this blind spot."""
+    files = Mock()
+    _mock_drive_service_with_files(monkeypatch, files)
+
+    result = json.loads(google_drive.google_drive_create_file(name, "some text"))
+
+    assert result["status"] == "error"
+    assert "google_drive_upload_file" in result["message"]
+    files.create.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "notes.mdx",
+        "template.j2",
+        "schema.json5",
+        "cert.pem",
+        "CMakeLists.cmake",
+        "messages.po",
+        "config.plist",
+    ],
+)
+def test_create_file_allows_newly_recognized_text_extensions(monkeypatch, name):
+    """These extensions were reported as false-positive rejections in
+    review (real text formats not yet in _KNOWN_TEXT_EXTENSIONS) --
+    confirms they're now accepted without needing an explicit mime_type
+    override."""
+    files = Mock()
+    files.create.return_value.execute.return_value = {"id": "f1"}
+    _mock_drive_service_with_files(monkeypatch, files)
+
+    result = json.loads(google_drive.google_drive_create_file(name, "some text"))
+
+    assert result["status"] == "success"
+    files.create.assert_called_once()
+
+
+@pytest.mark.parametrize("name", ["www.example.com", "report-v1.2", "2024.01.15-notes"])
+def test_create_file_explicit_mime_type_overrides_binary_looking_name(
+    monkeypatch, name
+):
+    """Regression guard: a name that merely contains a dot not meant as
+    an extension has no way to be rescued when mime_type is left unset --
+    but an explicit mime_type (even "text/plain") is a deliberate
+    assertion from the caller about the content's type, and must override
+    the name-based guess rather than being blocked by it."""
+    files = Mock()
+    files.create.return_value.execute.return_value = {"id": "f1"}
+    _mock_drive_service_with_files(monkeypatch, files)
+
+    result = json.loads(
+        google_drive.google_drive_create_file(name, "some text", mime_type="text/plain")
+    )
+
+    assert result["status"] == "success"
+    files.create.assert_called_once()
+
+
+@pytest.mark.parametrize("name", ["www.example.com", "report-v1.2", "2024.01.15-notes"])
+def test_create_file_still_rejects_binary_looking_name_without_explicit_override(
+    monkeypatch, name
+):
+    """Companion to the override test above: leaving mime_type unset must
+    still reject these same names -- the name-based guard only yields to
+    an *explicit* mime_type, not merely because the name happens to be a
+    false positive."""
+    files = Mock()
+    _mock_drive_service_with_files(monkeypatch, files)
+
+    result = json.loads(google_drive.google_drive_create_file(name, "some text"))
+
+    assert result["status"] == "error"
+    assert "google_drive_upload_file" in result["message"]
+    files.create.assert_not_called()
+
+
 @pytest.mark.parametrize("name", ["Dockerfile", "README", "LICENSE", "Makefile"])
 def test_create_file_allows_extensionless_names(monkeypatch, name):
     """A name with no extension at all isn't evidence of binary intent
@@ -3158,6 +3450,28 @@ def test_create_file_sends_the_normalized_mime_type_to_drive(
     kwargs = files.create.call_args.kwargs
     assert kwargs["body"]["mimeType"] == normalized
     assert kwargs["media_body"].mimetype() == normalized
+
+
+def test_create_file_strips_embedded_crlf_from_mime_type(monkeypatch):
+    """Regression guard: _normalize_mime_type strips embedded CR/LF the
+    same way _attach_resource_key already does for a different header --
+    not currently exploitable via this call site, but confirms the
+    canonical value sent to Drive never carries one through. A leading/
+    trailing CR/LF would already be handled by plain .strip(), so this
+    uses an *embedded* one to actually exercise the new stripping."""
+    files = Mock()
+    files.create.return_value.execute.return_value = {"id": "f1"}
+    _mock_drive_service_with_files(monkeypatch, files)
+
+    result = json.loads(
+        google_drive.google_drive_create_file(
+            "notes.txt", "hi", mime_type="text/pl\r\nain"
+        )
+    )
+
+    assert result["status"] == "success"
+    kwargs = files.create.call_args.kwargs
+    assert kwargs["body"]["mimeType"] == "text/plain"
 
 
 def test_create_file_google_apps_exemption_requires_the_real_prefix(monkeypatch):

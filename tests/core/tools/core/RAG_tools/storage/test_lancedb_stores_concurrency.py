@@ -6,9 +6,10 @@ single process-wide store instance at the same time. These tests pin the two
 pieces of *synchronous* shared state that made that unsafe: the table-handle
 cache, and the per-instance sync connection cache that no longer exists.
 
-Async connection init is NOT covered here and is not safe yet: ``_async_conn``
-is still guarded by an ``asyncio.Lock`` that deadlocks when reached from more
-than one event loop. Tracked in #2200.
+Async connection init is covered separately, in
+``tests/providers/vector_store/test_lancedb_async_pool.py``: it moved to a
+process-wide pool once the per-instance ``asyncio.Lock`` guarding it turned
+out to deadlock across event loops (#2200).
 
 The table-cache assertion is a conservation law rather than a race detector:
 every handle ``open_table`` returns must end up either in the cache or closed.

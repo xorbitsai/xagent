@@ -282,6 +282,16 @@ def test_redact_sensitive_text_masks_bearer_and_header_keys() -> None:
     assert "my_api_key" not in redacted
 
 
+def test_redact_sensitive_text_masks_shopify_header_case_insensitively() -> None:
+    text = "x-ShOpIfY-aCcEsS-tOkEn: shpat-secret Other-Header: preserved"
+
+    redacted = redact_sensitive_text(text)
+
+    assert "shpat-secret" not in redacted
+    assert "x-ShOpIfY-aCcEsS-tOkEn: ***" in redacted
+    assert "Other-Header: preserved" in redacted
+
+
 def test_redact_sensitive_text_masks_basic_auth_credential() -> None:
     text = "Authorization: Basic dXNlcjpzdXBlci1zZWNyZXQtdG9rZW4="
     redacted = redact_sensitive_text(text)

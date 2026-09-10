@@ -199,11 +199,20 @@ def create_mcp_server_table(Base: Type[Any]) -> Type[Any]:
             if getattr(self, "auth", None) is not None:
                 # HTTP transports consume auth via generated headers above; keep non-dict
                 # auth values for compatibility with callers that provide httpx.Auth.
-                if self.transport not in [
+                provenance_only = isinstance(decrypted_auth, dict) and set(
+                    decrypted_auth
+                ) == {"builtin_provenance"}
+                # Provenance is catalog metadata, not a transport auth object.
+                # Keep it persisted in to_config_dict(), but never pass it to
+                # the stdio client constructor.
+                is_http_transport = self.transport in {
                     "sse",
                     "websocket",
                     "streamable_http",
-                ] or not isinstance(decrypted_auth, dict):
+                }
+                if not isinstance(decrypted_auth, dict) or (
+                    not is_http_transport and not provenance_only
+                ):
                     connection["auth"] = decrypted_auth
 
             connection["concurrency_safe"] = bool(

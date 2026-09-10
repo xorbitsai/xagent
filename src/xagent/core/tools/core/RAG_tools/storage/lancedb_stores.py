@@ -11,12 +11,14 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterator, List, Literal, Optional, Sequence, Tuple, cast
 
-import lancedb
 import pyarrow as pa  # type: ignore
 from filelock import FileLock, Timeout
 from lancedb.db import DBConnection
 
-from xagent.providers.vector_store.lancedb import get_connection_from_env
+from xagent.providers.vector_store.lancedb import (
+    get_async_connection_from_env,
+    get_connection_from_env,
+)
 
 from ..core.config import (
     DEFAULT_INDEX_POLICY,
@@ -643,8 +645,6 @@ class LanceDBVectorIndexStore(VectorIndexStore):
     _TABLE_CACHE_MAXSIZE = 64
 
     def __init__(self) -> None:
-        self._async_conn: Optional[Any] = None  # AsyncConnection
-        self._async_lock = asyncio.Lock()  # Protect async connection initialization
         self._table_cache: OrderedDict[str, Any] = OrderedDict()
         # Guards _table_cache across the worker threads asyncio.to_thread
         # dispatches handle storage calls to.
@@ -720,26 +720,8 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             _safe_close_table(_table)
 
     async def _get_async_connection(self) -> Any:
-        """Get or create async LanceDB connection with thread-safe initialization."""
-        # Fast path: return existing connection without lock
-        if self._async_conn is not None:
-            return self._async_conn
-
-        # Slow path: initialize with lock to prevent race condition
-        async with self._async_lock:
-            # Double-check after acquiring lock
-            if self._async_conn is not None:
-                return self._async_conn
-
-            # Get URI from sync connection for reuse
-            sync_conn = await asyncio.to_thread(self._get_connection)
-            uri = getattr(sync_conn, "uri", None)
-            if uri is None:
-                # Fallback: use LANCEDB_DIR env var
-
-                uri = os.getenv("LANCEDB_DIR", "./data/lancedb")
-            self._async_conn = await lancedb.connect_async(uri)  # type: ignore[attr-defined]
-            return self._async_conn
+        """Get the process-wide async LanceDB connection."""
+        return await get_async_connection_from_env()
 
     def list_document_records(
         self,
@@ -3661,23 +3643,9 @@ class LanceDBIngestionStatusStore(IngestionStatusStore):
     Manages ingestion_runs table for tracking document processing status.
     """
 
-    def __init__(self) -> None:
-        self._async_conn: Optional[Any] = None
-        self._async_lock = asyncio.Lock()
-
     def _get_sync_connection(self) -> DBConnection:
         """Get sync LanceDB connection."""
         return get_connection_from_env()
-
-    async def _get_async_connection(self) -> Any:
-        """Get async LanceDB connection."""
-        if self._async_conn is None:
-            async with self._async_lock:
-                if self._async_conn is None:
-                    self._async_conn = await lancedb.connect_async(  # type: ignore[attr-defined]
-                        get_connection_from_env().uri  # type: ignore[attr-defined]
-                    )
-        return self._async_conn
 
     def _ensure_ingestion_runs_table(self, conn: DBConnection) -> None:
         """Ensure ingestion_runs table exists."""

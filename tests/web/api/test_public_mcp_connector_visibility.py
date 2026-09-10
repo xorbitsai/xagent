@@ -1115,6 +1115,89 @@ def test_builtin_registry_drift_validation_accepts_canonical_rows() -> None:
             pass
 
 
+def test_shopify_provenance_version_drift_keeps_ownership_and_is_reported() -> None:
+    from xagent.web.builtin_mcp_registry import (
+        _persisted_builtin_provenance_matches,
+        is_builtin_public_mcp_app,
+        validate_builtin_public_mcp_apps,
+    )
+    from xagent.web.mcp_apps import _app_to_dict
+
+    temp_dir = _setup_test_db()
+    db = next(get_db())
+    try:
+        shopify_app = (
+            db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "shopify").one()
+        )
+        launch_config = dict(shopify_app.launch_config)
+        marker = dict(launch_config["builtin_provenance"])
+        marker["version"] = 999
+        launch_config["builtin_provenance"] = marker
+        shopify_app.launch_config = launch_config
+        db.commit()
+
+        assert _persisted_builtin_provenance_matches("shopify", launch_config) is True
+        assert is_builtin_public_mcp_app("shopify") is True
+        assert (
+            _app_to_dict(shopify_app)["launch_config"]["builtin_provenance"]["version"]
+            == 1
+        )
+        with get_engine().begin() as connection:
+            mismatches = validate_builtin_public_mcp_apps(connection)
+
+        shopify_mismatch = next(
+            mismatch for mismatch in mismatches if mismatch["app_id"] == "shopify"
+        )
+        assert shopify_mismatch["mismatched_fields"] == ["launch_config"]
+    finally:
+        db.close()
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_shopify_foreign_provenance_is_not_owned_but_is_reported() -> None:
+    from xagent.web.builtin_mcp_registry import (
+        _persisted_builtin_provenance_matches,
+        validate_builtin_public_mcp_apps,
+    )
+
+    temp_dir = _setup_test_db()
+    db = next(get_db())
+    try:
+        shopify_app = (
+            db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "shopify").one()
+        )
+        launch_config = dict(shopify_app.launch_config)
+        marker = dict(launch_config["builtin_provenance"])
+        marker["registry"] = "custom"
+        launch_config["builtin_provenance"] = marker
+        shopify_app.launch_config = launch_config
+        db.commit()
+
+        assert _persisted_builtin_provenance_matches("shopify", launch_config) is False
+        with get_engine().begin() as connection:
+            mismatches = validate_builtin_public_mcp_apps(connection)
+
+        shopify_mismatch = next(
+            mismatch for mismatch in mismatches if mismatch["app_id"] == "shopify"
+        )
+        assert shopify_mismatch["mismatched_fields"] == ["builtin_provenance"]
+    finally:
+        db.close()
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
 def test_init_db_logs_safe_builtin_registry_drift_without_repairing(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

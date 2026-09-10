@@ -134,7 +134,17 @@ def _is_text_mime_type(mime_type: str) -> bool:
 # these extensions and _name_looks_binary treats them as text unless a
 # caller's own filename collides with one of the entries in the fallback
 # set below (it doesn't -- none share a suffix).
-_AMBIGUOUS_TEXT_EXTENSIONS = {".ts", ".bat", ".scm", ".sc"}
+_AMBIGUOUS_TEXT_EXTENSIONS = {
+    ".ts", ".bat", ".scm", ".sc",
+    # Not a verified collision like the four above -- mimetypes.guess_type
+    # returns None for ".ps1" on every host tested (see
+    # _KNOWN_BINARY_EXTENSIONS_WITHOUT_MIME_GUESS's own note on why it's
+    # NOT in that set). Included here defensively anyway: no real binary
+    # format uses ".ps1", so there's no downside, and it removes any
+    # dependency on some as-yet-unseen host's mime database staying silent
+    # on it.
+    ".ps1",
+}  # fmt: skip
 
 # Extensions of unambiguously binary formats that resolve to no mime type
 # at all (neither _MIME_TYPE_OVERRIDES nor a bare stdlib mimetypes install

@@ -743,6 +743,28 @@ def test_simple_upload_max_bytes_is_at_or_below_graphs_4mb_limit():
     assert onedrive._SIMPLE_UPLOAD_MAX_BYTES <= 4_000_000
 
 
+@pytest.mark.parametrize(
+    "mime_type",
+    [
+        "application/x-sql",
+        "application/x-httpd-php",
+        "application/vnd.dart",
+        "application/x-tex",
+        "application/x-csh",
+        "application/vnd.groove-tool-template",
+    ],
+)
+def test_text_safe_mime_types_includes_added_entries_directly(mime_type):
+    """Regression guard independent of the host's own mimetypes database:
+    whether mimetypes.guess_type actually resolves a given extension to one
+    of these types varies by host (e.g. ".php" only resolves to
+    "application/x-httpd-php" with a fuller system mime.types installed,
+    not reproduced on every machine/CI image) -- this asserts the set
+    membership directly, so the coverage doesn't silently depend on the
+    test host happening to have the right mime.types file installed."""
+    assert onedrive._is_text_mime_type(mime_type)
+
+
 def test_upload_file_at_exact_boundary_uses_simple_put(
     monkeypatch, _upload_allowed_dirs_env
 ):

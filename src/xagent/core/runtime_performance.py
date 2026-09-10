@@ -319,9 +319,14 @@ def initialize_runtime_performance_telemetry() -> bool:
     """Configure OTLP/HTTP metrics export when explicitly enabled."""
 
     global _meter_provider
-    if not get_runtime_telemetry_enabled():
+    try:
+        if not get_runtime_telemetry_enabled():
+            return False
+        endpoint = get_otel_metrics_endpoint()
+    except ValueError:
+        # Do not echo an endpoint that may contain credentials or query data.
+        logger.warning("Invalid OTLP metrics endpoint; runtime telemetry is disabled")
         return False
-    endpoint = get_otel_metrics_endpoint()
     if endpoint is None:
         logger.warning(
             "Runtime telemetry is enabled but no OTLP metrics endpoint is configured"

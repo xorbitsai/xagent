@@ -5240,23 +5240,28 @@ class ConnectionManager:
             # the delivery snapshot afterwards so newly connected clients are
             # included; membership is checked again before every send below.
             connections = self.connections_for_task(task_id)
+            # Fanout measures intended recipients, not successful deliveries.
             observe_value(
                 "xagent.websocket.broadcast.fanout",
                 len(connections),
                 unit="{connection}",
             )
-            encoded_message = json.dumps(versioned_message)
+            try:
+                encoded_message = json.dumps(versioned_message)
+            except Exception:
+                # Invalid message data does not imply a broken connection.
+                logger.error("Failed to serialize WebSocket broadcast", exc_info=True)
+                raise
+            observe_value(
+                "xagent.websocket.payload.size",
+                # ensure_ascii=True makes character count equal byte count.
+                len(encoded_message),
+                unit="By",
+            )
             for connection in connections:
                 if not self.is_connection_registered(connection, task_id):
                     continue
                 try:
-                    observe_value(
-                        "xagent.websocket.payload.size",
-                        # json.dumps defaults to ensure_ascii=True, so character
-                        # count equals encoded byte count without another copy.
-                        len(encoded_message),
-                        unit="By",
-                    )
                     await connection.send_text(encoded_message)
                     increment_performance_counter("xagent.websocket.messages.sent")
                 except (

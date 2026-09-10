@@ -5,6 +5,7 @@ import threading
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 from opentelemetry.proto.collector.metrics.v1.metrics_service_pb2 import (
@@ -23,6 +24,40 @@ from xagent.core.runtime_performance import (
     run_in_thread_with_telemetry,
     runtime_performance,
 )
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "localhost:4318",
+        "http://localhost:4318?secret=value",
+        "http://localhost:4318/#fragment",
+    ],
+)
+def test_invalid_endpoint_disables_telemetry(monkeypatch, caplog, endpoint):
+    monkeypatch.setenv("XAGENT_RUNTIME_TELEMETRY_ENABLED", "true")
+    monkeypatch.setenv("XAGENT_OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", endpoint)
+    assert runtime_metrics.initialize_runtime_performance_telemetry() is False
+    assert "runtime telemetry is disabled" in caplog.text
+    assert endpoint not in caplog.text
+
+
+def test_meter_failure_does_not_mask_business_result_or_error(monkeypatch):
+    meter = MagicMock()
+    meter.create_counter.side_effect = RuntimeError("broken meter")
+    meter.create_histogram.return_value.record.side_effect = RuntimeError(
+        "broken histogram"
+    )
+    monkeypatch.setattr(
+        runtime_metrics, "runtime_performance", RuntimePerformanceTelemetry(meter)
+    )
+    runtime_metrics.increment_counter("xagent.test")
+    with runtime_metrics.observe_duration("xagent.test.duration"):
+        result = 42
+    assert result == 42
+    with pytest.raises(ValueError, match="business error"):
+        with runtime_metrics.observe_duration("xagent.test.duration"):
+            raise ValueError("business error")
 
 
 @pytest.fixture

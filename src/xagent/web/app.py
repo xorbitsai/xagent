@@ -1850,8 +1850,6 @@ async def shutdown_event() -> None:
     if temp_file_cleanup_stop is not None:
         temp_file_cleanup_stop.set()
 
-    await stop_runtime_performance_monitor(app)
-
     flush_langfuse()
 
     if _task_command_dispatcher_task is not None:
@@ -1933,6 +1931,10 @@ async def shutdown_event() -> None:
 
     await background_task_manager.shutdown()
     await wait_for_heartbeat_manager_idle()
+
+    # Export task-finalization metrics and post-drain gauges before stopping
+    # telemetry. Exporter shutdown must not delay cancellation of live tasks.
+    await stop_runtime_performance_monitor(app)
 
     from .services.task_runtime import shutdown_task_runtime_hook_executor
 

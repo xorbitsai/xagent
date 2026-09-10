@@ -6,10 +6,10 @@ import re
 from datetime import date, datetime, timedelta
 from typing import Any
 from urllib.parse import quote
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
 from dateutil import parser as _date_parser
-from dateutil import tz as _tz
 from mcp.server.fastmcp import FastMCP
 from tzlocal.windows_tz import win_tz as _WINDOWS_TZ_TO_IANA
 
@@ -124,11 +124,12 @@ _RRULE_DAY_TO_GRAPH = {
 
 
 def _resolve_timezone(timezone: str) -> Any:
-    """Resolve a timezone name to a dateutil tzinfo, trying it as an IANA
-    name first (what this tool itself always writes) and falling back to
-    the full CLDR Windows<->IANA mapping (what Graph often reports for
-    events created by other clients, e.g. Outlook desktop/web) before
-    giving up.
+    """Resolve a timezone name to a valid tzinfo, trying it as an IANA
+    name first via the strict stdlib `zoneinfo` module (what this tool
+    itself always writes, and the same strict validation
+    `utils.resolve_zoneinfo` uses for Google) and falling back to the
+    full CLDR Windows<->IANA mapping (what Graph often reports for events
+    created by other clients, e.g. Outlook desktop/web) before giving up.
 
     A hand-written subset of this table (~18 entries) previously covered
     only common business timezones and left every other valid Windows
@@ -138,17 +139,29 @@ def _resolve_timezone(timezone: str) -> Any:
     is the same CLDR-derived table (~139 entries) `tzlocal` itself uses
     for Windows-local-timezone detection, already a transitive dependency
     via `celery` and now a direct one.
+
+    Deliberately does NOT fall back to `dateutil.tz.gettz`'s broader,
+    looser resolution: it silently accepts POSIX-TZ strings like "UTC+8"
+    as a `tzstr` (confirmed - `zoneinfo.ZoneInfo` correctly rejects the
+    same string), which is neither a real IANA nor Windows timezone name
+    and isn't anything Graph's own `recurrenceTimeZone`/`timeZone` fields
+    document accepting - letting it through here would only forward an
+    unvalidated, Graph-unrecognized string into the outgoing payload
+    verbatim, for a fully opaque remote rejection instead of a clear
+    local one.
     """
     if not timezone.strip():
         raise ValueError("timezone must not be blank")
-    zone = _tz.gettz(timezone)
-    if zone is not None:
-        return zone
+    try:
+        return ZoneInfo(timezone)
+    except (ZoneInfoNotFoundError, ValueError):
+        pass
     iana_name = _WINDOWS_TZ_TO_IANA.get(timezone)
     if iana_name is not None:
-        zone = _tz.gettz(iana_name)
-        if zone is not None:
-            return zone
+        try:
+            return ZoneInfo(iana_name)
+        except (ZoneInfoNotFoundError, ValueError):
+            pass
     raise ValueError(f"unknown timezone for recurrence rule: {timezone}")
 
 
@@ -173,6 +186,21 @@ def _rrule_until_to_date(until: str, zone: Any, anchor: datetime) -> str:
     since it only ever checks the calendar date - `endDate` is backed off
     by one day in that case so Graph actually excludes it, rather than
     silently running the series one occurrence past what UNTIL specified.
+
+    The "series' own occurrence time" is `anchor`'s own naive wall-clock
+    reading (`anchor.time()`), not `anchor` re-projected into `zone`
+    (`anchor.astimezone(zone).time()`). Those two differ whenever
+    `start_datetime` carries its own embedded UTC offset that disagrees
+    with the separately-passed `timezone` - a rare but real combination -
+    and re-projecting made the comparison mix two different frames: an
+    `endDate` derived from `anchor`'s OWN offset, compared against a
+    threshold computed in `zone`. That mismatch could back `endDate` off
+    onto a day the series never actually fires on, silently dropping the
+    real final occurrence with no error surfaced anywhere - worse than
+    just picking a differently-labeled day. Using `anchor.time()` keeps
+    the comparison anchored to the same wall-clock reading `start_date`
+    below is already derived from, regardless of which frame `zone`
+    happens to be.
     """
     try:
         parsed = _date_parser.isoparse(until.strip())
@@ -182,7 +210,7 @@ def _rrule_until_to_date(until: str, zone: Any, anchor: datetime) -> str:
         return parsed.date().isoformat()
     parsed = parsed.astimezone(zone)
     end_date = parsed.date()
-    if parsed.time() < anchor.astimezone(zone).time():
+    if parsed.time() < anchor.time():
         end_date -= timedelta(days=1)
     return end_date.isoformat()
 
@@ -899,6 +927,11 @@ def outlook_update_event(
     5545 RRULE string turns this event into a repeating series, or
     replaces its existing one - there is no way to clear an existing
     recurrence back to a single event through this parameter.
+    timezone is ignored when setting recurrence without also passing
+    start_datetime: the event's own current timeZone is used instead, so
+    the recurrence's pattern and its wall-clock start stay consistent
+    with each other. Pass start_datetime alongside timezone if you need
+    the recurrence built against a specific zone.
     """
     try:
         payload: dict[str, Any] = {}

@@ -66,6 +66,30 @@ def test_build_graph_recurrence_until_keeps_end_date_when_occurrence_lands_earli
     assert recurrence["range"]["endDate"] == "2026-09-11"
 
 
+def test_build_graph_recurrence_until_backoff_uses_anchors_own_offset_not_timezone_param():
+    """Confirmed bug: when start_datetime carries its own embedded UTC
+    offset that disagrees with the separately-passed timezone (already a
+    documented, accepted edge case for weekday/date derivation), the
+    backoff comparison used to re-project the anchor into `timezone`
+    instead of reading its own wall-clock time - mixing two different
+    frames with `startDate` (always derived from the anchor's own
+    offset). That could back `endDate` off onto a day the series never
+    actually fires on, silently dropping the real final occurrence with
+    no error. FREQ=WEEKLY;BYDAY=WE anchored Wednesday 07:00+08:00, with
+    UNTIL at 2026-09-16T10:00:00Z (2026-09-16 18:00 in the anchor's own
+    +08:00 offset, well after 07:00) must keep 2026-09-16 - the old,
+    wrong comparison (against the timezone="UTC" frame, where the
+    anchor's 07:00+08:00 reads as 23:00 the PRIOR day) backed off to
+    2026-09-15, a Tuesday the weekly-Wednesday series never fires on,
+    silently excluding the 09-16 occurrence entirely."""
+    recurrence = outlook._build_graph_recurrence(
+        "FREQ=WEEKLY;BYDAY=WE;UNTIL=20260916T100000Z",
+        "2026-08-26T07:00:00+08:00",
+        "UTC",
+    )
+    assert recurrence["range"]["endDate"] == "2026-09-16"
+
+
 def test_build_graph_recurrence_weekly_with_explicit_byday():
     recurrence = outlook._build_graph_recurrence(
         "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;UNTIL=20260911T235959Z",
@@ -610,6 +634,26 @@ def test_build_graph_recurrence_weekly_honors_explicit_wkst():
 def test_resolve_timezone_rejects_blank_string():
     with pytest.raises(ValueError, match="must not be blank"):
         outlook._resolve_timezone("")
+
+
+def test_resolve_timezone_rejects_posix_tz_strings():
+    """Confirmed bug: dateutil.tz.gettz silently accepts POSIX-TZ strings
+    like "UTC+8" as a valid tzstr (zoneinfo.ZoneInfo correctly rejects the
+    same string) - neither a real IANA nor Windows timezone name, and not
+    anything Graph's recurrenceTimeZone/timeZone fields document
+    accepting. The raw string used to reach the outgoing payload
+    unvalidated; must now be rejected locally instead."""
+    with pytest.raises(ValueError, match="unknown timezone"):
+        outlook._resolve_timezone("UTC+8")
+
+
+def test_resolve_timezone_still_resolves_iana_and_windows_names():
+    """The switch to strict zoneinfo-based resolution must not regress
+    either previously-working path."""
+    assert str(outlook._resolve_timezone("Asia/Manila")) == "Asia/Manila"
+    assert str(outlook._resolve_timezone("Pacific Standard Time")) == (
+        "America/Los_Angeles"
+    )
 
 
 def test_create_event_sends_translated_recurrence(monkeypatch):

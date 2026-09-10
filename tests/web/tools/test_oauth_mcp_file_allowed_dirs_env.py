@@ -1,7 +1,7 @@
 """Tests for injecting the file-upload allowlist directory into OAuth-transport
 MCP subprocess environments (LinkedIn's image upload, Slack's file upload,
-Gmail's message attachments) and Google Drive's dedicated write-target
-output directory."""
+Gmail's message attachments, Google Drive's file upload) and Google Drive's
+dedicated write-target output directory."""
 
 from types import SimpleNamespace
 
@@ -18,7 +18,7 @@ def _app_info(module: str, access_token_env: str) -> dict:
     }
 
 
-def test_transport_config_sets_both_allowlist_vars_when_workspace_has_a_task(
+def test_transport_config_sets_all_allowlist_vars_when_workspace_has_a_task(
     tmp_path,
 ):
     cfg = WebToolConfig(

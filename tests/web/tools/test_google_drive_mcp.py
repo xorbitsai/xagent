@@ -2493,13 +2493,12 @@ def test_download_file_returns_error_payload_on_api_failure(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_upload_file_sends_real_binary_content(monkeypatch, tmp_path):
+def test_upload_file_sends_real_binary_content(monkeypatch, _upload_allowed_dirs_env):
     """Regression guard for the actual production bug: uploading an
     already-generated PDF must send its real bytes with a real
     application/pdf mimeType — not a text/plain placeholder string, which
     is all google_drive_create_file's str content parameter can carry."""
-    allowed_dir = tmp_path / "workspace"
-    local_pdf = allowed_dir / "Regional_Performance_Summary.pdf"
+    local_pdf = _upload_allowed_dirs_env / "Regional_Performance_Summary.pdf"
     local_pdf.write_bytes(b"%PDF-1.4 fake pdf bytes")
 
     files = Mock()
@@ -2526,9 +2525,10 @@ def test_upload_file_sends_real_binary_content(monkeypatch, tmp_path):
     assert media.size() == len(b"%PDF-1.4 fake pdf bytes")
 
 
-def test_upload_file_accepts_explicit_name_and_mime_type(monkeypatch, tmp_path):
-    allowed_dir = tmp_path / "workspace"
-    local_file = allowed_dir / "data.bin"
+def test_upload_file_accepts_explicit_name_and_mime_type(
+    monkeypatch, _upload_allowed_dirs_env
+):
+    local_file = _upload_allowed_dirs_env / "data.bin"
     local_file.write_bytes(b"\x00\x01\x02")
 
     files = Mock()
@@ -2547,9 +2547,10 @@ def test_upload_file_accepts_explicit_name_and_mime_type(monkeypatch, tmp_path):
     assert kwargs["body"]["mimeType"] == "application/octet-stream"
 
 
-def test_upload_file_defaults_mime_type_when_unguessable(monkeypatch, tmp_path):
-    allowed_dir = tmp_path / "workspace"
-    local_file = allowed_dir / "mystery_file_no_extension"
+def test_upload_file_defaults_mime_type_when_unguessable(
+    monkeypatch, _upload_allowed_dirs_env
+):
+    local_file = _upload_allowed_dirs_env / "mystery_file_no_extension"
     local_file.write_bytes(b"some bytes")
 
     files = Mock()
@@ -2563,9 +2564,10 @@ def test_upload_file_defaults_mime_type_when_unguessable(monkeypatch, tmp_path):
     assert kwargs["body"]["mimeType"] == "application/octet-stream"
 
 
-def test_upload_file_includes_parent_id_when_given(monkeypatch, tmp_path):
-    allowed_dir = tmp_path / "workspace"
-    local_file = allowed_dir / "report.pdf"
+def test_upload_file_includes_parent_id_when_given(
+    monkeypatch, _upload_allowed_dirs_env
+):
+    local_file = _upload_allowed_dirs_env / "report.pdf"
     local_file.write_bytes(b"content")
 
     files = Mock()
@@ -2581,7 +2583,50 @@ def test_upload_file_includes_parent_id_when_given(monkeypatch, tmp_path):
     assert kwargs["body"]["parents"] == ["folder-1"]
 
 
-def test_upload_file_rejects_path_outside_allowed_directories(monkeypatch, tmp_path):
+def test_upload_file_resolves_parent_id_url_and_supports_shared_drives(
+    monkeypatch, _upload_allowed_dirs_env
+):
+    local_file = _upload_allowed_dirs_env / "report.pdf"
+    local_file.write_bytes(b"content")
+
+    service = _mock_drive_service(monkeypatch)
+    service.files.return_value.create.return_value.execute.return_value = {
+        "id": "new1",
+        "name": "report.pdf",
+    }
+
+    result = json.loads(
+        google_drive.google_drive_upload_file(
+            str(local_file), parent_id=_FOLDER_URL_WITH_ID
+        )
+    )
+
+    assert result["status"] == "success"
+    kwargs = service.files.return_value.create.call_args.kwargs
+    assert kwargs["body"]["parents"] == ["abc123"]
+    assert kwargs["supportsAllDrives"] is True
+
+
+def test_upload_file_attaches_resource_key_header_for_parent(
+    monkeypatch, _upload_allowed_dirs_env
+):
+    local_file = _upload_allowed_dirs_env / "report.pdf"
+    local_file.write_bytes(b"content")
+
+    service = _mock_drive_service(monkeypatch)
+    create_request = service.files.return_value.create.return_value
+    create_request.headers = {}
+    create_request.execute.return_value = {"id": "new1", "name": "report.pdf"}
+
+    url = "https://drive.google.com/drive/folders/abc123?resourcekey=0-Rkey123"
+    google_drive.google_drive_upload_file(str(local_file), parent_id=url)
+
+    assert create_request.headers == {"X-Goog-Drive-Resource-Keys": "abc123/0-Rkey123"}
+
+
+def test_upload_file_rejects_path_outside_allowed_directories(
+    monkeypatch, tmp_path, _upload_allowed_dirs_env
+):
     outside_file = tmp_path / "outside.pdf"
     outside_file.write_bytes(b"content")
 
@@ -2592,12 +2637,14 @@ def test_upload_file_rejects_path_outside_allowed_directories(monkeypatch, tmp_p
 
     assert result["status"] == "error"
     assert "allowed directories" in result["message"]
+    # The absolute host path must never leak into the message the LLM
+    # sees — that's the whole point of scrubbing it server-side.
+    assert str(outside_file) not in result["message"]
     files.create.assert_not_called()
 
 
-def test_upload_file_rejects_missing_file(monkeypatch, tmp_path):
-    allowed_dir = tmp_path / "workspace"
-    missing_path = allowed_dir / "does_not_exist.pdf"
+def test_upload_file_rejects_missing_file(monkeypatch, _upload_allowed_dirs_env):
+    missing_path = _upload_allowed_dirs_env / "does_not_exist.pdf"
 
     files = Mock()
     _mock_drive_service_with_files(monkeypatch, files)
@@ -2608,9 +2655,8 @@ def test_upload_file_rejects_missing_file(monkeypatch, tmp_path):
     files.create.assert_not_called()
 
 
-def test_upload_file_rejects_empty_file(monkeypatch, tmp_path):
-    allowed_dir = tmp_path / "workspace"
-    empty_file = allowed_dir / "empty.pdf"
+def test_upload_file_rejects_empty_file(monkeypatch, _upload_allowed_dirs_env):
+    empty_file = _upload_allowed_dirs_env / "empty.pdf"
     empty_file.write_bytes(b"")
 
     files = Mock()
@@ -2623,9 +2669,10 @@ def test_upload_file_rejects_empty_file(monkeypatch, tmp_path):
     files.create.assert_not_called()
 
 
-def test_upload_file_returns_error_payload_on_api_failure(monkeypatch, tmp_path):
-    allowed_dir = tmp_path / "workspace"
-    local_file = allowed_dir / "report.pdf"
+def test_upload_file_returns_error_payload_on_api_failure(
+    monkeypatch, _upload_allowed_dirs_env
+):
+    local_file = _upload_allowed_dirs_env / "report.pdf"
     local_file.write_bytes(b"content")
 
     files = Mock()
@@ -2714,7 +2761,7 @@ def test_create_file_rejects_binary_mime_type_even_with_a_non_flagged_name(
     always UTF-8-encoded text regardless of what mime_type claims. Without
     this, a caller could bypass the binary-looking-name guard entirely by
     using a name with no extension, a .txt extension, or an extension
-    outside the hardcoded binary set, while still declaring a binary
+    mimetypes doesn't recognize as binary, while still declaring a binary
     mime_type — producing the exact declared-type-vs-content mismatch this
     guard exists to prevent."""
     files = Mock()
@@ -2748,3 +2795,84 @@ def test_create_file_allows_text_safe_mime_types(monkeypatch, mime_type):
 
     assert result["status"] == "success"
     files.create.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "archive.7z",
+        "book.epub",
+        "doc.odt",
+        "photo.heic",
+        "sheet.xlsm",
+        "audio.wav",
+        "scan.tiff",
+        "installer.exe",
+        "backup.tar.gz",
+    ],
+)
+def test_create_file_rejects_previously_unlisted_binary_extensions(monkeypatch, name):
+    """Regression guard: reviewer-flagged gap in the old hand-maintained
+    _BINARY_NAME_EXTENSIONS blocklist — these extensions were never in that
+    18-entry set, so with the default text/plain mime_type they used to
+    sail straight through the guard and get silently created as
+    mislabeled text files. The mimetypes-based check must catch all of
+    them without needing a per-format entry added by hand."""
+    files = Mock()
+    _mock_drive_service_with_files(monkeypatch, files)
+
+    result = json.loads(google_drive.google_drive_create_file(name, "some text"))
+
+    assert result["status"] == "error"
+    assert "google_drive_upload_file" in result["message"]
+    files.create.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "mime_type",
+    [
+        "application/json; charset=utf-8",
+        "TEXT/PLAIN",
+        "  text/plain  ",
+        "application/x-yaml",
+        "application/yaml",
+        "application/javascript",
+        "",
+    ],
+)
+def test_create_file_allows_broadened_and_normalized_mime_types(monkeypatch, mime_type):
+    """Regression guard: reviewer-flagged over-narrow reuse of the
+    read-path's _is_text_mime_type — a parameterized mime_type (with
+    ";charset=..."), a differently-cased one, surrounding whitespace,
+    common text formats the original 3-entry allowlist didn't cover
+    (YAML, JavaScript), and an empty string (normalized to the documented
+    text/plain default) must all be accepted, not rejected."""
+    files = Mock()
+    files.create.return_value.execute.return_value = {"id": "f1"}
+    _mock_drive_service_with_files(monkeypatch, files)
+
+    result = json.loads(
+        google_drive.google_drive_create_file("notes", "some text", mime_type=mime_type)
+    )
+
+    assert result["status"] == "success"
+    files.create.assert_called_once()
+
+
+def test_create_file_google_apps_exemption_requires_the_real_prefix(monkeypatch):
+    """Regression guard: the old "google-apps" in mime_type substring check
+    let a crafted mime_type merely containing that text anywhere bypass
+    the binary-content guard, even though it isn't a real
+    "application/vnd.google-apps.*" Workspace type. The exemption must
+    require the actual prefix."""
+    files = Mock()
+    _mock_drive_service_with_files(monkeypatch, files)
+
+    result = json.loads(
+        google_drive.google_drive_create_file(
+            "notes", "some text", mime_type="application/pdf; x=google-apps"
+        )
+    )
+
+    assert result["status"] == "error"
+    files.create.assert_not_called()

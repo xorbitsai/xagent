@@ -21,11 +21,13 @@ mcp = FastMCP("onedrive-mcp")
 
 GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
 DEFAULT_TIMEOUT_SECONDS = 30
-# Sized for a single chunk PUT of up to _UPLOAD_SESSION_CHUNK_SIZE bytes over
-# a slow link, not just a small JSON Graph call -- DEFAULT_TIMEOUT_SECONDS'
-# 30s is realistic for the API calls elsewhere in this module but can
-# legitimately be too short for a multi-megabyte binary PUT.
-_CHUNK_UPLOAD_TIMEOUT_SECONDS = 120
+# Sized for a single binary PUT of up to a few megabytes over a slow link,
+# not just a small JSON Graph call -- DEFAULT_TIMEOUT_SECONDS' 30s is
+# realistic for the API calls elsewhere in this module but can legitimately
+# be too short for a multi-megabyte binary transfer. Used for both the
+# simple-PUT branch (up to _SIMPLE_UPLOAD_MAX_BYTES) and each chunk of the
+# resumable upload-session path.
+_BINARY_UPLOAD_TIMEOUT_SECONDS = 120
 # Microsoft's docs describe the simple content PUT's limit as "4 MB"; some
 # Graph deployments enforce that as the decimal 4,000,000 bytes rather than
 # 4 MiB (4,194,304 bytes). Using the smaller, decimal figure here means a
@@ -39,20 +41,75 @@ _UPLOAD_SESSION_CHUNK_SIZE = 5 * 1024 * 1024
 
 _UPLOAD_ALLOWED_DIRS_ENV_VAR = "XAGENT_ONEDRIVE_FILE_ALLOWED_DIRS"
 
-# Extensions of unambiguously binary formats a caller might plausibly name
-# a text-upload target after. Mirrors google_drive.py's equivalent guard —
-# onedrive_upload_text_file's content is always UTF-8 text (see below), so
-# a binary-looking target name is always a caller mistake, not a valid use.
-_KNOWN_BINARY_EXTENSIONS = {
-    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".xlsm", ".ppt", ".pptx",
-    ".odt", ".ods", ".odp", ".epub", ".mobi",
-    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff",
-    ".heic", ".heif", ".ico", ".psd",
-    ".mp3", ".wav", ".ogg", ".flac", ".m4a", ".aac",
-    ".mp4", ".mov", ".avi", ".mkv", ".webm", ".wmv",
-    ".zip", ".7z", ".rar", ".tar", ".gz", ".tgz", ".bz2",
-    ".exe", ".dll", ".so", ".dylib", ".dmg", ".bin", ".iso", ".apk",
-    ".woff", ".woff2", ".ttf", ".otf", ".wasm", ".parquet", ".sqlite", ".db",
+# stdlib mimetypes.guess_type() only recognizes these extensions when a
+# system mime.types file happens to be installed (e.g. Apache's, common on
+# a dev laptop) -- on a minimal/slim host with no such file (a stripped-down
+# container image, verified directly: MimeTypes(filenames=()) returns
+# (None, None) for every one of these), it silently can't identify them at
+# all. Checked before falling back to mimetypes.guess_type() everywhere
+# this module resolves a mime type, so a real .xlsx/.docx/etc. doesn't get
+# mislabeled "application/octet-stream" just because the host is missing a
+# file this module has no control over.
+_MIME_TYPE_OVERRIDES = {
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".xlsm": "application/vnd.ms-excel.sheet.macroEnabled.12",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".odt": "application/vnd.oasis.opendocument.text",
+    ".ods": "application/vnd.oasis.opendocument.spreadsheet",
+    ".odp": "application/vnd.oasis.opendocument.presentation",
+    ".epub": "application/epub+zip",
+}
+
+
+def _guess_mime_type(name: str) -> str | None:
+    """Guess a mime type from ``name``'s extension, consulting
+    _MIME_TYPE_OVERRIDES first for the formats stdlib mimetypes can't
+    reliably identify on its own (see above)."""
+    override = _MIME_TYPE_OVERRIDES.get(Path(name).suffix.lower())
+    if override is not None:
+        return override
+    return mimetypes.guess_type(name)[0]
+
+
+# mime types that are genuinely text despite not having a "text/" prefix --
+# reused from the same reasoning as google_drive.py's _TEXT_MIME_TYPES (the
+# equivalent guard planned for that connector in the still-unmerged sibling
+# PR #2275): a mime type not in this set and not "text/"-prefixed is
+# treated as binary by _name_looks_binary below.
+_TEXT_SAFE_MIME_TYPES = {
+    "application/json",
+    "application/xml",
+    "application/rtf",
+    "application/javascript",
+    "application/x-yaml",
+    "application/yaml",
+    "application/csv",
+}
+_TEXT_SAFE_MIME_SUFFIXES = ("+json", "+xml", "+yaml")
+
+
+def _is_text_mime_type(mime_type: str) -> bool:
+    return (
+        mime_type.startswith("text/")
+        or mime_type in _TEXT_SAFE_MIME_TYPES
+        or mime_type.endswith(_TEXT_SAFE_MIME_SUFFIXES)
+    )
+
+
+# Extensions of unambiguously binary formats that resolve to no mime type
+# at all (neither _MIME_TYPE_OVERRIDES nor a bare stdlib mimetypes install
+# recognizes them), so _name_looks_binary's mime-type check alone would
+# silently miss them. onedrive_upload_text_file's content is always UTF-8
+# text (see below), so a binary-looking target name is always a caller
+# mistake, not a valid use.
+_KNOWN_BINARY_EXTENSIONS_WITHOUT_MIME_GUESS = {
+    ".mobi", ".psd",
+    ".ogg", ".flac", ".m4a",
+    ".mkv", ".wmv",
+    ".7z", ".rar", ".gz", ".bz2",
+    ".dylib", ".dmg", ".iso", ".apk",
+    ".woff", ".woff2", ".ttf", ".otf", ".parquet", ".sqlite", ".db",
 }  # fmt: skip
 
 
@@ -91,6 +148,7 @@ def _graph_request(
     data: bytes | None = None,
     extra_headers: dict[str, str] | None = None,
     raw: bool = False,
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
 ) -> Any:
     response = requests.request(
         method=method,
@@ -99,7 +157,7 @@ def _graph_request(
         params=params,
         json=body,
         data=data,
-        timeout=DEFAULT_TIMEOUT_SECONDS,
+        timeout=timeout,
     )
     try:
         response.raise_for_status()
@@ -153,7 +211,18 @@ def _decode_bytes(content: bytes) -> tuple[str | None, str | None]:
 
 
 def _name_looks_binary(name: str) -> bool:
-    return Path(name).suffix.lower() in _KNOWN_BINARY_EXTENSIONS
+    """Whether ``name``'s extension names an unambiguously binary format.
+
+    A resolvable mime type (override or stdlib) that isn't text-safe is
+    binary; an unresolvable one falls back to the small hand-maintained set
+    of formats mimetypes has no opinion on at all (see
+    _KNOWN_BINARY_EXTENSIONS_WITHOUT_MIME_GUESS above) rather than silently
+    passing every extension mimetypes doesn't happen to recognize.
+    """
+    guessed = _guess_mime_type(name)
+    if guessed is not None:
+        return not _is_text_mime_type(guessed)
+    return Path(name).suffix.lower() in _KNOWN_BINARY_EXTENSIONS_WITHOUT_MIME_GUESS
 
 
 def _allowed_upload_dirs() -> list[Path]:
@@ -169,9 +238,10 @@ def _allowed_upload_dirs() -> list[Path]:
 
 def _resolve_upload_file_path(file_path: str) -> Path:
     """Restrict onedrive_upload_file to files under an allowlisted
-    directory, mirroring slack_upload_file's/google_drive_upload_file's
-    defense -- without it an agent could be tricked into exfiltrating
-    arbitrary host files through this tool.
+    directory, mirroring slack_upload_file's already-merged defense (and
+    the equivalent google_drive_upload_file guard proposed in the still-
+    unmerged sibling PR #2275) -- without it an agent could be tricked into
+    exfiltrating arbitrary host files through this tool.
 
     Containment is checked before existence, so a path that is both
     outside the allowlist and nonexistent reports the allowlist message,
@@ -201,7 +271,9 @@ def _resolve_upload_file_path(file_path: str) -> Path:
     return local_path
 
 
-def _upload_large_file_content(remote_path: str, fh: Any, total: int) -> dict[str, Any]:
+def _upload_large_file_content(
+    remote_path: str, fh: Any, total: int, mime_type: str
+) -> dict[str, Any]:
     """Upload the next ``total`` bytes readable from ``fh`` (too large for
     the simple content PUT) via a resumable upload session, in 320 KiB-
     aligned chunks read straight off disk -- never materializing more than
@@ -216,44 +288,79 @@ def _upload_large_file_content(remote_path: str, fh: Any, total: int) -> dict[st
     if not upload_url:
         raise RuntimeError("OneDrive did not return an upload session URL")
 
-    result: dict[str, Any] = {}
-    for start in range(0, total, _UPLOAD_SESSION_CHUNK_SIZE):
-        end = min(start + _UPLOAD_SESSION_CHUNK_SIZE, total)
-        chunk = fh.read(end - start)
-        # The upload session URL is itself pre-authenticated (a token in
-        # its query string) -- Graph 401s a chunk request that also carries
-        # our own Authorization header, so this goes straight through
-        # requests.put rather than _graph_request (which always attaches
-        # one), and content type is irrelevant to the session endpoint.
-        response = requests.put(
-            upload_url,
-            data=chunk,
-            headers={
-                "Content-Length": str(end - start),
-                "Content-Range": f"bytes {start}-{end - 1}/{total}",
-            },
-            timeout=_CHUNK_UPLOAD_TIMEOUT_SECONDS,
-        )
+    # One Session for every chunk of this upload -- a fresh top-level
+    # requests.put() per chunk would pay a new TCP+TLS handshake each time,
+    # which adds up over the ~100 requests a 500MB upload needs.
+    with requests.Session() as http:
+        result: dict[str, Any] = {}
         try:
-            response.raise_for_status()
-        except requests.HTTPError as exc:
-            # Mirror _graph_request's error enrichment (this loop can't go
-            # through _graph_request itself -- see the Authorization-header
-            # note above) so a rejected chunk surfaces Graph's actual error
-            # body instead of a bare "400 Client Error" with no detail.
-            response_text = response.text.strip()
-            message = str(exc)
-            if response_text:
-                message = f"{message} - {response_text}"
-            raise RuntimeError(message) from exc
-        # Only the final chunk's response carries the completed item;
-        # Graph's intermediate (202) responses return upload-progress
-        # info, not the item -- checked explicitly (end == total) rather
-        # than "the last response that happened to have a body", which
-        # would silently pick up an unrelated intermediate body if Graph's
-        # progress responses ever started including one.
-        if end == total:
-            result = response.json() if response.content else {}
+            for start in range(0, total, _UPLOAD_SESSION_CHUNK_SIZE):
+                end = min(start + _UPLOAD_SESSION_CHUNK_SIZE, total)
+                chunk = fh.read(end - start)
+                # The upload session URL is itself pre-authenticated (a
+                # token in its query string) -- Graph 401s a chunk request
+                # that also carries our own Authorization header, so this
+                # goes straight through the plain Session rather than
+                # _graph_request (which always attaches one). Graph's docs
+                # don't confirm Content-Type is honored on a chunk PUT the
+                # way it is on the simple-PUT endpoint (only Content-Length/
+                # Content-Range are documented there), but sending it costs
+                # nothing and is the closest available lever to the simple
+                # path's behavior.
+                response = http.put(
+                    upload_url,
+                    data=chunk,
+                    headers={
+                        "Content-Length": str(end - start),
+                        "Content-Range": f"bytes {start}-{end - 1}/{total}",
+                        "Content-Type": mime_type,
+                    },
+                    timeout=_BINARY_UPLOAD_TIMEOUT_SECONDS,
+                )
+                try:
+                    response.raise_for_status()
+                except requests.HTTPError as exc:
+                    # Mirror _graph_request's error enrichment (this loop
+                    # can't go through _graph_request itself -- see the
+                    # Authorization-header note above) so a rejected chunk
+                    # surfaces Graph's actual error body instead of a bare
+                    # "400 Client Error" with no detail.
+                    response_text = response.text.strip()
+                    message = str(exc)
+                    if response_text:
+                        message = f"{message} - {response_text}"
+                    raise RuntimeError(message) from exc
+                # Only the final chunk's response carries the completed
+                # item; Graph's intermediate (202) responses return upload-
+                # progress info, not the item -- checked explicitly
+                # (end == total) rather than "the last response that
+                # happened to have a body", which would silently pick up an
+                # unrelated intermediate body if Graph's progress responses
+                # ever started including one.
+                if end == total:
+                    result = response.json() if response.content else {}
+        except Exception:
+            # Best-effort: free the abandoned session immediately instead
+            # of leaving it for Graph's own ~15-minute expiry. A failure
+            # here must never mask the real error above.
+            try:
+                http.delete(upload_url, timeout=_BINARY_UPLOAD_TIMEOUT_SECONDS)
+            except Exception:
+                logger.warning(
+                    "Failed to cancel abandoned OneDrive upload session",
+                    exc_info=True,
+                )
+            raise
+
+    if "id" not in result:
+        # The final chunk's response didn't actually carry a completed
+        # driveItem (e.g. an unexpected 202 on what this loop computed as
+        # the last range) -- report this as a failure rather than a
+        # success with a hollow "item".
+        raise RuntimeError(
+            "OneDrive did not confirm the upload completed "
+            f"(final response: {result!r})"
+        )
     return result
 
 
@@ -405,9 +512,17 @@ def onedrive_upload_file(
     try:
         local_path = _resolve_upload_file_path(file_path)
         resolved_remote_path = remote_path.strip() or local_path.name
+        # _normalize_path strips leading/trailing "/" -- a caller passing
+        # "/" or "" ends up with nothing to name the uploaded item, which
+        # would otherwise reach _content_path/_item_path as an empty target
+        # (a confusing "file_path is required" from the simple-PUT path, or
+        # a malformed request against the drive root itself from the
+        # upload-session path). Reject explicitly, before either path.
+        if not _normalize_path(resolved_remote_path):
+            raise ValueError("remote_path must not be empty or just '/'")
         resolved_mime_type = (
             mime_type.strip()
-            or mimetypes.guess_type(local_path.name)[0]
+            or _guess_mime_type(local_path.name)
             or "application/octet-stream"
         )
 
@@ -422,6 +537,12 @@ def onedrive_upload_file(
         with local_path.open("rb") as fh:
             file_size = os.fstat(fh.fileno()).st_size
             if file_size == 0:
+                # A deliberate product choice, not an API constraint: Graph
+                # itself accepts a 0-byte file. An agent uploading an empty
+                # file is almost always a symptom of an upstream mistake
+                # (e.g. a generation step that silently produced nothing),
+                # so this is rejected here rather than silently creating a
+                # placeholder-empty item on OneDrive.
                 raise ValueError(f"File is empty: {file_path}")
 
             if file_size <= _SIMPLE_UPLOAD_MAX_BYTES:
@@ -430,9 +551,12 @@ def onedrive_upload_file(
                     _content_path(resolved_remote_path),
                     extra_headers={"Content-Type": resolved_mime_type},
                     data=fh.read(),
+                    timeout=_BINARY_UPLOAD_TIMEOUT_SECONDS,
                 )
             else:
-                result = _upload_large_file_content(resolved_remote_path, fh, file_size)
+                result = _upload_large_file_content(
+                    resolved_remote_path, fh, file_size, resolved_mime_type
+                )
 
         return _success(item=result)
     except Exception as e:

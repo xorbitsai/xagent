@@ -23,6 +23,29 @@ class MockResponse:
             raise requests.HTTPError(f"{self.status_code} Client Error", response=self)
 
 
+class _FakeSession:
+    """Stand-in for requests.Session() used by _upload_large_file_content --
+    a plain Mock doesn't support the `with ... as` context-manager protocol
+    on its own, and mocking Session.put/.delete at the class level would
+    leak between tests since the module only ever creates one Session."""
+
+    def __init__(self, put=None, delete=None):
+        self.put = put if put is not None else Mock(return_value=MockResponse({}))
+        self.delete = (
+            delete if delete is not None else Mock(return_value=MockResponse({}))
+        )
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+def _patch_session(monkeypatch, fake_session):
+    monkeypatch.setattr(onedrive.requests, "Session", Mock(return_value=fake_session))
+
+
 @pytest.fixture(autouse=True)
 def _credentials(monkeypatch):
     monkeypatch.setenv("AUTH_TOKEN", "test-graph-token")
@@ -82,6 +105,7 @@ def test_upload_file_sends_real_binary_content(monkeypatch, _upload_allowed_dirs
     assert kwargs["headers"]["Content-Type"] == (
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
+    assert kwargs["timeout"] == onedrive._BINARY_UPLOAD_TIMEOUT_SECONDS
 
 
 def test_upload_file_accepts_explicit_remote_path_and_mime_type(
@@ -123,10 +147,69 @@ def test_upload_file_defaults_mime_type_when_unguessable(
     assert kwargs["headers"]["Content-Type"] == "application/octet-stream"
 
 
+@pytest.mark.parametrize(
+    "extension,expected_mime_type",
+    [
+        (
+            ".docx",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ),
+        (".xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        (
+            ".pptx",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        ),
+        (".odt", "application/vnd.oasis.opendocument.text"),
+    ],
+)
+def test_upload_file_resolves_ooxml_mime_type_without_relying_on_host_mime_db(
+    monkeypatch, _upload_allowed_dirs_env, extension, expected_mime_type
+):
+    """Regression guard: stdlib mimetypes.guess_type() only recognizes OOXML/
+    ODF extensions when a system mime.types file happens to be installed —
+    verified directly (mimetypes.MimeTypes(filenames=()) returns (None, None)
+    for all of these). A minimal/slim container image has no such file, so
+    without _MIME_TYPE_OVERRIDES these would silently fall back to
+    "application/octet-stream" instead of the correct, real mime type."""
+    local_file = _upload_allowed_dirs_env / f"report{extension}"
+    local_file.write_bytes(b"binary content")
+
+    mock_request = Mock(return_value=MockResponse({"id": "item-1"}))
+    monkeypatch.setattr(onedrive.requests, "request", mock_request)
+
+    result = json.loads(onedrive.onedrive_upload_file(str(local_file)))
+
+    assert result["status"] == "success"
+    assert (
+        mock_request.call_args.kwargs["headers"]["Content-Type"] == expected_mime_type
+    )
+
+
+def test_upload_file_rejects_empty_or_root_remote_path(
+    monkeypatch, _upload_allowed_dirs_env
+):
+    """Regression guard: remote_path="/" previously reached _content_path
+    (simple-PUT path) as an effectively empty target, raising a confusing
+    "file_path is required" that names the wrong parameter, or reached
+    _item_path (large-file path) silently building a request against the
+    drive root itself instead of a named file."""
+    local_file = _upload_allowed_dirs_env / "report.pdf"
+    local_file.write_bytes(b"content")
+
+    mock_request = Mock()
+    monkeypatch.setattr(onedrive.requests, "request", mock_request)
+
+    result = json.loads(onedrive.onedrive_upload_file(str(local_file), remote_path="/"))
+
+    assert result["status"] == "error"
+    assert "remote_path" in result["message"]
+    mock_request.assert_not_called()
+
+
 def test_upload_file_uses_upload_session_for_large_files(
     monkeypatch, _upload_allowed_dirs_env
 ):
-    """Files over Graph's 4 MiB simple-PUT cap must go through
+    """Files over Graph's ~4MB simple-PUT cap must go through
     createUploadSession + chunked PUTs instead of a single content PUT."""
     local_file = _upload_allowed_dirs_env / "big.bin"
     chunk_size = onedrive._UPLOAD_SESSION_CHUNK_SIZE
@@ -150,9 +233,11 @@ def test_upload_file_uses_upload_session_for_large_files(
             MockResponse({"id": "item-1", "name": "big.bin"}),
         ]
     )
-    monkeypatch.setattr(onedrive.requests, "put", mock_put)
+    _patch_session(monkeypatch, _FakeSession(put=mock_put))
 
-    result = json.loads(onedrive.onedrive_upload_file(str(local_file)))
+    result = json.loads(
+        onedrive.onedrive_upload_file(str(local_file), mime_type="application/x-custom")
+    )
 
     assert result["status"] == "success"
     assert result["item"]["id"] == "item-1"
@@ -177,19 +262,23 @@ def test_upload_file_uses_upload_session_for_large_files(
     assert second_call.kwargs["headers"]["Content-Range"] == (
         f"bytes {chunk_size}-{total_size - 1}/{total_size}"
     )
+    # The explicit mime_type must reach every chunk, not just the simple-PUT
+    # branch — Graph doesn't document Content-Type as authoritative for the
+    # resumable path, but there's no other client-controllable lever, and
+    # sending it costs nothing.
+    assert first_call.kwargs["headers"]["Content-Type"] == "application/x-custom"
+    assert second_call.kwargs["headers"]["Content-Type"] == "application/x-custom"
     # Chunk uploads use a longer timeout than the small-JSON-call default —
     # a multi-megabyte PUT over a slow link can legitimately take longer
     # than DEFAULT_TIMEOUT_SECONDS.
-    assert first_call.kwargs["timeout"] == onedrive._CHUNK_UPLOAD_TIMEOUT_SECONDS
+    assert first_call.kwargs["timeout"] == onedrive._BINARY_UPLOAD_TIMEOUT_SECONDS
     # The pre-authenticated upload session URL must never carry our own
     # Authorization header alongside its own query-string token.
     assert "Authorization" not in first_call.kwargs["headers"]
     assert "Authorization" not in second_call.kwargs["headers"]
 
 
-def test_upload_large_file_content_reads_bounded_chunks_from_disk(
-    monkeypatch, _upload_allowed_dirs_env
-):
+def test_upload_large_file_content_reads_bounded_chunks_from_disk(monkeypatch):
     """Regression guard for the actual production bug's efficiency half:
     _upload_large_file_content must pull each chunk straight off the file
     handle rather than the caller loading the whole file into memory first
@@ -225,9 +314,11 @@ def test_upload_large_file_content_reads_bounded_chunks_from_disk(
             {"id": "item-1"} if is_last else {}, content=b"{}" if is_last else b""
         )
 
-    monkeypatch.setattr(onedrive.requests, "put", Mock(side_effect=_fake_put))
+    _patch_session(monkeypatch, _FakeSession(put=Mock(side_effect=_fake_put)))
 
-    result = onedrive._upload_large_file_content("big.bin", fh, total_size)
+    result = onedrive._upload_large_file_content(
+        "big.bin", fh, total_size, "application/octet-stream"
+    )
 
     assert result == {"id": "item-1"}
     assert b"".join(put_calls) == content
@@ -253,10 +344,89 @@ def test_upload_large_file_content_enriches_chunk_error_with_response_body(
         status_code=400,
         content=b'{"error": {"message": "Invalid upload session"}}',
     )
-    monkeypatch.setattr(onedrive.requests, "put", Mock(return_value=error_response))
+    mock_delete = Mock(return_value=MockResponse({}))
+    _patch_session(
+        monkeypatch,
+        _FakeSession(put=Mock(return_value=error_response), delete=mock_delete),
+    )
 
     with pytest.raises(RuntimeError, match="Invalid upload session"):
-        onedrive._upload_large_file_content("big.bin", fh, total_size)
+        onedrive._upload_large_file_content(
+            "big.bin", fh, total_size, "application/octet-stream"
+        )
+
+    # A failed upload must cancel its now-abandoned session immediately
+    # rather than leaving it for Graph's own ~15-minute expiry.
+    mock_delete.assert_called_once_with(
+        "https://upload.example/s", timeout=onedrive._BINARY_UPLOAD_TIMEOUT_SECONDS
+    )
+
+
+def test_upload_large_file_content_fails_on_a_non_first_chunk(monkeypatch):
+    """Regression guard: earlier test coverage only ever failed the first
+    chunk of a session — verifying a mid-sequence failure also propagates
+    (and still triggers cleanup) catches a bug that only manifests once the
+    loop has state to lose (e.g. an exception handler scoped to the first
+    iteration only)."""
+    chunk_size = onedrive._UPLOAD_SESSION_CHUNK_SIZE
+    total_size = 3 * chunk_size
+    fh = io.BytesIO(b"\x00" * total_size)
+
+    monkeypatch.setattr(
+        onedrive.requests,
+        "request",
+        Mock(return_value=MockResponse({"uploadUrl": "https://upload.example/s"})),
+    )
+    error_response = MockResponse(
+        {"error": {"message": "range conflict"}},
+        status_code=416,
+        content=b'{"error": {"message": "range conflict"}}',
+    )
+    mock_put = Mock(
+        side_effect=[
+            MockResponse({}, content=b""),  # chunk 1 succeeds
+            error_response,  # chunk 2 fails
+        ]
+    )
+    mock_delete = Mock(return_value=MockResponse({}))
+    _patch_session(monkeypatch, _FakeSession(put=mock_put, delete=mock_delete))
+
+    with pytest.raises(RuntimeError, match="range conflict"):
+        onedrive._upload_large_file_content(
+            "big.bin", fh, total_size, "application/octet-stream"
+        )
+
+    assert mock_put.call_count == 2
+    mock_delete.assert_called_once()
+
+
+def test_upload_large_file_content_raises_when_final_response_has_no_item(
+    monkeypatch,
+):
+    """Regression guard: the final chunk's response must actually carry a
+    completed driveItem before this reports success -- an unexpected 202 (or
+    any body without an "id") on what this loop computed as the last range
+    must surface as an error, not a hollow {"status": "success", "item": {}}."""
+    total_size = onedrive._UPLOAD_SESSION_CHUNK_SIZE + 10
+    fh = io.BytesIO(b"\x00" * total_size)
+
+    monkeypatch.setattr(
+        onedrive.requests,
+        "request",
+        Mock(return_value=MockResponse({"uploadUrl": "https://upload.example/s"})),
+    )
+    mock_put = Mock(
+        side_effect=[
+            MockResponse({}, content=b""),
+            MockResponse({"expirationDateTime": "2099-01-01T00:00:00Z"}),
+        ]
+    )
+    _patch_session(monkeypatch, _FakeSession(put=mock_put))
+
+    with pytest.raises(RuntimeError, match="did not confirm"):
+        onedrive._upload_large_file_content(
+            "big.bin", fh, total_size, "application/octet-stream"
+        )
 
 
 def test_simple_upload_max_bytes_is_at_or_below_graphs_4mb_limit():
@@ -268,6 +438,51 @@ def test_simple_upload_max_bytes_is_at_or_below_graphs_4mb_limit():
     resumable upload-session path instead of risking rejection right at the
     simple-PUT boundary."""
     assert onedrive._SIMPLE_UPLOAD_MAX_BYTES <= 4_000_000
+
+
+def test_upload_file_at_exact_boundary_uses_simple_put(
+    monkeypatch, _upload_allowed_dirs_env
+):
+    """Regression guard: a purely static assertion on the constant (see
+    above) can't catch a routing-condition regression like `<=` silently
+    flipped to `<` -- this exercises onedrive_upload_file itself with a
+    file sized exactly at the boundary and confirms it takes the simple-PUT
+    branch, not the upload-session one."""
+    local_file = _upload_allowed_dirs_env / "at_boundary.bin"
+    local_file.write_bytes(b"\x00" * onedrive._SIMPLE_UPLOAD_MAX_BYTES)
+
+    mock_request = Mock(return_value=MockResponse({"id": "item-1"}))
+    monkeypatch.setattr(onedrive.requests, "request", mock_request)
+    session_factory = Mock()
+    monkeypatch.setattr(onedrive.requests, "Session", session_factory)
+
+    result = json.loads(onedrive.onedrive_upload_file(str(local_file)))
+
+    assert result["status"] == "success"
+    assert mock_request.call_args.kwargs["method"] == "PUT"
+    session_factory.assert_not_called()
+
+
+def test_upload_file_one_byte_over_boundary_uses_upload_session(
+    monkeypatch, _upload_allowed_dirs_env
+):
+    """The complementary case to the exact-boundary test above: one byte
+    over the cutoff must take the resumable upload-session path."""
+    local_file = _upload_allowed_dirs_env / "over_boundary.bin"
+    local_file.write_bytes(b"\x00" * (onedrive._SIMPLE_UPLOAD_MAX_BYTES + 1))
+
+    mock_request = Mock(
+        return_value=MockResponse({"uploadUrl": "https://upload.example/s"})
+    )
+    monkeypatch.setattr(onedrive.requests, "request", mock_request)
+    mock_put = Mock(return_value=MockResponse({"id": "item-1"}))
+    _patch_session(monkeypatch, _FakeSession(put=mock_put))
+
+    result = json.loads(onedrive.onedrive_upload_file(str(local_file)))
+
+    assert result["status"] == "success"
+    assert mock_request.call_args.kwargs["url"].endswith("createUploadSession")
+    mock_put.assert_called_once()
 
 
 @pytest.mark.parametrize(
@@ -320,6 +535,54 @@ def test_upload_file_rejects_path_outside_allowed_directories(
     # The absolute host path must never leak into the message the LLM sees.
     assert str(outside_file) not in result["message"]
     mock_request.assert_not_called()
+
+
+def test_upload_file_rejects_symlink_escaping_allowed_dir(
+    monkeypatch, tmp_path, _upload_allowed_dirs_env
+):
+    """A symlink physically inside the allowed directory but pointing
+    outside it must not grant access to its target -- resolve() follows
+    the symlink to its real location before the containment check runs."""
+    secret_dir = tmp_path / "secret"
+    secret_dir.mkdir()
+    secret_file = secret_dir / "secret.txt"
+    secret_file.write_text("secret")
+    link = _upload_allowed_dirs_env / "escape_link.txt"
+    link.symlink_to(secret_file)
+
+    mock_request = Mock()
+    monkeypatch.setattr(onedrive.requests, "request", mock_request)
+
+    result = json.loads(onedrive.onedrive_upload_file(str(link)))
+
+    assert result["status"] == "error"
+    assert "allowed upload directories" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_upload_file_rejects_relative_traversal_outside_allowed_dir(
+    monkeypatch, tmp_path, _upload_allowed_dirs_env
+):
+    (tmp_path / "secret.txt").write_text("secret")
+
+    mock_request = Mock()
+    monkeypatch.setattr(onedrive.requests, "request", mock_request)
+
+    result = json.loads(
+        onedrive.onedrive_upload_file(
+            str(_upload_allowed_dirs_env / ".." / "secret.txt")
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "allowed upload directories" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_allowed_upload_dirs_falls_back_to_cwd_when_unset(monkeypatch):
+    monkeypatch.delenv("XAGENT_ONEDRIVE_FILE_ALLOWED_DIRS", raising=False)
+
+    assert onedrive._allowed_upload_dirs() == [onedrive.Path.cwd().resolve()]
 
 
 def test_upload_file_rejects_missing_file(monkeypatch, _upload_allowed_dirs_env):

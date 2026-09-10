@@ -165,9 +165,11 @@ def allowed_file_dirs(env_var: str) -> list[Path]:
     """Parse ``env_var``'s comma-separated directory allowlist, falling
     back to the current working directory when it's unset.
 
-    Shared by every MCP connector tool that reads a local file by path
-    (Gmail attachments, Slack file upload, Google Drive upload) — each
-    passes its own env var name.
+    Written to be reusable by any MCP connector tool that reads a local
+    file by path (each would pass its own env var name), but currently
+    only google_drive.py's upload tool calls this — gmail.py and slack.py
+    still carry their own private, near-identical copies of this same
+    logic rather than having been migrated to call it.
     """
     raw_dirs = os.environ.get(env_var, "")
     if not raw_dirs.strip():

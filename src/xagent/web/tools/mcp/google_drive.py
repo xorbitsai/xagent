@@ -435,6 +435,29 @@ def _attach_resource_key(request: Any, file_id: str, resource_key: str | None) -
     return request
 
 
+def _apply_parent_id(
+    file_metadata: dict[str, Any], parent_id: str | None
+) -> tuple[str | None, str | None]:
+    """Resolve an optional ``parent_id`` (a bare id or a folder URL/link,
+    possibly carrying a pre-2021 resourcekey) and, if given, add it to
+    ``file_metadata["parents"]`` in place.
+
+    Returns ``(resolved_parent_id, parent_resource_key)`` — both ``None``
+    when ``parent_id`` is falsy — for the caller to pass to
+    ``_attach_resource_key`` once its own request object exists (that
+    happens after ``file_metadata`` is built, so it can't be folded into
+    this function). Shared by google_drive_upload_file, ..._create_file,
+    and ..._create_folder, which otherwise each duplicated this exact
+    four-line resolve-then-mutate sequence.
+    """
+    if not parent_id:
+        return None, None
+    resolved_parent_id = _resolve_file_id(parent_id, "parent_id")
+    parent_resource_key = _extract_resource_key(parent_id)
+    file_metadata["parents"] = [resolved_parent_id]
+    return resolved_parent_id, parent_resource_key
+
+
 def _require_drive_id(value: str, field_name: str) -> str:
     """Validate a raw (non-URL) Drive id such as a permission_id: non-empty,
     no surrounding whitespace (require_clean_identifier), and restricted to
@@ -812,65 +835,84 @@ def _resolve_upload_file_path(file_path: str) -> Path:
     )
 
 
-# Extensions of unambiguously binary formats a caller might plausibly name
-# a file after. Deliberately NOT delegated to mimetypes.guess_type(): that
-# function's result for anything beyond a small hardcoded core depends on
-# whatever mime.types database happens to be installed on the *host* --
-# verified directly, this list's own entries for .docx/.xlsx/.pptx/.7z/
-# .epub/.odt/.xlsm (and even .sql/.tex/.dart/.tcl/.dtd, which must NOT be
-# in this list -- see _TEXT_MIME_TYPES above) come from an incidental
-# /etc/apache2/mime.types on one development machine and are silently
-# ABSENT in a minimal CI/production container, making guess_type()'s
-# verdict for the same file name differ between environments. A fixed,
-# in-source list is the only way to get identical behavior everywhere
-# this code runs, at the cost of needing an occasional addition here when
-# a new common binary format shows up (the previous mimetypes-based
-# design "solved" that at the price of being wrong by default on any host
-# without a system mime database).
-_KNOWN_BINARY_IMAGE_EXTENSIONS = {
-    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff",
-    ".heic", ".heif", ".ico", ".psd", ".ai",
+# Extensions of formats confidently known to be plain UTF-8 text. Default
+# a NAME to "looks binary" unless its extension is in this allowlist (or
+# it has no extension at all — an extensionless name like "Dockerfile" or
+# "README" isn't itself evidence of binary intent) — the opposite of a
+# binary-extension blocklist, which can never enumerate every binary
+# format that exists (three separate review rounds each found more gaps
+# in this module's blocklist attempts: the original hand list, then a
+# mimetypes.guess_type()-based one, then a wider hand list again). A
+# false positive here (a legitimate but unlisted text extension) is a
+# clear, actionable rejection pointing at google_drive_upload_file; a
+# false negative in a blocklist is a silently mislabeled file, a strictly
+# worse outcome, so this list defaults toward rejecting the unfamiliar
+# rather than accepting it.
+#
+# Also NOT delegated to mimetypes.guess_type(): that function's result
+# for anything beyond a small hardcoded core depends on whatever
+# mime.types database happens to be installed on the *host* — verified
+# directly, several of this list's own entries (.sql, .tex, .dart, .tcl,
+# .dtd) came back non-text from an incidental /etc/apache2/mime.types on
+# one development machine, and were silently ABSENT (making them "not
+# text" by the old design's logic) in a minimal CI/production container.
+# A fixed, in-source list is the only way to get identical behavior
+# everywhere this code runs.
+_KNOWN_TEXT_PLAIN_EXTENSIONS = {
+    ".txt", ".md", ".markdown", ".rst", ".adoc", ".rtf", ".log", ".lock",
+    ".gitignore", ".gitattributes", ".editorconfig", ".dockerignore",
+    ".env", ".ini", ".cfg", ".conf", ".properties", ".toml",
 }  # fmt: skip
-_KNOWN_BINARY_AUDIO_EXTENSIONS = {
-    ".mp3", ".wav", ".ogg", ".flac", ".m4a", ".aac", ".wma",
+_KNOWN_TEXT_DATA_EXTENSIONS = {
+    ".json", ".xml", ".yaml", ".yml", ".csv", ".tsv", ".dtd", ".xsd",
+    ".xsl", ".xslt", ".proto", ".graphql", ".gql", ".thrift", ".avsc",
 }  # fmt: skip
-_KNOWN_BINARY_VIDEO_EXTENSIONS = {
-    ".mp4", ".mov", ".avi", ".mkv", ".webm", ".wmv", ".flv", ".m4v",
+_KNOWN_TEXT_WEB_EXTENSIONS = {
+    ".html", ".htm", ".css", ".scss", ".sass", ".less",
+    ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx",
+    ".vue", ".svelte", ".astro",
 }  # fmt: skip
-_KNOWN_BINARY_DOCUMENT_EXTENSIONS = {
-    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".xlsm", ".ppt", ".pptx",
-    ".odt", ".ods", ".odp", ".epub", ".mobi", ".azw", ".azw3",
+_KNOWN_TEXT_SOURCE_EXTENSIONS = {
+    ".py", ".rb", ".php", ".java", ".c", ".h", ".cpp", ".hpp", ".cc",
+    ".cxx", ".go", ".rs", ".swift", ".kt", ".kts", ".scala", ".groovy",
+    ".lua", ".r", ".jl", ".pl", ".pm", ".hs", ".fs", ".fsx", ".ml",
+    ".mli", ".clj", ".cljs", ".erl", ".ex", ".exs", ".nim", ".zig", ".v",
+    ".d", ".dart", ".elm", ".cr", ".tcl", ".scm", ".rkt", ".lisp", ".el",
+    ".asm", ".s", ".pas", ".f90", ".for", ".vb", ".vbs", ".cabal", ".nix",
 }  # fmt: skip
-_KNOWN_BINARY_ARCHIVE_EXTENSIONS = {
-    ".zip", ".7z", ".rar", ".tar", ".gz", ".tgz", ".bz2", ".xz",
+_KNOWN_TEXT_SCRIPT_EXTENSIONS = {
+    ".sh", ".bash", ".zsh", ".csh", ".ksh", ".fish",
+    ".ps1", ".bat", ".cmd", ".awk", ".sed", ".sql",
 }  # fmt: skip
-_KNOWN_BINARY_EXECUTABLE_EXTENSIONS = {
-    ".exe", ".dll", ".so", ".dylib", ".msi", ".apk", ".deb", ".rpm",
-    ".iso", ".dmg", ".bin", ".class", ".jar",
+_KNOWN_TEXT_MISC_EXTENSIONS = {
+    ".tex", ".latex", ".bib", ".cls", ".sty", ".diff", ".patch",
+    ".hcl", ".tf", ".tfvars", ".gradle", ".dockerfile",
 }  # fmt: skip
-_KNOWN_BINARY_EXTENSIONS = (
-    _KNOWN_BINARY_IMAGE_EXTENSIONS
-    | _KNOWN_BINARY_AUDIO_EXTENSIONS
-    | _KNOWN_BINARY_VIDEO_EXTENSIONS
-    | _KNOWN_BINARY_DOCUMENT_EXTENSIONS
-    | _KNOWN_BINARY_ARCHIVE_EXTENSIONS
-    | _KNOWN_BINARY_EXECUTABLE_EXTENSIONS
+_KNOWN_TEXT_EXTENSIONS = (
+    _KNOWN_TEXT_PLAIN_EXTENSIONS
+    | _KNOWN_TEXT_DATA_EXTENSIONS
+    | _KNOWN_TEXT_WEB_EXTENSIONS
+    | _KNOWN_TEXT_SOURCE_EXTENSIONS
+    | _KNOWN_TEXT_SCRIPT_EXTENSIONS
+    | _KNOWN_TEXT_MISC_EXTENSIONS
 )
 
 
 def _name_looks_binary(name: str) -> bool:
-    """Whether ``name``'s extension is a known binary format.
+    """Whether ``name``'s extension is NOT a recognized text format.
 
-    ``Path.suffix`` already resolves a compound extension like ".tar.gz"
-    to just its last component (".gz"), which is itself in
-    _KNOWN_BINARY_EXTENSIONS — no separate ".tar.gz" entry is needed.
+    Default-deny: an extension is only accepted if it's in
+    _KNOWN_TEXT_EXTENSIONS. A name with no extension at all (e.g.
+    "Dockerfile", "README") is accepted too — the absence of an
+    extension isn't evidence of binary intent the way an unrecognized
+    one is.
 
-    An unrecognized extension returns False — google_drive_create_file's
-    mime_type-based check is the complementary signal that catches an
-    explicitly-declared binary type regardless of what the name looks
-    like.
+    google_drive_create_file's mime_type-based check is the complementary
+    signal that catches an explicitly-declared binary type regardless of
+    what the name looks like.
     """
-    return Path(name).suffix.lower() in _KNOWN_BINARY_EXTENSIONS
+    suffix = Path(name.strip()).suffix.lower()
+    return bool(suffix) and suffix not in _KNOWN_TEXT_EXTENSIONS
 
 
 def get_drive_service() -> Any:
@@ -950,6 +992,15 @@ def google_drive_get_file_content(file_id: str, mime_type: str = "text/plain") -
     case rather than the full file.
     """
     try:
+        # Normalized once here so every downstream use (the text-safety
+        # check, the "== text/plain" default-detection below, and the
+        # export_media mimeType itself) agrees on the same canonical
+        # value — an un-normalized "TEXT/PLAIN" or "text/plain; charset=..."
+        # would otherwise pass the check above but then fail the exact
+        # string comparison used to detect the default, silently skipping
+        # the Workspace-export mimeType fallback and sending Drive's API
+        # a non-canonical mimeType instead.
+        mime_type = _normalize_mime_type(mime_type)
         if not _is_text_mime_type(mime_type):
             return json.dumps(
                 {
@@ -1162,16 +1213,23 @@ def google_drive_upload_file(
 
     file_path: path to a file already on disk, e.g. something written to
     the task workspace. Must be inside an allowed directory (automatically
-    scoped to the current task workspace) so this tool cannot be used to
-    exfiltrate arbitrary files from the host. Pass an absolute path — a
-    relative path resolves against this process's own working directory,
-    not the allowed directory, and will not find a file written to the
-    task workspace.
+    scoped to the current task workspace), which is meant to keep this
+    tool from reading arbitrary host files — not an absolute guarantee
+    (see _resolve_upload_file_path's symlink-timing note below). Pass an
+    absolute path — a relative path resolves against this process's own
+    working directory, not the allowed directory, and will not find a
+    file written to the task workspace.
     name: the file name to give it in Drive; defaults to file_path's own
     basename.
-    mime_type: defaults to a guess from the file's extension, falling back
-    to "application/octet-stream" when it can't be guessed. Only needed
-    when the extension is missing or misleading.
+    mime_type: defaults to a guess from the file's extension via the
+    standard mimetypes module, falling back to "application/octet-stream"
+    when it can't be guessed. This guess is informational only — Drive's
+    displayed file type may be wrong on a host whose mimetypes database
+    doesn't recognize the extension (see the _KNOWN_TEXT_EXTENSIONS
+    comment above for why that's host-dependent), but the uploaded bytes
+    are always exactly file_path's real content either way. Pass mime_type
+    explicitly for a reliable label, especially for an extension outside
+    the common formats mimetypes ships with by default.
     """
     try:
         local_path = _resolve_upload_file_path(file_path)
@@ -1187,12 +1245,9 @@ def google_drive_upload_file(
             "name": resolved_name,
             "mimeType": resolved_mime_type,
         }
-        resolved_parent_id = None
-        parent_resource_key = None
-        if parent_id:
-            resolved_parent_id = _resolve_file_id(parent_id, "parent_id")
-            parent_resource_key = _extract_resource_key(parent_id)
-            file_metadata["parents"] = [resolved_parent_id]
+        resolved_parent_id, parent_resource_key = _apply_parent_id(
+            file_metadata, parent_id
+        )
 
         service = get_drive_service()
 
@@ -1255,13 +1310,20 @@ def google_drive_create_file(
     google_drive_upload_file with the file's path instead.
     """
     try:
-        # Normalize an empty/whitespace-only mime_type to the documented
-        # default rather than letting it fall through to the "not a text
-        # format" branch below — an LLM caller omitting the argument
-        # entirely gets the real default via the parameter itself, but one
-        # that explicitly passes "" should get the same treatment, not a
-        # confusing rejection.
-        mime_type = mime_type.strip() or "text/plain"
+        # Normalized (case/whitespace/;params stripped) once here so every
+        # downstream use agrees: the guard checks below, the Drive
+        # file_metadata["mimeType"] actually sent, and the upload's own
+        # media mimetype. Without this, a caller passing e.g. "TEXT/PLAIN"
+        # or "application/json; charset=utf-8" would pass the guard (which
+        # already normalized internally) but then have that same
+        # non-canonical string land in Drive's metadata instead of the
+        # canonical form the guard just validated. An empty/whitespace-only
+        # mime_type normalizes to the documented default rather than
+        # falling through to the "not a text format" branch below — an LLM
+        # caller omitting the argument entirely gets the real default via
+        # the parameter itself, but one that explicitly passes "" should
+        # get the same treatment, not a confusing rejection.
+        mime_type = _normalize_mime_type(mime_type) or "text/plain"
         is_google_doc_conversion = _is_google_workspace_mime_type(mime_type)
         # A Google Workspace conversion is exempt from both checks below
         # (Docs/Sheets/Slides always take text/HTML source regardless of
@@ -1308,12 +1370,9 @@ def google_drive_create_file(
             )
 
         file_metadata: dict[str, Any] = {"name": name, "mimeType": mime_type}
-        resolved_parent_id = None
-        parent_resource_key = None
-        if parent_id:
-            resolved_parent_id = _resolve_file_id(parent_id, "parent_id")
-            parent_resource_key = _extract_resource_key(parent_id)
-            file_metadata["parents"] = [resolved_parent_id]
+        resolved_parent_id, parent_resource_key = _apply_parent_id(
+            file_metadata, parent_id
+        )
 
         service = get_drive_service()
         fh = io.BytesIO(content.encode("utf-8"))
@@ -1350,12 +1409,9 @@ def google_drive_create_folder(name: str, parent_id: str | None = None) -> str:
             "name": name,
             "mimeType": "application/vnd.google-apps.folder",
         }
-        resolved_parent_id = None
-        parent_resource_key = None
-        if parent_id:
-            resolved_parent_id = _resolve_file_id(parent_id, "parent_id")
-            parent_resource_key = _extract_resource_key(parent_id)
-            file_metadata["parents"] = [resolved_parent_id]
+        resolved_parent_id, parent_resource_key = _apply_parent_id(
+            file_metadata, parent_id
+        )
 
         service = get_drive_service()
         create_request = service.files().create(

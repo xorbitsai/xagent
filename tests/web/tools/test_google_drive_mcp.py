@@ -920,6 +920,45 @@ def test_get_file_content_defaults_spreadsheet_export_to_csv(monkeypatch):
     )
 
 
+@pytest.mark.parametrize(
+    "mime_type", ["TEXT/PLAIN", "text/plain; charset=utf-8", "  text/plain  "]
+)
+def test_get_file_content_normalizes_mime_type_before_detecting_the_default(
+    monkeypatch, mime_type
+):
+    """Regression guard: the "did the caller leave mime_type at its
+    text/plain default" check must compare against the *normalized* value
+    -- a case variant or one with a trailing ";charset=..." passes the
+    earlier _is_text_mime_type gate (which normalizes internally) but,
+    without normalizing the variable itself, would then fail the later
+    "== text/plain" comparison verbatim and skip the CSV export fallback
+    entirely, sending Drive's export_media a non-canonical mimeType."""
+    service = _mock_drive_service(monkeypatch)
+    service.files.return_value.get.return_value.execute.return_value = {
+        "id": "sheet1",
+        "name": "Budget",
+        "mimeType": "application/vnd.google-apps.spreadsheet",
+    }
+
+    class _FakeDownloader:
+        def __init__(self, fh, _request):
+            self._fh = fh
+
+        def next_chunk(self):
+            self._fh.write(b"a,b\n1,2")
+            return None, True
+
+    monkeypatch.setattr(google_drive, "MediaIoBaseDownload", _FakeDownloader)
+
+    result = json.loads(google_drive.google_drive_get_file_content("sheet1", mime_type))
+
+    assert result["status"] == "success"
+    assert (
+        service.files.return_value.export_media.call_args.kwargs["mimeType"]
+        == "text/csv"
+    )
+
+
 def test_get_file_content_respects_explicit_mime_type_for_spreadsheet(monkeypatch):
     """An explicit (non-default) mime_type must be honored as-is rather
     than the text/plain->text/csv smart-fallback mapping overriding it.
@@ -2564,6 +2603,36 @@ def test_upload_file_defaults_mime_type_when_unguessable(
     assert kwargs["body"]["mimeType"] == "application/octet-stream"
 
 
+def test_upload_file_succeeds_with_real_bytes_even_when_mimetype_guess_is_wrong(
+    monkeypatch, _upload_allowed_dirs_env
+):
+    """Regression guard for the documented host-dependence tradeoff:
+    unlike google_drive_create_file's guard (a correctness-relevant
+    accept/reject decision), google_drive_upload_file's own mimetype
+    guess is purely informational -- when mimetypes.guess_type() can't
+    (or, on a different host, mis-)identify the extension, the upload
+    must still succeed with the real file bytes intact, just with the
+    application/octet-stream fallback label instead of a rejection."""
+    local_file = _upload_allowed_dirs_env / "report.docx"
+    local_file.write_bytes(b"real docx bytes")
+    monkeypatch.setattr(google_drive.mimetypes, "guess_type", lambda name: (None, None))
+
+    files = Mock()
+    files.create.return_value.execute.return_value = {"id": "f1"}
+    _mock_drive_service_with_files(monkeypatch, files)
+
+    result = json.loads(google_drive.google_drive_upload_file(str(local_file)))
+
+    assert result["status"] == "success"
+    kwargs = files.create.call_args.kwargs
+    assert kwargs["body"]["mimeType"] == "application/octet-stream"
+    assert kwargs["media_body"].size() == len(b"real docx bytes")
+    # The upload reads from the real file on disk regardless of the
+    # mimetype label -- confirm the source file's bytes were never
+    # touched by the failed/wrong mimetype guess.
+    assert local_file.read_bytes() == b"real docx bytes"
+
+
 def test_upload_file_includes_parent_id_when_given(
     monkeypatch, _upload_allowed_dirs_env
 ):
@@ -2652,7 +2721,25 @@ def test_upload_file_rejects_missing_file(monkeypatch, _upload_allowed_dirs_env)
     result = json.loads(google_drive.google_drive_upload_file(str(missing_path)))
 
     assert result["status"] == "error"
+    assert "not found" in result["message"].lower()
     files.create.assert_not_called()
+
+
+def test_upload_file_validates_parent_id_before_building_service(
+    monkeypatch, _upload_allowed_dirs_env
+):
+    local_file = _upload_allowed_dirs_env / "report.pdf"
+    local_file.write_bytes(b"content")
+    get_service = Mock()
+    monkeypatch.setattr(google_drive, "get_drive_service", get_service)
+
+    result = json.loads(
+        google_drive.google_drive_upload_file(str(local_file), parent_id=123)
+    )
+
+    assert result["status"] == "error"
+    assert "parent_id must be a string" in result["message"]
+    get_service.assert_not_called()
 
 
 def test_upload_file_rejects_empty_file(monkeypatch, _upload_allowed_dirs_env):
@@ -2905,18 +2992,77 @@ def test_create_file_allows_text_safe_mime_types(monkeypatch, mime_type):
         "scan.tiff",
         "installer.exe",
         "backup.tar.gz",
+        "data.parquet",
+        "sheet.xlsb",
+        "doc.numbers",
+        "deck.key",
+        "doc.pages",
+        "db.sqlite",
+        "app.db",
+        "model.pkl",
+        "arr.npy",
+        "mod.wasm",
+        "img.avif",
+        "font.woff",
+        "font.woff2",
+        "font.ttf",
+        "font.otf",
+        "audio.opus",
+        "vid.mpg",
+        "vid.3gp",
+        "archive.zst",
+        "compiled.pyc",
+        "raw.dat",
+        "draw.odg",
+        "diagram.vsdx",
     ],
 )
-def test_create_file_rejects_previously_unlisted_binary_extensions(monkeypatch, name):
-    """Regression guard: reviewer-flagged gap in the original 18-entry
-    binary-extension set — these were missing from it, so with the
-    default text/plain mime_type they used to sail straight through the
-    guard and get silently created as mislabeled text files.
-    _KNOWN_BINARY_EXTENSIONS must include all of them."""
+def test_create_file_rejects_binary_extensions_not_in_the_text_allowlist(
+    monkeypatch, name
+):
+    """Regression guard: with a default-deny design (accept only
+    recognized text extensions), every one of these -- including the
+    second round of gaps a reviewer found in the original 18-entry
+    binary-extension blocklist and its mimetypes-based successor -- must
+    be rejected without needing an entry of its own. Only
+    _KNOWN_TEXT_EXTENSIONS needs to be right; this list never has to be
+    exhaustive."""
     files = Mock()
     _mock_drive_service_with_files(monkeypatch, files)
 
     result = json.loads(google_drive.google_drive_create_file(name, "some text"))
+
+    assert result["status"] == "error"
+    assert "google_drive_upload_file" in result["message"]
+    files.create.assert_not_called()
+
+
+@pytest.mark.parametrize("name", ["Dockerfile", "README", "LICENSE", "Makefile"])
+def test_create_file_allows_extensionless_names(monkeypatch, name):
+    """A name with no extension at all isn't evidence of binary intent
+    the way an unrecognized extension is -- common extensionless files
+    like these must still be accepted."""
+    files = Mock()
+    files.create.return_value.execute.return_value = {"id": "f1"}
+    _mock_drive_service_with_files(monkeypatch, files)
+
+    result = json.loads(google_drive.google_drive_create_file(name, "some text"))
+
+    assert result["status"] == "success"
+    files.create.assert_called_once()
+
+
+def test_create_file_strips_name_before_checking_the_extension(monkeypatch):
+    """Regression guard: a trailing space on the whole name (e.g.
+    "report.pdf ") must not change Path(name).suffix into something that
+    matches nothing and slips past the guard -- name must be stripped the
+    same way mime_type already is."""
+    files = Mock()
+    _mock_drive_service_with_files(monkeypatch, files)
+
+    result = json.loads(
+        google_drive.google_drive_create_file("report.pdf ", "some text")
+    )
 
     assert result["status"] == "error"
     assert "google_drive_upload_file" in result["message"]
@@ -2952,6 +3098,36 @@ def test_create_file_allows_broadened_and_normalized_mime_types(monkeypatch, mim
 
     assert result["status"] == "success"
     files.create.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "mime_type,normalized",
+    [
+        ("TEXT/PLAIN", "text/plain"),
+        ("application/json; charset=utf-8", "application/json"),
+        ("  text/csv  ", "text/csv"),
+    ],
+)
+def test_create_file_sends_the_normalized_mime_type_to_drive(
+    monkeypatch, mime_type, normalized
+):
+    """Regression guard: the guard's text-safety check normalizes
+    mime_type internally, but without also reassigning the normalized
+    value, the raw (non-canonical) string would still be what actually
+    lands in Drive's file_metadata["mimeType"] and the upload's own media
+    mimetype -- Drive should only ever see the canonical form."""
+    files = Mock()
+    files.create.return_value.execute.return_value = {"id": "f1"}
+    _mock_drive_service_with_files(monkeypatch, files)
+
+    result = json.loads(
+        google_drive.google_drive_create_file("notes.txt", "hi", mime_type=mime_type)
+    )
+
+    assert result["status"] == "success"
+    kwargs = files.create.call_args.kwargs
+    assert kwargs["body"]["mimeType"] == normalized
+    assert kwargs["media_body"].mimetype() == normalized
 
 
 def test_create_file_google_apps_exemption_requires_the_real_prefix(monkeypatch):

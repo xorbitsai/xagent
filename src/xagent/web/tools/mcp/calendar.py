@@ -595,9 +595,15 @@ def google_calendar_create_events(
     """
     requested_conference = False
     try:
-        _reject_reversed_window(start_time, end_time)
+        # Checked before reject_reversed_window (which stays permissive,
+        # not diagnostic, on a mismatched-awareness pair): two NAIVE
+        # values that also happen to be reversed compare just fine (no
+        # TypeError, so reject_reversed_window doesn't defer to this
+        # check) and would otherwise surface the generic "must be after"
+        # message instead of this more specific, actionable one.
         _require_offset_datetime(start_time, "start_time")
         _require_offset_datetime(end_time, "end_time")
+        _reject_reversed_window(start_time, end_time)
         service = get_calendar_service()
         normalized_attendees = _normalize_addresses(attendees) if attendees else []
 
@@ -742,6 +748,51 @@ def google_calendar_update_events(
         # `attendees` was given at all.
         added_attendees = _attendees_to_add(attendees, existing_attendee_emails)
 
+        # The organizer's own calendar is checked separately, via
+        # check_organizer (events.list, excluded by id/recurringEventId) -
+        # freebusy.query has no concept of "exclude this event", so if the
+        # organizer's own email also shows up among the attendees being
+        # freebusy-checked (just added now, or already on the event from
+        # an earlier call), that query would always find this very
+        # event's own busy block on their calendar and report a false
+        # self-conflict. Excluded only from the freebusy-checked copies
+        # below, never from `added_attendees` itself - a caller that
+        # explicitly asked to add the organizer as an attendee must still
+        # have them actually written to the event. Computed this early
+        # (alongside added_attendees, rather than right before use) so
+        # both the timezone-lookup gate and the organizer-check gate
+        # below can key off the POST-filter attendee sets, not the raw
+        # ones - gating off the raw sets would trigger an unnecessary
+        # timezone lookup, or (worse) skip checking the organizer's
+        # calendar entirely, in the specific case where the organizer's
+        # own email was the only thing making a raw set non-empty.
+        organizer_email = (event.get("organizer") or {}).get("email")
+        # None never equals a real address's lowercased form, so this
+        # filter is a no-op (keeps everything) when there's no organizer
+        # email to exclude - same effect as branching on `organizer_email`
+        # explicitly, without a duplicated ternary.
+        organizer_email_lower = organizer_email.lower() if organizer_email else None
+        attendees_to_check = [
+            a for a in added_attendees if a.lower() != organizer_email_lower
+        ]
+        existing_attendees_to_check = [
+            a for a in existing_attendees_raw if a.lower() != organizer_email_lower
+        ]
+        # Whether the organizer's own email was itself one of the
+        # genuinely-new additions (filtered out of attendees_to_check
+        # above) - if so, their availability still needs verifying, just
+        # via the organizer-calendar path (which can actually exclude
+        # this event) rather than freebusy (which can't). Without this,
+        # adding ONLY the organizer as a new attendee - with the window
+        # otherwise unchanged - would skip checking their calendar
+        # entirely: `attendees_to_check` ends up empty (organizer
+        # filtered out) and `check_organizer` alone wouldn't have been
+        # true for an unmoved window, so no conflict check would run for
+        # them at all, silently missing a real conflict on their calendar.
+        organizer_newly_added = organizer_email_lower is not None and any(
+            a.lower() == organizer_email_lower for a in added_attendees
+        )
+
         existing_is_all_day = "date" in (event.get("start") or {}) or "date" in (
             event.get("end") or {}
         )
@@ -774,7 +825,7 @@ def google_calendar_update_events(
         # of that comparison fall back to the same assumption
         # consistently), so neither actually needs the real zone either.
         needs_real_calendar_timezone = existing_is_all_day and (
-            bool(start_time) or bool(end_time) or bool(added_attendees)
+            bool(start_time) or bool(end_time) or bool(attendees_to_check)
         )
         try:
             calendar_timezone = (
@@ -814,32 +865,18 @@ def google_calendar_update_events(
             existing_end_key,
         )
 
-        # The organizer's own calendar is already checked above via
-        # check_organizer (events.list, excluded by id/recurringEventId) -
-        # freebusy.query has no concept of "exclude this event", so if the
-        # organizer's own email also shows up among the attendees being
-        # freebusy-checked (just added now, or already on the event from
-        # an earlier call), that query would always find this very
-        # event's own busy block on their calendar and report a false
-        # self-conflict. Excluded only from the freebusy-checked copies
-        # below, never from `added_attendees` itself - a caller that
-        # explicitly asked to add the organizer as an attendee must still
-        # have them actually written to the event.
-        organizer_email = (event.get("organizer") or {}).get("email")
-        attendees_to_check = (
-            [a for a in added_attendees if a.lower() != organizer_email.lower()]
-            if organizer_email
-            else added_attendees
-        )
-        existing_attendees_to_check = (
-            [a for a in existing_attendees_raw if a.lower() != organizer_email.lower()]
-            if organizer_email
-            else existing_attendees_raw
-        )
-
         unchecked_attendees: list[str] = []
         if not ignore_conflicts and effective_start and effective_end:
-            check_organizer = window_changed
+            # A newly-added organizer is checked via the organizer path
+            # (events.list, which can actually exclude this event by id/
+            # recurringEventId) rather than freebusy - without also
+            # triggering it here, adding ONLY the organizer as a new
+            # attendee on an otherwise-unmoved event would leave
+            # `attendees_to_check` empty (organizer filtered out above)
+            # and `window_changed` false, skipping their calendar
+            # entirely instead of just skipping the self-conflicting
+            # freebusy path for them.
+            check_organizer = window_changed or organizer_newly_added
             all_conflicts: list[dict[str, Any]] = []
 
             try:

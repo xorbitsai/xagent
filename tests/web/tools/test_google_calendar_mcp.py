@@ -1139,6 +1139,29 @@ def test_create_events_rejects_an_offsetless_start_time(fake_service):
     assert fake_service._events.insert_calls == []
 
 
+def test_create_events_prefers_the_offset_error_over_the_reversed_window_one(
+    fake_service,
+):
+    """Regression test: two NAIVE values that also happen to be reversed
+    compare just fine (no TypeError, so reject_reversed_window's
+    permissive aware-vs-naive handling never kicks in) and would
+    otherwise raise the generic "must be after" message before the more
+    specific, actionable offset error ever got a chance to run - offset
+    validation must happen first."""
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Kickoff",
+            start_time="2026-08-27T10:30:00",  # naive AND reversed
+            end_time="2026-08-27T10:00:00",  # naive
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "start_time" in result["message"]
+    assert "offset" in result["message"]
+    assert fake_service._events.insert_calls == []
+
+
 def test_update_events_rejects_an_offsetless_start_time(fake_service):
     fake_service._events._get_result = {
         "id": "self-1",
@@ -1348,6 +1371,43 @@ def test_update_events_adding_the_organizer_as_an_attendee_does_not_self_conflic
     )
 
     assert result["status"] == "success"
+    assert fake_service._freebusy.query_calls == []
+    # The organizer's own calendar must still have been checked - just via
+    # the id/recurringEventId-excluding events.list path instead of the
+    # self-conflicting freebusy one - not skipped outright.
+    assert len(fake_service._events.list_calls) == 1
+
+
+def test_update_events_adding_the_organizer_as_an_attendee_still_catches_a_real_conflict(
+    fake_service,
+):
+    """Regression test: excluding the organizer from the freebusy batch
+    must not also skip checking their calendar altogether. Before this
+    fix, adding ONLY the organizer as a new attendee (window otherwise
+    unchanged) left both `attendees_to_check` empty (organizer filtered
+    out) and `check_organizer` false (window unchanged), so a genuinely
+    different conflicting event on the organizer's own calendar was
+    silently missed entirely."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T10:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T10:30:00+08:00"},
+        "attendees": [],
+        "organizer": {"email": "me@example.com"},
+    }
+    fake_service._events._list_result = {
+        "items": [_confirmed_event(event_id="other-1", summary="Board sync")]
+    }
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            attendees=["me@example.com"],
+        )
+    )
+
+    assert result["status"] == "conflict"
+    assert [c["summary"] for c in result["conflicts"]] == ["Board sync"]
     assert fake_service._freebusy.query_calls == []
 
 

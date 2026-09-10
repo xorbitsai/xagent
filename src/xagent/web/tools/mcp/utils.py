@@ -217,16 +217,21 @@ def conflict_response(
     that point the write is already correctly blocked by the known
     conflict, so being honest about who else couldn't be checked is safe.
 
-    `conflicts` is uncapped input (an organizer with a busy shared
-    calendar, or a wide window, can turn up far more overlapping events
-    than a caller needs to see) - unlike every other response path here,
-    which routes through `success_with_capped_dict`, this shape has
-    multiple top-level fields under a non-"success" status that function
-    doesn't support, so the payload is capped locally instead: only
-    `conflicts` (the one field that can actually grow large) is halved,
-    repeatedly, until the JSON fits `get_tool_max_output_length()` -
-    small fields like `hint`/`unchecked_attendees` are left untouched as
-    long as there's a bigger field left to shrink first.
+    `conflicts` and `unchecked_attendees` are both uncapped input (an
+    organizer with a busy shared calendar or a wide window can turn up
+    far more overlapping events than a caller needs to see; a missing-
+    scope error partway through a large invite list can likewise mark
+    an entire remaining batch unchecked) - unlike every other response
+    path here, which routes through `success_with_capped_dict`, this
+    shape has multiple top-level fields under a non-"success" status
+    that function doesn't support, so the payload is capped locally
+    instead: whichever of `conflicts`/`unchecked_attendees` is currently
+    larger (by its own serialized size) is halved each step, so a
+    single real conflict isn't fully dropped just to make room for a
+    still-oversized `unchecked_attendees` list (unconditionally halving
+    `conflicts` first would zero out a 1-item list in a single step,
+    regardless of whether that was actually necessary) - the small
+    `hint` field is never touched.
     """
     payload: dict[str, Any] = {
         "status": "conflict",
@@ -240,16 +245,31 @@ def conflict_response(
             "ignore_conflicts=true after the user has explicitly confirmed "
             "they still want this slot."
         ),
+        # Always present (not just when truncation actually happens),
+        # matching every other capped response path in this package
+        # (see success_with_capped_dict) - a caller that learned
+        # "truncated is always in the payload" from those shouldn't have
+        # to special-case this one.
+        "truncated": False,
     }
     response = json.dumps(payload, ensure_ascii=False)
     max_output_length = get_tool_max_output_length()
     if len(response) <= max_output_length:
         return response
 
-    remaining = conflicts
-    while remaining and len(response) > max_output_length:
-        remaining = remaining[: len(remaining) // 2]
-        payload["conflicts"] = remaining
+    remaining_conflicts = conflicts
+    remaining_unchecked = unchecked_attendees
+    while (remaining_conflicts or remaining_unchecked) and len(
+        response
+    ) > max_output_length:
+        conflicts_size = len(json.dumps(remaining_conflicts, ensure_ascii=False))
+        unchecked_size = len(json.dumps(remaining_unchecked, ensure_ascii=False))
+        if remaining_conflicts and conflicts_size >= unchecked_size:
+            remaining_conflicts = remaining_conflicts[: len(remaining_conflicts) // 2]
+        else:
+            remaining_unchecked = remaining_unchecked[: len(remaining_unchecked) // 2]
+        payload["conflicts"] = remaining_conflicts
+        payload["unchecked_attendees"] = remaining_unchecked
         payload["truncated"] = True
         response = json.dumps(payload, ensure_ascii=False)
     return response

@@ -375,7 +375,7 @@ def test_conflict_response_uncapped_when_it_fits(monkeypatch):
         )
     )
     assert response["conflicts"] == conflicts
-    assert "truncated" not in response
+    assert response["truncated"] is False
 
 
 def test_conflict_response_caps_an_oversized_conflicts_list(monkeypatch):
@@ -409,4 +409,44 @@ def test_conflict_response_caps_an_oversized_conflicts_list(monkeypatch):
     assert len(response["conflicts"]) < len(conflicts)
     assert response["conflicts"] == conflicts[: len(response["conflicts"])]
     assert response["unchecked_attendees"] == ["unreachable@example.com"]
+    assert len(json.dumps(response, ensure_ascii=False)) <= 2000
+
+
+def test_conflict_response_caps_unchecked_attendees_when_conflicts_alone_is_not_enough(
+    monkeypatch,
+):
+    """Regression test: a single real conflict combined with a huge
+    unchecked_attendees list (e.g. every remaining attendee in a large
+    invite batch, marked unchecked after a mid-batch scope error) can
+    still exceed the output budget even after `conflicts` has been
+    shrunk to nothing - unchecked_attendees must also be capped, not
+    left untouched forever."""
+    monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "2000")
+    conflicts = [
+        {
+            "calendar": "organizer",
+            "summary": "1:1 with Hazel",
+            "start": "2026-08-27T10:00:00+00:00",
+            "end": "2026-08-27T10:30:00+00:00",
+        }
+    ]
+    unchecked_attendees = [f"person{i}@example.com" for i in range(200)]
+
+    response = json.loads(
+        utils.conflict_response(
+            conflicts,
+            unchecked_attendees,
+            "2026-08-27T10:00:00",
+            "2026-08-27T10:30:00",
+        )
+    )
+
+    assert response["status"] == "conflict"
+    assert response["truncated"] is True
+    assert response["conflicts"] == conflicts
+    assert len(response["unchecked_attendees"]) < len(unchecked_attendees)
+    assert (
+        response["unchecked_attendees"]
+        == unchecked_attendees[: len(response["unchecked_attendees"])]
+    )
     assert len(json.dumps(response, ensure_ascii=False)) <= 2000

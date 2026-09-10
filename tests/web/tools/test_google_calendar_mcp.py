@@ -46,8 +46,8 @@ def test_create_events_sets_recurrence(monkeypatch):
     result = json.loads(
         calendar.google_calendar_create_events(
             summary="Daily Catch up with Bright",
-            start_time="2026-08-26T07:00:00+08:00",
-            end_time="2026-08-26T07:15:00+08:00",
+            start_time="2026-08-26T07:00:00",
+            end_time="2026-08-26T07:15:00",
             recurrence="FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;UNTIL=20260911T235959Z",
             timezone="Asia/Shanghai",
         )
@@ -60,6 +60,34 @@ def test_create_events_sets_recurrence(monkeypatch):
     ]
     assert kwargs["body"]["start"]["timeZone"] == "Asia/Shanghai"
     assert kwargs["body"]["end"]["timeZone"] == "Asia/Shanghai"
+
+
+def test_create_events_does_not_stamp_timezone_on_a_side_with_its_own_offset(
+    monkeypatch,
+):
+    """Confirmed bug: timezone used to be stamped onto start/end
+    unconditionally whenever it was given, even when start_time/end_time
+    already carried their own UTC offset - producing an internally
+    contradictory EventDateTime (e.g. dateTime says "+08:00", timeZone
+    says "America/Los_Angeles"). Must be skipped for a side that's
+    already self-describing."""
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Weekly sync",
+            start_time="2026-08-26T09:00:00+08:00",
+            end_time="2026-08-26T10:00:00+08:00",
+            timezone="America/Los_Angeles",
+            recurrence="FREQ=WEEKLY;COUNT=5",
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.insert.call_args
+    assert "timeZone" not in kwargs["body"]["start"]
+    assert "timeZone" not in kwargs["body"]["end"]
 
 
 def test_create_events_requires_timezone_when_recurrence_is_set(monkeypatch):
@@ -434,6 +462,39 @@ def test_update_events_explicit_timezone_overrides_existing_one_on_reschedule(
     _, kwargs = service.events.return_value.update.call_args
     assert kwargs["body"]["start"]["timeZone"] == "America/New_York"
     assert kwargs["body"]["end"]["timeZone"] == "America/New_York"
+
+
+def test_update_events_does_not_stamp_timezone_on_a_side_with_its_own_offset(
+    monkeypatch,
+):
+    """Confirmed bug: an explicit timezone used to be stamped onto
+    start/end unconditionally, even when the new start_time/end_time
+    already carried their own UTC offset - producing an internally
+    contradictory EventDateTime, the same class of bug the existing-
+    timeZone reuse fallback already guards against for the no-explicit-
+    timezone case."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-19T09:00:00+08:00", "timeZone": "Asia/Shanghai"},
+        "end": {"dateTime": "2026-08-19T10:00:00+08:00", "timeZone": "Asia/Shanghai"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-08-26T09:00:00+08:00",
+            end_time="2026-08-26T10:00:00+08:00",
+            timezone="America/Los_Angeles",
+            recurrence="FREQ=WEEKLY;COUNT=5",
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.update.call_args
+    assert "timeZone" not in kwargs["body"]["start"]
+    assert "timeZone" not in kwargs["body"]["end"]
 
 
 def test_update_events_preserves_existing_exdate_when_replacing_the_rrule(
@@ -929,8 +990,8 @@ def test_update_events_survives_an_explicit_none_start_and_end(monkeypatch):
     result = json.loads(
         calendar.google_calendar_update_events(
             event_id="existing-1",
-            start_time="2026-08-26T07:00:00Z",
-            end_time="2026-08-26T08:00:00Z",
+            start_time="2026-08-26T07:00:00",
+            end_time="2026-08-26T08:00:00",
             timezone="Asia/Manila",
             recurrence="FREQ=DAILY;UNTIL=20260911T235959Z",
         )

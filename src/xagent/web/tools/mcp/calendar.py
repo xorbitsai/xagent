@@ -371,11 +371,14 @@ def google_calendar_create_events(
     Google and rejected with a clear error if it can't be parsed, rather
     than silently landing as inert text with no actual recurrence.
     timezone is an IANA timezone name (e.g. 'America/Los_Angeles'). Google
-    requires it for recurring events specifically (it's what the
-    recurrence is expanded in), so it's required here whenever recurrence
-    is set; it's optional otherwise. When start_time/end_time have no UTC
-    offset, timezone also localizes them so recurrence's UNTIL can be
-    compared against them correctly.
+    requires it for a non-all-day recurring event specifically (it's what
+    the recurrence is expanded in), so it's required here whenever
+    recurrence is set on one; an all-day recurring event doesn't need it
+    (Google doesn't attach a timeZone to a date-only event). When
+    start_time/end_time have no UTC offset, timezone also localizes them
+    so recurrence's UNTIL can be compared against them correctly, and it's
+    skipped for a side that already carries its own offset to avoid the
+    two disagreeing.
     attendees is a list of email addresses to add to the event. Adding attendees does not, by
     itself, email them; set notify_attendees=True to have Google Calendar send them a native
     invite immediately. Confirm the recipient list with the user before setting notify_attendees=True.
@@ -414,8 +417,14 @@ def google_calendar_create_events(
             "end": {"date": end_time} if end_is_all_day else {"dateTime": end_time},
         }
         if timezone and not start_is_all_day:
-            event["start"]["timeZone"] = timezone
-            event["end"]["timeZone"] = timezone
+            # Skip a side whose value already carries its own UTC offset -
+            # stamping timezone there too could disagree with it (e.g. a
+            # "+08:00" dateTime alongside a "America/Los_Angeles"
+            # timeZone), an internally-contradictory EventDateTime.
+            if not _has_own_utc_offset(start_time):
+                event["start"]["timeZone"] = timezone
+            if not _has_own_utc_offset(end_time):
+                event["end"]["timeZone"] = timezone
 
         if description:
             event["description"] = description
@@ -596,10 +605,21 @@ def google_calendar_update_events(
             )
 
         if timezone and not is_all_day:
-            event["start"] = event.get("start") or {}
-            event["start"]["timeZone"] = timezone
-            event["end"] = event.get("end") or {}
-            event["end"]["timeZone"] = timezone
+            # Skip a side whose current value already carries its own UTC
+            # offset - stamping timezone there too could disagree with it,
+            # an internally-contradictory EventDateTime (the same concern
+            # the existing-timeZone reuse fallback above already guards
+            # against for the no-explicit-timezone case).
+            if current_start_value is None or not _has_own_utc_offset(
+                current_start_value
+            ):
+                event["start"] = event.get("start") or {}
+                event["start"]["timeZone"] = timezone
+            if current_end_value is None or not _has_own_utc_offset(
+                current_end_value
+            ):
+                event["end"] = event.get("end") or {}
+                event["end"]["timeZone"] = timezone
         if description:
             event["description"] = description
         if location:
@@ -624,10 +644,17 @@ def google_calendar_update_events(
                 # objects in practice, but this avoids a raw KeyError/
                 # AttributeError leaking through as an opaque error message
                 # if it ever doesn't), still gets a clean dict to write into.
-                event["start"] = event.get("start") or {}
-                event["start"]["timeZone"] = effective_timezone
-                event["end"] = event.get("end") or {}
-                event["end"]["timeZone"] = effective_timezone
+                # Same own-offset skip as the plain-reschedule branch above.
+                if current_start_value is None or not _has_own_utc_offset(
+                    current_start_value
+                ):
+                    event["start"] = event.get("start") or {}
+                    event["start"]["timeZone"] = effective_timezone
+                if current_end_value is None or not _has_own_utc_offset(
+                    current_end_value
+                ):
+                    event["end"] = event.get("end") or {}
+                    event["end"]["timeZone"] = effective_timezone
             # An all-day event's naive date anchor still needs *some*
             # timezone to compare against an aware ("Z"-suffixed) UNTIL -
             # RFC 5545 requires DTSTART and UNTIL to either both be aware or

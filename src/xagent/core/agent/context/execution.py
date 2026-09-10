@@ -12,7 +12,6 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import tiktoken
-logger = logging.getLogger(__name__)
 
 from ...context_ref import (
     CONTEXT_REFS_KEY,
@@ -64,6 +63,8 @@ from .skill_tool import (
     LOADED_SKILLS_METADATA_KEY,
     SKILL_INDEX_METADATA_KEY,
 )
+
+logger = logging.getLogger(__name__)
 
 READ_FILE_CONTEXT_LIMIT = 12_000
 # Set by the web layer into ``ExecutionContext.metadata`` at turn start: the

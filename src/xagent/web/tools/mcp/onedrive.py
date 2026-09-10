@@ -21,10 +21,17 @@ mcp = FastMCP("onedrive-mcp")
 
 GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
 DEFAULT_TIMEOUT_SECONDS = 30
-# Microsoft Graph's simple content PUT only accepts files up to 4 MiB;
-# anything larger must go through a resumable upload session instead (see
-# _upload_large_file_content).
-_SIMPLE_UPLOAD_MAX_BYTES = 4 * 1024 * 1024
+# Sized for a single chunk PUT of up to _UPLOAD_SESSION_CHUNK_SIZE bytes over
+# a slow link, not just a small JSON Graph call -- DEFAULT_TIMEOUT_SECONDS'
+# 30s is realistic for the API calls elsewhere in this module but can
+# legitimately be too short for a multi-megabyte binary PUT.
+_CHUNK_UPLOAD_TIMEOUT_SECONDS = 120
+# Microsoft's docs describe the simple content PUT's limit as "4 MB"; some
+# Graph deployments enforce that as the decimal 4,000,000 bytes rather than
+# 4 MiB (4,194,304 bytes). Using the smaller, decimal figure here means a
+# file in that ambiguous ~194KB gap always takes the resumable upload-session
+# path instead of risking a rejection right at the simple-PUT boundary.
+_SIMPLE_UPLOAD_MAX_BYTES = 4_000_000
 # Chunk size for the upload-session path. Must be a multiple of 320 KiB
 # (327,680 bytes) per Graph's requirement for every non-final chunk; 5 MiB
 # is exactly 16 * 320 KiB.
@@ -45,6 +52,7 @@ _KNOWN_BINARY_EXTENSIONS = {
     ".mp4", ".mov", ".avi", ".mkv", ".webm", ".wmv",
     ".zip", ".7z", ".rar", ".tar", ".gz", ".tgz", ".bz2",
     ".exe", ".dll", ".so", ".dylib", ".dmg", ".bin", ".iso", ".apk",
+    ".woff", ".woff2", ".ttf", ".otf", ".wasm", ".parquet", ".sqlite", ".db",
 }  # fmt: skip
 
 
@@ -193,11 +201,12 @@ def _resolve_upload_file_path(file_path: str) -> Path:
     return local_path
 
 
-def _upload_large_file_content(
-    remote_path: str, data: bytes, mime_type: str
-) -> dict[str, Any]:
-    """Upload ``data`` too large for the simple content PUT (Graph's 4 MiB
-    cap) via a resumable upload session, in 320 KiB-aligned chunks."""
+def _upload_large_file_content(remote_path: str, fh: Any, total: int) -> dict[str, Any]:
+    """Upload the next ``total`` bytes readable from ``fh`` (too large for
+    the simple content PUT) via a resumable upload session, in 320 KiB-
+    aligned chunks read straight off disk -- never materializing more than
+    one chunk of the file in memory at a time, unlike holding the whole
+    file as a single ``bytes`` object would."""
     session = _graph_request(
         "POST",
         f"{_item_path(remote_path)}/createUploadSession",
@@ -207,10 +216,10 @@ def _upload_large_file_content(
     if not upload_url:
         raise RuntimeError("OneDrive did not return an upload session URL")
 
-    total = len(data)
     result: dict[str, Any] = {}
     for start in range(0, total, _UPLOAD_SESSION_CHUNK_SIZE):
         end = min(start + _UPLOAD_SESSION_CHUNK_SIZE, total)
+        chunk = fh.read(end - start)
         # The upload session URL is itself pre-authenticated (a token in
         # its query string) -- Graph 401s a chunk request that also carries
         # our own Authorization header, so this goes straight through
@@ -218,16 +227,33 @@ def _upload_large_file_content(
         # one), and content type is irrelevant to the session endpoint.
         response = requests.put(
             upload_url,
-            data=data[start:end],
+            data=chunk,
             headers={
                 "Content-Length": str(end - start),
                 "Content-Range": f"bytes {start}-{end - 1}/{total}",
             },
-            timeout=DEFAULT_TIMEOUT_SECONDS,
+            timeout=_CHUNK_UPLOAD_TIMEOUT_SECONDS,
         )
-        response.raise_for_status()
-        if response.content:
-            result = response.json()
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            # Mirror _graph_request's error enrichment (this loop can't go
+            # through _graph_request itself -- see the Authorization-header
+            # note above) so a rejected chunk surfaces Graph's actual error
+            # body instead of a bare "400 Client Error" with no detail.
+            response_text = response.text.strip()
+            message = str(exc)
+            if response_text:
+                message = f"{message} - {response_text}"
+            raise RuntimeError(message) from exc
+        # Only the final chunk's response carries the completed item;
+        # Graph's intermediate (202) responses return upload-progress
+        # info, not the item -- checked explicitly (end == total) rather
+        # than "the last response that happened to have a body", which
+        # would silently pick up an unrelated intermediate body if Graph's
+        # progress responses ever started including one.
+        if end == total:
+            result = response.json() if response.content else {}
     return result
 
 
@@ -385,21 +411,28 @@ def onedrive_upload_file(
             or "application/octet-stream"
         )
 
-        data = local_path.read_bytes()
-        if not data:
-            raise ValueError(f"File is empty: {file_path}")
+        # Read from one open handle throughout -- the size check, the small-
+        # file read, and the large-file chunk reads all use this same fh
+        # rather than each re-opening/re-stat'ing the file. For a file over
+        # _SIMPLE_UPLOAD_MAX_BYTES, _upload_large_file_content reads it
+        # chunk-by-chunk straight off this handle rather than this function
+        # first loading the whole file into memory -- the resumable upload-
+        # session path exists specifically so a large file's memory
+        # footprint stays bounded to one chunk at a time.
+        with local_path.open("rb") as fh:
+            file_size = os.fstat(fh.fileno()).st_size
+            if file_size == 0:
+                raise ValueError(f"File is empty: {file_path}")
 
-        if len(data) <= _SIMPLE_UPLOAD_MAX_BYTES:
-            result = _graph_request(
-                "PUT",
-                _content_path(resolved_remote_path),
-                extra_headers={"Content-Type": resolved_mime_type},
-                data=data,
-            )
-        else:
-            result = _upload_large_file_content(
-                resolved_remote_path, data, resolved_mime_type
-            )
+            if file_size <= _SIMPLE_UPLOAD_MAX_BYTES:
+                result = _graph_request(
+                    "PUT",
+                    _content_path(resolved_remote_path),
+                    extra_headers={"Content-Type": resolved_mime_type},
+                    data=fh.read(),
+                )
+            else:
+                result = _upload_large_file_content(resolved_remote_path, fh, file_size)
 
         return _success(item=result)
     except Exception as e:

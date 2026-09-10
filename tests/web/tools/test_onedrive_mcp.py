@@ -1,3 +1,4 @@
+import io
 import json
 from unittest.mock import Mock
 
@@ -130,7 +131,13 @@ def test_upload_file_uses_upload_session_for_large_files(
     local_file = _upload_allowed_dirs_env / "big.bin"
     chunk_size = onedrive._UPLOAD_SESSION_CHUNK_SIZE
     total_size = chunk_size + 10
-    local_file.write_bytes(b"\x01" * total_size)
+    # Distinguishable per-region content (not a single repeated byte) so the
+    # assertions below can catch a chunk-boundary regression in the read-
+    # from-disk path (e.g. an off-by-one that shifts bytes between chunks)
+    # that a uniform b"\x01" * total_size body would silently pass.
+    first_chunk_bytes = bytes([1]) * chunk_size
+    second_chunk_bytes = bytes([2]) * (total_size - chunk_size)
+    local_file.write_bytes(first_chunk_bytes + second_chunk_bytes)
 
     mock_request = Mock(
         return_value=MockResponse({"uploadUrl": "https://upload.example/session-1"})
@@ -162,16 +169,123 @@ def test_upload_file_uses_upload_session_for_large_files(
     assert mock_put.call_count == 2
     first_call, second_call = mock_put.call_args_list
     assert first_call.args[0] == "https://upload.example/session-1"
+    assert first_call.kwargs["data"] == first_chunk_bytes
+    assert second_call.kwargs["data"] == second_chunk_bytes
     assert first_call.kwargs["headers"]["Content-Range"] == (
         f"bytes 0-{chunk_size - 1}/{total_size}"
     )
     assert second_call.kwargs["headers"]["Content-Range"] == (
         f"bytes {chunk_size}-{total_size - 1}/{total_size}"
     )
+    # Chunk uploads use a longer timeout than the small-JSON-call default —
+    # a multi-megabyte PUT over a slow link can legitimately take longer
+    # than DEFAULT_TIMEOUT_SECONDS.
+    assert first_call.kwargs["timeout"] == onedrive._CHUNK_UPLOAD_TIMEOUT_SECONDS
     # The pre-authenticated upload session URL must never carry our own
     # Authorization header alongside its own query-string token.
     assert "Authorization" not in first_call.kwargs["headers"]
     assert "Authorization" not in second_call.kwargs["headers"]
+
+
+def test_upload_large_file_content_reads_bounded_chunks_from_disk(
+    monkeypatch, _upload_allowed_dirs_env
+):
+    """Regression guard for the actual production bug's efficiency half:
+    _upload_large_file_content must pull each chunk straight off the file
+    handle rather than the caller loading the whole file into memory first
+    — verified directly against the function (not through the mimetypes/
+    allowlist plumbing of onedrive_upload_file) by tracking the largest
+    single read() request it issues against a fake file object."""
+    chunk_size = onedrive._UPLOAD_SESSION_CHUNK_SIZE
+    total_size = 2 * chunk_size + 10
+    content = bytes(range(256)) * (total_size // 256 + 1)
+    content = content[:total_size]
+
+    class _TrackingBuffer(io.BytesIO):
+        max_read_size = 0
+
+        def read(self, size=-1, *a, **kw):
+            if isinstance(size, int) and size > 0:
+                type(self).max_read_size = max(type(self).max_read_size, size)
+            return super().read(size, *a, **kw)
+
+    fh = _TrackingBuffer(content)
+
+    monkeypatch.setattr(
+        onedrive.requests,
+        "request",
+        Mock(return_value=MockResponse({"uploadUrl": "https://upload.example/s"})),
+    )
+    put_calls = []
+
+    def _fake_put(url, data, headers, timeout):
+        put_calls.append(data)
+        is_last = sum(len(d) for d in put_calls) >= total_size
+        return MockResponse(
+            {"id": "item-1"} if is_last else {}, content=b"{}" if is_last else b""
+        )
+
+    monkeypatch.setattr(onedrive.requests, "put", Mock(side_effect=_fake_put))
+
+    result = onedrive._upload_large_file_content("big.bin", fh, total_size)
+
+    assert result == {"id": "item-1"}
+    assert b"".join(put_calls) == content
+    assert _TrackingBuffer.max_read_size <= chunk_size
+
+
+def test_upload_large_file_content_enriches_chunk_error_with_response_body(
+    monkeypatch,
+):
+    """Regression guard: a rejected chunk must surface Graph's actual error
+    body, not a bare HTTPError with no detail — every other error path in
+    this module (via _graph_request) already does this."""
+    total_size = onedrive._UPLOAD_SESSION_CHUNK_SIZE + 10
+    fh = io.BytesIO(b"\x00" * total_size)
+
+    monkeypatch.setattr(
+        onedrive.requests,
+        "request",
+        Mock(return_value=MockResponse({"uploadUrl": "https://upload.example/s"})),
+    )
+    error_response = MockResponse(
+        {"error": {"message": "Invalid upload session"}},
+        status_code=400,
+        content=b'{"error": {"message": "Invalid upload session"}}',
+    )
+    monkeypatch.setattr(onedrive.requests, "put", Mock(return_value=error_response))
+
+    with pytest.raises(RuntimeError, match="Invalid upload session"):
+        onedrive._upload_large_file_content("big.bin", fh, total_size)
+
+
+def test_simple_upload_max_bytes_is_at_or_below_graphs_4mb_limit():
+    """Regression guard for the actual production boundary bug: Graph's
+    simple content PUT is documented as accepting files up to "4 MB", which
+    some deployments enforce as the decimal 4,000,000 bytes rather than the
+    binary 4 MiB (4,194,304 bytes). The cutoff must stay at or below the
+    smaller, decimal figure so a file in that ambiguous gap always takes the
+    resumable upload-session path instead of risking rejection right at the
+    simple-PUT boundary."""
+    assert onedrive._SIMPLE_UPLOAD_MAX_BYTES <= 4_000_000
+
+
+@pytest.mark.parametrize(
+    "file_path", ["font.woff2", "font.woff", "font.ttf", "data.parquet", "cache.sqlite"]
+)
+def test_upload_text_file_rejects_additional_binary_extensions(monkeypatch, file_path):
+    """Regression guard: reviewer-flagged gap in the original binary-
+    extension set — fonts, WASM, and columnar/DB formats were missing from
+    it, so with no other signal they used to sail straight through the
+    guard and get silently created as mislabeled text files."""
+    mock_request = Mock()
+    monkeypatch.setattr(onedrive.requests, "request", mock_request)
+
+    result = json.loads(onedrive.onedrive_upload_text_file(file_path, "some text"))
+
+    assert result["status"] == "error"
+    assert "onedrive_upload_file" in result["message"]
+    mock_request.assert_not_called()
 
 
 def test_upload_file_raises_when_upload_session_has_no_url(

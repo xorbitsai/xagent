@@ -523,8 +523,8 @@ def google_calendar_update_events(
         # event's existing timeZone (not just for the recurrence fallback
         # further down, but for a plain reschedule with no recurrence
         # involved at all).
-        existing_start_timezone = event.get("start", {}).get("timeZone")
-        existing_end_timezone = event.get("end", {}).get("timeZone")
+        existing_start_timezone = (event.get("start") or {}).get("timeZone")
+        existing_end_timezone = (event.get("end") or {}).get("timeZone")
 
         if summary:
             event["summary"] = summary
@@ -563,9 +563,8 @@ def google_calendar_update_events(
         # writes "date" for a bare-date start_time), so moving an all-day
         # event to a specific dateTime in this same call correctly stops
         # treating it as all-day.
-        current_start_value = event.get("start", {}).get("dateTime") or event.get(
-            "start", {}
-        ).get("date")
+        start_dict = event.get("start") or {}
+        current_start_value = start_dict.get("dateTime") or start_dict.get("date")
         is_all_day = current_start_value is not None and _is_bare_date(
             current_start_value
         )
@@ -574,9 +573,8 @@ def google_calendar_update_events(
         # start_time/end_time to convert an all-day event to a timed one
         # (or vice versa) would otherwise silently leave the other side in
         # its old shape, producing a payload Google's API would reject.
-        current_end_value = event.get("end", {}).get("dateTime") or event.get(
-            "end", {}
-        ).get("date")
+        end_dict = event.get("end") or {}
+        current_end_value = end_dict.get("dateTime") or end_dict.get("date")
         end_is_all_day = current_end_value is not None and _is_bare_date(
             current_end_value
         )
@@ -593,8 +591,10 @@ def google_calendar_update_events(
             )
 
         if timezone and not is_all_day:
-            event.setdefault("start", {})["timeZone"] = timezone
-            event.setdefault("end", {})["timeZone"] = timezone
+            event["start"] = event.get("start") or {}
+            event["start"]["timeZone"] = timezone
+            event["end"] = event.get("end") or {}
+            event["end"]["timeZone"] = timezone
         if description:
             event["description"] = description
         if location:
@@ -613,13 +613,16 @@ def google_calendar_update_events(
                     "in this timezone, and the event doesn't already have one)"
                 )
             if effective_timezone and not is_all_day:
-                # .setdefault, not direct indexing: a malformed fetched
-                # event missing "start"/"end" entirely (Google always
-                # returns both in practice, but this avoids a raw
-                # KeyError leaking through as an opaque error message if
-                # it ever doesn't) still gets a clean dict to write into.
-                event.setdefault("start", {})["timeZone"] = effective_timezone
-                event.setdefault("end", {})["timeZone"] = effective_timezone
+                # Not direct indexing or .setdefault: a malformed fetched
+                # event missing "start"/"end" entirely, or carrying an
+                # explicit None for one (Google always returns both as
+                # objects in practice, but this avoids a raw KeyError/
+                # AttributeError leaking through as an opaque error message
+                # if it ever doesn't), still gets a clean dict to write into.
+                event["start"] = event.get("start") or {}
+                event["start"]["timeZone"] = effective_timezone
+                event["end"] = event.get("end") or {}
+                event["end"]["timeZone"] = effective_timezone
             # An all-day event's naive date anchor still needs *some*
             # timezone to compare against an aware ("Z"-suffixed) UNTIL -
             # RFC 5545 requires DTSTART and UNTIL to either both be aware or

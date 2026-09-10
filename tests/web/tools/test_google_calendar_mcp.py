@@ -891,6 +891,32 @@ def test_update_events_recurrence_survives_a_missing_end_key(monkeypatch):
     assert result["status"] == "success"
 
 
+def test_update_events_survives_an_explicit_none_start_and_end(monkeypatch):
+    """A malformed fetched event carrying "start"/"end" as an explicit
+    None (as opposed to missing the key entirely, covered above) used to
+    raise AttributeError/TypeError: `event.get("start", {})` and
+    `event.setdefault("start", {})` both only fall back to {} when the
+    key is *absent*, not when it's present with a None value."""
+    existing_event = {"id": "existing-1", "start": None, "end": None}
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-08-26T07:00:00Z",
+            end_time="2026-08-26T08:00:00Z",
+            timezone="Asia/Manila",
+            recurrence="FREQ=DAILY;UNTIL=20260911T235959Z",
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["body"]["start"]["timeZone"] == "Asia/Manila"
+    assert kwargs["body"]["end"]["timeZone"] == "Asia/Manila"
+
+
 def test_update_events_rejects_recurrence_when_no_start_information_exists(
     monkeypatch,
 ):

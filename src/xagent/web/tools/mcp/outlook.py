@@ -775,7 +775,22 @@ def outlook_update_event(
             # prior behavior, rather than failing a call that may not
             # need this value to be exact).
             existing_timezone = existing.get("originalStartTimeZone")
+            existing_timezone_resolves = False
             if existing_timezone and not existing_timezone.startswith("tzone://"):
+                try:
+                    _resolve_zoneinfo(existing_timezone)
+                    existing_timezone_resolves = True
+                except ValueError:
+                    # An unmapped/legacy Windows zone id (the same gap
+                    # `_WINDOWS_TO_IANA` can't ever fully close) - using it
+                    # as existing_zone anyway would crash the later _key()
+                    # comparison instead of leaving this branch's original
+                    # "may not need this value to be exact" guarantee
+                    # intact, so fall back to the UTC-normalized field
+                    # exactly as if originalStartTimeZone were absent.
+                    pass
+            if existing_timezone_resolves:
+                assert existing_timezone is not None  # narrows for mypy
                 existing_zone = existing_timezone
                 # existing_start_field/existing_end_field are still the
                 # plain-GET UTC values above - re-express them as the real

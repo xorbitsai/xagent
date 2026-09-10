@@ -2190,3 +2190,36 @@ def test_update_events_missing_scope_can_be_bypassed_with_ignore_conflicts(
 
     assert result["status"] == "success"
     assert len(fake_service._events.update_calls) == 1
+
+
+def test_update_events_conflict_response_still_reports_unchecked_attendees(
+    fake_service,
+):
+    """A conflict found via one source (the organizer's own calendar) must
+    not suppress unchecked_attendees info for a different attendee whose
+    calendar couldn't be read (absent from the freebusy response, a
+    per-attendee gap rather than a whole-batch 403) - a caller acting on
+    the conflict still needs to know that attendee was never actually
+    checked."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+        "attendees": [],
+    }
+    fake_service._events._list_result = {
+        "items": [_confirmed_event(event_id="other-1")]
+    }
+    fake_service._freebusy = FakeFreebusy({"calendars": {}})
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-27T10:00:00+08:00",
+            end_time="2026-08-27T10:30:00+08:00",
+            attendees=["ghost@example.com"],
+        )
+    )
+
+    assert result["status"] == "conflict"
+    assert result["unchecked_attendees"] == ["ghost@example.com"]

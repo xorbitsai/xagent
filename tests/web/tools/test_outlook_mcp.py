@@ -1813,6 +1813,49 @@ def test_update_event_flag_only_all_day_toggle_widens_in_the_events_real_timezon
     )
 
 
+def test_update_event_unresolvable_original_timezone_falls_back_to_utc_instead_of_erroring(
+    monkeypatch,
+):
+    """Regression test: originalStartTimeZone can be a legacy/exotic
+    Windows zone id that isn't in the (necessarily incomplete)
+    Windows-to-IANA map - using it as existing_zone anyway without
+    checking it actually resolves would crash the later timezone-key
+    comparison with a raw ValueError, even for a plain flag-only edit
+    that never needed the real zone to be exact in the first place. Must
+    gracefully fall back to the UTC-normalized field instead, exactly as
+    if originalStartTimeZone were absent."""
+    graph_request = Mock(
+        side_effect=[
+            {
+                "start": {"dateTime": "2026-08-27T10:00:00", "timeZone": "UTC"},
+                "end": {"dateTime": "2026-08-27T10:30:00", "timeZone": "UTC"},
+                "attendees": [],
+                "isAllDay": False,
+                "originalStartTimeZone": "Some Exotic Legacy Standard Time",
+            },
+            {"value": []},
+            {"id": "updated"},
+        ]
+    )
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_update_event(
+            event_id="self-1",
+            is_all_day=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    calendar_view_call = graph_request.call_args_list[1]
+    assert calendar_view_call.kwargs["params"]["startDateTime"] == (
+        "2026-08-27T00:00:00+00:00"
+    )
+    assert calendar_view_call.kwargs["params"]["endDateTime"] == (
+        "2026-08-28T00:00:00+00:00"
+    )
+
+
 def test_update_event_adding_attendee_queries_the_correct_absolute_window_in_the_events_real_timezone(
     monkeypatch,
 ):
@@ -1975,3 +2018,39 @@ def test_update_event_missing_schedule_scope_can_be_bypassed_with_ignore_conflic
     assert result["status"] == "success"
     assert graph_request.call_count == 2
     assert graph_request.call_args_list[-1].args[:2] == ("PATCH", "/me/events/self-1")
+
+
+def test_update_event_conflict_response_still_reports_unchecked_attendees(
+    monkeypatch,
+):
+    """A conflict found via one source (the organizer's own calendar) must
+    not suppress unchecked_attendees info for a different attendee whose
+    schedule couldn't be read (absent from the getSchedule response, a
+    per-attendee gap rather than a whole-batch 403) - a caller acting on
+    the conflict still needs to know that attendee was never actually
+    checked."""
+    graph_request = Mock(
+        side_effect=[
+            {
+                "start": {"dateTime": "2026-08-27T09:00:00", "timeZone": "UTC"},
+                "end": {"dateTime": "2026-08-27T09:30:00", "timeZone": "UTC"},
+                "attendees": [],
+                "isAllDay": False,
+            },
+            {"value": [_busy_event(event_id="other-1", subject="Board sync")]},
+            {"value": []},
+        ]
+    )
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_update_event(
+            event_id="self-1",
+            start_datetime="2026-08-27T14:00:00",
+            end_datetime="2026-08-27T14:30:00",
+            attendees=["ghost@example.com"],
+        )
+    )
+
+    assert result["status"] == "conflict"
+    assert result["unchecked_attendees"] == ["ghost@example.com"]

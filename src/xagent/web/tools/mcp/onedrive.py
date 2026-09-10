@@ -97,6 +97,20 @@ def _is_text_mime_type(mime_type: str) -> bool:
     )
 
 
+# Extensions whose stdlib mimetypes.guess_type() result is a real binary
+# format that collides with an extension overwhelmingly used for genuine
+# text/source content -- verified directly: ".ts" -> "video/mp2t" (MPEG
+# transport stream, not TypeScript), ".bat" -> "application/x-msdownload",
+# ".scm" -> "application/vnd.lotus-screencam" (not Scheme source). Treating
+# the mimetype guess as authoritative for these three would flag an
+# ordinary source/script file as binary with no working upload path at all
+# (onedrive_upload_text_file rejects it, and onedrive_upload_file needs an
+# existing local *file*, not raw text content) -- so the mime-type signal
+# is ignored for exactly these extensions and _name_looks_binary treats
+# them as text unless a caller's own filename collides with one of the
+# entries in the fallback set below (it doesn't -- none share a suffix).
+_AMBIGUOUS_TEXT_EXTENSIONS = {".ts", ".bat", ".scm"}
+
 # Extensions of unambiguously binary formats that resolve to no mime type
 # at all (neither _MIME_TYPE_OVERRIDES nor a bare stdlib mimetypes install
 # recognizes them), so _name_looks_binary's mime-type check alone would
@@ -108,8 +122,10 @@ _KNOWN_BINARY_EXTENSIONS_WITHOUT_MIME_GUESS = {
     ".ogg", ".flac", ".m4a",
     ".mkv", ".wmv",
     ".7z", ".rar", ".gz", ".bz2",
-    ".dylib", ".dmg", ".iso", ".apk",
-    ".woff", ".woff2", ".ttf", ".otf", ".parquet", ".sqlite", ".db",
+    ".dylib", ".dmg", ".iso", ".apk", ".rpm", ".crx",
+    ".woff", ".woff2", ".ttf", ".otf",
+    ".parquet", ".sqlite", ".sqlite3", ".db", ".db3",
+    ".numbers", ".pages", ".key", ".blend", ".indd", ".ps1",
 }  # fmt: skip
 
 
@@ -139,6 +155,26 @@ def _graph_headers(extra_headers: dict[str, str] | None = None) -> dict[str, str
     return headers
 
 
+def _raise_for_status_with_body(response: Any) -> None:
+    """Like response.raise_for_status(), but a non-2xx status raises a
+    RuntimeError with Graph's own error body appended -- a bare HTTPError's
+    default message carries only the status line, not the JSON error detail
+    Graph actually returns. Shared by every call site in this module that
+    talks to Graph directly (both _graph_request and the per-chunk PUTs in
+    _upload_large_file_content, which can't go through _graph_request itself
+    -- see its own Authorization-header note) so a future change to the
+    message format only needs to happen once.
+    """
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        response_text = response.text.strip()
+        message = str(exc)
+        if response_text:
+            message = f"{message} - {response_text}"
+        raise RuntimeError(message) from exc
+
+
 def _graph_request(
     method: str,
     path: str,
@@ -159,14 +195,7 @@ def _graph_request(
         data=data,
         timeout=timeout,
     )
-    try:
-        response.raise_for_status()
-    except requests.HTTPError as exc:
-        response_text = response.text.strip()
-        message = str(exc)
-        if response_text:
-            message = f"{message} - {response_text}"
-        raise RuntimeError(message) from exc
+    _raise_for_status_with_body(response)
 
     if raw:
         return response.content
@@ -213,16 +242,22 @@ def _decode_bytes(content: bytes) -> tuple[str | None, str | None]:
 def _name_looks_binary(name: str) -> bool:
     """Whether ``name``'s extension names an unambiguously binary format.
 
-    A resolvable mime type (override or stdlib) that isn't text-safe is
+    _AMBIGUOUS_TEXT_EXTENSIONS is checked first and short-circuits to "not
+    binary" -- for those specific extensions the mime-type signal below is
+    actively wrong (see its definition), not merely unavailable. Otherwise a
+    resolvable mime type (override or stdlib) that isn't text-safe is
     binary; an unresolvable one falls back to the small hand-maintained set
     of formats mimetypes has no opinion on at all (see
     _KNOWN_BINARY_EXTENSIONS_WITHOUT_MIME_GUESS above) rather than silently
     passing every extension mimetypes doesn't happen to recognize.
     """
+    suffix = Path(name).suffix.lower()
+    if suffix in _AMBIGUOUS_TEXT_EXTENSIONS:
+        return False
     guessed = _guess_mime_type(name)
     if guessed is not None:
         return not _is_text_mime_type(guessed)
-    return Path(name).suffix.lower() in _KNOWN_BINARY_EXTENSIONS_WITHOUT_MIME_GUESS
+    return suffix in _KNOWN_BINARY_EXTENSIONS_WITHOUT_MIME_GUESS
 
 
 def _allowed_upload_dirs() -> list[Path]:
@@ -275,10 +310,17 @@ def _upload_large_file_content(
     remote_path: str, fh: Any, total: int, mime_type: str
 ) -> dict[str, Any]:
     """Upload the next ``total`` bytes readable from ``fh`` (too large for
-    the simple content PUT) via a resumable upload session, in 320 KiB-
+    the simple content PUT) via Graph's upload-session API, in 320 KiB-
     aligned chunks read straight off disk -- never materializing more than
     one chunk of the file in memory at a time, unlike holding the whole
-    file as a single ``bytes`` object would."""
+    file as a single ``bytes`` object would.
+
+    This uses the session only for chunking, not for actual resumability:
+    on any failure the session is cancelled outright (see below) rather
+    than retried from Graph's ``nextExpectedRanges``, so a transient
+    mid-upload failure means the whole file is re-sent from byte 0 on the
+    next call, not resumed from where it left off.
+    """
     session = _graph_request(
         "POST",
         f"{_item_path(remote_path)}/createUploadSession",
@@ -297,6 +339,20 @@ def _upload_large_file_content(
             for start in range(0, total, _UPLOAD_SESSION_CHUNK_SIZE):
                 end = min(start + _UPLOAD_SESSION_CHUNK_SIZE, total)
                 chunk = fh.read(end - start)
+                if len(chunk) != end - start:
+                    # A short read here means the local file shrank out from
+                    # under this upload (a concurrent rewrite/truncation, or
+                    # an unusual filesystem) -- sending Content-Length/
+                    # Content-Range computed from the size we *expected*
+                    # rather than what we actually read would either hang
+                    # waiting for bytes that never arrive or desynchronize
+                    # every later chunk's byte-range accounting. Fail loudly
+                    # instead.
+                    raise RuntimeError(
+                        f"expected to read {end - start} bytes at offset "
+                        f"{start} but got {len(chunk)} -- the local file "
+                        "may have changed size during upload"
+                    )
                 # The upload session URL is itself pre-authenticated (a
                 # token in its query string) -- Graph 401s a chunk request
                 # that also carries our own Authorization header, so this
@@ -317,19 +373,7 @@ def _upload_large_file_content(
                     },
                     timeout=_BINARY_UPLOAD_TIMEOUT_SECONDS,
                 )
-                try:
-                    response.raise_for_status()
-                except requests.HTTPError as exc:
-                    # Mirror _graph_request's error enrichment (this loop
-                    # can't go through _graph_request itself -- see the
-                    # Authorization-header note above) so a rejected chunk
-                    # surfaces Graph's actual error body instead of a bare
-                    # "400 Client Error" with no detail.
-                    response_text = response.text.strip()
-                    message = str(exc)
-                    if response_text:
-                        message = f"{message} - {response_text}"
-                    raise RuntimeError(message) from exc
+                _raise_for_status_with_body(response)
                 # Only the final chunk's response carries the completed
                 # item; Graph's intermediate (202) responses return upload-
                 # progress info, not the item -- checked explicitly
@@ -338,13 +382,37 @@ def _upload_large_file_content(
                 # unrelated intermediate body if Graph's progress responses
                 # ever started including one.
                 if end == total:
-                    result = response.json() if response.content else {}
+                    try:
+                        result = response.json() if response.content else {}
+                    except ValueError as exc:
+                        # The PUT itself succeeded (no HTTPError above) --
+                        # OneDrive has already committed the file at this
+                        # point, so this is "the transfer worked but the
+                        # confirmation can't be read", not a transfer
+                        # failure, even though it's still reported as an
+                        # error here (the caller has no completed item to
+                        # act on either way).
+                        raise RuntimeError(
+                            "OneDrive accepted the final chunk but "
+                            f"returned an unparsable response: {exc}"
+                        ) from exc
+                    if "id" not in result:
+                        # The final chunk's response didn't actually carry
+                        # a completed driveItem (e.g. an unexpected 202 on
+                        # what this loop computed as the last range).
+                        raise RuntimeError(
+                            "OneDrive did not confirm the upload completed "
+                            f"(final response: {result!r})"
+                        )
         except Exception:
             # Best-effort: free the abandoned session immediately instead
             # of leaving it for Graph's own ~15-minute expiry. A failure
-            # here must never mask the real error above.
+            # here must never mask the real error above, and uses the
+            # short, small-request timeout -- this DELETE carries no body,
+            # so it shouldn't compound a slow failure with another wait as
+            # long as a multi-megabyte upload's own timeout.
             try:
-                http.delete(upload_url, timeout=_BINARY_UPLOAD_TIMEOUT_SECONDS)
+                http.delete(upload_url, timeout=DEFAULT_TIMEOUT_SECONDS)
             except Exception:
                 logger.warning(
                     "Failed to cancel abandoned OneDrive upload session",
@@ -352,15 +420,7 @@ def _upload_large_file_content(
                 )
             raise
 
-    if "id" not in result:
-        # The final chunk's response didn't actually carry a completed
-        # driveItem (e.g. an unexpected 202 on what this loop computed as
-        # the last range) -- report this as a failure rather than a
-        # success with a hollow "item".
-        raise RuntimeError(
-            "OneDrive did not confirm the upload completed "
-            f"(final response: {result!r})"
-        )
+    return result
     return result
 
 
@@ -507,7 +567,12 @@ def onedrive_upload_file(
     overwriting any existing file there; defaults to the local file's own
     name at the OneDrive root.
     mime_type: defaults to a guess from the file's extension, falling back
-    to "application/octet-stream" when it can't be guessed.
+    to "application/octet-stream" when it can't be guessed. Reliably honored
+    for files small enough to upload in one request (up to a few MB); for
+    larger files uploaded via a resumable session, OneDrive doesn't document
+    this as something the caller can override, so an explicit value here may
+    not take effect and the file's own name/extension is what actually
+    determines its type in that case.
     """
     try:
         local_path = _resolve_upload_file_path(file_path)

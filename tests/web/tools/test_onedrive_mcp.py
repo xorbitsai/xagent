@@ -356,9 +356,13 @@ def test_upload_large_file_content_enriches_chunk_error_with_response_body(
         )
 
     # A failed upload must cancel its now-abandoned session immediately
-    # rather than leaving it for Graph's own ~15-minute expiry.
+    # rather than leaving it for Graph's own ~15-minute expiry. The
+    # cancellation itself carries no body, so it uses the short default
+    # timeout rather than the long one sized for a multi-megabyte PUT --
+    # otherwise a stalled cleanup call would needlessly delay surfacing the
+    # real failure by up to another _BINARY_UPLOAD_TIMEOUT_SECONDS.
     mock_delete.assert_called_once_with(
-        "https://upload.example/s", timeout=onedrive._BINARY_UPLOAD_TIMEOUT_SECONDS
+        "https://upload.example/s", timeout=onedrive.DEFAULT_TIMEOUT_SECONDS
     )
 
 
@@ -421,12 +425,89 @@ def test_upload_large_file_content_raises_when_final_response_has_no_item(
             MockResponse({"expirationDateTime": "2099-01-01T00:00:00Z"}),
         ]
     )
-    _patch_session(monkeypatch, _FakeSession(put=mock_put))
+    mock_delete = Mock(return_value=MockResponse({}))
+    _patch_session(monkeypatch, _FakeSession(put=mock_put, delete=mock_delete))
 
     with pytest.raises(RuntimeError, match="did not confirm"):
         onedrive._upload_large_file_content(
             "big.bin", fh, total_size, "application/octet-stream"
         )
+
+    # Regression guard: this validation error must go through the same
+    # cleanup path as a genuine transfer failure, not just the try/except
+    # around the HTTP call itself -- an earlier version of this check ran
+    # after the `with requests.Session()` block had already exited
+    # normally, so it never attempted to cancel the (still-incomplete, by
+    # this check's own logic) upload session.
+    mock_delete.assert_called_once()
+
+
+def test_upload_large_file_content_reports_unparsable_final_response_distinctly(
+    monkeypatch,
+):
+    """Regression guard: when every chunk PUT succeeds (no HTTPError) but the
+    final response body can't be parsed as JSON, the error must say the
+    upload itself was accepted -- distinguishing "transfer succeeded, can't
+    confirm the result" from a genuine transfer failure, since OneDrive has
+    already committed the file by this point."""
+    total_size = onedrive._UPLOAD_SESSION_CHUNK_SIZE + 10
+    fh = io.BytesIO(b"\x00" * total_size)
+
+    monkeypatch.setattr(
+        onedrive.requests,
+        "request",
+        Mock(return_value=MockResponse({"uploadUrl": "https://upload.example/s"})),
+    )
+    malformed_final = MockResponse({}, content=b"not valid json")
+    malformed_final.json = Mock(side_effect=ValueError("Expecting value"))
+    mock_put = Mock(side_effect=[MockResponse({}, content=b""), malformed_final])
+    _patch_session(monkeypatch, _FakeSession(put=mock_put))
+
+    with pytest.raises(RuntimeError, match="accepted the final chunk"):
+        onedrive._upload_large_file_content(
+            "big.bin", fh, total_size, "application/octet-stream"
+        )
+
+
+def test_upload_large_file_content_rejects_short_chunk_read(monkeypatch):
+    """Regression guard: if the local file shrinks mid-upload (a concurrent
+    rewrite/truncation), a short fh.read() must fail loudly instead of
+    silently sending a Content-Length/Content-Range that doesn't match the
+    actual bytes transmitted -- which would desynchronize every later
+    chunk's byte-range accounting."""
+    chunk_size = onedrive._UPLOAD_SESSION_CHUNK_SIZE
+    total_size = chunk_size + 100
+
+    class _ShortReadBuffer:
+        def __init__(self, data):
+            self._data = data
+            self._pos = 0
+
+        def read(self, size=-1):
+            # Always return at most half of what was asked for (but never
+            # zero, so this isn't just simulating ordinary EOF).
+            actual = max(1, size // 2) if size and size > 1 else size
+            chunk = self._data[self._pos : self._pos + actual]
+            self._pos += len(chunk)
+            return chunk
+
+    fh = _ShortReadBuffer(b"\x00" * total_size)
+
+    monkeypatch.setattr(
+        onedrive.requests,
+        "request",
+        Mock(return_value=MockResponse({"uploadUrl": "https://upload.example/s"})),
+    )
+    mock_put = Mock(return_value=MockResponse({}, content=b""))
+    _patch_session(monkeypatch, _FakeSession(put=mock_put))
+
+    with pytest.raises(RuntimeError, match="changed size during upload"):
+        onedrive._upload_large_file_content(
+            "big.bin", fh, total_size, "application/octet-stream"
+        )
+
+    # Must fail before ever sending the short chunk to Graph.
+    mock_put.assert_not_called()
 
 
 def test_simple_upload_max_bytes_is_at_or_below_graphs_4mb_limit():
@@ -486,13 +567,26 @@ def test_upload_file_one_byte_over_boundary_uses_upload_session(
 
 
 @pytest.mark.parametrize(
-    "file_path", ["font.woff2", "font.woff", "font.ttf", "data.parquet", "cache.sqlite"]
+    "file_path",
+    [
+        "font.woff2",
+        "font.woff",
+        "font.ttf",
+        "data.parquet",
+        "cache.sqlite",
+        "cache.sqlite3",
+        "budget.numbers",
+        "notes.pages",
+        "vault.key",
+        "extension.crx",
+    ],
 )
 def test_upload_text_file_rejects_additional_binary_extensions(monkeypatch, file_path):
     """Regression guard: reviewer-flagged gap in the original binary-
-    extension set — fonts, WASM, and columnar/DB formats were missing from
-    it, so with no other signal they used to sail straight through the
-    guard and get silently created as mislabeled text files."""
+    extension set — fonts, WASM, columnar/DB, and several common formats
+    stdlib mimetypes also has no opinion on were missing from it, so with
+    no other signal they used to sail straight through the guard and get
+    silently created as mislabeled text files."""
     mock_request = Mock()
     monkeypatch.setattr(onedrive.requests, "request", mock_request)
 
@@ -501,6 +595,28 @@ def test_upload_text_file_rejects_additional_binary_extensions(monkeypatch, file
     assert result["status"] == "error"
     assert "onedrive_upload_file" in result["message"]
     mock_request.assert_not_called()
+
+
+@pytest.mark.parametrize("file_path", ["app.ts", "deploy.bat", "session.scm"])
+def test_upload_text_file_allows_ambiguous_extensions_that_collide_with_binary_mimetypes(
+    monkeypatch, file_path
+):
+    """Regression guard for a bug introduced by switching from a fixed
+    extension allowlist to mimetype-driven detection: mimetypes.guess_type
+    resolves ".ts" to "video/mp2t", ".bat" to "application/x-msdownload",
+    and ".scm" to "application/vnd.lotus-screencam" -- none of which are
+    text-safe -- even though all three extensions are overwhelmingly used
+    for genuine text/source content (TypeScript, Windows batch scripts,
+    Scheme source) in practice. Without an explicit carve-out, onedrive_
+    upload_text_file would reject these with no working alternative (
+    onedrive_upload_file needs an existing local file, not raw text)."""
+    monkeypatch.setattr(
+        onedrive.requests, "request", Mock(return_value=MockResponse({"id": "f1"}))
+    )
+
+    result = json.loads(onedrive.onedrive_upload_text_file(file_path, "some text"))
+
+    assert result["status"] == "success"
 
 
 def test_upload_file_raises_when_upload_session_has_no_url(

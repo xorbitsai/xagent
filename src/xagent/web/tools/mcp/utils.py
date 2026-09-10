@@ -297,7 +297,14 @@ def parse_rrule(
     # already-`datetime` object (as Outlook's caller always passes,
     # already localized aware) - represents DATE-TIME, which RFC 5545
     # requires UNTIL to match: aware, not floating.
-    dtstart_is_bare_date = isinstance(dtstart, str) and "T" not in dtstart
+    # RFC3339 (section 5.6) permits a lowercase "t" as the date/time
+    # separator too, and dateutil's isoparse accepts it - checking case-
+    # insensitively (bare dates never contain any letters at all, so this
+    # can't misfire the other way) so a lowercase-t dtstart isn't wrongly
+    # treated as a bare date, which would disable the anchor localization
+    # this check exists to gate and let a genuine DATE-TIME + floating-
+    # UNTIL mismatch slip past validation.
+    dtstart_is_bare_date = isinstance(dtstart, str) and "t" not in dtstart.lower()
 
     if isinstance(dtstart, datetime):
         anchor = dtstart

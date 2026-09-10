@@ -435,9 +435,9 @@ def test_build_graph_recurrence_reports_unsupported_freq_before_int32_bound():
 def test_build_graph_recurrence_resolves_windows_style_timezone():
     """Graph commonly reports Windows-style timezone identifiers (e.g. for
     events created via Outlook desktop/web rather than this tool), which
-    dateutil.tz.gettz can't resolve directly - a small common-cases
-    mapping must translate it rather than raising for an otherwise valid,
-    pre-existing event."""
+    zoneinfo.ZoneInfo can't resolve directly (it only knows IANA names) -
+    the CLDR Windows<->IANA mapping must translate it rather than raising
+    for an otherwise valid, pre-existing event."""
     recurrence = outlook._build_graph_recurrence(
         "FREQ=DAILY", "2026-08-26T07:00:00", "Pacific Standard Time"
     )

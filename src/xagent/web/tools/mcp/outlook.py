@@ -162,7 +162,14 @@ def _resolve_timezone(timezone: str) -> Any:
             return ZoneInfo(iana_name)
         except (ZoneInfoNotFoundError, ValueError):
             pass
-    raise ValueError(f"unknown timezone for recurrence rule: {timezone}")
+    raise ValueError(
+        f"unknown timezone for recurrence rule: {timezone!r} - this can "
+        "happen for a legacy/deprecated Windows zone ID (e.g. an old "
+        "event's originalStartTimeZone) this connector's mapping table "
+        "doesn't cover; pass start_datetime and a resolvable timezone "
+        "(a valid IANA or current Windows name) explicitly instead of "
+        "relying on the event's own fetched zone"
+    )
 
 
 def _rrule_until_to_date(until: str, zone: Any, anchor: datetime) -> str:

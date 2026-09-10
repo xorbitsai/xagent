@@ -183,6 +183,66 @@ def test_create_events_without_recurrence_has_no_recurrence_key(monkeypatch):
     assert "recurrence" not in kwargs["body"]
 
 
+def test_create_events_creates_an_all_day_event_from_bare_dates(monkeypatch):
+    """Confirmed bug: a bare-date start_time/end_time (e.g. "2026-09-01",
+    no time component) used to be silently written under the "dateTime"
+    key regardless - {"dateTime": "2026-09-01"} is not valid RFC3339 and
+    Google's real API would reject it. Must be written under "date"
+    instead, with no timeZone stamped onto it."""
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="All day thing",
+            start_time="2026-09-01",
+            end_time="2026-09-02",
+            timezone="Asia/Shanghai",
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.insert.call_args
+    assert kwargs["body"]["start"] == {"date": "2026-09-01"}
+    assert kwargs["body"]["end"] == {"date": "2026-09-02"}
+
+
+def test_create_events_rejects_mixed_bare_date_and_datetime(monkeypatch):
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Mixed",
+            start_time="2026-09-01",
+            end_time="2026-09-02T10:00:00",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "must both be a bare date or both a dateTime" in result["message"]
+    service.events.return_value.insert.assert_not_called()
+
+
+def test_create_events_all_day_recurrence_does_not_require_timezone(monkeypatch):
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="All day recurring",
+            start_time="2026-09-01",
+            end_time="2026-09-02",
+            recurrence="FREQ=DAILY;UNTIL=20260911",
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.insert.call_args
+    assert kwargs["body"]["recurrence"] == ["RRULE:FREQ=DAILY;UNTIL=20260911"]
+    assert "timeZone" not in kwargs["body"]["start"]
+
+
 def test_update_events_adds_recurrence_to_a_previously_single_event(monkeypatch):
     """Reproduces the reported bug: an event created as a single instance
     must be convertible into a true recurring series via update, with the
@@ -745,6 +805,90 @@ def test_update_events_converts_all_day_event_to_timed_when_both_are_provided(
         "dateTime": "2026-08-26T10:00:00",
         "timeZone": "Asia/Shanghai",
     }
+
+
+def test_update_events_converts_a_timed_event_to_all_day_when_both_are_provided(
+    monkeypatch,
+):
+    """Confirmed bug: the mirror direction of the test above. A bare-date
+    start_time/end_time (converting an existing TIMED event to all-day)
+    used to still be written under the "dateTime" key - producing
+    {"dateTime": "2026-08-27", "timeZone": "Asia/Shanghai"}, a value
+    that's neither valid RFC3339 nor a legitimate all-day EventDateTime
+    (all-day events never carry timeZone). Must be written under "date",
+    with no timeZone."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "Asia/Manila"},
+        "end": {"dateTime": "2026-08-26T08:00:00", "timeZone": "Asia/Manila"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-08-27",
+            end_time="2026-08-28",
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["body"]["start"] == {"date": "2026-08-27"}
+    assert kwargs["body"]["end"] == {"date": "2026-08-28"}
+
+
+def test_update_events_does_not_reuse_existing_timezone_when_new_value_has_own_offset(
+    monkeypatch,
+):
+    """Confirmed bug: a new start_time/end_time that already carries its
+    own UTC offset is fully self-describing - stamping a possibly-
+    different reused timeZone from the existing event on top of it
+    produces an internally-contradictory EventDateTime (e.g. "-07:00" in
+    dateTime alongside timeZone: "Asia/Manila", UTC+8)."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "Asia/Manila"},
+        "end": {"dateTime": "2026-08-26T08:00:00", "timeZone": "Asia/Manila"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-08-27T09:00:00-07:00",
+            end_time="2026-08-27T09:15:00-07:00",
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["body"]["start"] == {"dateTime": "2026-08-27T09:00:00-07:00"}
+    assert kwargs["body"]["end"] == {"dateTime": "2026-08-27T09:15:00-07:00"}
+
+
+def test_update_events_recurrence_survives_a_missing_end_key(monkeypatch):
+    """Confirmed bug: a malformed fetched event missing the "end" key
+    entirely (Google always returns both in practice, but this is
+    defensive) used to raise a raw, opaque KeyError('end') instead of
+    either a clean error or a graceful degradation."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "Asia/Manila"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=DAILY;UNTIL=20260911T235959Z",
+        )
+    )
+
+    assert result["status"] == "success"
 
 
 def test_update_events_rejects_recurrence_when_no_start_information_exists(

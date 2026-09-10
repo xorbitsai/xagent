@@ -4514,6 +4514,12 @@ class BackgroundTaskManager:
         self._resume_owner_started_at.setdefault(task_id, time.monotonic())
         self.resume_tasks[task_id] = task
         self._resume_run_ids[task_id] = run_id
+        # Cancellation before the coroutine starts skips its finally block.
+        # Use the same owner fence as execution completion, including after
+        # this coordinator has been promoted into running_tasks.
+        task.add_done_callback(
+            lambda finished: self.cleanup_task(task_id, expected_task=finished)
+        )
         logger.info("Registered resume coordinator for task %s", task_id)
 
     def release_resume_reservation(self, task_id: int) -> None:

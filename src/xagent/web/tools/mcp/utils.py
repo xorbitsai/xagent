@@ -2,10 +2,65 @@ import json
 import os
 import re
 import urllib.request
+from datetime import date, datetime, time, timedelta
 from typing import Any
 from urllib.parse import quote
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ....config import get_tool_max_output_length
+
+
+class InsufficientScopeError(ValueError):
+    """Raised by a connector's ``_find_conflicts`` on a whole-batch
+    missing-scope error (see that function's own docstring for why this
+    is raised at all rather than degrading to unchecked).
+
+    Carries whatever ``conflicts``/``unchecked_attendees`` had already
+    been confirmed before the error - a caller accumulating results
+    across multiple ``_find_conflicts`` calls for one create/update (e.g.
+    one call for newly-added attendees, another per delta segment for
+    retained attendees) needs this to still report an already-confirmed
+    real conflict (found before the error, in this call or an earlier
+    one) instead of silently discarding it just because a *later*,
+    unrelated check also hit the same scope problem. Reporting a known
+    conflict is always safe regardless of what else couldn't be checked;
+    only the "nothing confirmed yet, can't tell if this is safe" case
+    should still reject the write outright.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        conflicts: list[dict[str, Any]],
+        unchecked_attendees: list[str],
+    ) -> None:
+        super().__init__(message)
+        self.conflicts = conflicts
+        self.unchecked_attendees = unchecked_attendees
+
+
+def merge_scope_error(
+    exc: InsufficientScopeError,
+    conflicts: list[dict[str, Any]],
+    unchecked_attendees: list[str],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Fold an `InsufficientScopeError` caught mid-accumulation into the
+    running `conflicts`/`unchecked_attendees` a connector's create/update
+    tool is building up (potentially across more than one `_find_conflicts`
+    call) - merging the error's own already-confirmed findings in first, so
+    a real conflict found before the error is never lost regardless of
+    which of possibly several calls actually raised.
+
+    Re-raises `exc` itself (preserving its original traceback/cause) when
+    the merged `conflicts` is still empty: nothing was confirmed yet, so
+    there is no already-known problem safe to report instead of rejecting
+    the write outright.
+    """
+    conflicts = [*conflicts, *exc.conflicts]
+    unchecked_attendees = [*unchecked_attendees, *exc.unchecked_attendees]
+    if not conflicts:
+        raise exc
+    return conflicts, unchecked_attendees
 
 
 def require_clean_identifier(value: str, field_name: str) -> str:
@@ -116,6 +171,453 @@ def success_with_capped_dict(field_name: str, data: Any) -> str:
         truncated = True
         response = _build(working, truncated)
     return response
+
+
+def normalize_addresses(addresses: list[str] | str) -> list[str]:
+    """Split/strip a comma-separated string or list of email addresses into a
+    clean list, dropping anything blank and case-insensitive duplicates
+    (keeping the first casing seen - email addresses are case-insensitive,
+    so a caller passing the same person twice with different casing, e.g.
+    from a human-written invite list, must not become two separate
+    attendee entries downstream)."""
+    if isinstance(addresses, str):
+        raw = [address.strip() for address in addresses.split(",") if address.strip()]
+    else:
+        raw = [address.strip() for address in addresses if address and address.strip()]
+    seen: set[str] = set()
+    deduped = []
+    for address in raw:
+        key = address.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(address)
+    return deduped
+
+
+def conflict_response(
+    conflicts: list[dict[str, Any]],
+    unchecked_attendees: list[str],
+    start: str,
+    end: str,
+) -> str:
+    """Build the status="conflict" envelope a calendar-writing MCP tool
+    returns instead of creating/updating an event, so the calling agent
+    reports the conflict to the user rather than silently double-booking.
+
+    `unchecked_attendees` is usually the self-explanatory kind (an
+    attendee absent from the provider's response, or its own per-attendee
+    error) - a missing-OAuth-scope 403 covering the whole call is instead
+    raised as `InsufficientScopeError` before ever reaching here, since
+    writing an event whose availability could never actually be checked
+    would defeat the point of this feature. The one exception: a caller
+    that catches `InsufficientScopeError` because `conflicts` was already
+    non-empty (a real conflict was confirmed before the scope error hit)
+    may pass that error's own `unchecked_attendees` through here too - at
+    that point the write is already correctly blocked by the known
+    conflict, so being honest about who else couldn't be checked is safe.
+    """
+    payload = {
+        "status": "conflict",
+        "message": f"{len(conflicts)} existing event(s) overlap {start} - {end}",
+        "conflicts": conflicts,
+        "unchecked_attendees": unchecked_attendees,
+        "hint": (
+            "Do not retry with the same time slot. Report these conflicts to "
+            "the user and ask them to pick a different time or confirm they "
+            "want to proceed anyway. Only call this tool again with "
+            "ignore_conflicts=true after the user has explicitly confirmed "
+            "they still want this slot."
+        ),
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def unchecked_extra(unchecked_attendees: list[str]) -> dict[str, Any]:
+    """Extra fields for a status="success" envelope when some attendees
+    ended up unchecked - empty (nothing to add) when there's nothing to
+    report."""
+    if not unchecked_attendees:
+        return {}
+    return {"unchecked_attendees": unchecked_attendees}
+
+
+def attendees_were_given(attendees: list[str] | str | None) -> bool:
+    """Whether `attendees` was actually provided by the caller for an
+    update, treating an empty string the same as not-provided at all -
+    matching every other optional field's truthy convention here (and the
+    create path's own check) - rather than as "clear every attendee".
+    That's still expressible, just via an explicit empty list: `[]` is a
+    deliberate, differently-typed value that must keep working."""
+    return attendees is not None and attendees != ""
+
+
+def attendees_to_add(
+    attendees: list[str] | str | None, existing_attendee_emails: set[str]
+) -> list[str]:
+    """The newly-added addresses from an update's `attendees` argument,
+    normalized and deduped, that aren't already in
+    `existing_attendee_emails` - what actually needs writing when
+    `attendees` only ever adds attendees and never removes any. Returns
+    [] for anything `attendees_were_given` treats as not-provided (None,
+    ""), matching its own convention, as well as for a caller-supplied
+    list/string that turns out to name only people already on the event.
+    """
+    if not attendees_were_given(attendees):
+        return []
+    assert attendees is not None  # narrows for mypy; attendees_were_given implies this
+    return [
+        address
+        for address in normalize_addresses(attendees)
+        if address.lower() not in existing_attendee_emails
+    ]
+
+
+_OVERLONG_FRACTIONAL_SECONDS = re.compile(r"(\.\d{6})\d+")
+
+
+def datetime_key_for_comparison(value: str | None) -> datetime | str | None:
+    """Return a value suitable for equality-comparing two datetime strings
+    that may be written in different but equivalent formats.
+
+    A caller re-submitting the same instant it just read back from an API
+    (or a value it typed by hand) can differ in formatting alone - "Z" vs
+    "+00:00", a different (but equal-instant) zone offset, missing vs
+    present fractional seconds - while meaning the same moment. Comparing
+    such strings directly treats a same-instant resubmission as a real
+    change, which for a scheduling-conflict check means re-querying (and,
+    worse, misjudging self-conflicts against) a window that never actually
+    moved.
+
+    Parses to a `datetime` and returns it: two aware datetimes compare
+    equal when they denote the same instant regardless of differing zone
+    offsets, which a string/isoformat() comparison would not catch. Two
+    naive datetimes (Outlook's dateTime values, which carry no offset of
+    their own) compare directly, which is correct since both sides here
+    always come from the same source. An aware value never equals a naive
+    one, which is fine - these are simply never the same source's values
+    (never worse than the plain-string comparison this replaces).
+
+    Returns the original value unchanged if it doesn't parse (None stays
+    None, and a genuinely malformed value still compares by raw string,
+    same as before this normalization existed - never worse, never a
+    crash).
+
+    Outlook commonly reports 7-digit (100-nanosecond) fractional seconds
+    (e.g. ".0000000"), one more digit than a `datetime` microsecond can
+    hold. `fromisoformat`'s tolerance for that is a CPython-version detail
+    the caller shouldn't need to know about, so any fractional-seconds run
+    longer than 6 digits is truncated to 6 before parsing, rather than
+    relying on the current interpreter to accept (and correctly truncate)
+    the extra digits itself.
+    """
+    if value is None:
+        return None
+    normalized = value
+    if normalized[-1:] in ("Z", "z"):
+        # Only the trailing UTC marker, not a blanket .replace("Z", ...) -
+        # a naive str.replace would also touch a "Z"/"z" anywhere else in
+        # the string, which happens to never occur in a valid ISO
+        # datetime today but is needless coupling to that happening to
+        # stay true.
+        normalized = normalized[:-1] + "+00:00"
+    normalized = _OVERLONG_FRACTIONAL_SECONDS.sub(r"\1", normalized)
+    try:
+        return datetime.fromisoformat(normalized)
+    except ValueError:
+        return value
+
+
+def reject_reversed_window(start_value: str, end_value: str) -> None:
+    """Raise ValueError when `end_value` is not after `start_value` - an
+    event window's basic ordering sanity, checked before forwarding it to
+    the provider API as-is (both on create, and on update's effective
+    window regardless of ignore_conflicts - this isn't a conflict-check
+    decision a caller can opt out of).
+
+    Deliberately permissive when either side doesn't parse to a real,
+    comparable instant (stays silent rather than rejecting) - matching
+    this module's other datetime comparisons, which treat "can't tell"
+    as "don't block", not "assume invalid". That includes the case where
+    both sides parse but one is offset-aware and the other naive (e.g. a
+    ``Z``-suffixed value alongside a naive one): Python raises
+    ``TypeError`` comparing those with ``<=`` even though both are real
+    ``datetime`` instances, so the ``isinstance`` check alone isn't
+    enough to guarantee a safe comparison - see ``window_delta_segments``,
+    which guards the identical hazard the same way.
+    """
+    start_key = datetime_key_for_comparison(start_value)
+    end_key = datetime_key_for_comparison(end_value)
+    if not (isinstance(start_key, datetime) and isinstance(end_key, datetime)):
+        return
+    try:
+        if end_key <= start_key:
+            raise ValueError(
+                f"end ({end_value!r}) must be after start ({start_value!r})."
+            )
+    except TypeError:
+        return
+
+
+# Microsoft Graph timeZone values come in two shapes depending on how/where
+# an event was created: IANA names (e.g. "Asia/Singapore", which Graph also
+# accepts on write) and legacy Windows names (e.g. "Pacific Standard Time",
+# from desktop Outlook or an Exchange org defaulting to them). zoneinfo only
+# understands the former. This is the standard (CLDR) Windows-to-IANA
+# mapping, restricted to the zone list Graph's own dateTimeTimeZone docs
+# enumerate as supported - not exhaustive of every Windows zone that has
+# ever existed, but covers every zone Graph itself claims to support.
+_WINDOWS_TO_IANA: dict[str, str] = {
+    "UTC": "UTC",
+    "GMT Standard Time": "Europe/London",
+    "Greenwich Standard Time": "Atlantic/Reykjavik",
+    "W. Europe Standard Time": "Europe/Berlin",
+    "Central Europe Standard Time": "Europe/Budapest",
+    "Central European Standard Time": "Europe/Warsaw",
+    "Romance Standard Time": "Europe/Paris",
+    "E. Europe Standard Time": "Europe/Bucharest",
+    "GTB Standard Time": "Europe/Bucharest",
+    "FLE Standard Time": "Europe/Kyiv",
+    "Turkey Standard Time": "Europe/Istanbul",
+    "Russian Standard Time": "Europe/Moscow",
+    "Kaliningrad Standard Time": "Europe/Kaliningrad",
+    "Arabic Standard Time": "Asia/Baghdad",
+    "Syria Standard Time": "Asia/Damascus",
+    "Arab Standard Time": "Asia/Riyadh",
+    "Israel Standard Time": "Asia/Jerusalem",
+    "Jordan Standard Time": "Asia/Amman",
+    "Middle East Standard Time": "Asia/Beirut",
+    "Egypt Standard Time": "Africa/Cairo",
+    "South Africa Standard Time": "Africa/Johannesburg",
+    "E. Africa Standard Time": "Africa/Nairobi",
+    "Mauritius Standard Time": "Indian/Mauritius",
+    "Iran Standard Time": "Asia/Tehran",
+    "Arabian Standard Time": "Asia/Dubai",
+    "Azerbaijan Standard Time": "Asia/Baku",
+    "Georgian Standard Time": "Asia/Tbilisi",
+    "Caucasus Standard Time": "Asia/Yerevan",
+    "Afghanistan Standard Time": "Asia/Kabul",
+    "Pakistan Standard Time": "Asia/Karachi",
+    "West Asia Standard Time": "Asia/Tashkent",
+    "India Standard Time": "Asia/Kolkata",
+    "Sri Lanka Standard Time": "Asia/Colombo",
+    "Nepal Standard Time": "Asia/Kathmandu",
+    "Central Asia Standard Time": "Asia/Almaty",
+    "Bangladesh Standard Time": "Asia/Dhaka",
+    "Ekaterinburg Standard Time": "Asia/Yekaterinburg",
+    "Myanmar Standard Time": "Asia/Yangon",
+    "SE Asia Standard Time": "Asia/Bangkok",
+    "Novosibirsk Standard Time": "Asia/Novosibirsk",
+    "China Standard Time": "Asia/Shanghai",
+    "North Asia Standard Time": "Asia/Krasnoyarsk",
+    "Singapore Standard Time": "Asia/Singapore",
+    "Taipei Standard Time": "Asia/Taipei",
+    "Ulaanbaatar Standard Time": "Asia/Ulaanbaatar",
+    "North Asia East Standard Time": "Asia/Irkutsk",
+    "W. Australia Standard Time": "Australia/Perth",
+    "Tokyo Standard Time": "Asia/Tokyo",
+    "Korea Standard Time": "Asia/Seoul",
+    "Cen. Australia Standard Time": "Australia/Adelaide",
+    "AUS Central Standard Time": "Australia/Darwin",
+    "E. Australia Standard Time": "Australia/Brisbane",
+    "AUS Eastern Standard Time": "Australia/Sydney",
+    "West Pacific Standard Time": "Pacific/Port_Moresby",
+    "Tasmania Standard Time": "Australia/Hobart",
+    "Yakutsk Standard Time": "Asia/Yakutsk",
+    "Central Pacific Standard Time": "Pacific/Guadalcanal",
+    "Vladivostok Standard Time": "Asia/Vladivostok",
+    "New Zealand Standard Time": "Pacific/Auckland",
+    "Fiji Standard Time": "Pacific/Fiji",
+    "Magadan Standard Time": "Asia/Magadan",
+    "Tonga Standard Time": "Pacific/Tongatapu",
+    "Samoa Standard Time": "Pacific/Apia",
+    "Line Islands Standard Time": "Pacific/Kiritimati",
+    "Dateline Standard Time": "Etc/GMT+12",
+    "Hawaiian Standard Time": "Pacific/Honolulu",
+    "Alaskan Standard Time": "America/Anchorage",
+    "Pacific Standard Time (Mexico)": "America/Santa_Isabel",
+    "Pacific Standard Time": "America/Los_Angeles",
+    "US Mountain Standard Time": "America/Phoenix",
+    "Mountain Standard Time (Mexico)": "America/Chihuahua",
+    "Mountain Standard Time": "America/Denver",
+    "Central America Standard Time": "America/Guatemala",
+    "Central Standard Time": "America/Chicago",
+    "Central Standard Time (Mexico)": "America/Mexico_City",
+    "Canada Central Standard Time": "America/Regina",
+    "SA Pacific Standard Time": "America/Bogota",
+    "Eastern Standard Time": "America/New_York",
+    "US Eastern Standard Time": "America/Indiana/Indianapolis",
+    "Venezuela Standard Time": "America/Caracas",
+    "Paraguay Standard Time": "America/Asuncion",
+    "Atlantic Standard Time": "America/Halifax",
+    "Central Brazilian Standard Time": "America/Cuiaba",
+    "SA Western Standard Time": "America/La_Paz",
+    "Pacific SA Standard Time": "America/Santiago",
+    "Newfoundland Standard Time": "America/St_Johns",
+    "E. South America Standard Time": "America/Sao_Paulo",
+    "Argentina Standard Time": "America/Argentina/Buenos_Aires",
+    "SA Eastern Standard Time": "America/Cayenne",
+    "Greenland Standard Time": "America/Godthab",
+    "Montevideo Standard Time": "America/Montevideo",
+    "Bahia Standard Time": "America/Bahia",
+    "Azores Standard Time": "Atlantic/Azores",
+    "Cape Verde Standard Time": "Atlantic/Cape_Verde",
+    "Morocco Standard Time": "Africa/Casablanca",
+    "Namibia Standard Time": "Africa/Windhoek",
+    "W. Central Africa Standard Time": "Africa/Lagos",
+}
+
+
+def resolve_zone_name(name: str) -> str:
+    """Map a Graph timeZone value to a name zoneinfo can load.
+
+    Returns the input unchanged when it isn't a recognized legacy Windows
+    zone name - it's then assumed to already be IANA-shaped, which
+    zoneinfo can load directly.
+    """
+    return _WINDOWS_TO_IANA.get(name, name)
+
+
+def resolve_zoneinfo(name: str) -> ZoneInfo:
+    """Resolve a Graph timeZone value (Windows or IANA) to a real
+    ``ZoneInfo``, for use anywhere a working zone is required (not just a
+    best-effort comparison) - e.g. attaching a real UTC offset to a naive
+    datetime string.
+
+    Raises ``ValueError`` rather than silently defaulting to UTC when the
+    name can't be resolved: a wrong silent guess here is exactly the class
+    of bug (a query or write running in the wrong real-world window) this
+    helper exists to prevent.
+    """
+    try:
+        return ZoneInfo(resolve_zone_name(name))
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ValueError(
+            f"Timezone {name!r} isn't a recognized IANA or Windows zone name."
+        ) from exc
+
+
+def offset_datetime_string(value: str, tz_name: str) -> str:
+    """Combine a naive datetime string (no embedded UTC offset - Outlook's
+    dateTimeTimeZone.dateTime is always this shape, paired with a separate
+    timeZone field) with its zone name into an offset-bearing ISO 8601
+    string.
+
+    Needed anywhere a naive value has to be sent to an API that (unlike
+    Outlook's own structured ``{"dateTime", "timeZone"}`` request bodies)
+    takes a single datetime string and infers UTC when it carries no
+    offset of its own. Graph's own docs for List calendarView's
+    startDateTime/endDateTime query parameters say exactly this: they're
+    "interpreted using the timezone offset specified in the value" and
+    "aren't impacted by the value of the Prefer ... header" - a naive
+    value there is silently read as UTC regardless of what timezone the
+    caller actually meant.
+
+    Raises ``ValueError`` (via ``resolve_zoneinfo``) rather than falling
+    back to UTC when ``tz_name`` can't be resolved - and also raises if
+    ``value`` turns out to already carry its own offset/``Z``, rather
+    than silently relabeling those same clock digits with `tz_name`'s
+    offset instead of converting them (``.replace(tzinfo=...)`` changes
+    what zone a datetime is interpreted in without changing the instant
+    it names, e.g. turning "10:00 UTC" into "10:00 <tz_name>" - a real
+    shift, not a no-op, whenever the two offsets differ). No public tool
+    parameter is documented as requiring a naive value, so a caller
+    passing one with an offset already attached is a real, reachable
+    input here, not just a theoretical one.
+    """
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is not None:
+        raise ValueError(
+            f"{value!r} already carries a UTC offset; pass a naive "
+            "datetime string (no trailing 'Z' or +HH:MM) together with "
+            "its timezone name instead of embedding an offset in both."
+        )
+    return parsed.replace(tzinfo=resolve_zoneinfo(tz_name)).isoformat()
+
+
+def calendar_day_bounds(
+    date_value: str, tz_name: str, *, days: int = 1
+) -> tuple[str, str]:
+    """Return (start, end) offset-bearing ISO instants spanning ``days``
+    full calendar day(s) starting at ``date_value``'s date, in ``tz_name``.
+
+    ``date_value`` may be a bare "YYYY-MM-DD" or a full datetime string
+    (only its date component is used). Used to widen an all-day event's
+    (or an all-day toggle's) boundary into a real queryable window: an
+    all-day event occupies the *calendar's own* day, not a UTC day, so a
+    hardcoded "T00:00:00Z" is only correct for a UTC calendar.
+    """
+    zone = resolve_zoneinfo(tz_name)
+    day: date = datetime.fromisoformat(date_value).date()
+    start = datetime.combine(day, time.min, tzinfo=zone)
+    end = start + timedelta(days=days)
+    return start.isoformat(), end.isoformat()
+
+
+def window_delta_segments(
+    existing_start: datetime | str | None,
+    existing_end: datetime | str | None,
+    new_start: datetime | str | None,
+    new_end: datetime | str | None,
+) -> list[tuple[datetime, datetime]]:
+    """The portion(s) of the half-open [new_start, new_end) window that
+    fall OUTSIDE [existing_start, existing_end) - the only territory an
+    attendee already on the event needs a fresh free/busy check against.
+
+    An attendee already on the event will always show this very event's
+    own busy block for any instant inside the OLD window - querying that
+    overlap can't distinguish "busy because of this event" from a real
+    conflict, the exact self-conflict bug this function exists to avoid.
+    But a window can move in a way that's neither identical/subset (no
+    new territory at all) nor fully disjoint (the whole new window is new
+    territory) - a partial nudge like 10:00-10:30 -> 10:15-10:45 makes
+    10:30-10:45 new territory while 10:15-10:30 is still old ground, and
+    checking the retained attendee only over the confirmed-safe old
+    portion (or not at all) would silently miss a genuine conflict
+    sitting in that new segment. This computes exactly that new territory
+    so the caller can check retained attendees against precisely it,
+    while newly-added attendees (who have no footprint on this event at
+    all) still get the FULL new window checked regardless of any of this
+    - they need every instant in it verified, delta or not.
+
+    Returns:
+    - ``[]`` when the new window is confirmed to add no territory beyond
+      the old one (identical or a subset) - nothing new for a retained
+      attendee to be checked against.
+    - Up to two disjoint segments when the new window extends past the
+      old one's start, end, or both (e.g. extending a meeting on both
+      sides in one call).
+    - The whole ``[new_start, new_end)`` as a single segment when the two
+      windows are confirmed to not overlap at all (matching "moved
+      somewhere completely disjoint -> check the whole thing"), OR when
+      any value isn't a real, mutually-comparable ``datetime`` (parsing
+      failure, or one side aware and the other naive) - "can't confirm
+      the delta is smaller than the whole window" must never silently
+      shrink what gets checked, so treat it as needing the full window.
+    - ``[]`` in the same can't-tell scenario if there's no valid new
+      window at all to fall back to (``new_start``/``new_end`` themselves
+      aren't real instants) - there is nothing meaningful to check.
+    """
+    if not (isinstance(new_start, datetime) and isinstance(new_end, datetime)):
+        return []
+    if not (
+        isinstance(existing_start, datetime) and isinstance(existing_end, datetime)
+    ):
+        return [(new_start, new_end)]
+    try:
+        fully_disjoint = new_end <= existing_start or new_start >= existing_end
+        if fully_disjoint:
+            return [(new_start, new_end)]
+        segments = []
+        if new_start < existing_start:
+            segments.append((new_start, existing_start))
+        if new_end > existing_end:
+            segments.append((existing_end, new_end))
+        return segments
+    except TypeError:
+        # Real datetimes that still can't be compared (aware vs. naive) -
+        # same "can't confirm smaller than the whole window" fallback.
+        return [(new_start, new_end)]
 
 
 def clamp_limit(limit: int, *, max_limit: int) -> int:

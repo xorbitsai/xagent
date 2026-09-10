@@ -76,6 +76,11 @@ dependencies = [
   "matplotlib>=3.5.0",
   "google-auth-oauthlib>=1.2.0",
   "google-api-python-client>=2.145.0",
+  # zoneinfo's IANA timezone database - stdlib zoneinfo relies on the OS's
+  # tz data, which minimal container images may not ship; this guarantees
+  # it's present regardless of platform (calendar/outlook conflict-check
+  # timezone math needs real zone offsets, not just zone names).
+  "tzdata>=2024.1",
   "boxlite>=0.6.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
   "boxlite>=0.6.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
   "filelock>=3.0.0",

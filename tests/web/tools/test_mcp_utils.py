@@ -115,3 +115,253 @@ def test_url_path_id_output_survives_requests_url_normalization():
 
     with pytest.raises(ValueError):
         utils.url_path_id("..", "record_id")
+
+
+def test_datetime_key_for_comparison_truncates_seven_digit_fractional_seconds():
+    """Outlook commonly reports 100-nanosecond (7-digit) fractional
+    seconds, one more digit than a microsecond can hold - this must not
+    depend on whichever CPython version happens to run it."""
+    key = utils.datetime_key_for_comparison("2026-08-27T10:00:00.0000000")
+    assert key == utils.datetime_key_for_comparison("2026-08-27T10:00:00")
+
+
+def test_datetime_key_for_comparison_treats_equal_instants_as_equal_across_offsets():
+    z_form = utils.datetime_key_for_comparison("2026-08-27T02:00:00Z")
+    offset_form = utils.datetime_key_for_comparison("2026-08-27T10:00:00+08:00")
+    assert z_form == offset_form
+
+
+def test_datetime_key_for_comparison_falls_back_to_raw_string_on_malformed_input():
+    assert utils.datetime_key_for_comparison("not-a-date") == "not-a-date"
+
+
+def test_datetime_key_for_comparison_passes_none_through():
+    assert utils.datetime_key_for_comparison(None) is None
+
+
+def test_normalize_addresses_drops_case_insensitive_duplicates():
+    """Regression test: email addresses are case-insensitive, so the same
+    person listed twice with different casing must not become two separate
+    attendee entries downstream - keeps the first casing seen."""
+    assert utils.normalize_addresses(
+        ["Chelsea@Example.com", "chelsea@example.com", "new@example.com"]
+    ) == ["Chelsea@Example.com", "new@example.com"]
+
+
+def test_normalize_addresses_dedup_works_for_comma_separated_string_input():
+    assert utils.normalize_addresses("a@x.com, A@X.com, b@x.com") == [
+        "a@x.com",
+        "b@x.com",
+    ]
+
+
+def test_attendees_were_given_treats_empty_string_as_not_provided():
+    assert utils.attendees_were_given(None) is False
+    assert utils.attendees_were_given("") is False
+
+
+def test_attendees_were_given_treats_empty_list_as_provided():
+    """An explicit [] is a deliberate "clear everyone" - distinct from
+    not-provided, unlike an empty string."""
+    assert utils.attendees_were_given([]) is True
+    assert utils.attendees_were_given(["a@x.com"]) is True
+    assert utils.attendees_were_given("a@x.com") is True
+
+
+def test_attendees_to_add_filters_out_existing_and_normalizes():
+    assert utils.attendees_to_add(
+        ["Old@Example.com", "new@example.com"], {"old@example.com"}
+    ) == ["new@example.com"]
+
+
+def test_attendees_to_add_returns_empty_for_not_provided_or_empty():
+    assert utils.attendees_to_add(None, {"old@example.com"}) == []
+    assert utils.attendees_to_add("", {"old@example.com"}) == []
+    assert utils.attendees_to_add([], {"old@example.com"}) == []
+
+
+def test_unchecked_extra_empty_when_nothing_unchecked():
+    assert utils.unchecked_extra([]) == {}
+
+
+def test_unchecked_extra_includes_attendees_when_given():
+    assert utils.unchecked_extra(["a@x.com"]) == {"unchecked_attendees": ["a@x.com"]}
+
+
+def _key(value: str):
+    return utils.datetime_key_for_comparison(value)
+
+
+def test_window_delta_segments_empty_for_unchanged_or_shrunk_window():
+    """A retained attendee's own busy block already covers everything
+    inside the old window - a new window that's identical, or a strict
+    subset of it, adds no territory worth checking them against."""
+    old_start, old_end = (
+        _key("2026-08-27T10:00:00+00:00"),
+        _key("2026-08-27T10:30:00+00:00"),
+    )
+    assert utils.window_delta_segments(old_start, old_end, old_start, old_end) == []
+
+    shrunk_start = _key("2026-08-27T10:05:00+00:00")
+    shrunk_end = _key("2026-08-27T10:25:00+00:00")
+    assert (
+        utils.window_delta_segments(old_start, old_end, shrunk_start, shrunk_end) == []
+    )
+
+
+def test_window_delta_segments_returns_the_new_only_portion_of_a_partial_nudge():
+    """10:00-10:30 nudged to 10:15-10:45 - only 10:30-10:45 is new
+    territory a retained attendee could have a genuine conflict in;
+    10:15-10:30 is still covered by their busy block for this event."""
+    old_start, old_end = (
+        _key("2026-08-27T10:00:00+00:00"),
+        _key("2026-08-27T10:30:00+00:00"),
+    )
+    new_start, new_end = (
+        _key("2026-08-27T10:15:00+00:00"),
+        _key("2026-08-27T10:45:00+00:00"),
+    )
+
+    segments = utils.window_delta_segments(old_start, old_end, new_start, new_end)
+
+    assert segments == [(old_end, new_end)]
+
+
+def test_window_delta_segments_returns_two_segments_when_widened_on_both_sides():
+    """Extending a meeting earlier AND later in the same call creates new
+    territory on both sides of the old window."""
+    old_start, old_end = (
+        _key("2026-08-27T10:00:00+00:00"),
+        _key("2026-08-27T10:30:00+00:00"),
+    )
+    new_start, new_end = (
+        _key("2026-08-27T09:45:00+00:00"),
+        _key("2026-08-27T10:45:00+00:00"),
+    )
+
+    segments = utils.window_delta_segments(old_start, old_end, new_start, new_end)
+
+    assert len(segments) == 2
+    assert segments[0] == (new_start, old_start)
+    assert segments[1] == (old_end, new_end)
+
+
+def test_window_delta_segments_returns_the_whole_window_for_a_disjoint_move():
+    """A move to somewhere with zero overlap with the old window means the
+    entire new window is new territory - this test also confirms the
+    move-by-15-minutes example from the actual reported bug is caught:
+    the delta segment here is the same shape as the disjoint case."""
+    old_start, old_end = (
+        _key("2026-08-27T10:00:00+00:00"),
+        _key("2026-08-27T10:30:00+00:00"),
+    )
+    new_start, new_end = (
+        _key("2026-08-27T14:00:00+00:00"),
+        _key("2026-08-27T14:30:00+00:00"),
+    )
+
+    assert utils.window_delta_segments(old_start, old_end, new_start, new_end) == [
+        (new_start, new_end)
+    ]
+
+
+def test_window_delta_segments_is_conservative_on_unparseable_or_mismatched_keys():
+    """ "Can't confirm the delta is smaller than the whole window" must
+    never silently shrink what gets checked - falls back to the whole new
+    window, both for a key that never parsed to a real datetime, and for
+    two real datetimes that can't be compared (aware vs. naive raises
+    TypeError on `<`)."""
+    new_start, new_end = (
+        _key("2026-08-27T10:00:00+00:00"),
+        _key("2026-08-27T10:30:00+00:00"),
+    )
+    assert utils.window_delta_segments(
+        "not-a-date", "also-not", new_start, new_end
+    ) == [(new_start, new_end)]
+
+    naive_start = _key("2026-08-27T09:00:00")
+    naive_end = _key("2026-08-27T11:00:00")
+    assert utils.window_delta_segments(naive_start, naive_end, new_start, new_end) == [
+        (new_start, new_end)
+    ]
+
+
+def test_window_delta_segments_empty_when_new_window_itself_is_unparseable():
+    """No valid new window at all means nothing meaningful to check,
+    regardless of the old window."""
+    old_start, old_end = (
+        _key("2026-08-27T10:00:00+00:00"),
+        _key("2026-08-27T10:30:00+00:00"),
+    )
+    assert (
+        utils.window_delta_segments(old_start, old_end, "not-a-date", "also-not") == []
+    )
+
+
+def test_reject_reversed_window_raises_when_end_is_not_after_start():
+    with pytest.raises(ValueError, match="must be after"):
+        utils.reject_reversed_window(
+            "2026-08-27T10:30:00+00:00", "2026-08-27T10:00:00+00:00"
+        )
+    with pytest.raises(ValueError, match="must be after"):
+        utils.reject_reversed_window(
+            "2026-08-27T10:00:00+00:00", "2026-08-27T10:00:00+00:00"
+        )
+
+
+def test_reject_reversed_window_allows_a_forward_window():
+    utils.reject_reversed_window(
+        "2026-08-27T10:00:00+00:00", "2026-08-27T10:30:00+00:00"
+    )
+
+
+def test_reject_reversed_window_is_permissive_on_unparseable_input():
+    """Can't-tell must never read as "reject" - only a confirmed reversal
+    should raise."""
+    utils.reject_reversed_window("not-a-date", "also-not-a-date")
+
+
+def test_reject_reversed_window_is_permissive_when_aware_and_naive_are_mixed():
+    """Regression test: both sides parse to real `datetime` instances, but
+    comparing an offset-aware one against a naive one with `<=` raises
+    `TypeError` in Python - the `isinstance` check alone doesn't guard
+    against this, only checking that both are `datetime` instances of the
+    SAME awareness does. Must stay permissive here, not crash with a raw
+    TypeError, matching `window_delta_segments`'s handling of the
+    identical hazard."""
+    utils.reject_reversed_window("2026-08-27T10:30:00", "2026-08-27T10:30:00Z")
+    utils.reject_reversed_window("2026-08-27T10:30:00Z", "2026-08-27T10:00:00")
+
+
+def test_resolve_zone_name_covers_graphs_additional_time_zones():
+    """Regression test: `_WINDOWS_TO_IANA` was missing several of the
+    Windows names for zones Microsoft's own dateTimeTimeZone docs list
+    under "Additional time zones" (e.g. Kaliningrad, Ekaterinburg) - an
+    event whose originalStartTimeZone happened to be one of these
+    previously hard-failed every single-boundary update and conflict
+    check outright."""
+    assert utils.resolve_zone_name("Kaliningrad Standard Time") == "Europe/Kaliningrad"
+    assert utils.resolve_zone_name("Ekaterinburg Standard Time") == "Asia/Yekaterinburg"
+    assert utils.resolve_zone_name("Vladivostok Standard Time") == "Asia/Vladivostok"
+
+
+def test_offset_datetime_string_attaches_the_zone_offset_to_a_naive_value():
+    assert (
+        utils.offset_datetime_string("2026-08-27T10:00:00", "Asia/Singapore")
+        == "2026-08-27T10:00:00+08:00"
+    )
+
+
+def test_offset_datetime_string_rejects_input_that_already_carries_an_offset():
+    """Regression test: no public tool parameter is documented as requiring
+    a naive value, so a caller passing one with a trailing 'Z' or an
+    explicit offset is a real, reachable mistake - not a theoretical one.
+    `.replace(tzinfo=...)` doesn't convert an aware datetime, it just
+    relabels the same clock digits under a different zone, silently
+    shifting the real instant by however much the two offsets differ
+    (e.g. "10:00:00Z" relabeled as Asia/Shanghai reads as 10:00 Shanghai
+    time - actually 8 hours earlier). Must fail loudly instead."""
+    with pytest.raises(ValueError, match="already carries a UTC offset"):
+        utils.offset_datetime_string("2026-08-27T10:00:00Z", "Asia/Shanghai")
+    with pytest.raises(ValueError, match="already carries a UTC offset"):
+        utils.offset_datetime_string("2026-08-27T10:00:00+00:00", "Asia/Shanghai")

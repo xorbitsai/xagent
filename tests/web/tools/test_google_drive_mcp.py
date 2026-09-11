@@ -2612,18 +2612,10 @@ def test_upload_allowed_dirs_falls_back_to_cwd_when_unset(monkeypatch):
 
 
 @pytest.mark.parametrize("raw_value", [",", " , ", ",,,"])
-def test_upload_allowed_dirs_falls_back_to_cwd_when_value_has_no_real_entries(
-    monkeypatch, raw_value
-):
-    """Regression guard: the env var being non-blank (so the "unset"
-    shortcut above doesn't apply) but normalizing to zero real directory
-    entries must still fall back to CWD, not silently return [] -- an
-    empty allowlist would make every google_drive_upload_file call fail
-    with "outside the allowed directories" instead of the documented
-    fail-open default."""
+def test_upload_allowed_dirs_denies_value_with_no_real_entries(monkeypatch, raw_value):
     monkeypatch.setenv("XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS", raw_value)
 
-    assert google_drive._upload_allowed_dirs() == [Path.cwd().resolve()]
+    assert google_drive._upload_allowed_dirs() == []
 
 
 def test_resolve_upload_file_path_accepts_file_inside_allowed_dir(

@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import mimetypes
 import os
 import urllib.parse
@@ -9,12 +10,16 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
+from .utils import allowed_dirs_from_env
+
 app = Server("linkedin-mcp")
+logger = logging.getLogger("linkedin-mcp")
 
 
 POSTS_URL = "https://api.linkedin.com/rest/posts"
 USERINFO_URL = "https://api.linkedin.com/v2/userinfo"
 IMAGES_URL = "https://api.linkedin.com/rest/images"
+_UPLOAD_ALLOWED_DIRS_ENV_VAR = "XAGENT_LINKEDIN_IMAGE_ALLOWED_DIRS"
 
 
 def _post_urn_from_header(post_id: str) -> str:
@@ -52,14 +57,11 @@ def _get_author_urn(headers: dict, proxies: dict | None) -> str:
 
 
 def _allowed_image_dirs() -> list[Path]:
-    raw_dirs = os.environ.get("XAGENT_LINKEDIN_IMAGE_ALLOWED_DIRS", "")
-    if not raw_dirs.strip():
-        return [Path.cwd().resolve()]
-    return [
-        Path(raw_dir).expanduser().resolve()
-        for raw_dir in raw_dirs.split(",")
-        if raw_dir.strip()
-    ]
+    try:
+        return allowed_dirs_from_env(_UPLOAD_ALLOWED_DIRS_ENV_VAR)
+    except ValueError as exc:
+        logger.warning("Invalid LinkedIn upload directory configuration: %s", exc)
+        raise ValueError("Upload directory configuration is invalid") from None
 
 
 def _resolve_allowed_image_path(image_path: str) -> Path:

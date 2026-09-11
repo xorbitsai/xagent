@@ -9,7 +9,7 @@ from typing import Any
 import requests
 from mcp.server.fastmcp import FastMCP
 
-from .utils import setup_proxy_env
+from .utils import allowed_dirs_from_env, setup_proxy_env
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("slack-mcp")
@@ -30,6 +30,7 @@ MAX_RETRY_AFTER_SECONDS = 30
 # for in one call — a channel history page can contain many threaded parents,
 # and each one is a separate conversations.replies call.
 MAX_SEARCH_THREADS = 20
+_UPLOAD_ALLOWED_DIRS_ENV_VAR = "XAGENT_SLACK_FILE_ALLOWED_DIRS"
 
 # Slack conversation ids are uppercase alphanumerics prefixed by their
 # conversation type: "C" (public channel), "G" (private channel or
@@ -125,14 +126,11 @@ def _resolve_channel_id(channel: str) -> str:
 
 
 def _allowed_file_dirs() -> list[Path]:
-    raw_dirs = os.environ.get("XAGENT_SLACK_FILE_ALLOWED_DIRS", "")
-    if not raw_dirs.strip():
-        return [Path.cwd().resolve()]
-    return [
-        Path(stripped).expanduser().resolve()
-        for raw_dir in raw_dirs.split(",")
-        if (stripped := raw_dir.strip())
-    ]
+    try:
+        return allowed_dirs_from_env(_UPLOAD_ALLOWED_DIRS_ENV_VAR)
+    except ValueError as exc:
+        logger.warning("Invalid Slack upload directory configuration: %s", exc)
+        raise ValueError("Upload directory configuration is invalid") from None
 
 
 def _resolve_allowed_file_path(file_path: str) -> Path:

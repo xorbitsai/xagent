@@ -11,7 +11,7 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build  # type: ignore[import-not-found]
 from mcp.server.fastmcp import FastMCP
 
-from .utils import setup_proxy_env
+from .utils import allowed_dirs_from_env, setup_proxy_env
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("gmail-mcp")
@@ -29,17 +29,15 @@ mcp = FastMCP("gmail-mcp")
 # across every message in one gmail_send_messages call, not per-message —
 # a batch of many medium attachments is capped the same as one big one.
 _MAX_ATTACHMENT_BYTES = int(25 * 1024 * 1024 * 3 / 4)
+_UPLOAD_ALLOWED_DIRS_ENV_VAR = "XAGENT_GMAIL_FILE_ALLOWED_DIRS"
 
 
 def _allowed_file_dirs() -> list[Path]:
-    raw_dirs = os.environ.get("XAGENT_GMAIL_FILE_ALLOWED_DIRS", "")
-    if not raw_dirs.strip():
-        return [Path.cwd().resolve()]
-    return [
-        Path(stripped).expanduser().resolve()
-        for raw_dir in raw_dirs.split(",")
-        if (stripped := raw_dir.strip())
-    ]
+    try:
+        return allowed_dirs_from_env(_UPLOAD_ALLOWED_DIRS_ENV_VAR)
+    except ValueError as exc:
+        logger.warning("Invalid Gmail upload directory configuration: %s", exc)
+        raise ValueError("Upload directory configuration is invalid") from None
 
 
 def _resolve_allowed_file_path(file_path: str) -> Path:

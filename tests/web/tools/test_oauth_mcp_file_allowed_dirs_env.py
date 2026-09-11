@@ -4,9 +4,18 @@ Gmail's message attachments, OneDrive's file upload, Google Drive's file
 upload) and Google Drive's dedicated write-target output directory."""
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 from xagent.web.tools.config import WebToolConfig
+
+_READ_ALLOWLIST_ENV_VARS = (
+    "XAGENT_SLACK_FILE_ALLOWED_DIRS",
+    "XAGENT_LINKEDIN_IMAGE_ALLOWED_DIRS",
+    "XAGENT_GMAIL_FILE_ALLOWED_DIRS",
+    "XAGENT_ONEDRIVE_FILE_ALLOWED_DIRS",
+    "XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS",
+)
 
 
 def _app_info(module: str, access_token_env: str) -> dict:
@@ -20,8 +29,8 @@ def _app_info(module: str, access_token_env: str) -> dict:
 
 
 def test_transport_config_sets_all_allowlist_vars_when_workspace_has_a_task(
-    tmp_path,
-):
+    tmp_path: Path,
+) -> None:
     cfg = WebToolConfig(
         db=None,
         request=None,
@@ -36,19 +45,12 @@ def test_transport_config_sets_all_allowlist_vars_when_workspace_has_a_task(
     )
 
     expected_dir = str((tmp_path / "task-123").resolve())
-    assert transport_config["env"]["XAGENT_SLACK_FILE_ALLOWED_DIRS"] == expected_dir
-    assert transport_config["env"]["XAGENT_LINKEDIN_IMAGE_ALLOWED_DIRS"] == expected_dir
-    assert transport_config["env"]["XAGENT_GMAIL_FILE_ALLOWED_DIRS"] == expected_dir
-    assert json.loads(transport_config["env"]["XAGENT_ONEDRIVE_FILE_ALLOWED_DIRS"]) == [
-        expected_dir
-    ]
-    assert (
-        transport_config["env"]["XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS"] == expected_dir
-    )
+    for env_var in _READ_ALLOWLIST_ENV_VARS:
+        assert json.loads(transport_config["env"][env_var]) == [expected_dir]
     assert transport_config["env"]["XAGENT_GOOGLE_DRIVE_OUTPUT_DIR"] == expected_dir
 
 
-def test_transport_config_omits_allowlist_vars_without_a_task_id():
+def test_transport_config_omits_allowlist_vars_without_a_task_id() -> None:
     """Regression guard for the branch that actually runs in production
     unpatched: with no task_id, _build_mcp_file_allowed_dirs() returns an
     empty string and neither allowlist var should be set at all — this is
@@ -70,8 +72,8 @@ def test_transport_config_omits_allowlist_vars_without_a_task_id():
 
 
 def test_drive_output_dir_excludes_external_dirs_unlike_the_read_allowlists(
-    tmp_path,
-):
+    tmp_path: Path,
+) -> None:
     """XAGENT_GOOGLE_DRIVE_OUTPUT_DIR must never pick up
     allowed_external_dirs the way the read allowlists do — those can be a
     read-only KB folder, and picking one as a *write* target would be
@@ -96,20 +98,15 @@ def test_drive_output_dir_excludes_external_dirs_unlike_the_read_allowlists(
     assert transport_config["env"]["XAGENT_GOOGLE_DRIVE_OUTPUT_DIR"] == task_dir
     # The read allowlists, by contrast, legitimately include the external
     # dir alongside the task dir.
-    assert str(external_dir.resolve()) in transport_config["env"][
-        "XAGENT_SLACK_FILE_ALLOWED_DIRS"
-    ].split(",")
-    assert str(external_dir.resolve()) in json.loads(
-        transport_config["env"]["XAGENT_ONEDRIVE_FILE_ALLOWED_DIRS"]
-    )
-    assert str(external_dir.resolve()) in transport_config["env"][
-        "XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS"
-    ].split(",")
+    for env_var in _READ_ALLOWLIST_ENV_VARS:
+        assert str(external_dir.resolve()) in json.loads(
+            transport_config["env"][env_var]
+        )
 
 
 def test_drive_output_dir_omitted_when_only_external_dirs_are_configured(
-    tmp_path,
-):
+    tmp_path: Path,
+) -> None:
     """No task_id at all (only allowed_external_dirs) must leave
     XAGENT_GOOGLE_DRIVE_OUTPUT_DIR unset entirely rather than falling back
     to one of those external dirs as a write target."""
@@ -125,18 +122,13 @@ def test_drive_output_dir_omitted_when_only_external_dirs_are_configured(
     )
 
     assert "XAGENT_GOOGLE_DRIVE_OUTPUT_DIR" not in transport_config["env"]
-    assert str(external_dir.resolve()) in transport_config["env"][
-        "XAGENT_SLACK_FILE_ALLOWED_DIRS"
-    ].split(",")
-    assert str(external_dir.resolve()) in json.loads(
-        transport_config["env"]["XAGENT_ONEDRIVE_FILE_ALLOWED_DIRS"]
-    )
-    assert str(external_dir.resolve()) in transport_config["env"][
-        "XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS"
-    ].split(",")
+    for env_var in _READ_ALLOWLIST_ENV_VARS:
+        assert str(external_dir.resolve()) in json.loads(
+            transport_config["env"][env_var]
+        )
 
 
-def test_onedrive_allowlist_preserves_comma_in_directory_name(tmp_path):
+def test_read_allowlists_preserve_comma_in_directory_name(tmp_path: Path) -> None:
     workspace_base = tmp_path / "workspaces,active"
     external_dir = tmp_path / "knowledge,base"
     cfg = WebToolConfig(
@@ -153,7 +145,9 @@ def test_onedrive_allowlist_preserves_comma_in_directory_name(tmp_path):
         access_token="user-access-token",
     )
 
-    assert json.loads(transport_config["env"]["XAGENT_ONEDRIVE_FILE_ALLOWED_DIRS"]) == [
+    expected_dirs = [
         str((workspace_base / "task-123").resolve()),
         str(external_dir.resolve()),
     ]
+    for env_var in _READ_ALLOWLIST_ENV_VARS:
+        assert json.loads(transport_config["env"][env_var]) == expected_dirs

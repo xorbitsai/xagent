@@ -2563,16 +2563,10 @@ def test_allowed_upload_dirs_falls_back_to_cwd_when_unset(monkeypatch):
     ]
 
 
-def test_allowed_upload_dirs_falls_back_to_cwd_when_malformed(monkeypatch):
-    """Regression guard: a malformed-but-nonblank env value (e.g. a lone
-    "," or " , ") must fall back to CWD the same way a fully-unset/blank
-    value does, not silently resolve to an empty allowlist that rejects
-    every upload with no diagnostic pointing at the env var as the cause."""
+def test_allowed_upload_dirs_denies_entryless_legacy_value(monkeypatch):
     monkeypatch.setenv("XAGENT_ONEDRIVE_FILE_ALLOWED_DIRS", " , ")
 
-    assert onedrive.allowed_dirs_from_env(onedrive._UPLOAD_ALLOWED_DIRS_ENV_VAR) == [
-        onedrive.Path.cwd().resolve()
-    ]
+    assert onedrive.allowed_dirs_from_env(onedrive._UPLOAD_ALLOWED_DIRS_ENV_VAR) == []
 
 
 def test_upload_file_honors_explicit_empty_allowed_dirs(

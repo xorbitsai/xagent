@@ -582,17 +582,9 @@ def test_allowed_dirs_from_env_falls_back_to_cwd_when_blank(monkeypatch):
 
 
 @pytest.mark.parametrize("raw_value", [",", " , ", ",,,"])
-def test_allowed_dirs_from_env_falls_back_to_cwd_when_malformed(monkeypatch, raw_value):
-    """Regression guard for the real bug this consolidation was written to
-    fix: a lone comma (or several) parses to zero real entries, and
-    without this fallback that becomes an empty allowlist that silently
-    rejects every upload with nothing pointing at the env var as the
-    cause -- previously true for onedrive.py/gmail.py/slack.py/linkedin.py,
-    but not google_drive.py, whose copy already guarded against it."""
+def test_allowed_dirs_from_env_denies_entryless_legacy_value(monkeypatch, raw_value):
     monkeypatch.setenv(_TEST_ALLOWED_DIRS_ENV_VAR, raw_value)
-    assert utils.allowed_dirs_from_env(_TEST_ALLOWED_DIRS_ENV_VAR) == [
-        Path.cwd().resolve()
-    ]
+    assert utils.allowed_dirs_from_env(_TEST_ALLOWED_DIRS_ENV_VAR) == []
 
 
 def test_allowed_dirs_from_env_parses_multiple_dirs_with_whitespace(

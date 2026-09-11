@@ -30,11 +30,15 @@ _UNTIL_RE = re.compile(r"[0-9]{8}(T[0-9]{6}Z?)?")
 def allowed_dirs_from_env(env_var_name: str) -> list[Path]:
     """Parse JSON or legacy comma-separated roots.
 
-    An unset, blank, or empty legacy value falls back to CWD for compatibility.
-    An explicit JSON array is authoritative, so an empty array denies all roots.
+    An unset or blank value falls back to CWD for compatibility with standalone
+    connector launches that predate an explicit allowlist. Any nonblank value is
+    authoritative: an empty JSON array or a legacy value containing only empty
+    entries denies all roots instead of silently broadening access to CWD.
     """
     raw_dirs = os.environ.get(env_var_name, "")
     stripped_raw_dirs = raw_dirs.strip()
+    if not stripped_raw_dirs:
+        return [Path.cwd().resolve()]
     is_json_array = stripped_raw_dirs.startswith("[")
     if is_json_array:
         try:
@@ -65,9 +69,7 @@ def allowed_dirs_from_env(env_var_name: str) -> list[Path]:
             parsed_dirs.append(resolved)
     except (OSError, RuntimeError) as exc:
         raise ValueError(f"{env_var_name} contains an invalid path") from exc
-    if is_json_array:
-        return parsed_dirs
-    return parsed_dirs or [Path.cwd().resolve()]
+    return parsed_dirs
 
 
 class InsufficientScopeError(RuntimeError):

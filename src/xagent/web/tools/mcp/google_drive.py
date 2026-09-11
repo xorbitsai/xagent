@@ -23,6 +23,8 @@ from .utils import (
     clamp_limit,
     require_clean_identifier,
     setup_proxy_env,
+    split_filename_suffix,
+    text_filename_looks_binary,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -684,12 +686,12 @@ def _capped_content_response(
 # accepting them here is always safe, however the caller arrived at
 # declaring one. Thrift/Avro/protobuf are deliberately NOT included here
 # even though their .thrift/.avsc/.proto *extensions* are in
-# _KNOWN_TEXT_EXTENSIONS below (an IDL/schema file is always text) —
+# the shared text-extension allowlist (an IDL/schema file is always text) —
 # unlike graphql, a generic Thrift/Avro/protobuf mime type (e.g.
 # "application/x-protobuf") can legitimately describe an actual
 # binary-encoded message payload in real-world use (Prometheus
 # remote-write, gRPC-Web, ...), the same ambiguity ".bat"/".ts"/".scm" have
-# at the extension level (see _KNOWN_TEXT_EXTENSIONS's own note on those).
+# at the extension level (see utils.KNOWN_TEXT_FILE_EXTENSIONS).
 _TEXT_MIME_TYPES = {
     "application/json",
     "application/xml",
@@ -782,23 +784,6 @@ def _output_dir() -> Path:
     return output_dir
 
 
-def _split_stem_suffix(base: str) -> tuple[str, str]:
-    """Like Path(base).stem/.suffix, except a name that's *entirely* a
-    leading dot plus extension (e.g. ".pdf") is treated as having that
-    extension. pathlib's own split refuses to do this — it follows the
-    Unix dotfile convention where a single leading dot with nothing before
-    it never counts as an extension separator, leaving Path(".pdf").suffix
-    empty — but Drive occasionally hands back names in exactly this shape,
-    and silently losing the extension breaks the downloaded file's type.
-    Only that narrow shape is special-cased; e.g. "..pdf" or "..." already
-    split the way we want via plain pathlib and are left alone.
-    """
-    suffix = Path(base).suffix
-    if not suffix and base.startswith(".") and base.count(".") == 1 and len(base) > 1:
-        return "", base
-    return Path(base).stem, suffix
-
-
 def _safe_output_filename(name: str) -> str:
     """Collapse a Drive file name into a single safe path segment so it
     can't escape the output directory (e.g. via ".." or embedded "/") — the
@@ -811,7 +796,7 @@ def _safe_output_filename(name: str) -> str:
     still come out as "....pdf" (something ending in .pdf), not "pdf".
     """
     base = Path(name).name
-    stem, suffix = _split_stem_suffix(base)
+    stem, suffix = split_filename_suffix(base)
     stem = _UNSAFE_FILENAME_CHARS.sub("_", stem).strip("._") or "file"
     suffix = _UNSAFE_FILENAME_CHARS.sub("_", suffix)[:_MAX_SUFFIX_LENGTH]
     max_stem_length = max(1, _MAX_FILENAME_LENGTH - len(suffix))
@@ -920,98 +905,6 @@ def _resolve_upload_file_path(file_path: str) -> Path:
     if not local_path.is_file():
         raise FileNotFoundError(f"File not found: {file_path}")
     return local_path
-
-
-# Extensions of formats confidently known to be plain UTF-8 text. Default
-# a NAME to "looks binary" unless its extension is in this allowlist (or
-# it has no extension at all — an extensionless name like "Dockerfile" or
-# "README" isn't itself evidence of binary intent) — the opposite of a
-# binary-extension blocklist, which can never enumerate every binary
-# format that exists (three separate review rounds each found more gaps
-# in this module's blocklist attempts: the original hand list, then a
-# mimetypes.guess_type()-based one, then a wider hand list again). A
-# false positive here (a legitimate but unlisted text extension) is a
-# clear, actionable rejection pointing at google_drive_upload_file; a
-# false negative in a blocklist is a silently mislabeled file, a strictly
-# worse outcome, so this list defaults toward rejecting the unfamiliar
-# rather than accepting it.
-#
-# Also NOT delegated to mimetypes.guess_type(): that function's result
-# for anything beyond a small hardcoded core depends on whatever
-# mime.types database happens to be installed on the *host* — verified
-# directly, several of this list's own entries (.sql, .tex, .dart, .tcl,
-# .dtd) came back non-text from an incidental /etc/apache2/mime.types on
-# one development machine, and were silently ABSENT (making them "not
-# text" by the old design's logic) in a minimal CI/production container.
-# A fixed, in-source list is the only way to get identical behavior
-# everywhere this code runs.
-#
-# ".bat", ".ts", and ".scm" are included as text (batch script,
-# TypeScript, Scheme source) even though each also names a real,
-# unrelated binary format elsewhere (a Windows .exe-like executable, an
-# MPEG-2 transport stream, a Lotus ScreenCam recording) -- a judgment
-# call in favor of what an agent generating files is overwhelmingly more
-# likely to mean, resolved per-extension since no mime-type rule can
-# distinguish the two (see _TEXT_MIME_TYPES's matching note on why
-# Thrift/Avro's mime types, unlike protobuf's, are excluded there for
-# the same reason). ".plist" gets the same treatment: real Apple property
-# lists can be either XML text or a binary-encoded format, but an
-# agent-authored one is overwhelmingly more likely to be the XML form.
-_KNOWN_TEXT_EXTENSIONS = {
-    # plain text / docs / dotfiles
-    ".txt", ".md", ".markdown", ".mdx", ".rst", ".adoc", ".rtf", ".log",
-    ".lock", ".gitignore", ".gitattributes", ".editorconfig",
-    ".dockerignore", ".env", ".ini", ".cfg", ".conf", ".properties",
-    ".toml",
-    # structured/data formats
-    ".json", ".json5", ".xml", ".yaml", ".yml", ".csv", ".tsv", ".dtd",
-    ".xsd", ".xsl", ".xslt", ".proto", ".graphql", ".gql", ".thrift",
-    ".avsc", ".ipynb", ".jsonl", ".ndjson", ".geojson", ".plist",
-    # web
-    ".html", ".htm", ".css", ".scss", ".sass", ".less", ".svg",
-    ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx",
-    ".vue", ".svelte", ".astro",
-    # source code
-    ".py", ".rb", ".php", ".java", ".c", ".h", ".cpp", ".hpp", ".cc",
-    ".cxx", ".cs", ".m", ".mm", ".go", ".rs", ".swift", ".kt", ".kts",
-    ".scala", ".groovy", ".lua", ".r", ".jl", ".pl", ".pm", ".hs", ".fs",
-    ".fsx", ".ml", ".mli", ".clj", ".cljs", ".erl", ".ex", ".exs", ".nim",
-    ".zig", ".v", ".d", ".dart", ".elm", ".cr", ".tcl", ".scm", ".rkt",
-    ".lisp", ".el", ".asm", ".s", ".pas", ".f90", ".for", ".vb", ".vbs",
-    ".cabal", ".nix",
-    # shell / scripting / templates
-    ".sh", ".bash", ".zsh", ".csh", ".ksh", ".fish",
-    ".ps1", ".bat", ".cmd", ".awk", ".sed", ".sql", ".j2",
-    # build / infra
-    ".tex", ".latex", ".bib", ".cls", ".sty", ".diff", ".patch",
-    ".hcl", ".tf", ".tfvars", ".gradle", ".dockerfile", ".cmake",
-    # misc
-    ".pem", ".po",
-}  # fmt: skip
-
-
-def _name_looks_binary(name: str) -> bool:
-    """Whether ``name``'s extension is NOT a recognized text format.
-
-    Default-deny: an extension is only accepted if it's in
-    _KNOWN_TEXT_EXTENSIONS. A name with no extension at all (e.g.
-    "Dockerfile", "README") is accepted too — the absence of an
-    extension isn't evidence of binary intent the way an unrecognized
-    one is.
-
-    Uses _split_stem_suffix rather than plain ``Path.suffix`` for the
-    same reason _safe_output_filename does: a name that's *entirely* a
-    leading dot plus extension (e.g. ".pdf") has an empty ``Path(...).suffix``
-    per pathlib's dotfile convention, which would make this function treat
-    it as extensionless (accepted) — exactly the kind of mislabeling this
-    guard exists to catch, just via a name pathlib refuses to split.
-
-    google_drive_create_file's mime_type-based check is the complementary
-    signal that catches an explicitly-declared binary type regardless of
-    what the name looks like.
-    """
-    suffix = _split_stem_suffix(name.strip())[1].lower()
-    return bool(suffix) and suffix not in _KNOWN_TEXT_EXTENSIONS
 
 
 def get_drive_service() -> Any:
@@ -1337,7 +1230,7 @@ def google_drive_upload_file(
     standard mimetypes module, falling back to "application/octet-stream"
     when it can't be guessed. This guess is informational only — Drive's
     displayed file type may be wrong on a host whose mimetypes database
-    doesn't recognize the extension (see the _KNOWN_TEXT_EXTENSIONS
+    doesn't recognize the extension (see the shared text-extension
     comment above for why that's host-dependent), but the uploaded bytes
     are always exactly file_path's real content either way. Pass mime_type
     explicitly for a reliable label, especially for an extension outside
@@ -1450,7 +1343,7 @@ def google_drive_create_file(
     try:
         # Stripped once here so every downstream use agrees: the
         # binary-name guard below and the actual Drive file_metadata["name"]
-        # sent. _name_looks_binary already stripped internally for its own
+        # sent. text_filename_looks_binary already strips internally for its own
         # suffix check, but without also reassigning `name` itself, a
         # trailing-space name like "notes.txt " would pass the guard (the
         # suffix check sees ".txt") yet still land in Drive with the
@@ -1490,13 +1383,13 @@ def google_drive_create_file(
         # A Google Workspace conversion is exempt from both checks below
         # (Docs/Sheets/Slides always take text/HTML source regardless of
         # the target doc's name), so short-circuit here rather than
-        # computing _name_looks_binary and the mime-type check on every
+        # computing text_filename_looks_binary and the mime-type check on every
         # such call for nothing.
         if not is_google_doc_conversion:
             mime_type_is_binary = not _is_text_mime_type(mime_type)
             # Two independent signals catch two different mistakes — but
             # only the name-based one is a heuristic guess, and only when
-            # the caller left mime_type unset. _KNOWN_TEXT_EXTENSIONS is a
+            # the caller left mime_type unset. The shared extension list is a
             # default-deny allowlist, so a name that merely CONTAINS a dot
             # not meant as an extension ("www.example.com",
             # "report-v1.2") or uses a real text extension this list
@@ -1509,7 +1402,9 @@ def google_drive_create_file(
             # mime_type is caught either way, regardless of the name,
             # since content can only ever be UTF-8 text (see the encode()
             # below).
-            name_looks_binary = not explicit_mime_type and _name_looks_binary(name)
+            name_looks_binary = not explicit_mime_type and text_filename_looks_binary(
+                name
+            )
         else:
             name_looks_binary = mime_type_is_binary = False
         if name_looks_binary or mime_type_is_binary:

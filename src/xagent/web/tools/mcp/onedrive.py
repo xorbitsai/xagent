@@ -10,7 +10,12 @@ from urllib.parse import quote
 import requests
 from mcp.server.fastmcp import FastMCP
 
-from .utils import allowed_dirs_from_env, setup_proxy_env, url_path_id
+from .utils import (
+    allowed_dirs_from_env,
+    setup_proxy_env,
+    text_filename_looks_binary,
+    url_path_id,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("onedrive-mcp")
@@ -38,7 +43,7 @@ _UPLOAD_ALLOWED_DIRS_ENV_VAR = "XAGENT_ONEDRIVE_FILE_ALLOWED_DIRS"
 # all. Checked before falling back to mimetypes.guess_type() wherever this
 # module resolves a *real* mime type (i.e. for onedrive_upload_file's
 # Content-Type header, never for the binary/text guard below -- see
-# _name_looks_binary's own docstring for why that guard doesn't use
+# text_filename_looks_binary's own docstring for why that guard doesn't use
 # mimetypes at all), so a real .xlsx/.docx/etc. doesn't get mislabeled
 # "application/octet-stream" just because the host is missing a file this
 # module has no control over.
@@ -82,64 +87,6 @@ def _guess_mime_type(name: str) -> str | None:
             "compress": "application/x-compress",
         }.get(guessed_encoding, "application/octet-stream")
     return guessed_type
-
-
-def _split_stem_suffix(base: str) -> tuple[str, str]:
-    """Like Path(base).stem/.suffix, except a name that's *entirely* a
-    leading dot plus extension (e.g. ".pdf") is treated as having that
-    extension. pathlib's own split refuses to do this -- it follows the
-    Unix dotfile convention where a single leading dot with nothing before
-    it never counts as an extension separator, leaving Path(".pdf").suffix
-    empty -- but silently losing the extension here would let a name like
-    that slip past _name_looks_binary's guard as "extensionless" (accepted)
-    when it's actually naming a real binary format. Only that narrow shape
-    is special-cased; e.g. "..pdf" or "..." already split the way we want
-    via plain pathlib and are left alone.
-    """
-    suffix = Path(base).suffix
-    if not suffix and base.startswith(".") and base.count(".") == 1 and len(base) > 1:
-        return "", base
-    return Path(base).stem, suffix
-
-
-# Stable text-extension allowlist shared in shape with the Google Drive
-# guard. Host MIME databases vary, so they cannot safely decide whether the
-# text-only tool may use a filename. Unknown extensions are rejected; names
-# without an extension remain valid for files such as README and Dockerfile.
-# Ambiguous but commonly textual source extensions such as .ts and .bat are
-# allowed, while formats with common binary variants such as .crt and .plist
-# are not.
-_KNOWN_TEXT_EXTENSIONS = {
-    # plain text / docs / dotfiles
-    ".txt", ".md", ".markdown", ".mdx", ".rst", ".adoc", ".rtf", ".log",
-    ".lock", ".gitignore", ".gitattributes", ".editorconfig",
-    ".dockerignore", ".env", ".ini", ".cfg", ".conf", ".properties",
-    ".toml",
-    # structured/data formats
-    ".json", ".json5", ".xml", ".yaml", ".yml", ".csv", ".tsv", ".dtd",
-    ".xsd", ".xsl", ".xslt", ".proto", ".graphql", ".gql", ".thrift",
-    ".avsc", ".ipynb", ".jsonl", ".ndjson", ".geojson",
-    # web
-    ".html", ".htm", ".css", ".scss", ".sass", ".less", ".svg",
-    ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx",
-    ".vue", ".svelte", ".astro",
-    # source code
-    ".py", ".rb", ".php", ".java", ".c", ".h", ".cpp", ".hpp", ".cc",
-    ".cxx", ".cs", ".m", ".mm", ".go", ".rs", ".swift", ".kt", ".kts",
-    ".scala", ".groovy", ".lua", ".r", ".jl", ".pl", ".pm", ".hs", ".fs",
-    ".fsx", ".ml", ".mli", ".clj", ".cljs", ".erl", ".ex", ".exs", ".nim",
-    ".zig", ".v", ".d", ".dart", ".elm", ".cr", ".tcl", ".scm", ".sc",
-    ".rkt", ".lisp", ".el", ".asm", ".s", ".pas", ".f90", ".for", ".vb",
-    ".vbs", ".cabal", ".nix",
-    # shell / scripting / templates
-    ".sh", ".bash", ".zsh", ".csh", ".ksh", ".fish",
-    ".ps1", ".bat", ".cmd", ".awk", ".sed", ".sql", ".j2", ".tpl", ".srt",
-    # build / infra
-    ".tex", ".latex", ".bib", ".cls", ".sty", ".diff", ".patch",
-    ".hcl", ".tf", ".tfvars", ".gradle", ".dockerfile", ".cmake",
-    # misc
-    ".pem", ".po",
-}  # fmt: skip
 
 
 def _success(**payload: Any) -> str:
@@ -264,25 +211,6 @@ def _decode_bytes(content: bytes) -> tuple[str | None, str | None]:
         return content.decode("utf-8"), None
     except UnicodeDecodeError:
         return None, base64.b64encode(content).decode("ascii")
-
-
-def _name_looks_binary(name: str) -> bool:
-    """Whether ``name``'s extension is NOT a recognized text format.
-
-    Default-deny: an extension is only accepted if it's in
-    _KNOWN_TEXT_EXTENSIONS. A name with no extension at all (e.g.
-    "Dockerfile", "README") is accepted too -- the absence of an extension
-    isn't evidence of binary intent the way an unrecognized one is.
-
-    Uses _split_stem_suffix rather than plain ``Path.suffix`` for the same
-    reason google_drive.py's equivalent does: a name that's *entirely* a
-    leading dot plus extension (e.g. ".pdf") has an empty ``Path(...).suffix``
-    per pathlib's dotfile convention, which would make this function treat
-    it as extensionless (accepted) -- exactly the kind of mislabeling this
-    guard exists to catch, just via a name pathlib refuses to split.
-    """
-    suffix = _split_stem_suffix(Path(name.strip()).name)[1].lower()
-    return bool(suffix) and suffix not in _KNOWN_TEXT_EXTENSIONS
 
 
 def _resolve_upload_file_path(local_file_path: str) -> Path:
@@ -436,7 +364,8 @@ def onedrive_upload_text_file(
     onedrive_upload_file with that file's path instead.
     """
     try:
-        if _name_looks_binary(file_path):
+        content_path = _content_path(file_path)
+        if text_filename_looks_binary(file_path):
             return _error(
                 f"'{file_path}' looks like a binary file, but "
                 "onedrive_upload_text_file only writes text content -- "
@@ -448,7 +377,7 @@ def onedrive_upload_text_file(
             )
         result = _graph_request(
             "PUT",
-            _content_path(file_path),
+            content_path,
             extra_headers={"Content-Type": "text/plain; charset=utf-8"},
             data=content.encode("utf-8"),
         )

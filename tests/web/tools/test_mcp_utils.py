@@ -9,6 +9,38 @@ import requests
 from xagent.web.tools.mcp import utils
 
 
+@pytest.mark.parametrize(
+    "name,expected",
+    [
+        ("notes.txt", False),
+        ("worksheet.sc", False),
+        ("subtitles.srt", False),
+        ("layout.tpl", False),
+        ("README", False),
+        (".env", False),
+        ("report.pdf", True),
+        (".pdf", True),
+        ("settings.plist", True),
+        ("report.pdf.", True),
+        ("Documents/archive.zip. ", True),
+    ],
+)
+def test_text_filename_looks_binary_shared_policy(name, expected):
+    assert utils.text_filename_looks_binary(name) is expected
+
+
+@pytest.mark.parametrize(
+    "name,expected",
+    [
+        ("report.pdf", ("report", ".pdf")),
+        (".pdf", ("", ".pdf")),
+        ("README", ("README", "")),
+    ],
+)
+def test_split_filename_suffix_handles_suffix_only_dotfile(name, expected):
+    assert utils.split_filename_suffix(name) == expected
+
+
 def test_require_clean_identifier_rejects_empty_and_whitespace():
     with pytest.raises(ValueError, match="record_id"):
         utils.require_clean_identifier("", "record_id")

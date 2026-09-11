@@ -3061,7 +3061,7 @@ def test_upload_file_returns_error_payload_on_api_failure(
 
 
 @pytest.mark.parametrize(
-    "name", ["report.pdf", "photo.PNG", "deck.pptx", "archive.zip"]
+    "name", ["report.pdf", "photo.PNG", "deck.pptx", "archive.zip", "settings.plist"]
 )
 def test_create_file_rejects_binary_looking_names(monkeypatch, name):
     """Regression guard for the actual production bug: google_drive_create_file
@@ -3127,6 +3127,9 @@ def test_create_file_allows_plain_text_names(monkeypatch):
         "script.tcl",
         "types.dtd",
         "file.scm",
+        "worksheet.sc",
+        "subtitles.srt",
+        "layout.tpl",
         "Program.cs",
         "AppDelegate.m",
         "AppDelegate.mm",
@@ -3357,8 +3360,19 @@ def test_create_file_rejects_dotfile_style_binary_names(monkeypatch, name):
     entirely a leading dot plus extension (pathlib's dotfile convention),
     which would make the old suffix check treat it as extensionless (and
     therefore accepted) -- exactly the mislabeling this guard exists to
-    catch. _name_looks_binary uses _split_stem_suffix instead, which
-    doesn't have this blind spot."""
+    catch. The shared classifier handles this shape explicitly."""
+    files = Mock()
+    _mock_drive_service_with_files(monkeypatch, files)
+
+    result = json.loads(google_drive.google_drive_create_file(name, "some text"))
+
+    assert result["status"] == "error"
+    assert "google_drive_upload_file" in result["message"]
+    files.create.assert_not_called()
+
+
+@pytest.mark.parametrize("name", ["report.pdf.", "archive.zip. "])
+def test_create_file_rejects_trailing_period_names(monkeypatch, name):
     files = Mock()
     _mock_drive_service_with_files(monkeypatch, files)
 
@@ -3378,12 +3392,11 @@ def test_create_file_rejects_dotfile_style_binary_names(monkeypatch, name):
         "cert.pem",
         "CMakeLists.cmake",
         "messages.po",
-        "config.plist",
     ],
 )
 def test_create_file_allows_newly_recognized_text_extensions(monkeypatch, name):
     """These extensions were reported as false-positive rejections in
-    review (real text formats not yet in _KNOWN_TEXT_EXTENSIONS) --
+    review (real text formats not yet in the shared allowlist) --
     confirms they're now accepted without needing an explicit mime_type
     override."""
     files = Mock()

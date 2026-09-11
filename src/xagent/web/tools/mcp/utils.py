@@ -10,6 +10,67 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ....config import get_tool_max_output_length
 
+# Text-only upload tools must make the same filename decision on every host.
+# ``mimetypes`` cannot provide that guarantee because it reads optional system
+# MIME databases. Unknown extensions and names ending in a period are therefore
+# rejected; extensionless names such as README remain valid. Ambiguous formats
+# with common binary encodings (for example ``.plist``) are deliberately absent.
+KNOWN_TEXT_FILE_EXTENSIONS = frozenset(
+    {
+        # plain text / docs / dotfiles
+        ".txt", ".md", ".markdown", ".mdx", ".rst", ".adoc", ".rtf", ".log",
+        ".lock", ".gitignore", ".gitattributes", ".editorconfig",
+        ".dockerignore", ".env", ".ini", ".cfg", ".conf", ".properties",
+        ".toml",
+        # structured/data formats
+        ".json", ".json5", ".xml", ".yaml", ".yml", ".csv", ".tsv", ".dtd",
+        ".xsd", ".xsl", ".xslt", ".proto", ".graphql", ".gql", ".thrift",
+        ".avsc", ".ipynb", ".jsonl", ".ndjson", ".geojson",
+        # web
+        ".html", ".htm", ".css", ".scss", ".sass", ".less", ".svg",
+        ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx",
+        ".vue", ".svelte", ".astro",
+        # source code
+        ".py", ".rb", ".php", ".java", ".c", ".h", ".cpp", ".hpp", ".cc",
+        ".cxx", ".cs", ".m", ".mm", ".go", ".rs", ".swift", ".kt", ".kts",
+        ".scala", ".groovy", ".lua", ".r", ".jl", ".pl", ".pm", ".hs", ".fs",
+        ".fsx", ".ml", ".mli", ".clj", ".cljs", ".erl", ".ex", ".exs", ".nim",
+        ".zig", ".v", ".d", ".dart", ".elm", ".cr", ".tcl", ".scm", ".sc",
+        ".rkt", ".lisp", ".el", ".asm", ".s", ".pas", ".f90", ".for", ".vb",
+        ".vbs", ".cabal", ".nix",
+        # shell / scripting / templates
+        ".sh", ".bash", ".zsh", ".csh", ".ksh", ".fish",
+        ".ps1", ".bat", ".cmd", ".awk", ".sed", ".sql", ".j2", ".tpl", ".srt",
+        # build / infra
+        ".tex", ".latex", ".bib", ".cls", ".sty", ".diff", ".patch",
+        ".hcl", ".tf", ".tfvars", ".gradle", ".dockerfile", ".cmake",
+        # misc
+        ".pem", ".po",
+    }
+)  # fmt: skip
+
+
+def split_filename_suffix(base: str) -> tuple[str, str]:
+    """Split a filename while treating ``.pdf`` as a suffix-only name."""
+    suffix = Path(base).suffix
+    if not suffix and base.startswith(".") and base.count(".") == 1 and len(base) > 1:
+        return "", base
+    return Path(base).stem, suffix
+
+
+def text_filename_looks_binary(name: str) -> bool:
+    """Return whether a name is unsafe for a tool that writes UTF-8 text.
+
+    Unknown extensions default to binary. A trailing period is also rejected:
+    providers such as OneDrive normalize it away, which could otherwise turn
+    ``report.pdf.`` into a misleading ``report.pdf`` after the check.
+    """
+    base = Path(name.strip()).name
+    if base.endswith("."):
+        return True
+    suffix = split_filename_suffix(base)[1].lower()
+    return bool(suffix) and suffix not in KNOWN_TEXT_FILE_EXTENSIONS
+
 
 def allowed_dirs_from_env(env_var_name: str) -> list[Path]:
     """Parse JSON or legacy comma-separated roots.

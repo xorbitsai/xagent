@@ -159,22 +159,25 @@ def _split_stem_suffix(base: str) -> tuple[str, str]:
 # allowed_dirs_from_env) is a reasonable follow-up, not done here to avoid
 # touching google_drive.py's already-merged, unrelated code in this PR.
 #
-# ".bat", ".ts", ".scm", and ".sc" are included as text (batch script,
-# TypeScript, Scheme source, Scala worksheet/SuperCollider) even though
-# each also names a real, unrelated binary format elsewhere (a Windows
-# .exe-like executable, an MPEG-2 transport stream, a Lotus ScreenCam
-# recording, an obscure and effectively dead IBM "secure container"
-# format) -- a judgment call in favor of what an agent generating files is
-# overwhelmingly more likely to mean, no different from google_drive.py's
-# own identical call on the first three. ".srt" (subtitles) and ".tpl"
-# (template, used by several different template engines) are unambiguous
-# text with no competing binary format. ".crt" is deliberately NOT
-# included despite frequently being PEM/text in practice -- unlike the
-# extensions above, a real X.509 certificate can also be DER-encoded
-# binary under the identical ".crt" extension with no reliable way to
-# tell which from the name alone, and this list's whole design principle
-# is to default toward rejecting exactly that kind of case rather than
-# guessing.
+# ".bat", ".ts", ".scm", ".sc", and ".tpl" are included as text (batch
+# script, TypeScript, Scheme source, Scala worksheet/SuperCollider,
+# template) even though each also names a real, registered binary format
+# elsewhere (a Windows .exe-like executable, an MPEG-2 transport stream, a
+# Lotus ScreenCam recording, an obscure and effectively dead IBM "secure
+# container" format, and -- verified directly against mimetypes.guess_type
+# -- Groove Networks' equally dead "Tool Template" format for ".tpl") --
+# a judgment call in favor of what an agent generating files is
+# overwhelmingly more likely to mean (a live template engine like Smarty/
+# Twig, not a discontinued-circa-2010 Microsoft product), no different from
+# google_drive.py's own identical call on the first three. ".srt"
+# (subtitles) is unambiguous text with no competing registered format at
+# all. ".crt" is deliberately NOT included despite frequently being PEM/
+# text in practice -- unlike the extensions above, a real X.509
+# certificate can also be DER-encoded binary under the identical ".crt"
+# extension in *common, current* use (not just an obscure/dead one), with
+# no reliable way to tell which from the name alone, and this list's whole
+# design principle is to default toward rejecting exactly that kind of case
+# rather than guessing.
 _KNOWN_TEXT_EXTENSIONS = {
     # plain text / docs / dotfiles
     ".txt", ".md", ".markdown", ".mdx", ".rst", ".adoc", ".rtf", ".log",

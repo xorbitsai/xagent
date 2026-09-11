@@ -1658,6 +1658,38 @@ def test_update_events_missing_scope_on_the_organizer_backfill_is_skipped_with_i
     assert len(fake_service._events.update_calls) == 1
 
 
+def test_update_events_non_scope_error_on_the_organizer_backfill_is_also_skipped_with_ignore_conflicts(
+    fake_service,
+):
+    """Companion to the test above: the backfill must forgive ANY failure
+    of calendars().get(), not just the specifically-recognized missing-
+    scope one - _primary_calendar_info re-raises any other HttpError
+    (rate limiting, a transient 5xx, an unrelated 403) unchanged rather
+    than converting it to InsufficientScopeError, and that's still "this
+    lookup couldn't run" every bit as much as a missing scope is."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+        "attendees": [],
+        # No "organizer" field at all - triggers the backfill attempt.
+    }
+    fake_service._calendars = FakeCalendars(
+        raise_error=HttpError(_FakeHttpResp(500), b'{"error": {"message": "boom"}}')
+    )
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            attendees=["me@example.com"],
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    assert len(fake_service._events.update_calls) == 1
+
+
 def test_update_events_organizer_self_true_needs_no_identity_api_call(
     fake_service,
 ):
@@ -2648,6 +2680,37 @@ def test_update_events_calendar_timezone_lookup_missing_scope_falls_back_with_ig
         "attendees": [],
     }
     fake_service._calendars = FakeCalendars(raise_error=_insufficient_scope_error())
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-27T10:00:00+08:00",
+            end_time="2026-08-27T10:30:00+08:00",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    assert len(fake_service._events.update_calls) == 1
+
+
+def test_update_events_calendar_timezone_lookup_non_scope_error_also_falls_back_with_ignore_conflicts(
+    fake_service,
+):
+    """Companion to the test above: the timezone lookup must forgive ANY
+    failure of calendars().get(), not just the specifically-recognized
+    missing-scope one - a bare HttpError (rate limiting, a transient
+    5xx, an unrelated 403) is still "this lookup couldn't run" too, and
+    must not defeat ignore_conflicts either."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"date": "2026-08-27"},
+        "end": {"date": "2026-08-28"},
+        "attendees": [],
+    }
+    fake_service._calendars = FakeCalendars(
+        raise_error=HttpError(_FakeHttpResp(500), b'{"error": {"message": "boom"}}')
+    )
 
     result = json.loads(
         calendar.google_calendar_update_events(

@@ -854,19 +854,26 @@ def google_calendar_update_events(
             # the known-organizer-email case already.
             try:
                 exclude_email = primary_calendar_info()[0]
-            except InsufficientScopeError:
+            except (InsufficientScopeError, HttpError):
+                # Not just the recognized missing-scope case -
+                # _primary_calendar_info re-raises any OTHER HttpError
+                # from calendars().get() unchanged (rate limiting, a
+                # transient 5xx, an unrelated 403), and that's still
+                # "this lookup couldn't run" every bit as much as a
+                # missing scope is.
                 if not ignore_conflicts:
                     raise
                 # ignore_conflicts=True means the caller has already
-                # decided the conflict check doesn't need to run - a
-                # missing-scope 403 here would only ever be surfaced by
-                # that check (which is skipped entirely below when
-                # ignore_conflicts is set), so leaving exclude_email
-                # unresolved is safe: nothing downstream that consults
-                # it runs in that case either. Without this, a token
-                # missing calendar.calendars.readonly would hard-fail
-                # this call even though the caller explicitly opted out
-                # of the check the docstring says this guards.
+                # decided the conflict check doesn't need to run - this
+                # lookup failing for ANY reason here would only ever be
+                # surfaced by that check (which is skipped entirely
+                # below when ignore_conflicts is set), so leaving
+                # exclude_email unresolved is safe: nothing downstream
+                # that consults it runs in that case either. Without
+                # this, any failure of this lookup - not just a missing
+                # scope - would hard-fail a call the caller explicitly
+                # opted out of the check the docstring says this
+                # guards.
         # None never equals a real address's lowercased form, so this
         # filter is a no-op (keeps everything) when there's no address
         # to exclude - same effect as branching on `exclude_email`
@@ -958,19 +965,26 @@ def google_calendar_update_events(
             # check the docstring says this guards.
             existing_start = _event_boundary(event.get("start"), calendar_timezone)
             existing_end = _event_boundary(event.get("end"), calendar_timezone)
-        except ValueError:
+        except (ValueError, HttpError):
+            # Not just the recognized missing-scope ValueError (or a
+            # malformed-event ValueError from _event_boundary) - a bare
+            # HttpError here means _primary_calendar_info hit some OTHER
+            # failure (rate limiting, a transient 5xx, an unrelated 403)
+            # that it re-raises unchanged rather than converting, and
+            # that's still "this lookup couldn't run" too.
             if not ignore_conflicts:
                 raise
             # ignore_conflicts=True means the caller has already decided
-            # the conflict check doesn't need to run - a missing-scope
-            # 403 here would only ever be surfaced by that check (or by
-            # the reversed-window sanity check below, which is fine to
-            # run a little less precisely against UTC than to block a
-            # write the caller explicitly opted out of checking). Leaving
-            # the existing boundaries unresolved (None) is safe: the
-            # conflict-check block below is itself gated on `not
-            # ignore_conflicts`, and the write payload only ever uses the
-            # caller-supplied start_time/end_time, never these.
+            # the conflict check doesn't need to run - this lookup
+            # failing for ANY reason here would only ever be surfaced by
+            # that check (or by the reversed-window sanity check below,
+            # which is fine to run a little less precisely against UTC
+            # than to block a write the caller explicitly opted out of
+            # checking). Leaving the existing boundaries unresolved
+            # (None) is safe: the conflict-check block below is itself
+            # gated on `not ignore_conflicts`, and the write payload only
+            # ever uses the caller-supplied start_time/end_time, never
+            # these.
             calendar_timezone = "UTC"
             existing_start = None
             existing_end = None

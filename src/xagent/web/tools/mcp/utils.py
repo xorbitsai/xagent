@@ -12,6 +12,14 @@ from dateutil.rrule import rrulestr as _rrulestr
 
 from ....config import get_tool_max_output_length
 
+_DIGITS_ONLY_RE = re.compile(r"[0-9]+")
+# RFC 5545 UNTIL is always in "basic" form - no "-"/":" separators, unlike
+# ISO8601's "extended" form that dateutil's isoparse also happily accepts
+# (e.g. "2026-09-11T23:59:59+08:00"). dateutil.rrule.rrulestr's own RFC
+# 5545 line parser expects exactly this basic shape and raises a raw,
+# uninformative "too many values to unpack" if it isn't - see parse_rrule.
+_UNTIL_RE = re.compile(r"[0-9]{8}(T[0-9]{6}Z)?")
+
 
 def require_clean_identifier(value: str, field_name: str) -> str:
     """Reject an empty or whitespace-padded id rather than silently fixing it.
@@ -132,9 +140,15 @@ def is_bare_date(value: str) -> bool:
     "T"/"t" date/time separator: RFC3339 also permits a space in place of
     "T" for readability, so "2026-08-26 07:00:00" contains no "t" either
     and would otherwise be misclassified as a bare date.
+
+    "all-digit" is checked via `_DIGITS_ONLY_RE` (ASCII 0-9 only), not
+    `str.isdigit()`: the latter also accepts non-ASCII digit lookalikes
+    (superscript, Thai, ...) that would misclassify a value as a bare
+    date with no further local validation before it's written straight
+    into a Google Calendar request body.
     """
     parts = value.strip().split("-")
-    return len(parts) == 3 and all(part.isdigit() for part in parts)
+    return len(parts) == 3 and all(_DIGITS_ONLY_RE.fullmatch(part) for part in parts)
 
 
 def resolve_zoneinfo(timezone: str) -> ZoneInfo:
@@ -171,9 +185,6 @@ def ensure_rrule_prefix(rrule_text: str) -> str:
     caller happened to use.
     """
     return f"RRULE:{_strip_rrule_prefix(rrule_text).upper()}"
-
-
-_DIGITS_ONLY_RE = re.compile(r"[0-9]+")
 
 
 def parse_rrule(
@@ -253,7 +264,13 @@ def parse_rrule(
             raise ValueError(
                 f"invalid recurrence rule: {key} is specified more than once"
             )
-        parts[key] = value.strip()
+        # Uppercased for the same reason ensure_rrule_prefix uppercases the
+        # whole rule text: RFC 5545's RRULE grammar has no case-sensitive
+        # free-text values, and this dict is what a future Outlook
+        # translator (parse_rrule's only other planned caller) would key
+        # lookups against - a caller who wrote "freq=daily" shouldn't get
+        # a dict with "daily" where every other caller gets "DAILY".
+        parts[key] = value.strip().upper()
     if "FREQ" not in parts:
         raise ValueError(
             "recurrence rule must include FREQ, e.g. "
@@ -289,6 +306,20 @@ def parse_rrule(
     # localize at all now depends on UNTIL's own value type.
     until_dt = None
     if "UNTIL" in parts:
+        # Checked against RFC 5545's actual (basic-form) UNTIL grammar
+        # before handing it to dateutil at all: isoparse below is lenient
+        # enough to accept ISO8601's extended form too (dashes, colons,
+        # e.g. "2026-09-11T23:59:59+08:00"), which RFC 5545 never allows
+        # for UNTIL - and dateutil.rrule.rrulestr's own line parser chokes
+        # on exactly that shape with a raw, uninformative "too many values
+        # to unpack" once this rule reaches the validation pass further
+        # down, instead of the clear error this function exists to give.
+        if not _UNTIL_RE.fullmatch(parts["UNTIL"]):
+            raise ValueError(
+                f"invalid UNTIL value in recurrence rule: {parts['UNTIL']!r} "
+                "- must be RFC 5545's basic form with no '-'/':' separators, "
+                "e.g. '20260911T235959Z' or '20260911'"
+            )
         try:
             until_dt = _date_parser.isoparse(parts["UNTIL"])
         except ValueError as exc:

@@ -130,6 +130,33 @@ def test_ensure_rrule_prefix_keeps_existing_prefix_and_uppercases():
     )
 
 
+def test_is_bare_date_accepts_a_bare_date():
+    assert utils.is_bare_date("2026-08-26")
+
+
+def test_is_bare_date_rejects_a_datetime():
+    assert not utils.is_bare_date("2026-08-26T07:00:00")
+
+
+def test_is_bare_date_rejects_a_space_separated_datetime():
+    assert not utils.is_bare_date("2026-08-26 07:00:00")
+
+
+def test_is_bare_date_accepts_surrounding_whitespace():
+    assert utils.is_bare_date("  2026-08-26  ")
+
+
+def test_is_bare_date_rejects_non_ascii_digit_lookalikes():
+    """Confirmed bug: str.isdigit() also accepts non-ASCII digit
+    lookalikes (superscript, Thai, fullwidth, ...), unlike the ASCII-only
+    _DIGITS_ONLY_RE this file already uses elsewhere for the identical
+    risk (see parse_rrule's INTERVAL/COUNT validation). A misclassified
+    value here reaches a Google Calendar request body's "date" field with
+    no further local validation, unlike parse_rrule's own path."""
+    assert not utils.is_bare_date("²⁰²⁶-08-26")
+    assert not utils.is_bare_date("๒๐๒๖-08-26")
+
+
 def test_ensure_rrule_prefix_normalizes_lowercase_rrule():
     """RFC 5545's RRULE grammar has no case-sensitive free-text values, so
     a fully lowercase rule (which parse_rrule's dateutil-backed validation
@@ -183,6 +210,32 @@ def test_parse_rrule_rejects_unparseable_rule():
 def test_parse_rrule_rejects_bad_dtstart():
     with pytest.raises(ValueError, match="invalid start time"):
         utils.parse_rrule("FREQ=DAILY", "not-a-date")
+
+
+def test_parse_rrule_rejects_an_extended_iso8601_until_with_a_clean_message():
+    """Confirmed bug: dateutil's own isoparse is lenient enough to accept
+    ISO8601's extended form for UNTIL (dashes/colons, e.g.
+    "2026-09-11T23:59:59+08:00"), which RFC 5545 never permits - UNTIL
+    must be RFC 5545's basic form. dateutil.rrule.rrulestr's own RFC 5545
+    line parser chokes on the extended form with a raw, uninformative
+    "too many values to unpack" instead of this function's own clean
+    error - must be caught here directly."""
+    with pytest.raises(ValueError, match="must be RFC 5545's basic form"):
+        utils.parse_rrule(
+            "FREQ=DAILY;UNTIL=2026-09-11T23:59:59+08:00",
+            "2026-09-01T07:00:00+08:00",
+        )
+
+
+def test_parse_rrule_uppercases_component_values_not_just_keys():
+    """Confirmed bug: only the FREQ/UNTIL/etc. *keys* were uppercased, not
+    their values - a lowercase "freq=daily" produced {"FREQ": "daily"}.
+    RFC 5545's RRULE grammar has no case-sensitive free-text values (the
+    same reasoning ensure_rrule_prefix already applies to the whole rule
+    text), and this returned dict is what a future Outlook translator
+    would key lookups against."""
+    parts = utils.parse_rrule("freq=daily;count=3", "2026-08-26T07:00:00")
+    assert parts == {"FREQ": "DAILY", "COUNT": "3"}
 
 
 def test_parse_rrule_accepts_a_datetime_object_directly():

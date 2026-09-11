@@ -142,12 +142,16 @@ def success_with_capped_dict(
 
     max_output_length = get_tool_max_output_length()
 
-    def _build(payload: Any, truncated: bool) -> str:
+    def _build(
+        payload: Any,
+        truncated: bool,
+        included_extras: dict[str, Any] | None = None,
+    ) -> str:
         return json.dumps(
             {
                 "status": "success",
                 field_name: payload,
-                **extras,
+                **(extras if included_extras is None else included_extras),
                 "truncated": truncated,
             },
             ensure_ascii=False,
@@ -189,6 +193,21 @@ def success_with_capped_dict(
         working = {key: working[key] for key in keys}
         truncated = True
         response = _build(working, truncated)
+
+    if len(response) > max_output_length:
+        compact_data: dict[str, Any] = {}
+        if isinstance(data.get("id"), (str, int, float, bool)):
+            compact_data["id"] = data["id"]
+        response = _build(compact_data, True, {})
+        if len(response) > max_output_length and compact_data:
+            response = _build({}, True, {})
+        if len(response) > max_output_length:
+            minimal = json.dumps(
+                {"status": "success", "truncated": True}, ensure_ascii=False
+            )
+            if len(minimal) <= max_output_length:
+                return minimal
+            return json.dumps({"status": "success"}, ensure_ascii=False)
     return response
 
 
@@ -219,6 +238,8 @@ def conflict_response(
     unchecked_attendees: list[str],
     start: str,
     end: str,
+    *,
+    check_error: str | None = None,
 ) -> str:
     """Build the status="conflict" envelope a calendar-writing MCP tool
     returns instead of creating/updating an event, so the calling agent
@@ -273,6 +294,8 @@ def conflict_response(
         # to special-case this one.
         "truncated": False,
     }
+    if check_error:
+        payload["check_error"] = check_error
     response = json.dumps(payload, ensure_ascii=False)
     max_output_length = get_tool_max_output_length()
     if len(response) <= max_output_length:
@@ -314,6 +337,56 @@ def conflict_response(
         # smallest contract-preserving response rather than returning `{}`.
         return json.dumps({"status": "conflict"}, ensure_ascii=False)
     return response
+
+
+def incomplete_check_response(
+    unchecked_attendees: list[str],
+    start: str,
+    end: str,
+) -> str:
+    """Return a bounded pre-write response when required calendars could
+    not be checked. The caller may retry with ``ignore_conflicts=True`` only
+    after the user explicitly accepts proceeding without complete checks.
+    """
+    payload: dict[str, Any] = {
+        "status": "conflict_check_incomplete",
+        "message": (
+            f"Availability could not be checked for {len(unchecked_attendees)} "
+            f"calendar(s) for {start} - {end}. No event was written."
+        ),
+        "unchecked_attendees": unchecked_attendees,
+        "hint": (
+            "Report the unchecked calendars to the user. Choose another action, "
+            "or call this tool again with ignore_conflicts=true only after the "
+            "user explicitly confirms they want to proceed without complete "
+            "availability checks."
+        ),
+        "truncated": False,
+    }
+    response = json.dumps(payload, ensure_ascii=False)
+    max_output_length = get_tool_max_output_length()
+    remaining = unchecked_attendees
+    while remaining and len(response) > max_output_length:
+        remaining = remaining[: len(remaining) // 2]
+        payload["unchecked_attendees"] = remaining
+        payload["truncated"] = True
+        response = json.dumps(payload, ensure_ascii=False)
+    if len(response) <= max_output_length:
+        return response
+
+    compact_payloads: tuple[dict[str, Any], ...] = (
+        {
+            "status": "conflict_check_incomplete",
+            "message": "Availability check incomplete; details truncated.",
+            "truncated": True,
+        },
+        {"status": "conflict_check_incomplete", "truncated": True},
+    )
+    for compact_payload in compact_payloads:
+        compact = json.dumps(compact_payload, ensure_ascii=False)
+        if len(compact) <= max_output_length:
+            return compact
+    return json.dumps({"status": "conflict_check_incomplete"}, ensure_ascii=False)
 
 
 def attendees_were_given(attendees: list[str] | str | None) -> bool:

@@ -1,6 +1,7 @@
 import copy
 import json
 import re
+from typing import Any
 from unittest.mock import Mock
 
 from xagent.web.tools.mcp import calendar
@@ -22,6 +23,7 @@ def _fake_service(execute_result: dict, existing_event: dict | None = None):
     """
     events = Mock()
     request = Mock()
+    request.headers = {}
     request.execute.return_value = execute_result
     events.insert = Mock(return_value=request)
     events.update = Mock(return_value=request)
@@ -39,9 +41,14 @@ def _fake_service(execute_result: dict, existing_event: dict | None = None):
     )
     service = Mock()
     service.events.return_value = events
-    service.freebusy.return_value = Mock(
-        query=Mock(return_value=Mock(execute=Mock(return_value={"calendars": {}})))
-    )
+
+    def freebusy_query(**kwargs: Any) -> Mock:
+        calendars = {
+            item["id"]: {"busy": []} for item in kwargs.get("body", {}).get("items", [])
+        }
+        return Mock(execute=Mock(return_value={"calendars": calendars}))
+
+    service.freebusy.return_value = Mock(query=Mock(side_effect=freebusy_query))
     service.calendars.return_value = Mock(
         get=Mock(
             return_value=Mock(

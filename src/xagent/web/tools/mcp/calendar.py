@@ -16,6 +16,7 @@ from .utils import attendees_to_add as _attendees_to_add
 from .utils import calendar_day_bounds as _calendar_day_bounds
 from .utils import conflict_response as _conflict_response
 from .utils import datetime_key_for_comparison as _datetime_key_for_comparison
+from .utils import incomplete_check_response as _incomplete_check_response
 from .utils import merge_scope_error as _merge_scope_error
 from .utils import normalize_addresses as _normalize_addresses
 from .utils import offset_datetime_string as _offset_datetime_string
@@ -607,6 +608,13 @@ def _event_response(
         response["unchecked_attendees"] = remaining_unchecked
         response["truncated"] = True
         encoded = json.dumps(response, ensure_ascii=False)
+    if len(encoded) > max_output_length:
+        # Even an empty unchecked list has JSON-key overhead. The base event
+        # response was already capped including all fixed conference fields,
+        # so omit the exhausted detail list and retain the truncation signal.
+        response.pop("unchecked_attendees", None)
+        response["truncated"] = True
+        encoded = json.dumps(response, ensure_ascii=False)
     return encoded
 
 
@@ -628,10 +636,10 @@ def google_calendar_create_events(
     attendees, if given, are checked for scheduling conflicts together with the organizer's own
     calendar; a conflict returns status="conflict" instead of creating the event. Pass
     ignore_conflicts=True to create it anyway once the user has explicitly confirmed a conflict is
-    fine. This also skips the whole check outright (not just the conflict result) whenever it can't
-    run at all -- e.g. a connector token missing a needed OAuth scope -- rather than failing loudly;
-    only pass it once the user has actually confirmed they want to proceed without checking, not as a
-    blanket way to route around an unrelated error. Adding attendees does not, by itself, email them; set notify_attendees=True to have Google
+    fine. If any required calendar cannot be checked, the tool returns
+    status="conflict_check_incomplete" and does not create the event. ignore_conflicts also skips
+    the whole check outright; only pass it after the user confirms they want to proceed without
+    complete availability checks. Adding attendees does not, by itself, email them; set notify_attendees=True to have Google
     Calendar send them a native invite immediately. Confirm the recipient list with the user before
     setting notify_attendees=True.
     Set add_google_meet=True to attach a real Google Meet video-conference link to the event. The
@@ -658,12 +666,14 @@ def google_calendar_create_events(
         normalized_attendees = _normalize_addresses(attendees) if attendees else []
 
         unchecked_attendees: list[str] = []
+        scope_error_message: str | None = None
         if not ignore_conflicts:
             try:
                 conflicts, unchecked_attendees = _find_conflicts(
                     service, start_time, end_time, normalized_attendees
                 )
             except InsufficientScopeError as exc:
+                scope_error_message = str(exc)
                 conflicts, unchecked_attendees = _merge_scope_error(exc, [], [])
             if conflicts:
                 return _conflict_response(
@@ -671,6 +681,11 @@ def google_calendar_create_events(
                     unchecked_attendees,
                     start_time,
                     end_time,
+                    check_error=scope_error_message,
+                )
+            if unchecked_attendees:
+                return _incomplete_check_response(
+                    unchecked_attendees, start_time, end_time
                 )
 
         event: dict[str, Any] = {
@@ -743,11 +758,10 @@ def google_calendar_update_events(
     start_time and end_time must be RFC3339 formatted if provided.
     If the update moves the event to a new time, or adds attendees, that change is checked for
     conflicts the same way google_calendar_create_events is; pass ignore_conflicts=True to skip the
-    check once the user has explicitly confirmed a conflict is fine. This also skips the whole check
-    outright (not just the conflict result) whenever it can't run at all -- e.g. a connector token
-    missing a needed OAuth scope, including the one needed to widen an all-day event's own boundary
-    -- rather than failing loudly; only pass it once the user has actually confirmed they want to
-    proceed without checking, not as a blanket way to route around an unrelated error. Editing other
+    check once the user has explicitly confirmed a conflict is fine. If any required calendar cannot
+    be checked, the tool returns status="conflict_check_incomplete" and does not update the event.
+    ignore_conflicts also skips the whole check outright; only pass it after the user confirms they
+    want to proceed without complete availability checks. Editing other
     fields (summary, description, location) without moving the event is never blocked.
     Moving the time or adding an attendee on a recurring event's own master (not a single occurrence)
     is refused outright rather than checked, since only that one occurrence's window can be verified
@@ -817,42 +831,6 @@ def google_calendar_update_events(
         # off whether anything is *actually* new, not just whether
         # `attendees` was given at all.
         added_attendees = _attendees_to_add(attendees, existing_attendee_emails)
-
-        if (
-            event.get("recurrence")
-            and not ignore_conflicts
-            and (bool(start_time) or bool(end_time) or added_attendees)
-        ):
-            # A recurring MASTER event's `recurrence` field (its RRULE/
-            # EXRULE/RDATE/EXDATE lines) is only present on the master
-            # itself - an individual occurrence carries `recurringEventId`
-            # instead (see the exclusion logic in _find_conflicts) and is
-            # unaffected by this check. Moving the master's time, or
-            # adding an attendee, affects EVERY occurrence the series
-            # generates, but the conflict check below only evaluates the
-            # single window this call computes (in effect, just the
-            # master's own occurrence) - there is no logic here to expand
-            # and check each future occurrence the recurrence rule would
-            # produce. Silently succeeding could let a real conflict on
-            # some LATER occurrence through completely unchecked. Refuse
-            # outright rather than give a false "no conflict" answer for
-            # the whole series - a metadata-only edit (no start_time/
-            # end_time/attendees change) is unaffected, and updating a
-            # single occurrence directly by its own event id is too (that
-            # event carries recurringEventId, not recurrence).
-            raise ValueError(
-                "This event is part of a recurring series (it has its "
-                "own recurrence rule) - moving it or adding an attendee "
-                "can only be conflict-checked against the single "
-                "occurrence this call computes, not every occurrence the "
-                "series will generate, so this write was refused rather "
-                "than risk missing a real conflict on a later date. "
-                "Update a single occurrence directly using its own event "
-                "id instead of the series' id, make a metadata-only edit "
-                "(summary/description/location) instead, or pass "
-                "ignore_conflicts=True only once the user has explicitly "
-                "confirmed they've verified every occurrence themselves."
-            )
 
         # The organizer's own calendar is checked separately, via
         # check_organizer (events.list, excluded by id/recurringEventId) -
@@ -1077,6 +1055,32 @@ def google_calendar_update_events(
             existing_end_key,
         )
 
+        if (
+            event.get("recurrence")
+            and not ignore_conflicts
+            and (window_changed or added_attendees)
+        ):
+            # A recurring MASTER event's `recurrence` field (its RRULE/
+            # EXRULE/RDATE/EXDATE lines) is only present on the master itself;
+            # an occurrence carries `recurringEventId` instead. A real time
+            # move or attendee addition affects every generated occurrence,
+            # while this call can check only one computed window. Equivalent
+            # RFC3339 spellings of an unchanged instant are allowed because
+            # window_changed is based on normalized datetime keys above.
+            raise ValueError(
+                "This event is part of a recurring series (it has its "
+                "own recurrence rule) - moving it or adding an attendee "
+                "can only be conflict-checked against the single "
+                "occurrence this call computes, not every occurrence the "
+                "series will generate, so this write was refused rather "
+                "than risk missing a real conflict on a later date. "
+                "Update a single occurrence directly using its own event "
+                "id instead of the series' id, make a metadata-only edit "
+                "(summary/description/location) instead, or pass "
+                "ignore_conflicts=True only once the user has explicitly "
+                "confirmed they've verified every occurrence themselves."
+            )
+
         unchecked_attendees: list[str] = []
         if not ignore_conflicts and effective_start and effective_end:
             # check_organizer queries calendarId="primary", which is
@@ -1286,6 +1290,15 @@ def google_calendar_update_events(
                     unchecked_attendees,
                     effective_start,
                     effective_end,
+                    check_error=(
+                        str(pending_scope_error)
+                        if pending_scope_error is not None
+                        else None
+                    ),
+                )
+            if unchecked_attendees:
+                return _incomplete_check_response(
+                    unchecked_attendees, effective_start, effective_end
                 )
 
         if summary:
@@ -1314,7 +1327,20 @@ def google_calendar_update_events(
             body=event,
             **_api_call_kwargs(event, notify_attendees),
         )
-        updated_event = request.execute()
+        if event.get("etag"):
+            # events.update replaces the full resource. Guard the snapshot
+            # fetched before conflict preflight so a concurrent Calendar edit
+            # cannot be silently overwritten by this stale body.
+            request.headers["If-Match"] = event["etag"]
+        try:
+            updated_event = request.execute()
+        except HttpError as exc:
+            if exc.resp.status == 412:
+                raise RuntimeError(
+                    "The event changed while its availability was being checked. "
+                    "No update was applied; fetch the latest event and retry."
+                ) from exc
+            raise
         return _event_response(updated_event, unchecked_attendees=unchecked_attendees)
 
     except Exception as e:

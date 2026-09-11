@@ -3736,16 +3736,14 @@ class WebToolConfig(BaseToolConfig):
             )
             allowed_file_dir_paths = self._mcp_file_allowed_dir_paths()
             if allowed_file_dir_paths:
-                allowed_file_dirs = ",".join(allowed_file_dir_paths)
+                # JSON preserves commas inside directory names. The shared
+                # parser also accepts the legacy comma-delimited form for
+                # manually configured standalone deployments.
+                allowed_file_dirs = json.dumps(allowed_file_dir_paths)
                 env["XAGENT_LINKEDIN_IMAGE_ALLOWED_DIRS"] = allowed_file_dirs
                 env["XAGENT_SLACK_FILE_ALLOWED_DIRS"] = allowed_file_dirs
                 env["XAGENT_GMAIL_FILE_ALLOWED_DIRS"] = allowed_file_dirs
-                # JSON preserves commas inside directory names. OneDrive's
-                # parser also accepts the legacy comma-delimited form for
-                # manually configured standalone deployments.
-                env["XAGENT_ONEDRIVE_FILE_ALLOWED_DIRS"] = json.dumps(
-                    allowed_file_dir_paths
-                )
+                env["XAGENT_ONEDRIVE_FILE_ALLOWED_DIRS"] = allowed_file_dirs
                 env["XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS"] = allowed_file_dirs
             # Distinct from the five read allowlists above: Google Drive's
             # download tool writes NEW files into the task workspace, so it

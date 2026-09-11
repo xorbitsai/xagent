@@ -1024,13 +1024,12 @@ def google_calendar_update_events(
             # check the docstring says this guards.
             existing_start = _event_boundary(event.get("start"), calendar_timezone)
             existing_end = _event_boundary(event.get("end"), calendar_timezone)
-        except (ValueError, HttpError):
-            # Not just the recognized missing-scope ValueError (or a
-            # malformed-event ValueError from _event_boundary) - a bare
-            # HttpError here means _primary_calendar_info hit some OTHER
-            # failure (rate limiting, a transient 5xx, an unrelated 403)
-            # that it re-raises unchanged rather than converting, and
-            # that's still "this lookup couldn't run" too.
+        except (InsufficientScopeError, ValueError, HttpError):
+            # Besides a recognized missing-scope error or malformed-event
+            # ValueError from _event_boundary, a bare HttpError here means
+            # _primary_calendar_info hit some OTHER failure (rate limiting,
+            # a transient 5xx, an unrelated 403) that it re-raises unchanged.
+            # All three mean this conflict-only lookup could not run.
             if not ignore_conflicts:
                 raise
             # ignore_conflicts=True means the caller has already decided

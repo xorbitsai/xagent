@@ -692,15 +692,16 @@ def _list_search(
             result_key,
         )
     capped = json.loads(success_with_capped_dict(result_key, {result_key: summaries}))
-    # Under an aggressively low XAGENT_TOOL_MAX_OUTPUT_LENGTH,
-    # success_with_capped_dict's phase-2 fallback can drop the wrapper's
-    # sole key entirely once phase 1's list-halving alone isn't enough --
-    # confirmed directly: with the list already emptied down to [], the
-    # skeleton can still exceed the limit, so capped[result_key] ends up
-    # {} instead of {result_key: []}. Re-add it rather than let a caller's
-    # capped[result_key][result_key] raise KeyError on an edge this
-    # aggressive-but-supported config can actually reach.
-    capped[result_key].setdefault(result_key, [])
+    # Under an aggressively low XAGENT_TOOL_MAX_OUTPUT_LENGTH, the compact
+    # fallback may omit the outer result field entirely because even the
+    # normal success skeleton cannot fit. Rebuild the list wrapper before
+    # adding pagination metadata so this adapter never indexes a field the
+    # shared capper was allowed to discard.
+    result_wrapper = capped.setdefault(result_key, {})
+    if not isinstance(result_wrapper, dict):
+        result_wrapper = {}
+        capped[result_key] = result_wrapper
+    result_wrapper.setdefault(result_key, [])
     capped["has_more"] = has_more
     capped["next_page"] = current_page + 1 if has_more else None
     return json.dumps(capped, ensure_ascii=False)

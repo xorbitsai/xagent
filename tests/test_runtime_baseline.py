@@ -77,7 +77,9 @@ async def target():
         assert request.headers["Authorization"] == "Bearer secret-test-token"
         state["created"] += 1
         if state.get("create_error"):
-            return web.Response(status=500)
+            # Model a persisted creation whose post-commit hook/cleanup failed:
+            # the client receives no task ID and must not infer rollback.
+            return web.Response(status=state["create_error"])
         return web.json_response(
             {
                 "task_id": state["created"],
@@ -180,9 +182,10 @@ async def test_task_error_retains_uncertain_id(target):
 
 
 @pytest.mark.asyncio
-async def test_creation_error_is_not_assumed_side_effect_free(target):
+@pytest.mark.parametrize("status", [400, 403, 500])
+async def test_creation_error_is_not_assumed_side_effect_free(target, status):
     base, state = target
-    state["create_error"] = True
+    state["create_error"] = status
     runner = Runner(base, "test", "secret-test-password", PINNED, 1)
     async with aiohttp.ClientSession() as session:
         await runner.login(session)
@@ -190,18 +193,23 @@ async def test_creation_error_is_not_assumed_side_effect_free(target):
     assert result["outcome"] == "create_http_error"
     assert runner.unknown_creations == 1
     assert not runner.task_ids
+    assert state["created"] == 1
+    assert state["commands"] == []
+    assert runner.stop_new_tasks
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["task", "model"])
+@pytest.mark.parametrize("failure", ["task", "model", 400, 403])
 async def test_failed_stage_aborts_before_next_cap(
     target, tmp_path, monkeypatch, failure
 ):
     base, state = target
     if failure == "task":
         state["fail"] = True
-    else:
+    elif failure == "model":
         state["models"] = ["fallback"] * 4
+    else:
+        state["create_error"] = failure
     monkeypatch.setenv("XAGENT_BENCH_USERNAME", "test")
     monkeypatch.setenv("XAGENT_BENCH_PASSWORD", "secret-test-password")
     payload = tmp_path / "payload.json"
@@ -226,7 +234,12 @@ async def test_failed_stage_aborts_before_next_cap(
     report = await run(args)
     assert report["status"] == "aborted_unconfirmed_tasks"
     assert len(report["stages"]) == 1
-    assert report["uncertain_task_ids"] == [1]
+    if isinstance(failure, int):
+        assert report["unknown_creations"] == 1
+        assert report["uncertain_task_ids"] == []
+        assert state["commands"] == []
+    else:
+        assert report["uncertain_task_ids"] == [1]
     if failure == "model":
         assert state["commands"] == []
         assert report["stages"][0]["summary"]["task"]["measured"] == 0

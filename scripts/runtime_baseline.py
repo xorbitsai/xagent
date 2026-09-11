@@ -341,8 +341,9 @@ class Runner:
                 ) as response:
                     if response.status != 200:
                         self.stop_new_tasks = True
-                        if response.status >= 500:
-                            self.unknown_creations += 1
+                        # Even 4xx can follow a committed task (extension hooks).
+                        # HTTP status alone cannot prove rollback/compensation.
+                        self.unknown_creations += 1
                         return {
                             "outcome": "create_http_error",
                             "status": response.status,

@@ -171,7 +171,7 @@ def test_attendees_were_given_treats_empty_list_as_provided():
 
 def test_attendees_to_add_filters_out_existing_and_normalizes():
     assert utils.attendees_to_add(
-        ["Old@Example.com", "new@example.com"], {"old@example.com"}
+        ["Old@Example.com", "new@example.com"], {"OLD@EXAMPLE.COM"}
     ) == ["new@example.com"]
 
 

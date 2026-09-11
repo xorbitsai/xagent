@@ -299,10 +299,11 @@ def attendees_to_add(
     if not attendees_were_given(attendees):
         return []
     assert attendees is not None  # narrows for mypy; attendees_were_given implies this
+    existing = {email.strip().lower() for email in existing_attendee_emails}
     return [
         address
         for address in normalize_addresses(attendees)
-        if address.lower() not in existing_attendee_emails
+        if address.lower() not in existing
     ]
 
 

@@ -22,7 +22,7 @@ before attendee free/busy checks stop 403ing for them; this migration does
 not (and cannot) retroactively fix already-issued tokens.
 
 Revision ID: 20260907_add_calendar_freebusy_scope
-Revises: 20260909_seed_shopify_mcp_app
+Revises: 20260911_assistant_source_event
 Create Date: 2026-09-07
 
 """

@@ -480,3 +480,27 @@ def test_conflict_response_caps_unchecked_attendees_when_conflicts_alone_is_not_
         == unchecked_attendees[: len(response["unchecked_attendees"])]
     )
     assert len(json.dumps(response, ensure_ascii=False)) <= 2000
+
+
+def test_conflict_response_uses_valid_compact_json_below_fixed_envelope(
+    monkeypatch,
+):
+    monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "300")
+    response_text = utils.conflict_response(
+        [
+            {
+                "calendar": "organizer",
+                "summary": "Busy",
+                "start": "2026-08-27T10:00:00+00:00",
+                "end": "2026-08-27T10:30:00+00:00",
+            }
+        ],
+        ["unreachable@example.com"],
+        "2026-08-27T10:00:00+00:00",
+        "2026-08-27T10:30:00+00:00",
+    )
+
+    response = json.loads(response_text)
+    assert response["status"] == "conflict"
+    assert response["truncated"] is True
+    assert len(response_text) <= 300

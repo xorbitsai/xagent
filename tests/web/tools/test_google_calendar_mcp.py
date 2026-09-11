@@ -25,6 +25,9 @@ def _fake_service(execute_result: dict, existing_event: dict | None = None):
     request.execute.return_value = execute_result
     events.insert = Mock(return_value=request)
     events.update = Mock(return_value=request)
+    # These Meet-focused tests do not exercise scheduling-conflict discovery.
+    # Return empty availability data so they continue to isolate event writes.
+    events.list = Mock(return_value=Mock(execute=Mock(return_value={"items": []})))
     events.get = Mock(
         return_value=Mock(
             execute=Mock(
@@ -36,6 +39,9 @@ def _fake_service(execute_result: dict, existing_event: dict | None = None):
     )
     service = Mock()
     service.events.return_value = events
+    service.freebusy.return_value = Mock(
+        query=Mock(return_value=Mock(execute=Mock(return_value={"calendars": {}})))
+    )
     return service
 
 

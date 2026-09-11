@@ -319,9 +319,8 @@ def attendees_to_add(
     ""), matching its own convention, as well as for a caller-supplied
     list/string that turns out to name only people already on the event.
     """
-    if not attendees_were_given(attendees):
+    if attendees is None or not attendees_were_given(attendees):
         return []
-    assert attendees is not None  # narrows for mypy; attendees_were_given implies this
     existing = {email.strip().lower() for email in existing_attendee_emails}
     return [
         address

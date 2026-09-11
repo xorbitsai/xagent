@@ -19,7 +19,11 @@ from googleapiclient.http import (  # type: ignore[import-not-found]
 from mcp.server.fastmcp import FastMCP
 
 from ....config import get_tool_max_output_length
-from .utils import clamp_limit, require_clean_identifier, setup_proxy_env
+from .utils import (
+    clamp_limit,
+    require_clean_identifier,
+    setup_proxy_env,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("google-drive-mcp")
@@ -430,6 +434,29 @@ def _attach_resource_key(request: Any, file_id: str, resource_key: str | None) -
     return request
 
 
+def _apply_parent_id(
+    file_metadata: dict[str, Any], parent_id: str | None
+) -> tuple[str | None, str | None]:
+    """Resolve an optional ``parent_id`` (a bare id or a folder URL/link,
+    possibly carrying a pre-2021 resourcekey) and, if given, add it to
+    ``file_metadata["parents"]`` in place.
+
+    Returns ``(resolved_parent_id, parent_resource_key)`` — both ``None``
+    when ``parent_id`` is falsy — for the caller to pass to
+    ``_attach_resource_key`` once its own request object exists (that
+    happens after ``file_metadata`` is built, so it can't be folded into
+    this function). Shared by google_drive_upload_file, ..._create_file,
+    and ..._create_folder, which otherwise each duplicated this exact
+    four-line resolve-then-mutate sequence.
+    """
+    if not parent_id:
+        return None, None
+    resolved_parent_id = _resolve_file_id(parent_id, "parent_id")
+    parent_resource_key = _extract_resource_key(parent_id)
+    file_metadata["parents"] = [resolved_parent_id]
+    return resolved_parent_id, parent_resource_key
+
+
 def _require_drive_id(value: str, field_name: str) -> str:
     """Validate a raw (non-URL) Drive id such as a permission_id: non-empty,
     no surrounding whitespace (require_clean_identifier), and restricted to
@@ -639,19 +666,91 @@ def _capped_content_response(
     return _capped_response(_build, content, halve=halve)
 
 
-# mime types safe to decode as UTF-8 text and return inline. Anything else
-# (PDFs, Office/OOXML formats, images, etc.) must go through
-# google_drive_download_file instead — decoding arbitrary binary content as
-# UTF-8 with errors="replace" silently corrupts it into unusable garbage.
-# RTF is included because it's specified as 7-bit-ASCII-clean (escape
-# sequences carry any non-ASCII content), so it round-trips through UTF-8
-# decoding safely, unlike the binary formats this allowlist exists to keep
-# out.
-_TEXT_MIME_TYPES = {"application/json", "application/xml", "application/rtf"}
+# mime types safe to decode as UTF-8 text and return inline, or to accept as
+# the declared type of a google_drive_create_file() call (whose content is
+# always literal UTF-8 text — see that function). Anything else (PDFs,
+# Office/OOXML formats, images, etc.) is binary and must go through
+# google_drive_download_file / google_drive_upload_file instead —
+# decoding/encoding it as UTF-8 would silently corrupt it into unusable
+# garbage. RTF is included because it's specified as 7-bit-ASCII-clean
+# (escape sequences carry any non-ASCII content), so it round-trips through
+# UTF-8 safely, unlike the binary formats this allowlist exists to keep out.
+# YAML/JS and the "+json"/"+xml" structured-syntax suffixes (RFC 6839, e.g.
+# "application/ld+json", "application/atom+xml") are included for the same
+# reason — genuinely text under the hood, just not "text/"-prefixed by
+# convention. The script/source-format entries (x-sh, x-sql, x-tex, ...,
+# graphql) are each an unambiguous registered mime type for a genuinely-text
+# format — no unrelated binary format is ever declared with them — so
+# accepting them here is always safe, however the caller arrived at
+# declaring one. Thrift/Avro/protobuf are deliberately NOT included here
+# even though their .thrift/.avsc/.proto *extensions* are in
+# _KNOWN_TEXT_EXTENSIONS below (an IDL/schema file is always text) —
+# unlike graphql, a generic Thrift/Avro/protobuf mime type (e.g.
+# "application/x-protobuf") can legitimately describe an actual
+# binary-encoded message payload in real-world use (Prometheus
+# remote-write, gRPC-Web, ...), the same ambiguity ".bat"/".ts"/".scm" have
+# at the extension level (see _KNOWN_TEXT_EXTENSIONS's own note on those).
+_TEXT_MIME_TYPES = {
+    "application/json",
+    "application/xml",
+    "application/rtf",
+    "application/javascript",
+    "application/ecmascript",
+    "application/x-yaml",
+    "application/yaml",
+    "application/csv",
+    "application/x-sh",
+    "application/x-csh",
+    "application/x-tcl",
+    "application/x-sql",
+    "application/x-tex",
+    "application/x-latex",
+    "application/xml-dtd",
+    "application/vnd.dart",
+    "application/graphql",
+}
+_TEXT_MIME_TYPE_SUFFIXES = ("+xml", "+json", "+yaml")
+
+
+def _normalize_mime_type(mime_type: str) -> str:
+    """Lowercase and strip any ``;charset=...``-style parameter — callers
+    (especially an LLM) commonly include one (e.g. "application/json;
+    charset=utf-8", "TEXT/PLAIN") without meaning anything other than the
+    plain type. Shared by every mime_type comparison in this module so
+    they all treat the same input the same way.
+
+    Also strips any embedded CR/LF. Not currently exploitable — the
+    normalized value only ever reaches Drive as a JSON body field or a
+    caller-facing error message, never a raw HTTP header the way
+    _attach_resource_key's resourcekey value does — but scrubbing it here
+    symmetrically is cheap insurance against a future call site adding
+    one.
+    """
+    normalized = mime_type.strip().split(";", 1)[0].strip().lower()
+    return normalized.replace("\r", "").replace("\n", "")
 
 
 def _is_text_mime_type(mime_type: str) -> bool:
-    return mime_type.startswith("text/") or mime_type in _TEXT_MIME_TYPES
+    """Whether ``mime_type`` denotes content safe to treat as UTF-8 text."""
+    normalized = _normalize_mime_type(mime_type)
+    return (
+        normalized.startswith("text/")
+        or normalized in _TEXT_MIME_TYPES
+        or normalized.endswith(_TEXT_MIME_TYPE_SUFFIXES)
+    )
+
+
+def _is_google_workspace_mime_type(mime_type: str) -> bool:
+    """Whether ``mime_type`` denotes a native Google Workspace document
+    (Docs/Sheets/Slides/...), whose mimeType is always exactly
+    "application/vnd.google-apps.<kind>".
+
+    A prefix check on that fixed namespace, not a bare ``"google-apps" in
+    mime_type`` substring test — the latter would also match an unrelated
+    value that merely contains that text somewhere (e.g. a crafted
+    "application/pdf; x=google-apps").
+    """
+    return _normalize_mime_type(mime_type).startswith("application/vnd.google-apps.")
 
 
 _UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.() -]")
@@ -743,6 +842,178 @@ def _unique_output_path(output_dir: Path, filename: str) -> Path:
     return candidate
 
 
+_UPLOAD_ALLOWED_DIRS_ENV_VAR = "XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS"
+
+
+def _upload_allowed_dirs() -> list[Path]:
+    """Parse XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS's comma-separated
+    directory allowlist, falling back to the current working directory
+    when it's unset.
+
+    That CWD fallback is a fail-open default: with no task workspace and
+    no configured external dirs, an MCP subprocess's own working
+    directory becomes the allowlist. Not reachable from the app's own
+    call sites today — _build_oauth_mcp_stdio_transport_config in
+    config.py always sets this env var whenever a task_id is present —
+    but a standalone or misconfigured launch of this server would fall
+    back to it silently.
+
+    Previously lived in utils.py as a name shared with gmail.py/slack.py's
+    own equivalents in spirit, but google_drive.py's upload tool is its
+    only real caller — gmail.py, slack.py, and linkedin.py each still
+    carry their own separate, near-identical copy rather than having been
+    migrated to a shared helper (a fast-follow, not part of this fix).
+    """
+    raw_dirs = os.environ.get(_UPLOAD_ALLOWED_DIRS_ENV_VAR, "")
+    parsed_dirs = [
+        Path(stripped).expanduser().resolve()
+        for raw_dir in raw_dirs.split(",")
+        if (stripped := raw_dir.strip())
+    ]
+    # Falls back to CWD not just when the env var is entirely unset/blank,
+    # but also when it normalizes to no real entries (e.g. "," or " , ") --
+    # otherwise this would return [] and _resolve_upload_file_path's `any(
+    # local_path.is_relative_to(d) for d in allowed_dirs)` is vacuously
+    # False for every path, turning the documented fail-open CWD default
+    # into an unintended fail-closed "everything rejected" for a malformed
+    # value, rather than the same fallback a fully-empty var gets.
+    return parsed_dirs or [Path.cwd().resolve()]
+
+
+def _resolve_upload_file_path(file_path: str) -> Path:
+    """Resolve ``file_path`` and ensure it falls under one of the upload
+    allowlist's directories — without this, google_drive_upload_file
+    could be tricked into reading arbitrary host files.
+
+    Pass an absolute path — a relative path resolves against this
+    process's own working directory, not the allowed directory, and will
+    not find a file written to the task workspace.
+
+    Containment is checked *before* existence, so a path that is both
+    outside the allowlist and nonexistent reports the allowlist message,
+    not "not found" — the latter would leak whether that host path exists
+    at all to a caller who has no business finding out.
+    """
+    local_path = Path(file_path).expanduser()
+    if not local_path.is_absolute():
+        local_path = Path.cwd() / local_path
+    local_path = local_path.resolve()
+
+    allowed_dirs = _upload_allowed_dirs()
+    if not any(local_path.is_relative_to(d) for d in allowed_dirs):
+        # The absolute host path is deliberately kept out of the raised
+        # message: it reaches the caller/LLM unfiltered via the error
+        # payload otherwise, and host filesystem layout has no business in
+        # a model transcript. Full detail (including the allowed
+        # directories) is logged server-side.
+        logger.warning(
+            "Rejected file path %s outside allowed directories: %s",
+            local_path,
+            ", ".join(str(path) for path in allowed_dirs),
+        )
+        raise PermissionError(
+            "file path is outside the allowed directories; ask the user "
+            "for a file inside the task workspace or another allowed "
+            "location"
+        )
+
+    if not local_path.is_file():
+        raise FileNotFoundError(f"File not found: {file_path}")
+    return local_path
+
+
+# Extensions of formats confidently known to be plain UTF-8 text. Default
+# a NAME to "looks binary" unless its extension is in this allowlist (or
+# it has no extension at all — an extensionless name like "Dockerfile" or
+# "README" isn't itself evidence of binary intent) — the opposite of a
+# binary-extension blocklist, which can never enumerate every binary
+# format that exists (three separate review rounds each found more gaps
+# in this module's blocklist attempts: the original hand list, then a
+# mimetypes.guess_type()-based one, then a wider hand list again). A
+# false positive here (a legitimate but unlisted text extension) is a
+# clear, actionable rejection pointing at google_drive_upload_file; a
+# false negative in a blocklist is a silently mislabeled file, a strictly
+# worse outcome, so this list defaults toward rejecting the unfamiliar
+# rather than accepting it.
+#
+# Also NOT delegated to mimetypes.guess_type(): that function's result
+# for anything beyond a small hardcoded core depends on whatever
+# mime.types database happens to be installed on the *host* — verified
+# directly, several of this list's own entries (.sql, .tex, .dart, .tcl,
+# .dtd) came back non-text from an incidental /etc/apache2/mime.types on
+# one development machine, and were silently ABSENT (making them "not
+# text" by the old design's logic) in a minimal CI/production container.
+# A fixed, in-source list is the only way to get identical behavior
+# everywhere this code runs.
+#
+# ".bat", ".ts", and ".scm" are included as text (batch script,
+# TypeScript, Scheme source) even though each also names a real,
+# unrelated binary format elsewhere (a Windows .exe-like executable, an
+# MPEG-2 transport stream, a Lotus ScreenCam recording) -- a judgment
+# call in favor of what an agent generating files is overwhelmingly more
+# likely to mean, resolved per-extension since no mime-type rule can
+# distinguish the two (see _TEXT_MIME_TYPES's matching note on why
+# Thrift/Avro's mime types, unlike protobuf's, are excluded there for
+# the same reason). ".plist" gets the same treatment: real Apple property
+# lists can be either XML text or a binary-encoded format, but an
+# agent-authored one is overwhelmingly more likely to be the XML form.
+_KNOWN_TEXT_EXTENSIONS = {
+    # plain text / docs / dotfiles
+    ".txt", ".md", ".markdown", ".mdx", ".rst", ".adoc", ".rtf", ".log",
+    ".lock", ".gitignore", ".gitattributes", ".editorconfig",
+    ".dockerignore", ".env", ".ini", ".cfg", ".conf", ".properties",
+    ".toml",
+    # structured/data formats
+    ".json", ".json5", ".xml", ".yaml", ".yml", ".csv", ".tsv", ".dtd",
+    ".xsd", ".xsl", ".xslt", ".proto", ".graphql", ".gql", ".thrift",
+    ".avsc", ".ipynb", ".jsonl", ".ndjson", ".geojson", ".plist",
+    # web
+    ".html", ".htm", ".css", ".scss", ".sass", ".less", ".svg",
+    ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx",
+    ".vue", ".svelte", ".astro",
+    # source code
+    ".py", ".rb", ".php", ".java", ".c", ".h", ".cpp", ".hpp", ".cc",
+    ".cxx", ".cs", ".m", ".mm", ".go", ".rs", ".swift", ".kt", ".kts",
+    ".scala", ".groovy", ".lua", ".r", ".jl", ".pl", ".pm", ".hs", ".fs",
+    ".fsx", ".ml", ".mli", ".clj", ".cljs", ".erl", ".ex", ".exs", ".nim",
+    ".zig", ".v", ".d", ".dart", ".elm", ".cr", ".tcl", ".scm", ".rkt",
+    ".lisp", ".el", ".asm", ".s", ".pas", ".f90", ".for", ".vb", ".vbs",
+    ".cabal", ".nix",
+    # shell / scripting / templates
+    ".sh", ".bash", ".zsh", ".csh", ".ksh", ".fish",
+    ".ps1", ".bat", ".cmd", ".awk", ".sed", ".sql", ".j2",
+    # build / infra
+    ".tex", ".latex", ".bib", ".cls", ".sty", ".diff", ".patch",
+    ".hcl", ".tf", ".tfvars", ".gradle", ".dockerfile", ".cmake",
+    # misc
+    ".pem", ".po",
+}  # fmt: skip
+
+
+def _name_looks_binary(name: str) -> bool:
+    """Whether ``name``'s extension is NOT a recognized text format.
+
+    Default-deny: an extension is only accepted if it's in
+    _KNOWN_TEXT_EXTENSIONS. A name with no extension at all (e.g.
+    "Dockerfile", "README") is accepted too — the absence of an
+    extension isn't evidence of binary intent the way an unrecognized
+    one is.
+
+    Uses _split_stem_suffix rather than plain ``Path.suffix`` for the
+    same reason _safe_output_filename does: a name that's *entirely* a
+    leading dot plus extension (e.g. ".pdf") has an empty ``Path(...).suffix``
+    per pathlib's dotfile convention, which would make this function treat
+    it as extensionless (accepted) — exactly the kind of mislabeling this
+    guard exists to catch, just via a name pathlib refuses to split.
+
+    google_drive_create_file's mime_type-based check is the complementary
+    signal that catches an explicitly-declared binary type regardless of
+    what the name looks like.
+    """
+    suffix = _split_stem_suffix(name.strip())[1].lower()
+    return bool(suffix) and suffix not in _KNOWN_TEXT_EXTENSIONS
+
+
 def get_drive_service() -> Any:
     token = os.environ.get("GOOGLE_ACCESS_TOKEN")
     refresh_token = os.environ.get("GOOGLE_REFRESH_TOKEN")
@@ -820,6 +1091,15 @@ def google_drive_get_file_content(file_id: str, mime_type: str = "text/plain") -
     case rather than the full file.
     """
     try:
+        # Normalized once here so every downstream use (the text-safety
+        # check, the "== text/plain" default-detection below, and the
+        # export_media mimeType itself) agrees on the same canonical
+        # value — an un-normalized "TEXT/PLAIN" or "text/plain; charset=..."
+        # would otherwise pass the check above but then fail the exact
+        # string comparison used to detect the default, silently skipping
+        # the Workspace-export mimeType fallback and sending Drive's API
+        # a non-canonical mimeType instead.
+        mime_type = _normalize_mime_type(mime_type)
         if not _is_text_mime_type(mime_type):
             return json.dumps(
                 {
@@ -861,7 +1141,7 @@ def google_drive_get_file_content(file_id: str, mime_type: str = "text/plain") -
                 "which has no content to read."
             )
 
-        if "application/vnd.google-apps" in file_mime_type:
+        if _is_google_workspace_mime_type(file_mime_type):
             # Export Google Workspace document. The tool's "text/plain"
             # default is reasonable for the common Docs/Slides case, but
             # several other Workspace types either have no text/plain
@@ -888,6 +1168,18 @@ def google_drive_get_file_content(file_id: str, mime_type: str = "text/plain") -
             # returns the file's own real bytes, so it's file_mime_type --
             # not the caller-supplied mime_type (already validated above)
             # -- that determines whether decoding as UTF-8 is safe here.
+            # file_mime_type itself comes straight from Drive's own stored
+            # metadata, which can itself be a host-dependent guess made at
+            # upload time (e.g. mimetypes.guess_type() in
+            # google_drive_upload_file's own mime_type default, or another
+            # client's own equivalent) rather than something this tool
+            # controls -- a ".docx" uploaded without an explicit mime_type
+            # on a host that fails to guess it lands in Drive as
+            # "application/octet-stream" and would be rejected here as
+            # "not a text file" even though the real content might have
+            # been text. Not something this function can correct after the
+            # fact; Drive's stored mimeType is the only source of truth it
+            # has for a regular (non-Workspace) file.
             if not _is_text_mime_type(file_mime_type):
                 return json.dumps(
                     {
@@ -966,7 +1258,7 @@ def google_drive_download_file(
         file_mime_type = file_metadata.get("mimeType", "")
         drive_name = file_metadata.get("name") or resolved_file_id
 
-        if "application/vnd.google-apps" in file_mime_type:
+        if _is_google_workspace_mime_type(file_mime_type):
             if not mime_type:
                 return json.dumps(
                     {
@@ -1021,28 +1313,245 @@ def google_drive_download_file(
 
 
 @mcp.tool()
-def google_drive_create_file(
-    name: str, content: str, mime_type: str = "text/plain", parent_id: str | None = None
+def google_drive_upload_file(
+    file_path: str, name: str = "", mime_type: str = "", parent_id: str | None = None
 ) -> str:
     """
-    Create a new file in Google Drive.
-    If you want to create a Google Doc, use mime_type="application/vnd.google-apps.document"
-    and pass plain text or HTML in the content. For normal text files, use "text/plain".
+    Upload a local file's real bytes to Google Drive — use this (not
+    google_drive_create_file) for a PDF, image, Office document, or any
+    other binary content, including a file this agent already generated
+    into the task workspace (e.g. an exported PDF report).
+
+    file_path: path to a file already on disk, e.g. something written to
+    the task workspace. Must be inside an allowed directory (automatically
+    scoped to the current task workspace), which is meant to keep this
+    tool from reading arbitrary host files — not an absolute guarantee
+    (see this function's own symlink-timing comment on the `with
+    local_path.open("rb")` line below). Pass an absolute path — a relative
+    path resolves against this process's own working directory, not the
+    allowed directory, and will not find a file written to the task
+    workspace.
+    name: the file name to give it in Drive; defaults to file_path's own
+    basename.
+    mime_type: defaults to a guess from the file's extension via the
+    standard mimetypes module, falling back to "application/octet-stream"
+    when it can't be guessed. This guess is informational only — Drive's
+    displayed file type may be wrong on a host whose mimetypes database
+    doesn't recognize the extension (see the _KNOWN_TEXT_EXTENSIONS
+    comment above for why that's host-dependent), but the uploaded bytes
+    are always exactly file_path's real content either way. Pass mime_type
+    explicitly for a reliable label, especially for an extension outside
+    the common formats mimetypes ships with by default.
     """
     try:
+        local_path = _resolve_upload_file_path(file_path)
+
+        resolved_name = name.strip() or local_path.name
+        # Normalized the same way google_drive_create_file's mime_type is,
+        # so an explicit "Application/PDF" or "application/pdf; foo=bar"
+        # doesn't land on Drive uncanonicalized just because this tool
+        # (unlike create_file) has no text-safety gate to normalize for.
+        resolved_mime_type = (
+            _normalize_mime_type(mime_type)
+            or mimetypes.guess_type(local_path.name)[0]
+            or "application/octet-stream"
+        )
+
+        file_metadata: dict[str, Any] = {
+            "name": resolved_name,
+            "mimeType": resolved_mime_type,
+        }
+        resolved_parent_id, parent_resource_key = _apply_parent_id(
+            file_metadata, parent_id
+        )
+
+        service = get_drive_service()
+
+        # local_path.open() here is a fresh by-path open, not the same
+        # descriptor _resolve_upload_file_path used for its allowlist
+        # check — a symlink swapped in during that window wouldn't be
+        # caught. Accepted risk: closing it would mean holding a file
+        # descriptor open across the whole allowlist resolution, which
+        # isn't worth it for a local, non-shared task workspace. Size is
+        # checked from this same handle the upload reads from (rather
+        # than a separate stat() call before opening) so at least those
+        # two agree with each other. No maximum size cap: MediaIoBaseUpload
+        # streams the file in chunks rather than buffering it whole, and
+        # Drive's own per-account storage quota is the real limit.
+        try:
+            fh_ctx = local_path.open("rb")
+        except OSError as e:
+            # str(OSError) embeds the absolute path (e.g. "[Errno 13]
+            # Permission denied: '/full/host/path'") -- the same detail
+            # _resolve_upload_file_path's own error deliberately scrubs.
+            # A permission error or a TOCTOU race (the allowlist-checked
+            # path got swapped/removed between the check and this open)
+            # would otherwise leak it straight into the caller/LLM-facing
+            # message through the generic `except Exception` below.
+            logger.warning("Failed to open upload file %s: %s", local_path, e)
+            raise ValueError("Could not read the file at the given path") from e
+        with fh_ctx as fh:
+            file_size = os.fstat(fh.fileno()).st_size
+            if file_size == 0:
+                # Drive's API itself accepts 0-byte files; rejecting one
+                # here is a deliberate product choice (an agent uploading
+                # an empty file is almost always a mistake upstream, e.g.
+                # a generation step that silently produced nothing) rather
+                # than an API constraint, unlike Gmail/Slack's matching
+                # rejects.
+                raise ValueError(f"File is empty: {file_path}")
+
+            media = MediaIoBaseUpload(fh, mimetype=resolved_mime_type, resumable=True)
+
+            create_request = service.files().create(
+                body=file_metadata,
+                media_body=media,
+                supportsAllDrives=True,
+                fields="id, name, webViewLink, mimeType",
+            )
+            if resolved_parent_id is not None:
+                _attach_resource_key(
+                    create_request, resolved_parent_id, parent_resource_key
+                )
+            file = create_request.execute()
+
+        return json.dumps({"status": "success", "file": file}, ensure_ascii=False)
+    except Exception as e:
+        logger.error(f"Error uploading file: {e}")
+        return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
+
+@mcp.tool()
+def google_drive_create_file(
+    name: str, content: str, mime_type: str | None = None, parent_id: str | None = None
+) -> str:
+    """
+    Create a new Drive file from plain text or HTML content.
+    If you want to create a Google Doc, use mime_type="application/vnd.google-apps.document"
+    and pass plain text or HTML in the content. For normal text files, leave
+    mime_type unset (it defaults to "text/plain").
+
+    content is always treated as text (it is UTF-8 encoded before upload) —
+    this tool cannot create a real PDF, image, or Office-format binary; a
+    name like "report.pdf" would get a file with that name but text/plain
+    content, not an actual PDF. To upload an already-generated file's real
+    bytes (a PDF exported earlier, an image, a .docx, etc.), use
+    google_drive_upload_file with the file's path instead.
+
+    mime_type left unset also gates `name` against a fixed guess-the-format
+    check: a name whose extension isn't recognized as a text format (this
+    can be a false positive — extensions this tool doesn't know about, or
+    a name like "www.example.com"/"report-v1.2" where the text after the
+    last "." isn't really an extension at all) gets rejected. If that
+    happens for a name you know is fine, pass mime_type explicitly (even
+    "text/plain") — an explicit mime_type is trusted over the name-based
+    guess, and is only rejected if it itself isn't a text-safe type.
+    """
+    try:
+        # Stripped once here so every downstream use agrees: the
+        # binary-name guard below and the actual Drive file_metadata["name"]
+        # sent. _name_looks_binary already stripped internally for its own
+        # suffix check, but without also reassigning `name` itself, a
+        # trailing-space name like "notes.txt " would pass the guard (the
+        # suffix check sees ".txt") yet still land in Drive with the
+        # literal trailing space intact — inconsistent with
+        # google_drive_upload_file's matching `name.strip()`.
+        name = name.strip()
+        # None/omitted vs. an explicit value are distinguished on purpose
+        # (rather than defaulting the parameter itself to "text/plain"):
+        # an explicit mime_type — even one that happens to also be
+        # "text/plain" — is the caller making a deliberate assertion about
+        # the content's type, which is trusted over the name-based guess
+        # below; an omitted one leaves the name as the only signal, same
+        # as before. Empty/whitespace-only is treated as omitted too, so a
+        # caller that explicitly passes "" gets the same default rather
+        # than a confusing rejection.
+        # Normalized (case/whitespace/;params stripped) once here so every
+        # downstream use agrees: the guard checks below, the Drive
+        # file_metadata["mimeType"] actually sent, and the upload's own
+        # media mimetype. Without this, a caller passing e.g. "TEXT/PLAIN"
+        # or "application/json; charset=utf-8" would pass the guard (which
+        # already normalized internally) but then have that same
+        # non-canonical string land in Drive's metadata instead of the
+        # canonical form the guard just validated.
+        #
+        # The `mime_type is not None` check is spelled out again here
+        # (rather than reusing a separately-assigned bool) so mypy can
+        # narrow `mime_type` to `str` for the _normalize_mime_type call --
+        # a bool computed from that same condition doesn't carry the
+        # narrowing through to this branch.
+        if mime_type is not None and mime_type.strip() != "":
+            explicit_mime_type = True
+            mime_type = _normalize_mime_type(mime_type)
+        else:
+            explicit_mime_type = False
+            mime_type = "text/plain"
+        is_google_doc_conversion = _is_google_workspace_mime_type(mime_type)
+        # A Google Workspace conversion is exempt from both checks below
+        # (Docs/Sheets/Slides always take text/HTML source regardless of
+        # the target doc's name), so short-circuit here rather than
+        # computing _name_looks_binary and the mime-type check on every
+        # such call for nothing.
+        if not is_google_doc_conversion:
+            mime_type_is_binary = not _is_text_mime_type(mime_type)
+            # Two independent signals catch two different mistakes — but
+            # only the name-based one is a heuristic guess, and only when
+            # the caller left mime_type unset. _KNOWN_TEXT_EXTENSIONS is a
+            # default-deny allowlist, so a name that merely CONTAINS a dot
+            # not meant as an extension ("www.example.com",
+            # "report-v1.2") or uses a real text extension this list
+            # doesn't happen to know about would otherwise be rejected
+            # with no way to correct it. An explicit mime_type — even
+            # "text/plain" — lets the caller override that false positive
+            # directly; a caller that left mime_type unset, named the file
+            # like a binary format, is still caught (the original
+            # production bug this guard exists for). An explicit *binary*
+            # mime_type is caught either way, regardless of the name,
+            # since content can only ever be UTF-8 text (see the encode()
+            # below).
+            name_looks_binary = not explicit_mime_type and _name_looks_binary(name)
+        else:
+            name_looks_binary = mime_type_is_binary = False
+        if name_looks_binary or mime_type_is_binary:
+            if name_looks_binary:
+                message = (
+                    f"'{name}' looks like a binary file, but "
+                    "google_drive_create_file only writes text content — "
+                    "uploading it here would produce a mislabeled text "
+                    "file, not real binary data. If this is actually text "
+                    "and the name just isn't recognized (e.g. the text "
+                    'after the last "." isn\'t really an extension, like '
+                    "in a version number or domain name), pass an "
+                    'explicit mime_type (e.g. "text/plain") to confirm '
+                    "that. If you already generated a real binary file "
+                    "(e.g. as a task output), use google_drive_upload_file "
+                    "with its file path to upload the real binary content "
+                    "instead."
+                )
+            else:
+                message = (
+                    f"mime_type '{mime_type}' is not a text format, but "
+                    "google_drive_create_file's content is always UTF-8 "
+                    "text — either use a text-safe mime_type (e.g. "
+                    '"text/plain"), or if this is genuinely binary '
+                    "content, write it to a file first and use "
+                    "google_drive_upload_file with that file's path "
+                    "instead."
+                )
+            return json.dumps(
+                {"status": "error", "message": message}, ensure_ascii=False
+            )
+
         file_metadata: dict[str, Any] = {"name": name, "mimeType": mime_type}
-        resolved_parent_id = None
-        parent_resource_key = None
-        if parent_id:
-            resolved_parent_id = _resolve_file_id(parent_id, "parent_id")
-            parent_resource_key = _extract_resource_key(parent_id)
-            file_metadata["parents"] = [resolved_parent_id]
+        resolved_parent_id, parent_resource_key = _apply_parent_id(
+            file_metadata, parent_id
+        )
 
         service = get_drive_service()
         fh = io.BytesIO(content.encode("utf-8"))
 
         # When creating a Google Doc, the upload mime type needs to be the original content's mime type (like text/plain)
-        upload_mime_type = "text/plain" if "google-apps" in mime_type else mime_type
+        upload_mime_type = "text/plain" if is_google_doc_conversion else mime_type
         media = MediaIoBaseUpload(fh, mimetype=upload_mime_type, resumable=True)
 
         create_request = service.files().create(
@@ -1073,12 +1582,9 @@ def google_drive_create_folder(name: str, parent_id: str | None = None) -> str:
             "name": name,
             "mimeType": "application/vnd.google-apps.folder",
         }
-        resolved_parent_id = None
-        parent_resource_key = None
-        if parent_id:
-            resolved_parent_id = _resolve_file_id(parent_id, "parent_id")
-            parent_resource_key = _extract_resource_key(parent_id)
-            file_metadata["parents"] = [resolved_parent_id]
+        resolved_parent_id, parent_resource_key = _apply_parent_id(
+            file_metadata, parent_id
+        )
 
         service = get_drive_service()
         create_request = service.files().create(

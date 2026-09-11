@@ -44,6 +44,13 @@ from ..core.execution_scope import (
     ExecutionScopeResolverContractError,
 )
 from ..core.file_storage import StorageKeyScopeError
+from ..core.runtime_performance import (
+    initialize_runtime_performance_telemetry,
+    register_observable_gauge,
+    shutdown_runtime_performance_telemetry,
+    start_event_loop_lag_monitor,
+    stop_event_loop_lag_monitor,
+)
 from ..core.tracing.langfuse import flush_langfuse, initialize_langfuse
 from .api.a2a import router as a2a_router
 from .api.admin_interaction_rollout import router as admin_interaction_rollout_router
@@ -1240,6 +1247,52 @@ app.include_router(share_router)
 app.include_router(v1_router)
 
 
+def start_runtime_performance_monitor(app_instance: FastAPI) -> None:
+    """Start one event-loop lag sampler for the current app lifespan."""
+
+    existing = getattr(app_instance.state, "runtime_performance_task", None)
+    if existing is not None and not existing.done():
+        return
+    try:
+        if not initialize_runtime_performance_telemetry():
+            app_instance.state.runtime_performance_task = None
+            return
+
+        from .api.websocket import background_task_manager, manager
+
+        register_observable_gauge(
+            "xagent.agent_tasks.running",
+            lambda: len(background_task_manager.running_tasks),
+            unit="{task}",
+            description="Current locally running agent tasks",
+        )
+        register_observable_gauge(
+            "xagent.agent_tasks.resuming",
+            lambda: len(background_task_manager.resume_tasks),
+            unit="{task}",
+            description="Current local resume coordinators",
+        )
+        register_observable_gauge(
+            "xagent.websocket.connections",
+            manager.connection_count,
+            unit="{connection}",
+            description="Current task WebSocket connections",
+        )
+        app_instance.state.runtime_performance_task = start_event_loop_lag_monitor()
+    except Exception:
+        # Telemetry is observational and must not block application startup.
+        app_instance.state.runtime_performance_task = None
+        shutdown_runtime_performance_telemetry()
+        logger.warning("Could not start runtime performance monitor", exc_info=True)
+
+
+async def stop_runtime_performance_monitor(app_instance: FastAPI) -> None:
+    task = getattr(app_instance.state, "runtime_performance_task", None)
+    app_instance.state.runtime_performance_task = None
+    await stop_event_loop_lag_monitor(task)
+    await asyncio.to_thread(shutdown_runtime_performance_telemetry)
+
+
 async def _initialize_database_and_admit_runtime(app_instance: FastAPI) -> None:
     """Prepare the database, admit the host, then open runtime work ingress."""
     with _startup_phase("database init"):
@@ -1775,6 +1828,7 @@ async def startup_event() -> None:
     # test_failed_startup_leaves_no_unsignaled_temp_file_cleanup pins this.
     if auto_migrate:
         start_temp_file_cleanup_task(app)
+    start_runtime_performance_monitor(app)
 
 
 @app.on_event("shutdown")
@@ -1877,6 +1931,10 @@ async def shutdown_event() -> None:
 
     await background_task_manager.shutdown()
     await wait_for_heartbeat_manager_idle()
+
+    # Export task-finalization metrics and post-drain gauges before stopping
+    # telemetry. Exporter shutdown must not delay cancellation of live tasks.
+    await stop_runtime_performance_monitor(app)
 
     from .services.task_runtime import shutdown_task_runtime_hook_executor
 

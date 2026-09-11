@@ -22,6 +22,14 @@ from ...core.agent.checkpoint import (
 )
 from ...core.agent.trace import BaseTraceHandler
 from ...core.agent.trace import TraceEvent as CoreTraceEvent
+from ...core.runtime_performance import (
+    increment_counter as increment_performance_counter,
+)
+from ...core.runtime_performance import (
+    observe_duration,
+    observe_value,
+    run_in_thread_with_telemetry,
+)
 from ...core.tools.adapters.vibe.connector_runtime import (
     redact_runtime_sensitive_payload,
 )
@@ -29,6 +37,7 @@ from ...web.models.database import get_db
 from ...web.models.task import Task, TaskStatus
 from ...web.models.task import TraceEvent as DatabaseTraceEvent
 from ...web.models.task_interaction import TaskInteractionRequest
+from ...web.services.db_runtime import drain_async_task_cancellation_safe
 from ...web.services.interaction_rollout import (
     COUNTER_CHECKPOINT_READ_PARTITION_WIDENED,
     increment_counter,
@@ -212,9 +221,25 @@ class DatabaseTraceHandler(BaseTraceHandler):
     async def _save_to_database(self, event: CoreTraceEvent) -> None:
         """Save trace event to database."""
         try:
-            # Run synchronous database operations in a thread pool to avoid blocking event loop
-            await asyncio.to_thread(self._sync_save_to_database, event)
+            # A cancelled caller must wait for the instrumented worker to
+            # release its transaction before task settlement can begin.
+            worker = asyncio.create_task(
+                run_in_thread_with_telemetry(
+                    "trace_database_write",
+                    self._sync_save_to_database,
+                    event,
+                )
+            )
+            await drain_async_task_cancellation_safe(worker)
+            increment_performance_counter(
+                "xagent.trace.database.writes",
+                attributes={"outcome": "succeeded"},
+            )
         except Exception as e:
+            increment_performance_counter(
+                "xagent.trace.database.writes",
+                attributes={"outcome": "failed"},
+            )
             # Don't catch required field validation errors - let them propagate
             if isinstance(e, ValueError) and ("missing required" in str(e)):
                 logger.error(f"Re-raising required field validation error: {e}")
@@ -982,7 +1007,8 @@ class DatabaseTraceHandler(BaseTraceHandler):
             timestamp = _convert_float_to_datetime(event.timestamp)
 
             # Serialize data to ensure JSON compatibility
-            data = self._serialize_data_for_json(event.data or {})
+            with observe_duration("xagent.trace.database.serialization.duration"):
+                data = self._serialize_data_for_json(event.data or {})
             lease = current_task_lease() if self.build_id is None else None
             is_legacy_checkpoint = (
                 event_type_str == "system_update_general"
@@ -1104,7 +1130,8 @@ class DatabaseTraceHandler(BaseTraceHandler):
                         f"{event.id} could be persisted"
                     )
 
-            db.commit()
+            with observe_duration("xagent.trace.database.commit.duration"):
+                db.commit()
 
             if (
                 event_type_str == "system_update_general"
@@ -1418,7 +1445,14 @@ class DatabaseTraceHandler(BaseTraceHandler):
             cleaned_data = serialize_value(data)
 
             # Test if cleaned data is JSON serializable
-            json.dumps(cleaned_data)
+            encoded_data = json.dumps(cleaned_data)
+            observe_value(
+                "xagent.trace.payload.size",
+                # json.dumps defaults to ensure_ascii=True, so character count
+                # equals encoded byte count without allocating another copy.
+                len(encoded_data),
+                unit="By",
+            )
             return cleaned_data
         except (TypeError, ValueError) as e:
             # If still not serializable, log the error and return a safe fallback

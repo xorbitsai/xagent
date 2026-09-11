@@ -13,7 +13,10 @@ from typing import Any, Dict, List
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from .builtin_mcp_registry import get_builtin_execution_fields_and_optional_scopes
+from .builtin_mcp_registry import (
+    _persisted_builtin_provenance_matches,
+    get_builtin_execution_fields_and_optional_scopes,
+)
 from .models.public_mcp import PublicMCPApp
 
 # Apps that must not be satisfied by a bare provider-level OAuth grant (one
@@ -160,6 +163,11 @@ def _app_to_dict(app: PublicMCPApp) -> Dict[str, Any]:
     execution_fields, optional_oauth_scopes = (
         get_builtin_execution_fields_and_optional_scopes(app.app_id)
     )
+    if execution_fields is not None and not _persisted_builtin_provenance_matches(
+        app.app_id, app.launch_config
+    ):
+        execution_fields = None
+        optional_oauth_scopes = []
     if execution_fields is None:
         execution_fields = {
             "name": app.name,
@@ -254,10 +262,9 @@ class RemoteOAuthDefinitionOwnership(Enum):
 
 def _normalized_catalog_key(value: object) -> str | None:
     """Normalize only for collision detection, never for persisted identity."""
-    if value is None:
-        return None
-    normalized = "-".join(str(value).strip().lower().split())
-    return normalized or None
+    from ..builtin_identity import canonicalize_builtin_identity
+
+    return canonicalize_builtin_identity(value)
 
 
 def _strict_catalog_app_by_id(
@@ -303,6 +310,10 @@ def _strict_catalog_app_by_id(
     execution_fields, _optional_scopes = (
         get_builtin_execution_fields_and_optional_scopes(app.app_id)
     )
+    if execution_fields is not None and not _persisted_builtin_provenance_matches(
+        app.app_id, app.launch_config
+    ):
+        execution_fields = None
     if require_builtin_oauth and execution_fields is None:
         raise BuiltinOAuthServerDefinitionError(
             f"OAuth catalog app {app_id!r} is absent from the builtin registry"

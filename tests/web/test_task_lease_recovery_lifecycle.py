@@ -158,6 +158,10 @@ async def test_application_shutdown_stops_task_lease_recovery(
     async def fake_wait_for_heartbeat_idle() -> None:
         shutdown_order.append("heartbeat_idle")
 
+    async def fake_stop_telemetry(app_instance) -> None:
+        assert app_instance is app_module.app
+        shutdown_order.append("telemetry")
+
     class _FakeChannel:
         enabled = False
 
@@ -190,6 +194,9 @@ async def test_application_shutdown_stops_task_lease_recovery(
         fake_slack_bot,
     )
     monkeypatch.setattr(app_module, "flush_langfuse", lambda: None)
+    monkeypatch.setattr(
+        app_module, "stop_runtime_performance_monitor", fake_stop_telemetry
+    )
     monkeypatch.setattr(app_module, "stop_task_lease_recovery_task", fake_stop)
     monkeypatch.setattr(
         app_module,
@@ -225,5 +232,6 @@ async def test_application_shutdown_stops_task_lease_recovery(
     assert shutdown_order == [
         "background_tasks",
         "heartbeat_idle",
+        "telemetry",
         "sandbox",
     ]

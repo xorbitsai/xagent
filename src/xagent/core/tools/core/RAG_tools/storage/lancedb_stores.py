@@ -5,17 +5,20 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import threading
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterator, List, Literal, Optional, Sequence, Tuple, cast
 
-import lancedb
 import pyarrow as pa  # type: ignore
 from filelock import FileLock, Timeout
 from lancedb.db import DBConnection
 
-from xagent.providers.vector_store.lancedb import get_connection_from_env
+from xagent.providers.vector_store.lancedb import (
+    get_async_connection_from_env,
+    get_connection_from_env,
+)
 
 from ..core.config import (
     DEFAULT_INDEX_POLICY,
@@ -159,11 +162,8 @@ def _stale_version_count(table: Any, cutoff: datetime) -> int:
 class LanceDBMetadataStore(MetadataStore):
     """LanceDB implementation for control-plane metadata operations."""
 
-    def __init__(self) -> None:
-        self._conn: Optional[DBConnection] = None
-
     async def _get_connection(self) -> DBConnection:
-        """Open (and memoise) the connection without stalling the event loop.
+        """Reach the connection pool without stalling the event loop.
 
         Opening a LanceDB connection is blocking I/O, so it is dispatched to a
         worker thread. ``get_raw_connection`` is the synchronous equivalent for
@@ -626,15 +626,12 @@ class LanceDBMetadataStore(MetadataStore):
         """Get the underlying LanceDB connection.
 
         This method provides access to the raw connection for operations that
-        cannot be performed through the storage abstraction. It initializes
-        and caches the connection for consistency with async methods.
+        cannot be performed through the storage abstraction.
 
         Returns:
             DBConnection: The LanceDB connection object
         """
-        if self._conn is None:
-            self._conn = get_connection_from_env()
-        return self._conn
+        return get_connection_from_env()
 
 
 class LanceDBVectorIndexStore(VectorIndexStore):
@@ -648,70 +645,83 @@ class LanceDBVectorIndexStore(VectorIndexStore):
     _TABLE_CACHE_MAXSIZE = 64
 
     def __init__(self) -> None:
-        self._conn: Optional[DBConnection] = None
-        self._async_conn: Optional[Any] = None  # AsyncConnection
-        self._async_lock = asyncio.Lock()  # Protect async connection initialization
         self._table_cache: OrderedDict[str, Any] = OrderedDict()
+        # Guards _table_cache across the worker threads asyncio.to_thread
+        # dispatches handle storage calls to.
+        self._table_cache_lock = threading.Lock()
+        self._table_cache_epoch = 0
 
     def _get_connection(self) -> DBConnection:
-        if self._conn is None:
-            self._conn = get_connection_from_env()
-        return self._conn
+        return get_connection_from_env()
 
     def _get_table(self, table_name: str, *, use_cache: bool = True) -> Any:
         """Get a table handle, optionally reusing the per-process cache."""
         from ..LanceDB.schema_manager import _safe_close_table
 
-        if use_cache:
-            cached = self._table_cache.get(table_name)
-            if cached is not None:
-                self._table_cache.move_to_end(table_name)
-                return cached
-        table = self._get_connection().open_table(table_name)
-        if use_cache:
-            self._table_cache[table_name] = table
-            if len(self._table_cache) > self._TABLE_CACHE_MAXSIZE:
-                _evicted_name, _evicted_table = self._table_cache.popitem(last=False)
-                _safe_close_table(_evicted_table)
-        return table
+        if not use_cache:
+            return self._get_connection().open_table(table_name)
+
+        # At most two passes. An invalidation landing while the unlocked open
+        # below is in flight means the table may have just been dropped, so
+        # that handle is thrown away and re-opened against the new epoch.
+        for last_pass in (False, True):
+            with self._table_cache_lock:
+                cached = self._table_cache.get(table_name)
+                if cached is not None:
+                    self._table_cache.move_to_end(table_name)
+                    return cached
+                epoch = self._table_cache_epoch
+
+            # Blocking I/O, deliberately outside the lock: holding it across
+            # this would serialize every concurrent open.
+            table = self._get_connection().open_table(table_name)
+
+            discarded = None
+            with self._table_cache_lock:
+                if self._table_cache_epoch != epoch and not last_pass:
+                    discarded, table = table, None
+                else:
+                    # Unlocked, an insert landing inside
+                    # invalidate_table_cache's own critical section is dropped
+                    # by its clear() while absent from its stale snapshot, so
+                    # that handle would be neither cached nor closed.
+                    existing = self._table_cache.get(table_name)
+                    if existing is not None:
+                        self._table_cache.move_to_end(table_name)
+                        discarded, table = table, existing
+                    else:
+                        self._table_cache[table_name] = table
+                        if len(self._table_cache) > self._TABLE_CACHE_MAXSIZE:
+                            _evicted_name, discarded = self._table_cache.popitem(
+                                last=False
+                            )
+            _safe_close_table(discarded)
+            if table is not None:
+                return table
+
+        raise RuntimeError("unreachable: the second pass always returns")
 
     def invalidate_table_cache(self, table_name: str | None = None) -> None:
         """Clear table cache after drop/delete to avoid stale handles.
 
-        Cached handles are closed before removal so underlying file
-        descriptors are released promptly.
+        Handles are dropped from the cache under the lock, then closed outside
+        it so a blocking close never runs while the lock is held.
         """
         from ..LanceDB.schema_manager import _safe_close_table
 
-        if table_name is None:
-            for _name, _table in list(self._table_cache.items()):
-                _safe_close_table(_table)
-            self._table_cache.clear()
-        else:
-            _table = self._table_cache.pop(table_name, None)
+        with self._table_cache_lock:
+            self._table_cache_epoch += 1
+            if table_name is None:
+                stale = list(self._table_cache.values())
+                self._table_cache.clear()
+            else:
+                stale = [self._table_cache.pop(table_name, None)]
+        for _table in stale:
             _safe_close_table(_table)
 
     async def _get_async_connection(self) -> Any:
-        """Get or create async LanceDB connection with thread-safe initialization."""
-        # Fast path: return existing connection without lock
-        if self._async_conn is not None:
-            return self._async_conn
-
-        # Slow path: initialize with lock to prevent race condition
-        async with self._async_lock:
-            # Double-check after acquiring lock
-            if self._async_conn is not None:
-                return self._async_conn
-
-            # Get URI from sync connection for reuse
-            sync_conn = self._get_connection()
-            uri = getattr(sync_conn, "uri", None)
-            if uri is None:
-                # Fallback: use LANCEDB_DIR env var
-
-                uri = os.getenv("LANCEDB_DIR", "./data/lancedb")
-            self._async_conn = await lancedb.connect_async(uri)  # type: ignore[attr-defined]
-            return self._async_conn
+        """Get the process-wide async LanceDB connection."""
+        return await get_async_connection_from_env()
 
     def list_document_records(
         self,
@@ -2521,7 +2531,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
 
         # Note: ensure_documents_table uses sync connection - may need async variant
         # For now, reuse sync connection for table creation
-        sync_conn = self._get_connection()
+        sync_conn = await asyncio.to_thread(self._get_connection)
         ensure_documents_table(sync_conn)
 
         from ..LanceDB.schema_manager import _safe_close_table
@@ -2550,7 +2560,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         async_conn = await self._get_async_connection()
 
         # Reuse sync connection for table creation
-        sync_conn = self._get_connection()
+        sync_conn = await asyncio.to_thread(self._get_connection)
         ensure_chunks_table(sync_conn)
 
         from ..LanceDB.schema_manager import _safe_close_table
@@ -2584,7 +2594,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             return
 
         async_conn = await self._get_async_connection()
-        sync_conn = self._get_connection()
+        sync_conn = await asyncio.to_thread(self._get_connection)
 
         table_name = f"embeddings_{to_model_tag(model_tag)}"
 
@@ -3633,26 +3643,9 @@ class LanceDBIngestionStatusStore(IngestionStatusStore):
     Manages ingestion_runs table for tracking document processing status.
     """
 
-    def __init__(self) -> None:
-        self._sync_conn: Optional[DBConnection] = None
-        self._async_conn: Optional[Any] = None
-        self._async_lock = asyncio.Lock()
-
     def _get_sync_connection(self) -> DBConnection:
         """Get sync LanceDB connection."""
-        if self._sync_conn is None:
-            self._sync_conn = get_connection_from_env()
-        return self._sync_conn
-
-    async def _get_async_connection(self) -> Any:
-        """Get async LanceDB connection."""
-        if self._async_conn is None:
-            async with self._async_lock:
-                if self._async_conn is None:
-                    self._async_conn = await lancedb.connect_async(  # type: ignore[attr-defined]
-                        get_connection_from_env().uri  # type: ignore[attr-defined]
-                    )
-        return self._async_conn
+        return get_connection_from_env()
 
     def _ensure_ingestion_runs_table(self, conn: DBConnection) -> None:
         """Ensure ingestion_runs table exists."""
@@ -3937,14 +3930,9 @@ class LanceDBPromptTemplateStore(PromptTemplateStore):
     Manages prompt_templates table for storing and retrieving prompt templates.
     """
 
-    def __init__(self) -> None:
-        self._sync_conn: Optional[DBConnection] = None
-
     def _get_sync_connection(self) -> DBConnection:
         """Get or create sync connection."""
-        if self._sync_conn is None:
-            self._sync_conn = get_connection_from_env()
-        return self._sync_conn
+        return get_connection_from_env()
 
     def _ensure_table(self) -> None:
         """Ensure prompt_templates table exists."""
@@ -4427,14 +4415,9 @@ class LanceDBMainPointerStore(MainPointerStore):
     multi-tenancy support.
     """
 
-    def __init__(self) -> None:
-        self._sync_conn: Optional[DBConnection] = None
-
     def _get_sync_connection(self) -> DBConnection:
         """Get or create sync connection."""
-        if self._sync_conn is None:
-            self._sync_conn = get_connection_from_env()
-        return self._sync_conn
+        return get_connection_from_env()
 
     def _ensure_table(self) -> None:
         """Ensure main_pointers table exists."""

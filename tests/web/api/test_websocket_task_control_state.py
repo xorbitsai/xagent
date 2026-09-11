@@ -479,6 +479,32 @@ async def test_broadcast_skips_closed_connection_and_reaches_live_connection(
 
 
 @pytest.mark.asyncio
+async def test_broadcast_serializes_shared_payload_once(monkeypatch) -> None:
+    task_id = 42
+    first_websocket = _RecordingWebSocket()
+    second_websocket = _RecordingWebSocket()
+    connection_manager = ConnectionManager()
+    connection_manager.register_connection(first_websocket, task_id)
+    connection_manager.register_connection(second_websocket, task_id)
+    original_dumps = json.dumps
+    serialized_values: list[dict] = []
+
+    def counted_dumps(value, *args, **kwargs):
+        serialized_values.append(value)
+        return original_dumps(value, *args, **kwargs)
+
+    monkeypatch.setattr(websocket_api.json, "dumps", counted_dumps)
+
+    message = {"type": "diagnostic", "message": "shared"}
+    await connection_manager.broadcast_to_task(message, task_id)
+
+    encoded_message = original_dumps(message)
+    assert serialized_values == [message]
+    assert first_websocket.messages == [encoded_message]
+    assert second_websocket.messages == [encoded_message]
+
+
+@pytest.mark.asyncio
 async def test_broadcast_reraises_unexpected_connection_error() -> None:
     task_id = 42
     failed_websocket = _ClosedWebSocket(ValueError)
@@ -514,6 +540,34 @@ async def test_broadcast_rechecks_membership_after_message_enrichment(
 
     assert websocket.messages == []
     assert connection_manager.active_connections == {}
+
+
+@pytest.mark.asyncio
+async def test_broadcast_includes_connection_registered_during_enrichment(
+    monkeypatch,
+) -> None:
+    task_id = 42
+    existing_websocket = _RecordingWebSocket()
+    new_websocket = _RecordingWebSocket()
+    connection_manager = ConnectionManager()
+    connection_manager.register_connection(existing_websocket, task_id)
+
+    async def connect_during_enrichment(message, **kwargs):
+        connection_manager.register_connection(new_websocket, task_id)
+        return message
+
+    monkeypatch.setattr(
+        websocket_api,
+        "_with_current_task_control_state",
+        connect_during_enrichment,
+    )
+
+    message = {"type": "diagnostic"}
+    await connection_manager.broadcast_to_task(message, task_id)
+
+    encoded_message = json.dumps(message)
+    assert existing_websocket.messages == [encoded_message]
+    assert new_websocket.messages == [encoded_message]
 
 
 @pytest.mark.asyncio

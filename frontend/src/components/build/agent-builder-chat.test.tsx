@@ -1,6 +1,7 @@
 import React from "react"
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import type { ClarificationOnSend } from "@/components/chat/clarification-delivery"
 
 const apiRequestMock = vi.hoisted(() => vi.fn())
 const toastErrorMock = vi.hoisted(() => vi.fn())
@@ -103,7 +104,7 @@ vi.mock("@/components/chat/ChatMessage", () => ({
     traceEvents,
   }: {
     content?: React.ReactNode
-    onSendInteraction?: (text: string, files?: File[]) => Promise<void> | void
+    onSendInteraction?: ClarificationOnSend
     processStatus?: string
     traceEvents?: unknown[]
   }) => {
@@ -127,16 +128,24 @@ vi.mock("@/components/chat/ChatMessage", () => ({
         data-process-status={processStatus || ""}
         data-trace-count={traceEvents?.length ?? 0}
       >
+        {/* Rendered so the rollback tests can tell the surviving row apart
+            from the optimistic bubbles it is supposed to have removed. */}
+        <div>{content}</div>
         <button
           type="button"
           onClick={async () => {
             try {
               await onSendInteraction("upload this", [
                 new File(["data"], "data.txt", { type: "text/plain" }),
-              ])
+              ], {})
               setStatus("resolved")
-            } catch {
-              setStatus("rejected")
+            } catch (error) {
+              // Surface the declared delivery contract (#1485): the form
+              // probes `disposition` off whatever this callback rejects with.
+              const disposition = (error as { disposition?: unknown })?.disposition
+              setStatus(
+                `rejected:${typeof disposition === "string" ? disposition : "untyped"}`,
+              )
             }
           }}
         >
@@ -279,8 +288,45 @@ describe("AgentBuilderChat", () => {
     })
 
     await waitFor(() => {
-      expect(screen.getByText("rejected")).toBeInTheDocument()
+      // The upload failed before anything reached the agent, and the typed
+      // failure must say so - "not_sent" is what lets ClarificationForm tell
+      // the visitor a resubmit is safe.
+      expect(screen.getByText("rejected:not_sent")).toBeInTheDocument()
     })
+    // The resubmit that hint invites must not stack a duplicate answer: both
+    // optimistic bubbles (user + assistant placeholder) are rolled back,
+    // leaving only the initial greeting.
+    expect(screen.getAllByTestId("chat-message")).toHaveLength(1)
+    expect(screen.getAllByTestId("chat-message")[0]).toHaveTextContent(
+      "builds.configForm.chat.initialMessage"
+    )
+  })
+
+  it("rolls back both optimistic bubbles when the connection setup throws", async () => {
+    apiRequestMock.mockResolvedValueOnce(
+      successfulUploadResponse([{ file_id: "file-1", filename: "data.txt" }])
+    )
+    class ThrowingWebSocket {
+      static OPEN = 1
+      constructor(_url: string) {
+        throw new Error("SecurityError: insecure WebSocket")
+      }
+    }
+    globalThis.WebSocket = ThrowingWebSocket as unknown as typeof WebSocket
+
+    renderBuilderChat()
+    fireEvent.click(await screen.findByText("send-file-interaction"))
+
+    // Nothing reached the wire, so the interaction rejects as not_sent and
+    // the transcript returns to just the greeting - a hinted resubmit must
+    // not find a stranded answer bubble or blank placeholder.
+    await waitFor(() => {
+      expect(screen.getByText("rejected:not_sent")).toBeInTheDocument()
+    })
+    expect(screen.getAllByTestId("chat-message")).toHaveLength(1)
+    expect(screen.getAllByTestId("chat-message")[0]).toHaveTextContent(
+      "builds.configForm.chat.initialMessage"
+    )
   })
 
   it.each([

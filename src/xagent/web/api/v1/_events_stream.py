@@ -1350,8 +1350,11 @@ def count_task_sinks(task_id: int) -> int:
 
 
 def _is_runtime_key_active(key_prefix: str) -> bool:
-    """One indexed lookup, no bcrypt (the handshake already verified the
-    secret; this only re-checks revoked/paused)."""
+    """One indexed lookup without secret verification.
+
+    The handshake already verified the secret; this only re-checks
+    revoked/paused state.
+    """
     SessionLocal = get_session_local()
     with SessionLocal() as db:
         return (

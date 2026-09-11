@@ -36,6 +36,14 @@ from sqlalchemy.orm import Session
 
 from ...config import get_app_base_url, get_password_reset_expire_minutes
 from ...core.agent.voice_policy import VALID_VOICES as _CORE_VALID_VOICES
+from ...core.runtime_performance import (
+    increment_counter as increment_performance_counter,
+)
+from ...core.runtime_performance import (
+    observe_duration,
+    observe_value,
+    run_in_thread_with_telemetry,
+)
 from ..auth_config import (
     ACCESS_TOKEN_EXPIRE_MINUTES,
     JWT_ALGORITHM,
@@ -1479,6 +1487,8 @@ def get_user_by_login_identifier(db: Session, identifier: str) -> Optional[User]
 @auth_router.post("/login")
 async def login(request: LoginRequest, db: Session = Depends(get_db)) -> Dict[str, Any]:
     """User login endpoint"""
+    started_at = time.perf_counter()
+    outcome = "error"
     try:
         # Run synchronous database queries in thread pool to avoid blocking event loop
         def _get_user_sync() -> User:
@@ -1492,26 +1502,32 @@ async def login(request: LoginRequest, db: Session = Depends(get_db)) -> Dict[st
             return user
 
         # Execute database query in thread pool to avoid blocking
-        user = await asyncio.to_thread(_get_user_sync)
+        user = await run_in_thread_with_telemetry(
+            "login_user_lookup",
+            _get_user_sync,
+        )
 
         # Verify password
-        if not verify_password(request.password, str(user.password_hash)):
+        with observe_duration("xagent.auth.login.password_verify.duration"):
+            password_valid = verify_password(request.password, str(user.password_hash))
+        if not password_valid:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Incorrect username or password",
             )
 
         # Create JWT tokens
-        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-        access_token = create_access_token(
-            data={"sub": user.username, "user_id": user.id},
-            expires_delta=access_token_expires,
-        )
+        with observe_duration("xagent.auth.login.token_creation.duration"):
+            access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+            access_token = create_access_token(
+                data={"sub": user.username, "user_id": user.id},
+                expires_delta=access_token_expires,
+            )
 
-        # Create refresh token
-        refresh_token = create_refresh_token(
-            data={"sub": user.username, "user_id": user.id}
-        )
+            # Create refresh token
+            refresh_token = create_refresh_token(
+                data={"sub": user.username, "user_id": user.id}
+            )
 
         # Store refresh token in database - run in thread pool to avoid blocking
         def _update_user_sync() -> None:
@@ -1524,9 +1540,13 @@ async def login(request: LoginRequest, db: Session = Depends(get_db)) -> Dict[st
             db.commit()
 
         # Execute database update in thread pool to avoid blocking
-        await asyncio.to_thread(_update_user_sync)
+        await run_in_thread_with_telemetry(
+            "login_refresh_token_commit",
+            _update_user_sync,
+        )
 
         # Login successful
+        outcome = "succeeded"
         return {
             "success": True,
             "message": "Login successful",
@@ -1541,6 +1561,7 @@ async def login(request: LoginRequest, db: Session = Depends(get_db)) -> Dict[st
 
     except HTTPException:
         # Re-raise HTTP exceptions
+        outcome = "rejected"
         raise
     except Exception:
         # str(e) is not put in the response: _update_user_sync's db.commit()
@@ -1556,6 +1577,17 @@ async def login(request: LoginRequest, db: Session = Depends(get_db)) -> Dict[st
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="An unexpected error occurred during login.",
+        )
+    finally:
+        observe_value(
+            "xagent.auth.login.total.duration",
+            (time.perf_counter() - started_at) * 1_000.0,
+            unit="ms",
+            attributes={"outcome": outcome},
+        )
+        increment_performance_counter(
+            "xagent.auth.login.requests",
+            attributes={"outcome": outcome},
         )
 
 

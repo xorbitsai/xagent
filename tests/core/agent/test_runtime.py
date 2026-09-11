@@ -180,6 +180,222 @@ class StreamingLLM:
         yield StreamChunk(type=ChunkType.END)
 
 
+@pytest.mark.asyncio
+async def test_buffered_stream_yields_to_other_callbacks_between_chunks() -> None:
+    runtime = PatternRuntime()
+    observed = []
+    received = []
+    loop = asyncio.get_running_loop()
+
+    def on_chunk(chunk: StreamChunk) -> None:
+        received.append(chunk)
+        loop.call_soon(lambda: observed.append(len(received)))
+
+    result = await runtime.run_streaming_llm_call(StreamingLLM(), on_chunk=on_chunk)
+
+    assert result == "hello world"
+    assert observed == [1, 2, 3]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interrupt", [False, True])
+async def test_buffered_stream_can_be_stopped_between_chunks(interrupt: bool) -> None:
+    runtime = PatternRuntime()
+    received = []
+    loop = asyncio.get_running_loop()
+
+    def on_chunk(chunk: StreamChunk) -> None:
+        received.append(chunk.delta)
+        if interrupt:
+            loop.call_soon(runtime.request_interrupt, "stop buffered stream")
+        else:
+            loop.call_soon(call.cancel)
+
+    call = asyncio.create_task(
+        runtime.run_streaming_llm_call(StreamingLLM(), on_chunk=on_chunk)
+    )
+    expected = LLMCallInterrupted if interrupt else asyncio.CancelledError
+    with pytest.raises(expected):
+        await call
+    assert received == ["hello"]
+    assert not runtime._active_llm_tasks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode",
+    ["complete", "provider_error", "callback_error", "cancel", "interrupt", "checker"],
+)
+async def test_stream_is_closed_before_runtime_returns(mode: str) -> None:
+    closed = asyncio.Event()
+    stop = asyncio.Event()
+
+    class RetainedStream:
+        def __init__(self) -> None:
+            # Keep a reference so GC cannot hide missing explicit cleanup.
+            self.stream = self.generate()
+
+        def stream_chat(self, **_: Any) -> Any:
+            return self.stream
+
+        async def generate(self) -> Any:
+            owner = asyncio.current_task()
+            try:
+                yield StreamChunk(type=ChunkType.TOKEN, delta="first")
+                yield StreamChunk(
+                    type=ChunkType.ERROR
+                    if mode == "provider_error"
+                    else ChunkType.TOKEN,
+                    content="provider failed",
+                    delta="second",
+                )
+            finally:
+                assert asyncio.current_task() is owner
+                await asyncio.sleep(0)
+                closed.set()
+
+    runtime = PatternRuntime(
+        interrupt_checker=lambda: "checker stopped" if stop.is_set() else False
+    )
+    llm = RetainedStream()
+    received = []
+
+    def on_chunk(chunk: StreamChunk) -> None:
+        received.append(chunk.delta)
+        if mode == "callback_error":
+            raise ValueError("callback failed")
+        loop = asyncio.get_running_loop()
+        if mode == "cancel":
+            loop.call_soon(call.cancel)
+        elif mode == "interrupt":
+            loop.call_soon(runtime.request_interrupt, "requested stop")
+        elif mode == "checker":
+            # No explicit cancel/request_interrupt: exercise the checker path.
+            loop.call_soon(stop.set)
+
+    call = asyncio.create_task(runtime.run_streaming_llm_call(llm, on_chunk=on_chunk))
+    try:
+        if mode == "complete":
+            assert await call == "firstsecond"
+        else:
+            exception = {
+                "provider_error": RuntimeError,
+                "callback_error": ValueError,
+                "cancel": asyncio.CancelledError,
+                "interrupt": LLMCallInterrupted,
+                "checker": LLMCallInterrupted,
+            }[mode]
+            with pytest.raises(exception) as error:
+                await call
+            if mode == "checker":
+                assert str(error.value) == "checker stopped"
+            assert received == ["first"]
+        assert closed.is_set()
+        assert not runtime._active_llm_tasks
+    finally:
+        await llm.stream.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source_error", [False, True])
+async def test_stream_close_error_does_not_mask_source_error(
+    source_error: bool,
+) -> None:
+    class BrokenClose:
+        def stream_chat(self, **_: Any) -> Any:
+            return self
+
+        def __aiter__(self) -> Any:
+            return self
+
+        async def __anext__(self) -> Any:
+            if source_error:
+                raise ValueError("source failed")
+            raise StopAsyncIteration
+
+        async def aclose(self) -> None:
+            await asyncio.sleep(0)
+            raise RuntimeError("close failed")
+
+    expected = ValueError if source_error else RuntimeError
+    message = "source failed" if source_error else "close failed"
+    with pytest.raises(expected, match=message):
+        await PatternRuntime().run_streaming_llm_call(BrokenClose())
+
+
+@pytest.mark.asyncio
+async def test_stream_without_aclose_remains_supported() -> None:
+    class Iterator:
+        def __init__(self) -> None:
+            self.done = False
+
+        def __aiter__(self) -> Any:
+            return self
+
+        async def __anext__(self) -> StreamChunk:
+            if self.done:
+                raise StopAsyncIteration
+            self.done = True
+            return StreamChunk(type=ChunkType.TOKEN, delta="answer")
+
+    class LLM:
+        def stream_chat(self, **_: Any) -> Any:
+            return Iterator()
+
+    assert await PatternRuntime().run_streaming_llm_call(LLM()) == "answer"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interrupt", [False, True])
+async def test_cancellation_wins_over_concurrent_provider_error(
+    interrupt: bool,
+) -> None:
+    runtime = PatternRuntime()
+
+    class ErrorStream:
+        async def stream_chat(self, **_: Any) -> Any:
+            loop = asyncio.get_running_loop()
+            if interrupt:
+                loop.call_soon(runtime.request_interrupt, "requested stop")
+            else:
+                loop.call_soon(call.cancel)
+            yield StreamChunk(type=ChunkType.ERROR, content="provider failed")
+
+    call = asyncio.create_task(runtime.run_streaming_llm_call(ErrorStream()))
+    expected = LLMCallInterrupted if interrupt else asyncio.CancelledError
+    with pytest.raises(expected):
+        await call
+
+
+@pytest.mark.asyncio
+async def test_buffered_protocol_error_keeps_usage_and_yields() -> None:
+    from xagent.core.model.chat.tool_protocol import TOOL_PROTOCOL_ERROR_KEY
+
+    class ProtocolStream:
+        async def stream_chat(self, **_: Any) -> Any:
+            yield StreamChunk(
+                type=ChunkType.PROTOCOL_ERROR,
+                protocol_error={"code": "invalid_tool_call"},
+            )
+            yield StreamChunk(type=ChunkType.USAGE, usage={"total_tokens": 10})
+
+    observed = []
+    received = []
+
+    def on_chunk(chunk: StreamChunk) -> None:
+        received.append(chunk.type)
+        asyncio.get_running_loop().call_soon(lambda: observed.append(len(received)))
+
+    result = await PatternRuntime().run_streaming_llm_call(
+        ProtocolStream(), on_chunk=on_chunk
+    )
+    assert observed == [1, 2]
+    assert result[TOOL_PROTOCOL_ERROR_KEY] == {"code": "invalid_tool_call"}
+    assert result["usage"] == {"total_tokens": 10}
+    assert result["content"] == ""
+    assert result["tool_calls"] == []
+
+
 class StreamingLLMWithUsage:
     async def stream_chat(self, **_: Any) -> Any:
         yield StreamChunk(type=ChunkType.TOKEN, delta="hello")
@@ -1317,6 +1533,7 @@ class RaisingCompactLLM:
     fallback in ``PatternRuntime.compact_context_if_needed``."""
 
     model_name = "raising-compact-llm"
+    context_window = 32_000
 
     async def chat(self, **_: Any) -> Any:
         raise RuntimeError("compact llm exploded")
@@ -1459,6 +1676,7 @@ async def test_compaction_records_that_an_unusable_summary_was_discarded() -> No
 
     class EmptySummaryLLM:
         model_name = "compact-test"
+        context_window = 32_000
 
         async def chat(self, **_: Any) -> Any:
             return {"content": ""}
@@ -1507,6 +1725,7 @@ async def test_compaction_retries_with_a_smaller_budget_before_truncating() -> N
 
     class OutputCappedLLM:
         model_name = "compact-test"
+        context_window = 64_000
 
         def __init__(self) -> None:
             self.budgets: list[int] = []
@@ -1559,6 +1778,7 @@ async def test_compaction_ladder_skips_a_budget_the_model_cannot_use() -> None:
 
     class CappedReasoningLLM:
         model_name = "compact-test"
+        context_window = 64_000
 
         def __init__(self) -> None:
             self.budgets: list[int] = []
@@ -1614,6 +1834,7 @@ async def test_compaction_stops_descending_once_a_budget_is_accepted() -> None:
 
     class AlwaysReasoningLLM:
         model_name = "compact-test"
+        context_window = 64_000
 
         def __init__(self) -> None:
             self.budgets: list[int] = []
@@ -1712,6 +1933,7 @@ async def test_compaction_does_not_blame_the_model_when_nothing_is_summarizable(
 
     class UnusedCompactLLM:
         model_name = "compact-test"
+        context_window = 32_000
 
         async def chat(self, **_: Any) -> Any:  # pragma: no cover - never called
             raise AssertionError("no request should have been built")
@@ -1734,9 +1956,85 @@ async def test_compaction_does_not_blame_the_model_when_nothing_is_summarizable(
 
 class _SummarizingLLM:
     model_name = "compact-test"
+    context_window = 32_000
 
     async def chat(self, **_: Any) -> Any:
         return {"content": "what happened earlier"}
+
+
+@pytest.mark.asyncio
+async def test_compaction_does_not_truncate_an_unsendable_safe_request() -> None:
+    context = ExecutionContext(execution_id="unsafe-to-truncate")
+    context.compact_config.threshold = 24000
+    context.compact_config.max_messages = 2
+    for _ in range(6):
+        context.add_user_message("z" * 17_000)
+    context.add_assistant_message(
+        "",
+        tool_calls=[
+            {
+                "id": "call-1",
+                "type": "function",
+                "function": {
+                    "name": "large_call",
+                    "arguments": "v" * 200_000,
+                },
+            }
+        ],
+    )
+    original_messages = list(context.messages)
+
+    class UnusedLLM:
+        context_window = 32_000
+
+        async def chat(self, **_: Any) -> Any:  # pragma: no cover - must not run
+            raise AssertionError("an oversized compact request must not be sent")
+
+    result = await PatternRuntime().compact_context_if_needed(
+        context=context,
+        llm=UnusedLLM(),
+    )
+
+    assert not result.compacted
+    assert result.metadata["llm_compact_request_too_large"] is True
+    assert result.metadata["fallback_suppressed"] is True
+    assert context.messages == original_messages
+
+
+@pytest.mark.asyncio
+async def test_compaction_preserves_context_after_provider_rejects_its_length() -> None:
+    context = ExecutionContext(execution_id="provider-context-rejection")
+    context.compact_config.threshold = 1
+    context.compact_config.max_messages = 2
+    marker = "ORIGINAL_REQUIREMENT_MUST_SURVIVE"
+    context.add_user_message(marker)
+    for index in range(4):
+        context.add_assistant_message(f"work-{index}")
+    original_messages = list(context.messages)
+
+    class RejectingLLM:
+        context_window = 32_000
+
+        def __init__(self) -> None:
+            self.budgets: list[int] = []
+
+        async def chat(self, **kwargs: Any) -> Any:
+            self.budgets.append(kwargs["max_tokens"])
+            raise RuntimeError(
+                "The input token count (461428) exceeds the maximum number "
+                "of tokens allowed (131072)."
+            )
+
+    llm = RejectingLLM()
+    result = await PatternRuntime().compact_context_if_needed(context=context, llm=llm)
+
+    assert llm.budgets == [256]
+    assert not result.compacted
+    assert result.strategy == "none"
+    assert result.metadata["llm_compact_context_length_error"] is True
+    assert result.metadata["fallback_suppressed"] is True
+    assert context.messages == original_messages
+    assert marker in context.messages[0].content
 
 
 def _oversized_context(execution_id: str) -> ExecutionContext:

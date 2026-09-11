@@ -49,6 +49,15 @@ def _user(db, uid):
     return db.query(User).filter(User.id == uid).first()
 
 
+def _add_shopify_catalog_app(db):
+    from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app
+
+    row = get_builtin_public_mcp_app("shopify")
+    assert row is not None
+    db.add(PublicMCPApp(**row))
+    db.commit()
+
+
 def test_connect_provisions_shared_server_with_per_user_env(test_db):
     """First connect creates the shared stdio server + a non-owner association
     whose per-user env holds the caller's key, encrypted at rest."""
@@ -78,6 +87,102 @@ def test_connect_provisions_shared_server_with_per_user_env(test_db):
     # Key stored encrypted, decrypts back to plaintext.
     assert assoc.env != {"GOOGLE_MAPS_API_KEY": "alice-key"}
     assert decrypt_env_dict(assoc.env) == {"GOOGLE_MAPS_API_KEY": "alice-key"}
+
+
+def test_shopify_connect_stamps_official_server_provenance(test_db):
+    from xagent.web.api.mcp import MCPAppConnectRequest, connect_mcp_app
+
+    _add_shopify_catalog_app(test_db)
+    connect_mcp_app(
+        "shopify",
+        MCPAppConnectRequest(
+            env={
+                "SHOPIFY_STORE_DOMAIN": "acme",
+                "SHOPIFY_ACCESS_TOKEN": "shpat_test_secret",
+            }
+        ),
+        current_user=_user(test_db, 1),
+        db=test_db,
+    )
+
+    server = test_db.query(MCPServer).filter(MCPServer.name == "shopify").one()
+    assert server.auth == {
+        "builtin_provenance": {
+            "registry": "xagent",
+            "app_id": "shopify",
+            "version": 1,
+        }
+    }
+    assert "auth" not in server.to_connection_dict()
+
+
+@pytest.mark.parametrize("server_name", ["shopify", " Shopify ", "ShOpIfY"])
+def test_shopify_connect_refuses_unstamped_custom_server_even_if_shape_matches(
+    test_db, server_name
+):
+    from fastapi import HTTPException
+
+    from xagent.web.api.mcp import MCPAppConnectRequest, connect_mcp_app
+
+    _add_shopify_catalog_app(test_db)
+    test_db.add(
+        MCPServer(
+            name=server_name,
+            description="custom",
+            managed="external",
+            transport="stdio",
+            command="python",
+            args=["-m", "xagent.web.tools.mcp.shopify"],
+        )
+    )
+    test_db.commit()
+
+    with pytest.raises(HTTPException) as exc_info:
+        connect_mcp_app(
+            "shopify",
+            MCPAppConnectRequest(
+                env={
+                    "SHOPIFY_STORE_DOMAIN": "acme",
+                    "SHOPIFY_ACCESS_TOKEN": "shpat_test_secret",
+                }
+            ),
+            current_user=_user(test_db, 1),
+            db=test_db,
+        )
+
+    assert exc_info.value.status_code == 409
+
+
+def test_shopify_connect_refuses_normalized_custom_catalog_name_collision(test_db):
+    from fastapi import HTTPException
+
+    from xagent.web.api.mcp import MCPAppConnectRequest, connect_mcp_app
+
+    _add_shopify_catalog_app(test_db)
+    test_db.add(
+        PublicMCPApp(
+            app_id="custom-store",
+            name=" SHOPIFY ",
+            transport="stdio",
+            launch_config={"command": "custom"},
+        )
+    )
+    test_db.commit()
+
+    with pytest.raises(HTTPException) as exc_info:
+        connect_mcp_app(
+            "shopify",
+            MCPAppConnectRequest(
+                env={
+                    "SHOPIFY_STORE_DOMAIN": "acme",
+                    "SHOPIFY_ACCESS_TOKEN": "shpat_test_secret",
+                }
+            ),
+            current_user=_user(test_db, 1),
+            db=test_db,
+        )
+
+    assert exc_info.value.status_code == 409
 
 
 def test_second_user_joins_same_server_with_own_key(test_db):

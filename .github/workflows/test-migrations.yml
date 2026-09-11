@@ -45,6 +45,9 @@ on:
       - 'src/xagent/web/services/task_interaction_schema.py'
       - 'src/xagent/core/agent/checkpoint.py'
       - 'src/xagent/web/services/task_lease_service.py'
+      - 'tests/web/services/test_task_lease_heartbeat_batch.py'
+      - 'tests/web/services/test_task_settlement_locking.py'
+      - 'tests/web/services/test_task_execution_event_store.py'
       - 'src/xagent/web/services/chat_history_service.py'
       - 'src/xagent/web/services/ops_signals.py'
       - 'src/xagent/core/tools/adapters/vibe/ask_user_tool.py'
@@ -148,6 +151,9 @@ jobs:
             src/xagent/web/services/task_interaction_schema.py
             src/xagent/core/agent/checkpoint.py
             src/xagent/web/services/task_lease_service.py
+            tests/web/services/test_task_lease_heartbeat_batch.py
+            tests/web/services/test_task_settlement_locking.py
+            tests/web/services/test_task_execution_event_store.py
             src/xagent/web/services/chat_history_service.py
             src/xagent/web/services/ops_signals.py
             src/xagent/core/tools/adapters/vibe/ask_user_tool.py
@@ -408,6 +414,13 @@ jobs:
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
           pytest tests/web/services/test_user_preferences_lock_postgres.py -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test heartbeat and settlement lock isolation (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/web/services/test_task_lease_heartbeat_batch.py tests/web/services/test_task_settlement_locking.py -m postgresql -q
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 

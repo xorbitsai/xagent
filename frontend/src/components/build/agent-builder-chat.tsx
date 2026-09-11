@@ -15,6 +15,10 @@ import { useI18n } from "@/contexts/i18n-context"
 import { toast } from "@/components/ui/sonner"
 import { getBrandingFromEnv } from "@/lib/branding"
 import { normalizeUploadFileIds } from "@/lib/upload-file-ids"
+import {
+  createClarificationSendFailure,
+  type ClarificationSendMetadata,
+} from "@/components/chat/clarification-delivery"
 
 import { Interaction } from "@/contexts/app-context-chat"
 
@@ -142,7 +146,7 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
     }
   }, [messages])
 
-  const handleSendMessage = useCallback(async (text: string, files?: File[], metadata?: any) => {
+  const handleSendMessage = useCallback(async (text: string, files?: File[], metadata?: ClarificationSendMetadata) => {
     if ((!text.trim() && (!files || files.length === 0)) || isLoading) return false
 
     let displayMessage: string | React.ReactNode = text || t("chatPage.clarification.uploadedFiles")
@@ -236,7 +240,10 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
         console.error("Failed to upload files", err);
         toast.error(err instanceof Error ? err.message : "Failed to upload files");
         setIsLoading(false);
-        setMessages(prev => prev.slice(0, -1));
+        // Nothing was sent, so the optimistic user bubble comes back out with
+        // the assistant placeholder - otherwise a resubmit (which the form's
+        // "not sent" hint now invites) shows the same answer twice.
+        setMessages(prev => prev.slice(0, -2));
         return false;
       }
     } else if (metadata?.url) {
@@ -514,6 +521,11 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
       console.error(error)
       toast.error(t("builds.configForm.chat.errorInit") || "Failed to initialize connection.")
       setIsLoading(false)
+      // Same rollback as the upload failure above: nothing was sent, so both
+      // optimistic bubbles come back out - the "not sent" hint invites a
+      // resubmit that must not stack a duplicate answer over a blank
+      // placeholder.
+      setMessages(prev => prev.slice(0, -2))
       return false
     }
     return true
@@ -553,7 +565,15 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
               onSendInteraction={async (text, files, meta) => {
                 const didSend = await handleSendMessage(text, files, meta)
                 if (!didSend) {
-                  throw new Error("Failed to send interaction")
+                  // Every false return means the payload never went out -
+                  // empty input, a send already in flight, upload failure, or
+                  // a connection setup throw - so "not_sent" is accurate and
+                  // the visitor can resubmit safely. The message is a
+                  // developer diagnostic, so it stays non-user-facing.
+                  throw createClarificationSendFailure(
+                    "Failed to send interaction",
+                    "not_sent",
+                  )
                 }
               }}
             />

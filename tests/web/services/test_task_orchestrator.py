@@ -4342,3 +4342,122 @@ async def test_leased_auto_failure_preserves_client_classification(db_session) -
     assert settlements[0]["client_error_message"] == CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
     assert settlements[0]["error_message"] == CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
     assert "private model binding details" not in json.dumps(frames)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["checkpoint", "trace", "outbound"])
+@pytest.mark.parametrize("write_fails", [False, True])
+async def test_cancelled_runner_drains_persistence_before_settlement(
+    db_session, monkeypatch, kind, write_fails
+):
+    from xagent.core.agent.checkpoint import CHECKPOINT_EVENT_TYPE
+    from xagent.core.agent.trace import TraceEvent as CoreTraceEvent
+    from xagent.web.api import trace_handlers, websocket
+    from xagent.web.services.task_lease_service import bind_task_lease_context
+
+    turn_id = f"cancel-persist-{kind}-{write_fails}"
+    user, task, payload, lease = _finalize_turn_fixture(db_session, turn_id=turn_id)
+    started, release, closed, rolled_back = Event(), Event(), Event(), Event()
+    heartbeat_stopped = asyncio.Event()
+    settlement_started = Event()
+    error = RuntimeError("persistence failed during cancellation")
+
+    class WriterSession(Session):
+        def commit(self):
+            self.flush()
+            started.set()
+            assert release.wait(8)
+            if write_fails:
+                raise error
+            return super().commit()
+
+        def rollback(self):
+            result = super().rollback()
+            rolled_back.set()
+            return result
+
+        def close(self):
+            super().close()
+            closed.set()
+
+    factory = sessionmaker(db_session.get_bind(), class_=WriterSession)
+    monkeypatch.setattr(trace_handlers, "get_db", lambda: iter([factory()]))
+    monkeypatch.setattr(websocket, "get_db", lambda: iter([factory()]))
+    broadcast = AsyncMock()
+    monkeypatch.setattr(websocket.manager, "broadcast_to_task", broadcast)
+
+    async def execute(*args, **kwargs):
+        with bind_task_lease_context(lease):
+            if kind == "outbound":
+                await websocket.make_agent_outbound_handler(task.id)(
+                    {"message": "progress", "event_id": turn_id}
+                )
+            else:
+                event = CoreTraceEvent(
+                    CHECKPOINT_EVENT_TYPE,
+                    task_id=str(task.id),
+                    step_id="step",
+                    data={
+                        "checkpoint_type": CHECKPOINT_TYPE,
+                        "execution_id": "cancel-test",
+                        "snapshot": {},
+                    }
+                    if kind == "checkpoint"
+                    else {"message": "progress"},
+                    require_persisted=kind == "checkpoint",
+                )
+                await trace_handlers.DatabaseTraceHandler(task.id)._save_to_database(
+                    event
+                )
+
+    async def heartbeat(_lease, stop_event):
+        await stop_event.wait()
+        heartbeat_stopped.set()
+        return TaskLeaseHeartbeatOutcome()
+
+    settle = task_orchestrator_module.settle_task_lease_isolated
+
+    def checked_settle(*args, **kwargs):
+        settlement_started.set()
+        assert closed.is_set()
+        assert heartbeat_stopped.is_set()
+        assert rolled_back.is_set() == write_fails
+        return settle(*args, **kwargs)
+
+    with _finalize_runner_patches(lease, execute=execute, settle=checked_settle):
+        monkeypatch.setattr(
+            task_orchestrator_module, "run_task_lease_heartbeat", heartbeat
+        )
+        bg_task = _spawn_finalize_runner(task, user, payload)
+        try:
+            async with asyncio.timeout(5):
+                while not started.is_set():
+                    await asyncio.sleep(0.001)
+            for _ in range(2):
+                bg_task.cancel()
+                # Give cancellation a complete event-loop turn to reach the
+                # persistence boundary; the worker stays behind its barrier.
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+                assert not bg_task.done()
+                assert not closed.is_set()
+                assert not settlement_started.is_set()
+                assert not heartbeat_stopped.is_set()
+        finally:
+            release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(bg_task, 5)
+
+    assert settlement_started.is_set()
+    db_session.expire_all()
+    stored = db_session.get(Task, task.id)
+    assert stored.status == TaskStatus.FAILED
+    assert bool(stored.last_checkpoint_event_id) == (
+        kind == "checkpoint" and not write_fails
+    )
+    assert _delivery_status(db_session, turn_id) == DELIVERY_DISPATCHED
+    if kind == "outbound":
+        assert not any(
+            call.args[0].get("event_id") == turn_id
+            for call in broadcast.await_args_list
+        )

@@ -64,6 +64,8 @@ def test_pause_accepted_marker_can_be_cleared() -> None:
 async def test_resume_coordinator_does_not_replace_task_that_it_waits_for() -> None:
     manager = BackgroundTaskManager()
     allow_original_to_check = asyncio.Event()
+    promoted = asyncio.Event()
+    allow_resume_to_finish = asyncio.Event()
 
     async def original_runner() -> None:
         await allow_original_to_check.wait()
@@ -78,6 +80,8 @@ async def test_resume_coordinator_does_not_replace_task_that_it_waits_for() -> N
         current = asyncio.current_task()
         assert current is not None
         manager.promote_resume_task(7, current)
+        promoted.set()
+        await allow_resume_to_finish.wait()
 
     resume = asyncio.create_task(resume_runner())
     manager.register_reserved_resume(7, resume, run_id=None)
@@ -88,9 +92,22 @@ async def test_resume_coordinator_does_not_replace_task_that_it_waits_for() -> N
     assert manager.resume_tasks[7] is resume
     assert not manager.reserve_resume(7)
 
-    allow_original_to_check.set()
-    await asyncio.wait_for(asyncio.gather(original, resume), timeout=1)
-    assert manager.running_tasks[7] is resume
+    try:
+        allow_original_to_check.set()
+        await asyncio.wait_for(promoted.wait(), timeout=1)
+        # Check ownership while the promoted coordinator is still running;
+        # completed owners are intentionally removed by their done callback.
+        assert original.done()
+        assert not resume.done()
+        assert manager.running_tasks[7] is resume
+        assert manager.resume_tasks[7] is resume
+    finally:
+        allow_original_to_check.set()
+        allow_resume_to_finish.set()
+        await asyncio.wait_for(asyncio.gather(original, resume), timeout=1)
+
+    assert 7 not in manager.running_tasks
+    assert 7 not in manager.resume_tasks
 
 
 @pytest.mark.asyncio

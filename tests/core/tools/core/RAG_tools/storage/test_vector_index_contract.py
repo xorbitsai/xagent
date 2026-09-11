@@ -68,7 +68,7 @@ def _store_on(db):
     )
 
     store = LanceDBVectorIndexStore()
-    store._conn = db
+    store._get_connection = lambda: db  # type: ignore[method-assign]
     return store
 
 

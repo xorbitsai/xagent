@@ -134,10 +134,14 @@ async def test_web_search_category_selection_keeps_web_fetch_tool(monkeypatch):
 
     tools = await ToolFactory.create_all_tools(config)
 
-    # get_current_time is intrinsic: it rides along every non-NONE selection
-    # regardless of category, so a web_search-only agent sees it too (#1729).
-    # It sorts last, being category OTHER rather than BASIC.
-    assert _tool_names(tools) == ["fetch_web_content", "get_current_time"]
+    # The time tools are intrinsic: they ride along every non-NONE selection
+    # regardless of category, so a web_search-only agent sees them too
+    # (#1729). They sort last, being category OTHER rather than BASIC.
+    assert _tool_names(tools) == [
+        "fetch_web_content",
+        "get_current_time",
+        "validate_local_time",
+    ]
 
 
 @pytest.mark.asyncio

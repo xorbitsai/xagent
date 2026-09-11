@@ -2919,23 +2919,6 @@ export function AppProvider({
     }
 
     switch (message.type) {
-      case "chat":
-        const chatData = message as any
-        const messageContent = chatData.message || ""
-
-        if (!isDuplicateMessageForViewedTask(messageContent, 'user-message')) {
-          dispatch({
-            type: "ADD_MESSAGE",
-            payload: {
-              id: generateMessageId("msg-user"),
-              role: "user",
-              content: messageContent,
-              timestamp: message.timestamp?.toString() || Date.now().toString(),
-            }
-          })
-        }
-        break
-
       case "trace_event":
         const traceEventData = (message.data ?? {}) as any
 
@@ -5400,20 +5383,6 @@ export function AppProvider({
             dispatch({ type: "ADD_TRACE_EVENT", payload: traceEventData })
           }
         }
-        break
-
-      case "chat_message":
-        console.trace('Original message:', JSON.stringify(message), 'Handler: handleMessage (chat_message)')
-        const messageData = message.data as any
-        dispatch({
-          type: "ADD_MESSAGE",
-          payload: {
-            id: `msg-${messageData.id}`,
-            role: messageData.role,
-            content: messageData.content,
-            timestamp: messageData.timestamp,
-          },
-        })
         break
 
       case "task_completed":

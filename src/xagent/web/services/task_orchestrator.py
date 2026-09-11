@@ -111,7 +111,7 @@ from .task_lease_service import (
     acquire_task_lease_no_commit,
     fail_and_release_task_lease_no_commit,
     get_runner_id,
-    lock_task_lease_no_commit,
+    lock_task_lease_for_settlement_no_commit,
     release_task_lease,
     run_task_lease_heartbeat,
     run_while_task_lease_owned,
@@ -1565,7 +1565,7 @@ def finish_turn(
                 task_id,
             )
             return False
-        lock_task_lease_no_commit(bg_db, task_lease)
+        lock_task_lease_for_settlement_no_commit(bg_db, task_lease)
         query = query.filter(
             Task.runner_id == task_lease.runner_id,
             task_lease_attempt_predicate(task_lease),

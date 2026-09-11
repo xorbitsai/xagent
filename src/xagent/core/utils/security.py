@@ -38,6 +38,7 @@ AUTH_HEADER_PATTERN = re.compile(
 HEADER_KEY_PATTERNS = [
     re.compile(r"(?i)(x-goog-api-key\s*[:=]\s*)([^\s,;]+)"),
     re.compile(r"(?i)(x-api-key\s*[:=]\s*)([^\s,;]+)"),
+    re.compile(r"(?i)(x-shopify-access-token\s*[:=]\s*)([^\s,;]+)"),
 ]
 
 

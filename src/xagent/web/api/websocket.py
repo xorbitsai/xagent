@@ -65,6 +65,13 @@ from ...core.execution_scope import (
     resolve_execution_scope_off_turn,
 )
 from ...core.file_ref import FILE_REF_MODEL_INSTRUCTIONS, build_file_ref
+from ...core.runtime_performance import (
+    increment_counter as increment_performance_counter,
+)
+from ...core.runtime_performance import (
+    observe_duration,
+    observe_value,
+)
 from ..models.chat_message import TaskChatMessage
 from ..models.database import (
     get_db,
@@ -215,6 +222,7 @@ from ..services.task_lease_service import (
     acquire_task_lease_cancellation_safe,
     acquire_task_lease_no_commit,
     bind_task_lease_context,
+    lock_task_lease_for_settlement_no_commit,
     lock_task_lease_no_commit,
     registered_task_lease,
     release_task_lease_no_commit,
@@ -1203,7 +1211,9 @@ def make_agent_outbound_handler(task_id: int) -> Any:
             },
             event_id=payload.get("event_id"),
         )
-        await asyncio.to_thread(_persist_agent_outbound_event, task_id, event)
+        await run_db_io_cancellation_safe(
+            lambda: _persist_agent_outbound_event(task_id, event)
+        )
         await manager.broadcast_to_task(event, task_id)
 
     return handle_outbound_message
@@ -2497,7 +2507,7 @@ def _finalize_task_execution_result_isolated(
                 task_updated = None
                 late_result = True
             else:
-                lock_task_lease_no_commit(finalize_db, task_lease)
+                lock_task_lease_for_settlement_no_commit(finalize_db, task_lease)
                 task_updated = (
                     task_query.filter(
                         Task.runner_id == task_lease.runner_id,
@@ -3237,7 +3247,7 @@ def _finalize_resumed_task(
     metadata_committed = False
     cleanup_claims: tuple[SupersededObjectCleanupClaim, ...] = ()
     try:
-        lock_task_lease_no_commit(db, task_lease)
+        lock_task_lease_for_settlement_no_commit(db, task_lease)
         task = (
             db.query(Task)
             .filter(
@@ -4401,6 +4411,13 @@ class BackgroundTaskManager:
             task.cancel()
             raise RuntimeError("Background task manager is shutting down")
         self.running_tasks[task_id] = task
+        # Execution may run in a lease-guard child task, whose finally block
+        # cannot remove this still-running outer owner. Release the registration
+        # when its actual owner finishes, including failure or early cancellation.
+        # Fence by identity so an old completion cannot remove a newer run.
+        task.add_done_callback(
+            lambda finished: self.cleanup_task(task_id, expected_task=finished)
+        )
         logger.info(f"Registered background task for task {task_id}")
 
     def resume_admission_state(
@@ -4500,6 +4517,12 @@ class BackgroundTaskManager:
         self._resume_owner_started_at.setdefault(task_id, time.monotonic())
         self.resume_tasks[task_id] = task
         self._resume_run_ids[task_id] = run_id
+        # Cancellation before the coroutine starts skips its finally block.
+        # Use the same owner fence as execution completion, including after
+        # this coordinator has been promoted into running_tasks.
+        task.add_done_callback(
+            lambda finished: self.cleanup_task(task_id, expected_task=finished)
+        )
         logger.info("Registered resume coordinator for task %s", task_id)
 
     def release_resume_reservation(self, task_id: int) -> None:
@@ -5193,6 +5216,16 @@ class ConnectionManager:
         """Return a stable snapshot of a task's current connections."""
         return self.active_connections.get(task_id, []).copy()
 
+    def has_connections_for_task(self, task_id: int) -> bool:
+        """Return whether a task currently has a registered connection."""
+
+        return bool(self.active_connections.get(task_id))
+
+    def connection_count(self) -> int:
+        """Return the current number of task WebSocket registrations."""
+
+        return len(self._connection_task_ids)
+
     def is_connection_registered(self, websocket: WebSocket, task_id: int) -> bool:
         """Return whether a connection is still owned by the given task."""
         return self._connection_task_ids.get(websocket) == task_id
@@ -5210,16 +5243,47 @@ class ConnectionManager:
         await websocket.send_text(json.dumps(versioned_message))
 
     async def broadcast_to_task(self, message: dict, task_id: int) -> None:
-        if self.connections_for_task(task_id):
+        has_connections = self.has_connections_for_task(task_id)
+        increment_performance_counter(
+            "xagent.websocket.broadcast.calls",
+            attributes={"outcome": "connected" if has_connections else "empty"},
+        )
+        if not has_connections:
+            return
+
+        with observe_duration("xagent.websocket.broadcast.duration"):
             versioned_message = await _with_current_task_control_state(
                 message,
                 fallback_task_id=task_id,
             )
-            for connection in self.connections_for_task(task_id):
+            # Registrations can change while message enrichment yields. Take
+            # the delivery snapshot afterwards so newly connected clients are
+            # included; membership is checked again before every send below.
+            connections = self.connections_for_task(task_id)
+            # Fanout measures intended recipients, not successful deliveries.
+            observe_value(
+                "xagent.websocket.broadcast.fanout",
+                len(connections),
+                unit="{connection}",
+            )
+            try:
+                encoded_message = json.dumps(versioned_message)
+            except Exception:
+                # Invalid message data does not imply a broken connection.
+                logger.error("Failed to serialize WebSocket broadcast", exc_info=True)
+                raise
+            observe_value(
+                "xagent.websocket.payload.size",
+                # ensure_ascii=True makes character count equal byte count.
+                len(encoded_message),
+                unit="By",
+            )
+            for connection in connections:
                 if not self.is_connection_registered(connection, task_id):
                     continue
                 try:
-                    await connection.send_text(json.dumps(versioned_message))
+                    await connection.send_text(encoded_message)
+                    increment_performance_counter("xagent.websocket.messages.sent")
                 except (
                     BrokenResourceError,
                     ClosedResourceError,
@@ -5227,10 +5291,18 @@ class ConnectionManager:
                     WebSocketDisconnect,
                     RuntimeError,
                 ) as e:
+                    increment_performance_counter(
+                        "xagent.websocket.send.errors",
+                        attributes={"error.type": "connection"},
+                    )
                     # Network connection error, remove disconnected connection
                     logger.warning(f"Connection error for task {task_id}: {e}")
                     self.disconnect(connection)
                 except Exception as e:
+                    increment_performance_counter(
+                        "xagent.websocket.send.errors",
+                        attributes={"error.type": "unexpected"},
+                    )
                     # Other errors should not be silently handled, log and re-raise
                     logger.error(
                         f"Unexpected error broadcasting to task {task_id}: {e}"

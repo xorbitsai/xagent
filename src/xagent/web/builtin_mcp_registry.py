@@ -9,6 +9,11 @@ from typing import Any
 import sqlalchemy as sa
 from sqlalchemy.engine import Connection
 
+from ..builtin_identity import (
+    builtin_provenance_identity,
+    canonicalize_builtin_identity,
+)
+
 OAUTH_PROVIDERS_TABLE = sa.table(
     "oauth_providers",
     sa.column("provider_name", sa.String),
@@ -36,6 +41,12 @@ PUBLIC_MCP_APPS_TABLE = sa.table(
     sa.column("oauth_scopes", sa.JSON),
     sa.column("is_visible_in_connector", sa.Boolean),
     sa.column("launch_config", sa.JSON),
+)
+
+MCP_SERVERS_IDENTITY_TABLE = sa.table(
+    "mcp_servers",
+    sa.column("name", sa.String),
+    sa.column("auth", sa.JSON),
 )
 
 
@@ -1434,6 +1445,44 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             },
         },
         {
+            "app_id": "shopify",
+            "name": "Shopify",
+            "description": "Connect a Shopify custom app with a store label (for example, acme for acme.myshopify.com) and Admin API access token. Grant write_products, write_orders, and read_customers; read_all_orders is optional for orders older than 60 days.",
+            "icon": "https://www.google.com/s2/favicons?domain=shopify.com&sz=128",
+            "transport": "stdio",
+            "provider_name": None,
+            "category": "Commerce",
+            "oauth_scopes": None,
+            "is_visible_in_connector": True,
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.shopify"],
+                "required_env": [
+                    "SHOPIFY_STORE_DOMAIN",
+                    "SHOPIFY_ACCESS_TOKEN",
+                ],
+                "required_admin_scopes": [
+                    "write_products",
+                    "write_orders",
+                    "read_customers",
+                ],
+                "optional_admin_scopes": ["read_all_orders"],
+                # Compatibility metadata only. Current main ignores this
+                # field; a later actor-scoped stdio runtime can recognize
+                # that credentials are personal without this PR enabling
+                # delegated/Toby access or bypassing current isolation.
+                "credential_scope": "personal",
+                # Stable ownership marker used by the seed migration. It is
+                # intentionally inside launch_config because current main
+                # has no dedicated catalog-provenance column.
+                "builtin_provenance": {
+                    "registry": "xagent",
+                    "app_id": "shopify",
+                    "version": 1,
+                },
+            },
+        },
+        {
             "app_id": "magento",
             "name": "Magento",
             "description": 'Connect to a self-hosted Magento/Adobe Commerce store with an Integration access token to search and manage products, look up orders and add order comments, and browse customers and categories. On Magento 2.4.4+, enable Stores > Configuration > Services > OAuth > Consumer Settings > "Allow OAuth Access Tokens to be used as standalone Bearer tokens" first.',
@@ -1498,6 +1547,27 @@ _BUILTIN_EXECUTION_FIELD_NAMES = (
 )
 
 
+def _matches_builtin_provenance(
+    canonical_row: dict[str, Any], persisted_launch_config: Any
+) -> bool:
+    canonical_launch = canonical_row.get("launch_config")
+    marker = (
+        canonical_launch.get("builtin_provenance")
+        if isinstance(canonical_launch, dict)
+        else None
+    )
+    if marker is None:
+        return True
+    persisted_marker = (
+        persisted_launch_config.get("builtin_provenance")
+        if isinstance(persisted_launch_config, dict)
+        else None
+    )
+    return builtin_provenance_identity(persisted_marker) == builtin_provenance_identity(
+        marker
+    )
+
+
 def get_builtin_public_mcp_app(app_id: str) -> dict[str, Any] | None:
     for row in get_builtin_public_mcp_app_rows():
         if row["app_id"] == app_id:
@@ -1505,8 +1575,20 @@ def get_builtin_public_mcp_app(app_id: str) -> dict[str, Any] | None:
     return None
 
 
+def _persisted_builtin_provenance_matches(
+    app_id: str, persisted_launch_config: Any
+) -> bool:
+    """Whether a persisted row carries any provenance required by its builtin.
+
+    An absent registry row has no provenance constraint. This keeps callers
+    composable with an injected registry while Shopify's real row is checked.
+    """
+    row = get_builtin_public_mcp_app(app_id)
+    return row is None or _matches_builtin_provenance(row, persisted_launch_config)
+
+
 def is_builtin_public_mcp_app(app_id: str) -> bool:
-    return any(row["app_id"] == app_id for row in get_builtin_public_mcp_app_rows())
+    return get_builtin_public_mcp_app(app_id) is not None
 
 
 def get_builtin_execution_fields(app_id: str) -> dict[str, Any] | None:
@@ -1583,6 +1665,31 @@ def validate_builtin_public_mcp_apps(bind: Connection) -> list[dict[str, Any]]:
         persisted_row = persisted_by_app_id.get(app_id)
         if persisted_row is None:
             continue
+        if not _matches_builtin_provenance(
+            canonical_row, persisted_row["launch_config"]
+        ):
+            canonical_marker = canonical_row.get("launch_config", {}).get(
+                "builtin_provenance"
+            )
+            persisted_launch = persisted_row["launch_config"]
+            persisted_marker = (
+                persisted_launch.get("builtin_provenance")
+                if isinstance(persisted_launch, dict)
+                else None
+            )
+            mismatches.append(
+                {
+                    "app_id": app_id,
+                    "mismatched_fields": ["builtin_provenance"],
+                    "canonical_hash": _safe_configuration_hash(
+                        {"builtin_provenance": canonical_marker}
+                    ),
+                    "persisted_hash": _safe_configuration_hash(
+                        {"builtin_provenance": persisted_marker}
+                    ),
+                }
+            )
+            continue
 
         mismatched_fields = [
             field_name
@@ -1612,6 +1719,50 @@ def validate_builtin_public_mcp_apps(bind: Connection) -> list[dict[str, Any]]:
 
 def _filter_row(row: dict[str, Any], allowed_columns: set[str]) -> dict[str, Any]:
     return {key: value for key, value in row.items() if key in allowed_columns}
+
+
+def _validate_shopify_seed_server_identity(
+    bind: Connection, existing_tables: set[str]
+) -> None:
+    """Reject a fresh-seed server collision unless it is provably official."""
+    if "mcp_servers" not in existing_tables:
+        return
+    inspector = sa.inspect(bind)
+    server_columns = {column["name"] for column in inspector.get_columns("mcp_servers")}
+    if "auth" not in server_columns:
+        raise RuntimeError(
+            "Cannot verify builtin Shopify server provenance: mcp_servers.auth "
+            "is required"
+        )
+    shopify_keys = {
+        canonicalize_builtin_identity("shopify"),
+        canonicalize_builtin_identity("Shopify"),
+    }
+    collisions = [
+        row
+        for row in bind.execute(
+            sa.select(
+                MCP_SERVERS_IDENTITY_TABLE.c.name,
+                MCP_SERVERS_IDENTITY_TABLE.c.auth,
+            )
+        ).mappings()
+        if canonicalize_builtin_identity(row["name"]) in shopify_keys
+    ]
+    official_identity = builtin_provenance_identity(
+        {"registry": "xagent", "app_id": "shopify"}
+    )
+    trusted = (
+        len(collisions) == 1
+        and collisions[0]["name"] == "shopify"
+        and isinstance(collisions[0]["auth"], dict)
+        and builtin_provenance_identity(collisions[0]["auth"].get("builtin_provenance"))
+        == official_identity
+    )
+    if collisions and not trusted:
+        raise RuntimeError(
+            "Cannot seed builtin Shopify connector: custom mcp_servers identity "
+            "collides with 'shopify'"
+        )
 
 
 def seed_builtin_oauth_and_public_mcp_apps(bind: Connection) -> None:
@@ -1654,9 +1805,14 @@ def seed_builtin_oauth_and_public_mcp_apps(bind: Connection) -> None:
         existing_app_ids = set(
             bind.execute(sa.select(PUBLIC_MCP_APPS_TABLE.c.app_id)).scalars()
         )
+        builtin_app_rows = get_builtin_public_mcp_app_rows()
+        if "shopify" not in existing_app_ids and any(
+            row["app_id"] == "shopify" for row in builtin_app_rows
+        ):
+            _validate_shopify_seed_server_identity(bind, existing_tables)
         app_rows_to_insert = [
             _filter_row(row, app_columns)
-            for row in get_builtin_public_mcp_app_rows()
+            for row in builtin_app_rows
             if row["app_id"] not in existing_app_ids
         ]
         if app_rows_to_insert:

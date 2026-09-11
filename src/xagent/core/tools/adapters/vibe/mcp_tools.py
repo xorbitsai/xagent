@@ -99,7 +99,9 @@ def _build_mcp_load_summary(
             continue
 
         successful_tool_count += 1
-        source_server = getattr(tool, "source_server", None)
+        source_server = getattr(getattr(tool, "metadata", None), "source_server", None)
+        if source_server is None:
+            source_server = getattr(tool, "source_server", None)
         if type(source_server) is not str:
             continue
         key = normalize_mcp_server_name(source_server)

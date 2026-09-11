@@ -1139,6 +1139,29 @@ def test_merge_context_metadata_restored_clears_absent_modality_key(
     assert context.metadata["execution_type"] == "checkpointed"
 
 
+def test_merge_context_metadata_restored_overlays_execution_identity(
+    tmp_path: Path,
+) -> None:
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[StatefulPattern()]),
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    context = ExecutionContext(execution_id="exec-trusted-identity")
+    context.metadata.update(
+        {"task_source": "spoofed", "run_id": "stale", "other": "checkpointed"}
+    )
+
+    runner._merge_context_metadata(
+        context,
+        {"task_source": "slack", "run_id": "run-current"},
+        restored=True,
+    )
+
+    assert context.metadata["task_source"] == "slack"
+    assert context.metadata["run_id"] == "run-current"
+    assert context.metadata["other"] == "checkpointed"
+
+
 @pytest.mark.asyncio
 async def test_runner_empty_resume_metadata_preserves_non_modality_metadata(
     tmp_path: Path,

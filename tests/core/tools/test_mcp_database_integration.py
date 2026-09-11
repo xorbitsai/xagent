@@ -442,6 +442,14 @@ class TestToolFactoryMCPIntegration:
         call_args = mock_load_mcp.call_args
         connections_arg = call_args[0][0]  # First positional argument
         assert sample_stdio_config["name"] in connections_arg
+        connector_refs = call_args.kwargs["connector_refs"]
+        persisted_server = (
+            test_db.query(MCPServer).filter_by(name=sample_stdio_config["name"]).one()
+        )
+        assert connector_refs[sample_stdio_config["name"]].to_wire() == {
+            "connector_type": "mcp",
+            "connector_id": persisted_server.id,
+        }
 
     @patch("xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools")
     async def test_create_mcp_tools_exposes_unavailable_oauth_and_loads_other_servers(

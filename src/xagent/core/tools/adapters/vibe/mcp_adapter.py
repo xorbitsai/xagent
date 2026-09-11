@@ -44,11 +44,13 @@ from .connector_runtime import (
     RUNTIME_INPUT_CONTEXT,
     TARGET_MCP_META,
     TARGET_TOOL_ARGUMENTS,
+    ConnectorRef,
     binding_source_value,
     binding_target,
     connector_runtime_from_config,
     runtime_bindings_from_config,
 )
+from .mcp_approval_gate import gate_mcp_tools
 from .sandboxed_tool.sandboxed_mcp_tool_helper import (
     load_sandboxed_mcp_tools,
     should_sandbox_mcp_connection,
@@ -2123,6 +2125,7 @@ async def _load_server_tools_bounded(
 async def load_mcp_tools_as_agent_tools(
     connection_map: Dict[str, Connection],
     *,
+    connector_refs: Mapping[str, ConnectorRef] | None = None,
     name_prefix: str = "mcp_",
     visibility: Optional[ToolVisibility] = None,
     allow_users: Optional[List[str]] = None,
@@ -2132,6 +2135,9 @@ async def load_mcp_tools_as_agent_tools(
 
     Args:
         connection_map: Map of server names to connection configurations
+        connector_refs: Trusted persisted connector identities keyed by server
+            name. These stay outside transport mappings so sandbox guests never
+            receive host authorization identity.
         name_prefix: Prefix for tool names (default: "mcp_")
         visibility: Tool visibility setting
         allow_users: List of allowed user IDs
@@ -2259,7 +2265,15 @@ async def load_mcp_tools_as_agent_tools(
                 server_tools = direct_result.tools
                 failures.extend(direct_result.failures)
 
-            agent_tools.extend(server_tools)
+            # Both direct adapters and sandbox wrappers reach this host-side
+            # boundary before any connector dispatch.
+            agent_tools.extend(
+                gate_mcp_tools(
+                    server_tools,
+                    connection=connection,
+                    connector_ref=(connector_refs or {}).get(server_name),
+                )
+            )
             if server_tools:
                 loaded_servers.append(server_name)
             logger.info(f"Found {len(server_tools)} tools from server {server_name}")

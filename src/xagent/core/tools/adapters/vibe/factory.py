@@ -33,7 +33,7 @@ from .config import (
     normalize_tool_allowlist,
     run_with_tool_runtime_cleanup,
 )
-from .connector_runtime import ConnectorRuntimeError
+from .connector_runtime import ConnectorRef, ConnectorRuntimeError
 from .output_filter_wrapper import OutputFilteredToolWrapper
 from .selection_spec import ToolSelectionSpec
 
@@ -1148,8 +1148,16 @@ class ToolFactory:
 
                     # Load MCP tools
                     if connections:
+                        connector_refs = {
+                            server_name: ConnectorRef("mcp", int(config["id"]))
+                            for server_name, config in configs_by_name.items()
+                            if isinstance(config.get("id"), int)
+                            and not isinstance(config.get("id"), bool)
+                            and int(config["id"]) > 0
+                        }
                         load_result = await load_mcp_tools_as_agent_tools(
                             connections,
+                            connector_refs=connector_refs,
                             sandbox=sandbox,
                         )  # type: ignore[arg-type]
                         normal_tools = list(load_result.tools)
@@ -1290,7 +1298,17 @@ class ToolFactory:
 
             # Load MCP tools
             try:
-                load_result = await load_mcp_tools_as_agent_tools(connections)
+                connector_refs = {
+                    server_name: ConnectorRef("mcp", int(config["id"]))
+                    for server_name, config in configs_by_name.items()
+                    if isinstance(config.get("id"), int)
+                    and not isinstance(config.get("id"), bool)
+                    and int(config["id"]) > 0
+                }
+                load_result = await load_mcp_tools_as_agent_tools(
+                    connections,
+                    connector_refs=connector_refs,
+                )
             except ConnectorRuntimeError:
                 raise
             except Exception as e:

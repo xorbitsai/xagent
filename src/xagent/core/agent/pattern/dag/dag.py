@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 from dataclasses import dataclass, replace
@@ -12,6 +13,7 @@ from ....task_runtime import (
     PREFERRED_INPUT_MODALITIES_METADATA_KEY,
     normalize_input_modalities,
 )
+from ...checkpoint import CheckpointPersistenceError
 from ...context.enrichment import (
     enrich_context_with_memory,
     hydrate_top_level_user_request,
@@ -177,26 +179,35 @@ class _DAGStepRuntime:
         status: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        self.dag_pattern._set_active_step_context(self.step_id, context.to_dict())
-        get_state = getattr(pattern, "get_state", None)
-        if callable(get_state):
-            self.dag_pattern._set_active_step_pattern_state(
-                self.step_id,
-                get_state(),
-            )
+        active_ids_before = list(self.dag_pattern.active_step_ids)
+        contexts_before = copy.deepcopy(self.dag_pattern.active_step_contexts)
+        states_before = copy.deepcopy(self.dag_pattern.active_step_pattern_states)
         step_metadata = {
             "active_step_id": self.step_id,
             "child_label": label,
         }
         if metadata:
             step_metadata.update(metadata)
-        return await self.parent.checkpoint(
-            label=f"dag_{label}",
-            context=self.root_context,
-            pattern=self.dag_pattern,
-            status=status,
-            metadata=step_metadata,
-        )
+        try:
+            self.dag_pattern._set_active_step_context(self.step_id, context.to_dict())
+            get_state = getattr(pattern, "get_state", None)
+            if callable(get_state):
+                self.dag_pattern._set_active_step_pattern_state(
+                    self.step_id, get_state()
+                )
+            return await self.parent.checkpoint(
+                label=f"dag_{label}",
+                context=self.root_context,
+                pattern=self.dag_pattern,
+                status=status,
+                metadata=step_metadata,
+            )
+        except BaseException:
+            self.dag_pattern.active_step_ids = active_ids_before
+            self.dag_pattern.active_step_contexts = contexts_before
+            self.dag_pattern.active_step_pattern_states = states_before
+            self.dag_pattern._sync_legacy_active_step()
+            raise
 
     async def on_tool_start(self, *, tool_call: dict[str, Any]) -> None:
         await self.parent.on_tool_start(tool_call=self._with_step(tool_call))
@@ -1047,7 +1058,7 @@ class DAGPattern(AgentPattern):
                 skill_manager=skill_manager,
                 allowed_skills=allowed_skills,
             )
-        except ExecutionInterrupted:
+        except (ExecutionInterrupted, CheckpointPersistenceError):
             raise
         except Exception as exc:
             step.status = "failed"

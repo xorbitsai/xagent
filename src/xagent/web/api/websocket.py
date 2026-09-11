@@ -2846,10 +2846,20 @@ async def execute_task_background(
             # Execute the next turn under the same task/thread id.
             actual_task_id = str(task_id)
             task_for_agent = llm_user_message or user_message
+            agent_context = dict(context_dict)
+            # These are server-owned execution identities. WebSocket context
+            # is caller supplied and must never select an approval registry or
+            # impersonate another execution lease.
+            agent_context["task_source"] = snapshot.task.source
+            run_id = task_lease.run_id if task_lease is not None else expected_run_id
+            if run_id is not None:
+                agent_context["run_id"] = run_id
+            else:
+                agent_context.pop("run_id", None)
             result = await agent_manager.execute_task(
                 agent_service=agent_service,
                 task=task_for_agent,
-                context=context,
+                context=agent_context,
                 task_id=actual_task_id,
                 tracking_task_id=str(task_id),
                 db_session=None,
@@ -3397,6 +3407,7 @@ async def execute_resume_background(
     # forgets to pass its own run id would silently claim a lease under a
     # run nobody else knows about instead of failing loudly.
     expected_run_id: str | None = None,
+    trusted_task_source: str | None = None,
     resolved_execution_scope: Union[
         ExecutionScope, None, ExecutionScopeNotProvided
     ] = EXECUTION_SCOPE_NOT_PROVIDED,
@@ -3778,7 +3789,13 @@ async def execute_resume_background(
             bind_task_lease_context(lease),
         ):
             result = await run_while_task_lease_owned(
-                agent_service.resume_execution_by_id(str(task_id)),
+                agent_service.resume_execution_by_id(
+                    str(task_id),
+                    metadata={
+                        "task_source": trusted_task_source,
+                        "run_id": lease.run_id,
+                    },
+                ),
                 lease_heartbeat_task,
             )
 
@@ -5904,6 +5921,7 @@ class _WebSocketTaskRoutingSnapshot:
 
     task_id: int
     task_owner_user_id: int
+    task_source: str | None
     status: TaskStatus
     control_state: str | None
     run_id: str | None
@@ -6001,6 +6019,7 @@ def _load_websocket_task_routing_snapshot(
         _WebSocketTaskRoutingSnapshot(
             task_id=int(task.id),
             task_owner_user_id=int(task.user_id),
+            task_source=str(task.source) if task.source is not None else None,
             status=status,
             control_state=_task_control_state_value(task),
             run_id=_task_run_id(task),
@@ -6964,6 +6983,7 @@ async def _handle_chat_message_unserialized(
                             # is what a resume wants: those pointers are the
                             # anchor it is resuming from.
                             expected_run_id=handoff_snapshot.run_id,
+                            trusted_task_source=routing.task_source,
                             previous_task=previous_task,
                             resolved_execution_scope=resolved_execution_scope,
                             pending_user_message=(
@@ -9537,6 +9557,7 @@ async def _handle_resume_task_unserialized(
                         agent_service=agent_service,
                         task_owner_user_id=task_owner_user_id,
                         expected_run_id=resume_snapshot.run_id,
+                        trusted_task_source=task_fields.source,
                         previous_task=previous_task,
                         # Not `resolved_execution_scope`: that value is the
                         # off-turn downgrade used above to obtain

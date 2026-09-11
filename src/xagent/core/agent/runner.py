@@ -880,6 +880,12 @@ class AgentRunner:
                     PREFERRED_INPUT_MODALITIES_METADATA_KEY,
                     None,
                 )
+            # A resumed checkpoint may carry stale or legacy caller-influenced
+            # values. The resume boundary supplies these two server-owned
+            # identities from the current task row and exact execution lease.
+            for key in ("task_source", "run_id"):
+                if key in metadata:
+                    context.metadata[key] = metadata[key]
             return
 
         current_metadata = dict(metadata)

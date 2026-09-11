@@ -43,7 +43,8 @@ async def test_stalled_server_times_out_and_other_servers_still_load(monkeypatch
         }
     )
 
-    assert result.tools == (healthy_tool,)
+    assert len(result.tools) == 1
+    assert result.tools[0].target is healthy_tool
     assert result.loaded_servers == ("healthy",)
     assert len(result.failures) == 1
     assert result.failures[0].server_name == "stalled"

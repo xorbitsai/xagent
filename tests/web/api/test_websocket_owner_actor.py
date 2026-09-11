@@ -16,7 +16,7 @@ from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any, TypeVar
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 from sqlalchemy import create_engine
@@ -4230,7 +4230,9 @@ async def test_deferred_injection_marker_failure_does_not_abort_resume(
             delivery_client_message_id="deferred-marker-turn",
         )
 
-    agent.resume_execution_by_id.assert_awaited_once_with(str(task.id))
+    agent.resume_execution_by_id.assert_awaited_once_with(
+        str(task.id), metadata={"task_source": None, "run_id": ANY}
+    )
     accepted = [
         call.args[0]
         for call in ws_manager.send_personal_message.call_args_list
@@ -4311,7 +4313,9 @@ async def test_deferred_injection_marker_cancellation_does_not_abort_resume(
             delivery_client_message_id="deferred-marker-cancel-turn",
         )
 
-    agent.resume_execution_by_id.assert_awaited_once_with(str(task.id))
+    agent.resume_execution_by_id.assert_awaited_once_with(
+        str(task.id), metadata={"task_source": None, "run_id": ANY}
+    )
     accepted = [
         call.args[0]
         for call in ws_manager.send_personal_message.call_args_list
@@ -4410,7 +4414,9 @@ async def test_deferred_injection_close_failure_does_not_abort_resume(
             delivery_client_message_id="deferred-close-failure-turn",
         )
 
-    agent.resume_execution_by_id.assert_awaited_once_with(str(task.id))
+    agent.resume_execution_by_id.assert_awaited_once_with(
+        str(task.id), metadata={"task_source": None, "run_id": ANY}
+    )
     assert len(observed_close_calls) == 1
     called_task_id, called_run_id, live_run_id = observed_close_calls[0]
     assert called_task_id == int(task.id)
@@ -4686,7 +4692,9 @@ async def test_deferred_injection_close_cancellation_does_not_abort_resume(
             delivery_client_message_id="deferred-close-cancel-turn",
         )
 
-    agent.resume_execution_by_id.assert_awaited_once_with(str(task.id))
+    agent.resume_execution_by_id.assert_awaited_once_with(
+        str(task.id), metadata={"task_source": None, "run_id": ANY}
+    )
     assert len(observed_close_calls) == 1
     called_task_id, called_run_id, live_run_id = observed_close_calls[0]
     assert called_task_id == int(task.id)

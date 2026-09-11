@@ -97,6 +97,7 @@ def _bg_patches(db: Any) -> list[Any]:
             user_id=1,
             status=TaskStatus.RUNNING,
             agent_id=None,
+            source=None,
         ),
         runtime_user=SimpleNamespace(id=1, is_admin=False),
         agent=None,
@@ -356,6 +357,7 @@ async def test_bg_turn_resolves_scope_before_loading_snapshot_off_loop() -> None
                 user_id=1,
                 status=TaskStatus.RUNNING,
                 agent_id=None,
+                source=None,
             ),
             runtime_user=SimpleNamespace(id=1, is_admin=False),
             agent=None,
@@ -411,8 +413,9 @@ async def test_resumed_turn_re_resolves_scope() -> None:
     seen: dict[str, Any] = {}
     agent_service = MagicMock()
 
-    async def _resume(task_id: str) -> dict:
+    async def _resume(task_id: str, *, metadata: dict[str, Any]) -> dict:
         seen["scope_at_resume"] = get_execution_scope()
+        assert metadata == {"task_source": None, "run_id": "scope-run"}
         return {"status": "completed", "success": True, "output": "ok"}
 
     agent_service.resume_execution_by_id = AsyncMock(side_effect=_resume)
@@ -550,7 +553,9 @@ async def test_resume_background_adopts_preacquired_lease_without_reacquiring() 
 
     acquire.assert_not_called()
     start_heartbeat.assert_not_called()
-    agent_service.resume_execution_by_id.assert_awaited_once_with("42")
+    agent_service.resume_execution_by_id.assert_awaited_once_with(
+        "42", metadata={"task_source": None, "run_id": "run-a"}
+    )
     assert heartbeat_task.done()
 
 
@@ -584,6 +589,7 @@ async def test_resume_handler_resolves_scope_once_off_loop_for_agent_lookup() ->
             control_state="paused",
             run_id="run-a",
             state_version=3,
+            source=None,
         ),
         runtime_user=SimpleNamespace(id=1, is_admin=False),
     )
@@ -604,7 +610,9 @@ async def test_resume_handler_resolves_scope_once_off_loop_for_agent_lookup() ->
         ResumeReservationOutcome.RESERVED
     )
     transition = AsyncMock(
-        return_value=SimpleNamespace(run_id="run-a", status=TaskStatus.PAUSED)
+        return_value=SimpleNamespace(
+            run_id="run-a", status=TaskStatus.PAUSED, state_version=4
+        )
     )
 
     with _Patches(
@@ -685,6 +693,7 @@ async def test_resume_survives_a_scope_authority_mismatch() -> None:
             control_state="paused",
             run_id="run-a",
             state_version=3,
+            source=None,
         ),
         runtime_user=SimpleNamespace(id=1, is_admin=False),
     )
@@ -716,7 +725,7 @@ async def test_resume_survives_a_scope_authority_mismatch() -> None:
                 "xagent.web.api.websocket.task_execution_controller.transition",
                 new=AsyncMock(
                     return_value=SimpleNamespace(
-                        run_id="run-a", status=TaskStatus.PAUSED
+                        run_id="run-a", status=TaskStatus.PAUSED, state_version=4
                     )
                 ),
             ),
@@ -1809,7 +1818,8 @@ async def test_resume_lease_loss_cancels_execution_without_stale_side_effects() 
         async def interrupt_reason_for_quota(self) -> None:
             return None
 
-    async def resume(_task_id: str) -> dict[str, Any]:
+    async def resume(_task_id: str, *, metadata: dict[str, Any]) -> dict[str, Any]:
+        assert metadata == {"task_source": None, "run_id": "run-a"}
         resume_started.set()
         try:
             await asyncio.Event().wait()
@@ -1861,7 +1871,9 @@ async def test_resume_lease_loss_cancels_execution_without_stale_side_effects() 
         )
 
     assert resume_cancelled.is_set()
-    agent_service.resume_execution_by_id.assert_awaited_once_with("42")
+    agent_service.resume_execution_by_id.assert_awaited_once_with(
+        "42", metadata={"task_source": None, "run_id": "run-a"}
+    )
     finalize.assert_not_called()
     settle.assert_not_called()
     assert [

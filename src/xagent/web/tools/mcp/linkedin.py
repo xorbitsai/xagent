@@ -234,7 +234,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return [TextContent(type="text", text=r.text)]
 
         elif name == "create_post":
-            text = _sanitize_post_text(str(arguments.get("text") or ""))
+            # The caller owns the exact approved post text. Parentheses and
+            # backslashes are ordinary JSON string content and must not be
+            # rewritten before the LinkedIn REST request.
+            text = str(arguments.get("text") or "")
             image_path = (arguments.get("image_path") or "").strip()
             alt_text = str(arguments.get("altText") or "")
             author_urn = _get_author_urn(headers, proxies)

@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import uuid
+from datetime import date
 from typing import Any
 
 from dateutil import parser as _date_parser
@@ -37,6 +38,28 @@ def _normalize_rrule(recurrence: str, dtstart: str, timezone: str | None = None)
     """
     parse_rrule(recurrence, dtstart, timezone)
     return ensure_rrule_prefix(recurrence)
+
+
+def _classify_event_time(value: str, field_name: str) -> bool:
+    """Validate an event time and return whether it is an all-day date."""
+    if is_bare_date(value):
+        return True
+    try:
+        _date_parser.isoparse(value)
+    except ValueError as exc:
+        raise ValueError(
+            f"{field_name} must be a valid YYYY-MM-DD date or RFC3339 dateTime"
+        ) from exc
+    if (
+        len(value) < 11
+        or value[4] != "-"
+        or value[7] != "-"
+        or value[10] not in {"T", "t", " "}
+    ):
+        raise ValueError(
+            f"{field_name} must be a valid YYYY-MM-DD date or RFC3339 dateTime"
+        )
+    return False
 
 
 def _has_own_utc_offset(dt_string: str) -> bool:
@@ -374,8 +397,10 @@ def google_calendar_create_events(
     """
     Create a new event in Google Calendar.
     start_time and end_time must be RFC3339 formatted (e.g., '2024-01-01T10:00:00Z' or '2024-01-01T10:00:00-07:00'),
-    or both a bare date (e.g. '2024-01-01') to create an all-day event -
-    they must both be the same kind, never a mix.
+    or both a bare date (e.g. '2024-01-01') to create an all-day event.
+    For an all-day event, end_time is exclusive and must be later than
+    start_time: use the following date for a one-day event. Both values
+    must be the same kind, never a mix.
     recurrence, if given, is a single RFC 5545 RRULE string describing a
     repeating series for this event (the "RRULE:" prefix is optional; it
     must not contain embedded newlines), e.g.
@@ -383,7 +408,9 @@ def google_calendar_create_events(
     weekday until Sep 11, 2026". It's validated before being sent to
     Google and rejected with a clear error if it can't be parsed, rather
     than silently landing as inert text with no actual recurrence. There
-    is no way to clear a recurrence back to a single event once set,
+    must be a bare-date UNTIL (e.g. UNTIL=20260911) for an all-day event;
+    a timed event with timezone uses a UTC UNTIL ending in Z. There is no
+    way to clear a recurrence back to a single event once set,
     through this tool or google_calendar_update_events.
     timezone is an IANA timezone name (e.g. 'America/Los_Angeles'). Google
     requires it for a non-all-day recurring event specifically - and does
@@ -418,13 +445,20 @@ def google_calendar_create_events(
         # valid values that carry incidental surrounding whitespace.
         start_time = start_time.strip()
         end_time = end_time.strip()
-        start_is_all_day = is_bare_date(start_time)
-        end_is_all_day = is_bare_date(end_time)
+        start_is_all_day = _classify_event_time(start_time, "start_time")
+        end_is_all_day = _classify_event_time(end_time, "end_time")
         if start_is_all_day != end_is_all_day:
             raise ValueError(
                 "start_time and end_time must both be a bare date or both "
                 "a dateTime, never a mix - a Google Calendar event's start "
                 "and end must be the same kind"
+            )
+        if start_is_all_day and date.fromisoformat(end_time) <= date.fromisoformat(
+            start_time
+        ):
+            raise ValueError(
+                "end_time is exclusive for an all-day event and must be later "
+                "than start_time; use the following date for a one-day event"
             )
         if recurrence is not None and not start_is_all_day and not timezone:
             raise ValueError(
@@ -458,16 +492,7 @@ def google_calendar_create_events(
         if location:
             event["location"] = location
         if recurrence is not None:
-            # An all-day event's naive date anchor still needs *some*
-            # timezone to compare against an aware ("Z"-suffixed) UNTIL -
-            # RFC 5545 requires DTSTART and UNTIL to either both be aware
-            # or both floating, regardless of whether Google itself cares
-            # about a timeZone for a date-only event. UTC is only used
-            # here for that comparison; it's never written to the event.
-            localization_timezone = timezone or ("UTC" if start_is_all_day else None)
-            event["recurrence"] = [
-                _normalize_rrule(recurrence, start_time, localization_timezone)
-            ]
+            event["recurrence"] = [_normalize_rrule(recurrence, start_time, timezone)]
         _merge_attendees(event, attendees)
         requested_conference = _apply_conference_request(event, add_google_meet)
 

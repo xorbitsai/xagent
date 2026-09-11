@@ -147,6 +147,14 @@ def test_is_bare_date_accepts_surrounding_whitespace():
     assert utils.is_bare_date("  2026-08-26  ")
 
 
+@pytest.mark.parametrize(
+    "value",
+    ["2026-2-3", "2026-02-30", "2026-13-01", "0000-01-01"],
+)
+def test_is_bare_date_rejects_noncanonical_or_impossible_dates(value):
+    assert not utils.is_bare_date(value)
+
+
 def test_is_bare_date_rejects_non_ascii_digit_lookalikes():
     """Confirmed bug: str.isdigit() also accepts non-ASCII digit
     lookalikes (superscript, Thai, fullwidth, ...), unlike the ASCII-only
@@ -324,6 +332,62 @@ def test_parse_rrule_all_day_bare_date_until_before_start_is_still_rejected():
         )
 
 
+@pytest.mark.parametrize(
+    "until",
+    ["20260911T235959", "20260911T235959Z"],
+)
+def test_parse_rrule_rejects_datetime_until_for_all_day_start(until):
+    with pytest.raises(ValueError, match="same DATE or DATE-TIME value type"):
+        utils.parse_rrule(
+            f"FREQ=DAILY;UNTIL={until}",
+            "2026-08-26",
+            timezone="Asia/Shanghai",
+        )
+
+
+def test_parse_rrule_rejects_date_until_for_floating_timed_start():
+    with pytest.raises(ValueError, match="same DATE or DATE-TIME value type"):
+        utils.parse_rrule(
+            "FREQ=DAILY;UNTIL=20260911",
+            "2026-08-26T07:00:00",
+        )
+
+
+@pytest.mark.parametrize("part", ["BYSECOND=10", "BYMINUTE=30", "BYHOUR=9"])
+def test_parse_rrule_rejects_time_parts_for_all_day_start(part):
+    with pytest.raises(ValueError, match="all-day DATE start"):
+        utils.parse_rrule(f"FREQ=DAILY;{part};COUNT=3", "2026-08-26")
+
+
+@pytest.mark.parametrize(
+    ("rule", "message"),
+    [
+        ("FREQ=DAILY;BYDAY=1MO;COUNT=3", "numeric BYDAY"),
+        ("FREQ=YEARLY;BYWEEKNO=1;BYDAY=1MO;COUNT=3", "numeric BYDAY"),
+        ("FREQ=WEEKLY;BYMONTHDAY=1;COUNT=3", "BYMONTHDAY"),
+        ("FREQ=DAILY;BYYEARDAY=1;COUNT=3", "BYYEARDAY"),
+        ("FREQ=MONTHLY;BYWEEKNO=1;COUNT=3", "BYWEEKNO"),
+        ("FREQ=MONTHLY;BYSETPOS=1;COUNT=3", "BYSETPOS"),
+    ],
+)
+def test_parse_rrule_rejects_invalid_frequency_combinations(rule, message):
+    with pytest.raises(ValueError, match=message):
+        utils.parse_rrule(rule, "2026-08-26T07:00:00")
+
+
+@pytest.mark.parametrize(
+    "rule",
+    [
+        "FREQ=MONTHLY;BYDAY=1MO;COUNT=3",
+        "FREQ=YEARLY;BYWEEKNO=1;BYDAY=MO;COUNT=3",
+        "FREQ=YEARLY;BYYEARDAY=1;COUNT=3",
+        "FREQ=MONTHLY;BYMONTHDAY=1;BYSETPOS=1;COUNT=3",
+    ],
+)
+def test_parse_rrule_accepts_valid_frequency_combinations(rule):
+    assert utils.parse_rrule(rule, "2026-08-26T07:00:00")["FREQ"]
+
+
 def test_parse_rrule_rejects_space_separated_dtstart_paired_with_bare_date_until():
     """Confirmed bug: RFC3339 permits a space in place of "T" as the
     date/time separator, so a check that only looked for the absence of
@@ -362,7 +426,7 @@ def test_parse_rrule_timezone_still_rejects_until_before_dtstart():
 
 
 def test_parse_rrule_rejects_unknown_timezone():
-    with pytest.raises(ValueError, match="unknown timezone"):
+    with pytest.raises(ValueError, match="recognized IANA zone name"):
         utils.parse_rrule(
             "FREQ=DAILY;UNTIL=20260911T235959Z",
             "2026-08-26T07:00:00",
@@ -444,7 +508,7 @@ def test_resolve_zoneinfo_returns_zoneinfo_for_valid_iana_name():
 
 
 def test_resolve_zoneinfo_rejects_unknown_timezone():
-    with pytest.raises(ValueError, match="unknown timezone"):
+    with pytest.raises(ValueError, match="recognized IANA zone name"):
         utils.resolve_zoneinfo("Not/ARealZone")
 
 

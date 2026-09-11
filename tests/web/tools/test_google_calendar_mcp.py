@@ -3,6 +3,8 @@ import json
 import re
 from unittest.mock import Mock
 
+import pytest
+
 from xagent.web.tools.mcp import calendar
 from xagent.web.tools.mcp import utils as mcp_utils
 
@@ -204,7 +206,7 @@ def test_create_events_rejects_an_invalid_timezone_even_without_recurrence(
     )
 
     assert result["status"] == "error"
-    assert "unknown timezone" in result["message"]
+    assert "recognized IANA zone name" in result["message"]
     service.events.return_value.insert.assert_not_called()
 
 
@@ -330,6 +332,54 @@ def test_create_events_creates_an_all_day_event_from_bare_dates(monkeypatch):
     _, kwargs = service.events.return_value.insert.call_args
     assert kwargs["body"]["start"] == {"date": "2026-09-01"}
     assert kwargs["body"]["end"] == {"date": "2026-09-02"}
+
+
+@pytest.mark.parametrize(
+    ("start_time", "end_time"),
+    [
+        ("2026-02-30", "2026-03-01"),
+        ("2026-2-3", "2026-02-04"),
+        ("2026-13-01", "2026-13-02"),
+    ],
+)
+def test_create_events_rejects_invalid_all_day_dates(monkeypatch, start_time, end_time):
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Invalid all-day event",
+            start_time=start_time,
+            end_time=end_time,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "valid YYYY-MM-DD date or RFC3339 dateTime" in result["message"]
+    service.events.return_value.insert.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("start_time", "end_time"),
+    [("2026-09-01", "2026-09-01"), ("2026-09-02", "2026-09-01")],
+)
+def test_create_events_rejects_nonpositive_all_day_ranges(
+    monkeypatch, start_time, end_time
+):
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Invalid all-day range",
+            start_time=start_time,
+            end_time=end_time,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "end_time is exclusive" in result["message"]
+    service.events.return_value.insert.assert_not_called()
 
 
 def test_create_events_strips_whitespace_from_a_bare_date_before_sending_it(

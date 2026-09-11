@@ -13,6 +13,7 @@ from dateutil.rrule import rrulestr as _rrulestr
 from ....config import get_tool_max_output_length
 
 _DIGITS_ONLY_RE = re.compile(r"[0-9]+")
+_BARE_DATE_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 # RFC 5545 UNTIL is always in "basic" form - no "-"/":" separators, unlike
 # ISO8601's "extended" form that dateutil's isoparse also happily accepts
 # (e.g. "2026-09-11T23:59:59+08:00"). dateutil.rrule.rrulestr's own RFC
@@ -635,20 +636,70 @@ def is_bare_date(value: str) -> bool:
     """Whether a caller-supplied date/time string is a bare "date" (e.g.
     Google's all-day form, "2026-08-26") rather than a "dateTime".
 
-    Checked structurally (exactly three hyphen-separated all-digit parts,
-    after stripping outer whitespace) rather than by the absence of a
+    Checked as an exact, calendar-valid YYYY-MM-DD value (after stripping
+    outer whitespace) rather than only by the absence of a
     "T"/"t" date/time separator: RFC3339 also permits a space in place of
     "T" for readability, so "2026-08-26 07:00:00" contains no "t" either
     and would otherwise be misclassified as a bare date.
 
-    "all-digit" is checked via `_DIGITS_ONLY_RE` (ASCII 0-9 only), not
-    `str.isdigit()`: the latter also accepts non-ASCII digit lookalikes
-    (superscript, Thai, ...) that would misclassify a value as a bare
-    date with no further local validation before it's written straight
-    into a Google Calendar request body.
+    The explicit ASCII shape check rejects abbreviated dates and Unicode
+    digit lookalikes; ``date.fromisoformat`` then rejects impossible dates.
     """
-    parts = value.strip().split("-")
-    return len(parts) == 3 and all(_DIGITS_ONLY_RE.fullmatch(part) for part in parts)
+    normalized = value.strip()
+    if not _BARE_DATE_RE.fullmatch(normalized):
+        return False
+    try:
+        date.fromisoformat(normalized)
+    except ValueError:
+        return False
+    return True
+
+
+def _validate_rrule_constraints(
+    parts: dict[str, str], *, dtstart_is_date: bool
+) -> None:
+    """Enforce RFC 5545 constraints that dateutil accepts leniently."""
+    freq = parts["FREQ"]
+    if dtstart_is_date and any(
+        key in parts for key in ("BYSECOND", "BYMINUTE", "BYHOUR")
+    ):
+        raise ValueError(
+            "invalid recurrence rule: BYSECOND, BYMINUTE, and BYHOUR must "
+            "not be used with an all-day DATE start"
+        )
+
+    byday = parts.get("BYDAY")
+    has_numeric_byday = bool(
+        byday and any(len(value.strip()) > 2 for value in byday.split(","))
+    )
+    if has_numeric_byday and freq not in {"MONTHLY", "YEARLY"}:
+        raise ValueError(
+            "invalid recurrence rule: numeric BYDAY values are only valid "
+            "with MONTHLY or YEARLY frequency"
+        )
+    if has_numeric_byday and freq == "YEARLY" and "BYWEEKNO" in parts:
+        raise ValueError(
+            "invalid recurrence rule: numeric BYDAY must not be combined "
+            "with BYWEEKNO in a YEARLY rule"
+        )
+    if freq == "WEEKLY" and "BYMONTHDAY" in parts:
+        raise ValueError(
+            "invalid recurrence rule: BYMONTHDAY must not be used with WEEKLY frequency"
+        )
+    if freq in {"DAILY", "WEEKLY", "MONTHLY"} and "BYYEARDAY" in parts:
+        raise ValueError(
+            "invalid recurrence rule: BYYEARDAY is only valid with YEARLY frequency"
+        )
+    if freq != "YEARLY" and "BYWEEKNO" in parts:
+        raise ValueError(
+            "invalid recurrence rule: BYWEEKNO is only valid with YEARLY frequency"
+        )
+    if "BYSETPOS" in parts and not any(
+        key.startswith("BY") and key != "BYSETPOS" for key in parts
+    ):
+        raise ValueError(
+            "invalid recurrence rule: BYSETPOS requires another BY rule part"
+        )
 
 
 def _strip_rrule_prefix(rrule_text: str) -> str:
@@ -702,21 +753,15 @@ def parse_rrule(
     Outlook start time) - skipping the format-then-reparse round trip that
     passing `.isoformat()` back in would otherwise cost.
 
-    ``timezone``, if given, localizes a naive ``dtstart``. For a genuine
-    all-day event - ``dtstart`` passed as a bare-date string with no "T",
-    e.g. Google's own all-day "date" field - this only happens when
-    needed to compare against an aware UNTIL; a naive/bare-date UNTIL is
-    correctly left floating to match the still-naive anchor instead,
-    since RFC 5545's DATE value type legitimately pairs a floating DTSTART
-    with a floating UNTIL. For anything else (a full dateTime string,
-    aware or not, or an already-`datetime` object), the
-    anchor is always localized when naive - RFC 5545's DATE-TIME value
-    type requires UNTIL to be aware too, so if it isn't, that's an actual
-    mismatch dateutil's own validation below correctly rejects, the same
-    way it already does for a dtstart string that carries its own offset.
-    Either way, the UNTIL-not-before-dtstart check
-    below still runs - it compares whenever anchor and UNTIL share the
-    same awareness, aware-vs-aware or naive-vs-naive alike.
+    ``timezone``, if given, localizes a naive DATE-TIME ``dtstart``. A
+    genuine all-day event uses a DATE value instead and remains timezone
+    independent. RFC 5545 requires UNTIL to have the same value type as
+    DTSTART: a DATE for an all-day start, a floating DATE-TIME for a
+    floating start, or a UTC DATE-TIME for an aware/timezone-qualified
+    start. These relationships are checked explicitly rather than left to
+    dateutil, which accepts several mismatched combinations. The
+    UNTIL-not-before-dtstart check then compares values with matching types
+    and awareness.
 
     The returned dict (rather than the parsed rrule object) is what
     callers actually build a provider payload from: Google takes the RRULE
@@ -771,6 +816,8 @@ def parse_rrule(
             "recurrence rule must not specify both UNTIL and COUNT - RFC "
             "5545 treats these as mutually exclusive ways to end a series"
         )
+    dtstart_is_bare_date = isinstance(dtstart, str) and is_bare_date(dtstart)
+    _validate_rrule_constraints(parts, dtstart_is_date=dtstart_is_bare_date)
     # RFC 5545 defines INTERVAL/COUNT as `1*DIGIT` - plain unsigned digits,
     # nothing else. Python's int() is more permissive (a leading "+"/"-",
     # PEP 515 "_" digit separators), and `parts` holds the ORIGINAL string,
@@ -817,16 +864,6 @@ def parse_rrule(
                 f"invalid UNTIL value in recurrence rule: {parts['UNTIL']!r}"
             ) from exc
 
-    # A bare-date dtstart string (e.g. Google's own all-day "date" field,
-    # "2026-08-26") is the same signal calendar.py itself already uses to
-    # detect an all-day event - RFC 5545's DATE value type, which
-    # legitimately pairs with an equally bare-date (floating) UNTIL.
-    # Anything else - a full dateTime string (with or without its own
-    # offset) or an already-`datetime` object (as Outlook's caller always
-    # passes, already localized aware) - represents DATE-TIME, which RFC
-    # 5545 requires UNTIL to match: aware, not floating.
-    dtstart_is_bare_date = isinstance(dtstart, str) and is_bare_date(dtstart)
-
     if isinstance(dtstart, datetime):
         anchor = dtstart
     else:
@@ -836,22 +873,35 @@ def parse_rrule(
             raise ValueError(
                 f"invalid start time for recurrence rule: {dtstart}"
             ) from exc
-    if anchor.tzinfo is None and timezone is not None:
-        if dtstart_is_bare_date:
-            # All-day: only localize if needed to compare against an
-            # aware UNTIL - localizing unconditionally would instead
-            # create a mismatch in the opposite direction for a
-            # legitimately floating, bare-date UNTIL.
-            if until_dt is not None and until_dt.tzinfo is not None:
-                anchor = anchor.replace(tzinfo=resolve_zoneinfo(timezone))
-        else:
-            # Timed: always localize. If UNTIL is naive/bare-date here,
-            # that's an actual RFC 5545 value-type mismatch (a DATE-TIME
-            # DTSTART requires an aware UNTIL) - localizing the anchor
-            # anyway makes dateutil's own validation below correctly
-            # reject it, the same way it always has for an
-            # already-aware-string dtstart.
-            anchor = anchor.replace(tzinfo=resolve_zoneinfo(timezone))
+    resolved_timezone = resolve_zoneinfo(timezone) if timezone is not None else None
+    if until_dt is not None:
+        until_is_date = "T" not in parts["UNTIL"]
+        if dtstart_is_bare_date != until_is_date:
+            raise ValueError(
+                "invalid recurrence rule: UNTIL must use the same DATE or "
+                "DATE-TIME value type as the event start"
+            )
+        if not dtstart_is_bare_date:
+            until_is_utc = parts["UNTIL"].endswith("Z")
+            dtstart_has_timezone = (
+                anchor.tzinfo is not None or resolved_timezone is not None
+            )
+            if dtstart_has_timezone != until_is_utc:
+                expected = (
+                    "UTC with a trailing Z"
+                    if dtstart_has_timezone
+                    else "floating local time"
+                )
+                raise ValueError(
+                    f"invalid recurrence rule: UNTIL must be {expected} to match "
+                    "the event start"
+                )
+    if (
+        anchor.tzinfo is None
+        and resolved_timezone is not None
+        and not dtstart_is_bare_date
+    ):
+        anchor = anchor.replace(tzinfo=resolved_timezone)
     try:
         _rrulestr(f"RRULE:{body}", dtstart=anchor)
     except (ValueError, TypeError) as exc:

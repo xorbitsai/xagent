@@ -3785,6 +3785,12 @@ class WebToolConfig(BaseToolConfig):
             task_output_dir = self._build_mcp_task_output_dir()
             if task_output_dir:
                 env["XAGENT_GOOGLE_DRIVE_OUTPUT_DIR"] = task_output_dir
+            # Only this trusted built-in may receive the adapter's one-call,
+            # task-scoped FileRef resolution.
+            if "xagent.web.tools.mcp.google_drive" in transport_config["args"]:
+                transport_config["workspace_file_ref_env"] = {
+                    "google_drive_upload_file": "XAGENT_GOOGLE_DRIVE_UPLOAD_FILE"
+                }
             transport_config["env"] = env
             return transport_config
 

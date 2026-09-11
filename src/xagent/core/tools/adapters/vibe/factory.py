@@ -1041,6 +1041,7 @@ class ToolFactory:
         sandbox: Optional["Sandbox"] = None,
         actor_stdio_session_identities: "Mapping[str, ActorMCPStdioSessionIdentity] | None" = None,
         actor_stdio_session_consumer: "ActorMCPStdioSessionConsumer | None" = None,
+        workspace: Any = None,
     ) -> list[Tool]:
         """Create MCP tools while keeping actor session identity host-only."""
         try:
@@ -1124,6 +1125,13 @@ class ToolFactory:
                             "transport": transport,
                             **inner_config,
                         }
+                        if workspace is not None and inner_config.get(
+                            "workspace_file_ref_env"
+                        ):
+                            # create_session filters private connection keys;
+                            # the MCP adapter consumes this object locally to
+                            # resolve opaque workspace FileRefs before launch.
+                            connection_config["_workspace"] = workspace
                         for runtime_key in (
                             "runtime_bindings",
                             "runtime_input_schema",

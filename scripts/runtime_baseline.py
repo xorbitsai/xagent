@@ -22,8 +22,11 @@ Fixed workload:
       "execution_mode": "flash",
       "llm_ids": ["TEST_MODEL_ID", "TEST_MODEL_ID", "TEST_MODEL_ID", "TEST_MODEL_ID"]
     }
-  Pin all four model slots, or an agent_id with a recorded published config;
-  avoid automatic routing. The short prompt validates the harness, not the
+  Pin all four slots with canonical model_id strings, not aliases or DB PKs.
+  agent_id is not supported: this harness does not snapshot agent configuration.
+  The create response must match these IDs before execution; this verifies task
+  configuration, not provider revisions or concurrent server configuration edits.
+  Avoid automatic routing. The short prompt validates the harness, not the
   multi-round workload. To reproduce that workload, configure a local model
   with fixed delays, response sizes and tool-call rounds, plus harmless local
   tools/MCP. Record their source revisions; this script does not emulate them.
@@ -56,9 +59,10 @@ Scheduling and failure handling:
 
 Reports and interpretation:
   report.json contains config, payload SHA-256, stage timestamps, per-attempt
-  timings/outcomes, task IDs, summaries, throughput and optional raw Prometheus
-  series. report.md summarizes p95/p99 and outcomes. Credentials, tokens, task
-  contents, response bodies and exception messages are not written by the
+  timings/outcomes, task IDs, verified model IDs, health degradation names,
+  summaries, throughput and optional raw Prometheus series. report.md summarizes
+  p95/p99 and outcomes. Credentials, tokens, task contents, raw response bodies
+  and exception messages are not written by the
   runner. Prometheus labels can contain deployment identifiers; use a dedicated
   test monitoring endpoint. completed means the runner finished, not an SLO pass.
   Task latency includes creation, WebSocket execution and status confirmation;
@@ -66,8 +70,11 @@ Reports and interpretation:
   separate. Task timeout covers the whole operation; HTTP timeout defaults to
   60 seconds. Throughput uses submission PLUS drain time. Failed/timed-out
   attempts remain in latency statistics (timeouts are censored lower bounds);
-  shed attempts have no latency sample. Empty percentiles are unavailable, not
-  zero. Collect hundreds of probes per stage; small-sample p99 is near the max.
+  shed attempts have no latency sample. Model mismatches are recorded but excluded
+  from latency statistics and never executed. Degraded health fails preflight;
+  stage probes retain degradation names and a distinct degraded outcome.
+  Empty percentiles are unavailable, not zero. Collect hundreds of probes per
+  stage; small-sample p99 is near the max.
   Warm up separately and repeat at least three times. Record server Git SHA,
   lockfile hash, DB version/pool limits, worker count, CPU/memory limits, model/
   tool revisions and delay/round/payload settings, generator configuration and
@@ -108,10 +115,54 @@ import math
 import os
 import time
 from collections import Counter
+from decimal import Decimal, InvalidOperation
+from fractions import Fraction
 from pathlib import Path
 from urllib.parse import urlsplit
 
 import aiohttp
+
+MODEL_FIELDS = (
+    "model_id",
+    "small_fast_model_id",
+    "visual_model_id",
+    "compact_model_id",
+)
+
+
+def pinned_models(payload):
+    ids = payload.get("llm_ids")
+    if payload.get("agent_id") is not None:
+        raise ValueError("agent_id is not supported for fixed-workload runs")
+    if (
+        not isinstance(ids, list)
+        or len(ids) != 4
+        or any(
+            not isinstance(value, str) or not value.strip() or value != value.strip()
+            for value in ids
+        )
+    ):
+        raise ValueError(
+            "Pin exactly four nonempty canonical model_id strings in llm_ids"
+        )
+    return ids
+
+
+def arrival_offsets(rate, duration):
+    """Exact half-open arrival schedule; floats from callers use decimal spelling."""
+    rate, duration = Fraction(str(rate)), Fraction(str(duration))
+    for index in range(math.ceil(rate * duration)):
+        yield float(index / rate)
+
+
+def decimal_argument(value):
+    try:
+        result = Decimal(value)
+    except InvalidOperation as exc:
+        raise argparse.ArgumentTypeError("expected a finite decimal number") from exc
+    if not result.is_finite():
+        raise argparse.ArgumentTypeError("expected a finite decimal number")
+    return result
 
 
 def percentile(values, fraction):
@@ -127,7 +178,9 @@ def summarize(records):
     result = {}
     for operation in sorted({r["operation"] for r in records}):
         samples = [r for r in records if r["operation"] == operation]
-        measured = [r for r in samples if r["outcome"] != "shed"]
+        measured = [
+            r for r in samples if r["outcome"] not in {"shed", "model_mismatch"}
+        ]
         durations = [r["duration_ms"] for r in measured]
         result[operation] = {
             "scheduled": len(samples),
@@ -144,36 +197,60 @@ def summarize(records):
     return result
 
 
-async def schedule(rate, duration, limit, operation, invoke, records, stop_when=None):
+async def schedule(
+    rate,
+    duration,
+    limit,
+    operation,
+    invoke,
+    records,
+    stop_when=None,
+    *,
+    stop_event=None,
+    clock=None,
+    sleeper=asyncio.sleep,
+):
     """Fixed arrival times, bounded in-flight work, no unbounded waiting queue."""
     if rate == 0:
         return
     loop = asyncio.get_running_loop()
-    start = loop.time()
+    clock = clock or loop.time
+    start = clock()
     pending = set()
 
     async def run(due):
-        lag = max(0, loop.time() - due) * 1000
-        began = loop.time()
+        lag = max(0, clock() - due) * 1000
+        began = clock()
         record = {"operation": operation, "scheduler_lag_ms": lag}
         try:
             record.update(await invoke())
         except Exception as exc:
             # Exception messages/URLs and response bodies can contain tokens.
             record.update(outcome="error", error_type=type(exc).__name__)
-        record["duration_ms"] = (loop.time() - began) * 1000
+        record["duration_ms"] = (clock() - began) * 1000
         record["finished_at"] = time.time()
         records.append(record)
 
     try:
-        for index in range(math.ceil(rate * duration)):
-            due = start + index / rate
-            await asyncio.sleep(max(0, due - loop.time()))
+        for offset in arrival_offsets(rate, duration):
+            due = start + offset
+            delay = max(0, due - clock())
+            if stop_event is not None:
+                if stop_event.is_set():
+                    break
+                if delay:
+                    try:
+                        await asyncio.wait_for(stop_event.wait(), timeout=delay)
+                        break
+                    except asyncio.TimeoutError:
+                        pass
+            else:
+                await sleeper(delay)
             if stop_when is not None and stop_when():
                 break
-            lag = max(0, loop.time() - due) * 1000
+            lag = max(0, clock() - due) * 1000
             # Do not burst missed arrivals after a stalled load generator.
-            if len(pending) >= limit or lag > 1000 / rate:
+            if len(pending) >= limit or lag > 1000 / float(rate):
                 records.append(
                     dict(
                         operation=operation,
@@ -197,9 +274,14 @@ async def schedule(rate, duration, limit, operation, invoke, records, stop_when=
 
 class Runner:
     def __init__(self, base_url, username, password, payload, task_timeout):
-        self.base_url = base_url.rstrip("/")
+        origin = urlsplit(base_url)
+        self.base_url = origin._replace(scheme=origin.scheme.lower(), path="").geturl()
+        self.ws_url = origin._replace(
+            scheme="wss" if origin.scheme.lower() == "https" else "ws", path=""
+        ).geturl()
         self.credentials = {"username": username, "password": password}
         self.payload = payload
+        self.expected_models = pinned_models(payload)
         self.task_timeout = task_timeout
         self.token = None
         self.uncertain = set()
@@ -221,10 +303,30 @@ class Runner:
 
     async def health(self, session):
         async with session.get(self.base_url + "/health") as response:
-            await response.read()
+            if response.status != 200:
+                return {"outcome": "http_error", "status": response.status}
+            # Never persist arbitrary response bodies; bound JSON before parsing.
+            body = bytearray()
+            async for chunk in response.content.iter_chunked(4096):
+                body.extend(chunk)
+                if len(body) > 65536:
+                    return {"outcome": "invalid_health_response", "status": 200}
+            try:
+                data = json.loads(body)
+                signals = data.get("degradations", [])
+                if (
+                    data.get("status") != "ok"
+                    or not isinstance(signals, list)
+                    or len(signals) > 128
+                    or any(not isinstance(s, str) or len(s) > 256 for s in signals)
+                ):
+                    raise ValueError
+            except (ValueError, AttributeError):
+                return {"outcome": "invalid_health_response", "status": 200}
             return {
-                "outcome": "success" if response.status == 200 else "http_error",
+                "outcome": "degraded" if signals else "success",
                 "status": response.status,
+                "degradations": signals,
             }
 
     async def task(self, session):
@@ -245,15 +347,19 @@ class Runner:
                             "outcome": "create_http_error",
                             "status": response.status,
                         }
-                    task_id = int((await response.json())["task_id"])
+                    created = await response.json()
+                    task_id = int(created["task_id"])
                 self.task_ids.append(task_id)
                 self.uncertain.add(task_id)
                 record["task_id"] = task_id
-                ws_url = (
-                    "wss" if self.base_url.startswith("https:") else "ws"
-                ) + self.base_url[self.base_url.index(":") :]
+                effective = [created.get(field) for field in MODEL_FIELDS]
+                if effective != self.expected_models:
+                    self.stop_new_tasks = True
+                    record["outcome"] = "model_mismatch"
+                    return record
+                record["effective_model_ids"] = effective
                 async with session.ws_connect(
-                    f"{ws_url}/ws/chat/{task_id}",
+                    f"{self.ws_url}/ws/chat/{task_id}",
                     params={"token": self.token},
                     max_msg_size=16 * 1024 * 1024,
                 ) as socket:
@@ -330,7 +436,7 @@ def markdown(report):
         "",
         f"Status: {report['status']}",
         "",
-        "Latency includes failed/timed-out attempts; shed arrivals have no latency sample.",
+        "Latency includes failed/timed-out attempts; shed arrivals and model mismatches are excluded.",
         "Task throughput covers submission plus drain. Caps are not measured active-task counts.",
         "",
         "| Stage | Operation | Measured / scheduled | p95 ms | p99 ms | Outcomes |",
@@ -368,8 +474,7 @@ async def run(args):
         or not payload.get("description")
     ):
         raise ValueError("Task payload must include title and a fixed description")
-    if not payload.get("llm_ids") and not payload.get("agent_id"):
-        raise ValueError("Pin llm_ids or agent_id in the task payload")
+    expected_models = pinned_models(payload)
     # A new directory prevents accidental overwrites and separates comparison runs.
     args.output.mkdir(parents=True, exist_ok=False)
     runner = Runner(args.base_url, username, password, payload, args.task_timeout)
@@ -379,8 +484,9 @@ async def run(args):
         "uncertain_task_ids": [],
         "task_ids": runner.task_ids,
         "payload_sha256": hashlib.sha256(raw).hexdigest(),
+        "expected_model_ids": expected_models,
         "config": {
-            key: str(value) if isinstance(value, Path) else value
+            key: str(value) if isinstance(value, (Path, Decimal)) else value
             for key, value in vars(args).items()
         },
     }
@@ -404,17 +510,18 @@ async def run(args):
         ):
             if (await runner.login(probes))["outcome"] != "success":
                 raise ValueError("Test-account login preflight failed")
-            if (await runner.health(probes))["outcome"] != "success":
+            report["health_preflight"] = await runner.health(probes)
+            if report["health_preflight"]["outcome"] != "success":
                 raise ValueError("Health preflight failed")
             for cap in args.stages:
                 records = []
                 stage = {"cap": cap, "started_at": time.time(), "records": records}
                 report["stages"].append(stage)
-                stage_started = asyncio.get_running_loop().time()
+                stop_probes = asyncio.Event()
                 # Probe arrivals continue during drain, not only during submissions.
                 work = asyncio.create_task(
                     schedule(
-                        args.tasks_per_minute / 60 if cap else 0,
+                        Fraction(args.tasks_per_minute) / 60 if cap else 0,
                         args.duration,
                         max(cap, 1),
                         "task",
@@ -427,18 +534,22 @@ async def run(args):
                 async def probe_loop(operation, callback):
                     await schedule(
                         args.probe_rate,
-                        args.duration + args.task_timeout + 1,
+                        float(args.duration) + args.task_timeout + 1,
                         args.probe_inflight,
                         operation,
                         callback,
                         records,
-                        stop_when=lambda: work.done()
-                        and asyncio.get_running_loop().time() - stage_started
-                        >= args.duration,
+                        stop_event=stop_probes,
                     )
 
+                async def finish_window():
+                    try:
+                        await asyncio.gather(work, asyncio.sleep(float(args.duration)))
+                    finally:
+                        stop_probes.set()
+
                 await asyncio.gather(
-                    work,
+                    finish_window(),
                     probe_loop("login", lambda: runner.login(probes)),
                     probe_loop("health", lambda: runner.health(probes)),
                 )
@@ -500,9 +611,11 @@ def parse_args(argv=None):
     parser.add_argument(
         "--stages", type=lambda s: [int(x) for x in s.split(",")], default=[0, 10, 50]
     )
-    parser.add_argument("--duration", type=float, default=60)
-    parser.add_argument("--tasks-per-minute", type=float, default=12)
-    parser.add_argument("--probe-rate", type=float, default=1)
+    parser.add_argument("--duration", type=decimal_argument, default=Decimal("60"))
+    parser.add_argument(
+        "--tasks-per-minute", type=decimal_argument, default=Decimal("12")
+    )
+    parser.add_argument("--probe-rate", type=decimal_argument, default=Decimal("1"))
     parser.add_argument("--probe-inflight", type=int, default=16)
     parser.add_argument("--task-timeout", type=float, default=300)
     parser.add_argument("--request-timeout", type=float, default=60)
@@ -522,7 +635,7 @@ def parse_args(argv=None):
         "task_timeout",
         "request_timeout",
     ):
-        if not math.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
+        if not math.isfinite(getattr(args, name)) or float(getattr(args, name)) <= 0:
             parser.error(f"{name} must be finite and positive")
     if not args.stages or any(x < 0 for x in args.stages):
         parser.error("stages must be nonnegative concurrency caps")

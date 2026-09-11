@@ -104,6 +104,8 @@ _DURATION_METRICS = frozenset(
         "xagent.auth.login.password_verify.duration",
         "xagent.auth.login.token_creation.duration",
         "xagent.auth.login.total.duration",
+        "xagent.auth.login.sync_lookup.duration",
+        "xagent.auth.login.sync_commit.duration",
         "xagent.event_loop.lag",
         "xagent.thread_pool.execution.duration",
         "xagent.thread_pool.queue_wait.duration",

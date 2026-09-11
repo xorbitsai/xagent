@@ -117,8 +117,8 @@ async def test_login_and_refresh_have_single_thread_owners(worker_db):
     assert [name for name, _ in events] == [
         "create",
         "SELECT",
-        "commit",
         "UPDATE",
+        "commit",
         "close",
     ]
     assert len({owner for _, owner in events}) == 1
@@ -146,8 +146,127 @@ async def test_commit_failure_rolls_back_and_closes(worker_db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_cancelled_login_drains_commit_and_close(worker_db, monkeypatch):
+async def test_concurrent_refresh_consumes_token_once(worker_db, monkeypatch):
+    factory, _, engine = worker_db
+    logged_in = await auth.login(
+        auth.LoginRequest(username="worker", password="password123"), factory
+    )
+    token = logged_in["refresh_token"]
+    barrier = threading.Barrier(2)
+    prepare = auth._prepare_refresh_response
+
+    def overlapping_prepare(user, request):
+        response = prepare(user, request)
+        # Both independent sessions have validated the same old token before
+        # either is allowed to attempt its conditional write.
+        barrier.wait(timeout=10)
+        return response
+
+    monkeypatch.setattr(auth, "_prepare_refresh_response", overlapping_prepare)
+    results = await asyncio.gather(
+        *(
+            auth.refresh_token(auth.RefreshTokenRequest(refresh_token=token), factory)
+            for _ in range(2)
+        ),
+        return_exceptions=True,
+    )
+    winners = [r for r in results if isinstance(r, auth.RefreshTokenResponse)]
+    losers = [r for r in results if isinstance(r, HTTPException)]
+    assert len(winners) == len(losers) == 1, results
+    assert losers[0].status_code == 401
+    assert winners[0].refresh_token != token
+    with Session(engine) as session:
+        assert session.scalar(select(User.refresh_token)) == winners[0].refresh_token
+    monkeypatch.setattr(auth, "_prepare_refresh_response", prepare)
+    with pytest.raises(HTTPException) as caught:
+        await auth.refresh_token(auth.RefreshTokenRequest(refresh_token=token), factory)
+    assert caught.value.status_code == 401
+
+
+def test_refresh_tokens_are_unique_at_identical_time(monkeypatch):
+    from unittest.mock import Mock
+
+    fixed = auth.datetime.now(auth.timezone.utc)
+    monkeypatch.setattr(auth, "datetime", Mock(now=Mock(return_value=fixed)))
+    first = auth.create_refresh_token({"sub": "worker", "user_id": 1})
+    second = auth.create_refresh_token({"sub": "worker", "user_id": 1})
+    assert first != second
+    assert (
+        auth.verify_refresh_token(first)["jti"]
+        != auth.verify_refresh_token(second)["jti"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_refresh_commit_failure_preserves_old_token(worker_db, monkeypatch):
     factory, events, engine = worker_db
+    logged_in = await auth.login(
+        auth.LoginRequest(username="worker", password="password123"), factory
+    )
+    token = logged_in["refresh_token"]
+
+    def fail(session):
+        raise SQLAlchemyError("private-db-detail")
+
+    monkeypatch.setattr(factory.class_, "commit", fail)
+    with pytest.raises(HTTPException) as caught:
+        await auth.refresh_token(auth.RefreshTokenRequest(refresh_token=token), factory)
+    assert caught.value.status_code == 503
+    assert "private-db-detail" not in caught.value.detail
+    assert events[-1][0] == "close"
+    with Session(engine) as session:
+        assert session.scalar(select(User.refresh_token)) == token
+
+
+@pytest.mark.asyncio
+async def test_login_phase_histograms_use_configured_buckets(worker_db, monkeypatch):
+    from opentelemetry.sdk.metrics import MeterProvider
+    from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+
+    from xagent.core import runtime_performance as metrics
+
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(
+        metric_readers=[reader],
+        views=metrics._histogram_views(),
+        shutdown_on_exit=False,
+    )
+    monkeypatch.setattr(
+        metrics,
+        "runtime_performance",
+        metrics.RuntimePerformanceTelemetry(provider.get_meter("test")),
+    )
+    try:
+        await auth.login(
+            auth.LoginRequest(username="worker", password="password123"), worker_db[0]
+        )
+        recorded = {
+            metric.name: metric
+            for resource in reader.get_metrics_data().resource_metrics
+            for scope in resource.scope_metrics
+            for metric in scope.metrics
+        }
+        for phase in ("sync_lookup", "sync_commit"):
+            point = recorded[f"xagent.auth.login.{phase}.duration"].data.data_points[0]
+            assert point.count == 1
+            assert tuple(point.explicit_bounds) == tuple(metrics._DURATION_BUCKETS_MS)
+    finally:
+        provider.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["login", "refresh"])
+async def test_cancelled_auth_drains_commit_and_close(
+    worker_db, monkeypatch, operation
+):
+    factory, events, engine = worker_db
+    token = None
+    if operation == "refresh":
+        logged_in = await auth.login(
+            auth.LoginRequest(username="worker", password="password123"), factory
+        )
+        token = logged_in["refresh_token"]
+        events.clear()
     entered = threading.Event()
     release = threading.Event()
     original = factory.class_.commit
@@ -158,11 +277,14 @@ async def test_cancelled_login_drains_commit_and_close(worker_db, monkeypatch):
         original(session)
 
     monkeypatch.setattr(factory.class_, "commit", blocked_commit)
-    task = asyncio.create_task(
-        auth.login(
+    request = (
+        auth.refresh_token(auth.RefreshTokenRequest(refresh_token=token), factory)
+        if operation == "refresh"
+        else auth.login(
             auth.LoginRequest(username="worker", password="password123"), factory
         )
     )
+    task = asyncio.create_task(request)
     try:
         assert await asyncio.to_thread(entered.wait, 5)
         task.cancel()
@@ -179,7 +301,10 @@ async def test_cancelled_login_drains_commit_and_close(worker_db, monkeypatch):
     assert len({owner for _, owner in events}) == 1
     # Cancellation cannot promise rollback if commit has already begun.
     with Session(engine) as session:
-        assert session.scalar(select(User.refresh_token)) is not None
+        persisted = session.scalar(select(User.refresh_token))
+        assert persisted is not None
+        if operation == "refresh":
+            assert persisted != token
 
 
 @pytest.mark.asyncio

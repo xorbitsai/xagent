@@ -962,7 +962,8 @@ def create_refresh_token(data: Dict[str, Any]) -> str:
     """Create JWT refresh token with longer expiry"""
     to_encode = data.copy()
     expire = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
-    to_encode.update({"exp": expire, "type": "refresh"})
+    # Rotation must change the stored value even within one JWT timestamp second.
+    to_encode.update({"exp": expire, "type": "refresh", "jti": secrets.token_hex(16)})
     encoded_jwt: str = jwt.encode(to_encode, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
     return encoded_jwt
 
@@ -2043,12 +2044,6 @@ def _prepare_refresh_response(
         data=identity, expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     )
     new_token = create_refresh_token(data=identity)
-    setattr(user, "refresh_token", new_token)
-    setattr(
-        user,
-        "refresh_token_expires_at",
-        datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS),
-    )
     return RefreshTokenResponse(
         success=True,
         message="Token refreshed successfully",
@@ -2067,6 +2062,29 @@ def _refresh_in_worker(
     with session_factory() as session:
         user = session.query(User).filter(User.id == user_id).first()
         response = _prepare_refresh_response(user, request)
+        # End the read snapshot before competing for a write. In SQLite this
+        # avoids a deferred read-to-write lock upgrade; the conditional UPDATE
+        # below, not the preceding SELECT, is the authority on token consumption.
+        session.rollback()
+        now = datetime.now(timezone.utc)
+        changed = (
+            session.query(User)
+            .filter(
+                User.id == user_id,
+                User.refresh_token == request.refresh_token,
+                User.refresh_token_expires_at >= now,
+            )
+            .update(
+                {
+                    User.refresh_token: response.refresh_token,
+                    User.refresh_token_expires_at: now
+                    + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS),
+                },
+                synchronize_session=False,
+            )
+        )
+        if changed != 1:
+            raise HTTPException(status_code=401, detail="Invalid refresh token")
         session.commit()
         return response
 

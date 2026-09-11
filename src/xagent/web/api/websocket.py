@@ -220,16 +220,6 @@ async def _handle_chat_message_unserialized(
 CHECKPOINT_EVENT_TYPE_NAME = str(CHECKPOINT_EVENT_TYPE)
 
 
-# Non-transient turn rejections must not fall back to retryable busy guidance.
-_TURN_REJECTION_CODES = {
-    "actor_task_reuse_unsupported": (ClientErrorCode.MESSAGE_CONTINUATION_UNSUPPORTED),
-    "workforce_archived": ClientErrorCode.WORKFORCE_ARCHIVED,
-    "workforce_config_changed": ClientErrorCode.WORKFORCE_UNAVAILABLE,
-    "workforce_run_not_found": ClientErrorCode.WORKFORCE_UNAVAILABLE,
-    "workforce_run_not_active": ClientErrorCode.WORKFORCE_UNAVAILABLE,
-}
-
-
 # Exception text can carry file paths, SQL fragments, provider payloads and
 # other internals. It reaches anonymous widget/share visitors through both the
 # error bubble and the message_rejected ack, so an *incidental* validation

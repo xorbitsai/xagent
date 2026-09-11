@@ -14,7 +14,6 @@ from tests.web.services.task_lease_shared import (
     live_task_lease as live_task_lease_fixture,
 )
 from xagent.core.agent.runner import UserMessageInjectionOutcome
-from xagent.web.api import websocket as websocket_api
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import Base, get_db, get_engine, init_db
 from xagent.web.models.task import Task, TaskStatus
@@ -243,7 +242,7 @@ async def test_dispatcher_reclaims_and_applies_message_after_contention_clears(
     db_session,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    caplog.set_level("INFO", logger=websocket_api.__name__)
+    caplog.set_level("INFO", logger=command_execution_service.__name__)
     owner = _user(db_session, "eventual-delivery-owner")
     task = _live_task(db_session, int(owner.id))
     task.runner_id = get_runner_id()

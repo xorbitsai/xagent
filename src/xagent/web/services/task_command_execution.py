@@ -165,6 +165,7 @@ from .task_runtime import (
 
 logger = logging.getLogger(__name__)
 
+# Non-transient turn rejections must not fall back to retryable busy guidance.
 _TURN_REJECTION_CODES = {
     "actor_task_reuse_unsupported": (ClientErrorCode.MESSAGE_CONTINUATION_UNSUPPORTED),
     "workforce_archived": ClientErrorCode.WORKFORCE_ARCHIVED,
@@ -1983,7 +1984,7 @@ async def handle_task_message(
                         # reports the distinction explicitly and this guard
                         # reads that report. See task_interaction_close's
                         # module docstring for the rule, the other sites,
-                        # and why the v1 websocket resume-input path needs no
+                        # and why the v1 reply resume-input path needs no
                         # guard at all.
                         #
                         # The run fence
@@ -3159,7 +3160,7 @@ async def resume_task(
                     # ``acquire_task_lease_no_commit`` keeps the existing run
                     # (``candidate_run_id = expected_run_id or uuid4()``)
                     # while bumping ``state_version``. Without this fence a
-                    # v1 websocket and a WebSocket Resume landing together both
+                    # v1 reply and a WebSocket Resume landing together both
                     # transition the row and schedule two coordinators
                     # against one lease.
                     #

@@ -127,11 +127,6 @@ async def _load_published_agent_card_isolated(
     )
 
 
-def _task_run_id(task: Task) -> str | None:
-    run_id = getattr(task, "run_id", None)
-    return str(run_id) if run_id is not None else None
-
-
 def _require_bound_agent(path_agent_id: int, agent: AgentPrincipalSnapshot) -> None:
     if int(agent.id) != int(path_agent_id) or not is_published_agent(agent):
         raise a2a_error("agent_not_found", "Agent not found.", status_code=404)

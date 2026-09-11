@@ -392,7 +392,7 @@ async def test_cancellation_after_uncommitted_finalization_always_propagates(
     with_task_lease: bool,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    caplog.set_level(logging.WARNING, logger="xagent.web.api.websocket")
+    caplog.set_level(logging.WARNING, logger="xagent.web.services.task_execution")
     snapshot = _make_snapshot()
     agent_service = _build_fake_agent_service()
     agent_manager = MagicMock(

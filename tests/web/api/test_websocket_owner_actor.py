@@ -2185,7 +2185,7 @@ async def test_live_resume_reads_the_interaction_row_before_injecting(
             "xagent.web.services.task_command_execution.close_legacy_resume_interaction_sync",
             return_value=1,
         ) as close_mock,
-        caplog.at_level(logging.INFO, logger="xagent.web.api.websocket"),
+        caplog.at_level(logging.INFO, logger=command_execution_service.__name__),
     ):
         await handle_task_message(
             _make_command_reply(MagicMock()),

@@ -1084,7 +1084,7 @@ async def test_resume_pool_timeout_does_not_start_secondary_db_cleanup(caplog) -
         return_value={"status": "completed", "success": True, "output": "ok"}
     )
     ws_manager = MagicMock(broadcast_to_task=AsyncMock())
-    caplog.set_level(logging.ERROR, logger="xagent.web.api.websocket")
+    caplog.set_level(logging.ERROR, logger="xagent.web.services.task_execution")
 
     with _Patches(
         [

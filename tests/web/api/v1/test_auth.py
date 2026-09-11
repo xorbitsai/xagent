@@ -9,7 +9,7 @@ Test plumbing (client, _test_db fixture, auth helpers) is shared via
 
 import asyncio
 import threading
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -20,6 +20,7 @@ from fastapi.security import HTTPAuthorizationCredentials
 from sqlalchemy import create_engine, text
 from sqlalchemy.pool import QueuePool
 
+from tests.web.pool_contention_shared import GUARD_TIMEOUT
 from xagent.core.utils.api_key import (
     SHA256_HASH_PREFIX,
     hash_api_key,
@@ -255,7 +256,7 @@ def test_concurrent_wrong_legacy_secrets_verify_without_serializing(
                 active_checks += 1
                 peak_checks = max(peak_checks, active_checks)
             try:
-                verification_barrier.wait(timeout=2)
+                verification_barrier.wait(timeout=GUARD_TIMEOUT)
                 return original_verify(raw, stored_hash)
             finally:
                 with count_lock:
@@ -302,7 +303,7 @@ def test_concurrent_valid_legacy_auth_does_not_wait_for_migration(
     count_lock = threading.Lock()
 
     def synchronized_verify(raw: str, stored_hash: str):  # type: ignore[no-untyped-def]
-        verification_barrier.wait(timeout=2)
+        verification_barrier.wait(timeout=GUARD_TIMEOUT)
         return original_verify(raw, stored_hash)
 
     def blocking_upgrade(*args, **kwargs):  # type: ignore[no-untyped-def]
@@ -310,7 +311,9 @@ def test_concurrent_valid_legacy_auth_does_not_wait_for_migration(
         with count_lock:
             migration_calls += 1
         migration_started.set()
-        assert release_migration.wait(timeout=2)
+        # The test releases this in finally after observing the other requests.
+        # A timed release could let migration finish before that observation.
+        release_migration.wait()
         return original_upgrade(*args, **kwargs)
 
     monkeypatch.setattr(deps, "verify_api_key_with_timing", synchronized_verify)
@@ -320,20 +323,23 @@ def test_concurrent_valid_legacy_auth_does_not_wait_for_migration(
         credentials=full_key,
     )
     pool = ThreadPoolExecutor(max_workers=8)
-    futures = [
-        pool.submit(deps._resolve_principal_from_credentials, credentials)
-        for _ in range(8)
-    ]
     try:
-        assert migration_started.wait(timeout=2)
-        completed, _pending = wait(futures, timeout=1)
-        completed_before_migration = len(completed)
+        futures = [
+            pool.submit(deps._resolve_principal_from_credentials, credentials)
+            for _ in range(8)
+        ]
+        assert migration_started.wait(timeout=GUARD_TIMEOUT)
+        completed = as_completed(futures, timeout=GUARD_TIMEOUT)
+        # One request is deliberately parked in migration. Observe the other
+        # seven returning while the gate stays closed, regardless of CPU speed.
+        for _ in range(7):
+            next(completed).result()
+        assert sum(future.done() for future in futures) == 7
     finally:
         release_migration.set()
         pool.shutdown(wait=True)
 
     principals = [future.result() for future in futures]
-    assert completed_before_migration == 7
     assert migration_calls == 1
     assert all(
         principal.agent is not None and principal.agent.id == agent_id
@@ -621,7 +627,7 @@ async def test_runtime_key_auth_cancellation_drains_worker_before_propagating(
 
     def blocking_load(key_prefix: str):  # type: ignore[no-untyped-def]
         worker_started.set()
-        assert allow_worker.wait(timeout=2)
+        assert allow_worker.wait(timeout=GUARD_TIMEOUT)
         try:
             return original_load(key_prefix)
         finally:
@@ -633,13 +639,19 @@ async def test_runtime_key_auth_cancellation_drains_worker_before_propagating(
             HTTPAuthorizationCredentials(scheme="Bearer", credentials=full_key)
         )
     )
-    await asyncio.to_thread(worker_started.wait, 2)
-    auth.cancel()
-    allow_worker.set()
-
-    with pytest.raises(asyncio.CancelledError):
-        await auth
-    assert worker_finished.is_set()
+    try:
+        assert await asyncio.to_thread(worker_started.wait, GUARD_TIMEOUT)
+        auth.cancel()
+        allow_worker.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(auth, timeout=GUARD_TIMEOUT)
+        assert worker_finished.is_set()
+    finally:
+        allow_worker.set()
+        auth.cancel()
+        await asyncio.wait_for(
+            asyncio.gather(auth, return_exceptions=True), timeout=GUARD_TIMEOUT
+        )
 
 
 @pytest.mark.asyncio
@@ -799,7 +811,7 @@ async def test_record_key_usage_pool_wait_keeps_event_loop_responsive(
     async def invoke_usage() -> None:
         await record_key_usage(prefix)
 
-    from tests.web.pool_contention_shared import GUARD_TIMEOUT, gated_pool_checkout
+    from tests.web.pool_contention_shared import gated_pool_checkout
 
     try:
         with gated_pool_checkout(engine) as gate:

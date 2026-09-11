@@ -23,6 +23,7 @@ repos:
           - types-PyYAML
           - types-beautifulsoup4
           - types-requests
+          - types-python-dateutil
           - httpx
           - fastapi
           - uvicorn

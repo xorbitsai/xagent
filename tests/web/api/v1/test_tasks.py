@@ -697,7 +697,7 @@ async def test_cancelled_upload_cleans_partial_local_file_and_metadata(
         with open(target_path, "xb") as buffer:
             buffer.write(b"partial")
         write_started.set()
-        assert allow_write.wait(timeout=2)
+        assert allow_write.wait(timeout=GUARD_TIMEOUT)
         return target_path
 
     monkeypatch.setattr(files_api, "_reserve_and_copy_upload", delayed_copy)
@@ -716,11 +716,18 @@ async def test_cancelled_upload_cleans_partial_local_file_and_metadata(
             user_id=user_id,
         )
     )
-    assert await asyncio.to_thread(write_started.wait, 2)
-    upload_task.cancel()
-    allow_write.set()
-    with pytest.raises(asyncio.CancelledError):
-        await upload_task
+    try:
+        assert await asyncio.to_thread(write_started.wait, GUARD_TIMEOUT)
+        upload_task.cancel()
+        allow_write.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(upload_task, timeout=GUARD_TIMEOUT)
+    finally:
+        allow_write.set()
+        upload_task.cancel()
+        await asyncio.wait_for(
+            asyncio.gather(upload_task, return_exceptions=True), timeout=GUARD_TIMEOUT
+        )
 
     assert written_path is not None
     assert not written_path.exists()

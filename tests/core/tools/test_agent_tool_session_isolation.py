@@ -22,6 +22,11 @@ from xagent.web.models.model import Model
 from xagent.web.models.user import User
 from xagent.web.services.llm_utils import UserAwareModelStorage
 
+# Every no-valid-model assertion in this module depends on the fallback
+# resolving to nothing; see the fixture for why that cannot be left to the
+# machine's environment.
+pytestmark = pytest.mark.usefixtures("no_resolvable_default_llm")
+
 
 class _Stop(Exception):
     """Halt the run before the sub-agent executes."""
@@ -806,9 +811,9 @@ async def test_agent_tool_missing_agent_fails_closed(monkeypatch):
 async def test_agent_tool_without_resolved_model_fails_closed(monkeypatch):
     """The no-valid-model preflight exit must be a classified failure.
 
-    ``agent_models`` is falsy so model resolution is skipped entirely and
-    ``default_llm`` stays ``None``, driving the same preflight exit a
-    resolution failure would.
+    ``agent_models`` is falsy and the autouse fixture leaves the configured
+    fallback empty, driving the same preflight exit a resolution failure
+    would.
     """
 
     traced_statuses: list[str] = []
@@ -854,6 +859,260 @@ async def test_agent_tool_without_resolved_model_fails_closed(monkeypatch):
         "response",
     ]
     assert traced_statuses == ["start", "error"]
+
+
+@pytest.mark.asyncio
+async def test_empty_model_config_falls_back_to_the_configured_default(
+    monkeypatch, tmp_path
+):
+    """Server-side creation paths persisted no model config; an unset slot
+    must not fail the delegation when the user has a default to resolve.
+
+    Drives the real execution stack (unlike ``_real_delegated_agent_tool``,
+    which fakes ``resolve_agent_model_llms`` -- the very seam under test), so
+    the child has to actually run on the fallback LLM.
+    """
+
+    fallback_calls: list[tuple[int, tuple[str, ...]]] = []
+    llm = _StubSingleCallLLM(
+        {
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "function": {
+                        "name": "final_answer",
+                        "arguments": json.dumps({"answer": "delegated output"}),
+                    },
+                }
+            ],
+            "done": False,
+        }
+    )
+
+    def _get_configured_defaults(self, user_id=None, *, config_types, **_kwargs):
+        fallback_calls.append((user_id, config_types))
+        return llm, None, None, None
+
+    from xagent.web.services.llm_utils import UserAwareModelStorage
+
+    monkeypatch.setattr(
+        UserAwareModelStorage,
+        "get_configured_defaults",
+        _get_configured_defaults,
+    )
+    monkeypatch.setattr(
+        mod, "WebToolConfig", lambda **_kwargs: _SucceedingCloseConfig()
+    )
+
+    async def _no_tools(*_args, **_kwargs):
+        return []
+
+    import xagent.core.tools.adapters.vibe.factory as factory_module
+
+    monkeypatch.setattr(factory_module.ToolFactory, "create_all_tools", _no_tools)
+
+    tool = AgentTool(
+        agent_id=1,
+        agent_name="Delegated",
+        agent_description="d",
+        session_factory=lambda: _DelegatedSession(
+            SimpleNamespace(
+                id=1,
+                name="Delegated",
+                instructions=None,
+                knowledge_bases=None,
+                skills=None,
+                tool_categories=[],
+                models=None,
+                execution_mode=None,
+            )
+        ),
+        user_id=7,
+        tool_name="delegated",
+        tool_description="d",
+    )
+
+    result = await tool.run_json_async({"task": "run"})
+
+    assert tool_result_succeeded(result) is True
+    assert "delegated output" in str(result.get("response"))
+    # Only the general slot: the other three stay as resolved, so the fallback
+    # does not instantiate three default LLMs to discard. Narrower than the
+    # plain chat path, which backfills all four.
+    assert fallback_calls == [(7, ("general",))]
+
+
+@pytest.mark.parametrize(
+    "models",
+    [
+        pytest.param({"compact": 3}, id="compact_only"),
+        pytest.param({"general": None, "compact": 3}, id="explicit_null_general"),
+        pytest.param({}, id="empty_dict"),
+        # No autoincrement PK is 0, so these state nothing either.
+        pytest.param({"general": 0}, id="zero_id"),
+        pytest.param({"general": False}, id="false_id"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_partial_config_without_a_general_slot_falls_back(monkeypatch, models):
+    """An unset general slot is unset whether or not other slots carry ids."""
+
+    fallback_calls: list[int] = []
+    llm = _StubSingleCallLLM(
+        {
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "function": {
+                        "name": "final_answer",
+                        "arguments": json.dumps({"answer": "delegated output"}),
+                    },
+                }
+            ],
+            "done": False,
+        }
+    )
+
+    def _get_configured_defaults(self, user_id=None, **_kwargs):
+        fallback_calls.append(user_id)
+        return llm, None, None, None
+
+    from xagent.web.services.llm_utils import UserAwareModelStorage
+
+    monkeypatch.setattr(
+        UserAwareModelStorage, "get_configured_defaults", _get_configured_defaults
+    )
+    monkeypatch.setattr(
+        mod, "WebToolConfig", lambda **_kwargs: _SucceedingCloseConfig()
+    )
+
+    async def _no_tools(*_args, **_kwargs):
+        return []
+
+    import xagent.core.tools.adapters.vibe.agent_model_resolution as resolution
+    import xagent.core.tools.adapters.vibe.factory as factory_module
+
+    monkeypatch.setattr(factory_module.ToolFactory, "create_all_tools", _no_tools)
+    # Whatever the other slots resolve to, the general one stays empty.
+    monkeypatch.setattr(
+        resolution, "resolve_agent_model_llms", lambda *_args: (None, None, None, None)
+    )
+
+    tool = AgentTool(
+        agent_id=1,
+        agent_name="Delegated",
+        agent_description="d",
+        session_factory=lambda: _DelegatedSession(
+            SimpleNamespace(
+                id=1,
+                name="Delegated",
+                instructions=None,
+                knowledge_bases=None,
+                skills=None,
+                tool_categories=[],
+                models=models,
+                execution_mode=None,
+            )
+        ),
+        user_id=7,
+        tool_name="delegated",
+        tool_description="d",
+    )
+
+    result = await tool.run_json_async({"task": "run"})
+
+    assert tool_result_succeeded(result) is True
+    assert fallback_calls == [7]
+
+
+def _real_session_factory(models: object) -> tuple[sessionmaker, str]:
+    """A sqlite-backed factory holding one agent with *models*.
+
+    Stubbing ``resolve_agent_model_llms`` would skip the very pipeline these
+    cases are about -- id coercion and the model lookup -- so the resolver
+    runs for real against a database that simply has no matching row.
+    """
+    temp_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    temp_db.close()
+    engine = create_engine(f"sqlite:///{temp_db.name}")
+    Base.metadata.create_all(bind=engine)
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    db = SessionLocal()
+    try:
+        user = User(username="delegator", password_hash="x", is_admin=False)
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        agent = Agent(
+            user_id=user.id,
+            name="Delegated",
+            models=models,
+            status=AgentStatus.DRAFT,
+        )
+        db.add(agent)
+        db.commit()
+        return SessionLocal, temp_db.name
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    "models",
+    [
+        # Resolves by id only, so a name states a choice that cannot be met.
+        pytest.param({"general": "gpt-4o"}, id="model_name"),
+        pytest.param({"general": 999999}, id="missing_id"),
+        # Not even a mapping: stated-but-corrupt, not unset.
+        pytest.param("gpt-4o", id="non_mapping"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_general_slot_that_cannot_resolve_fails_closed(monkeypatch, models):
+    """The fallback covers an unset general slot, never a stated one that will
+    not resolve -- substituting a model there would hide the owner's intent."""
+
+    called: list[int] = []
+
+    def _get_configured_defaults(self, user_id=None, **_kwargs):
+        called.append(user_id)
+        return None, None, None, None
+
+    monkeypatch.setattr(
+        UserAwareModelStorage, "get_configured_defaults", _get_configured_defaults
+    )
+
+    async def _trace_delegation(self, status, **_kwargs):
+        return None
+
+    monkeypatch.setattr(AgentTool, "_trace_delegation", _trace_delegation)
+
+    SessionLocal, db_path = _real_session_factory(models)
+    try:
+        db = SessionLocal()
+        agent_id = int(db.query(Agent).one().id)
+        user_id = int(db.query(User).one().id)
+        db.close()
+
+        tool = AgentTool(
+            agent_id=agent_id,
+            agent_name="Delegated",
+            agent_description="d",
+            session_factory=SessionLocal,
+            user_id=user_id,
+            tool_name="delegated",
+            tool_description="d",
+        )
+
+        result = await tool.run_json_async({"task": "run"})
+
+        assert (
+            result["response"] == "Error: No valid model configured for agent Delegated"
+        )
+        assert called == []
+    finally:
+        os.remove(db_path)
 
 
 class _StubSingleCallLLM:

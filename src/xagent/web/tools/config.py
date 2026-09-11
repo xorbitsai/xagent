@@ -8,6 +8,7 @@ and other web-specific sources.
 import asyncio
 import copy
 import inspect
+import json
 import logging
 import os
 import random
@@ -1863,8 +1864,8 @@ class WebToolConfig(BaseToolConfig):
         self._browser_locale_resolved = False
         self._cached_browser_locale: Optional[str] = None
 
-    def _build_mcp_file_allowed_dirs(self) -> str:
-        """Build comma-separated file roots that local MCP tools may read."""
+    def _mcp_file_allowed_dir_paths(self) -> list[str]:
+        """Build unique, resolved file roots for local MCP read tools."""
         dirs: list[str] = []
         base_dir = Path(str(self._workspace_config.get("base_dir", get_uploads_dir())))
         task_id = self._workspace_config.get("task_id")
@@ -1880,14 +1881,14 @@ class WebToolConfig(BaseToolConfig):
             if dir_path not in seen:
                 unique_dirs.append(dir_path)
                 seen.add(dir_path)
-        return ",".join(unique_dirs)
+        return unique_dirs
 
     def _build_mcp_task_output_dir(self) -> str:
         """Single write-target root for connectors that create new files in
         the task workspace (currently just Google Drive's download tool).
 
-        Deliberately distinct from _build_mcp_file_allowed_dirs() above:
-        that one is a read allowlist that may reasonably include
+        Deliberately distinct from _mcp_file_allowed_dir_paths() above:
+        that method builds a read allowlist that may reasonably include
         allowed_external_dirs (e.g. read-only KB folders) alongside the
         task dir, and multiple consumers of it pick whichever entry a
         requested path happens to fall under. A write target has no such
@@ -3733,20 +3734,27 @@ class WebToolConfig(BaseToolConfig):
                     "http_proxy": os.environ.get("http_proxy", ""),
                 }
             )
-            allowed_file_dirs = self._build_mcp_file_allowed_dirs()
-            if allowed_file_dirs:
+            allowed_file_dir_paths = self._mcp_file_allowed_dir_paths()
+            if allowed_file_dir_paths:
+                allowed_file_dirs = ",".join(allowed_file_dir_paths)
                 env["XAGENT_LINKEDIN_IMAGE_ALLOWED_DIRS"] = allowed_file_dirs
                 env["XAGENT_SLACK_FILE_ALLOWED_DIRS"] = allowed_file_dirs
                 env["XAGENT_GMAIL_FILE_ALLOWED_DIRS"] = allowed_file_dirs
+                # JSON preserves commas inside directory names. OneDrive's
+                # parser also accepts the legacy comma-delimited form for
+                # manually configured standalone deployments.
+                env["XAGENT_ONEDRIVE_FILE_ALLOWED_DIRS"] = json.dumps(
+                    allowed_file_dir_paths
+                )
                 env["XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS"] = allowed_file_dirs
-            # Distinct from the four read allowlists above: Google Drive's
+            # Distinct from the five read allowlists above: Google Drive's
             # download tool writes NEW files into the task workspace, so it
             # gets its own single-value, task-dir-only var rather than
             # reusing the read-allowlist shape (see
             # _build_mcp_task_output_dir's docstring for why that would be
             # wrong, not just differently-shaped). google_drive_upload_file
             # reads from XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS above instead,
-            # like the other three read allowlists.
+            # like the other four read allowlists.
             task_output_dir = self._build_mcp_task_output_dir()
             if task_output_dir:
                 env["XAGENT_GOOGLE_DRIVE_OUTPUT_DIR"] = task_output_dir

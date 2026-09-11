@@ -50,6 +50,7 @@ def test_auth_status_uses_injected_meta_token(monkeypatch):
         },
         params={"fields": "id,name,email"},
         data=None,
+        json=None,
         timeout=30,
     )
 
@@ -165,6 +166,7 @@ def test_get_profile_reads_selected_instagram_account(monkeypatch):
             )
         },
         data=None,
+        json=None,
         timeout=30,
     )
 

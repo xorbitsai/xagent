@@ -56,3 +56,68 @@ def test_response_error_text_truncates_large_body():
     assert meta_graph.response_error_text(response) == (
         "x" * meta_graph.MAX_ERROR_RESPONSE_TEXT_CHARS + "... [truncated]"
     )
+
+
+def test_graph_request_sends_json_body_with_json_content_type(monkeypatch):
+    monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
+    seen = {}
+
+    def request(**kwargs):
+        seen.update(kwargs)
+        return MockResponse({"messages": [{"id": "wamid.1"}]}, text="{}")
+
+    monkeypatch.setattr(meta_graph.requests, "request", request)
+
+    result = meta_graph.graph_request(
+        "POST", "/pn-1/messages", json_body={"type": "text", "text": {"body": "hi"}}
+    )
+
+    assert result == {"messages": [{"id": "wamid.1"}]}
+    assert seen["json"] == {"type": "text", "text": {"body": "hi"}}
+    assert seen["data"] is None
+    assert seen["headers"] == {
+        "Authorization": "Bearer user-token",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+
+
+def test_graph_request_sends_null_json_for_form_posts(monkeypatch):
+    """Existing form-encoded callers must keep sending a null json body (the
+    Facebook/Instagram tests assert `json=None` in their exact call shape) --
+    `requests` only substitutes a JSON body `if not data and json is not
+    None`, so this never changes what actually goes over the wire."""
+    monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
+    seen = {}
+
+    def request(**kwargs):
+        seen.update(kwargs)
+        return MockResponse({"id": "post-1"}, text="{}")
+
+    monkeypatch.setattr(meta_graph.requests, "request", request)
+
+    meta_graph.graph_request("POST", "/page-1/feed", data={"message": "hi"})
+
+    assert seen["json"] is None
+    assert seen["data"] == {"message": "hi"}
+    assert seen["headers"]["Content-Type"] == "application/x-www-form-urlencoded"
+
+
+def test_graph_request_rejects_data_and_json_body_together(monkeypatch):
+    monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
+    called = False
+
+    def request(**kwargs):
+        nonlocal called
+        called = True
+        return MockResponse()
+
+    monkeypatch.setattr(meta_graph.requests, "request", request)
+
+    try:
+        meta_graph.graph_request("POST", "/x", data={"a": 1}, json_body={"b": 2})
+    except ValueError as exc:
+        assert "either data or json_body" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
+    assert called is False

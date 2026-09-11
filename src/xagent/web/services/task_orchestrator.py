@@ -1418,7 +1418,7 @@ def _refuse_if_bg_inflight(task_id: int) -> None:
     works fine for the legitimate "previous task naturally completed"
     case).
     """
-    from ..api.websocket import background_task_manager
+    from .task_execution import background_task_manager
 
     existing = background_task_manager.running_tasks.get(task_id)
     if existing is not None and not existing.done():
@@ -1428,10 +1428,10 @@ def _refuse_if_bg_inflight(task_id: int) -> None:
 def _get_agent_manager() -> Any:
     """Resolve the global ``AgentServiceManager`` singleton.
 
-    Local import keeps the services -> api boundary one-way at module
-    load time.
+    Resolve lazily so importing turn lifecycle helpers does not construct
+    the process-local runtime manager.
     """
-    from ..api.chat import get_agent_manager
+    from .agent_service_manager import get_agent_manager
 
     return get_agent_manager()
 
@@ -1790,12 +1790,12 @@ def _schedule_bg(
     bg run loads its own snapshot and opens its own sessions, so no
     caller-bound ORM object crosses into the coroutine.
     """
-    from ..api.websocket import (
+    from .task_events import publish_task_event
+    from .task_execution import (
         background_task_manager,
         create_terminal_task_error_event,
         execute_task_background,
     )
-    from ..api.websocket import manager as websocket_manager
 
     execution_failed = False
 
@@ -2090,7 +2090,7 @@ def _schedule_bg(
                         lease_settled = bool(settled)
                         if settled and broadcast_error_message is not None:
                             try:
-                                await websocket_manager.broadcast_to_task(
+                                await publish_task_event(
                                     create_terminal_task_error_event(
                                         task_id,
                                         broadcast_error_message,

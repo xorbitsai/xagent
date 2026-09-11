@@ -9,10 +9,10 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from xagent.web.api.agents import enhance_system_prompt_with_kb
 from xagent.web.api.agents import router as agents_router
 from xagent.web.api.auth import auth_router
 from xagent.web.models.database import Base, get_db, get_engine
+from xagent.web.services.agent_prompt import enhance_system_prompt_with_kb
 
 
 def _override_get_db():

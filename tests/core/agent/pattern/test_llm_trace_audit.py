@@ -155,13 +155,13 @@ def test_ws_handler_drops_audit_only_events() -> None:
 
     This is a security-critical assertion: the audit pipeline persists
     raw LLM I/O (messages, response) via DatabaseTraceHandler, and the
-    drop in WebSocketTraceHandler is the only barrier preventing that
+    drop in TaskEventTraceHandler is the only barrier preventing that
     same payload from being broadcast to connected clients.
     """
     from xagent.core.agent.trace import ACTION_START_LLM, TraceEvent
-    from xagent.web.api.ws_trace_handlers import WebSocketTraceHandler
+    from xagent.web.services.task_event_trace_handler import TaskEventTraceHandler
 
-    handler = WebSocketTraceHandler(task_id=1)
+    handler = TaskEventTraceHandler(task_id=1)
 
     audit_event = TraceEvent(
         event_type=ACTION_START_LLM,
@@ -184,9 +184,9 @@ def test_ws_handler_drops_audit_only_events() -> None:
 def test_ws_handler_passes_non_audit_events() -> None:
     """Regression: dropping ``__audit_only__`` must not affect normal events."""
     from xagent.core.agent.trace import ACTION_START_LLM, TraceEvent
-    from xagent.web.api.ws_trace_handlers import WebSocketTraceHandler
+    from xagent.web.services.task_event_trace_handler import TaskEventTraceHandler
 
-    handler = WebSocketTraceHandler(task_id=1)
+    handler = TaskEventTraceHandler(task_id=1)
 
     event = TraceEvent(
         event_type=ACTION_START_LLM,

@@ -2022,7 +2022,7 @@ async def update_current_user_preferences(
             # client-visible 500 for a write that already happened,
             # mirroring the exact bug _run_post_commit_oauth_side_effects
             # (issue #1150) exists to prevent; same fix, same reasoning.
-            from .chat import get_agent_manager
+            from ..services.agent_service_manager import get_agent_manager
 
             try:
                 await get_agent_manager().invalidate_cached_agents_for_owner(user_id)

@@ -15,11 +15,11 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
 
 from xagent.web.api import auth as auth_api
-from xagent.web.api import chat as chat_api
 from xagent.web.api.auth import RefreshTokenResponse, auth_router, hash_password
 from xagent.web.models import database as database_module
 from xagent.web.models.database import Base, configure_db, get_db, get_engine
 from xagent.web.models.user import User
+from xagent.web.services import agent_service_manager as agent_runtime_service
 
 # Create temporary directory for database
 temp_dir = tempfile.mkdtemp()
@@ -770,7 +770,9 @@ class TestAuthAPI:
 
         mock_manager = MagicMock()
         mock_manager.invalidate_cached_agents_for_owner = AsyncMock()
-        monkeypatch.setattr(chat_api, "get_agent_manager", lambda: mock_manager)
+        monkeypatch.setattr(
+            agent_runtime_service, "get_agent_manager", lambda: mock_manager
+        )
 
         response = client.patch(
             "/api/auth/me/preferences", json={"department": "Sales"}, headers=headers
@@ -803,7 +805,9 @@ class TestAuthAPI:
         mock_manager.invalidate_cached_agents_for_owner = AsyncMock(
             side_effect=RuntimeError("cache backend unavailable")
         )
-        monkeypatch.setattr(chat_api, "get_agent_manager", lambda: mock_manager)
+        monkeypatch.setattr(
+            agent_runtime_service, "get_agent_manager", lambda: mock_manager
+        )
 
         response = client.patch(
             "/api/auth/me/preferences", json={"voice": "warm"}, headers=headers
@@ -1335,7 +1339,9 @@ class TestAuthAPI:
 
         mock_manager = MagicMock()
         mock_manager.invalidate_cached_agents_for_owner = AsyncMock()
-        monkeypatch.setattr(chat_api, "get_agent_manager", lambda: mock_manager)
+        monkeypatch.setattr(
+            agent_runtime_service, "get_agent_manager", lambda: mock_manager
+        )
 
         merge_engine = get_engine()
         event.listen(merge_engine, "commit", _on_commit)

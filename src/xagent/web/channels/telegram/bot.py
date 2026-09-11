@@ -37,10 +37,10 @@ from aiogram.types import (
 from sqlalchemy.orm import Session
 
 from ....core.file_ref import build_file_id_ref
-from ...api.chat import get_agent_manager
 from ...models.database import get_session_local
 from ...models.task import TaskStatus
 from ...models.user import User
+from ...services.agent_service_manager import get_agent_manager
 from ...services.channel_runtime import (
     TELEGRAM_TASK_LIST_LIMIT,
     ChannelAgentSnapshot,
@@ -1479,10 +1479,8 @@ class TelegramBotInstance:
                         ext = ".jpg"
                     file_name = f"{file_id}{ext}"
 
-                from ...api.websocket import (
-                    build_unique_target_path,
-                    normalize_filename,
-                )
+                from ...api.websocket import build_unique_target_path
+                from ...services.task_execution import normalize_filename
 
                 try:
                     normalized_file_name = normalize_filename(file_name)

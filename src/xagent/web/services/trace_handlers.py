@@ -997,7 +997,7 @@ class DatabaseTraceHandler(BaseTraceHandler):
 
     def _save_trace_event(self, db: Session, event: CoreTraceEvent) -> None:
         """Save trace event in unified format to database."""
-        from ...web.api.ws_trace_handlers import get_event_type_mapping
+        from .task_event_trace_handler import get_event_type_mapping
 
         try:
             # Map the trace event to the unified event type

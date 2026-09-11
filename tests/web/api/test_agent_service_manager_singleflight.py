@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from xagent.web.api.chat import AgentServiceManager
+from xagent.web.services.agent_service_manager import AgentServiceManager
 
 
 @pytest.mark.asyncio

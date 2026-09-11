@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from xagent.web.api.websocket import BackgroundTaskManager
+from xagent.web.services.task_execution import BackgroundTaskManager
 from xagent.web.services.task_lease_service import run_while_task_lease_owned
 
 

@@ -13,7 +13,6 @@ from sqlalchemy.pool import QueuePool
 from xagent.core.file_storage.factory import get_unscoped_file_storage
 from xagent.core.file_storage.storage import FsspecFileStorage
 from xagent.core.workspace import TaskWorkspace
-from xagent.web.api.chat import AgentServiceManager
 from xagent.web.models import database as database_module
 from xagent.web.models.agent import Agent, AgentOrigin
 from xagent.web.models.database import Base
@@ -22,6 +21,7 @@ from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 from xagent.web.models.user_channel import UserChannel
 from xagent.web.services import channel_runtime
+from xagent.web.services.agent_service_manager import AgentServiceManager
 from xagent.web.services.channel_runtime import (
     ChannelAuthorizationError,
     DownloadedChannelFile,

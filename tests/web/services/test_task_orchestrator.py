@@ -273,7 +273,7 @@ def mock_schedule_bg():
 def _clear_bg_manager():
     """Reset the global bg manager between tests so _refuse_if_bg_inflight
     sees a clean slate."""
-    from xagent.web.api.websocket import background_task_manager
+    from xagent.web.services.task_execution import background_task_manager
 
     background_task_manager.running_tasks.clear()
     yield
@@ -1491,7 +1491,7 @@ async def test_begin_turn_refuses_when_bg_inflight(
     db_session,
     mock_schedule_bg,
 ) -> None:
-    from xagent.web.api.websocket import background_task_manager
+    from xagent.web.services.task_execution import background_task_manager
 
     user = _create_user(db_session)
     task = _create_task(db_session, user.id, status=TaskStatus.COMPLETED)
@@ -1800,7 +1800,7 @@ def test_finish_turn_mirrors_failed_task_to_trigger_run(db_session) -> None:
 async def test_schedule_bg_cancels_execution_after_heartbeat_loses_lease(
     db_session,
 ) -> None:
-    from xagent.web.api.websocket import background_task_manager
+    from xagent.web.services.task_execution import background_task_manager
 
     user = _create_user(db_session)
     task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
@@ -1842,7 +1842,7 @@ async def test_schedule_bg_cancels_execution_after_heartbeat_loses_lease(
             return_value=None,
         ),
         patch(
-            "xagent.web.api.websocket.execute_task_background",
+            "xagent.web.services.task_execution.execute_task_background",
             new=execute,
         ),
         patch(
@@ -1872,7 +1872,7 @@ async def test_schedule_bg_cancels_execution_after_heartbeat_loses_lease(
 async def test_delayed_preclaimed_scheduler_does_not_resurrect_recovered_task(
     db_session,
 ) -> None:
-    from xagent.web.api.websocket import background_task_manager
+    from xagent.web.services.task_execution import background_task_manager
     from xagent.web.services.task_lease_recovery import (
         recover_expired_task_leases_until_cutoff,
     )
@@ -1906,7 +1906,7 @@ async def test_delayed_preclaimed_scheduler_does_not_resurrect_recovered_task(
             new=AsyncMock(),
         ),
         patch(
-            "xagent.web.api.websocket.execute_task_background",
+            "xagent.web.services.task_execution.execute_task_background",
             new=AsyncMock(),
         ) as execute,
         patch(
@@ -1941,7 +1941,7 @@ async def test_schedule_bg_skips_finish_turn_when_lease_acquire_fails(
     user = _create_user(db_session)
     task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
 
-    from xagent.web.api.websocket import background_task_manager
+    from xagent.web.services.task_execution import background_task_manager
 
     payload = TaskTurnPayload("x")
     _store_runtime_secret_for_turn(payload.turn_id)
@@ -1953,7 +1953,7 @@ async def test_schedule_bg_skips_finish_turn_when_lease_acquire_fails(
             return_value=None,
         ),
         patch(
-            "xagent.web.api.websocket.execute_task_background",
+            "xagent.web.services.task_execution.execute_task_background",
             new=AsyncMock(),
         ) as mock_exec,
         patch(
@@ -1986,7 +1986,7 @@ async def test_schedule_bg_resolves_scope_off_loop_before_execution(
     queue_pool_runtime_db_factory,
 ) -> None:
     """A contended scope lookup must not block the main event loop."""
-    from xagent.web.api.websocket import background_task_manager
+    from xagent.web.services.task_execution import background_task_manager
 
     user = _create_user(db_session)
     task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
@@ -2050,7 +2050,7 @@ async def test_schedule_bg_resolves_scope_off_loop_before_execution(
             create=True,
         ),
         patch(
-            "xagent.web.api.websocket.execute_task_background",
+            "xagent.web.services.task_execution.execute_task_background",
             new=execute,
         ),
         patch(
@@ -2095,7 +2095,7 @@ async def test_schedule_bg_persists_setup_failures_off_loop(
     db_session,
     failure_point,
 ) -> None:
-    from xagent.web.api.websocket import background_task_manager
+    from xagent.web.services.task_execution import background_task_manager
 
     user = _create_user(db_session)
     task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
@@ -2137,7 +2137,7 @@ async def test_schedule_bg_persists_setup_failures_off_loop(
             create=True,
         ),
         patch(
-            "xagent.web.api.websocket.execute_task_background",
+            "xagent.web.services.task_execution.execute_task_background",
             new=execute,
         ),
         patch(
@@ -2168,7 +2168,7 @@ async def test_schedule_bg_pool_timeout_defers_settlement_to_lease_recovery(
     caplog,
 ) -> None:
     """One exhausted checkout must not trigger an immediate second checkout."""
-    from xagent.web.api.websocket import background_task_manager
+    from xagent.web.services.task_execution import background_task_manager
 
     engine, SessionLocal = queue_pool_runtime_db
     with SessionLocal() as seed_db:
@@ -2219,7 +2219,7 @@ async def test_schedule_bg_pool_timeout_defers_settlement_to_lease_recovery(
                 side_effect=load_snapshot_from_contended_pool,
             ),
             patch(
-                "xagent.web.api.websocket.execute_task_background",
+                "xagent.web.services.task_execution.execute_task_background",
                 new=AsyncMock(),
             ) as mock_execute,
             patch(
@@ -2263,7 +2263,7 @@ async def test_schedule_bg_heartbeat_pool_timeout_skips_settlement(
     db_session,
 ) -> None:
     """A heartbeat checkout timeout must not trigger a cleanup checkout."""
-    from xagent.web.api.websocket import background_task_manager
+    from xagent.web.services.task_execution import background_task_manager
 
     user = _create_user(db_session)
     task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
@@ -2302,7 +2302,7 @@ async def test_schedule_bg_heartbeat_pool_timeout_skips_settlement(
             create=True,
         ),
         patch(
-            "xagent.web.api.websocket.execute_task_background",
+            "xagent.web.services.task_execution.execute_task_background",
             new=AsyncMock(),
         ),
         patch(
@@ -2333,7 +2333,7 @@ async def test_schedule_bg_settles_owned_terminal_task_observed_by_heartbeat(
     monkeypatch,
 ) -> None:
     """A terminal commit is settlement-ready, not evidence of lease loss."""
-    from xagent.web.api.websocket import background_task_manager
+    from xagent.web.services.task_execution import background_task_manager
 
     user = _create_user(db_session)
     agent = Agent(user_id=user.id, name="terminal heartbeat agent")
@@ -2407,7 +2407,7 @@ async def test_schedule_bg_settles_owned_terminal_task_observed_by_heartbeat(
             create=True,
         ),
         patch(
-            "xagent.web.api.websocket.execute_task_background",
+            "xagent.web.services.task_execution.execute_task_background",
             new=execute_then_wait,
         ),
         patch.object(background_task_manager, "register_task"),
@@ -2445,7 +2445,7 @@ async def test_schedule_bg_releases_lease_without_blocking_pool_checkout(
     monkeypatch,
 ) -> None:
     """Final status read and workforce-aware release share one worker session."""
-    from xagent.web.api.websocket import background_task_manager
+    from xagent.web.services.task_execution import background_task_manager
 
     # The release path must wait for the slot, never give up on it.
     engine, SessionLocal = queue_pool_runtime_db_factory(
@@ -2500,7 +2500,7 @@ async def test_schedule_bg_releases_lease_without_blocking_pool_checkout(
             create=True,
         ),
         patch(
-            "xagent.web.api.websocket.execute_task_background",
+            "xagent.web.services.task_execution.execute_task_background",
             new=AsyncMock(),
         ),
         patch.object(background_task_manager, "register_task"),
@@ -2546,7 +2546,7 @@ async def test_schedule_bg_releases_lease_on_execute_task_background_exception(
 ) -> None:
     """Lease must not leak when execute_task_background raises — _runner.finally
     must still call the lease release + workforce sync helper."""
-    from xagent.web.api.websocket import background_task_manager
+    from xagent.web.services.task_execution import background_task_manager
     from xagent.web.services.task_lease_service import TaskLease
 
     user = _create_user(db_session)
@@ -2568,7 +2568,7 @@ async def test_schedule_bg_releases_lease_on_execute_task_background_exception(
             new=AsyncMock(),
         ),
         patch(
-            "xagent.web.api.websocket.execute_task_background",
+            "xagent.web.services.task_execution.execute_task_background",
             new=AsyncMock(side_effect=RuntimeError("boom")),
         ),
         patch(
@@ -2612,7 +2612,7 @@ async def test_schedule_bg_broadcasts_failure_only_after_exact_settlement(
     expected_broadcasts: int,
 ) -> None:
     """A replacement owner must never inherit a stale runner's error event."""
-    from xagent.web.api.websocket import background_task_manager
+    from xagent.web.services.task_execution import background_task_manager
 
     user = _create_user(db_session)
     task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
@@ -2649,7 +2649,7 @@ async def test_schedule_bg_broadcasts_failure_only_after_exact_settlement(
             create=True,
         ),
         patch(
-            "xagent.web.api.websocket.execute_task_background",
+            "xagent.web.services.task_execution.execute_task_background",
             new=AsyncMock(side_effect=RuntimeError("owned run failed")),
         ),
         patch(
@@ -2799,7 +2799,7 @@ async def test_schedule_bg_forwards_execution_message_to_execute_task_background
     type-signature level, so a future refactor can't silently collapse
     transcript and execution into a single string.
     """
-    from xagent.web.api.websocket import background_task_manager
+    from xagent.web.services.task_execution import background_task_manager
     from xagent.web.services.task_lease_service import TaskLease
 
     user = _create_user(db_session)
@@ -2826,7 +2826,7 @@ async def test_schedule_bg_forwards_execution_message_to_execute_task_background
             new=AsyncMock(),
         ),
         patch(
-            "xagent.web.api.websocket.execute_task_background",
+            "xagent.web.services.task_execution.execute_task_background",
             new=AsyncMock(),
         ) as mock_exec,
         patch(
@@ -2875,7 +2875,7 @@ async def test_schedule_bg_forwards_execution_message_to_execute_task_background
 @pytest.mark.asyncio
 async def test_schedule_bg_acquires_expired_lease_on_first_try(db_session) -> None:
     """Expired lease columns are granted by acquire_task_lease's atomic WHERE."""
-    from xagent.web.api.websocket import background_task_manager
+    from xagent.web.services.task_execution import background_task_manager
     from xagent.web.services.task_lease_service import utc_now
 
     user = _create_user(db_session)
@@ -2897,7 +2897,7 @@ async def test_schedule_bg_acquires_expired_lease_on_first_try(db_session) -> No
             return_value=fake_snapshot,
         ),
         patch(
-            "xagent.web.api.websocket.execute_task_background",
+            "xagent.web.services.task_execution.execute_task_background",
             new=AsyncMock(),
         ) as mock_exec,
         patch(
@@ -2947,8 +2947,8 @@ async def test_schedule_bg_marks_task_failed_when_snapshot_load_raises(
     The outer ``except`` records the error and the one fenced settlement
     transaction pushes the exact run to ``FAILED`` while releasing it.
     """
-    from xagent.web.api.websocket import background_task_manager
     from xagent.web.api.websocket import manager as ws_manager
+    from xagent.web.services.task_execution import background_task_manager
     from xagent.web.services.task_lease_service import TaskLease
 
     user = _create_user(db_session)
@@ -2981,7 +2981,7 @@ async def test_schedule_bg_marks_task_failed_when_snapshot_load_raises(
             side_effect=RuntimeError("simulated snapshot load failure"),
         ),
         patch(
-            "xagent.web.api.websocket.execute_task_background",
+            "xagent.web.services.task_execution.execute_task_background",
             new=AsyncMock(),
         ) as mock_exec,
         patch.object(background_task_manager, "register_task"),
@@ -3031,7 +3031,7 @@ async def test_schedule_bg_marks_task_failed_when_snapshot_load_raises(
 
 @pytest.mark.asyncio
 async def test_schedule_bg_cleanup_handles_missing_payload_turn_id(db_session) -> None:
-    from xagent.web.api.websocket import background_task_manager
+    from xagent.web.services.task_execution import background_task_manager
     from xagent.web.services.task_lease_service import TaskLease
 
     user = _create_user(db_session)
@@ -3054,7 +3054,7 @@ async def test_schedule_bg_cleanup_handles_missing_payload_turn_id(db_session) -
             return_value=MagicMock(),
         ),
         patch(
-            "xagent.web.api.websocket.execute_task_background",
+            "xagent.web.services.task_execution.execute_task_background",
             new=AsyncMock(),
         ) as mock_exec,
         patch(
@@ -3088,8 +3088,8 @@ async def test_schedule_bg_preserves_public_safe_required_mcp_failure(
 ) -> None:
     """A typed, curated setup failure remains actionable to the client."""
     from xagent.core.utils import setup_metrics
-    from xagent.web.api.websocket import background_task_manager
     from xagent.web.api.websocket import manager as ws_manager
+    from xagent.web.services.task_execution import background_task_manager
 
     counters = setup_metrics.SetupMetrics()
     monkeypatch.setattr(setup_metrics, "trigger_execution", counters)
@@ -3168,8 +3168,8 @@ async def test_schedule_bg_marks_task_failed_when_execute_raises(
     db_session,
 ) -> None:
     """An execution exception is persisted by the one fenced settlement."""
-    from xagent.web.api.websocket import background_task_manager
     from xagent.web.api.websocket import manager as ws_manager
+    from xagent.web.services.task_execution import background_task_manager
     from xagent.web.services.task_lease_service import TaskLease
 
     user = _create_user(db_session)
@@ -3203,7 +3203,7 @@ async def test_schedule_bg_marks_task_failed_when_execute_raises(
             return_value=fake_snapshot,
         ),
         patch(
-            "xagent.web.api.websocket.execute_task_background",
+            "xagent.web.services.task_execution.execute_task_background",
             new=AsyncMock(side_effect=RuntimeError("simulated agent boom")),
         ),
         patch.object(background_task_manager, "register_task"),
@@ -3247,7 +3247,7 @@ async def test_schedule_bg_does_not_overwrite_terminal_status_from_execute(
     ``_runner`` returns, the row must remain PAUSED, not be flipped
     to FAILED by the outer safety net.
     """
-    from xagent.web.api.websocket import background_task_manager
+    from xagent.web.services.task_execution import background_task_manager
     from xagent.web.services.task_lease_service import TaskLease
 
     user = _create_user(db_session)
@@ -3289,7 +3289,7 @@ async def test_schedule_bg_does_not_overwrite_terminal_status_from_execute(
             return_value=fake_snapshot,
         ),
         patch(
-            "xagent.web.api.websocket.execute_task_background",
+            "xagent.web.services.task_execution.execute_task_background",
             new=fake_execute,
         ),
         patch.object(background_task_manager, "register_task"),
@@ -3584,7 +3584,7 @@ def _finalize_runner_patches(
     Only the agent runtime is faked by default; lease settlement and delivery
     marking run for real against SQLite unless a stub is supplied.
     """
-    from xagent.web.api.websocket import background_task_manager
+    from xagent.web.services.task_execution import background_task_manager
 
     patches = [
         patch(
@@ -3602,7 +3602,7 @@ def _finalize_runner_patches(
             else MagicMock(return_value=MagicMock()),
         ),
         patch(
-            "xagent.web.api.websocket.execute_task_background",
+            "xagent.web.services.task_execution.execute_task_background",
             new=execute if execute is not None else AsyncMock(),
         ),
         patch.object(background_task_manager, "register_task"),
@@ -3969,7 +3969,7 @@ def _captured_terminal_broadcast(setup_or_run_error: BaseException, db_session):
     with every test still green, so the settlement kwargs come back too.
     """
 
-    from xagent.web.api.websocket import background_task_manager
+    from xagent.web.services.task_execution import background_task_manager
 
     user = _create_user(db_session)
     task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
@@ -4007,7 +4007,7 @@ def _captured_terminal_broadcast(setup_or_run_error: BaseException, db_session):
             create=True,
         ),
         patch(
-            "xagent.web.api.websocket.execute_task_background",
+            "xagent.web.services.task_execution.execute_task_background",
             new=AsyncMock(side_effect=setup_or_run_error),
         ),
         patch(
@@ -4289,7 +4289,7 @@ async def test_incidental_failure_persists_the_generic_history_type(
 @pytest.mark.asyncio
 async def test_trigger_metrics_cancelled_before_runner_starts(monkeypatch) -> None:
     from xagent.core.utils import setup_metrics
-    from xagent.web.api.websocket import background_task_manager
+    from xagent.web.services.task_execution import background_task_manager
 
     counters = setup_metrics.SetupMetrics()
     monkeypatch.setattr(setup_metrics, "trigger_execution", counters)
@@ -4322,7 +4322,7 @@ async def test_leased_auto_failure_preserves_client_classification(db_session) -
     ):
         task = db_session.query(Task).filter(Task.id == task_id).one()
         with patch(
-            "xagent.web.api.websocket.execute_task_background",
+            "xagent.web.services.task_execution.execute_task_background",
             new=AsyncMock(side_effect=error),
         ) as execute:
             await _run_failing_turn(task_id, int(task.user_id), task.source)
@@ -4352,7 +4352,8 @@ async def test_cancelled_runner_drains_persistence_before_settlement(
 ):
     from xagent.core.agent.checkpoint import CHECKPOINT_EVENT_TYPE
     from xagent.core.agent.trace import TraceEvent as CoreTraceEvent
-    from xagent.web.api import trace_handlers, websocket
+    from xagent.web.api import websocket
+    from xagent.web.services import task_execution, trace_handlers
     from xagent.web.services.task_lease_service import bind_task_lease_context
 
     turn_id = f"cancel-persist-{kind}-{write_fails}"
@@ -4382,14 +4383,14 @@ async def test_cancelled_runner_drains_persistence_before_settlement(
 
     factory = sessionmaker(db_session.get_bind(), class_=WriterSession)
     monkeypatch.setattr(trace_handlers, "get_db", lambda: iter([factory()]))
-    monkeypatch.setattr(websocket, "get_db", lambda: iter([factory()]))
+    monkeypatch.setattr(task_execution, "get_db", lambda: iter([factory()]))
     broadcast = AsyncMock()
     monkeypatch.setattr(websocket.manager, "broadcast_to_task", broadcast)
 
     async def execute(*args, **kwargs):
         with bind_task_lease_context(lease):
             if kind == "outbound":
-                await websocket.make_agent_outbound_handler(task.id)(
+                await task_execution.make_agent_outbound_handler(task.id)(
                     {"message": "progress", "event_id": turn_id}
                 )
             else:

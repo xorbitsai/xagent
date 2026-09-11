@@ -41,23 +41,23 @@ from xagent.core.tools.adapters.vibe.connector_runtime import (
     redact_runtime_sensitive_payload,
 )
 from xagent.web.api.chat import chat_router
-from xagent.web.api.trace_handlers import (
-    DatabaseTraceHandler,
-    _convert_float_to_datetime,
-)
 from xagent.web.api.v1 import _events_stream as es
 from xagent.web.api.v1 import tasks as v1_tasks
 from xagent.web.api.v1.deps import ApiKeyPrincipal, _resolve_principal_from_credentials
 from xagent.web.api.v1.errors import V1ApiError, V1ErrorCode
-from xagent.web.api.ws_trace_handlers import (
-    WebSocketTraceHandler,
-    get_event_type_mapping,
-)
 from xagent.web.models.agent_api_key import AgentApiKey
 from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.services.hot_path_cache import (
     InMemoryTTLCache,
     set_cache_backend_for_testing,
+)
+from xagent.web.services.task_event_trace_handler import (
+    TaskEventTraceHandler,
+    get_event_type_mapping,
+)
+from xagent.web.services.trace_handlers import (
+    DatabaseTraceHandler,
+    _convert_float_to_datetime,
 )
 
 from ..conftest import (
@@ -1993,7 +1993,7 @@ def _broadcast_frame_for(event: "CoreTraceEvent", *, task_id: int) -> str:
     """The exact text a real broadcast of ``event`` would carry.
 
     Routes the core trace event through the production conversion --
-    ``WebSocketTraceHandler._convert_trace_event_to_stream_event``, which
+    ``TaskEventTraceHandler._convert_trace_event_to_stream_event``, which
     applies ``serialize_trace_data``, ``normalize_public_trace_event``
     and ``create_stream_event`` -- and serializes it the way
     ``ConnectionManager.broadcast_to_task`` does. Constructing the
@@ -2001,7 +2001,7 @@ def _broadcast_frame_for(event: "CoreTraceEvent", *, task_id: int) -> str:
     ``_load_task_description`` is the async path and is deliberately not
     called, so no ``task_description`` is injected).
     """
-    handler = WebSocketTraceHandler(task_id)
+    handler = TaskEventTraceHandler(task_id)
     converted = handler._convert_trace_event_to_stream_event(event)
     assert converted is not None, "fixture event must be projectable"
     return json.dumps(converted)

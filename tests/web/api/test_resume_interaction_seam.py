@@ -37,12 +37,15 @@ from tests.web.services.task_interaction_schema_shared import (
     make_user,
 )
 from xagent.db.sqlite import apply_sqlite_concurrency_pragmas
-from xagent.web.api import chat as chat_api
 from xagent.web.api import websocket as websocket_api
+from xagent.web.api.websocket import _make_command_reply
 from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.task_interaction import TaskInteractionRequest
+from xagent.web.services import agent_service_manager as agent_runtime_service
 from xagent.web.services import ops_signals
+from xagent.web.services import task_command_execution as command_execution_service
+from xagent.web.services import task_execution as task_execution_service
 from xagent.web.services.task_interaction_close import (
     ACTIVE_INTERACTION_UNAVAILABLE_REASONS,
     ActiveInteractionUnavailable,
@@ -226,24 +229,32 @@ async def test_legacy_resume_without_a_receipt_is_refused_with_an_active_row(
             )
         )
         stack.enter_context(
-            patch.object(websocket_api, "background_task_manager", background_manager)
+            patch.object(
+                task_execution_service, "background_task_manager", background_manager
+            )
         )
         # The handler asks the DB whether another process still holds a live
         # lease before it schedules; these suites drive the handler without a
         # task row, so answer "no foreign owner" explicitly.
         stack.enter_context(
             patch.object(
-                websocket_api, "task_has_live_foreign_runner", return_value=False
+                command_execution_service,
+                "task_has_live_foreign_runner",
+                return_value=False,
             )
         )
         agent_manager = MagicMock()
         agent_manager.get_agent_for_task = AsyncMock(return_value=agent_service)
         stack.enter_context(
-            patch.object(chat_api, "get_agent_manager", lambda: agent_manager)
+            patch.object(
+                agent_runtime_service,
+                "get_agent_manager",
+                lambda: agent_manager,
+            )
         )
 
-        await websocket_api._handle_resume_task_unserialized(
-            MagicMock(),
+        await command_execution_service.resume_task(
+            _make_command_reply(MagicMock()),
             _seeded_task,
             {"user": SimpleNamespace(id=OWNER_ID, is_admin=False)},
         )
@@ -304,24 +315,32 @@ async def test_legacy_resume_without_a_receipt_is_refused_on_the_fallback_path(
             )
         )
         stack.enter_context(
-            patch.object(websocket_api, "background_task_manager", background_manager)
+            patch.object(
+                task_execution_service, "background_task_manager", background_manager
+            )
         )
         # The handler asks the DB whether another process still holds a live
         # lease before it schedules; these suites drive the handler without a
         # task row, so answer "no foreign owner" explicitly.
         stack.enter_context(
             patch.object(
-                websocket_api, "task_has_live_foreign_runner", return_value=False
+                command_execution_service,
+                "task_has_live_foreign_runner",
+                return_value=False,
             )
         )
         agent_manager = MagicMock()
         agent_manager.get_agent_for_task = AsyncMock(return_value=agent_service)
         stack.enter_context(
-            patch.object(chat_api, "get_agent_manager", lambda: agent_manager)
+            patch.object(
+                agent_runtime_service,
+                "get_agent_manager",
+                lambda: agent_manager,
+            )
         )
 
-        await websocket_api._handle_resume_task_unserialized(
-            MagicMock(),
+        await command_execution_service.resume_task(
+            _make_command_reply(MagicMock()),
             _seeded_task,
             {"user": SimpleNamespace(id=OWNER_ID, is_admin=False)},
         )
@@ -374,7 +393,7 @@ async def test_legacy_resume_is_not_refused_when_the_task_marker_is_null(
     background_manager.running_tasks = {}
     background_manager.resume_admission_state.return_value = None
     background_manager.try_reserve_resume.return_value = (
-        websocket_api.ResumeReservationOutcome.RESERVED
+        task_execution_service.ResumeReservationOutcome.RESERVED
     )
     transition = AsyncMock(
         return_value=SimpleNamespace(run_id=RUN_ID, status=TaskStatus.WAITING_FOR_USER)
@@ -402,19 +421,23 @@ async def test_legacy_resume_is_not_refused_when_the_task_marker_is_null(
             )
         )
         stack.enter_context(
-            patch.object(websocket_api, "background_task_manager", background_manager)
+            patch.object(
+                task_execution_service, "background_task_manager", background_manager
+            )
         )
         # The handler asks the DB whether another process still holds a live
         # lease before it schedules; these suites drive the handler without a
         # task row, so answer "no foreign owner" explicitly.
         stack.enter_context(
             patch.object(
-                websocket_api, "task_has_live_foreign_runner", return_value=False
+                command_execution_service,
+                "task_has_live_foreign_runner",
+                return_value=False,
             )
         )
         stack.enter_context(
             patch.object(
-                websocket_api,
+                task_execution_service,
                 "execute_resume_background",
                 side_effect=_stub_execute_resume_background,
             )
@@ -422,11 +445,15 @@ async def test_legacy_resume_is_not_refused_when_the_task_marker_is_null(
         agent_manager = MagicMock()
         agent_manager.get_agent_for_task = AsyncMock(return_value=agent_service)
         stack.enter_context(
-            patch.object(chat_api, "get_agent_manager", lambda: agent_manager)
+            patch.object(
+                agent_runtime_service,
+                "get_agent_manager",
+                lambda: agent_manager,
+            )
         )
 
-        await websocket_api._handle_resume_task_unserialized(
-            MagicMock(),
+        await command_execution_service.resume_task(
+            _make_command_reply(MagicMock()),
             _seeded_task,
             {"user": SimpleNamespace(id=OWNER_ID, is_admin=False)},
         )
@@ -581,24 +608,32 @@ async def test_receipts_the_seam_cannot_verify_are_refused(
             )
         )
         stack.enter_context(
-            patch.object(websocket_api, "background_task_manager", background_manager)
+            patch.object(
+                task_execution_service, "background_task_manager", background_manager
+            )
         )
         # The handler asks the DB whether another process still holds a live
         # lease before it schedules; these suites drive the handler without a
         # task row, so answer "no foreign owner" explicitly.
         stack.enter_context(
             patch.object(
-                websocket_api, "task_has_live_foreign_runner", return_value=False
+                command_execution_service,
+                "task_has_live_foreign_runner",
+                return_value=False,
             )
         )
         agent_manager = MagicMock()
         agent_manager.get_agent_for_task = AsyncMock(return_value=agent_service)
         stack.enter_context(
-            patch.object(chat_api, "get_agent_manager", lambda: agent_manager)
+            patch.object(
+                agent_runtime_service,
+                "get_agent_manager",
+                lambda: agent_manager,
+            )
         )
 
-        await websocket_api._handle_resume_task_unserialized(
-            MagicMock(),
+        await command_execution_service.resume_task(
+            _make_command_reply(MagicMock()),
             _seeded_task,
             payload,
         )
@@ -637,7 +672,7 @@ async def test_resume_with_a_matching_receipt_is_not_refused(
     background_manager.running_tasks = {}
     background_manager.resume_admission_state.return_value = None
     background_manager.try_reserve_resume.return_value = (
-        websocket_api.ResumeReservationOutcome.RESERVED
+        task_execution_service.ResumeReservationOutcome.RESERVED
     )
     transition = AsyncMock(
         return_value=SimpleNamespace(run_id=RUN_ID, status=TaskStatus.WAITING_FOR_USER)
@@ -665,19 +700,23 @@ async def test_resume_with_a_matching_receipt_is_not_refused(
             )
         )
         stack.enter_context(
-            patch.object(websocket_api, "background_task_manager", background_manager)
+            patch.object(
+                task_execution_service, "background_task_manager", background_manager
+            )
         )
         # The handler asks the DB whether another process still holds a live
         # lease before it schedules; these suites drive the handler without a
         # task row, so answer "no foreign owner" explicitly.
         stack.enter_context(
             patch.object(
-                websocket_api, "task_has_live_foreign_runner", return_value=False
+                command_execution_service,
+                "task_has_live_foreign_runner",
+                return_value=False,
             )
         )
         stack.enter_context(
             patch.object(
-                websocket_api,
+                task_execution_service,
                 "execute_resume_background",
                 side_effect=_stub_execute_resume_background,
             )
@@ -685,11 +724,15 @@ async def test_resume_with_a_matching_receipt_is_not_refused(
         agent_manager = MagicMock()
         agent_manager.get_agent_for_task = AsyncMock(return_value=agent_service)
         stack.enter_context(
-            patch.object(chat_api, "get_agent_manager", lambda: agent_manager)
+            patch.object(
+                agent_runtime_service,
+                "get_agent_manager",
+                lambda: agent_manager,
+            )
         )
 
-        await websocket_api._handle_resume_task_unserialized(
-            MagicMock(),
+        await command_execution_service.resume_task(
+            _make_command_reply(MagicMock()),
             _seeded_task,
             {
                 "user": SimpleNamespace(id=OWNER_ID, is_admin=False),
@@ -730,7 +773,7 @@ async def test_stale_run_active_row_does_not_trip_the_seam(
     background_manager.running_tasks = {}
     background_manager.resume_admission_state.return_value = None
     background_manager.try_reserve_resume.return_value = (
-        websocket_api.ResumeReservationOutcome.RESERVED
+        task_execution_service.ResumeReservationOutcome.RESERVED
     )
     transition = AsyncMock(
         return_value=SimpleNamespace(run_id=RUN_ID, status=TaskStatus.WAITING_FOR_USER)
@@ -757,19 +800,23 @@ async def test_stale_run_active_row_does_not_trip_the_seam(
             )
         )
         stack.enter_context(
-            patch.object(websocket_api, "background_task_manager", background_manager)
+            patch.object(
+                task_execution_service, "background_task_manager", background_manager
+            )
         )
         # The handler asks the DB whether another process still holds a live
         # lease before it schedules; these suites drive the handler without a
         # task row, so answer "no foreign owner" explicitly.
         stack.enter_context(
             patch.object(
-                websocket_api, "task_has_live_foreign_runner", return_value=False
+                command_execution_service,
+                "task_has_live_foreign_runner",
+                return_value=False,
             )
         )
         stack.enter_context(
             patch.object(
-                websocket_api,
+                task_execution_service,
                 "execute_resume_background",
                 side_effect=_stub_execute_resume_background,
             )
@@ -777,11 +824,15 @@ async def test_stale_run_active_row_does_not_trip_the_seam(
         agent_manager = MagicMock()
         agent_manager.get_agent_for_task = AsyncMock(return_value=agent_service)
         stack.enter_context(
-            patch.object(chat_api, "get_agent_manager", lambda: agent_manager)
+            patch.object(
+                agent_runtime_service,
+                "get_agent_manager",
+                lambda: agent_manager,
+            )
         )
 
-        await websocket_api._handle_resume_task_unserialized(
-            MagicMock(),
+        await command_execution_service.resume_task(
+            _make_command_reply(MagicMock()),
             _seeded_task,
             {"user": SimpleNamespace(id=OWNER_ID, is_admin=False)},
         )
@@ -827,7 +878,7 @@ async def test_legacy_resume_is_not_refused_when_the_active_interaction_read_is_
     """
 
     monkeypatch.setattr(
-        websocket_api,
+        command_execution_service,
         "active_interaction_id_sync",
         lambda task_id: ActiveInteractionUnavailable(reason),
     )
@@ -838,7 +889,7 @@ async def test_legacy_resume_is_not_refused_when_the_active_interaction_read_is_
     background_manager.running_tasks = {}
     background_manager.resume_admission_state.return_value = None
     background_manager.try_reserve_resume.return_value = (
-        websocket_api.ResumeReservationOutcome.RESERVED
+        task_execution_service.ResumeReservationOutcome.RESERVED
     )
     transition = AsyncMock(
         return_value=SimpleNamespace(run_id=RUN_ID, status=TaskStatus.WAITING_FOR_USER)
@@ -866,19 +917,23 @@ async def test_legacy_resume_is_not_refused_when_the_active_interaction_read_is_
             )
         )
         stack.enter_context(
-            patch.object(websocket_api, "background_task_manager", background_manager)
+            patch.object(
+                task_execution_service, "background_task_manager", background_manager
+            )
         )
         # The handler asks the DB whether another process still holds a live
         # lease before it schedules; these suites drive the handler without a
         # task row, so answer "no foreign owner" explicitly.
         stack.enter_context(
             patch.object(
-                websocket_api, "task_has_live_foreign_runner", return_value=False
+                command_execution_service,
+                "task_has_live_foreign_runner",
+                return_value=False,
             )
         )
         stack.enter_context(
             patch.object(
-                websocket_api,
+                task_execution_service,
                 "execute_resume_background",
                 side_effect=_stub_execute_resume_background,
             )
@@ -886,14 +941,16 @@ async def test_legacy_resume_is_not_refused_when_the_active_interaction_read_is_
         agent_manager = MagicMock()
         agent_manager.get_agent_for_task = AsyncMock(return_value=agent_service)
         stack.enter_context(
-            patch.object(chat_api, "get_agent_manager", lambda: agent_manager)
+            patch.object(
+                agent_runtime_service, "get_agent_manager", lambda: agent_manager
+            )
         )
         stack.enter_context(
             caplog.at_level(logging.INFO, logger="xagent.web.api.websocket")
         )
 
-        result = await websocket_api._handle_resume_task_unserialized(
-            MagicMock(),
+        result = await command_execution_service.resume_task(
+            _make_command_reply(MagicMock()),
             _seeded_task,
             {"user": SimpleNamespace(id=OWNER_ID, is_admin=False)},
         )
@@ -913,7 +970,7 @@ async def test_legacy_resume_is_not_refused_when_the_active_interaction_read_is_
         ops_signals.INTERACTION_LEGACY_RESUME_SHIM
         not in ops_signals.active_degradations()
     )
-    assert result.outcome is not websocket_api.ResumeCommandOutcome.REJECTED
+    assert result.outcome is not command_execution_service.ResumeCommandOutcome.REJECTED
     assert [
         record.getMessage()
         for record in caplog.records

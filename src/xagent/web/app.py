@@ -1258,7 +1258,8 @@ def start_runtime_performance_monitor(app_instance: FastAPI) -> None:
             app_instance.state.runtime_performance_task = None
             return
 
-        from .api.websocket import background_task_manager, manager
+        from .api.websocket import manager
+        from .services.task_execution import background_task_manager
 
         register_observable_gauge(
             "xagent.agent_tasks.running",
@@ -1311,7 +1312,7 @@ async def _initialize_database_and_admit_runtime(app_instance: FastAPI) -> None:
 
     # Reopen process-local task admission before any trigger, command, or
     # channel ingress can create background execution work for this lifespan.
-    from .api.websocket import background_task_manager
+    from .services.task_execution import background_task_manager
 
     background_task_manager.start_accepting()
 
@@ -1780,7 +1781,7 @@ async def startup_event() -> None:
 
     # Recover accepted-but-unfinished task commands only after the runtime,
     # skill/template managers, tracing, and sandbox services are ready.
-    from .api.websocket import execute_durable_task_command
+    from .services.task_command_execution import execute_durable_task_command
     from .services.task_command_transport import start_task_command_dispatcher
 
     global _task_command_dispatcher_task
@@ -1926,7 +1927,7 @@ async def shutdown_event() -> None:
 
     # All producers are stopped. Drain task-owned finalizers and their shared
     # lease heartbeats before tearing down the sandboxes those tasks may use.
-    from .api.websocket import background_task_manager
+    from .services.task_execution import background_task_manager
     from .services.task_lease_service import wait_for_heartbeat_manager_idle
 
     await background_task_manager.shutdown()

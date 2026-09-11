@@ -2850,3 +2850,16 @@ def test_standard_otel_fallbacks_and_xagent_precedence(
     assert config.get_otel_metrics_endpoint() == "http://xagent:4318/v1/metrics"
     assert config.get_otel_export_interval_milliseconds() == 5_000
     assert config.get_otel_service_name() == "xagent-override"
+
+
+def test_toby_personal_stdio_is_disabled_by_default(monkeypatch):
+    monkeypatch.delenv(config.TOBY_PERSONAL_STDIO_ENABLED, raising=False)
+
+    assert config.get_toby_personal_stdio_enabled() is False
+
+
+@pytest.mark.parametrize("value", ["1", "true", "YES", "on"])
+def test_toby_personal_stdio_explicit_opt_in(monkeypatch, value):
+    monkeypatch.setenv(config.TOBY_PERSONAL_STDIO_ENABLED, value)
+
+    assert config.get_toby_personal_stdio_enabled() is True

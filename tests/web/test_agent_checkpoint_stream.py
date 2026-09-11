@@ -31,20 +31,10 @@ from xagent.core.agent.trace import (
     TraceEventType,
     TraceScope,
 )
-from xagent.web.api.trace_handlers import DatabaseTraceHandler, _ResolvedReadPartition
 from xagent.web.api.websocket import (
-    _agent_outbound_event_type,
     _is_agent_checkpoint_data,
     _is_duplicate_user_message_turn,
-    _persist_agent_outbound_event,
-    create_final_answer_stream_event,
-    create_stream_event,
-    make_agent_outbound_handler,
     send_historical_data_as_stream,
-)
-from xagent.web.api.ws_trace_handlers import (
-    WebSocketTraceHandler,
-    get_event_type_mapping,
 )
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import Base
@@ -58,6 +48,17 @@ from xagent.web.services.ops_signals import (
     active_degradations,
     clear_degradation,
 )
+from xagent.web.services.task_event_trace_handler import (
+    TaskEventTraceHandler,
+    get_event_type_mapping,
+)
+from xagent.web.services.task_execution import (
+    _agent_outbound_event_type,
+    _persist_agent_outbound_event,
+    create_final_answer_stream_event,
+    create_stream_event,
+    make_agent_outbound_handler,
+)
 from xagent.web.services.task_interaction_schema import (
     interaction_requests_table_exists,
 )
@@ -66,6 +67,10 @@ from xagent.web.services.task_lease_service import (
     TaskLease,
     bind_task_lease_context,
     current_task_lease,
+)
+from xagent.web.services.trace_handlers import (
+    DatabaseTraceHandler,
+    _ResolvedReadPartition,
 )
 
 
@@ -90,7 +95,7 @@ def test_agent_checkpoint_is_not_converted_to_websocket_stream_event() -> None:
         },
     )
 
-    stream_event = WebSocketTraceHandler(365)._convert_trace_event_to_stream_event(
+    stream_event = TaskEventTraceHandler(365)._convert_trace_event_to_stream_event(
         event
     )
 
@@ -134,7 +139,7 @@ def test_workforce_delegation_summary_maps_to_public_stream_event() -> None:
         },
     )
 
-    stream_event = WebSocketTraceHandler(365)._convert_trace_event_to_stream_event(
+    stream_event = TaskEventTraceHandler(365)._convert_trace_event_to_stream_event(
         event
     )
 
@@ -158,7 +163,7 @@ def test_non_task_update_event_with_delegation_payload_is_not_promoted() -> None
         },
     )
 
-    stream_event = WebSocketTraceHandler(365)._convert_trace_event_to_stream_event(
+    stream_event = TaskEventTraceHandler(365)._convert_trace_event_to_stream_event(
         event
     )
 
@@ -255,7 +260,7 @@ async def test_agent_outbound_handler_skips_hidden_messages(monkeypatch) -> None
         broadcast_calls.append((event, task_id))
 
     monkeypatch.setattr(
-        "xagent.web.api.websocket._persist_agent_outbound_event", fake_persist
+        "xagent.web.services.task_execution._persist_agent_outbound_event", fake_persist
     )
     monkeypatch.setattr("xagent.web.api.websocket.asyncio.to_thread", fake_to_thread)
     monkeypatch.setattr(
@@ -296,7 +301,7 @@ async def test_agent_outbound_handler_repairs_completed_final_answer(
         broadcast_calls.append((event, task_id))
 
     monkeypatch.setattr(
-        "xagent.web.api.websocket._reconcile_streamed_final_answer",
+        "xagent.web.services.task_execution._reconcile_streamed_final_answer",
         fake_reconcile,
     )
     monkeypatch.setattr("xagent.web.api.websocket.asyncio.to_thread", fake_to_thread)
@@ -349,7 +354,7 @@ def test_persist_agent_outbound_event_uses_payload_ids(monkeypatch) -> None:
         finally:
             session.close()
 
-    monkeypatch.setattr("xagent.web.api.websocket.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.services.task_execution.get_db", get_test_db)
 
     event = create_stream_event(
         "agent_progress",
@@ -409,7 +414,7 @@ def test_persist_agent_outbound_event_sanitizes_payload(monkeypatch) -> None:
         finally:
             session.close()
 
-    monkeypatch.setattr("xagent.web.api.websocket.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.services.task_execution.get_db", get_test_db)
 
     # chr, not source escapes: a lone surrogate is not encodable as UTF-8.
     nul, lone_high, replacement = chr(0x0000), chr(0xD800), chr(0xFFFD)
@@ -1230,7 +1235,7 @@ def test_database_trace_handler_load_latest_checkpoint_is_build_scoped(
         finally:
             session.close()
 
-    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.services.trace_handlers.get_db", get_test_db)
 
     try:
         parent_handler = DatabaseTraceHandler(int(task.id))
@@ -1328,7 +1333,7 @@ def test_database_trace_handler_loads_checkpoint_only_from_bound_run(
         finally:
             session.close()
 
-    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.services.trace_handlers.get_db", get_test_db)
 
     try:
         with bind_task_lease_context(
@@ -1397,7 +1402,7 @@ def test_database_trace_handler_bound_run_widens_to_legacy_checkpoint_when_untag
         finally:
             session.close()
 
-    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.services.trace_handlers.get_db", get_test_db)
 
     try:
         with bind_task_lease_context(
@@ -1442,7 +1447,7 @@ def test_database_trace_handler_load_without_pk_anchor_uses_legacy_scan(
         finally:
             session.close()
 
-    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.services.trace_handlers.get_db", get_test_db)
 
     try:
         with bind_task_lease_context(
@@ -1499,7 +1504,7 @@ def test_database_trace_handler_load_uses_pk_anchor_over_newer_row(
         finally:
             session.close()
 
-    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.services.trace_handlers.get_db", get_test_db)
 
     try:
         with bind_task_lease_context(
@@ -1630,7 +1635,7 @@ def test_database_trace_handler_load_pk_anchor_single_fault_raises_corrupt(
         finally:
             session.close()
 
-    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.services.trace_handlers.get_db", get_test_db)
 
     try:
         with bind_task_lease_context(
@@ -1725,7 +1730,7 @@ def test_database_trace_handler_load_pk_anchor_absent_run_field_still_raises_cor
         finally:
             session.close()
 
-    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.services.trace_handlers.get_db", get_test_db)
 
     try:
         with bind_task_lease_context(
@@ -1786,7 +1791,7 @@ def test_database_trace_handler_load_pk_anchor_without_execution_identity_loads(
         finally:
             session.close()
 
-    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.services.trace_handlers.get_db", get_test_db)
 
     try:
         with bind_task_lease_context(
@@ -1839,7 +1844,7 @@ def test_database_trace_handler_load_dangling_pk_anchor_falls_back_with_telemetr
         finally:
             session.close()
 
-    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.services.trace_handlers.get_db", get_test_db)
 
     clear_degradation(CHECKPOINT_PK_ANCHOR_DANGLING)
     try:
@@ -1889,7 +1894,7 @@ def test_database_trace_handler_unbound_legacy_load_fails_closed_after_tagged_ru
         finally:
             session.close()
 
-    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.services.trace_handlers.get_db", get_test_db)
 
     try:
         # A tagged run has positive proof a checkpoint exists in a partition
@@ -1928,7 +1933,7 @@ def test_database_trace_handler_unbound_legacy_load_stays_legacy_compatible(
         finally:
             session.close()
 
-    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.services.trace_handlers.get_db", get_test_db)
 
     try:
         assert DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
@@ -1966,7 +1971,7 @@ def test_database_trace_handler_unbound_root_load_fails_closed_for_active_run(
         finally:
             session.close()
 
-    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.services.trace_handlers.get_db", get_test_db)
 
     try:
         # An active run is in progress under a different lease; this unbound
@@ -1997,7 +2002,7 @@ def test_database_trace_handler_load_refuses_lease_bound_to_another_task(
         finally:
             session.close()
 
-    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.services.trace_handlers.get_db", get_test_db)
 
     try:
         with (
@@ -2040,7 +2045,7 @@ def test_partition_refusal_is_distinct_from_absence(
         finally:
             session.close()
 
-    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.services.trace_handlers.get_db", get_test_db)
 
     try:
         # No lease bound, and a tagged run has positive proof a checkpoint
@@ -2109,7 +2114,7 @@ def test_read_partition_keeps_bound_run_when_a_tagged_checkpoint_exists(
         finally:
             session.close()
 
-    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.services.trace_handlers.get_db", get_test_db)
 
     try:
         with bind_task_lease_context(
@@ -2224,7 +2229,7 @@ def test_legacy_checkpoint_is_read_after_a_run_id_is_minted(
         finally:
             session.close()
 
-    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.services.trace_handlers.get_db", get_test_db)
 
     try:
         with bind_task_lease_context(
@@ -2326,7 +2331,7 @@ def test_widened_partition_is_confirmed_before_rejecting_a_row_failing_any_other
         finally:
             session.close()
 
-    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.services.trace_handlers.get_db", get_test_db)
 
     # Every field except "run_partition" leaves the row untagged, so the
     # probe finds no run-tagged checkpoint for this task and the reader
@@ -2439,7 +2444,7 @@ def test_widened_read_never_returns_without_a_fresh_recheck(
         finally:
             session.close()
 
-    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.services.trace_handlers.get_db", get_test_db)
 
     real_unguarded = DatabaseTraceHandler._sync_load_latest_checkpoint_unguarded
 
@@ -2514,7 +2519,7 @@ def test_widened_read_is_not_flagged_stale_when_nothing_concurrent_happens(
         finally:
             session.close()
 
-    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.services.trace_handlers.get_db", get_test_db)
 
     try:
         with bind_task_lease_context(
@@ -2570,7 +2575,7 @@ def test_unleased_widened_read_is_guarded_against_a_concurrent_tag(
         finally:
             session.close()
 
-    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.services.trace_handlers.get_db", get_test_db)
 
     # (a) the resolver itself, called directly with no lease bound.
     partition = DatabaseTraceHandler(task_id)._root_checkpoint_read_partition(db)
@@ -2657,7 +2662,7 @@ def test_recheck_probe_failure_surfaces_as_unavailable_not_a_snapshot(
         finally:
             session.close()
 
-    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.services.trace_handlers.get_db", get_test_db)
 
     real_probe = DatabaseTraceHandler._task_has_run_tagged_checkpoint
     calls = {"n": 0}
@@ -2728,7 +2733,7 @@ def test_run_bound_read_issues_no_extra_probe(
         finally:
             session.close()
 
-    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.services.trace_handlers.get_db", get_test_db)
 
     real_probe = DatabaseTraceHandler._task_has_run_tagged_checkpoint
     calls = {"n": 0}
@@ -2842,7 +2847,7 @@ def test_probe_failure_registers_signal_from_both_callers(
         finally:
             session.close()
 
-    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.services.trace_handlers.get_db", get_test_db)
 
     original_first = Query.first
 
@@ -2912,7 +2917,7 @@ def test_widening_self_extinguishes_after_the_first_tagged_checkpoint(
         finally:
             session.close()
 
-    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.services.trace_handlers.get_db", get_test_db)
 
     try:
         with bind_task_lease_context(
@@ -3009,7 +3014,7 @@ def test_widening_increments_its_counter_only_when_it_engages(
         finally:
             session.close()
 
-    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.services.trace_handlers.get_db", get_test_db)
 
     try:
         with bind_task_lease_context(
@@ -3074,7 +3079,7 @@ def test_widening_increments_its_counter_only_when_it_engages(
         finally:
             session.close()
 
-    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db2)
+    monkeypatch.setattr("xagent.web.services.trace_handlers.get_db", get_test_db2)
 
     try:
         before = widened_count()
@@ -3137,7 +3142,7 @@ def test_database_trace_handler_prunes_only_bound_run_partition(
     )
     db.commit()
     monkeypatch.setattr(
-        "xagent.web.api.trace_handlers.get_checkpoint_history_limit",
+        "xagent.web.services.trace_handlers.get_checkpoint_history_limit",
         lambda: 1,
     )
 
@@ -3193,7 +3198,7 @@ def test_database_trace_handler_prunes_legacy_partition_without_tagged_runs(
     )
     db.commit()
     monkeypatch.setattr(
-        "xagent.web.api.trace_handlers.get_checkpoint_history_limit",
+        "xagent.web.services.trace_handlers.get_checkpoint_history_limit",
         lambda: 1,
     )
 
@@ -3252,7 +3257,7 @@ def test_database_trace_handler_prune_excludes_the_anchored_row(
     task.last_checkpoint_trace_event_id = old_row.id
     db.commit()
     monkeypatch.setattr(
-        "xagent.web.api.trace_handlers.get_checkpoint_history_limit",
+        "xagent.web.services.trace_handlers.get_checkpoint_history_limit",
         lambda: 1,
     )
 
@@ -3311,7 +3316,7 @@ def test_prune_protects_a_trace_row_anchored_by_an_active_interaction(
         db, task_id=task_id, resume_trace_event_id=old_row.id, status="active"
     )
     monkeypatch.setattr(
-        "xagent.web.api.trace_handlers.get_checkpoint_history_limit",
+        "xagent.web.services.trace_handlers.get_checkpoint_history_limit",
         lambda: 1,
     )
 
@@ -3370,7 +3375,7 @@ def test_prune_does_not_protect_a_terminal_interaction_anchor(
         db, task_id=task_id, resume_trace_event_id=old_row.id, status="terminated"
     )
     monkeypatch.setattr(
-        "xagent.web.api.trace_handlers.get_checkpoint_history_limit",
+        "xagent.web.services.trace_handlers.get_checkpoint_history_limit",
         lambda: 1,
     )
 
@@ -3432,7 +3437,7 @@ def test_prune_protects_an_expired_but_active_interaction_anchor(
         expires_at=now - timedelta(hours=1),
     )
     monkeypatch.setattr(
-        "xagent.web.api.trace_handlers.get_checkpoint_history_limit",
+        "xagent.web.services.trace_handlers.get_checkpoint_history_limit",
         lambda: 1,
     )
 
@@ -3504,7 +3509,7 @@ def test_prune_retains_at_most_limit_plus_two(
         status="active",
     )
     monkeypatch.setattr(
-        "xagent.web.api.trace_handlers.get_checkpoint_history_limit",
+        "xagent.web.services.trace_handlers.get_checkpoint_history_limit",
         lambda: 1,
     )
 
@@ -3572,7 +3577,7 @@ def test_prune_retains_exactly_the_limit_when_the_interaction_anchor_is_in_range
         db, task_id=task_id, resume_trace_event_id=rows[-1].id, status="active"
     )
     monkeypatch.setattr(
-        "xagent.web.api.trace_handlers.get_checkpoint_history_limit",
+        "xagent.web.services.trace_handlers.get_checkpoint_history_limit",
         lambda: 1,
     )
 
@@ -3632,7 +3637,7 @@ def test_prune_runs_without_the_interaction_table(
     )
     db.commit()
     monkeypatch.setattr(
-        "xagent.web.api.trace_handlers.get_checkpoint_history_limit",
+        "xagent.web.services.trace_handlers.get_checkpoint_history_limit",
         lambda: 1,
     )
 
@@ -3713,7 +3718,7 @@ def test_database_trace_handler_prune_registers_degradation_on_delete_error(
     )
     db.commit()
     monkeypatch.setattr(
-        "xagent.web.api.trace_handlers.get_checkpoint_history_limit",
+        "xagent.web.services.trace_handlers.get_checkpoint_history_limit",
         lambda: 1,
     )
 
@@ -3781,7 +3786,7 @@ def test_websocket_trace_handler_dedupes_prior_user_message_turn_id(
 
     monkeypatch.setattr("xagent.web.models.database.get_db", get_test_db)
 
-    handler = WebSocketTraceHandler(task_id)
+    handler = TaskEventTraceHandler(task_id)
     assert not handler._has_prior_user_message_turn(
         "user_message", {"turn_id": "turn-1"}, "first-event"
     )
@@ -4523,7 +4528,7 @@ def _bind_checkpoint_read_session(
         finally:
             session.close()
 
-    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.services.trace_handlers.get_db", get_test_db)
 
 
 def test_database_trace_handler_load_pk_anchor_undecodable_payload_falls_back_to_older_row(
@@ -4568,7 +4573,7 @@ def test_database_trace_handler_load_pk_anchor_undecodable_payload_falls_back_to
 
     _bind_checkpoint_read_session(monkeypatch, SessionLocal)
     monkeypatch.setattr(
-        "xagent.web.api.trace_handlers.decode_trace_event_data",
+        "xagent.web.services.trace_handlers.decode_trace_event_data",
         _decode_failing_on(
             _BROKEN_ANCHOR_LABEL, CheckpointMessageDecodeError("blob is gone")
         ),
@@ -4614,7 +4619,7 @@ def test_database_trace_handler_load_pk_anchor_undecodable_payload_without_older
 
     _bind_checkpoint_read_session(monkeypatch, SessionLocal)
     monkeypatch.setattr(
-        "xagent.web.api.trace_handlers.decode_trace_event_data",
+        "xagent.web.services.trace_handlers.decode_trace_event_data",
         _decode_failing_on(
             _BROKEN_ANCHOR_LABEL, CheckpointMessageDecodeError("blob is gone")
         ),
@@ -4666,7 +4671,7 @@ def test_database_trace_handler_load_pk_anchor_generic_decode_failure_is_unavail
 
     _bind_checkpoint_read_session(monkeypatch, SessionLocal)
     monkeypatch.setattr(
-        "xagent.web.api.trace_handlers.decode_trace_event_data",
+        "xagent.web.services.trace_handlers.decode_trace_event_data",
         _decode_failing_on(_BROKEN_ANCHOR_LABEL, RuntimeError("blob prefetch failed")),
     )
 
@@ -4937,7 +4942,7 @@ def test_database_trace_handler_prune_retains_exactly_the_limit_when_the_anchor_
     task.last_checkpoint_trace_event_id = rows[-1].id
     db.commit()
     monkeypatch.setattr(
-        "xagent.web.api.trace_handlers.get_checkpoint_history_limit",
+        "xagent.web.services.trace_handlers.get_checkpoint_history_limit",
         lambda: 1,
     )
 
@@ -4985,7 +4990,7 @@ def test_database_trace_handler_prune_with_nothing_stale_clears_the_failure_sign
     )
     db.commit()
     monkeypatch.setattr(
-        "xagent.web.api.trace_handlers.get_checkpoint_history_limit",
+        "xagent.web.services.trace_handlers.get_checkpoint_history_limit",
         lambda: 5,
     )
 

@@ -14,9 +14,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from xagent.web.api import chat as chat_api
 from xagent.web.api import websocket as websocket_api
+from xagent.web.api.websocket import _make_command_reply
 from xagent.web.models.task import TaskStatus
+from xagent.web.services import agent_service_manager as agent_runtime_service
+from xagent.web.services import task_command_execution as command_execution_service
+from xagent.web.services import task_execution as task_execution_service
 from xagent.web.services import task_setup_snapshot as snapshot_module
 
 
@@ -58,20 +61,26 @@ async def _run_pause_with_no_live_execution(
         lambda *args, **kwargs: snapshot,
     )
     monkeypatch.setattr(
-        websocket_api, "resolve_execution_scope_off_turn", lambda _task_id: None
+        command_execution_service,
+        "resolve_execution_scope_off_turn",
+        lambda _task_id: None,
     )
     monkeypatch.setattr(
-        websocket_api, "_read_task_error_payload_offloop", read_error_payload
+        command_execution_service,
+        "_read_task_error_payload_offloop",
+        read_error_payload,
     )
-    monkeypatch.setattr(chat_api, "get_agent_manager", lambda: agent_manager)
+    monkeypatch.setattr(
+        agent_runtime_service, "get_agent_manager", lambda: agent_manager
+    )
     monkeypatch.setattr(websocket_api, "manager", connection_manager)
 
     try:
-        await websocket_api._handle_pause_task_unserialized(
-            MagicMock(), task_id, {"user": actor}
+        await command_execution_service.pause_task(
+            _make_command_reply(MagicMock()), task_id, {"user": actor}
         )
     finally:
-        websocket_api._clear_task_pause_accepted(task_id)
+        task_execution_service._clear_task_pause_accepted(task_id)
 
     connection_manager.broadcast_to_task.assert_not_awaited()
     return reported

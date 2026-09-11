@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import pytest
 
-from xagent.web.api.chat import create_default_llm
+from xagent.web.services.agent_service_manager import create_default_llm
 
 
 @pytest.fixture(autouse=True)
@@ -28,7 +28,9 @@ class TestCreateDefaultLLM:
         monkeypatch.delenv("ZHIPU_MODEL_NAME", raising=False)
 
         # Mock OpenAILLM constructor to capture arguments
-        with patch("xagent.web.api.chat.OpenAILLM") as mock_openai_llm:
+        with patch(
+            "xagent.web.services.agent_service_manager.OpenAILLM"
+        ) as mock_openai_llm:
             mock_openai_llm.return_value = None  # Return None for simplicity
 
             result = create_default_llm()
@@ -56,7 +58,9 @@ class TestCreateDefaultLLM:
         monkeypatch.delenv("ZHIPU_MODEL_NAME", raising=False)
 
         # Mock OpenAILLM constructor
-        with patch("xagent.web.api.chat.OpenAILLM") as mock_openai_llm:
+        with patch(
+            "xagent.web.services.agent_service_manager.OpenAILLM"
+        ) as mock_openai_llm:
             # OpenAILLM should not be called because api_key is None
             result = create_default_llm()
 
@@ -77,7 +81,9 @@ class TestCreateDefaultLLM:
         monkeypatch.delenv("OPENAI_MODEL", raising=False)
 
         # Mock ZhipuLLM constructor
-        with patch("xagent.web.api.chat.ZhipuLLM") as mock_zhipu_llm:
+        with patch(
+            "xagent.web.services.agent_service_manager.ZhipuLLM"
+        ) as mock_zhipu_llm:
             # ZhipuLLM should not be called because api_key is empty string
             result = create_default_llm()
 
@@ -98,7 +104,9 @@ class TestCreateDefaultLLM:
         monkeypatch.delenv("ZHIPU_BASE_URL", raising=False)
         monkeypatch.delenv("OPENAI_MODEL", raising=False)
 
-        with patch("xagent.web.api.chat.ZhipuLLM") as mock_zhipu_llm:
+        with patch(
+            "xagent.web.services.agent_service_manager.ZhipuLLM"
+        ) as mock_zhipu_llm:
             mock_zhipu_llm.return_value = None
 
             result = create_default_llm()
@@ -123,7 +131,9 @@ class TestCreateDefaultLLM:
         monkeypatch.delenv("ZHIPU_BASE_URL", raising=False)
         monkeypatch.delenv("OPENAI_MODEL", raising=False)
 
-        with patch("xagent.web.api.chat.ZhipuLLM") as mock_zhipu_llm:
+        with patch(
+            "xagent.web.services.agent_service_manager.ZhipuLLM"
+        ) as mock_zhipu_llm:
             mock_zhipu_llm.return_value = None
 
             result = create_default_llm()
@@ -149,7 +159,9 @@ class TestCreateDefaultLLM:
         monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
         monkeypatch.delenv("OPENAI_MODEL", raising=False)
 
-        with patch("xagent.web.api.chat.ZhipuLLM") as mock_zhipu_llm:
+        with patch(
+            "xagent.web.services.agent_service_manager.ZhipuLLM"
+        ) as mock_zhipu_llm:
             mock_zhipu_llm.return_value = None
 
             result = create_default_llm()
@@ -175,7 +187,9 @@ class TestCreateDefaultLLM:
         monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
         monkeypatch.delenv("ZHIPU_MODEL_NAME", raising=False)
 
-        with patch("xagent.web.api.chat.OpenAILLM") as mock_openai_llm:
+        with patch(
+            "xagent.web.services.agent_service_manager.OpenAILLM"
+        ) as mock_openai_llm:
             mock_openai_llm.return_value = None
 
             result = create_default_llm()
@@ -201,7 +215,9 @@ class TestCreateDefaultLLM:
         monkeypatch.delenv("ZHIPU_BASE_URL", raising=False)
         monkeypatch.delenv("ZHIPU_MODEL_NAME", raising=False)
 
-        with patch("xagent.web.api.chat.OpenAILLM") as mock_openai_llm:
+        with patch(
+            "xagent.web.services.agent_service_manager.OpenAILLM"
+        ) as mock_openai_llm:
             mock_openai_llm.return_value = None
 
             result = create_default_llm()
@@ -226,7 +242,9 @@ class TestCreateDefaultLLM:
         monkeypatch.delenv("ZHIPU_BASE_URL", raising=False)
         monkeypatch.delenv("ZHIPU_MODEL_NAME", raising=False)
 
-        with patch("xagent.web.api.chat.OpenAILLM") as mock_openai_llm:
+        with patch(
+            "xagent.web.services.agent_service_manager.OpenAILLM"
+        ) as mock_openai_llm:
             mock_openai_llm.return_value = None
 
             result = create_default_llm()
@@ -251,7 +269,9 @@ class TestCreateDefaultLLM:
         monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
         monkeypatch.delenv("OPENAI_MODEL", raising=False)
 
-        with patch("xagent.web.api.chat.ZhipuLLM") as mock_zhipu_llm:
+        with patch(
+            "xagent.web.services.agent_service_manager.ZhipuLLM"
+        ) as mock_zhipu_llm:
             mock_zhipu_llm.return_value = None
 
             result = create_default_llm()
@@ -276,7 +296,9 @@ class TestCreateDefaultLLM:
         monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
         monkeypatch.delenv("ZHIPU_MODEL_NAME", raising=False)
 
-        with patch("xagent.web.api.chat.OpenAILLM") as mock_openai_llm:
+        with patch(
+            "xagent.web.services.agent_service_manager.OpenAILLM"
+        ) as mock_openai_llm:
             mock_openai_llm.return_value = None
 
             result = create_default_llm()
@@ -301,7 +323,9 @@ class TestCreateDefaultLLM:
         monkeypatch.delenv("ZHIPU_BASE_URL", raising=False)
         monkeypatch.delenv("OPENAI_MODEL", raising=False)
 
-        with patch("xagent.web.api.chat.ZhipuLLM") as mock_zhipu_llm:
+        with patch(
+            "xagent.web.services.agent_service_manager.ZhipuLLM"
+        ) as mock_zhipu_llm:
             mock_zhipu_llm.return_value = None
 
             result = create_default_llm()
@@ -325,7 +349,9 @@ class TestCreateDefaultLLM:
         monkeypatch.delenv("ZHIPU_BASE_URL", raising=False)
         monkeypatch.delenv("OPENAI_MODEL", raising=False)
 
-        with patch("xagent.web.api.chat.ZhipuLLM") as mock_zhipu_llm:
+        with patch(
+            "xagent.web.services.agent_service_manager.ZhipuLLM"
+        ) as mock_zhipu_llm:
             mock_zhipu_llm.return_value = None
 
             result = create_default_llm()
@@ -350,7 +376,9 @@ class TestCreateDefaultLLM:
         monkeypatch.delenv("ZHIPU_BASE_URL", raising=False)
         monkeypatch.delenv("OPENAI_MODEL", raising=False)
 
-        with patch("xagent.web.api.chat.ZhipuLLM") as mock_zhipu_llm:
+        with patch(
+            "xagent.web.services.agent_service_manager.ZhipuLLM"
+        ) as mock_zhipu_llm:
             mock_zhipu_llm.return_value = None
 
             result = create_default_llm()
@@ -392,7 +420,9 @@ class TestCreateDefaultLLM:
         monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
         monkeypatch.delenv("ZHIPU_BASE_URL", raising=False)
 
-        with patch("xagent.web.api.chat.ZhipuLLM") as mock_zhipu_llm:
+        with patch(
+            "xagent.web.services.agent_service_manager.ZhipuLLM"
+        ) as mock_zhipu_llm:
             mock_zhipu_llm.return_value = None
 
             result = create_default_llm()
@@ -405,7 +435,9 @@ class TestCreateDefaultLLM:
             assert call_args.kwargs["api_key"] == zhipu_api_key
             assert call_args.kwargs["model_name"] == "glm-4.7"
 
-            with patch("xagent.web.api.chat.OpenAILLM") as mock_openai_llm:
+            with patch(
+                "xagent.web.services.agent_service_manager.OpenAILLM"
+            ) as mock_openai_llm:
                 # OpenAILLM should not be called
                 mock_openai_llm.assert_not_called()
 
@@ -423,7 +455,9 @@ class TestCreateDefaultLLM:
         monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
         monkeypatch.delenv("ZHIPU_BASE_URL", raising=False)
 
-        with patch("xagent.web.api.chat.ZhipuLLM") as mock_zhipu_llm:
+        with patch(
+            "xagent.web.services.agent_service_manager.ZhipuLLM"
+        ) as mock_zhipu_llm:
             mock_zhipu_llm.return_value = None
 
             result = create_default_llm()
@@ -436,7 +470,9 @@ class TestCreateDefaultLLM:
             assert call_args.kwargs["api_key"] == "valid-zhipu-api-key"
             assert call_args.kwargs["model_name"] == "glm-4.7"
 
-            with patch("xagent.web.api.chat.OpenAILLM") as mock_openai_llm:
+            with patch(
+                "xagent.web.services.agent_service_manager.OpenAILLM"
+            ) as mock_openai_llm:
                 # OpenAILLM should not be called
                 mock_openai_llm.assert_not_called()
 
@@ -454,7 +490,9 @@ class TestCreateDefaultLLM:
         monkeypatch.delenv("ZHIPU_BASE_URL", raising=False)
         monkeypatch.delenv("ZHIPU_MODEL_NAME", raising=False)
 
-        with patch("xagent.web.api.chat.DeepSeekLLM") as mock_deepseek_llm:
+        with patch(
+            "xagent.web.services.agent_service_manager.DeepSeekLLM"
+        ) as mock_deepseek_llm:
             mock_deepseek_llm.return_value = None
 
             result = create_default_llm()
@@ -476,7 +514,9 @@ class TestCreateDefaultLLM:
         monkeypatch.delenv("ZHIPU_BASE_URL", raising=False)
         monkeypatch.delenv("ZHIPU_MODEL_NAME", raising=False)
 
-        with patch("xagent.web.api.chat.DeepSeekLLM") as mock_deepseek_llm:
+        with patch(
+            "xagent.web.services.agent_service_manager.DeepSeekLLM"
+        ) as mock_deepseek_llm:
             result = create_default_llm()
 
         mock_deepseek_llm.assert_not_called()
@@ -495,8 +535,12 @@ class TestCreateDefaultLLM:
         monkeypatch.delenv("DEEPSEEK_BASE_URL", raising=False)
 
         with (
-            patch("xagent.web.api.chat.OpenAILLM") as mock_openai_llm,
-            patch("xagent.web.api.chat.DeepSeekLLM") as mock_deepseek_llm,
+            patch(
+                "xagent.web.services.agent_service_manager.OpenAILLM"
+            ) as mock_openai_llm,
+            patch(
+                "xagent.web.services.agent_service_manager.DeepSeekLLM"
+            ) as mock_deepseek_llm,
         ):
             mock_openai_llm.return_value = None
             mock_deepseek_llm.return_value = None
@@ -524,8 +568,12 @@ class TestCreateDefaultLLM:
         monkeypatch.delenv("DEEPSEEK_BASE_URL", raising=False)
 
         with (
-            patch("xagent.web.api.chat.DeepSeekLLM") as mock_deepseek_llm,
-            patch("xagent.web.api.chat.OpenAILLM") as mock_openai_llm,
+            patch(
+                "xagent.web.services.agent_service_manager.DeepSeekLLM"
+            ) as mock_deepseek_llm,
+            patch(
+                "xagent.web.services.agent_service_manager.OpenAILLM"
+            ) as mock_openai_llm,
         ):
             mock_openai_llm.return_value = None
             mock_deepseek_llm.return_value = None

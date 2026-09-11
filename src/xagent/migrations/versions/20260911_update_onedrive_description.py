@@ -1,7 +1,7 @@
 """update OneDrive description for the new upload tool
 
 Revision ID: 20260911_update_onedrive_description
-Revises: 20260909_seed_shopify_mcp_app
+Revises: 20260911_assistant_source_event
 Create Date: 2026-09-11
 
 """
@@ -12,7 +12,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "20260911_update_onedrive_description"
-down_revision: Union[str, None] = "20260909_seed_shopify_mcp_app"
+down_revision: Union[str, None] = "20260911_assistant_source_event"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

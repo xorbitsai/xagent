@@ -21,10 +21,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from xagent.web.api.chat import AgentServiceManager
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
+from xagent.web.services.agent_service_manager import AgentServiceManager
 from xagent.web.services.llm_utils import AgentRuntimeFields
 from xagent.web.services.task_setup_snapshot import (
     RuntimeUserFields,
@@ -179,7 +179,7 @@ async def test_existing_task_with_agent_dedups_task_and_agent_queries() -> None:
     # fields without ever opening a real SessionLocal.
     with (
         patch(
-            "xagent.web.api.chat.load_task_setup_snapshot_sync",
+            "xagent.web.services.agent_service_manager.load_task_setup_snapshot_sync",
             return_value=snapshot_stub,
         ) as snapshot_loader,
         patch.object(
@@ -187,11 +187,11 @@ async def test_existing_task_with_agent_dedups_task_and_agent_queries() -> None:
             "_load_persisted_conversation_history",
         ),
         patch(
-            "xagent.web.api.chat.create_task_tracer",
+            "xagent.web.services.agent_service_manager.create_task_tracer",
             return_value=MagicMock(),
         ),
         patch(
-            "xagent.web.api.chat.create_default_tools",
+            "xagent.web.services.agent_service_manager.create_default_tools",
             new=AsyncMock(return_value=([], MagicMock())),
         ),
         patch(
@@ -199,7 +199,7 @@ async def test_existing_task_with_agent_dedups_task_and_agent_queries() -> None:
             return_value=None,
         ),
         patch(
-            "xagent.web.api.chat.AgentService",
+            "xagent.web.services.agent_service_manager.AgentService",
         ),
     ):
         try:
@@ -276,19 +276,22 @@ async def test_owner_mismatch_reload_failure_detaches_the_live_owner_row() -> No
 
     with (
         patch(
-            "xagent.web.api.chat.load_task_setup_snapshot_sync",
+            "xagent.web.services.agent_service_manager.load_task_setup_snapshot_sync",
             side_effect=RuntimeError("snapshot load failed"),
         ),
         patch.object(manager, "_load_persisted_conversation_history"),
-        patch("xagent.web.api.chat.create_task_tracer", return_value=MagicMock()),
         patch(
-            "xagent.web.api.chat.create_default_tools",
+            "xagent.web.services.agent_service_manager.create_task_tracer",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "xagent.web.services.agent_service_manager.create_default_tools",
             new=fake_create_default_tools,
         ),
         patch("xagent.web.sandbox_manager.get_sandbox_manager", return_value=None),
-        patch("xagent.web.api.chat.AgentService"),
+        patch("xagent.web.services.agent_service_manager.AgentService"),
         patch(
-            "xagent.web.api.chat.resolve_execution_scope",
+            "xagent.web.services.agent_service_manager.resolve_execution_scope",
             return_value=None,
         ),
     ):

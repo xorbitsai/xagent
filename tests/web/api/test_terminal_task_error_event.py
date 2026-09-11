@@ -20,10 +20,10 @@ from xagent.core.tools.adapters.vibe import (
     connector_runtime as connector_runtime_module,
 )
 from xagent.web.api.v1.errors import V1ErrorCode
-from xagent.web.api.websocket import create_terminal_task_error_event
 from xagent.web.services.client_error_messages import (
     CONNECTOR_RUNTIME_CLIENT_ERROR_CODES,
 )
+from xagent.web.services.task_execution import create_terminal_task_error_event
 
 BASE_FIELDS = {"type", "message", "task_id", "task", "error", "timestamp"}
 

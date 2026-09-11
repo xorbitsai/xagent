@@ -3034,7 +3034,7 @@ def test_append_message_bg_inflight_does_not_corrupt_task_state(mock_start_task)
     """
     import asyncio
 
-    from xagent.web.api.websocket import background_task_manager
+    from xagent.web.services.task_execution import background_task_manager
 
     agent_id, full_key = _create_agent_with_key()
     task_id = _create_task(full_key, agent_id, content="first turn")

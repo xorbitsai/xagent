@@ -25,8 +25,11 @@ from tests.web.services.task_lease_shared import (
     live_task_lease as live_task_lease_fixture,
 )
 from xagent.web.api import websocket as websocket_api
+from xagent.web.api.websocket import _make_command_reply
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
+from xagent.web.services import task_command_execution as command_execution_service
+from xagent.web.services import task_execution as task_execution_service
 from xagent.web.services.client_error_messages import ClientErrorCode
 from xagent.web.services.mcp_runtime import (
     MCPBuiltinOAuthActorPolicyRequiredError,
@@ -139,7 +142,7 @@ async def test_execute_task_redacts_an_incidental_validation_error(
     assert SECRET not in serialized
     assert str(raised) not in serialized
     assert any(
-        payload.get("message") == websocket_api.CLIENT_SAFE_VALIDATION_ERROR
+        payload.get("message") == task_execution_service.CLIENT_SAFE_VALIDATION_ERROR
         for payload in payloads
     )
 
@@ -166,6 +169,33 @@ async def test_execute_task_uses_the_authentication_error_contract(
     )
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    ["wrong_helper_import", "wrong_command_helper_import", "missing_constant"],
+)
+def test_delivery_guard_rejects_invalid_route_bindings(monkeypatch, mutation):
+    path = Path(websocket_api.__file__)
+    read_text = Path.read_text
+    source = read_text(path, encoding="utf-8")
+    if mutation == "wrong_helper_import":
+        source = source.replace("    client_safe_error_message,\n", "")
+        source += "\nfrom ..services.assistant_history_safety import safe_str as client_safe_error_message\n"
+    elif mutation == "wrong_command_helper_import":
+        source = source.replace(
+            "from ..services.task_command_execution import _read_task_error_payload_offloop",
+            "from ..services.task_execution import _read_task_error_payload_offloop",
+        )
+    else:
+        source = source.replace("    CLIENT_SAFE_TASK_FAILURE,\n", "", 1)
+
+    def mutated_read(candidate, *args, **kwargs):
+        return source if candidate == path else read_text(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", mutated_read)
+    with pytest.raises(AssertionError):
+        test_no_delivery_producer_can_bypass_the_client_safe_message()
+
+
 def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
     """Exception text may not reach a client through the *recognized* shapes.
 
@@ -181,22 +211,39 @@ def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
     """
     # Explicit encoding: this module carries non-ASCII prose, and the
     # platform default would decode it as cp1252/GBK on a Windows runner.
-    source = Path(websocket_api.__file__).read_text(encoding="utf-8")
-    result = _scan(ast.parse(source))
+    # Scan each module independently: imported helpers must retain their exact
+    # origin, and constants must be available in the module that uses them.
+    trees = [
+        ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+        for module in (websocket_api, task_execution_service, command_execution_service)
+    ]
+    for tree in trees[1:]:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.level == 1:
+                node.level = 2
+                node.module = "services." + (node.module or "")
+    results = [_scan(tree) for tree in trees]
+    result = type(results[0])(
+        offenders=[item for result in results for item in result.offenders],
+        producers=sum(result.producers for result in results),
+        error_payloads=sum(result.error_payloads for result in results),
+        used_allowlist=set().union(*(result.used_allowlist for result in results)),
+    )
 
+    modules = (websocket_api, task_execution_service, command_execution_service)
     for builder in SAFE_MESSAGE_BUILDERS:
-        assert callable(getattr(websocket_api, builder, None)), (
+        assert any(callable(getattr(module, builder, None)) for module in modules), (
             f"SAFE_MESSAGE_BUILDERS blesses {builder!r}, which does not exist"
         )
     for constant in SAFE_MESSAGE_CONSTANTS:
-        assert isinstance(getattr(websocket_api, constant, None), str), (
-            f"SAFE_MESSAGE_CONSTANTS blesses {constant!r}, which is not text"
-        )
+        assert any(
+            isinstance(getattr(module, constant, None), str) for module in modules
+        ), f"SAFE_MESSAGE_CONSTANTS blesses {constant!r}, which is not text"
 
     # These are deliberate exact baselines. If a producer is added or removed,
     # inspect the changed site and bump the corresponding count in this test.
-    assert result.producers == 29, (
-        f"expected exactly 29 producers, matched {result.producers}; "
+    assert result.producers == 30, (
+        f"expected exactly 30 producers, matched {result.producers}; "
         "review the changed sites and bump deliberately"
     )
     # #1658 removed ``_resync_client_to_running_task``'s stale-client ``error``
@@ -206,8 +253,10 @@ def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
     # ``_broadcast_terminal_command_error`` gained a third payload literal for
     # external-scope non-cancel commands, mirroring the persisted-event
     # identity rule for the live frame too, bringing the census to 51.
-    assert result.error_payloads == 51, (
-        f"expected exactly 51 error payloads, matched {result.error_payloads}; "
+    # The host event and command reply adapters add two forwarding sinks
+    # to the original 51.
+    assert result.error_payloads == 53, (
+        f"expected exactly 53 error payloads, matched {result.error_payloads}; "
         "review the changed sites and bump deliberately"
     )
     # Every allowlist entry must be earned by a live call site: a stale entry
@@ -224,6 +273,7 @@ def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
 
 
 WEBSOCKET_LOGGER = "xagent.web.api.websocket"
+CONTROL_LOGGERS = (WEBSOCKET_LOGGER, command_execution_service.__name__)
 
 # Every handler that turns an enqueue refusal into client-visible text. Each
 # entry is (handler, extra message_data) - the ack in handle_chat_message only
@@ -253,9 +303,10 @@ def test_missing_task_keeps_its_wording_for_the_sender(_test_db: None) -> None:
             allow_missing_task=False,
         )
 
-    assert isinstance(raised.value, websocket_api.ClientVisibleValidationError)
+    assert isinstance(raised.value, task_execution_service.ClientVisibleValidationError)
     assert (
-        websocket_api.client_safe_error_message(raised.value) == "Task 424242 not found"
+        task_execution_service.client_safe_error_message(raised.value)
+        == "Task 424242 not found"
     )
 
 
@@ -403,7 +454,7 @@ async def test_redacted_enqueue_failure_still_reaches_the_log(
     )
 
     handler = getattr(websocket_api, handler_name)
-    with caplog.at_level(logging.ERROR, logger=WEBSOCKET_LOGGER):
+    with caplog.at_level(logging.ERROR):
         await handler(
             MagicMock(),
             7,
@@ -414,11 +465,11 @@ async def test_redacted_enqueue_failure_still_reaches_the_log(
     assert payloads, "the handler must tell the client something"
     assert SECRET not in repr(payloads)
     assert any(
-        payload.get("message") == websocket_api.CLIENT_SAFE_VALIDATION_ERROR
+        payload.get("message") == task_execution_service.CLIENT_SAFE_VALIDATION_ERROR
         for payload in payloads
     )
 
-    records = [record for record in caplog.records if record.name == WEBSOCKET_LOGGER]
+    records = [record for record in caplog.records if record.name in CONTROL_LOGGERS]
     assert records, f"{handler_name} redacted the failure without logging it"
     assert any(SECRET in record.getMessage() for record in records)
     assert any(record.exc_info is not None for record in records)
@@ -428,7 +479,9 @@ async def test_redacted_enqueue_failure_still_reaches_the_log(
     ("error", "expected_level", "expects_traceback"),
     [
         (
-            websocket_api.ClientVisibleValidationError("User authentication required"),
+            task_execution_service.ClientVisibleValidationError(
+                "User authentication required"
+            ),
             logging.WARNING,
             False,
         ),
@@ -447,12 +500,12 @@ def test_log_level_follows_the_marker_not_the_call_site(
     Without the split, any visitor could make the server dump a stack on
     demand by sending an unauthenticated frame in a loop.
     """
-    with caplog.at_level(logging.DEBUG, logger=WEBSOCKET_LOGGER):
-        websocket_api.log_client_facing_failure(
+    with caplog.at_level(logging.DEBUG):
+        command_execution_service.log_client_facing_failure(
             error, "Pause command rejected for task %s: %s", 7
         )
 
-    (record,) = [r for r in caplog.records if r.name == WEBSOCKET_LOGGER]
+    (record,) = [r for r in caplog.records if r.name in CONTROL_LOGGERS]
     assert record.levelno == expected_level
     assert (record.exc_info is not None) is expects_traceback
     assert "task 7" in record.getMessage()
@@ -461,12 +514,12 @@ def test_log_level_follows_the_marker_not_the_call_site(
 def test_malformed_curated_failure_remains_a_warning_without_traceback(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    websocket_api.log_client_facing_failure(
-        websocket_api.ClientVisibleValidationError("Authentication required"),
+    command_execution_service.log_client_facing_failure(
+        task_execution_service.ClientVisibleValidationError("Authentication required"),
         "Pause command rejected",
     )
 
-    (record,) = [r for r in caplog.records if r.name == WEBSOCKET_LOGGER]
+    (record,) = [r for r in caplog.records if r.name in CONTROL_LOGGERS]
     assert (record.levelno, record.exc_info) == (logging.WARNING, None)
     assert "malformed client-facing log template" in record.getMessage().lower()
 
@@ -496,10 +549,10 @@ def test_log_helper_rejects_every_malformed_percent_template(
     try:
         raise ValueError("operator detail")
     except ValueError as error:
-        with caplog.at_level(logging.ERROR, logger=WEBSOCKET_LOGGER):
-            websocket_api.log_client_facing_failure(error, template, *args)
+        with caplog.at_level(logging.ERROR):
+            command_execution_service.log_client_facing_failure(error, template, *args)
 
-    records = [record for record in caplog.records if record.name == WEBSOCKET_LOGGER]
+    records = [record for record in caplog.records if record.name in CONTROL_LOGGERS]
     assert len(records) == 1
     assert records[0].levelno == logging.ERROR
     assert records[0].exc_info is not None
@@ -514,14 +567,14 @@ def test_log_helper_accepts_int_enum_for_native_integer_placeholder(
     class TaskNumber(IntEnum):
         FIRST = 7
 
-    with caplog.at_level(logging.ERROR, logger=WEBSOCKET_LOGGER):
-        websocket_api.log_client_facing_failure(
+    with caplog.at_level(logging.ERROR):
+        command_execution_service.log_client_facing_failure(
             ValueError("operator detail"),
             "Task %d failed: %s",
             TaskNumber.FIRST,
         )
 
-    records = [record for record in caplog.records if record.name == WEBSOCKET_LOGGER]
+    records = [record for record in caplog.records if record.name in CONTROL_LOGGERS]
     assert len(records) == 1
     assert records[0].getMessage() == "Task 7 failed: operator detail"
     assert "malformed client-facing log template" not in records[0].getMessage().lower()
@@ -541,9 +594,11 @@ def test_log_helper_preserves_native_percent_formatting(
     args: tuple[object, ...],
     expected_message: str,
 ) -> None:
-    websocket_api.log_client_facing_failure(ValueError("e"), template, *args)
+    command_execution_service.log_client_facing_failure(
+        ValueError("e"), template, *args
+    )
 
-    (record,) = [r for r in caplog.records if r.name == WEBSOCKET_LOGGER]
+    (record,) = [r for r in caplog.records if r.name in CONTROL_LOGGERS]
     assert record.getMessage() == expected_message
 
 
@@ -576,23 +631,23 @@ def test_log_helper_does_not_raise_for_unprintable_values(
                 raise RuntimeError("rendered repeatedly")
             return self
 
-    with caplog.at_level(logging.ERROR, logger=WEBSOCKET_LOGGER):
-        websocket_api.log_client_facing_failure(
+    with caplog.at_level(logging.ERROR):
+        command_execution_service.log_client_facing_failure(
             ValueError(BrokenText()), "Data validation error: %s"
         )
-        websocket_api.log_client_facing_failure(
+        command_execution_service.log_client_facing_failure(
             ValueError("operator detail"), "Task %s failed: %s", BrokenStr("x")
         )
-        websocket_api.log_client_facing_failure(
+        command_execution_service.log_client_facing_failure(
             ValueError("operator detail"), "Malformed template", BadFallback("x")
         )
-        websocket_api.log_client_facing_failure(
+        command_execution_service.log_client_facing_failure(
             ValueError("operator detail"),
             "Task %s failed: %s",
             StatefulText("stable"),
         )
 
-    records = [record for record in caplog.records if record.name == WEBSOCKET_LOGGER]
+    records = [record for record in caplog.records if record.name in CONTROL_LOGGERS]
     assert len(records) == 4
     assert "unprintable ValueError" in records[0].getMessage()
     assert "unprintable BrokenStr" in records[1].getMessage()
@@ -603,20 +658,22 @@ def test_log_helper_does_not_raise_for_unprintable_values(
 def test_client_visible_error_is_a_subclass_only_marker() -> None:
     """The marker base cannot escape handlers that catch its typed subclasses."""
     with pytest.raises(TypeError, match="must be subclassed"):
-        websocket_api.ClientVisibleError("bare marker")
+        task_execution_service.ClientVisibleError("bare marker")
 
-    assert str(websocket_api.ClientVisibleValidationError("curated")) == "curated"
+    assert (
+        str(task_execution_service.ClientVisibleValidationError("curated")) == "curated"
+    )
 
 
 @pytest.mark.parametrize("message", ["", "   ", "\t\n"])
 def test_empty_client_visible_message_falls_back_to_the_generic_text(
     message: str,
 ) -> None:
-    error = websocket_api.ClientVisibleValidationError(message)
+    error = task_execution_service.ClientVisibleValidationError(message)
 
     assert (
-        websocket_api.client_safe_error_message(error)
-        == websocket_api.CLIENT_SAFE_VALIDATION_ERROR
+        task_execution_service.client_safe_error_message(error)
+        == task_execution_service.CLIENT_SAFE_VALIDATION_ERROR
     )
 
 
@@ -624,8 +681,8 @@ def test_client_visible_message_preserves_non_ascii_text() -> None:
     message = "请求无效：缺少步骤标识"
 
     assert (
-        websocket_api.client_safe_error_message(
-            websocket_api.ClientVisibleValidationError(message)
+        task_execution_service.client_safe_error_message(
+            task_execution_service.ClientVisibleValidationError(message)
         )
         == message
     )
@@ -634,7 +691,7 @@ def test_client_visible_message_preserves_non_ascii_text() -> None:
 def test_incidental_exception_uses_the_requested_safe_fallback() -> None:
     fallback = "The requested operation could not be completed."
 
-    rendered = websocket_api.client_safe_error_message(
+    rendered = task_execution_service.client_safe_error_message(
         RuntimeError(SECRET),
         fallback=fallback,
     )
@@ -645,12 +702,12 @@ def test_incidental_exception_uses_the_requested_safe_fallback() -> None:
 
 def test_empty_client_visible_outer_error_does_not_expose_its_cause() -> None:
     cause = RuntimeError(SECRET)
-    error = websocket_api.ClientVisibleValidationError("")
+    error = task_execution_service.ClientVisibleValidationError("")
     error.__cause__ = cause
 
-    rendered = websocket_api.client_safe_error_message(error)
+    rendered = task_execution_service.client_safe_error_message(error)
 
-    assert rendered == websocket_api.CLIENT_SAFE_VALIDATION_ERROR
+    assert rendered == task_execution_service.CLIENT_SAFE_VALIDATION_ERROR
     assert SECRET not in rendered
 
 
@@ -677,14 +734,14 @@ async def test_builder_chat_redacts_through_its_own_socket_sink(
     websocket.send_text = AsyncMock()
     websocket.state = SimpleNamespace()
 
-    with caplog.at_level(logging.ERROR, logger=WEBSOCKET_LOGGER):
+    with caplog.at_level(logging.ERROR):
         await websocket_api.handle_builder_chat(
             websocket,
             {"message": "build me an agent"},
             SimpleNamespace(id=1, is_admin=False),
         )
 
-    records = [r for r in caplog.records if r.name == WEBSOCKET_LOGGER]
+    records = [r for r in caplog.records if r.name in CONTROL_LOGGERS]
     assert any(SECRET in r.getMessage() for r in records), (
         "the operator half of the contract: redacting the client's copy must "
         "not delete the server's"
@@ -694,7 +751,7 @@ async def test_builder_chat_redacts_through_its_own_socket_sink(
     errors = [p for p in payloads if p.get("type") == "error"]
     assert errors, "the handler must answer the builder client"
     assert SECRET not in repr(payloads)
-    assert errors[-1]["message"] == websocket_api.CLIENT_SAFE_VALIDATION_ERROR
+    assert errors[-1]["message"] == task_execution_service.CLIENT_SAFE_VALIDATION_ERROR
 
 
 @pytest.mark.asyncio
@@ -728,14 +785,14 @@ async def test_actor_policy_rejection_returns_chat_delivery_error(
         client_message_id="command-1",
         turn_id="command-1",
         accepted=False,
-        message=websocket_api.CLIENT_SAFE_VALIDATION_ERROR,
+        message=task_execution_service.CLIENT_SAFE_VALIDATION_ERROR,
         error_code=ClientErrorCode.MESSAGE_PROCESSING_FAILED.value,
         rejection_outcome="not_accepted",
     )
     connection_manager.send_personal_message.assert_awaited_once_with(
         {
             "type": "error",
-            "message": websocket_api.CLIENT_SAFE_VALIDATION_ERROR,
+            "message": task_execution_service.CLIENT_SAFE_VALIDATION_ERROR,
             "error_code": ClientErrorCode.MESSAGE_PROCESSING_FAILED.value,
         },
         websocket,
@@ -773,7 +830,7 @@ async def test_actor_policy_rejection_returns_websocket_error(
     payload = connection_manager.send_personal_message.await_args.args[0]
     assert payload == {
         "type": "error",
-        "message": websocket_api.CLIENT_SAFE_VALIDATION_ERROR,
+        "message": task_execution_service.CLIENT_SAFE_VALIDATION_ERROR,
         "error_code": ClientErrorCode.MESSAGE_PROCESSING_FAILED.value,
     }
 
@@ -966,7 +1023,7 @@ async def test_unresolvable_task_answers_the_sender_instead_of_dropping_them(
     monkeypatch.setattr(websocket_api, "manager", connection_manager)
 
     missing_task_id = 987654
-    with caplog.at_level(logging.DEBUG, logger=WEBSOCKET_LOGGER):
+    with caplog.at_level(logging.DEBUG):
         await websocket_api.handle_execute_task(
             MagicMock(),
             missing_task_id,
@@ -983,7 +1040,7 @@ async def test_unresolvable_task_answers_the_sender_instead_of_dropping_them(
     # Marking this raise made it reachable by a typed handler, which is the
     # point - but that handler must not hand an anonymous visitor a way to
     # make the server dump a stack for every task id they guess.
-    records = [r for r in caplog.records if r.name == WEBSOCKET_LOGGER]
+    records = [r for r in caplog.records if r.name in CONTROL_LOGGERS]
     assert records, "the refusal still has to be recorded"
     assert all(r.exc_info is None for r in records), (
         "a curated refusal is routine; only an incidental fault earns a stack"
@@ -1997,14 +2054,14 @@ async def test_terminal_command_failure_keeps_context_and_redacts_detail() -> No
         attempt_count=1,
     )
     with patch.object(websocket_api, "manager", connection_manager):
-        await websocket_api._broadcast_terminal_command_error(
+        await command_execution_service._broadcast_terminal_command_error(
             command, RuntimeError(f"lease lost at {SECRET}")
         )
     (payload, task_id) = connection_manager.broadcast_to_task.await_args.args
     assert task_id == 7
     assert SECRET not in repr(payload)
     assert payload["message"] == (
-        f"Task command pause failed: {websocket_api.CLIENT_SAFE_VALIDATION_ERROR}"
+        f"Task command pause failed: {task_execution_service.CLIENT_SAFE_VALIDATION_ERROR}"
     )
     assert payload["command_kind"] == "pause"
 
@@ -2012,7 +2069,7 @@ async def test_terminal_command_failure_keeps_context_and_redacts_detail() -> No
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "handler_name",
-    ["_handle_pause_task_unserialized", "_handle_resume_task_unserialized"],
+    ["pause_task", "resume_task"],
     ids=["pause", "resume"],
 )
 async def test_inner_command_validation_redacts_the_client_payload(
@@ -2026,13 +2083,13 @@ async def test_inner_command_validation_redacts_the_client_payload(
     connection_manager.broadcast_to_task = AsyncMock()
     monkeypatch.setattr(websocket_api, "manager", connection_manager)
     monkeypatch.setattr(
-        websocket_api,
+        command_execution_service,
         "run_db_io_cancellation_safe",
         AsyncMock(side_effect=ValueError(f"snapshot fault at {SECRET}")),
     )
 
-    await getattr(websocket_api, handler_name)(
-        MagicMock(),
+    await getattr(command_execution_service, handler_name)(
+        websocket_api._make_command_reply(MagicMock()),
         7,
         {"user": SimpleNamespace(id=1, is_admin=False)},
     )
@@ -2041,7 +2098,7 @@ async def test_inner_command_validation_redacts_the_client_payload(
     assert payloads, "the handler must answer the client"
     assert SECRET not in repr(payloads)
     assert any(
-        payload.get("message") == websocket_api.CLIENT_SAFE_VALIDATION_ERROR
+        payload.get("message") == task_execution_service.CLIENT_SAFE_VALIDATION_ERROR
         for payload in payloads
     )
 
@@ -2049,7 +2106,7 @@ async def test_inner_command_validation_redacts_the_client_payload(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "handler_name",
-    ["_handle_pause_task_unserialized", "_handle_resume_task_unserialized"],
+    ["pause_task", "resume_task"],
     ids=["pause", "resume"],
 )
 async def test_inner_command_runtime_failure_uses_safe_localizable_error(
@@ -2061,14 +2118,14 @@ async def test_inner_command_runtime_failure_uses_safe_localizable_error(
     connection_manager.broadcast_to_task = AsyncMock()
     monkeypatch.setattr(websocket_api, "manager", connection_manager)
     monkeypatch.setattr(
-        websocket_api,
+        command_execution_service,
         "run_db_io_cancellation_safe",
         AsyncMock(side_effect=RuntimeError(f"snapshot fault at {SECRET}")),
     )
 
     with pytest.raises(RuntimeError):
-        await getattr(websocket_api, handler_name)(
-            MagicMock(),
+        await getattr(command_execution_service, handler_name)(
+            websocket_api._make_command_reply(MagicMock()),
             7,
             {"user": SimpleNamespace(id=1, is_admin=False)},
         )
@@ -2077,7 +2134,8 @@ async def test_inner_command_runtime_failure_uses_safe_localizable_error(
     assert SECRET not in repr(payloads)
     assert any(
         payload.get("error_code") == "message_processing_failed"
-        and payload.get("message") == websocket_api.CLIENT_SAFE_VALIDATION_ERROR
+        and payload.get("message")
+        == task_execution_service.CLIENT_SAFE_VALIDATION_ERROR
         for payload in payloads
     )
 
@@ -2101,7 +2159,7 @@ async def test_intervention_validation_redacts_the_client_payload(
     sent = [c.args[0] for c in connection_manager.send_personal_message.await_args_list]
     assert sent, "the handler must answer the sender"
     assert SECRET not in repr(sent)
-    assert sent[-1]["message"] == websocket_api.CLIENT_SAFE_VALIDATION_ERROR
+    assert sent[-1]["message"] == task_execution_service.CLIENT_SAFE_VALIDATION_ERROR
 
 
 @pytest.mark.asyncio
@@ -2127,7 +2185,7 @@ async def test_intervention_runtime_failure_uses_a_safe_localizable_error(
     assert payload == {
         "type": "error",
         "error_code": "message_processing_failed",
-        "message": websocket_api.CLIENT_SAFE_VALIDATION_ERROR,
+        "message": task_execution_service.CLIENT_SAFE_VALIDATION_ERROR,
     }
 
 
@@ -2171,7 +2229,7 @@ async def test_unexpected_execute_error_keeps_its_traceback(
         AsyncMock(side_effect=_Unexpected("boom")),
     )
 
-    with caplog.at_level(logging.ERROR, logger=WEBSOCKET_LOGGER):
+    with caplog.at_level(logging.ERROR):
         with pytest.raises(_Unexpected):
             await websocket_api.handle_execute_task(
                 MagicMock(),
@@ -2179,7 +2237,7 @@ async def test_unexpected_execute_error_keeps_its_traceback(
                 {"user": SimpleNamespace(id=user_id, is_admin=False)},
             )
 
-    records = [r for r in caplog.records if r.name == WEBSOCKET_LOGGER]
+    records = [r for r in caplog.records if r.name in CONTROL_LOGGERS]
     assert any(r.exc_info is not None for r in records), (
         "the traceback must be recorded where the detail is known"
     )
@@ -2200,13 +2258,13 @@ async def test_unexpected_intervention_error_keeps_its_traceback(
     connection_manager.broadcast_to_task = AsyncMock(side_effect=_Unexpected("boom"))
     monkeypatch.setattr(websocket_api, "manager", connection_manager)
 
-    with caplog.at_level(logging.ERROR, logger=WEBSOCKET_LOGGER):
+    with caplog.at_level(logging.ERROR):
         with pytest.raises(_Unexpected):
             await websocket_api.handle_intervention(
                 MagicMock(), 7, {"step_id": "s1", "action": "approve"}
             )
 
-    records = [r for r in caplog.records if r.name == WEBSOCKET_LOGGER]
+    records = [r for r in caplog.records if r.name in CONTROL_LOGGERS]
     assert any(r.exc_info is not None for r in records), (
         "the traceback must be recorded where the detail is known"
     )
@@ -2260,7 +2318,7 @@ async def test_chat_validation_redacts_both_the_ack_and_the_broadcast(
     )
     bg_mgr = MagicMock()
     bg_mgr.try_reserve_resume.return_value = (
-        websocket_api.ResumeReservationOutcome.RESERVED
+        task_execution_service.ResumeReservationOutcome.RESERVED
     )
 
     def _fake_error_payload(task_id: int, message: str, **kwargs: object) -> dict:
@@ -2270,20 +2328,23 @@ async def test_chat_validation_redacts_both_the_ack_and_the_broadcast(
         return payload
 
     with (
-        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
-        patch("xagent.web.api.websocket.manager", ws_manager),
-        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
         patch(
-            "xagent.web.api.websocket.mark_user_message_delivery_sync",
+            "xagent.web.services.agent_service_manager.get_agent_manager",
+            return_value=mgr,
+        ),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.services.task_execution.background_task_manager", bg_mgr),
+        patch(
+            "xagent.web.services.task_command_execution.mark_user_message_delivery_sync",
             MagicMock(),
         ),
         patch(
-            "xagent.web.api.websocket._read_task_error_payload_isolated",
+            "xagent.web.services.task_command_execution._read_task_error_payload_isolated",
             MagicMock(side_effect=_fake_error_payload),
         ),
     ):
-        await websocket_api._handle_chat_message_unserialized(
-            MagicMock(),
+        await command_execution_service.handle_task_message(
+            _make_command_reply(MagicMock()),
             task_id,
             {
                 "message": "trip the validation branch",
@@ -2301,11 +2362,11 @@ async def test_chat_validation_redacts_both_the_ack_and_the_broadcast(
 
     rejected = [p for p in personal if p.get("type") == "message_rejected"]
     assert rejected and rejected[0]["message"] == (
-        websocket_api.CLIENT_SAFE_VALIDATION_ERROR
+        task_execution_service.CLIENT_SAFE_VALIDATION_ERROR
     )
     task_errors = [b for b in broadcast if b.get("type") == "agent_error"]
     assert task_errors and task_errors[0]["message"] == (
-        websocket_api.CLIENT_SAFE_VALIDATION_ERROR
+        task_execution_service.CLIENT_SAFE_VALIDATION_ERROR
     )
 
 
@@ -2322,7 +2383,7 @@ def _chat_runtime_error_harness(secret_error: Exception):
     )
     bg_mgr = MagicMock()
     bg_mgr.try_reserve_resume.return_value = (
-        websocket_api.ResumeReservationOutcome.RESERVED
+        task_execution_service.ResumeReservationOutcome.RESERVED
     )
 
     def _fake_error_payload(task_id: int, message: str, **kwargs: object) -> dict:
@@ -2367,20 +2428,23 @@ async def test_runtime_error_is_redacted_and_coded_for_every_audience(
     mgr, ws_manager, bg_mgr, fake_payload = _chat_runtime_error_harness(raised)
 
     with (
-        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
-        patch("xagent.web.api.websocket.manager", ws_manager),
-        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
         patch(
-            "xagent.web.api.websocket.mark_user_message_delivery_sync",
+            "xagent.web.services.agent_service_manager.get_agent_manager",
+            return_value=mgr,
+        ),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.services.task_execution.background_task_manager", bg_mgr),
+        patch(
+            "xagent.web.services.task_command_execution.mark_user_message_delivery_sync",
             MagicMock(),
         ),
         patch(
-            "xagent.web.api.websocket._read_task_error_payload_isolated",
+            "xagent.web.services.task_command_execution._read_task_error_payload_isolated",
             MagicMock(side_effect=fake_payload),
         ),
     ):
-        await websocket_api._handle_chat_message_unserialized(
-            MagicMock(),
+        await command_execution_service.handle_task_message(
+            _make_command_reply(MagicMock()),
             task_id,
             {
                 "message": "trip the runtime branch",
@@ -2408,7 +2472,7 @@ async def test_runtime_error_is_redacted_and_coded_for_every_audience(
             "client_message_id": "runtime-boundary",
             "turn_id": "runtime-boundary",
             "timestamp": rejected[0]["timestamp"],
-            "message": websocket_api.CLIENT_SAFE_VALIDATION_ERROR,
+            "message": task_execution_service.CLIENT_SAFE_VALIDATION_ERROR,
             "error_code": "message_processing_failed",
             "rejection_outcome": "not_accepted",
         }
@@ -2445,7 +2509,7 @@ async def test_execute_runtime_error_broadcast_is_redacted(
     connection_manager.broadcast_to_task = AsyncMock()
     monkeypatch.setattr(websocket_api, "manager", connection_manager)
     monkeypatch.setattr(
-        websocket_api,
+        command_execution_service,
         "_read_task_error_payload_isolated",
         MagicMock(
             side_effect=lambda task_id, message, **kwargs: {
@@ -2543,12 +2607,12 @@ async def _run_pause_to_runtime_error(
 ) -> None:
     monkeypatch.setattr(websocket_api, "manager", manager_mock)
     monkeypatch.setattr(
-        websocket_api,
+        command_execution_service,
         "_load_command_actor",
         lambda actor_user_id: SimpleNamespace(id=actor_user_id or 1, is_admin=False),
     )
     monkeypatch.setattr(
-        websocket_api, "task_has_live_foreign_runner", lambda task_id: False
+        command_execution_service, "task_has_live_foreign_runner", lambda task_id: False
     )
     import xagent.web.services.task_setup_snapshot as snapshot_module
 
@@ -2558,7 +2622,7 @@ async def _run_pause_to_runtime_error(
         MagicMock(side_effect=RuntimeError(f"storage fault at {SECRET}")),
     )
     with pytest.raises(RuntimeError):
-        await websocket_api._execute_durable_task_command(command)
+        await command_execution_service._execute_durable_task_command(command)
 
 
 def _personal_targets(manager_mock: MagicMock) -> list[tuple[dict, object]]:
@@ -2639,14 +2703,7 @@ async def test_durable_safe_error_degrades_when_origin_is_unverifiable(
 
     personal = _personal_targets(manager_mock)
     assert SECRET not in repr(personal)
-    safe_targets = [
-        ws
-        for payload, ws in personal
-        if payload.get("error_code") == "message_processing_failed"
-    ]
-    assert all(
-        isinstance(ws, websocket_api._DiscardingCommandWebSocket) for ws in safe_targets
-    ), f"durable error rerouted to a real socket: {safe_targets}"
+    manager_mock.send_personal_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -2663,32 +2720,36 @@ async def test_origin_entry_dies_with_its_command_or_socket(
     socket = MagicMock(name="origin")
     origins.register(command.command_id, socket, command.task_id)
     monkeypatch.setattr(
-        websocket_api,
+        command_execution_service,
         "_execute_durable_task_command",
-        AsyncMock(side_effect=websocket_api.TaskCommandRejected("done")),
+        AsyncMock(side_effect=command_execution_service.TaskCommandRejected("done")),
     )
-    with pytest.raises(websocket_api.TaskCommandRejected):
-        await websocket_api.execute_durable_task_command(command)
+    with pytest.raises(command_execution_service.TaskCommandRejected):
+        await command_execution_service.execute_durable_task_command(command)
     assert origins.resolve(command.command_id, command.task_id) is None
     assert not origins.has(command.command_id, command.task_id)
 
     # A deferral that will retry keeps it; exhaustion clears it.
     origins.register(command.command_id, socket, command.task_id)
     monkeypatch.setattr(
-        websocket_api,
+        command_execution_service,
         "_execute_durable_task_command",
-        AsyncMock(side_effect=websocket_api.ClientVisibleTaskCommandDeferred("wait")),
+        AsyncMock(
+            side_effect=command_execution_service.ClientVisibleTaskCommandDeferred(
+                "wait"
+            )
+        ),
     )
     monkeypatch.setattr(websocket_api, "manager", _origin_test_manager({socket}))
-    with pytest.raises(websocket_api.TaskCommandDeferred):
-        await websocket_api.execute_durable_task_command(command)
+    with pytest.raises(command_execution_service.TaskCommandDeferred):
+        await command_execution_service.execute_durable_task_command(command)
     assert origins.has(command.command_id, command.task_id), (
         "retrying deferral keeps the origin"
     )
     exhausted = _pause_command(command_id="pause:cleanup")
-    exhausted.defer_count = websocket_api.max_command_defers()
-    with pytest.raises(websocket_api.TaskCommandDeferred):
-        await websocket_api.execute_durable_task_command(exhausted)
+    exhausted.defer_count = command_execution_service.max_command_defers()
+    with pytest.raises(command_execution_service.TaskCommandDeferred):
+        await command_execution_service.execute_durable_task_command(exhausted)
     assert not origins.has(command.command_id, command.task_id)
 
     # Disconnect clears every entry for that socket.
@@ -2735,20 +2796,23 @@ async def test_durable_chat_runtime_error_is_safe_for_verified_origin(
     origin_socket = MagicMock(name="verified-origin")
 
     with (
-        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
-        patch("xagent.web.api.websocket.manager", ws_manager),
-        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
         patch(
-            "xagent.web.api.websocket.mark_user_message_delivery_sync",
+            "xagent.web.services.agent_service_manager.get_agent_manager",
+            return_value=mgr,
+        ),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.services.task_execution.background_task_manager", bg_mgr),
+        patch(
+            "xagent.web.services.task_command_execution.mark_user_message_delivery_sync",
             MagicMock(),
         ),
         patch(
-            "xagent.web.api.websocket._read_task_error_payload_isolated",
+            "xagent.web.services.task_command_execution._read_task_error_payload_isolated",
             MagicMock(side_effect=fake_payload),
         ),
     ):
-        await websocket_api._handle_chat_message_unserialized(
-            origin_socket,
+        await command_execution_service.handle_task_message(
+            _make_command_reply(origin_socket),
             task_id,
             {
                 "message": "durable runtime failure",
@@ -2807,7 +2871,7 @@ async def test_execute_safe_error_reaches_the_ingress_socket(
     connection_manager.broadcast_to_task = AsyncMock()
     monkeypatch.setattr(websocket_api, "manager", connection_manager)
     monkeypatch.setattr(
-        websocket_api,
+        command_execution_service,
         "_read_task_error_payload_isolated",
         MagicMock(
             side_effect=lambda task_id, message, **kwargs: {
@@ -3082,17 +3146,23 @@ async def test_live_chat_runtime_error_sends_one_safe_rejection(
     raised = RuntimeError(f"live fault {SECRET}")
     mgr, ws_manager, bg_mgr, fake_payload = _chat_runtime_error_harness(raised)
     with (
-        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
-        patch("xagent.web.api.websocket.manager", ws_manager),
-        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
-        patch("xagent.web.api.websocket.mark_user_message_delivery_sync", MagicMock()),
         patch(
-            "xagent.web.api.websocket._read_task_error_payload_isolated",
+            "xagent.web.services.agent_service_manager.get_agent_manager",
+            return_value=mgr,
+        ),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.services.task_execution.background_task_manager", bg_mgr),
+        patch(
+            "xagent.web.services.task_command_execution.mark_user_message_delivery_sync",
+            MagicMock(),
+        ),
+        patch(
+            "xagent.web.services.task_command_execution._read_task_error_payload_isolated",
             MagicMock(side_effect=fake_payload),
         ),
     ):
-        await websocket_api._handle_chat_message_unserialized(
-            MagicMock(name="live-sender"),
+        await command_execution_service.handle_task_message(
+            _make_command_reply(MagicMock(name="live-sender")),
             task_id,
             {
                 "message": "live runtime failure",
@@ -3169,3 +3239,17 @@ def test_registry_is_bounded_by_lru_eviction(_clean_origins: None) -> None:
         websocket_api.manager, "is_connection_registered", return_value=True
     ):
         assert origins.resolve("cmd-0", 7) is None  # evicted -> safe discard
+
+
+def test_ast_guard_rejects_raw_errors_in_command_replies() -> None:
+    result = _scan(
+        ast.parse("""
+async def handle_task_message(reply):
+    try:
+        execute()
+    except Exception as error:
+        await reply({"type": "error", "message": str(error)})
+""")
+    )
+    assert result.error_payloads == 1
+    assert result.offenders

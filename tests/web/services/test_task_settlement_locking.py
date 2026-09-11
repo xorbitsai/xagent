@@ -14,13 +14,13 @@ from tests.web.services.test_task_execution_event_store import (
 )
 from xagent.core.agent.checkpoint import CHECKPOINT_EVENT_TYPE, CHECKPOINT_TYPE
 from xagent.core.agent.trace import TraceEvent
-from xagent.web.api import trace_handlers as traces
-from xagent.web.api import websocket as ws
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.uploaded_file import UploadedFile
+from xagent.web.services import task_execution as execution
 from xagent.web.services import task_lease_service as leases
 from xagent.web.services import task_orchestrator as orch
+from xagent.web.services import trace_handlers as traces
 from xagent.web.services import workforce_runtime as workforce
 from xagent.web.services.uploaded_file_store import UploadedFileStore
 
@@ -29,7 +29,7 @@ task_id = task_id_fixture
 
 
 def make_call(route, factory, tid, uid, lease, output):
-    empty = ws._PreparedTaskFileOutputs((), (), ())
+    empty = execution._PreparedTaskFileOutputs((), (), ())
     if route == "finish":
         fn = orch.finish_turn
 
@@ -37,7 +37,7 @@ def make_call(route, factory, tid, uid, lease, output):
             with factory() as db:
                 return fn(db, tid, task_lease=lease)
     elif route == "result":
-        fn = ws._finalize_task_execution_result_isolated
+        fn = execution._finalize_task_execution_result_isolated
 
         def call():
             return fn(
@@ -51,7 +51,7 @@ def make_call(route, factory, tid, uid, lease, output):
                 prepared_outputs=empty,
             )
     elif route == "resume":
-        fn = ws._finalize_resumed_task
+        fn = execution._finalize_resumed_task
 
         def call():
             return fn(
@@ -81,7 +81,7 @@ def test_actual_entrypoint_lock_and_child_visibility(
     if engine.dialect.name != "postgresql":
         pytest.skip("PostgreSQL row and FK locks")
     factory = sessionmaker(engine)
-    monkeypatch.setattr(ws, "get_session_local", lambda: factory)
+    monkeypatch.setattr(execution, "get_session_local", lambda: factory)
     with factory() as db:
         lease = leases.acquire_task_lease(db, task_id, runner_id="review", new_run=True)
         task = db.get(Task, task_id)
@@ -260,7 +260,7 @@ def test_checkpoint_and_settlement_complete_without_lock_upgrade(
 @pytest.mark.parametrize("route", ["finish", "result", "resume", "workforce"])
 def test_stale_owner_still_rejected(engine, task_id, monkeypatch, route):
     factory = sessionmaker(engine)
-    monkeypatch.setattr(ws, "get_session_local", lambda: factory)
+    monkeypatch.setattr(execution, "get_session_local", lambda: factory)
     with factory() as db:
         old = leases.acquire_task_lease(db, task_id, runner_id="review", new_run=True)
         leases.acquire_task_lease(

@@ -36,6 +36,7 @@ from xagent.web.models.database import Base, get_db, get_engine, init_db
 from xagent.web.models.task import DAGExecution, Task, TaskStatus, TraceEvent
 from xagent.web.models.user import User
 from xagent.web.models.workforce import Workforce, WorkforceRun
+from xagent.web.services import agent_service_manager as agent_runtime_service
 from xagent.web.services.llm_utils import AgentRuntimeFields
 from xagent.web.services.task_setup_snapshot import (
     RuntimeUserFields,
@@ -573,8 +574,7 @@ async def test_build_tools_inline_preview_uses_persisted_task_owner(
     expected_excluded,
 ) -> None:
     """The live DB reader authorizes preview IDs as the persisted task owner."""
-    from xagent.web.api import chat as chat_module
-    from xagent.web.api.chat import AgentServiceManager
+    from xagent.web.services.agent_service_manager import AgentServiceManager
 
     owner = _create_user(db_session)
     actor = User(username="preview-actor", password_hash="hash", is_admin=False)
@@ -595,7 +595,7 @@ async def test_build_tools_inline_preview_uses_persisted_task_owner(
     )
 
     resolved_owner_ids: list[int] = []
-    real_resolver = chat_module.resolve_authorized_agent
+    real_resolver = agent_runtime_service.resolve_authorized_agent
 
     def observe_resolver(session, owner_user_id, candidate_id):
         resolved_owner_ids.append(owner_user_id)
@@ -607,8 +607,10 @@ async def test_build_tools_inline_preview_uses_persisted_task_owner(
         observed_excluded_ids.append(kwargs["excluded_agent_id"])
         return [], object()
 
-    monkeypatch.setattr(chat_module, "resolve_authorized_agent", observe_resolver)
-    monkeypatch.setattr(chat_module, "create_default_tools", capture_tools)
+    monkeypatch.setattr(
+        agent_runtime_service, "resolve_authorized_agent", observe_resolver
+    )
+    monkeypatch.setattr(agent_runtime_service, "create_default_tools", capture_tools)
     monkeypatch.setattr("xagent.web.sandbox_manager.get_sandbox_manager", lambda: None)
 
     manager = AgentServiceManager()

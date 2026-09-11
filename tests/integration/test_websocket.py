@@ -379,7 +379,7 @@ class TestWebSocket(unittest.IsolatedAsyncioTestCase):
 
         from datetime import datetime, timezone
 
-        from xagent.web.api.websocket import create_stream_event
+        from xagent.web.services.task_execution import create_stream_event
 
         # 测试创建流式事件
         test_data = {
@@ -455,7 +455,7 @@ class TestWebSocket(unittest.IsolatedAsyncioTestCase):
         from datetime import datetime, timezone
         from unittest.mock import AsyncMock
 
-        from xagent.web.api.websocket import create_stream_event
+        from xagent.web.services.task_execution import create_stream_event
 
         # 创建模拟的WebSocket和数据库
         websocket = AsyncMock()
@@ -514,7 +514,7 @@ class TestWebSocket(unittest.IsolatedAsyncioTestCase):
         print(f"  WebSocket调用次数: {websocket.send_text.call_count}")
 
     async def test_rewrite_file_links_supports_legacy_preview_paths(self):
-        from xagent.web.api.websocket import _rewrite_file_links_to_file_id
+        from xagent.web.services.task_execution import _rewrite_file_links_to_file_id
 
         output_text = (
             "Legacy link: [report](/preview/web_task_12/output/report.html)\n"
@@ -537,14 +537,14 @@ class TestWebSocket(unittest.IsolatedAsyncioTestCase):
         self.assertIn("[poster](file:fid-poster)", rewritten)
 
     async def test_rewrite_file_links_preserves_non_legacy_urls(self):
-        from xagent.web.api.websocket import _rewrite_file_links_to_file_id
+        from xagent.web.services.task_execution import _rewrite_file_links_to_file_id
 
         output_text = "[site](https://example.com) and [local](/not-preview/path)"
         rewritten = _rewrite_file_links_to_file_id(output_text, {})
         self.assertEqual(rewritten, output_text)
 
     async def test_rewrite_file_links_preserves_unmapped_absolute_paths(self):
-        from xagent.web.api.websocket import _rewrite_file_links_to_file_id
+        from xagent.web.services.task_execution import _rewrite_file_links_to_file_id
 
         absolute_image_path = (
             "/Users/bsbds/workspace/xagent_1/src/xagent/web/uploads/"
@@ -572,15 +572,18 @@ class TestWebSocket(unittest.IsolatedAsyncioTestCase):
             TraceEventType,
             TraceScope,
         )
-        from xagent.web.api.ws_trace_handlers import WebSocketTraceHandler
+        from xagent.web.services.task_event_trace_handler import TaskEventTraceHandler
 
         # 创建模拟的WebSocket管理器
         mock_manager = AsyncMock()
 
         # 用patch替换manager
-        with patch("xagent.web.api.ws_trace_handlers.manager", mock_manager):
+        with patch(
+            "xagent.web.services.task_event_trace_handler.publish_task_event",
+            mock_manager.broadcast_to_task,
+        ):
             # 创建WebSocket追踪处理器
-            handler = WebSocketTraceHandler(task_id=1)
+            handler = TaskEventTraceHandler(task_id=1)
 
             # 创建测试事件
             event_type = TraceEventType(

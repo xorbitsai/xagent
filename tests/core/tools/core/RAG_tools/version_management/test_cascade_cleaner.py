@@ -604,7 +604,7 @@ def test_cleanup_embed_cascade_preserves_multiple_predicates_per_table() -> None
     with (
         patch.object(LanceDBVectorIndexStore, "_get_connection") as mock_get_conn,
         patch(
-            "xagent.core.tools.core.RAG_tools.kb.cleanup_filters.build_embedding_cleanup_filters"
+            "xagent.core.tools.core.RAG_tools.storage.lancedb_cleanup_filters.build_embedding_cleanup_filters"
         ) as mock_build_filters,
         patch(f"{_STORE}._vis_plan_by_predicates") as mock_plan,
     ):
@@ -636,7 +636,7 @@ def test_cleanup_embed_cascade_deletes_multiple_predicates_per_table() -> None:
     with (
         patch.object(LanceDBVectorIndexStore, "_get_connection") as mock_get_conn,
         patch(
-            "xagent.core.tools.core.RAG_tools.kb.cleanup_filters.build_embedding_cleanup_filters"
+            "xagent.core.tools.core.RAG_tools.storage.lancedb_cleanup_filters.build_embedding_cleanup_filters"
         ) as mock_build_filters,
     ):
         table = MagicMock()
@@ -787,7 +787,7 @@ def test_cleanup_cascade_plans_unless_confirmed_outside_preview(
     with (
         patch.object(LanceDBVectorIndexStore, "_get_connection") as mock_get_conn,
         patch(
-            "xagent.core.tools.core.RAG_tools.kb.cleanup_filters.build_embedding_cleanup_filters"
+            "xagent.core.tools.core.RAG_tools.storage.lancedb_cleanup_filters.build_embedding_cleanup_filters"
         ) as mock_build_filters,
         patch(f"{_STORE}._vis_plan_by_predicates") as mock_plan,
         patch(f"{_STORE}._vis_delete_by_predicates") as mock_delete,

@@ -25,6 +25,7 @@ from tests.e2e.scripted_llm import build_scripted_llm_from_json
 from xagent.core.file_storage.factory import get_unscoped_file_storage
 from xagent.web.api.auth import hash_password
 from xagent.web.models.user import User
+from xagent.web.services import agent_service_manager as agent_runtime_service
 
 MINIO_ACCESS_KEY = "minioadmin"
 MINIO_SECRET_KEY = "minioadmin"
@@ -144,7 +145,9 @@ def run_file_persistence_app(
     disable_external_app_services(monkeypatch)
     reset_chat_agent_manager(monkeypatch)
     scripted_llm = build_scripted_llm_from_json(llm_responses_path)
-    monkeypatch.setattr(chat_api, "create_default_llm", lambda: scripted_llm)
+    monkeypatch.setattr(
+        agent_runtime_service, "create_default_llm", lambda: scripted_llm
+    )
     monkeypatch.setattr(
         chat_api,
         "resolve_llms_from_names",

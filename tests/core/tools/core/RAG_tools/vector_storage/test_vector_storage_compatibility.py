@@ -156,7 +156,7 @@ def test_cleanup_vectors_for_chunks_uses_model_tag_table_and_reports_counts(
     facade = KBVectorStorageCompatibilityFacade(storage_shim=storage_shim)
 
     monkeypatch.setattr(
-        "xagent.core.tools.core.RAG_tools.kb.cleanup_filters."
+        "xagent.core.tools.core.RAG_tools.storage.lancedb_cleanup_filters."
         "build_lancedb_filter_expression",
         lambda filters, **kwargs: " AND ".join(
             f"{key} == '{value}'" for key, value in filters.items()
@@ -203,7 +203,7 @@ def test_cleanup_vectors_for_chunks_batches_chunk_ids_with_in_filter(monkeypatch
     facade = KBVectorStorageCompatibilityFacade(storage_shim=storage_shim)
 
     monkeypatch.setattr(
-        "xagent.core.tools.core.RAG_tools.kb.cleanup_filters."
+        "xagent.core.tools.core.RAG_tools.storage.lancedb_cleanup_filters."
         "build_lancedb_filter_expression",
         lambda filters, **kwargs: " AND ".join(
             f"{key} == '{value}'" for key, value in filters.items()
@@ -240,7 +240,7 @@ def test_cleanup_vectors_for_operation_uses_request_user_scope(monkeypatch):
     facade = KBVectorStorageCompatibilityFacade(storage_shim=storage_shim)
 
     monkeypatch.setattr(
-        "xagent.core.tools.core.RAG_tools.kb.cleanup_filters."
+        "xagent.core.tools.core.RAG_tools.storage.lancedb_cleanup_filters."
         "build_lancedb_filter_expression",
         lambda filters, **kwargs: " AND ".join(
             f"{key} == '{value}'" for key, value in filters.items()
@@ -270,7 +270,7 @@ def test_cleanup_vectors_for_operation_without_user_scope_fails_closed(monkeypat
     facade = KBVectorStorageCompatibilityFacade(storage_shim=storage_shim)
 
     monkeypatch.setattr(
-        "xagent.core.tools.core.RAG_tools.kb.cleanup_filters."
+        "xagent.core.tools.core.RAG_tools.storage.lancedb_cleanup_filters."
         "build_lancedb_filter_expression",
         lambda filters, **kwargs: " AND ".join(
             f"{key} == '{value}'" for key, value in filters.items()
@@ -313,7 +313,7 @@ def test_cleanup_vectors_for_operation_preview_does_not_delete(monkeypatch):
     facade = KBVectorStorageCompatibilityFacade(storage_shim=storage_shim)
 
     monkeypatch.setattr(
-        "xagent.core.tools.core.RAG_tools.kb.cleanup_filters."
+        "xagent.core.tools.core.RAG_tools.storage.lancedb_cleanup_filters."
         "build_lancedb_filter_expression",
         lambda filters, **kwargs: "base_filter",
     )
@@ -341,7 +341,7 @@ def test_cleanup_vectors_for_operation_reports_partial_cleanup_failure(monkeypat
     facade = KBVectorStorageCompatibilityFacade(storage_shim=storage_shim)
 
     monkeypatch.setattr(
-        "xagent.core.tools.core.RAG_tools.kb.cleanup_filters."
+        "xagent.core.tools.core.RAG_tools.storage.lancedb_cleanup_filters."
         "build_lancedb_filter_expression",
         lambda filters, **kwargs: "base_filter",
     )

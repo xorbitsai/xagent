@@ -17,10 +17,10 @@ from unittest.mock import patch
 
 import pytest
 
-from xagent.web.api.chat import AgentServiceManager
 from xagent.web.models.database import Base, get_engine, init_db
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
+from xagent.web.services.agent_service_manager import AgentServiceManager
 from xagent.web.services.llm_utils import AgentRuntimeFields
 from xagent.web.services.task_setup_snapshot import (
     RuntimeUserFields,

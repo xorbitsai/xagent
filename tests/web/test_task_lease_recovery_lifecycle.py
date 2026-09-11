@@ -204,7 +204,7 @@ async def test_application_shutdown_stops_task_lease_recovery(
         fake_stop_uploaded_file_recovery,
     )
     monkeypatch.setattr(
-        "xagent.web.api.websocket.background_task_manager.shutdown",
+        "xagent.web.services.task_execution.background_task_manager.shutdown",
         fake_shutdown_background_tasks,
     )
     monkeypatch.setattr(

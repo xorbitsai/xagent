@@ -3783,12 +3783,15 @@ class LanceDBCollectionHandle(KBCollectionHandle):
         """Delete or preview embedding rows for a failed operation (#515).
 
         Ports the former facade ``_cleanup_vectors_for_operation_impl``: builds
-        per-table predicates via ``kb/cleanup_filters`` (relocation tracked in
-        #821), counts/deletes through this handle's raw store connection, and
-        derives status / side_effects_may_remain exactly as before.
+        per-table predicates via ``storage/lancedb_cleanup_filters``,
+        counts/deletes through this handle's raw store connection, and derives
+        status / side_effects_may_remain exactly as before.
         """
+        from ..storage.lancedb_cleanup_filters import (
+            build_embedding_cleanup_filters,
+        )
         from ..utils.lancedb_query_utils import _safe_count_rows
-        from .cleanup_filters import KBCleanupScope, build_embedding_cleanup_filters
+        from .cleanup_filters import KBCleanupScope
         from .models import KBVectorStorageCleanupResult
 
         scope = KBCleanupScope(

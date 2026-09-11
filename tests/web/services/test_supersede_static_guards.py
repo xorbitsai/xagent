@@ -33,8 +33,8 @@ from tests.architecture.string_constant_resolution import (
     string_constant_bindings,
     string_values,
 )
-from xagent.web.api import websocket
 from xagent.web.services import chat_history_service
+from xagent.web.services import task_execution as websocket
 
 # This guard only ever needs to recognize the superseded value -- it never
 # checks for the question value -- so, unlike the tree-wide monotonicity

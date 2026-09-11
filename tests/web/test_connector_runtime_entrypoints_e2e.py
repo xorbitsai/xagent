@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 
 from xagent.core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
 from xagent.web.api.auth import auth_router, create_access_token
-from xagent.web.api.chat import AgentServiceManager, chat_router
+from xagent.web.api.chat import chat_router
 from xagent.web.api.public_chat_access import create_public_chat_access_token
 from xagent.web.api.share import share_router
 from xagent.web.api.websocket import handle_chat_message
@@ -42,6 +42,7 @@ from xagent.web.models.user import User
 from xagent.web.models.user_channel import UserChannel
 from xagent.web.models.workforce import Workforce
 from xagent.web.services import connector_team_scope
+from xagent.web.services.agent_service_manager import AgentServiceManager
 from xagent.web.services.agent_team_scope import (
     AgentTeamScope,
     set_agent_team_scope_hook,

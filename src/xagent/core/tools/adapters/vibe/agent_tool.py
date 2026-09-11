@@ -59,7 +59,7 @@ class _DelegatedAgentDatabaseTraceHandler:
         build_id: str,
         metadata: Mapping[str, Any],
     ) -> None:
-        from .....web.api.trace_handlers import DatabaseTraceHandler
+        from .....web.services.trace_handlers import DatabaseTraceHandler
 
         self.task_id = task_id
         self.build_id = build_id
@@ -81,7 +81,7 @@ class _DelegatedAgentDatabaseTraceHandler:
         return await self._handler.load_latest_checkpoint(execution_id)
 
 
-class _DelegatedAgentWebSocketTraceHandler:
+class _DelegatedAgentTaskEventTraceHandler:
     """Broadcast safe child-agent traces on the parent task stream."""
 
     def __init__(
@@ -90,11 +90,11 @@ class _DelegatedAgentWebSocketTraceHandler:
         task_id: int,
         metadata: Mapping[str, Any],
     ) -> None:
-        from .....web.api.ws_trace_handlers import WebSocketTraceHandler
+        from .....web.services.task_event_trace_handler import TaskEventTraceHandler
 
         self.task_id = task_id
         self.metadata = dict(metadata)
-        self._handler = WebSocketTraceHandler(task_id)
+        self._handler = TaskEventTraceHandler(task_id)
 
     async def handle_event(self, event: Any) -> None:
         original_data = event.data
@@ -1965,7 +1965,7 @@ class AgentTool(AbstractBaseTool):
                 )
             )
             handlers.append(
-                _DelegatedAgentWebSocketTraceHandler(
+                _DelegatedAgentTaskEventTraceHandler(
                     task_id=parent_db_task_id,
                     metadata=metadata,
                 )

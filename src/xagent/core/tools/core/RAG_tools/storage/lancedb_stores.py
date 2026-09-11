@@ -1143,11 +1143,9 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         without cascading into documents/parses/chunks. Idempotent: returns 0
         when no embeddings table matches.
         """
-        from ..kb.cleanup_filters import (
-            build_embedding_cleanup_filters,
-            resolve_cleanup_scope,
-        )
+        from ..kb.cleanup_filters import resolve_cleanup_scope
         from ..LanceDB.schema_manager import _safe_close_table
+        from .lancedb_cleanup_filters import build_embedding_cleanup_filters
 
         scope = resolve_cleanup_scope(
             collection=collection_name,
@@ -2882,10 +2880,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         confirm: bool = False,
     ) -> Dict[str, int]:
         from ..core.exceptions import CascadeCleanupError
-        from ..kb.cleanup_filters import (
-            KBCleanupScope,
-            build_embedding_cleanup_filters,
-        )
+        from ..kb.cleanup_filters import KBCleanupScope
         from ..LanceDB.schema_manager import (
             ensure_chunks_table,
             ensure_documents_table,
@@ -2895,6 +2890,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         from ..version_management.main_pointer_manager import (
             _get_main_pointer_impl as get_main_pointer,
         )
+        from .lancedb_cleanup_filters import build_embedding_cleanup_filters
 
         conn = self._get_connection()
         ensure_documents_table(conn)
@@ -3103,7 +3099,6 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         confirm: bool = False,
     ) -> Dict[str, int]:
         from ..core.exceptions import CascadeCleanupError
-        from ..kb.cleanup_filters import select_embedding_tables
         from ..LanceDB.schema_manager import (
             ensure_chunks_table,
             ensure_documents_table,
@@ -3112,6 +3107,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             ensure_parses_table,
         )
         from ..utils.user_scope import resolve_user_scope
+        from .lancedb_cleanup_filters import select_embedding_tables
 
         user_scope = resolve_user_scope(user_id=user_id, is_admin=is_admin)
         user_id = user_scope.user_id
@@ -3226,11 +3222,11 @@ def _vis_append_user_filter_if_needed(
     user_id: Optional[int],
     is_admin: bool,
 ) -> str:
-    from ..kb.cleanup_filters import (
+    from ..LanceDB.schema_manager import _safe_close_table
+    from .lancedb_cleanup_filters import (
         append_user_filter_for_table,
         append_user_filter_without_schema,
     )
-    from ..LanceDB.schema_manager import _safe_close_table
 
     table = None
     try:
@@ -3260,7 +3256,7 @@ def _vis_replace_embedding_predicates(
     is_admin: bool,
     model_tag: Optional[str] = None,
 ) -> None:
-    from ..kb.cleanup_filters import build_embedding_cleanup_filters_from_base
+    from .lancedb_cleanup_filters import build_embedding_cleanup_filters_from_base
 
     table_filters = build_embedding_cleanup_filters_from_base(
         conn,
@@ -3286,8 +3282,8 @@ def _vis_get_table_names(conn: Any) -> list:
 def _vis_plan_by_predicates(
     conn: Any, table_to_filter: Dict[str, list], model_tag: Optional[str] = None
 ) -> Dict[str, int]:
-    from ..kb.cleanup_filters import select_embedding_tables
     from ..LanceDB.schema_manager import _safe_close_table
+    from .lancedb_cleanup_filters import select_embedding_tables
 
     counts: Dict[str, int] = {}
     table_names = _vis_get_table_names(conn)
@@ -3333,8 +3329,8 @@ def _vis_delete_by_predicates(
 ) -> Dict[str, int]:
     import logging as _logging
 
-    from ..kb.cleanup_filters import select_embedding_tables
     from ..LanceDB.schema_manager import _safe_close_table
+    from .lancedb_cleanup_filters import select_embedding_tables
 
     _logger = _logging.getLogger(__name__)
     deleted: Dict[str, int] = {}
@@ -3455,8 +3451,8 @@ def _vis_build_collection_filter(
 
     Adds user_id filtering only when the target table contains a user_id column.
     """
-    from ..kb.cleanup_filters import table_has_column as _table_has_column
     from ..LanceDB.schema_manager import _safe_close_table
+    from .lancedb_cleanup_filters import table_has_column as _table_has_column
 
     base: Dict[str, str] = {"collection": collection}
     table = None
@@ -3489,8 +3485,8 @@ def _vis_build_document_filter(
     is_admin: bool,
 ) -> str:
     """Build a safe filter for document-scoped deletion."""
-    from ..kb.cleanup_filters import table_has_column as _table_has_column
     from ..LanceDB.schema_manager import _safe_close_table
+    from .lancedb_cleanup_filters import table_has_column as _table_has_column
 
     base: Dict[str, str] = {"collection": collection, "doc_id": doc_id}
     table = None
@@ -3530,8 +3526,8 @@ def _vis_build_documents_filter(
     is_admin: bool,
 ) -> str:
     """Build a safe filter for deleting multiple document-scoped rows."""
-    from ..kb.cleanup_filters import table_has_column as _table_has_column
     from ..LanceDB.schema_manager import _safe_close_table
+    from .lancedb_cleanup_filters import table_has_column as _table_has_column
 
     base_expr = build_lancedb_filter_expression(
         {"collection": collection}, skip_user_filter=True
@@ -3572,7 +3568,6 @@ def _vis_cascade_delete_documents(
     confirm: bool = False,
 ) -> Dict[str, int]:
     """Cascade delete multiple documents using one predicate set per table."""
-    from ..kb.cleanup_filters import select_embedding_tables
     from ..LanceDB.schema_manager import (
         ensure_chunks_table,
         ensure_documents_table,
@@ -3581,6 +3576,7 @@ def _vis_cascade_delete_documents(
         ensure_parses_table,
     )
     from ..utils.user_scope import resolve_user_scope
+    from .lancedb_cleanup_filters import select_embedding_tables
 
     normalized_doc_ids = sorted({str(d) for d in doc_ids if d})
     if not normalized_doc_ids:

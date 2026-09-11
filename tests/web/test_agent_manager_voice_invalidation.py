@@ -15,7 +15,7 @@ import asyncio
 
 import pytest
 
-from xagent.web.api.chat import AgentServiceManager
+from xagent.web.services.agent_service_manager import AgentServiceManager
 
 
 class _CachedAgent:

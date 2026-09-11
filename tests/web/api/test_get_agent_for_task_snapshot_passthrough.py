@@ -41,10 +41,10 @@ from tests.web.pool_contention_shared import (
     wait_for_ticks,
 )
 from xagent.core.execution_scope import scope_fingerprint
-from xagent.web.api.chat import AgentServiceManager
 from xagent.web.models.agent import AgentStatus
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
+from xagent.web.services.agent_service_manager import AgentServiceManager
 from xagent.web.services.llm_utils import AgentRuntimeFields
 from xagent.web.services.task_setup_snapshot import (
     RuntimeUserFields,
@@ -108,18 +108,18 @@ def _common_patches(manager: AgentServiceManager) -> list[Any]:
         patch.object(manager, "_load_persisted_conversation_history"),
         patch.object(manager, "_load_persisted_execution_context", new=AsyncMock()),
         patch(
-            "xagent.web.api.chat.create_task_tracer",
+            "xagent.web.services.agent_service_manager.create_task_tracer",
             return_value=MagicMock(),
         ),
         patch(
-            "xagent.web.api.chat.create_default_tools",
+            "xagent.web.services.agent_service_manager.create_default_tools",
             new=AsyncMock(return_value=([], MagicMock())),
         ),
         patch(
             "xagent.web.sandbox_manager.get_sandbox_manager",
             return_value=None,
         ),
-        patch("xagent.web.api.chat.AgentService"),
+        patch("xagent.web.services.agent_service_manager.AgentService"),
     ]
 
 
@@ -148,7 +148,9 @@ async def test_caller_supplied_snapshot_skips_internal_to_thread() -> None:
 
     with ExitStack() as stack:
         loader_mock = stack.enter_context(
-            patch("xagent.web.api.chat.load_task_setup_snapshot_sync")
+            patch(
+                "xagent.web.services.agent_service_manager.load_task_setup_snapshot_sync"
+            )
         )
         for p in _common_patches(manager):
             stack.enter_context(p)
@@ -266,7 +268,7 @@ async def test_no_snapshot_falls_back_to_internal_to_thread() -> None:
     with ExitStack() as stack:
         loader_mock = stack.enter_context(
             patch(
-                "xagent.web.api.chat.load_task_setup_snapshot_sync",
+                "xagent.web.services.agent_service_manager.load_task_setup_snapshot_sync",
                 return_value=snapshot,
             )
         )
@@ -298,7 +300,9 @@ async def test_explicit_unscoped_result_skips_internal_scope_resolver() -> None:
     manager._agent_owner_ids[42] = 1
     manager._agent_scope_fingerprints[42] = scope_fingerprint(None)
 
-    with patch("xagent.web.api.chat.resolve_execution_scope") as resolver_mock:
+    with patch(
+        "xagent.web.services.agent_service_manager.resolve_execution_scope"
+    ) as resolver_mock:
         resolved = await manager.get_agent_for_task(
             task_id=42,
             user=_make_user(),

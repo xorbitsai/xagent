@@ -66,8 +66,13 @@ from pathlib import Path
 
 import pytest
 
-from xagent.web.api import admin_users, trace_handlers
-from xagent.web.services import task_deletion, task_lease_service, task_orchestrator
+from xagent.web.api import admin_users
+from xagent.web.services import (
+    task_deletion,
+    task_lease_service,
+    task_orchestrator,
+    trace_handlers,
+)
 
 POINTER_COLUMNS = frozenset(
     {"last_checkpoint_event_id", "last_checkpoint_trace_event_id"}

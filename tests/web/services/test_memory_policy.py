@@ -8,7 +8,7 @@ from unittest.mock import Mock
 import pytest
 
 from xagent.core.memory.in_memory import InMemoryMemoryStore
-from xagent.web.api import chat as chat_api
+from xagent.web.services import agent_service_manager as agent_runtime_service
 from xagent.web.services.memory_policy import (
     MEMORY_POLICY_RESOLVER_FAILURE_REASON,
     MemoryPolicyDecision,
@@ -52,9 +52,9 @@ def test_default_memory_policy_is_unchanged_without_resolver(
 ) -> None:
     dynamic_store = Mock(name="dynamic-memory-store")
     get_memory_store = Mock(return_value=dynamic_store)
-    monkeypatch.setattr(chat_api, "get_memory_store", get_memory_store)
+    monkeypatch.setattr(agent_runtime_service, "get_memory_store", get_memory_store)
 
-    policy = chat_api.resolve_agent_service_memory_policy(
+    policy = agent_runtime_service.resolve_agent_service_memory_policy(
         task=_task(agent_id=agent_id),
         agent_config=agent_config,
     )
@@ -74,7 +74,11 @@ def test_trusted_resolver_can_enable_preview_memory(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     dynamic_store = Mock(name="dynamic-memory-store")
-    monkeypatch.setattr(chat_api, "get_memory_store", Mock(return_value=dynamic_store))
+    monkeypatch.setattr(
+        agent_runtime_service,
+        "get_memory_store",
+        Mock(return_value=dynamic_store),
+    )
     resolver = Mock(
         return_value=MemoryPolicyDecision(
             enabled=True,
@@ -84,7 +88,7 @@ def test_trusted_resolver_can_enable_preview_memory(
     )
     set_trusted_memory_policy_resolver(resolver)
 
-    policy = chat_api.resolve_agent_service_memory_policy(
+    policy = agent_runtime_service.resolve_agent_service_memory_policy(
         task=_task(source="trusted-ingress"),
         agent_config={"is_preview": True},
     )
@@ -108,7 +112,11 @@ def test_trusted_resolver_can_disable_otherwise_enabled_memory(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     dynamic_store = Mock(name="dynamic-memory-store")
-    monkeypatch.setattr(chat_api, "get_memory_store", Mock(return_value=dynamic_store))
+    monkeypatch.setattr(
+        agent_runtime_service,
+        "get_memory_store",
+        Mock(return_value=dynamic_store),
+    )
     set_trusted_memory_policy_resolver(
         lambda _request: MemoryPolicyDecision(
             enabled=False,
@@ -117,7 +125,7 @@ def test_trusted_resolver_can_disable_otherwise_enabled_memory(
         )
     )
 
-    policy = chat_api.resolve_agent_service_memory_policy(task=_task())
+    policy = agent_runtime_service.resolve_agent_service_memory_policy(task=_task())
 
     assert policy.memory is dynamic_store
     assert policy.memory_enabled is False
@@ -129,7 +137,7 @@ def test_trusted_resolver_can_report_unavailable_memory(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     get_memory_store = Mock(name="get-memory-store")
-    monkeypatch.setattr(chat_api, "get_memory_store", get_memory_store)
+    monkeypatch.setattr(agent_runtime_service, "get_memory_store", get_memory_store)
     set_trusted_memory_policy_resolver(
         lambda _request: MemoryPolicyDecision(
             enabled=False,
@@ -138,7 +146,7 @@ def test_trusted_resolver_can_report_unavailable_memory(
         )
     )
 
-    policy = chat_api.resolve_agent_service_memory_policy(task=_task())
+    policy = agent_runtime_service.resolve_agent_service_memory_policy(task=_task())
 
     assert isinstance(policy.memory, InMemoryMemoryStore)
     assert policy.memory_enabled is False
@@ -153,7 +161,7 @@ def test_resolver_exception_fails_closed_for_preview() -> None:
 
     set_trusted_memory_policy_resolver(fail)
 
-    policy = chat_api.resolve_agent_service_memory_policy(
+    policy = agent_runtime_service.resolve_agent_service_memory_policy(
         task=_task(),
         agent_config={"is_preview": True},
     )
@@ -186,10 +194,10 @@ def test_invalid_resolver_decision_fails_closed(
     decision: object,
 ) -> None:
     get_memory_store = Mock(name="get-memory-store")
-    monkeypatch.setattr(chat_api, "get_memory_store", get_memory_store)
+    monkeypatch.setattr(agent_runtime_service, "get_memory_store", get_memory_store)
     set_trusted_memory_policy_resolver(lambda _request: decision)  # type: ignore[arg-type,return-value]
 
-    policy = chat_api.resolve_agent_service_memory_policy(task=_task())
+    policy = agent_runtime_service.resolve_agent_service_memory_policy(task=_task())
 
     assert isinstance(policy.memory, InMemoryMemoryStore)
     assert policy.memory_enabled is False
@@ -208,7 +216,9 @@ def test_resolver_receives_none_for_missing_or_nonprimitive_task_fields() -> Non
     )
     set_trusted_memory_policy_resolver(resolver)
 
-    chat_api.resolve_agent_service_memory_policy(task=None, agent_config={})
+    agent_runtime_service.resolve_agent_service_memory_policy(
+        task=None, agent_config={}
+    )
 
     resolver.assert_called_once_with(
         MemoryPolicyRequest(

@@ -21,8 +21,8 @@ from slack_sdk.web.async_client import AsyncWebClient
 
 from ....config import get_slack_app_token, get_storage_root
 from ....core.file_ref import build_file_id_ref
-from ...api.chat import get_agent_manager
 from ...models.task import TaskStatus
+from ...services.agent_service_manager import get_agent_manager
 from ...services.channel_runtime import (
     ChannelAuthorizationError,
     ChannelConfigurationError,
@@ -798,7 +798,8 @@ class SlackBotInstance:
         # token attached, so validate the host before any request is made.
         validate_slack_file_url(download_url)
 
-        from ...api.websocket import build_unique_target_path, normalize_filename
+        from ...api.websocket import build_unique_target_path
+        from ...services.task_execution import normalize_filename
 
         filename = normalize_filename(
             str(resolved.get("name") or f"{file_id or 'slack-file'}.bin")

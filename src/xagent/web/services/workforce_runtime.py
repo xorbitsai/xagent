@@ -520,7 +520,7 @@ async def pause_workforce_tasks_after_archive(
                     kind=TaskCommandKind.PAUSE,
                     payload={},
                 )
-            from ..api.websocket import execute_durable_task_command
+            from .task_command_execution import execute_durable_task_command
 
             await dispatch_task_command_promptly(
                 execute_durable_task_command,

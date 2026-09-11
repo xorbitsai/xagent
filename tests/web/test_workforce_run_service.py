@@ -18,11 +18,6 @@ from xagent.core.execution_scope import (
     ExecutionScopeContext,
 )
 from xagent.core.tools.adapters.vibe.factory import ToolFactory
-from xagent.web.api.chat import (
-    AgentServiceManager,
-    _build_tool_selection_spec_for_task,
-    create_default_tools,
-)
 from xagent.web.models import Agent, Base, Task, User, Workforce, WorkforceRun
 from xagent.web.models import database as database_module
 from xagent.web.models.agent import AgentStatus
@@ -31,6 +26,11 @@ from xagent.web.models.task import TaskStatus
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.services import task_orchestrator as task_orchestrator_module
 from xagent.web.services import workforce_runs as workforce_runs_module
+from xagent.web.services.agent_service_manager import (
+    AgentServiceManager,
+    _build_tool_selection_spec_for_task,
+    create_default_tools,
+)
 from xagent.web.services.task_lease_service import (
     acquire_task_lease,
     bind_task_lease_context,
@@ -1685,7 +1685,10 @@ async def test_verified_workforce_run_scope_loads_manager_config(
 
     default_llm = MagicMock()
     default_llm.model_name = "default-model"
-    with patch("xagent.web.api.chat.create_default_llm", return_value=default_llm):
+    with patch(
+        "xagent.web.services.agent_service_manager.create_default_llm",
+        return_value=default_llm,
+    ):
         runtime_config = AgentServiceManager()._resolve_task_runtime_config(
             task_id=int(result.task.id),
             task=task,

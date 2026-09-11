@@ -22,10 +22,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from xagent.web.api.chat import AgentServiceManager
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
+from xagent.web.services.agent_service_manager import AgentServiceManager
 from xagent.web.services.llm_utils import AgentRuntimeFields
 from xagent.web.services.task_setup_snapshot import (
     RuntimeUserFields,
@@ -93,7 +93,7 @@ async def test_build_tools_for_task_forwards_snapshot_creator_not_runner() -> No
 
     with (
         patch(
-            "xagent.web.api.chat.create_default_tools",
+            "xagent.web.services.agent_service_manager.create_default_tools",
             new=AsyncMock(return_value=([], MagicMock())),
         ) as create_tools_mock,
         patch.object(
@@ -152,14 +152,17 @@ async def test_get_agent_for_task_forwards_snapshot_declaration_not_empty() -> N
 
     with (
         patch(
-            "xagent.web.api.chat.create_default_tools",
+            "xagent.web.services.agent_service_manager.create_default_tools",
             new=AsyncMock(return_value=([], MagicMock())),
         ) as create_tools_mock,
         patch.object(manager, "_load_persisted_conversation_history"),
         patch.object(manager, "_load_persisted_execution_context", new=AsyncMock()),
-        patch("xagent.web.api.chat.create_task_tracer", return_value=MagicMock()),
+        patch(
+            "xagent.web.services.agent_service_manager.create_task_tracer",
+            return_value=MagicMock(),
+        ),
         patch("xagent.web.sandbox_manager.get_sandbox_manager", return_value=None),
-        patch("xagent.web.api.chat.AgentService"),
+        patch("xagent.web.services.agent_service_manager.AgentService"),
     ):
         try:
             await manager.get_agent_for_task(
@@ -226,10 +229,13 @@ async def test_build_tools_for_task_live_orm_branch_reads_the_agent_row() -> Non
 
     with (
         patch(
-            "xagent.web.api.chat.create_default_tools",
+            "xagent.web.services.agent_service_manager.create_default_tools",
             new=AsyncMock(return_value=([], MagicMock())),
         ) as create_tools_mock,
-        patch("xagent.web.api.chat.resolve_workforce_task_runtime", return_value=None),
+        patch(
+            "xagent.web.services.agent_service_manager.resolve_workforce_task_runtime",
+            return_value=None,
+        ),
         patch.object(
             manager, "_get_or_create_task_sandbox", AsyncMock(return_value=None)
         ),

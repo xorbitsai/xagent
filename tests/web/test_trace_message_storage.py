@@ -25,7 +25,6 @@ from xagent.core.agent.trace import (
 )
 from xagent.core.tools.adapters.vibe.connector_runtime import REDACTED_RUNTIME_SECRET
 from xagent.db.sqlite import apply_sqlite_concurrency_pragmas
-from xagent.web.api.trace_handlers import DatabaseTraceHandler
 from xagent.web.models.database import Base
 from xagent.web.models.task import (
     Task,
@@ -37,6 +36,7 @@ from xagent.web.models.task import (
     TraceMessageBlob,
 )
 from xagent.web.models.user import User
+from xagent.web.services.trace_handlers import DatabaseTraceHandler
 from xagent.web.services.trace_message_storage import (
     CHECKPOINT_BLOB_REF_ENCODING,
     LEDGER_REFS_ENCODING,
@@ -684,7 +684,7 @@ def test_database_trace_handler_stores_checkpoint_messages_as_refs(
         assert db.query(TraceCheckpointBlob).count() == 2
 
         monkeypatch.setattr(
-            "xagent.web.api.trace_handlers.get_db",
+            "xagent.web.services.trace_handlers.get_db",
             lambda: _get_db_factory(SessionLocal),
         )
         loaded = handler._sync_load_latest_checkpoint("exec-handler")
@@ -876,7 +876,7 @@ def test_database_trace_handler_reads_old_inline_checkpoint(
         db.commit()
 
         monkeypatch.setattr(
-            "xagent.web.api.trace_handlers.get_db",
+            "xagent.web.services.trace_handlers.get_db",
             lambda: _get_db_factory(SessionLocal),
         )
         loaded = DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
@@ -928,7 +928,7 @@ def test_database_trace_handler_falls_back_when_latest_refs_are_unreadable(
         db.commit()
 
         monkeypatch.setattr(
-            "xagent.web.api.trace_handlers.get_db",
+            "xagent.web.services.trace_handlers.get_db",
             lambda: _get_db_factory(SessionLocal),
         )
         loaded = DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
@@ -1203,12 +1203,12 @@ def test_database_trace_handler_prunes_checkpoint_history(
         task_id = int(task.id)
         handler = DatabaseTraceHandler(task_id)
         monkeypatch.setattr(
-            "xagent.web.api.trace_handlers.get_checkpoint_history_limit",
+            "xagent.web.services.trace_handlers.get_checkpoint_history_limit",
             lambda: 3,
         )
         # Force the batched-delete loop to run multiple chunks.
         monkeypatch.setattr(
-            "xagent.web.api.trace_handlers.SQL_IN_CLAUSE_CHUNK_SIZE",
+            "xagent.web.services.trace_handlers.SQL_IN_CLAUSE_CHUNK_SIZE",
             1,
         )
 
@@ -1314,7 +1314,7 @@ def test_loader_falls_back_to_older_row_when_prefetch_raises(
         db.commit()
 
         monkeypatch.setattr(
-            "xagent.web.api.trace_handlers.get_db",
+            "xagent.web.services.trace_handlers.get_db",
             lambda: _get_db_factory(SessionLocal),
         )
         # The newest row needs the prefetch (it has refs) and fails; the
@@ -1346,7 +1346,7 @@ def test_prune_matches_legacy_execution_id_shapes(
         task_id = int(task.id)
         handler = DatabaseTraceHandler(task_id)
         monkeypatch.setattr(
-            "xagent.web.api.trace_handlers.get_checkpoint_history_limit",
+            "xagent.web.services.trace_handlers.get_checkpoint_history_limit",
             lambda: 2,
         )
         now = datetime.now(timezone.utc)
@@ -1420,7 +1420,7 @@ def test_checkpoint_execution_id_predicate_matches_the_python_helper() -> None:
     matches a real, non-empty id -- absence and the empty string are the
     same SQL fact."""
     from xagent.core.agent.checkpoint import checkpoint_execution_id
-    from xagent.web.api.trace_handlers import _checkpoint_execution_id_predicate
+    from xagent.web.services.trace_handlers import _checkpoint_execution_id_predicate
 
     real_execution_id = "exec-parity-real"
 
@@ -1501,7 +1501,7 @@ def test_database_trace_handler_prune_disabled_keeps_all_checkpoints(
         task_id = int(task.id)
         handler = DatabaseTraceHandler(task_id)
         monkeypatch.setattr(
-            "xagent.web.api.trace_handlers.get_checkpoint_history_limit",
+            "xagent.web.services.trace_handlers.get_checkpoint_history_limit",
             lambda: 0,
         )
 
@@ -1695,7 +1695,7 @@ def test_load_checkpoint_query_failure_raises_unavailable(
         raise RuntimeError("pool checkout failed")
         yield  # pragma: no cover - unreachable, keeps this a generator
 
-    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", broken_get_db)
+    monkeypatch.setattr("xagent.web.services.trace_handlers.get_db", broken_get_db)
     clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
     try:
         handler = DatabaseTraceHandler(999999)
@@ -1721,7 +1721,7 @@ async def test_load_checkpoint_async_wrapper_propagates_query_failure(
         raise RuntimeError("pool checkout failed")
         yield  # pragma: no cover - unreachable, keeps this a generator
 
-    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", broken_get_db)
+    monkeypatch.setattr("xagent.web.services.trace_handlers.get_db", broken_get_db)
     clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
     try:
         handler = DatabaseTraceHandler(999999)
@@ -1747,7 +1747,7 @@ def test_load_checkpoint_zero_rows_returns_none_and_clears_stale_degradation(
         task = _create_task(db)
         task_id = int(task.id)
         monkeypatch.setattr(
-            "xagent.web.api.trace_handlers.get_db",
+            "xagent.web.services.trace_handlers.get_db",
             lambda: _get_db_factory(SessionLocal),
         )
         # A prior transient failure left the signal active; a query that
@@ -1799,7 +1799,7 @@ def test_load_checkpoint_all_rows_undecodable_raises_corrupt(
         db.commit()
 
         monkeypatch.setattr(
-            "xagent.web.api.trace_handlers.get_db",
+            "xagent.web.services.trace_handlers.get_db",
             lambda: _get_db_factory(SessionLocal),
         )
         with pytest.raises(CheckpointCorruptError):
@@ -1841,7 +1841,7 @@ def test_load_checkpoint_generic_decode_failure_raises_unavailable(
         db.commit()
 
         monkeypatch.setattr(
-            "xagent.web.api.trace_handlers.get_db",
+            "xagent.web.services.trace_handlers.get_db",
             lambda: _get_db_factory(SessionLocal),
         )
         with patch.object(
@@ -1865,7 +1865,7 @@ def test_load_checkpoint_undecodable_full_batch_is_exhausted_raises_corrupt(
     exhausted -- exclusively permanent decode failures is corrupt, not a
     conservative unavailable."""
     from xagent.core.agent.checkpoint import CheckpointCorruptError
-    from xagent.web.api.trace_handlers import CHECKPOINT_ROW_SCAN_LIMIT
+    from xagent.web.services.trace_handlers import CHECKPOINT_ROW_SCAN_LIMIT
 
     SessionLocal = _session_factory()
     db = SessionLocal()
@@ -1894,7 +1894,7 @@ def test_load_checkpoint_undecodable_full_batch_is_exhausted_raises_corrupt(
         db.commit()
 
         monkeypatch.setattr(
-            "xagent.web.api.trace_handlers.get_db",
+            "xagent.web.services.trace_handlers.get_db",
             lambda: _get_db_factory(SessionLocal),
         )
         with pytest.raises(CheckpointCorruptError):
@@ -1951,11 +1951,11 @@ def test_load_checkpoint_scan_continues_past_a_batch_of_undecodable_rows(
         db.commit()
 
         monkeypatch.setattr(
-            "xagent.web.api.trace_handlers.get_db",
+            "xagent.web.services.trace_handlers.get_db",
             lambda: _get_db_factory(SessionLocal),
         )
         monkeypatch.setattr(
-            "xagent.web.api.trace_handlers.CHECKPOINT_ROW_SCAN_LIMIT", 2
+            "xagent.web.services.trace_handlers.CHECKPOINT_ROW_SCAN_LIMIT", 2
         )
         loaded = DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
             "exec-multi-batch"
@@ -2001,11 +2001,11 @@ def test_load_checkpoint_scan_exhausts_multiple_batches_raises_corrupt(
         db.commit()
 
         monkeypatch.setattr(
-            "xagent.web.api.trace_handlers.get_db",
+            "xagent.web.services.trace_handlers.get_db",
             lambda: _get_db_factory(SessionLocal),
         )
         monkeypatch.setattr(
-            "xagent.web.api.trace_handlers.CHECKPOINT_ROW_SCAN_LIMIT", 2
+            "xagent.web.services.trace_handlers.CHECKPOINT_ROW_SCAN_LIMIT", 2
         )
         with pytest.raises(CheckpointCorruptError):
             DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
@@ -2059,14 +2059,14 @@ def test_load_checkpoint_scan_stops_at_max_page_cap(
         db.commit()
 
         monkeypatch.setattr(
-            "xagent.web.api.trace_handlers.get_db",
+            "xagent.web.services.trace_handlers.get_db",
             lambda: _get_db_factory(SessionLocal),
         )
         monkeypatch.setattr(
-            "xagent.web.api.trace_handlers.CHECKPOINT_ROW_SCAN_LIMIT", 2
+            "xagent.web.services.trace_handlers.CHECKPOINT_ROW_SCAN_LIMIT", 2
         )
         monkeypatch.setattr(
-            "xagent.web.api.trace_handlers.CHECKPOINT_SCAN_MAX_PAGES", 2
+            "xagent.web.services.trace_handlers.CHECKPOINT_SCAN_MAX_PAGES", 2
         )
         clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
         with pytest.raises(CheckpointUnavailableError):
@@ -2147,11 +2147,11 @@ def test_load_checkpoint_generic_failure_mid_scan_raises_unavailable(
         db.commit()
 
         monkeypatch.setattr(
-            "xagent.web.api.trace_handlers.get_db",
+            "xagent.web.services.trace_handlers.get_db",
             lambda: _get_db_factory(SessionLocal),
         )
         monkeypatch.setattr(
-            "xagent.web.api.trace_handlers.CHECKPOINT_ROW_SCAN_LIMIT", 2
+            "xagent.web.services.trace_handlers.CHECKPOINT_ROW_SCAN_LIMIT", 2
         )
         original_lookup = tms._load_trace_blob_lookup
 
@@ -2202,7 +2202,7 @@ def test_load_checkpoint_readable_type_without_snapshot_raises_corrupt(
         db.commit()
 
         monkeypatch.setattr(
-            "xagent.web.api.trace_handlers.get_db",
+            "xagent.web.services.trace_handlers.get_db",
             lambda: _get_db_factory(SessionLocal),
         )
         with pytest.raises(CheckpointCorruptError):
@@ -2251,7 +2251,7 @@ def test_load_checkpoint_snapshotless_newest_row_does_not_shadow_older_valid(
         db.commit()
 
         monkeypatch.setattr(
-            "xagent.web.api.trace_handlers.get_db",
+            "xagent.web.services.trace_handlers.get_db",
             lambda: _get_db_factory(SessionLocal),
         )
         loaded = DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
@@ -2288,7 +2288,7 @@ def test_checkpoint_read_failure_preserves_pool_timeout_cause_chain(
         raise SQLAlchemyTimeoutError("QueuePool limit reached")
         yield  # pragma: no cover - unreachable, keeps this a generator
 
-    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", timing_out_get_db)
+    monkeypatch.setattr("xagent.web.services.trace_handlers.get_db", timing_out_get_db)
     clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
     try:
         handler = DatabaseTraceHandler(999999)
@@ -2324,7 +2324,7 @@ def test_checkpoint_query_failure_preserves_pool_timeout_cause_chain(
             raise SQLAlchemyTimeoutError("QueuePool limit reached")
 
         monkeypatch.setattr(
-            "xagent.web.api.trace_handlers.get_db",
+            "xagent.web.services.trace_handlers.get_db",
             lambda: _get_db_factory(SessionLocal),
         )
         # Only the row scan uses ``.all()``; partition resolution reads
@@ -2374,7 +2374,7 @@ def test_checkpoint_partition_read_failure_is_translated_and_chained(
             raise SQLAlchemyTimeoutError("QueuePool limit reached")
 
         monkeypatch.setattr(
-            "xagent.web.api.trace_handlers.get_db",
+            "xagent.web.services.trace_handlers.get_db",
             lambda: _get_db_factory(SessionLocal),
         )
         monkeypatch.setattr(
@@ -2418,7 +2418,7 @@ def test_checkpoint_read_for_missing_task_row_is_unavailable_not_refused(
     db = SessionLocal()
     try:
         monkeypatch.setattr(
-            "xagent.web.api.trace_handlers.get_db",
+            "xagent.web.services.trace_handlers.get_db",
             lambda: _get_db_factory(SessionLocal),
         )
         clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)

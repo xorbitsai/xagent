@@ -31,10 +31,6 @@ from tests.web.services.task_lease_shared import (
 from xagent.core.agent.runner import UserMessageInjectionOutcome
 from xagent.db.sqlite import apply_sqlite_concurrency_pragmas
 from xagent.web.api import websocket as websocket_api
-from xagent.web.api.websocket import (
-    _load_command_message_delivery_status,
-    execute_durable_task_command,
-)
 from xagent.web.models import database as database_module
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import (
@@ -48,7 +44,13 @@ from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.task_command_terminal_event import TaskCommandTerminalEvent
 from xagent.web.models.user import User
+from xagent.web.services import task_command_execution as command_execution_service
 from xagent.web.services import task_command_transport as task_command_transport_module
+from xagent.web.services import task_execution as task_execution_service
+from xagent.web.services.task_command_execution import (
+    _load_command_message_delivery_status,
+    execute_durable_task_command,
+)
 from xagent.web.services.task_command_transport import (
     COMMAND_COMPLETED,
     COMMAND_FAILED,
@@ -592,7 +594,7 @@ async def test_cancel_command_does_not_require_persisted_actor(db_session) -> No
     )
 
     with (
-        patch.object(websocket_api, "_load_command_actor") as load_actor,
+        patch.object(command_execution_service, "_load_command_actor") as load_actor,
         pytest.raises(ValueError, match="Agent ID is missing"),
     ):
         await execute_durable_task_command(command)
@@ -1074,10 +1076,10 @@ async def test_recovery_dispatches_committed_message_across_run_rotation(
 
     with (
         patch(
-            "xagent.web.api.chat.get_agent_manager",
+            "xagent.web.services.agent_service_manager.get_agent_manager",
             return_value=runtime_manager,
         ),
-        patch.object(websocket_api, "execute_resume_background", new=resume),
+        patch.object(task_execution_service, "execute_resume_background", new=resume),
     ):
         try:
             assert await dispatch_one_task_command(
@@ -1086,8 +1088,10 @@ async def test_recovery_dispatches_committed_message_across_run_rotation(
             )
             # A completed mock can already have been unregistered by the time
             # command dispatch returns. Hold execution to inspect live ownership.
-            resume_task = websocket_api.background_task_manager.resume_tasks.get(
-                int(task.id)
+            resume_task = (
+                task_execution_service.background_task_manager.resume_tasks.get(
+                    int(task.id)
+                )
             )
             assert resume_task is not None
             assert not resume_task.done()
@@ -1096,8 +1100,12 @@ async def test_recovery_dispatches_committed_message_across_run_rotation(
             if resume_task is not None:
                 await asyncio.wait_for(resume_task, timeout=1)
 
-    assert int(task.id) not in websocket_api.background_task_manager.resume_tasks
-    assert int(task.id) not in websocket_api.background_task_manager.running_tasks
+    assert (
+        int(task.id) not in task_execution_service.background_task_manager.resume_tasks
+    )
+    assert (
+        int(task.id) not in task_execution_service.background_task_manager.running_tasks
+    )
 
     db_session.expire_all()
     messages = (
@@ -2170,7 +2178,7 @@ def test_websocket_enqueue_rejects_missing_task_with_client_visible_wording(
             payload={"type": "pause_task"},
             allow_missing_task=False,
         )
-    assert isinstance(raised.value, websocket_api.ClientVisibleValidationError)
+    assert isinstance(raised.value, task_execution_service.ClientVisibleValidationError)
     assert str(raised.value) == f"Task {task_id} not found"
 
 

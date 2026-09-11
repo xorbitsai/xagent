@@ -232,7 +232,7 @@ def test_only_run_partition_mismatched_is_false_when_something_else_also_fails()
 
 _SHARED_PREDICATE = "failed_checkpoint_row_conditions"
 _BY_PK_RESOLVERS = (
-    ("xagent/web/api/trace_handlers.py", "_load_pk_anchored_checkpoint"),
+    ("xagent/web/services/trace_handlers.py", "_load_pk_anchored_checkpoint"),
     ("xagent/web/services/task_interaction_anchor.py", "resolve_interaction_anchor"),
 )
 

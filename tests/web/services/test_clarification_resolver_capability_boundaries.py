@@ -26,9 +26,9 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-import xagent.web.api.trace_handlers as trace_handlers_module
+from xagent.web.services import trace_handlers as _trace_handlers_services
 
-TRACE_HANDLERS_PATH = Path(trace_handlers_module.__file__)
+TRACE_HANDLERS_PATH = Path(_trace_handlers_services.__file__)
 
 
 def _function_named(tree: ast.Module, name: str) -> ast.AST:

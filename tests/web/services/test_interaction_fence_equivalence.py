@@ -1,6 +1,6 @@
 """Static equivalence between the shared lease-fence predicates
-(``task_lease_service.py``) and the two WebSocket finalizers'
-(``websocket.py``) own inline ownership fencing.
+(``task_lease_service.py``) and the two execution finalizers'
+(``task_execution.py``) own inline ownership fencing.
 
 The two finalizers, ``_finalize_task_execution_result_isolated`` and
 ``_finalize_resumed_task``, do not call ``task_row_matches_lease_owner`` --
@@ -31,7 +31,7 @@ helper's own docstring on constant-valued filter conditions):
 | Finalizers' filter judges by "the filtered SELECT returned no row", predicate judges by "the comparison is false" | Same condition, two landing points; the finalizers compile it into the WHERE clause so the row lock they take is scoped by it |
 | Finalizers additionally filter on ``Task.id == task_id`` | That identifies which row, not whether it is still owned; excluded explicitly below |
 | Finalizers additionally call ``.with_for_update()`` | Locking is the caller's concern; the predicate is a pure boolean, takes no lock and issues no SQL |
-| Finalizers never compare ``lease_attempt_id`` / ``attempt_id`` | A deliberate capability gap -- the WebSocket finalizers do not carry the attempt contract; the predicate's third check does not apply to them (cell 3 below) |
+| Finalizers never compare ``lease_attempt_id`` / ``attempt_id`` | A deliberate capability gap -- the execution finalizers do not carry the attempt contract; the predicate's third check does not apply to them (cell 3 below) |
 | Finalizers read the lease off a local named ``task_lease``, predicate reads it off a parameter named ``lease`` | Same object, different local name at each call site; normalized by ``_ROOT_NAME_REWRITES`` below so cell 2 compares field *and* object, not field name alone |
 """
 
@@ -42,7 +42,7 @@ import inspect
 import textwrap
 from typing import Any
 
-from xagent.web.api import websocket as websocket_module
+from xagent.web.services import task_execution as execution_module
 from xagent.web.services import task_lease_service as lease_service
 
 _FINALIZER_NAMES = (
@@ -97,7 +97,7 @@ def test_both_finalizers_reject_an_unfenced_lease_the_same_way() -> None:
     """
 
     for name in _FINALIZER_NAMES:
-        func = getattr(websocket_module, name)
+        func = getattr(execution_module, name)
         func_node = _parse_function(func)
         guard = _unfenced_lease_guard(func_node)
         # The guard's own shape is asserted by _unfenced_lease_guard's
@@ -288,7 +288,7 @@ def test_ownership_filter_fields_match_the_shared_predicate() -> None:
     }
 
     for name in _FINALIZER_NAMES:
-        func = getattr(websocket_module, name)
+        func = getattr(execution_module, name)
         func_node = _parse_function(func)
         assert _finalizer_has_primary_key_filter(func_node), (
             f"{name}: expected a Task.id == task_id filter somewhere in the function"
@@ -300,7 +300,7 @@ def test_ownership_filter_fields_match_the_shared_predicate() -> None:
 
 
 def test_neither_finalizer_compares_attempt_identity() -> None:
-    """Cell 3: the WebSocket finalizers do not carry the attempt contract
+    """Cell 3: the execution finalizers do not carry the attempt contract
     ``task_row_matches_lease_attempt`` adds as its third check -- that
     predicate does not apply to them. If this turns red, someone gave a
     finalizer an attempt comparison, and its relationship to
@@ -310,7 +310,7 @@ def test_neither_finalizer_compares_attempt_identity() -> None:
 
     forbidden = {"lease_attempt_id", "attempt_id"}
     for name in _FINALIZER_NAMES:
-        func = getattr(websocket_module, name)
+        func = getattr(execution_module, name)
         func_node = _parse_function(func)
         offenders = set()
         for node in ast.walk(func_node):

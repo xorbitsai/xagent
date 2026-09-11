@@ -1,10 +1,10 @@
 """Direct coverage for ``serialize_trace_data``.
 
-This is the module-level function ``WebSocketTraceHandler._serialize_data``
-now delegates to (see ``ws_trace_handlers.py``). The whole point of lifting
+This is the module-level function ``TaskEventTraceHandler._serialize_data``
+now delegates to (see ``task_event_trace_handler.py``). The whole point of lifting
 it out of the class was to let a second caller -- the v1 SSE
 content-projection layer -- reuse the exact same pass without going through
-``WebSocketTraceHandler``. These tests call it directly, the way that
+``TaskEventTraceHandler``. These tests call it directly, the way that
 second caller will, instead of only exercising it indirectly through the
 handler class (as ``tests/core/agent/test_react_clarification_draft.py``
 already does).
@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 
-from xagent.web.api.ws_trace_handlers import serialize_trace_data
+from xagent.web.services.task_event_trace_handler import serialize_trace_data
 
 
 def test_recursively_serializes_nested_structures_into_json_safe_data() -> None:

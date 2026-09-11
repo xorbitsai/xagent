@@ -80,7 +80,7 @@ async def test_broadcast_records_one_payload_for_multiple_connections(
 @pytest.mark.asyncio
 async def test_database_trace_handler_emits_write_outcome(monkeypatch, metric_reader):
     from xagent.core.agent.trace import TASK_START_GENERAL, TraceEvent
-    from xagent.web.api.trace_handlers import DatabaseTraceHandler
+    from xagent.web.services.trace_handlers import DatabaseTraceHandler
 
     handler = DatabaseTraceHandler(42)
     saved = []
@@ -100,13 +100,13 @@ async def test_websocket_trace_handler_emits_metrics(monkeypatch, metric_reader)
     from unittest.mock import AsyncMock
 
     from xagent.core.agent.trace import TASK_START_GENERAL, TraceEvent
-    from xagent.web.api import ws_trace_handlers
+    from xagent.web.services import task_event_trace_handler as ws_trace_handlers
 
-    handler = ws_trace_handlers.WebSocketTraceHandler(42)
+    handler = ws_trace_handlers.TaskEventTraceHandler(42)
     handler._task_description_loaded = True
     monkeypatch.setattr(handler, "_has_prior_user_message_turn", lambda *_: False)
     broadcast = AsyncMock()
-    monkeypatch.setattr(ws_trace_handlers.manager, "broadcast_to_task", broadcast)
+    monkeypatch.setattr(ws_trace_handlers, "publish_task_event", broadcast)
     await handler.handle_event(
         TraceEvent(event_type=TASK_START_GENERAL, task_id="42", data={})
     )

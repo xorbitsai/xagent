@@ -21,12 +21,12 @@ from ..services.file_reference_output_service import (
     load_assistant_file_reference_records,
     reconcile_assistant_file_references,
 )
-from ..utils.db_timezone import format_datetime_for_api
-from .public_trace_events import (
+from ..services.public_trace_events import (
     is_audit_only_trace_data,
     normalize_public_trace_event,
     public_task_trace_filter,
 )
+from ..utils.db_timezone import format_datetime_for_api
 
 logger = logging.getLogger(__name__)
 

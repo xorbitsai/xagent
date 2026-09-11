@@ -2,14 +2,14 @@ import asyncio
 
 import pytest
 
-from xagent.web.api.websocket import (
+from xagent.web.models.task import TaskStatus
+from xagent.web.services.task_command_execution import _task_status_uses_live_control
+from xagent.web.services.task_execution import (
     BackgroundTaskManager,
     _clear_task_pause_accepted,
     _is_task_pause_accepted,
     _mark_task_pause_accepted,
-    _task_status_uses_live_control,
 )
-from xagent.web.models.task import TaskStatus
 
 
 def test_paused_task_user_message_is_not_live_control() -> None:

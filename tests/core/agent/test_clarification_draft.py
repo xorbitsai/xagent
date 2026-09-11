@@ -14,8 +14,11 @@ from xagent.core.agent.clarification import (
     draft_from_waiting_request,
 )
 from xagent.core.agent.pattern.react.react import _normalize_ask_user_interactions
-from xagent.web.api.trace_handlers import DatabaseTraceHandler
+from xagent.core.tools.adapters.vibe.interaction_types import (
+    DEFAULT_WAITING_INTERACTION,
+)
 from xagent.web.services.task_clarification_draft import clarification_idempotency_key
+from xagent.web.services.trace_handlers import DatabaseTraceHandler
 
 
 class FakeLLM:
@@ -199,9 +202,10 @@ def test_tool_waiting_draft_classifies_and_shapes_requests() -> None:
 def test_empty_form_ask_user_question_still_classifies_as_ask_user_question() -> None:
     """An empty-form ask_user_question is still ``ask_user_question``, not send_message.
 
-    The classifier reads key presence (``"interactions" in request``), not
-    truthiness -- an empty ``interactions`` list must not fall through to the
-    ``send_message`` branch.
+    The classifier reads ``tool_name``, so an empty ``interactions`` list
+    must not fall through to the ``send_message`` branch. It used to read
+    key presence, which gave the same answer here but no longer distinguishes
+    the two: every waiting path now writes the key.
     """
 
     request = _ask_user_question_request(message="", interactions=[])
@@ -211,6 +215,56 @@ def test_empty_form_ask_user_question_still_classifies_as_ask_user_question() ->
     assert draft is not None
     assert draft.source == "ask_user_question"
     assert draft.interactions == ()
+
+
+def test_send_message_carrying_interactions_still_classifies_as_send_message() -> None:
+    """The shape every ``send_message`` pause now has: a populated
+    ``"interactions"`` key holding the engine's appended free-text field.
+
+    This is the cell the ``tool_name`` rule exists for. Mutation (measured):
+    restoring the old ``message_type == "question" and has_interactions_key``
+    rule turns this red -- the request below is a ``question`` and does carry
+    the key, so it would be misclassified as ``ask_user_question`` and the
+    draft would advertise a tool the model never called.
+    """
+
+    request = _send_message_request()
+    request["interactions"] = [dict(DEFAULT_WAITING_INTERACTION)]
+
+    draft = draft_from_waiting_request(request, execution_id="exec-1", step_id=None)
+
+    assert draft is not None
+    assert draft.source == "send_message"
+    assert draft.requests[0].tool_name == "send_message"
+    assert list(draft.interactions) == [DEFAULT_WAITING_INTERACTION]
+
+
+def test_a_request_with_no_tool_name_classifies_as_send_message() -> None:
+    """The second shape the old and new rules disagree on, and the one the
+    docstring's "``tool_name`` has always been written here" claim rests on.
+
+    ``message_type == "question"`` plus a non-empty ``interactions`` and no
+    ``tool_name`` classified as ``ask_user_question`` under the old rule and
+    as ``send_message`` under the new one. No ReAct path produces it -- both
+    control-tool branches and ``_pause_for_tool_results`` write ``tool_name``
+    or ``kind`` -- so this is only reachable from a hand-built or foreign
+    checkpoint, where degrading to ``send_message`` names no tool the model
+    never called. Pinned because nothing else pins the divergence.
+    """
+
+    request = {
+        "event_id": "evt-1",
+        "message": "Which city?",
+        "message_type": "question",
+        "interactions": [dict(DEFAULT_WAITING_INTERACTION)],
+        "message_count": 5,
+    }
+
+    draft = draft_from_waiting_request(request, execution_id="exec-1", step_id=None)
+
+    assert draft is not None
+    assert draft.source == "send_message"
+    assert draft.requests[0].tool_name == ""
 
 
 def test_tool_waiting_multi_tool_requests_and_interaction_id_fallback() -> None:

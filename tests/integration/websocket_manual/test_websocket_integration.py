@@ -107,7 +107,7 @@ async def test_websocket_debug():
             if message_count == 0:
                 print("❌ 没有收到任何实时消息")
                 print("可能的原因:")
-                print("1. WebSocketTraceHandler没有正确添加")
+                print("1. TaskEventTraceHandler没有正确添加")
                 print("2. AgentService没有正确执行")
                 print("3. 消息发送失败")
             else:

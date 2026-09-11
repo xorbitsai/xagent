@@ -27,7 +27,7 @@ def _patch_runtime_starts(
         app_module, "register_local_browser_runtime", lambda: events.append("runtime")
     )
 
-    from xagent.web.api.websocket import background_task_manager
+    from xagent.web.services.task_execution import background_task_manager
 
     monkeypatch.setattr(
         background_task_manager,

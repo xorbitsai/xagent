@@ -1,4 +1,4 @@
-"""WebSocket trace handlers for real-time updates."""
+"""Publish task trace events through the host event delivery adapter."""
 
 import logging
 from datetime import datetime, timezone
@@ -16,13 +16,14 @@ from ...core.runtime_performance import (
     observe_duration,
     run_in_thread_with_telemetry,
 )
-from ..services.trace_event_types import (
+from .public_trace_events import is_audit_only_trace_data, normalize_public_trace_event
+from .task_events import publish_task_event
+from .task_execution import create_stream_event
+from .trace_event_types import (
     LEGACY_GENERAL_ERROR_EVENT_TYPE,
     STEP_GENERAL_ERROR_EVENT_TYPE,
     TASK_GENERAL_ERROR_EVENT_TYPE,
 )
-from .public_trace_events import is_audit_only_trace_data, normalize_public_trace_event
-from .websocket import create_stream_event, manager
 
 
 # Helper function to map new event types to old-style handling for compatibility
@@ -266,7 +267,7 @@ def serialize_trace_data(data: Dict[str, Any]) -> Dict[str, Any]:
     (``v1/_events_stream.py``) can reuse the exact same pass on live
     broadcast frames that the WebSocket handler applies before
     broadcasting -- this function never reads ``self``, so lifting it
-    out of ``WebSocketTraceHandler`` changes nothing about its
+    out of ``TaskEventTraceHandler`` changes nothing about its
     behavior for the existing caller below.
     """
     import json
@@ -348,8 +349,8 @@ def _convert_timestamp_to_utc_timestamp(timestamp: Any) -> float:
         return datetime.now(timezone.utc).timestamp()
 
 
-class WebSocketTraceHandler(TraceHandler):
-    """Trace handler that sends events to WebSocket clients."""
+class TaskEventTraceHandler(TraceHandler):
+    """Trace handler that publishes events through the host event delivery adapter."""
 
     def __init__(self, task_id: int):
         self.task_id = task_id
@@ -357,7 +358,7 @@ class WebSocketTraceHandler(TraceHandler):
         self._task_description_loaded = False
 
     async def handle_event(self, event: TraceEvent) -> None:
-        """Send trace event to WebSocket clients using unified stream format."""
+        """Publish a trace event through the host adapter using unified stream format."""
         with observe_duration("xagent.websocket.trace_handler.duration"):
             await self._handle_event(event)
 
@@ -365,7 +366,7 @@ class WebSocketTraceHandler(TraceHandler):
         try:
             # Debug: Log the event being handled (reduced verbosity)
             logger.debug(
-                f"WebSocketTraceHandler handling event: {event.event_type.value} for task {self.task_id}"
+                f"TaskEventTraceHandler handling event: {event.event_type.value} for task {self.task_id}"
             )
 
             # Load task description if not already loaded
@@ -385,23 +386,23 @@ class WebSocketTraceHandler(TraceHandler):
                 ):
                     stream_event = None
 
-            # Send to all connected WebSocket clients for this task
+            # Publish through the host event delivery adapter for this task
             if stream_event:
                 increment_counter(
                     "xagent.websocket.trace.events",
                     attributes={"outcome": "broadcast"},
                 )
                 logger.debug(
-                    f"WebSocketTraceHandler sending stream event: {stream_event.get('event_type')} (id: {stream_event.get('event_id')}) to task {self.task_id}"
+                    f"TaskEventTraceHandler sending stream event: {stream_event.get('event_type')} (id: {stream_event.get('event_id')}) to task {self.task_id}"
                 )
-                await manager.broadcast_to_task(stream_event, self.task_id)
+                await publish_task_event(stream_event, self.task_id)
             else:
                 increment_counter(
                     "xagent.websocket.trace.events",
                     attributes={"outcome": "dropped"},
                 )
                 logger.debug(
-                    f"WebSocketTraceHandler no stream event to send for event: {event.event_type.value}"
+                    f"TaskEventTraceHandler no stream event to send for event: {event.event_type.value}"
                 )
 
         except Exception as e:

@@ -21,6 +21,7 @@ PRODUCERS: dict[str, int | None] = {
     "finish_delivery": 1,
     "notify_deferred_delivery": 1,
     "send_message_delivery": None,  # keyword-only
+    "delivery_notifier": None,  # transport callback, keyword-only
 }
 
 # Issue #1479 removes the last deliberate RuntimeError passthroughs. Keep the
@@ -68,7 +69,13 @@ def _message_expression(node: ast.Call, index: int | None) -> ast.expr | None:
 
 
 # ``send_text`` takes a serialized payload, so the dict sits one call deeper.
-ERROR_PAYLOAD_SINKS = {"send_personal_message", "broadcast_to_task", "send_text"}
+ERROR_PAYLOAD_SINKS = {
+    "send_personal_message",
+    "broadcast_to_task",
+    "send_text",
+    "publish_task_event",
+    "reply",
+}
 
 # Both render in the client's conversation, so both are the same disclosure
 # surface. ``agent_error`` was missing until review found a producer using it.
@@ -353,6 +360,7 @@ def _error_payload_messages(
 
 
 ATTRIBUTE_CALL_RECEIVERS = {
+    "send_message_delivery": {"command_execution_service"},
     "broadcast_to_task": {"manager"},
     "dumps": {"json"},
     "send_personal_message": {"manager"},
@@ -999,6 +1007,40 @@ def _is_unshadowed_module_name(
     return True
 
 
+def _is_execution_helper_import(
+    node: ast.Name, parents: dict[ast.AST, ast.AST]
+) -> bool:
+    """Only canonical imports from the separately scanned execution service."""
+    if _has_local_binding(node, node.id, parents):
+        return False
+    module: ast.AST = node
+    while module in parents:
+        module = parents[module]
+    if not isinstance(module, ast.Module):
+        return False
+    bindings = _module_bindings(module, node.id)
+    if len(bindings) != 1 or not isinstance(bindings[0], ast.ImportFrom):
+        return False
+    binding = bindings[0]
+    return (
+        binding in module.body
+        and binding.level == 2
+        and binding.module
+        == (
+            "services.task_command_execution"
+            if node.id == "_read_task_error_payload_offloop"
+            else "services.task_execution"
+        )
+        and [
+            alias.name
+            for alias in binding.names
+            if (alias.asname or alias.name) == node.id
+        ]
+        == [node.id]
+        and not _has_nested_global_rebinding(module, node.id)
+    )
+
+
 def _is_client_error_contract_import(
     node: ast.Name,
     parents: dict[ast.AST, ast.AST],
@@ -1098,6 +1140,10 @@ def _trusted_module_helpers(tree: ast.Module) -> set[str]:
     )
     trusted: set[str] = set()
     for name in expected:
+        reference = ast.Name(id=name, ctx=ast.Load())
+        if _is_execution_helper_import(reference, {reference: tree}):
+            trusted.add(name)
+            continue
         bindings = _module_bindings(tree, name)
         definitions = [node for node in bindings if isinstance(node, FUNCTION_NODES)]
         overload_stubs = [
@@ -1168,8 +1214,9 @@ def _is_client_safe(
             expr.func, parents
         ):
             return True
-        if expr.func.id == "client_safe_error_message" and _is_unshadowed_module_name(
-            expr.func, parents, ast.FunctionDef
+        if expr.func.id == "client_safe_error_message" and (
+            _is_unshadowed_module_name(expr.func, parents, ast.FunctionDef)
+            or _is_execution_helper_import(expr.func, parents)
         ):
             fallback = next(
                 (

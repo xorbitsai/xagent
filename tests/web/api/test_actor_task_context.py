@@ -11,8 +11,11 @@ from xagent.core.tools.adapters.vibe.selection_spec import (
     ToolSelectionSpec,
     without_published_agent_tools,
 )
-from xagent.web.api.chat import AgentServiceManager, _spec_wants_mcp
 from xagent.web.models.task import TaskStatus
+from xagent.web.services.agent_service_manager import (
+    AgentServiceManager,
+    _spec_wants_mcp,
+)
 from xagent.web.services.channel_runtime import ChannelTaskMode
 from xagent.web.services.mcp_runtime import (
     MCPBuiltinOAuthActorPolicy,
@@ -126,7 +129,10 @@ async def test_marked_task_requires_policy_before_tool_construction() -> None:
     create_tools = AsyncMock()
 
     with (
-        patch("xagent.web.api.chat.create_default_tools", new=create_tools),
+        patch(
+            "xagent.web.services.agent_service_manager.create_default_tools",
+            new=create_tools,
+        ),
         patch("xagent.web.sandbox_manager.get_sandbox_manager", return_value=None),
         pytest.raises(
             MCPBuiltinOAuthActorPolicyRequiredError,
@@ -154,10 +160,18 @@ async def test_marked_task_binds_policy_and_omits_published_agent_tools(
     agent = _Agent(tool_config)
 
     with (
-        patch("xagent.web.api.chat.create_default_tools", new=create_tools),
-        patch("xagent.web.api.chat.create_task_tracer", return_value=MagicMock()),
+        patch(
+            "xagent.web.services.agent_service_manager.create_default_tools",
+            new=create_tools,
+        ),
+        patch(
+            "xagent.web.services.agent_service_manager.create_task_tracer",
+            return_value=MagicMock(),
+        ),
         patch("xagent.web.sandbox_manager.get_sandbox_manager", return_value=None),
-        patch("xagent.web.api.chat.AgentService", return_value=agent),
+        patch(
+            "xagent.web.services.agent_service_manager.AgentService", return_value=agent
+        ),
     ):
         built = await manager.get_agent_for_task(
             42,
@@ -189,7 +203,10 @@ async def test_actor_interaction_rejects_different_persisted_policy(
     create_tools = AsyncMock()
 
     with (
-        patch("xagent.web.api.chat.create_default_tools", new=create_tools),
+        patch(
+            "xagent.web.services.agent_service_manager.create_default_tools",
+            new=create_tools,
+        ),
         pytest.raises(
             MCPBuiltinOAuthActorPolicyMismatchError,
             match="durable identity",
@@ -224,7 +241,10 @@ async def test_actor_interaction_rejects_deleted_claimed_agent(
     create_tools = AsyncMock()
 
     with (
-        patch("xagent.web.api.chat.create_default_tools", new=create_tools),
+        patch(
+            "xagent.web.services.agent_service_manager.create_default_tools",
+            new=create_tools,
+        ),
         pytest.raises(
             MCPBuiltinOAuthActorPolicyRequiredError,
             match="claimed agent is unavailable",
@@ -341,10 +361,19 @@ async def test_actor_interaction_reconstruction_preserves_tool_context(
     reconstructed = _Agent(tool_config)
 
     with (
-        patch("xagent.web.api.chat.create_default_tools", new=create_tools),
-        patch("xagent.web.api.chat.create_task_tracer", return_value=MagicMock()),
+        patch(
+            "xagent.web.services.agent_service_manager.create_default_tools",
+            new=create_tools,
+        ),
+        patch(
+            "xagent.web.services.agent_service_manager.create_task_tracer",
+            return_value=MagicMock(),
+        ),
         patch("xagent.web.sandbox_manager.get_sandbox_manager", return_value=None),
-        patch("xagent.web.api.chat.AgentService", return_value=reconstructed),
+        patch(
+            "xagent.web.services.agent_service_manager.AgentService",
+            return_value=reconstructed,
+        ),
     ):
         result = await manager.get_agent_for_task(
             42,
@@ -412,10 +441,18 @@ async def test_non_literal_true_marker_preserves_ordinary_task_behavior(
     agent = _Agent(tool_config)
 
     with (
-        patch("xagent.web.api.chat.create_default_tools", new=create_tools),
-        patch("xagent.web.api.chat.create_task_tracer", return_value=MagicMock()),
+        patch(
+            "xagent.web.services.agent_service_manager.create_default_tools",
+            new=create_tools,
+        ),
+        patch(
+            "xagent.web.services.agent_service_manager.create_task_tracer",
+            return_value=MagicMock(),
+        ),
         patch("xagent.web.sandbox_manager.get_sandbox_manager", return_value=None),
-        patch("xagent.web.api.chat.AgentService", return_value=agent),
+        patch(
+            "xagent.web.services.agent_service_manager.AgentService", return_value=agent
+        ),
     ):
         assert (
             await manager.get_agent_for_task(

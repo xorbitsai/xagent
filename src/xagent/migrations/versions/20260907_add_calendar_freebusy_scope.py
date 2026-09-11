@@ -34,7 +34,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "20260907_add_calendar_freebusy_scope"
-down_revision: Union[str, None] = "20260909_seed_shopify_mcp_app"
+down_revision: Union[str, None] = "20260911_assistant_source_event"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

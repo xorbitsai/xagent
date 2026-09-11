@@ -212,3 +212,451 @@ def test_allowed_dirs_from_env_expands_user_home(monkeypatch, tmp_path):
     assert utils.allowed_dirs_from_env(_TEST_ALLOWED_DIRS_ENV_VAR) == [
         (tmp_path / "workspace").resolve()
     ]
+
+
+def test_datetime_key_for_comparison_truncates_seven_digit_fractional_seconds():
+    """Outlook commonly reports 100-nanosecond (7-digit) fractional
+    seconds, one more digit than a microsecond can hold - this must not
+    depend on whichever CPython version happens to run it."""
+    key = utils.datetime_key_for_comparison("2026-08-27T10:00:00.1234567")
+    assert key == utils.datetime_key_for_comparison("2026-08-27T10:00:00.123456")
+
+
+def test_datetime_key_for_comparison_treats_equal_instants_as_equal_across_offsets():
+    z_form = utils.datetime_key_for_comparison("2026-08-27T02:00:00Z")
+    offset_form = utils.datetime_key_for_comparison("2026-08-27T10:00:00+08:00")
+    assert z_form == offset_form
+
+
+def test_datetime_key_for_comparison_falls_back_to_raw_string_on_malformed_input():
+    assert utils.datetime_key_for_comparison("not-a-date") == "not-a-date"
+
+
+def test_datetime_key_for_comparison_passes_none_through():
+    assert utils.datetime_key_for_comparison(None) is None
+
+
+def test_normalize_addresses_drops_case_insensitive_duplicates():
+    """Regression test: email addresses are case-insensitive, so the same
+    person listed twice with different casing must not become two separate
+    attendee entries downstream - keeps the first casing seen."""
+    assert utils.normalize_addresses(
+        ["Chelsea@Example.com", "chelsea@example.com", "new@example.com"]
+    ) == ["Chelsea@Example.com", "new@example.com"]
+
+
+def test_normalize_addresses_dedup_works_for_comma_separated_string_input():
+    assert utils.normalize_addresses("a@x.com, A@X.com, b@x.com") == [
+        "a@x.com",
+        "b@x.com",
+    ]
+
+
+def test_attendees_were_given_treats_empty_string_as_not_provided():
+    assert utils.attendees_were_given(None) is False
+    assert utils.attendees_were_given("") is False
+
+
+def test_attendees_were_given_treats_empty_list_as_provided():
+    """An explicit [] is a deliberate "clear everyone" - distinct from
+    not-provided, unlike an empty string."""
+    assert utils.attendees_were_given([]) is True
+    assert utils.attendees_were_given(["a@x.com"]) is True
+    assert utils.attendees_were_given("a@x.com") is True
+
+
+def test_attendees_to_add_filters_out_existing_and_normalizes():
+    assert utils.attendees_to_add(
+        ["Old@Example.com", "new@example.com"], {"OLD@EXAMPLE.COM"}
+    ) == ["new@example.com"]
+
+
+def test_attendees_to_add_returns_empty_for_not_provided_or_empty():
+    assert utils.attendees_to_add(None, {"old@example.com"}) == []
+    assert utils.attendees_to_add("", {"old@example.com"}) == []
+    assert utils.attendees_to_add([], {"old@example.com"}) == []
+
+
+def test_merge_scope_error_reraises_when_no_conflict_is_known():
+    error = utils.InsufficientScopeError(
+        "reconnect required", [], ["unchecked@example.com"]
+    )
+
+    with pytest.raises(utils.InsufficientScopeError) as raised:
+        utils.merge_scope_error(error, [], [])
+
+    assert raised.value is error
+
+
+def test_merge_scope_error_preserves_confirmed_results():
+    existing_conflict = {"calendar": "organizer"}
+    error_conflict = {"calendar": "attendee@example.com"}
+    error = utils.InsufficientScopeError(
+        "reconnect required", [error_conflict], ["unchecked@example.com"]
+    )
+
+    conflicts, unchecked = utils.merge_scope_error(
+        error, [existing_conflict], ["already-unchecked@example.com"]
+    )
+
+    assert conflicts == [existing_conflict, error_conflict]
+    assert unchecked == [
+        "already-unchecked@example.com",
+        "unchecked@example.com",
+    ]
+
+
+def _key(value: str):
+    return utils.datetime_key_for_comparison(value)
+
+
+def test_window_delta_segments_empty_for_unchanged_or_shrunk_window():
+    """A retained attendee's own busy block already covers everything
+    inside the old window - a new window that's identical, or a strict
+    subset of it, adds no territory worth checking them against."""
+    old_start, old_end = (
+        _key("2026-08-27T10:00:00+00:00"),
+        _key("2026-08-27T10:30:00+00:00"),
+    )
+    assert utils.window_delta_segments(old_start, old_end, old_start, old_end) == []
+
+    shrunk_start = _key("2026-08-27T10:05:00+00:00")
+    shrunk_end = _key("2026-08-27T10:25:00+00:00")
+    assert (
+        utils.window_delta_segments(old_start, old_end, shrunk_start, shrunk_end) == []
+    )
+
+
+def test_window_delta_segments_returns_the_new_only_portion_of_a_partial_nudge():
+    """10:00-10:30 nudged to 10:15-10:45 - only 10:30-10:45 is new
+    territory a retained attendee could have a genuine conflict in;
+    10:15-10:30 is still covered by their busy block for this event."""
+    old_start, old_end = (
+        _key("2026-08-27T10:00:00+00:00"),
+        _key("2026-08-27T10:30:00+00:00"),
+    )
+    new_start, new_end = (
+        _key("2026-08-27T10:15:00+00:00"),
+        _key("2026-08-27T10:45:00+00:00"),
+    )
+
+    segments = utils.window_delta_segments(old_start, old_end, new_start, new_end)
+
+    assert segments == [(old_end, new_end)]
+
+
+def test_window_delta_segments_normalizes_iso_strings_internally():
+    assert utils.window_delta_segments(
+        "2026-08-27T10:00:00+00:00",
+        "2026-08-27T10:30:00+00:00",
+        "2026-08-27T10:15:00+00:00",
+        "2026-08-27T10:45:00+00:00",
+    ) == [
+        (
+            utils.datetime_key_for_comparison("2026-08-27T10:30:00+00:00"),
+            utils.datetime_key_for_comparison("2026-08-27T10:45:00+00:00"),
+        )
+    ]
+
+
+def test_window_delta_segments_returns_two_segments_when_widened_on_both_sides():
+    """Extending a meeting earlier AND later in the same call creates new
+    territory on both sides of the old window."""
+    old_start, old_end = (
+        _key("2026-08-27T10:00:00+00:00"),
+        _key("2026-08-27T10:30:00+00:00"),
+    )
+    new_start, new_end = (
+        _key("2026-08-27T09:45:00+00:00"),
+        _key("2026-08-27T10:45:00+00:00"),
+    )
+
+    segments = utils.window_delta_segments(old_start, old_end, new_start, new_end)
+
+    assert len(segments) == 2
+    assert segments[0] == (new_start, old_start)
+    assert segments[1] == (old_end, new_end)
+
+
+def test_window_delta_segments_returns_the_whole_window_for_a_disjoint_move():
+    """A move to somewhere with zero overlap with the old window means the
+    entire new window is new territory - this test also confirms the
+    move-by-15-minutes example from the actual reported bug is caught:
+    the delta segment here is the same shape as the disjoint case."""
+    old_start, old_end = (
+        _key("2026-08-27T10:00:00+00:00"),
+        _key("2026-08-27T10:30:00+00:00"),
+    )
+    new_start, new_end = (
+        _key("2026-08-27T14:00:00+00:00"),
+        _key("2026-08-27T14:30:00+00:00"),
+    )
+
+    assert utils.window_delta_segments(old_start, old_end, new_start, new_end) == [
+        (new_start, new_end)
+    ]
+
+
+def test_window_delta_segments_is_conservative_on_unparseable_or_mismatched_keys():
+    """ "Can't confirm the delta is smaller than the whole window" must
+    never silently shrink what gets checked - falls back to the whole new
+    window, both for a key that never parsed to a real datetime, and for
+    two real datetimes that can't be compared (aware vs. naive raises
+    TypeError on `<`)."""
+    new_start, new_end = (
+        _key("2026-08-27T10:00:00+00:00"),
+        _key("2026-08-27T10:30:00+00:00"),
+    )
+    assert utils.window_delta_segments(
+        "not-a-date", "also-not", new_start, new_end
+    ) == [(new_start, new_end)]
+
+    naive_start = _key("2026-08-27T09:00:00")
+    naive_end = _key("2026-08-27T11:00:00")
+    assert utils.window_delta_segments(naive_start, naive_end, new_start, new_end) == [
+        (new_start, new_end)
+    ]
+
+
+def test_window_delta_segments_empty_when_new_window_itself_is_unparseable():
+    """No valid new window at all means nothing meaningful to check,
+    regardless of the old window."""
+    old_start, old_end = (
+        _key("2026-08-27T10:00:00+00:00"),
+        _key("2026-08-27T10:30:00+00:00"),
+    )
+    assert (
+        utils.window_delta_segments(old_start, old_end, "not-a-date", "also-not") == []
+    )
+
+
+def test_window_delta_segments_empty_when_only_one_of_the_new_window_parses():
+    """Regression test: the guard is `new_start AND new_end` both being
+    real datetimes - a MIXED pair (one parses, one doesn't) must still
+    return [], not fall through and try to build a segment out of a
+    half-valid window. A prior test only exercised BOTH sides failing
+    together, which can't tell `and` apart from a mistakenly-broadened
+    `or` in that guard - this fixture, with exactly one side invalid,
+    can."""
+    old_start, old_end = (
+        _key("2026-08-27T10:00:00+00:00"),
+        _key("2026-08-27T10:30:00+00:00"),
+    )
+    new_start = _key("2026-08-27T14:00:00+00:00")
+    assert utils.window_delta_segments(old_start, old_end, new_start, "also-not") == []
+    assert (
+        utils.window_delta_segments(old_start, old_end, "not-a-date", new_start) == []
+    )
+
+
+def test_reject_reversed_window_raises_when_end_is_not_after_start():
+    with pytest.raises(ValueError, match="must be after"):
+        utils.reject_reversed_window(
+            "2026-08-27T10:30:00+00:00", "2026-08-27T10:00:00+00:00"
+        )
+    with pytest.raises(ValueError, match="must be after"):
+        utils.reject_reversed_window(
+            "2026-08-27T10:00:00+00:00", "2026-08-27T10:00:00+00:00"
+        )
+
+
+def test_reject_reversed_window_allows_a_forward_window():
+    utils.reject_reversed_window(
+        "2026-08-27T10:00:00+00:00", "2026-08-27T10:30:00+00:00"
+    )
+
+
+def test_reject_reversed_window_is_permissive_on_unparseable_input():
+    """Can't-tell must never read as "reject" - only a confirmed reversal
+    should raise."""
+    utils.reject_reversed_window("not-a-date", "also-not-a-date")
+
+
+def test_reject_reversed_window_is_permissive_when_aware_and_naive_are_mixed():
+    """Regression test: both sides parse to real `datetime` instances, but
+    comparing an offset-aware one against a naive one with `<=` raises
+    `TypeError` in Python - the `isinstance` check alone doesn't guard
+    against this, only checking that both are `datetime` instances of the
+    SAME awareness does. Must stay permissive here, not crash with a raw
+    TypeError, matching `window_delta_segments`'s handling of the
+    identical hazard."""
+    utils.reject_reversed_window("2026-08-27T10:30:00", "2026-08-27T10:30:00Z")
+    utils.reject_reversed_window("2026-08-27T10:30:00Z", "2026-08-27T10:00:00")
+
+
+def test_require_offset_datetime_rejects_a_naive_value():
+    with pytest.raises(ValueError, match="start_time"):
+        utils.require_offset_datetime("2026-08-27T10:30:00", "start_time")
+
+
+def test_require_offset_datetime_accepts_an_offset_or_z_suffixed_value():
+    utils.require_offset_datetime("2026-08-27T10:30:00+08:00", "start_time")
+    utils.require_offset_datetime("2026-08-27T10:30:00Z", "start_time")
+
+
+def test_require_offset_datetime_is_permissive_on_unparseable_input():
+    """A value that doesn't even parse is a different failure a caller
+    will already hit downstream with its own clear error - not this
+    function's job to preempt with a possibly-confusing offset-specific
+    message."""
+    utils.require_offset_datetime("not-a-date", "start_time")
+
+
+def test_calendar_day_bounds_spans_a_short_day_across_a_dst_spring_forward():
+    """2026-03-08 is when America/New_York springs forward (clocks skip
+    02:00-03:00), so the calendar day is only 23 hours long. The end
+    boundary must be constructed from the next local calendar date so the
+    timezone can apply the new UTC offset; adding 24 elapsed hours would
+    land at 01:00 on the following day and mis-widen the query window."""
+    start, end = utils.calendar_day_bounds("2026-03-08", "America/New_York")
+    assert start == "2026-03-08T00:00:00-05:00"
+    assert end == "2026-03-09T00:00:00-04:00"
+
+
+def test_calendar_day_bounds_spans_a_long_day_across_a_dst_fall_back():
+    start, end = utils.calendar_day_bounds("2026-11-01", "America/New_York")
+    assert start == "2026-11-01T00:00:00-04:00"
+    assert end == "2026-11-02T00:00:00-05:00"
+
+
+@pytest.mark.parametrize("days", [0, -1])
+def test_calendar_day_bounds_rejects_non_positive_days(days):
+    with pytest.raises(ValueError, match="positive"):
+        utils.calendar_day_bounds("2026-08-27", "UTC", days=days)
+
+
+def test_resolve_zoneinfo_reports_missing_name_as_value_error():
+    with pytest.raises(ValueError, match="recognized IANA"):
+        utils.resolve_zoneinfo(None)  # type: ignore[arg-type]
+
+
+def test_offset_datetime_string_attaches_the_zone_offset_to_a_naive_value():
+    assert (
+        utils.offset_datetime_string("2026-08-27T10:00:00", "Asia/Singapore")
+        == "2026-08-27T10:00:00+08:00"
+    )
+
+
+def test_offset_datetime_string_rejects_input_that_already_carries_an_offset():
+    """Regression test: no public tool parameter is documented as requiring
+    a naive value, so a caller passing one with a trailing 'Z' or an
+    explicit offset is a real, reachable mistake - not a theoretical one.
+    `.replace(tzinfo=...)` doesn't convert an aware datetime, it just
+    relabels the same clock digits under a different zone, silently
+    shifting the real instant by however much the two offsets differ
+    (e.g. "10:00:00Z" relabeled as Asia/Shanghai reads as 10:00 Shanghai
+    time - actually 8 hours earlier). Must fail loudly instead."""
+    with pytest.raises(ValueError, match="already carries a UTC offset"):
+        utils.offset_datetime_string("2026-08-27T10:00:00Z", "Asia/Shanghai")
+    with pytest.raises(ValueError, match="already carries a UTC offset"):
+        utils.offset_datetime_string("2026-08-27T10:00:00+00:00", "Asia/Shanghai")
+
+
+def test_conflict_response_uncapped_when_it_fits(monkeypatch):
+    monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "50000")
+    conflicts = [{"calendar": "organizer", "summary": "1:1", "start": "a", "end": "b"}]
+    response = json.loads(
+        utils.conflict_response(
+            conflicts, [], "2026-08-27T10:00:00", "2026-08-27T10:30:00"
+        )
+    )
+    assert response["conflicts"] == conflicts
+    assert response["truncated"] is False
+
+
+def test_conflict_response_caps_an_oversized_conflicts_list(monkeypatch):
+    """Regression test: unlike every other response path in this module,
+    conflict_response used to return an uncapped payload - a busy shared
+    calendar or wide window can turn up far more overlapping events than
+    fit the platform's output budget. Only `conflicts` (the field that
+    can actually grow large) should be halved to fit; small fields like
+    `hint`/`unchecked_attendees` must survive untouched."""
+    monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "2000")
+    conflicts = [
+        {
+            "calendar": f"person{i}@example.com",
+            "summary": "Busy block " + "x" * 50,
+            "start": "2026-08-27T10:00:00+00:00",
+            "end": "2026-08-27T10:30:00+00:00",
+        }
+        for i in range(100)
+    ]
+    response = json.loads(
+        utils.conflict_response(
+            conflicts,
+            ["unreachable@example.com"],
+            "2026-08-27T10:00:00",
+            "2026-08-27T10:30:00",
+        )
+    )
+
+    assert response["status"] == "conflict"
+    assert response["truncated"] is True
+    assert len(response["conflicts"]) < len(conflicts)
+    assert response["conflicts"] == conflicts[: len(response["conflicts"])]
+    assert response["unchecked_attendees"] == ["unreachable@example.com"]
+    assert len(json.dumps(response, ensure_ascii=False)) <= 2000
+
+
+def test_conflict_response_caps_unchecked_attendees_when_conflicts_alone_is_not_enough(
+    monkeypatch,
+):
+    """Regression test: a single real conflict combined with a huge
+    unchecked_attendees list (e.g. every remaining attendee in a large
+    invite batch, marked unchecked after a mid-batch scope error) can
+    still exceed the output budget even after `conflicts` has been
+    shrunk to nothing - unchecked_attendees must also be capped, not
+    left untouched forever."""
+    monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "2000")
+    conflicts = [
+        {
+            "calendar": "organizer",
+            "summary": "1:1 with Hazel",
+            "start": "2026-08-27T10:00:00+00:00",
+            "end": "2026-08-27T10:30:00+00:00",
+        }
+    ]
+    unchecked_attendees = [f"person{i}@example.com" for i in range(200)]
+
+    response = json.loads(
+        utils.conflict_response(
+            conflicts,
+            unchecked_attendees,
+            "2026-08-27T10:00:00",
+            "2026-08-27T10:30:00",
+        )
+    )
+
+    assert response["status"] == "conflict"
+    assert response["truncated"] is True
+    assert response["conflicts"] == conflicts
+    assert len(response["unchecked_attendees"]) < len(unchecked_attendees)
+    assert (
+        response["unchecked_attendees"]
+        == unchecked_attendees[: len(response["unchecked_attendees"])]
+    )
+    assert len(json.dumps(response, ensure_ascii=False)) <= 2000
+
+
+def test_conflict_response_uses_valid_compact_json_below_fixed_envelope(
+    monkeypatch,
+):
+    monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "300")
+    response_text = utils.conflict_response(
+        [
+            {
+                "calendar": "organizer",
+                "summary": "Busy",
+                "start": "2026-08-27T10:00:00+00:00",
+                "end": "2026-08-27T10:30:00+00:00",
+            }
+        ],
+        ["unreachable@example.com"],
+        "2026-08-27T10:00:00+00:00",
+        "2026-08-27T10:30:00+00:00",
+    )
+
+    response = json.loads(response_text)
+    assert response["status"] == "conflict"
+    assert response["truncated"] is True
+    assert len(response_text) <= 300

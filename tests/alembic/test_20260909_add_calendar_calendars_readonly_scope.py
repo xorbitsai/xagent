@@ -1,4 +1,5 @@
-"""Tests for narrowing the Google Calendar connector's OAuth scope."""
+"""Tests for adding calendar.calendars.readonly to the Google Calendar
+connector's scope."""
 
 import importlib.util
 import json
@@ -13,16 +14,23 @@ from alembic.operations import Operations
 
 MIGRATION_PATH = (
     Path(__file__).parent.parent.parent
-    / "src/xagent/migrations/versions/20260817_narrow_google_calendar_scope.py"
+    / "src/xagent/migrations/versions/20260909_add_calendar_calendars_readonly_scope.py"
 )
 
-OLD_SCOPES = ["https://www.googleapis.com/auth/calendar"]
-NEW_SCOPES = ["https://www.googleapis.com/auth/calendar.events"]
+OLD_SCOPES = [
+    "https://www.googleapis.com/auth/calendar.events",
+    "https://www.googleapis.com/auth/calendar.freebusy",
+]
+NEW_SCOPES = [
+    "https://www.googleapis.com/auth/calendar.events",
+    "https://www.googleapis.com/auth/calendar.freebusy",
+    "https://www.googleapis.com/auth/calendar.calendars.readonly",
+]
 
 
 def _load_migration_module():
     spec = importlib.util.spec_from_file_location(
-        "narrow_google_calendar_scope_migration", MIGRATION_PATH
+        "add_calendar_calendars_readonly_scope_migration", MIGRATION_PATH
     )
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -49,7 +57,7 @@ def _scopes_by_app_id(connection, table: sa.Table) -> dict[str, object]:
     return {row.app_id: row.oauth_scopes for row in rows}
 
 
-def test_upgrade_narrows_google_calendar_scope_without_touching_other_apps(
+def test_upgrade_adds_calendars_readonly_scope_without_touching_other_apps(
     tmp_path,
 ) -> None:
     migration = _load_migration_module()
@@ -149,7 +157,7 @@ def test_upgrade_skips_when_oauth_scopes_column_is_absent() -> None:
     assert stored["app_id"] == "google-calendar"
 
 
-def test_downgrade_restores_the_full_calendar_scope(tmp_path) -> None:
+def test_downgrade_restores_the_freebusy_only_scope(tmp_path) -> None:
     migration = _load_migration_module()
     engine = sa.create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     metadata = sa.MetaData()
@@ -171,7 +179,7 @@ def test_downgrade_restores_the_full_calendar_scope(tmp_path) -> None:
     assert scopes["google-calendar"] == OLD_SCOPES
 
 
-def test_downgrade_restores_the_full_calendar_scope_without_touching_other_apps(
+def test_downgrade_restores_the_freebusy_only_scope_without_touching_other_apps(
     tmp_path,
 ) -> None:
     migration = _load_migration_module()
@@ -198,6 +206,56 @@ def test_downgrade_restores_the_full_calendar_scope_without_touching_other_apps(
     assert scopes["gmail"] == ["gmail-scope"]
 
 
+def test_upgrade_downgrade_upgrade_converges_on_the_new_scope(tmp_path) -> None:
+    migration = _load_migration_module()
+    engine = sa.create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    metadata = sa.MetaData()
+    table = _public_mcp_apps(metadata)
+    metadata.create_all(engine)
+
+    with engine.begin() as connection:
+        connection.execute(
+            sa.insert(table),
+            {"app_id": "google-calendar", "oauth_scopes": OLD_SCOPES},
+        )
+
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+            migration.downgrade()
+            migration.upgrade()
+
+        scopes = _scopes_by_app_id(connection, table)
+
+    assert scopes["google-calendar"] == NEW_SCOPES
+
+
+def test_upgrade_after_downgrade_does_not_touch_other_apps(tmp_path) -> None:
+    migration = _load_migration_module()
+    engine = sa.create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    metadata = sa.MetaData()
+    table = _public_mcp_apps(metadata)
+    metadata.create_all(engine)
+
+    with engine.begin() as connection:
+        connection.execute(
+            sa.insert(table),
+            [
+                {"app_id": "google-calendar", "oauth_scopes": OLD_SCOPES},
+                {"app_id": "gmail", "oauth_scopes": ["gmail-scope"]},
+            ],
+        )
+
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+            migration.downgrade()
+            migration.upgrade()
+
+        scopes = _scopes_by_app_id(connection, table)
+
+    assert scopes["google-calendar"] == NEW_SCOPES
+    assert scopes["gmail"] == ["gmail-scope"]
+
+
 def test_offline_postgresql_upgrade_emits_literal_update_only_sql() -> None:
     migration = _load_migration_module()
     output = StringIO()
@@ -213,7 +271,7 @@ def test_offline_postgresql_upgrade_emits_literal_update_only_sql() -> None:
     assert sql.count("UPDATE public_mcp_apps SET") == 1
     assert "oauth_scopes=" in sql
     assert "public_mcp_apps.app_id = 'google-calendar'" in sql
-    assert "calendar.events" in sql
+    assert "calendar.calendars.readonly" in sql
     assert "INSERT INTO public_mcp_apps" not in sql
     assert "DELETE FROM public_mcp_apps" not in sql
     assert "%(" not in sql
@@ -264,13 +322,11 @@ def test_offline_postgresql_downgrade_emits_literal_update_only_sql() -> None:
     assert sql.count("UPDATE public_mcp_apps SET") == 1
     assert "oauth_scopes=" in sql
     assert "public_mcp_apps.app_id = 'google-calendar'" in sql
-    # "auth/calendar" alone is a substring of both OLD_SCOPES and NEW_SCOPES
-    # ("auth/calendar.events"), so it can't distinguish which one was
-    # emitted; assert the narrower scope is absent to catch a swapped
-    # OLD_SCOPES/NEW_SCOPES argument in downgrade()'s
-    # _set_calendar_scopes_offline() call.
-    assert "auth/calendar" in sql
-    assert "calendar.events" not in sql
+    # Assert the calendars.readonly scope is absent, not just present-or-
+    # absent by accident, to catch a swapped OLD_SCOPES/NEW_SCOPES argument
+    # in downgrade()'s _set_calendar_scopes_offline() call.
+    assert "calendar.freebusy" in sql
+    assert "calendar.calendars.readonly" not in sql
     assert "INSERT INTO public_mcp_apps" not in sql
     assert "DELETE FROM public_mcp_apps" not in sql
     assert "%(" not in sql
@@ -306,20 +362,22 @@ def test_offline_sqlite_downgrade_round_trips_json_scope_value() -> None:
     assert json.loads(stored[0]) == OLD_SCOPES
 
 
-def test_migration_fields_match_this_files_expectations() -> None:
-    # This migration has since been superseded by
-    # 20260907_add_calendar_freebusy_scope, which adds calendar.freebusy on
-    # top of what this one set - so migration.NEW_SCOPES is no longer
-    # expected to equal the live registry value; that comparison now lives
-    # in the newer migration's own test instead.
-    #
-    # This file's own OLD_SCOPES/NEW_SCOPES (used throughout the tests
-    # above) are a separate copy of the migration's constants, not a
-    # reference to them -- if the migration's values ever changed without
-    # this file's copy following, every test above would keep passing
-    # against a stale expectation instead of failing loudly.
-    migration = _load_migration_module()
+def test_migration_fields_match_registry() -> None:
+    from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
 
+    migration = _load_migration_module()
+    registry_row = next(
+        row
+        for row in get_builtin_public_mcp_app_rows()
+        if row["app_id"] == "google-calendar"
+    )
+
+    assert list(migration.NEW_SCOPES) == registry_row["oauth_scopes"]
+    # This file's own OLD_SCOPES/NEW_SCOPES (used throughout the tests above)
+    # are a separate copy of the migration's constants, not a reference to
+    # them -- if the migration's values ever changed without this file's
+    # copy following, every test above would keep passing against a stale
+    # expectation instead of failing loudly.
     assert list(migration.OLD_SCOPES) == OLD_SCOPES
     assert list(migration.NEW_SCOPES) == NEW_SCOPES
 
@@ -327,5 +385,5 @@ def test_migration_fields_match_this_files_expectations() -> None:
 def test_revision_metadata() -> None:
     migration = _load_migration_module()
 
-    assert migration.revision == "20260817_narrow_google_calendar_scope"
-    assert migration.down_revision == "20260825_add_slack_channels_join_scope"
+    assert migration.revision == "20260909_add_calendar_calendars_readonly_scope"
+    assert migration.down_revision == "20260907_add_calendar_freebusy_scope"

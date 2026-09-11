@@ -206,6 +206,50 @@ def test_upload_file_rejects_empty_or_root_remote_path(
     mock_request.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "traversal_remote_path",
+    ["../../etc/passwd", "../../../../me/messages", "foo/../../bar", "./secret"],
+)
+def test_upload_file_rejects_dot_segments_in_remote_path(
+    monkeypatch, _upload_allowed_dirs_env, traversal_remote_path
+):
+    """Regression guard for a confirmed request-forgery bug: requests'
+    own URL preparation collapses ".." segments the same way a browser
+    does (verified directly: 'root:/../../etc/x:/content' becomes
+    '/me/etc/x:/content'), so an unvalidated remote_path could walk the
+    actual HTTP request Graph receives entirely out of
+    '/me/drive/root:/' and onto a different, unrelated Graph API endpoint
+    under the same OAuth token -- not just the wrong file within Drive."""
+    local_file = _upload_allowed_dirs_env / "report.pdf"
+    local_file.write_bytes(b"content")
+
+    mock_request = Mock()
+    monkeypatch.setattr(onedrive.requests, "request", mock_request)
+
+    result = json.loads(
+        onedrive.onedrive_upload_file(
+            str(local_file), remote_path=traversal_remote_path
+        )
+    )
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
+def test_normalize_path_rejects_dot_segments_directly():
+    """Direct regression guard on the shared choke point every path-
+    building helper (_item_path/_children_path/_content_path) goes
+    through, independent of which public tool calls it."""
+    with pytest.raises(ValueError, match=r"\.\.|\bpath must not contain"):
+        onedrive._normalize_path("../../etc/passwd")
+    with pytest.raises(ValueError):
+        onedrive._normalize_path("a/../b")
+    with pytest.raises(ValueError):
+        onedrive._normalize_path("./a")
+    # A path with no dot-segments at all must be unaffected.
+    assert onedrive._normalize_path("Documents/report.pdf") == "Documents/report.pdf"
+
+
 def test_upload_file_uses_upload_session_for_large_files(
     monkeypatch, _upload_allowed_dirs_env
 ):
@@ -755,15 +799,17 @@ def test_simple_upload_max_bytes_is_at_or_below_graphs_4mb_limit():
         "application/vnd.groove-tool-template",
     ],
 )
-def test_text_safe_mime_types_includes_added_entries_directly(mime_type):
+def test_is_binary_mime_type_excludes_known_text_formats_directly(mime_type):
     """Regression guard independent of the host's own mimetypes database:
     whether mimetypes.guess_type actually resolves a given extension to one
     of these types varies by host (e.g. ".php" only resolves to
     "application/x-httpd-php" with a fuller system mime.types installed,
-    not reproduced on every machine/CI image) -- this asserts the set
-    membership directly, so the coverage doesn't silently depend on the
-    test host happening to have the right mime.types file installed."""
-    assert onedrive._is_text_mime_type(mime_type)
+    not reproduced on every machine/CI image). Under the positive
+    known-binary-formats design, these types are "not binary" simply by
+    not appearing in _BINARY_MIME_TYPES/_BINARY_MIME_PREFIXES -- this pins
+    that down directly so a future addition to that set can't silently
+    re-capture one of these genuinely-text formats."""
+    assert not onedrive._is_binary_mime_type(mime_type)
 
 
 def test_upload_file_at_exact_boundary_uses_simple_put(
@@ -824,6 +870,11 @@ def test_upload_file_one_byte_over_boundary_uses_upload_session(
         "notes.pages",
         "vault.key",
         "extension.crx",
+        "app.pub",
+        "installer.dmg",
+        "image.iso",
+        "app.apk",
+        "book.mobi",
     ],
 )
 def test_upload_text_file_rejects_additional_binary_extensions(monkeypatch, file_path):
@@ -831,7 +882,11 @@ def test_upload_text_file_rejects_additional_binary_extensions(monkeypatch, file
     extension set — fonts, WASM, columnar/DB, and several common formats
     stdlib mimetypes also has no opinion on were missing from it, so with
     no other signal they used to sail straight through the guard and get
-    silently created as mislabeled text files."""
+    silently created as mislabeled text files. (.pub/.dmg/.iso/.apk/.mobi
+    were re-verified after switching to a positive known-binary-formats
+    list, since a host WITH a system mime.types installed resolves them to
+    a specific mimetype that must itself be in _BINARY_MIME_TYPES -- the
+    "no mimetype at all" fallback alone only covers a bare-stdlib host.)"""
     mock_request = Mock()
     monkeypatch.setattr(onedrive.requests, "request", mock_request)
 
@@ -878,17 +933,24 @@ def test_upload_text_file_allows_ambiguous_extensions_that_collide_with_binary_m
         ("paper.tex", "application/x-tex"),
         ("build.csh", "application/x-csh"),
         ("layout.tpl", "application/vnd.groove-tool-template"),
+        ("deploy.sh", "application/x-sh"),
+        ("subs.srt", "application/x-subrip"),
+        ("schema.dtd", "application/xml-dtd"),
+        ("host.crt", "application/x-x509-ca-cert"),
     ],
 )
 def test_upload_text_file_allows_source_extensions_with_non_text_mime_guess(
     monkeypatch, file_path, simulated_mime_type
 ):
     """Regression guard: a reviewer-verified false-positive class --
-    ".sql"/".php"/".dart"/".tex"/".csh"/".tpl" resolve via mimetypes on at
-    least some hosts to non-text application/* types that were missing
-    from the text-safe allowlist. None of these collide with a real binary
-    format the way .ts/.bat/.scm/.sc do, so they belong in
-    _TEXT_SAFE_MIME_TYPES rather than the ambiguous-extension carve-out.
+    ".sql"/".php"/".dart"/".tex"/".csh"/".tpl"/".sh"/".srt"/".dtd"/".crt"
+    resolve via mimetypes on at least some hosts to non-text application/*
+    types. None of these are in _BINARY_MIME_TYPES (nor collide with a
+    real binary format the way .ts/.bat/.scm/.sc do), so _is_binary_mime_type
+    correctly treats them as text by default rather than needing an
+    explicit text-safe entry -- ".sh" in particular is a common,
+    frequently-generated format that shipped genuinely broken (rejected
+    with no working alternative) before this fix.
 
     The mimetype each extension actually resolves to is host- and Python-
     version-dependent (confirmed directly: this file's own dev host and a
@@ -961,6 +1023,30 @@ def test_upload_file_rejects_path_outside_allowed_directories(
     mock_request.assert_not_called()
 
 
+def test_upload_file_rejects_sibling_directory_name_collision(
+    monkeypatch, tmp_path, _upload_allowed_dirs_env
+):
+    """Regression guard: an allowed dir like "/workspace" must not
+    accidentally admit a sibling "/workspace-other" just because it starts
+    with the same string -- containment must be a real path-relative check
+    (is_relative_to), not a naive string prefix comparison. Passing today,
+    but pinned down directly so a future refactor to str.startswith()
+    can't silently regress it while every other test stays green."""
+    sibling_dir = tmp_path / (_upload_allowed_dirs_env.name + "-other")
+    sibling_dir.mkdir()
+    outside_file = sibling_dir / "secret.pdf"
+    outside_file.write_bytes(b"content")
+
+    mock_request = Mock()
+    monkeypatch.setattr(onedrive.requests, "request", mock_request)
+
+    result = json.loads(onedrive.onedrive_upload_file(str(outside_file)))
+
+    assert result["status"] == "error"
+    assert "allowed upload directories" in result["message"]
+    mock_request.assert_not_called()
+
+
 def test_upload_file_rejects_symlink_escaping_allowed_dir(
     monkeypatch, tmp_path, _upload_allowed_dirs_env
 ):
@@ -1022,6 +1108,25 @@ def test_upload_file_rejects_missing_file(monkeypatch, _upload_allowed_dirs_env)
     mock_request.assert_not_called()
 
 
+def test_upload_file_rejects_directory_with_a_distinct_message(
+    monkeypatch, _upload_allowed_dirs_env
+):
+    """Regression guard: a directory (or other non-regular file) used to
+    raise the same "File not found" as a genuinely missing path, which
+    reads as "retry, it'll show up" even though a directory never will."""
+    a_directory = _upload_allowed_dirs_env / "not_a_file"
+    a_directory.mkdir()
+
+    mock_request = Mock()
+    monkeypatch.setattr(onedrive.requests, "request", mock_request)
+
+    result = json.loads(onedrive.onedrive_upload_file(str(a_directory)))
+
+    assert result["status"] == "error"
+    assert "not a regular file" in result["message"].lower()
+    mock_request.assert_not_called()
+
+
 def test_upload_file_rejects_empty_file(monkeypatch, _upload_allowed_dirs_env):
     empty_file = _upload_allowed_dirs_env / "empty.pdf"
     empty_file.write_bytes(b"")
@@ -1036,6 +1141,47 @@ def test_upload_file_rejects_empty_file(monkeypatch, _upload_allowed_dirs_env):
     mock_request.assert_not_called()
 
 
+def test_upload_file_rejects_file_over_max_upload_bytes(
+    monkeypatch, _upload_allowed_dirs_env
+):
+    """Regression guard: onedrive_upload_file previously had no upper size
+    bound at all (only rejected 0 bytes), so a mistargeted large file (an
+    unrelated log directory, the wrong generated artifact) would trigger
+    an unbounded chunked upload with no early feedback."""
+    local_file = _upload_allowed_dirs_env / "huge.bin"
+    local_file.write_bytes(b"x")
+
+    mock_request = Mock()
+    monkeypatch.setattr(onedrive.requests, "request", mock_request)
+    real_fstat = onedrive.os.fstat
+    fake_size = onedrive._MAX_UPLOAD_BYTES + 1
+
+    def _fake_fstat(fd):
+        real = real_fstat(fd)
+        return type(real)(
+            (
+                real.st_mode,
+                real.st_ino,
+                real.st_dev,
+                real.st_nlink,
+                real.st_uid,
+                real.st_gid,
+                fake_size,
+                real.st_atime,
+                real.st_mtime,
+                real.st_ctime,
+            )
+        )
+
+    monkeypatch.setattr(onedrive.os, "fstat", _fake_fstat)
+
+    result = json.loads(onedrive.onedrive_upload_file(str(local_file)))
+
+    assert result["status"] == "error"
+    assert "limit" in result["message"].lower()
+    mock_request.assert_not_called()
+
+
 def test_upload_file_returns_error_payload_on_api_failure(
     monkeypatch, _upload_allowed_dirs_env
 ):
@@ -1045,12 +1191,17 @@ def test_upload_file_returns_error_payload_on_api_failure(
     monkeypatch.setattr(
         onedrive.requests,
         "request",
-        Mock(return_value=MockResponse({"error": "boom"}, status_code=500)),
+        Mock(
+            return_value=MockResponse(
+                {"error": "boom"}, status_code=500, content=b'{"error": "boom"}'
+            )
+        ),
     )
 
     result = json.loads(onedrive.onedrive_upload_file(str(local_file)))
 
     assert result["status"] == "error"
+    assert "boom" in result["message"]
 
 
 # ---------------------------------------------------------------------------

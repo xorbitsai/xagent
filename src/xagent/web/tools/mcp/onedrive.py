@@ -38,6 +38,13 @@ _SIMPLE_UPLOAD_MAX_BYTES = 4_000_000
 # (327,680 bytes) per Graph's requirement for every non-final chunk; 5 MiB
 # is exactly 16 * 320 KiB.
 _UPLOAD_SESSION_CHUNK_SIZE = 5 * 1024 * 1024
+# Not a Graph API limit (OneDrive itself supports files far larger than
+# this via the resumable upload session) -- a guard-rail against a
+# mistargeted file (a generated artifact pointed at the wrong path, an
+# entire log directory, etc.) tying up a chunked upload for a long time
+# with no feedback until it eventually finishes or fails, mirroring
+# gmail.py's own _MAX_ATTACHMENT_BYTES guard for the same kind of mistake.
+_MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
 
 _UPLOAD_ALLOWED_DIRS_ENV_VAR = "XAGENT_ONEDRIVE_FILE_ALLOWED_DIRS"
 
@@ -62,95 +69,106 @@ _MIME_TYPE_OVERRIDES = {
 }
 
 
+# Extensions whose real mime type collides with a totally unrelated binary
+# format's registered mimetype, verified directly: ".ts" -> "video/mp2t"
+# (MPEG transport stream, not TypeScript), ".bat" -> "application/x-msdownload",
+# ".scm" -> "application/vnd.lotus-screencam" (not Scheme source), ".sc" ->
+# "application/vnd.ibm.secure-container" (an obscure, effectively dead IBM
+# format, not Scala/SuperCollider source). Consulted by _guess_mime_type
+# itself (so onedrive_upload_file's own Content-Type guess for a real file
+# with one of these names is also right, not just the binary/text guard
+# below) -- for these four the mimetype signal is actively wrong, not
+# merely unavailable, so it's overridden to "text/plain" rather than left
+# to resolve to the colliding binary type.
+_AMBIGUOUS_TEXT_EXTENSIONS = {
+    ".ts", ".bat", ".scm", ".sc",
+    # Not a verified collision like the four above -- mimetypes.guess_type
+    # returns None for ".ps1" on every host tested. Included here
+    # defensively anyway: no real binary format uses ".ps1", so there's no
+    # downside, and it removes any dependency on some as-yet-unseen host's
+    # mime database staying silent on it.
+    ".ps1",
+}  # fmt: skip
+
+
 def _guess_mime_type(name: str) -> str | None:
-    """Guess a mime type from ``name``'s extension, consulting
-    _MIME_TYPE_OVERRIDES first for the formats stdlib mimetypes can't
-    reliably identify on its own (see above)."""
-    override = _MIME_TYPE_OVERRIDES.get(Path(name).suffix.lower())
+    """Guess a mime type from ``name``'s extension: _AMBIGUOUS_TEXT_EXTENSIONS
+    first (see above), then _MIME_TYPE_OVERRIDES for the formats stdlib
+    mimetypes can't reliably identify on its own, then stdlib itself."""
+    suffix = Path(name).suffix.lower()
+    if suffix in _AMBIGUOUS_TEXT_EXTENSIONS:
+        return "text/plain"
+    override = _MIME_TYPE_OVERRIDES.get(suffix)
     if override is not None:
         return override
     return mimetypes.guess_type(name)[0]
 
 
-# mime types that are genuinely text despite not having a "text/" prefix --
-# reused from the same reasoning as google_drive.py's _TEXT_MIME_TYPES (the
-# equivalent guard planned for that connector in the still-unmerged sibling
-# PR #2275): a mime type not in this set and not "text/"-prefixed is
-# treated as binary by _name_looks_binary below.
-_TEXT_SAFE_MIME_TYPES = {
-    "application/json",
-    "application/xml",
-    "application/rtf",
-    "application/javascript",
-    "application/x-yaml",
-    "application/yaml",
-    "application/csv",
-    # Each of these is a real host mime.types mapping for a mainstream
-    # source/script language, verified directly against this file's
-    # extension list: ".sql" -> "application/x-sql" and ".dart" ->
-    # "application/vnd.dart" resolve this way even without any system
-    # mime.types file; ".php" -> "application/x-httpd-php" is the common
-    # Apache mapping present on many production hosts (not reproduced on
-    # every host, but a false negative here -- treating real PHP/SQL/Dart
-    # source as binary -- is worse than the false positive of never
-    # rejecting a genuinely binary file that happens to declare one of
-    # these types, which none do.
-    "application/x-sql",
-    # Newer Python/OS mime databases (confirmed: CI's Ubuntu + Python 3.12,
-    # unlike this file's own dev/test host) resolve ".sql" to the
-    # IANA-registered "application/sql" instead of the older unofficial
-    # "application/x-sql" -- both point at the same plain-text format, so
-    # both are listed rather than picking one and hoping every host agrees.
-    "application/sql",
-    "application/x-httpd-php",
-    "application/vnd.dart",
-    # Found by a broader sweep of common script/config/source extensions
-    # against stdlib mimetypes after .sql/.php/.dart turned up the same
-    # class of gap -- each of these is a real host mapping for a plain
-    # text format: ".tex" -> "application/x-tex" (LaTeX source), ".csh"
-    # -> "application/x-csh" (C shell script), ".tpl" -> "application/
-    # vnd.groove-tool-template" (an obscure, effectively dead format;
-    # ".tpl" is otherwise universal for text templates in practice).
-    "application/x-tex",
-    "application/x-csh",
-    "application/vnd.groove-tool-template",
+# Mime-type prefixes that are unambiguously binary media containers.
+_BINARY_MIME_PREFIXES = ("image/", "audio/", "video/", "font/")
+
+# Specific mime types (documents, archives, executables) that are
+# unambiguously binary but don't fall under one of the prefixes above.
+# This is deliberately a *positive* list of known binary formats rather
+# than the inverse (a "known text" allowlist grown to cover every possible
+# script/config/source-code mimetype) -- the false-positive class that
+# approach produces (.ts/.bat/.scm/.sc, then .ps1/.sql/.php/.dart, then
+# .tex/.csh/.tpl, then .sh/.srt/.dtd, discovered across four separate
+# review rounds) keeps recurring because programming/script/config-file
+# extensions are effectively unbounded, while real binary container/
+# document formats are a small, enumerable set. Anything not matched here
+# (or by a prefix above) is treated as text by default -- including a
+# mimetype nobody has thought to test yet, which is exactly the case this
+# design change exists to stop mishandling.
+_BINARY_MIME_TYPES = {
+    "application/pdf",
+    "application/msword",
+    "application/vnd.ms-excel",
+    "application/vnd.ms-powerpoint",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.ms-excel.sheet.macroEnabled.12",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "application/vnd.oasis.opendocument.text",
+    "application/vnd.oasis.opendocument.spreadsheet",
+    "application/vnd.oasis.opendocument.presentation",
+    "application/epub+zip",
+    "application/zip",
+    "application/x-tar",
+    "application/gzip",
+    "application/x-gzip",
+    "application/x-bzip2",
+    "application/x-7z-compressed",
+    "application/vnd.rar",
+    "application/x-rar-compressed",
+    "application/x-msdownload",
+    "application/x-executable",
+    "application/x-mach-binary",
+    "application/x-sharedlib",
+    "application/octet-stream",
+    "application/wasm",
+    "application/vnd.sqlite3",
+    "application/x-sqlite3",
+    "application/x-mspublisher",  # .pub -- a real binary format, verified
+    "application/postscript",  # .ps -- pre-existing behavior, unchanged
+    # Found while re-auditing _KNOWN_BINARY_EXTENSIONS_WITHOUT_MIME_GUESS's
+    # own extensions against a host WITH a system mime.types installed
+    # (unlike the bare-stdlib probe that motivated that fallback set in the
+    # first place) -- these four resolve to a real, specific mimetype
+    # there instead of None, so the "no mimetype at all" fallback alone
+    # would miss them on such a host.
+    "application/x-mobipocket-ebook",  # .mobi
+    "application/x-apple-diskimage",  # .dmg
+    "application/x-iso9660-image",  # .iso
+    "application/vnd.android.package-archive",  # .apk
 }
-_TEXT_SAFE_MIME_SUFFIXES = ("+json", "+xml", "+yaml")
 
 
-def _is_text_mime_type(mime_type: str) -> bool:
+def _is_binary_mime_type(mime_type: str) -> bool:
     return (
-        mime_type.startswith("text/")
-        or mime_type in _TEXT_SAFE_MIME_TYPES
-        or mime_type.endswith(_TEXT_SAFE_MIME_SUFFIXES)
+        mime_type.startswith(_BINARY_MIME_PREFIXES) or mime_type in _BINARY_MIME_TYPES
     )
 
-
-# Extensions whose stdlib mimetypes.guess_type() result is a real binary
-# format that collides with an extension overwhelmingly used for genuine
-# text/source content -- verified directly: ".ts" -> "video/mp2t" (MPEG
-# transport stream, not TypeScript), ".bat" -> "application/x-msdownload",
-# ".scm" -> "application/vnd.lotus-screencam" (not Scheme source), ".sc"
-# -> "application/vnd.ibm.secure-container" (an obscure, effectively dead
-# IBM format, not Scala/SuperCollider source). Treating the mimetype guess
-# as authoritative for these four would flag an ordinary source/script
-# file as binary with no working upload path at all (onedrive_upload_text_file
-# rejects it, and onedrive_upload_file needs an existing local *file*, not
-# raw text content) -- so the mime-type signal is ignored for exactly
-# these extensions and _name_looks_binary treats them as text unless a
-# caller's own filename collides with one of the entries in the fallback
-# set below (it doesn't -- none share a suffix).
-_AMBIGUOUS_TEXT_EXTENSIONS = {
-    ".ts", ".bat", ".scm", ".sc",
-    # Not a verified collision like the four above -- mimetypes.guess_type
-    # returns None for ".ps1" on every host tested (see
-    # _KNOWN_BINARY_EXTENSIONS_WITHOUT_MIME_GUESS's own note on why it's
-    # NOT in that set). Included here defensively anyway: no real binary
-    # format uses ".ps1", so there's no downside, and it removes any
-    # dependency on some as-yet-unseen host's mime database staying silent
-    # on it.
-    ".ps1",
-}  # fmt: skip
 
 # Extensions of unambiguously binary formats that resolve to no mime type
 # at all (neither _MIME_TYPE_OVERRIDES nor a bare stdlib mimetypes install
@@ -166,12 +184,7 @@ _KNOWN_BINARY_EXTENSIONS_WITHOUT_MIME_GUESS = {
     ".dylib", ".dmg", ".iso", ".apk", ".rpm", ".crx",
     ".woff", ".woff2", ".ttf", ".otf",
     ".parquet", ".sqlite", ".sqlite3", ".db", ".db3",
-    ".numbers", ".pages", ".key", ".blend", ".indd",
-    # NOT ".ps1" -- PowerShell scripts are genuine UTF-8 text (same mistake
-    # class as _AMBIGUOUS_TEXT_EXTENSIONS above, just self-inflicted here
-    # rather than a real mimetypes collision): mimetypes.guess_type(".ps1")
-    # returns None on every host tested, which this set previously treated
-    # as "therefore binary" without checking what the format actually is.
+    ".numbers", ".pages", ".key", ".blend", ".indd", ".pub",
 }  # fmt: skip
 
 
@@ -251,10 +264,28 @@ def _graph_request(
 
 
 def _normalize_path(path: str | None) -> str | None:
+    """Normalize a Drive-relative path for use in a root:/{path}: request
+    URL, rejecting any "." or ".." segment outright rather than trying to
+    resolve it.
+
+    This isn't a filesystem path -- it's spliced directly into the request
+    URL below -- but standard HTTP client URL normalization still applies
+    to it: verified directly that requests' own PreparedRequest collapses
+    ".." segments the same way a browser would (e.g.
+    "/me/drive/root:/../../etc/x:/content" becomes "/me/etc/x:/content"),
+    which can walk the request entirely out of "/me/drive/root:/" and onto
+    a different, unrelated Graph API endpoint under the same OAuth token --
+    not merely "the wrong file within Drive." A caller-supplied path with a
+    dot-segment is refused rather than silently normalized away.
+    """
     if path is None:
         return None
     value = path.strip().strip("/")
-    return value or None
+    if not value:
+        return None
+    if any(segment in (".", "..") for segment in value.split("/")):
+        raise ValueError(f"path must not contain '.' or '..' segments: {path!r}")
+    return value
 
 
 def _item_path(base_path: str | None) -> str:
@@ -288,22 +319,18 @@ def _decode_bytes(content: bytes) -> tuple[str | None, str | None]:
 def _name_looks_binary(name: str) -> bool:
     """Whether ``name``'s extension names an unambiguously binary format.
 
-    _AMBIGUOUS_TEXT_EXTENSIONS is checked first and short-circuits to "not
-    binary" -- for those specific extensions the mime-type signal below is
-    actively wrong (see its definition), not merely unavailable. Otherwise a
-    resolvable mime type (override or stdlib) that isn't text-safe is
-    binary; an unresolvable one falls back to the small hand-maintained set
-    of formats mimetypes has no opinion on at all (see
-    _KNOWN_BINARY_EXTENSIONS_WITHOUT_MIME_GUESS above) rather than silently
-    passing every extension mimetypes doesn't happen to recognize.
+    A resolvable mime type (override, ambiguous-extension override, or
+    stdlib) is binary only if _is_binary_mime_type says so -- anything
+    else, including a mime type nobody anticipated, defaults to "not
+    binary" (see that function's own docstring for why a positive binary
+    list is the safer default here). An unresolvable mime type falls back
+    to the small hand-maintained set of formats mimetypes has no opinion
+    on at all (_KNOWN_BINARY_EXTENSIONS_WITHOUT_MIME_GUESS above).
     """
-    suffix = Path(name).suffix.lower()
-    if suffix in _AMBIGUOUS_TEXT_EXTENSIONS:
-        return False
     guessed = _guess_mime_type(name)
     if guessed is not None:
-        return not _is_text_mime_type(guessed)
-    return suffix in _KNOWN_BINARY_EXTENSIONS_WITHOUT_MIME_GUESS
+        return _is_binary_mime_type(guessed)
+    return Path(name).suffix.lower() in _KNOWN_BINARY_EXTENSIONS_WITHOUT_MIME_GUESS
 
 
 def _allowed_upload_dirs() -> list[Path]:
@@ -347,6 +374,12 @@ def _resolve_upload_file_path(file_path: str) -> Path:
             "location"
         )
 
+    if local_path.exists() and not local_path.is_file():
+        # Distinguish "not a regular file" (a directory, a device node,
+        # etc.) from "does not exist" -- both used to raise the same
+        # FileNotFoundError, which reads as "retry, it'll show up" to a
+        # caller/agent even though a directory will never become a file.
+        raise ValueError(f"Not a regular file: {file_path}")
     if not local_path.is_file():
         raise FileNotFoundError(f"File not found: {file_path}")
     return local_path
@@ -670,6 +703,9 @@ def onedrive_upload_file(
     this as something the caller can override, so an explicit value here may
     not take effect and the file's own name/extension is what actually
     determines its type in that case.
+
+    Rejects a file over _MAX_UPLOAD_BYTES (2 GiB) -- a guard-rail against a
+    mistargeted upload, not a OneDrive/Graph limit.
     """
     try:
         local_path = _resolve_upload_file_path(file_path)
@@ -706,6 +742,12 @@ def onedrive_upload_file(
                 # so this is rejected here rather than silently creating a
                 # placeholder-empty item on OneDrive.
                 raise ValueError(f"File is empty: {file_path}")
+            if file_size > _MAX_UPLOAD_BYTES:
+                raise ValueError(
+                    f"File is {file_size} bytes, over the "
+                    f"{_MAX_UPLOAD_BYTES // (1024 * 1024)}MB limit for "
+                    "onedrive_upload_file"
+                )
 
             if file_size <= _SIMPLE_UPLOAD_MAX_BYTES:
                 result = _graph_request(

@@ -50,11 +50,17 @@ def _merge_recurrence(
     lines, not just the RRULE - overwriting the whole list with only the
     new RRULE would silently resurrect any occurrence the user had already
     cancelled.
+
+    `isinstance` checked before `line.strip()`, which would otherwise
+    raise on a non-str element (e.g. a malformed fetched event's
+    `recurrence` carrying a `None` or a nested list) - the same reason
+    `_event_side` guards a non-dict "start"/"end" elsewhere in this file,
+    rather than trusting Google always returns the documented shape.
     """
     preserved = [
         line
         for line in existing_recurrence or []
-        if not line.strip().upper().startswith("RRULE:")
+        if isinstance(line, str) and not line.strip().upper().startswith("RRULE:")
     ]
     return [new_rrule, *preserved]
 
@@ -664,6 +670,16 @@ def google_calendar_update_events(
         # involved at all).
         existing_start_timezone = _event_side(event, "start").get("timeZone")
         existing_end_timezone = _event_side(event, "end").get("timeZone")
+        # Also captured before any reassignment - whether the event was
+        # all-day or timed *before* this call, so a value-type change can
+        # be detected below even though _resolve_side below overwrites
+        # event["start"] in place.
+        original_start_value = _event_side(event, "start").get(
+            "dateTime"
+        ) or _event_side(event, "start").get("date")
+        original_is_all_day = original_start_value is not None and is_bare_date(
+            original_start_value
+        )
         # Whether this event is (or, after this call, remains) a
         # recurring series - Google requires timeZone unconditionally for
         # one, regardless of this call's own recurrence argument: leaving
@@ -725,7 +741,11 @@ def google_calendar_update_events(
         effective_start_timezone = own_start_timezone or own_end_timezone
         effective_end_timezone = own_end_timezone or own_start_timezone
 
-        if event_is_recurring and not is_all_day:
+        if (
+            event_is_recurring
+            and not is_all_day
+            and (recurrence is not None or start_time or end_time)
+        ):
             # Google requires timeZone unconditionally for a recurring
             # event, regardless of any offset already in
             # current_start_value/current_end_value - the offset fixes
@@ -734,6 +754,11 @@ def google_calendar_update_events(
             # This applies whenever the event already has a recurrence,
             # not just when this call's own recurrence argument sets one
             # - leaving recurrence unset on an update doesn't clear it.
+            # Gated on this call actually touching recurrence/start_time/
+            # end_time, not on every update to an already-recurring event
+            # - a metadata-only change (summary, attendees, ...) doesn't
+            # rewrite start/end at all, so it shouldn't be blocked by a
+            # zone the *existing* (untouched) data happens to be missing.
             if not effective_start_timezone:
                 raise ValueError(
                     "timezone is required to set a recurrence rule on this "
@@ -790,15 +815,17 @@ def google_calendar_update_events(
                 force=True,
             )
         elif timezone and not is_all_day:
-            # Not recurring: timeZone is merely optional, so a side
-            # already carrying its own offset is skipped instead of
-            # risking a disagreeing zone (see _stamp_timezone).
+            # Either not recurring, or recurring but this call doesn't
+            # touch recurrence/start_time/end_time: timeZone is merely
+            # optional here, so a side already carrying its own offset is
+            # skipped instead of risking a disagreeing zone (see
+            # _stamp_timezone).
             _stamp_timezone(event, "start", current_start_value, timezone, force=False)
             _stamp_timezone(event, "end", current_end_value, timezone, force=False)
         elif not is_all_day:
-            # Not recurring, no explicit timezone: opportunistically
-            # reuse each side's own existing zone (again skipped for a
-            # side already carrying its own offset).
+            # Same as above but with no explicit timezone either:
+            # opportunistically reuse each side's own existing zone
+            # (again skipped for a side already carrying its own offset).
             if existing_start_timezone:
                 _stamp_timezone(
                     event,
@@ -817,6 +844,32 @@ def google_calendar_update_events(
         if location:
             event["location"] = location
         if recurrence is not None:
+            existing_recurrence = event.get("recurrence")
+            if original_is_all_day != is_all_day and any(
+                isinstance(line, str) and not line.strip().upper().startswith("RRULE:")
+                for line in existing_recurrence or []
+            ):
+                # An existing EXDATE/RDATE line is typed to match the
+                # event's OLD all-day-vs-timed kind (a DATE-TIME value for
+                # a timed series, a bare-date value for an all-day one).
+                # Converting the event's kind in this same call would
+                # carry that now-mismatched line forward verbatim -
+                # _merge_recurrence only ever replaces the RRULE line(s),
+                # never revalidates or converts the rest - producing an
+                # RFC 5545 value-type mismatch between DTSTART and
+                # EXDATE/RDATE with no error. Converting the value type
+                # and replacing recurrence safely can't both happen in
+                # one call without knowing how to re-derive each
+                # preserved line under the new kind; reject rather than
+                # silently send Google an inconsistent recurrence.
+                raise ValueError(
+                    "cannot convert this event between all-day and timed "
+                    "while also replacing its recurrence rule: the "
+                    "existing EXDATE/RDATE line(s) are typed for the "
+                    "event's current kind and would no longer match after "
+                    "the conversion - change the event's kind in a "
+                    "separate call first, then set recurrence"
+                )
             # An all-day event's naive date anchor still needs *some*
             # timezone to compare against an aware ("Z"-suffixed) UNTIL -
             # RFC 5545 requires DTSTART and UNTIL to either both be aware or
@@ -832,7 +885,7 @@ def google_calendar_update_events(
             new_rrule = _normalize_rrule(
                 recurrence, cast(str, current_start_value), localization_timezone
             )
-            event["recurrence"] = _merge_recurrence(event.get("recurrence"), new_rrule)
+            event["recurrence"] = _merge_recurrence(existing_recurrence, new_rrule)
         _merge_attendees(event, attendees)
         requested_conference = _apply_conference_request(event, add_google_meet)
 

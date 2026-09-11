@@ -746,6 +746,39 @@ def test_update_events_rejects_a_naive_reschedule_of_a_recurring_event_with_no_z
     service.events.return_value.update.assert_not_called()
 
 
+def test_update_events_allows_unrelated_changes_on_a_zoneless_recurring_event(
+    monkeypatch,
+):
+    """Confirmed bug: the recurring-event timezone requirement fired for
+    *any* update to an already-recurring event, even one that never
+    touches start_time/end_time/recurrence at all - a plain title change
+    on an event that happens to have no timeZone (a pre-existing data
+    issue this call isn't making any worse) was rejected outright, never
+    even reaching events().update(). Must only apply when this call is
+    actually changing recurrence or the event's start/end."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-19T09:00:00"},
+        "end": {"dateTime": "2026-08-19T10:00:00"},
+        "recurrence": ["RRULE:FREQ=DAILY;UNTIL=20261231T235959Z"],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            summary="New title",
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["body"]["summary"] == "New title"
+    assert "timeZone" not in kwargs["body"]["start"]
+    assert "timeZone" not in kwargs["body"]["end"]
+
+
 def test_update_events_reschedules_an_already_recurring_event_with_an_explicit_timezone(
     monkeypatch,
 ):
@@ -987,6 +1020,80 @@ def test_update_events_preserves_existing_exdate_when_replacing_the_rrule(
         "RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;UNTIL=20260911T235959Z",
         "EXDATE:20260902T070000+08:00",
     ]
+
+
+def test_update_events_rejects_converting_all_day_with_existing_exdate_and_new_recurrence(
+    monkeypatch,
+):
+    """Confirmed bug: converting a recurring timed event to all-day (or
+    vice versa) while also replacing its recurrence rule used to carry a
+    preserved EXDATE/RDATE line forward verbatim - still typed for the
+    OLD kind (a DATE-TIME value with a time-of-day and "Z") even though
+    the event's DTSTART is now DATE-only, an RFC 5545 value-type mismatch
+    sent to Google in a single call. Must be rejected rather than send
+    the mismatched payload."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-03-01T09:00:00", "timeZone": "Asia/Shanghai"},
+        "end": {"dateTime": "2026-03-01T10:00:00", "timeZone": "Asia/Shanghai"},
+        "recurrence": [
+            "RRULE:FREQ=DAILY;UNTIL=20261231T235959Z",
+            "EXDATE:20260302T090000Z",
+        ],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-03-02",
+            end_time="2026-03-03",
+            recurrence="FREQ=DAILY;COUNT=10",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "cannot convert this event" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_events_allows_converting_all_day_and_recurrence_with_no_stale_lines(
+    monkeypatch,
+):
+    """The rejection above is specifically about a stale EXDATE/RDATE
+    line surviving a value-type change - a plain RRULE (nothing else to
+    preserve) converting kind in the same call is unaffected."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-03-01T09:00:00", "timeZone": "Asia/Shanghai"},
+        "end": {"dateTime": "2026-03-01T10:00:00", "timeZone": "Asia/Shanghai"},
+        "recurrence": ["RRULE:FREQ=DAILY;UNTIL=20261231T235959Z"],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-03-02",
+            end_time="2026-03-03",
+            recurrence="FREQ=DAILY;COUNT=10",
+        )
+    )
+
+    assert result["status"] == "success"
+
+
+def test_merge_recurrence_ignores_a_non_string_existing_line():
+    """A malformed fetched event could carry a non-str element in
+    "recurrence" (e.g. None) - `line.strip()` would otherwise crash with
+    a raw AttributeError instead of just skipping it, the same defensive
+    style _event_side already applies to "start"/"end"."""
+    merged = calendar._merge_recurrence(
+        ["RRULE:FREQ=DAILY", None, "EXDATE:20260827T090000Z"], "RRULE:FREQ=WEEKLY"
+    )
+    assert merged == ["RRULE:FREQ=WEEKLY", "EXDATE:20260827T090000Z"]
 
 
 def test_update_events_rejects_invalid_recurrence_without_calling_the_api(

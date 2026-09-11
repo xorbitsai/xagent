@@ -496,7 +496,12 @@ def calendar_day_bounds(
     zone = resolve_zoneinfo(tz_name)
     day: date = datetime.fromisoformat(date_value).date()
     start = datetime.combine(day, time.min, tzinfo=zone)
-    end = start + timedelta(days=days)
+    # Advance the local calendar date before attaching the timezone again.
+    # Adding a timedelta to an aware datetime preserves the original
+    # offset across DST transitions, which can produce the wrong local
+    # midnight for the end boundary.
+    end_day = day + timedelta(days=days)
+    end = datetime.combine(end_day, time.min, tzinfo=zone)
     return start.isoformat(), end.isoformat()
 
 

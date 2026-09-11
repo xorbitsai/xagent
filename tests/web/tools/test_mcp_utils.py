@@ -365,13 +365,10 @@ def test_require_offset_datetime_is_permissive_on_unparseable_input():
 
 def test_calendar_day_bounds_spans_a_short_day_across_a_dst_spring_forward():
     """2026-03-08 is when America/New_York springs forward (clocks skip
-    02:00-03:00), so the calendar day is only 23 hours long. `start +
-    timedelta(days=1)` on an aware datetime only advances the wall-clock
-    date/time components (per datetime's documented semantics) and
-    re-derives the UTC offset lazily via ZoneInfo - a naive
-    `timedelta(hours=24)` would instead land on 01:00 the following day,
-    silently mis-widening an all-day event's boundary by an hour on every
-    DST-transition day in a zone that observes it."""
+    02:00-03:00), so the calendar day is only 23 hours long. The end
+    boundary must be constructed from the next local calendar date so the
+    timezone can apply the new UTC offset; adding 24 elapsed hours would
+    land at 01:00 on the following day and mis-widen the query window."""
     start, end = utils.calendar_day_bounds("2026-03-08", "America/New_York")
     assert start == "2026-03-08T00:00:00-05:00"
     assert end == "2026-03-09T00:00:00-04:00"

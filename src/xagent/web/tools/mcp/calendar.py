@@ -12,25 +12,34 @@ from googleapiclient.errors import HttpError  # type: ignore
 from mcp.server.fastmcp import FastMCP
 
 from ....config import get_tool_max_output_length
-from .utils import InsufficientScopeError
+from .utils import (
+    InsufficientScopeError,
+)
 from .utils import attendees_to_add as _attendees_to_add
 from .utils import calendar_day_bounds as _calendar_day_bounds
 from .utils import conflict_response as _conflict_response
 from .utils import datetime_key_for_comparison as _datetime_key_for_comparison
+from .utils import (
+    ensure_rrule_prefix,
+)
 from .utils import incomplete_check_response as _incomplete_check_response
+from .utils import (
+    is_bare_date,
+)
 from .utils import merge_scope_error as _merge_scope_error
 from .utils import normalize_addresses as _normalize_addresses
 from .utils import offset_datetime_string as _offset_datetime_string
+from .utils import (
+    parse_rrule,
+)
 from .utils import reject_reversed_window as _reject_reversed_window
 from .utils import require_offset_datetime as _require_offset_datetime
-from .utils import setup_proxy_env, success_with_capped_dict
-from .utils import window_delta_segments as _window_delta_segments
 from .utils import (
-    ensure_rrule_prefix,
-    is_bare_date,
-    parse_rrule,
     resolve_zoneinfo,
+    setup_proxy_env,
+    success_with_capped_dict,
 )
+from .utils import window_delta_segments as _window_delta_segments
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("calendar-mcp")

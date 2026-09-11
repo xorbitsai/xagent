@@ -229,6 +229,33 @@ def test_upgrade_downgrade_upgrade_converges_on_the_new_scope(tmp_path) -> None:
     assert scopes["google-calendar"] == NEW_SCOPES
 
 
+def test_upgrade_after_downgrade_does_not_touch_other_apps(tmp_path) -> None:
+    migration = _load_migration_module()
+    engine = sa.create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    metadata = sa.MetaData()
+    table = _public_mcp_apps(metadata)
+    metadata.create_all(engine)
+
+    with engine.begin() as connection:
+        connection.execute(
+            sa.insert(table),
+            [
+                {"app_id": "google-calendar", "oauth_scopes": OLD_SCOPES},
+                {"app_id": "gmail", "oauth_scopes": ["gmail-scope"]},
+            ],
+        )
+
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+            migration.downgrade()
+            migration.upgrade()
+
+        scopes = _scopes_by_app_id(connection, table)
+
+    assert scopes["google-calendar"] == NEW_SCOPES
+    assert scopes["gmail"] == ["gmail-scope"]
+
+
 def test_offline_postgresql_upgrade_emits_literal_update_only_sql() -> None:
     migration = _load_migration_module()
     output = StringIO()

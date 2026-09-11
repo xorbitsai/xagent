@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from ....config import get_tool_max_output_length
 
 
-class InsufficientScopeError(ValueError):
+class InsufficientScopeError(RuntimeError):
     """Raised by a connector's ``_find_conflicts`` on a whole-batch
     missing-scope error (see that function's own docstring for why this
     is raised at all rather than degrading to unchecked).
@@ -285,12 +285,15 @@ def conflict_response(
                 "truncated": True,
             },
             {"status": "conflict", "truncated": True},
-            {},
         )
         for compact_payload in compact_payloads:
             compact_response = json.dumps(compact_payload, ensure_ascii=False)
             if len(compact_response) <= max_output_length:
                 return compact_response
+        # A configured limit smaller than this JSON object cannot preserve
+        # both valid JSON and the response's required status. Keep the
+        # smallest contract-preserving response rather than returning `{}`.
+        return json.dumps({"status": "conflict"}, ensure_ascii=False)
     return response
 
 
@@ -299,8 +302,9 @@ def attendees_were_given(attendees: list[str] | str | None) -> bool:
     update, treating an empty string the same as not-provided at all -
     matching every other optional field's truthy convention here (and the
     create path's own check) - rather than as "clear every attendee".
-    That's still expressible, just via an explicit empty list: `[]` is a
-    deliberate, differently-typed value that must keep working."""
+    An explicit empty list is still considered supplied, even though the
+    current additive attendee API treats it as a no-op rather than removing
+    existing attendees."""
     return attendees is not None and attendees != ""
 
 
@@ -456,7 +460,7 @@ def resolve_zoneinfo(name: str) -> ZoneInfo:
     """
     try:
         return ZoneInfo(name)
-    except (ZoneInfoNotFoundError, ValueError) as exc:
+    except (ZoneInfoNotFoundError, TypeError, ValueError) as exc:
         raise ValueError(
             f"Timezone {name!r} isn't a recognized IANA zone name."
         ) from exc
@@ -512,6 +516,8 @@ def calendar_day_bounds(
     all-day event occupies the *calendar's own* day, not a UTC day, so a
     hardcoded "T00:00:00Z" is only correct for a UTC calendar.
     """
+    if days <= 0:
+        raise ValueError("days must be a positive integer")
     zone = resolve_zoneinfo(tz_name)
     day: date = datetime.fromisoformat(date_value).date()
     start = datetime.combine(day, time.min, tzinfo=zone)
@@ -550,6 +556,9 @@ def window_delta_segments(
     all) still get the FULL new window checked regardless of any of this
     - they need every instant in it verified, delta or not.
 
+    ISO strings are normalized internally before comparison, so callers do
+    not have to coordinate a separate parsing step.
+
     Returns:
     - ``[]`` when the new window is confirmed to add no territory beyond
       the old one (identical or a subset) - nothing new for a retained
@@ -560,7 +569,7 @@ def window_delta_segments(
     - The whole ``[new_start, new_end)`` as a single segment when the two
       windows are confirmed to not overlap at all (matching "moved
       somewhere completely disjoint -> check the whole thing"), OR when
-      any value isn't a real, mutually-comparable ``datetime`` (parsing
+      any value isn't a real, mutually-comparable instant (parsing
       failure, or one side aware and the other naive) - "can't confirm
       the delta is smaller than the whole window" must never silently
       shrink what gets checked, so treat it as needing the full window.
@@ -568,6 +577,24 @@ def window_delta_segments(
       window at all to fall back to (``new_start``/``new_end`` themselves
       aren't real instants) - there is nothing meaningful to check.
     """
+    existing_start = (
+        datetime_key_for_comparison(existing_start)
+        if isinstance(existing_start, str)
+        else existing_start
+    )
+    existing_end = (
+        datetime_key_for_comparison(existing_end)
+        if isinstance(existing_end, str)
+        else existing_end
+    )
+    new_start = (
+        datetime_key_for_comparison(new_start)
+        if isinstance(new_start, str)
+        else new_start
+    )
+    new_end = (
+        datetime_key_for_comparison(new_end) if isinstance(new_end, str) else new_end
+    )
     if not (isinstance(new_start, datetime) and isinstance(new_end, datetime)):
         return []
     if not (

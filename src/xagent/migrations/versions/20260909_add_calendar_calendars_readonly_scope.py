@@ -1,10 +1,10 @@
 """add calendar.calendars.readonly to the Google Calendar connector's OAuth scope
 
-The all-day conflict-check path calls Google's ``calendars.get`` endpoint (via
-``_primary_calendar_info``) to widen an all-day boundary using the primary
-calendar's own configured timezone (the same call also resolves the
-connected account's own address, used to tell whether the caller is
-actually a given event's organizer). That endpoint is not authorized by
+The follow-up all-day conflict-check implementation calls Google's
+``calendars.get`` endpoint to widen an all-day boundary using the primary
+calendar's own configured timezone. The same call resolves the connected
+account's own address so the connector can determine whether the caller is
+actually a given event's organizer. That endpoint is not authorized by
 ``.../auth/calendar.events`` or ``.../auth/calendar.freebusy`` (per Google's
 own Calendar API scope reference for ``calendars.get``) -- it needs one of
 ``calendar``, ``calendar.readonly``, ``calendar.app.created``,
@@ -23,10 +23,9 @@ Like 20260907_add_calendar_freebusy_scope, this WIDENS the scope: an
 already-issued ``user_oauth`` grant does not automatically pick up the new
 scope. Existing users must reconnect the Google Calendar connector before
 all-day conflict checks stop 403ing for them; this migration does not (and
-cannot) retroactively fix already-issued tokens. Unlike the freebusy gap,
-which degraded to "attendee unchecked but still books", the calendar.py
-caller now rejects the write outright on this missing-scope signal rather
-than silently proceeding (see google_calendar_update_events).
+cannot) retroactively fix already-issued tokens. The follow-up connector
+implementation rejects writes when this required scope is missing rather
+than silently proceeding.
 
 Revision ID: 20260909_add_calendar_calendars_readonly_scope
 Revises: 20260907_add_calendar_freebusy_scope

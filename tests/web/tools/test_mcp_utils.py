@@ -122,8 +122,8 @@ def test_datetime_key_for_comparison_truncates_seven_digit_fractional_seconds():
     """Outlook commonly reports 100-nanosecond (7-digit) fractional
     seconds, one more digit than a microsecond can hold - this must not
     depend on whichever CPython version happens to run it."""
-    key = utils.datetime_key_for_comparison("2026-08-27T10:00:00.0000000")
-    assert key == utils.datetime_key_for_comparison("2026-08-27T10:00:00")
+    key = utils.datetime_key_for_comparison("2026-08-27T10:00:00.1234567")
+    assert key == utils.datetime_key_for_comparison("2026-08-27T10:00:00.123456")
 
 
 def test_datetime_key_for_comparison_treats_equal_instants_as_equal_across_offsets():
@@ -181,6 +181,35 @@ def test_attendees_to_add_returns_empty_for_not_provided_or_empty():
     assert utils.attendees_to_add([], {"old@example.com"}) == []
 
 
+def test_merge_scope_error_reraises_when_no_conflict_is_known():
+    error = utils.InsufficientScopeError(
+        "reconnect required", [], ["unchecked@example.com"]
+    )
+
+    with pytest.raises(utils.InsufficientScopeError) as raised:
+        utils.merge_scope_error(error, [], [])
+
+    assert raised.value is error
+
+
+def test_merge_scope_error_preserves_confirmed_results():
+    existing_conflict = {"calendar": "organizer"}
+    error_conflict = {"calendar": "attendee@example.com"}
+    error = utils.InsufficientScopeError(
+        "reconnect required", [error_conflict], ["unchecked@example.com"]
+    )
+
+    conflicts, unchecked = utils.merge_scope_error(
+        error, [existing_conflict], ["already-unchecked@example.com"]
+    )
+
+    assert conflicts == [existing_conflict, error_conflict]
+    assert unchecked == [
+        "already-unchecked@example.com",
+        "unchecked@example.com",
+    ]
+
+
 def _key(value: str):
     return utils.datetime_key_for_comparison(value)
 
@@ -218,6 +247,20 @@ def test_window_delta_segments_returns_the_new_only_portion_of_a_partial_nudge()
     segments = utils.window_delta_segments(old_start, old_end, new_start, new_end)
 
     assert segments == [(old_end, new_end)]
+
+
+def test_window_delta_segments_normalizes_iso_strings_internally():
+    assert utils.window_delta_segments(
+        "2026-08-27T10:00:00+00:00",
+        "2026-08-27T10:30:00+00:00",
+        "2026-08-27T10:15:00+00:00",
+        "2026-08-27T10:45:00+00:00",
+    ) == [
+        (
+            utils.datetime_key_for_comparison("2026-08-27T10:30:00+00:00"),
+            utils.datetime_key_for_comparison("2026-08-27T10:45:00+00:00"),
+        )
+    ]
 
 
 def test_window_delta_segments_returns_two_segments_when_widened_on_both_sides():
@@ -372,6 +415,23 @@ def test_calendar_day_bounds_spans_a_short_day_across_a_dst_spring_forward():
     start, end = utils.calendar_day_bounds("2026-03-08", "America/New_York")
     assert start == "2026-03-08T00:00:00-05:00"
     assert end == "2026-03-09T00:00:00-04:00"
+
+
+def test_calendar_day_bounds_spans_a_long_day_across_a_dst_fall_back():
+    start, end = utils.calendar_day_bounds("2026-11-01", "America/New_York")
+    assert start == "2026-11-01T00:00:00-04:00"
+    assert end == "2026-11-02T00:00:00-05:00"
+
+
+@pytest.mark.parametrize("days", [0, -1])
+def test_calendar_day_bounds_rejects_non_positive_days(days):
+    with pytest.raises(ValueError, match="positive"):
+        utils.calendar_day_bounds("2026-08-27", "UTC", days=days)
+
+
+def test_resolve_zoneinfo_reports_missing_name_as_value_error():
+    with pytest.raises(ValueError, match="recognized IANA"):
+        utils.resolve_zoneinfo(None)  # type: ignore[arg-type]
 
 
 def test_offset_datetime_string_attaches_the_zone_offset_to_a_naive_value():

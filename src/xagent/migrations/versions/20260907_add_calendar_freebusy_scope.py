@@ -34,6 +34,9 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "20260907_add_calendar_freebusy_scope"
+# This migration was originally authored before the later-dated assistant
+# source migration landed. Pointing at the current main head keeps the graph
+# linear; migration filenames are descriptive labels, not execution order.
 down_revision: Union[str, None] = "20260911_assistant_source_event"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None

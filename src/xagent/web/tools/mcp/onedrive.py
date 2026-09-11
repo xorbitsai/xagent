@@ -263,6 +263,118 @@ def _upload_retry_delay(exc: BaseException, retry_number: int) -> float:
     return min(exponential_delay, _UPLOAD_RETRY_MAX_SECONDS)
 
 
+def _upload_status_code(exc: BaseException) -> int | None:
+    """Return an HTTP status from a credential-safe upload error."""
+    cause = exc.__cause__ if isinstance(exc, _UploadError) else exc
+    status_code = getattr(getattr(cause, "response", None), "status_code", None)
+    return status_code if isinstance(status_code, int) else None
+
+
+def _next_expected_upload_offset(response: Any) -> int:
+    """Parse the first missing offset from an upload-session status response."""
+    try:
+        payload = response.json()
+        ranges = payload["nextExpectedRanges"]
+        offsets = [int(value.split("-", 1)[0]) for value in ranges]
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        raise _UploadError("OneDrive returned invalid upload-session progress") from exc
+    if not offsets or any(offset < 0 for offset in offsets):
+        raise _UploadError("OneDrive returned invalid upload-session progress")
+    return min(offsets)
+
+
+def _upload_item_fingerprint(item: Any) -> tuple[Any, Any, Any, Any] | None:
+    """Return fields that change when an existing destination is replaced."""
+    if not isinstance(item, dict) or not item.get("id"):
+        return None
+    return (item.get("id"), item.get("eTag"), item.get("cTag"), item.get("size"))
+
+
+def _current_upload_item(remote_path: str) -> dict[str, Any] | None:
+    """Read destination metadata, treating an absent item as no baseline."""
+    try:
+        item = _graph_request(
+            "GET",
+            _item_path(remote_path),
+            params={"$select": "id,name,size,eTag,cTag"},
+        )
+    except RuntimeError as exc:
+        cause = exc.__cause__
+        if getattr(getattr(cause, "response", None), "status_code", None) == 404:
+            return None
+        raise _UploadError("Could not inspect the OneDrive upload target") from exc
+    return item if isinstance(item, dict) and item.get("id") else None
+
+
+def _completed_upload_item(
+    remote_path: str,
+    total: int,
+    previous_fingerprint: tuple[Any, Any, Any, Any] | None,
+) -> dict[str, Any]:
+    """Confirm a final fragment whose response was lost via drive metadata."""
+    try:
+        item = _current_upload_item(remote_path)
+    except Exception as exc:
+        raise _UploadError(
+            "OneDrive upload completed ambiguously and could not be confirmed"
+        ) from exc
+    if (
+        not isinstance(item, dict)
+        or not item.get("id")
+        or item.get("size") != total
+        or _upload_item_fingerprint(item) == previous_fingerprint
+    ):
+        raise _UploadError(
+            "OneDrive upload completed ambiguously and could not be confirmed"
+        )
+    return item
+
+
+def _reconcile_upload_progress(
+    http: requests.Session,
+    upload_url: str,
+    remote_path: str,
+    start: int,
+    end: int,
+    total: int,
+    previous_fingerprint: tuple[Any, Any, Any, Any] | None,
+) -> tuple[bool, dict[str, Any] | None]:
+    """Return whether an ambiguous fragment was accepted, plus a final item."""
+    last_error: BaseException | None = None
+    for attempt in range(1, _UPLOAD_CHUNK_MAX_ATTEMPTS + 1):
+        try:
+            response = http.get(upload_url, timeout=DEFAULT_TIMEOUT_SECONDS)
+            if response.status_code == 404:
+                if end == total:
+                    return True, _completed_upload_item(
+                        remote_path, total, previous_fingerprint
+                    )
+                raise _UploadError(
+                    "OneDrive upload session disappeared before completion"
+                )
+            _raise_upload_status(response)
+            next_offset = _next_expected_upload_offset(response)
+            if next_offset == start:
+                return False, None
+            if next_offset >= end:
+                if end == total:
+                    return True, _completed_upload_item(
+                        remote_path, total, previous_fingerprint
+                    )
+                return True, None
+            raise _UploadError("OneDrive returned inconsistent upload-session progress")
+        except Exception as exc:
+            last_error = exc
+            if not _is_retriable_upload_error(exc):
+                raise
+            if attempt == _UPLOAD_CHUNK_MAX_ATTEMPTS:
+                break
+            time.sleep(_upload_retry_delay(exc, attempt))
+    raise _UploadError(
+        "Could not determine OneDrive upload-session progress"
+    ) from last_error
+
+
 def _graph_request(
     method: str,
     path: str,
@@ -453,6 +565,7 @@ def _upload_large_file_content(
         # function initializes below, bypassing the "did OneDrive actually
         # confirm this" check that only runs inside the loop.
         raise ValueError(f"total must be positive, got {total}")
+    previous_fingerprint = _upload_item_fingerprint(_current_upload_item(remote_path))
     session = _graph_request(
         "POST",
         f"{_item_path(remote_path)}/createUploadSession",
@@ -470,8 +583,9 @@ def _upload_large_file_content(
         try:
             for start in range(0, total, _UPLOAD_SESSION_CHUNK_SIZE):
                 end = min(start + _UPLOAD_SESSION_CHUNK_SIZE, total)
-                chunk = fh.read(end - start)
-                if len(chunk) != end - start:
+                expected_size = end - start
+                chunk = fh.read(expected_size)
+                if len(chunk) != expected_size:
                     # A short read here means the local file shrank out from
                     # under this upload (a concurrent rewrite/truncation, or
                     # an unusual filesystem) -- sending Content-Length/
@@ -481,9 +595,16 @@ def _upload_large_file_content(
                     # every later chunk's byte-range accounting. Fail loudly
                     # instead.
                     raise _UploadError(
-                        f"expected to read {end - start} bytes at offset "
+                        f"expected to read {expected_size} bytes at offset "
                         f"{start} but got {len(chunk)} -- the local file "
                         "may have changed size during upload"
+                    )
+                # Detect growth after the caller's fstat snapshot before a
+                # truncated final item is committed. Keeping this as a
+                # separate read preserves the one-chunk memory bound.
+                if end == total and fh.read(1):
+                    raise _UploadError(
+                        "the local file may have changed size during upload"
                     )
                 # The upload session URL is itself pre-authenticated (a
                 # token in its query string) -- Microsoft's own docs for
@@ -513,10 +634,23 @@ def _upload_large_file_content(
                         _raise_upload_status(response)
                         break
                     except Exception as exc:
-                        if (
-                            not _is_retriable_upload_error(exc)
-                            or attempt == _UPLOAD_CHUNK_MAX_ATTEMPTS
-                        ):
+                        status_code = _upload_status_code(exc)
+                        if not (_is_retriable_upload_error(exc) or status_code == 416):
+                            raise
+                        accepted, completed_item = _reconcile_upload_progress(
+                            http,
+                            upload_url,
+                            remote_path,
+                            start,
+                            end,
+                            total,
+                            previous_fingerprint,
+                        )
+                        if accepted:
+                            if completed_item is not None:
+                                result = completed_item
+                            break
+                        if attempt == _UPLOAD_CHUNK_MAX_ATTEMPTS:
                             raise
                         delay = _upload_retry_delay(exc, attempt)
                         logger.warning(
@@ -535,6 +669,8 @@ def _upload_large_file_content(
                 # unrelated intermediate body if Graph's progress responses
                 # ever started including one.
                 if end == total:
+                    if result.get("id"):
+                        continue
                     try:
                         result = response.json() if response.content else {}
                     except ValueError as exc:

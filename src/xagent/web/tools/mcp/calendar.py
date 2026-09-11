@@ -1081,15 +1081,34 @@ def google_calendar_update_events(
                 and organizer_needs_verification
                 and not caller_is_organizer
             ):
-                # The real organizer's own copy of this event would
-                # self-conflict via freebusy (same problem
-                # attendees_to_check's exclusion above avoids), and we
-                # have no calendarId to query their actual calendar
-                # directly (only "primary", which is the caller's) - so
-                # there is no available mechanism to actually verify
-                # them. Report as unchecked rather than silently treating
-                # them as clear.
-                unchecked_attendees.append(organizer_email)
+                if window_changed:
+                    # freebusy.query accepts any calendar/email id, not
+                    # just "primary" - the real organizer's calendar CAN
+                    # be checked this way, same as any other attendee.
+                    # Their own copy of this event already occupies the
+                    # OLD window regardless of whether they're also
+                    # listed as an attendee (they've always been the
+                    # organizer), so - exactly like a retained attendee -
+                    # only the delta segments beyond that old window are
+                    # safe to check without self-conflicting on their own
+                    # unrelated busy block for this same event.
+                    existing_attendees_to_check = existing_attendees_to_check + [
+                        organizer_email
+                    ]
+                else:
+                    # window_changed is False here only because
+                    # organizer_newly_added forced organizer_needs_
+                    # verification - the window itself never moved, so
+                    # window_delta_segments would find no new territory
+                    # at all to check them against. Unlike the
+                    # caller_is_organizer path (which excludes by event
+                    # id via events.list and so can safely re-scan the
+                    # whole unchanged window), freebusy has no id-based
+                    # exclusion - there is genuinely no way to verify an
+                    # unchanged window for them without risking a
+                    # self-conflict. Report as unchecked rather than
+                    # silently treating them as clear.
+                    unchecked_attendees.append(organizer_email)
             all_conflicts: list[dict[str, Any]] = []
             # Tracks the most recent InsufficientScopeError seen across
             # EITHER block below, re-raised only once both blocks have

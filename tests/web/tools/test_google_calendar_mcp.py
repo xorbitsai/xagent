@@ -1538,23 +1538,22 @@ def test_update_events_adding_the_organizer_as_an_attendee_still_catches_a_real_
     assert fake_service._freebusy.query_calls == []
 
 
-def test_update_events_on_someone_elses_event_reports_the_real_organizer_unchecked(
+def test_update_events_on_someone_elses_event_actually_checks_the_real_organizer(
     fake_service,
 ):
     """Regression test: check_organizer queries calendarId="primary",
     which is always the AUTHENTICATED CALLER's own calendar, not
     necessarily this event's organizer - a guest with edit permission
     (guestsCanModify) can update an event they didn't organize. Before
-    this fix, the organizer's email was unconditionally excluded from the
-    freebusy-checked set on the assumption check_organizer already
-    covered them, which is only true when the caller IS the organizer;
-    here they differ, so the real organizer (boss@example.com) must be
-    reported as unchecked rather than silently treated as clear - and
-    "primary" (the caller's own calendar) must not be queried and
-    mislabeled as the organizer's. With nothing else to check here, the
-    write still proceeds (same as any other "can't verify this one
-    attendee" gap elsewhere in this module, e.g. one absent from a
-    freebusy response) - it just surfaces the gap in the response."""
+    this fix, the organizer's email was unconditionally excluded from
+    freebusy and merely reported as unchecked in this scenario, even
+    though freebusy.query accepts any calendar/email id - not just
+    "primary" - so the real organizer (boss@example.com) CAN be checked
+    the same way a retained attendee is: over just the delta segment
+    beyond the event's old window, so their own pre-existing footprint
+    on this same event doesn't self-conflict. A genuine busy block of
+    theirs in the new-only territory must now be caught as a real
+    conflict, not silently missed."""
     fake_service._events._get_result = {
         "id": "self-1",
         "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
@@ -1564,6 +1563,57 @@ def test_update_events_on_someone_elses_event_reports_the_real_organizer_uncheck
     }
     # Default FakeCalendars() resolves the connected account's own
     # address as "me@example.com" - different from the organizer above.
+    fake_service._freebusy = FakeFreebusy(
+        {
+            "calendars": {
+                "boss@example.com": {
+                    "busy": [
+                        {
+                            "start": "2026-08-27T14:10:00+08:00",
+                            "end": "2026-08-27T14:20:00+08:00",
+                        }
+                    ]
+                }
+            }
+        }
+    )
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-27T14:00:00+08:00",  # disjoint move
+            end_time="2026-08-27T14:30:00+08:00",
+        )
+    )
+
+    assert result["status"] == "conflict"
+    assert [c["calendar"] for c in result["conflicts"]] == ["boss@example.com"]
+    assert result["unchecked_attendees"] == []
+    # Never queried "primary" (the caller's own calendar) as if it were
+    # the organizer's - the real organizer was checked via freebusy
+    # instead, using their own real address.
+    assert fake_service._events.list_calls == []
+    query_call = fake_service._freebusy.query_calls[0]
+    assert query_call["body"]["items"] == [{"id": "boss@example.com"}]
+
+
+def test_update_events_on_someone_elses_event_reports_the_real_organizer_unchecked_when_freebusy_has_no_data_for_them(
+    fake_service,
+):
+    """Companion to the test above: the real organizer IS now queried via
+    freebusy over the delta segment, but if their calendar is absent from
+    the response (the same per-attendee gap _find_conflicts already
+    handles for any other attendee), they must still be reported as
+    unchecked rather than silently treated as clear."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+        "attendees": [{"email": "boss@example.com"}],
+        "organizer": {"email": "boss@example.com"},
+    }
+    # FakeFreebusy defaults to an empty "calendars" dict - boss@example.com
+    # is absent from it, same as a real per-attendee visibility gap.
 
     result = json.loads(
         calendar.google_calendar_update_events(
@@ -1575,11 +1625,40 @@ def test_update_events_on_someone_elses_event_reports_the_real_organizer_uncheck
 
     assert result["status"] == "success"
     assert result["unchecked_attendees"] == ["boss@example.com"]
-    # Never queried "primary" (the caller's own calendar) as if it were
-    # the organizer's, and never freebusy-checked the real organizer
-    # either (which would have self-conflicted on their own copy of this
-    # event, same as the caller-is-organizer case this exclusion was
-    # originally written for).
+    assert fake_service._events.list_calls == []
+    query_call = fake_service._freebusy.query_calls[0]
+    assert query_call["body"]["items"] == [{"id": "boss@example.com"}]
+
+
+def test_update_events_organizer_newly_added_with_unchanged_window_is_still_unverifiable(
+    fake_service,
+):
+    """Regression test for the one residual case the delta-segment fix
+    above can't cover: the real organizer is added as a "new" attendee
+    but the window itself never moves. window_delta_segments finds no
+    new territory at all in that case (correctly - a retained party's
+    existing footprint already covers an unchanged window), so unlike a
+    genuine window move, there is no safe way to freebusy-check them
+    without risking a self-conflict on their own pre-existing copy of
+    this same event. Must still be reported as unchecked, not silently
+    treated as clear, and not freebusy-queried at all."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+        "attendees": [],
+        "organizer": {"email": "boss@example.com"},
+    }
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            attendees=["boss@example.com"],
+        )
+    )
+
+    assert result["status"] == "success"
+    assert result["unchecked_attendees"] == ["boss@example.com"]
     assert fake_service._events.list_calls == []
     assert fake_service._freebusy.query_calls == []
 
@@ -1592,7 +1671,10 @@ def test_update_events_organizer_self_false_needs_no_identity_api_call(
     event appears") directly answers caller_is_organizer - when present,
     no calendars().get(calendarId="primary") call is needed at all for
     identity purposes, unlike the email-comparison fallback this uses
-    when organizer.self is absent."""
+    when organizer.self is absent. The organizer IS still freebusy-
+    checked over the delta segment (a separate mechanism from identity
+    resolution) - absent from the default empty freebusy response here,
+    so still reported as unchecked."""
     fake_service._events._get_result = {
         "id": "self-1",
         "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
@@ -1612,7 +1694,6 @@ def test_update_events_organizer_self_false_needs_no_identity_api_call(
     assert result["status"] == "success"
     assert result["unchecked_attendees"] == ["boss@example.com"]
     assert fake_service._events.list_calls == []
-    assert fake_service._freebusy.query_calls == []
     # The whole point: organizer.self answered caller_is_organizer
     # directly, so the connected account's own identity never needed
     # looking up via calendars().get() at all.

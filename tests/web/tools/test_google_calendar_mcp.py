@@ -356,6 +356,29 @@ def test_create_events_strips_whitespace_from_a_bare_date_before_sending_it(
     assert kwargs["body"]["end"] == {"date": "2026-09-02"}
 
 
+def test_create_events_strips_whitespace_from_timed_values_before_validation_and_send(
+    monkeypatch,
+):
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Standup",
+            start_time="  2026-09-01T09:00:00+08:00  ",
+            end_time="  2026-09-01T09:15:00+08:00  ",
+            recurrence="FREQ=DAILY;COUNT=3",
+            timezone="Asia/Shanghai",
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.insert.call_args
+    assert kwargs["body"]["start"]["dateTime"] == "2026-09-01T09:00:00+08:00"
+    assert kwargs["body"]["end"]["dateTime"] == "2026-09-01T09:15:00+08:00"
+    assert kwargs["body"]["recurrence"] == ["RRULE:FREQ=DAILY;COUNT=3"]
+
+
 def test_create_events_accepts_a_whitespace_padded_all_day_recurrence(monkeypatch):
     """Confirmed bug: the payload used the stripped bare-date value, but
     recurrence validation was passed the raw, unstripped start_time - so

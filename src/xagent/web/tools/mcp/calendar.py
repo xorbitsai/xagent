@@ -413,6 +413,11 @@ def google_calendar_create_events(
     """
     requested_conference = False
     try:
+        # Normalize both accepted input shapes before classifying or validating
+        # them. Google expects exact RFC3339/date values and rejects otherwise
+        # valid values that carry incidental surrounding whitespace.
+        start_time = start_time.strip()
+        end_time = end_time.strip()
         start_is_all_day = is_bare_date(start_time)
         end_is_all_day = is_bare_date(end_time)
         if start_is_all_day != end_is_all_day:
@@ -436,19 +441,12 @@ def google_calendar_create_events(
 
         service = get_calendar_service()
 
-        # Stripped once here so the value written into the payload always
-        # matches what is_bare_date actually validated - is_bare_date
-        # strips internally for the shape check, but a raw start_time with
-        # incidental surrounding whitespace would otherwise still reach
-        # Google verbatim.
-        start_value = start_time.strip() if start_is_all_day else start_time
-        end_value = end_time.strip() if end_is_all_day else end_time
         event: dict[str, Any] = {
             "summary": summary,
             "start": (
-                {"date": start_value} if start_is_all_day else {"dateTime": start_value}
+                {"date": start_time} if start_is_all_day else {"dateTime": start_time}
             ),
-            "end": {"date": end_value} if end_is_all_day else {"dateTime": end_value},
+            "end": {"date": end_time} if end_is_all_day else {"dateTime": end_time},
         }
         if timezone and not start_is_all_day:
             force = recurrence is not None
@@ -468,7 +466,7 @@ def google_calendar_create_events(
             # here for that comparison; it's never written to the event.
             localization_timezone = timezone or ("UTC" if start_is_all_day else None)
             event["recurrence"] = [
-                _normalize_rrule(recurrence, start_value, localization_timezone)
+                _normalize_rrule(recurrence, start_time, localization_timezone)
             ]
         _merge_attendees(event, attendees)
         requested_conference = _apply_conference_request(event, add_google_meet)

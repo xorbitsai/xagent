@@ -10,6 +10,7 @@ from googleapiclient.discovery import build  # type: ignore
 from googleapiclient.errors import HttpError  # type: ignore
 from mcp.server.fastmcp import FastMCP
 
+from ....config import get_tool_max_output_length
 from .utils import InsufficientScopeError
 from .utils import attendees_to_add as _attendees_to_add
 from .utils import calendar_day_bounds as _calendar_day_bounds
@@ -576,9 +577,27 @@ def _event_response(
     # capping never has to reason about them.
     response = json.loads(success_with_capped_dict("event", event))
     response.update(extra)
-    if unchecked_attendees:
-        response["unchecked_attendees"] = unchecked_attendees
-    return json.dumps(response, ensure_ascii=False)
+    if not unchecked_attendees:
+        return json.dumps(response, ensure_ascii=False)
+
+    # unchecked_attendees is appended AFTER the event has already been
+    # capped to fit the output budget, so it needs its own check - an
+    # attendee list has no documented maximum, and a whole-batch scope
+    # error or a large invite list can leave most of it unchecked. Without
+    # this, a long enough list could push the final response back over
+    # budget with nothing left to shrink it, unlike conflict_response's
+    # payload (which caps both of its own list fields for the same
+    # reason).
+    response["unchecked_attendees"] = unchecked_attendees
+    max_output_length = get_tool_max_output_length()
+    encoded = json.dumps(response, ensure_ascii=False)
+    remaining_unchecked = unchecked_attendees
+    while remaining_unchecked and len(encoded) > max_output_length:
+        remaining_unchecked = remaining_unchecked[: len(remaining_unchecked) // 2]
+        response["unchecked_attendees"] = remaining_unchecked
+        response["truncated"] = True
+        encoded = json.dumps(response, ensure_ascii=False)
+    return encoded
 
 
 @mcp.tool()

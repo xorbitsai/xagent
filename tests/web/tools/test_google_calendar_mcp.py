@@ -799,6 +799,37 @@ def test_event_response_caps_a_large_event_like_other_tools_in_this_package(
     assert len(result["event"]["attendees"]) < 200
 
 
+def test_event_response_caps_unchecked_attendees_on_the_success_path(
+    fake_service, monkeypatch
+):
+    """Regression test: unchecked_attendees is appended to the success
+    envelope AFTER success_with_capped_dict has already finalized the
+    event's own size budget, so a long enough list (e.g. from many
+    attendees absent from the freebusy response, or a whole-batch scope
+    error) could otherwise push the final response back over budget with
+    nothing left to shrink it - unlike conflict_response's payload, which
+    already caps both of its own list fields for the same reason."""
+    monkeypatch.setattr(calendar, "get_tool_max_output_length", lambda: 300)
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T10:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T10:30:00+08:00"},
+        "attendees": [],
+    }
+    fake_service._freebusy = FakeFreebusy({"calendars": {}})
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            attendees=[f"person{i}@example.com" for i in range(200)],
+        )
+    )
+
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert len(result["unchecked_attendees"]) < 200
+
+
 def test_event_response_does_not_truncate_a_small_event(monkeypatch):
     service = _fake_service({"id": "evt1", "summary": "1:1"})
     monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)

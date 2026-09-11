@@ -16,12 +16,14 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from xagent.web.api import a2a as a2a_api
 from xagent.web.api import websocket as websocket_api
 from xagent.web.models.agent import Agent
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.task import Task, TaskStatus
-from xagent.web.services import external_task_cancel, task_events
+from xagent.web.services import a2a_task_cancel as a2a_cancel_service
+from xagent.web.services import external_task_cancel
+from xagent.web.services import task_command_execution as command_execution_service
+from xagent.web.services import task_events
 from xagent.web.services import task_execution as task_execution_service
 from xagent.web.services import task_orchestrator
 from xagent.web.services.assistant_history_safety import (
@@ -722,10 +724,10 @@ async def test_cancel_command_turn_id_reaches_the_core(
         observed.append(kwargs)
 
     monkeypatch.setattr(
-        websocket_api, "cancel_external_task_unserialized", record_target
+        command_execution_service, "cancel_external_task_unserialized", record_target
     )
 
-    await websocket_api._execute_durable_task_command(
+    await command_execution_service._execute_durable_task_command(
         ClaimedTaskCommand(
             id=4,
             task_id=task_id,
@@ -786,7 +788,7 @@ async def test_cancel_wait_constants_isolated(monkeypatch: pytest.MonkeyPatch) -
         expected_run_id="run-external",
         expected_state_version=4,
     )
-    await a2a_api._cancel_task_unserialized(
+    await a2a_cancel_service.cancel_a2a_task(
         task_id=a2a_task_id,
         agent_id=agent_id,
         expected_run_id="run-external",
@@ -989,7 +991,7 @@ async def test_terminal_command_error_text_external(
     )
 
     with pytest.raises(ValueError) as raised:
-        await websocket_api.execute_durable_task_command(command)
+        await command_execution_service.execute_durable_task_command(command)
 
     payloads = _broadcast_payloads(manager)
     assert [payload["type"] for payload in payloads] == ["agent_error"]
@@ -1056,7 +1058,7 @@ async def test_terminal_command_error_text_follows_the_task_state(
     manager = _broadcast_manager(monkeypatch)
     command = _exhausted_cancel_command(task_id=task_id, agent_id=agent_id)
 
-    await websocket_api._broadcast_terminal_command_error(
+    await command_execution_service._broadcast_terminal_command_error(
         command, RuntimeError(f"lease lost at {task_id}")
     )
 
@@ -1088,7 +1090,7 @@ async def test_terminal_command_error_completed_task_stays_silent(
     manager = _broadcast_manager(monkeypatch)
     command = _exhausted_cancel_command(task_id=task_id, agent_id=agent_id)
 
-    await websocket_api._broadcast_terminal_command_error(
+    await command_execution_service._broadcast_terminal_command_error(
         command, RuntimeError(f"lease lost at {task_id}")
     )
 
@@ -1189,7 +1191,7 @@ async def test_rejected_external_cancel_stale_run_broadcasts(
     manager = _broadcast_manager(monkeypatch)
 
     with pytest.raises(TaskCommandRejected) as raised:
-        await websocket_api.execute_durable_task_command(
+        await command_execution_service.execute_durable_task_command(
             _external_cancel_command(
                 task_id=task_id,
                 agent_id=agent_id,
@@ -1240,7 +1242,7 @@ async def test_rejected_external_cancel_completed_target_stays_silent(
     manager = _broadcast_manager(monkeypatch)
 
     with pytest.raises(TaskCommandRejected) as raised:
-        await websocket_api.execute_durable_task_command(
+        await command_execution_service.execute_durable_task_command(
             _external_cancel_command(
                 task_id=task_id,
                 agent_id=agent_id,
@@ -1276,7 +1278,7 @@ async def test_rejected_external_cancel_task_not_found_stays_silent(
     manager = _broadcast_manager(monkeypatch)
 
     with pytest.raises(TaskCommandRejected) as raised:
-        await websocket_api.execute_durable_task_command(
+        await command_execution_service.execute_durable_task_command(
             _external_cancel_command(task_id=task_id, agent_id=agent_id)
         )
 
@@ -1306,7 +1308,7 @@ async def test_cancel_payload_audit_only(monkeypatch: pytest.MonkeyPatch) -> Non
         observed.append(kwargs)
 
     monkeypatch.setattr(
-        websocket_api, "cancel_external_task_unserialized", record_target
+        command_execution_service, "cancel_external_task_unserialized", record_target
     )
     payloads: list[dict[str, Any]] = [
         {"agent_id": agent_id, "target_state_version": 4, "scope": "external"},
@@ -1319,7 +1321,7 @@ async def test_cancel_payload_audit_only(monkeypatch: pytest.MonkeyPatch) -> Non
     ]
 
     for payload in payloads:
-        await websocket_api._execute_durable_task_command(
+        await command_execution_service._execute_durable_task_command(
             ClaimedTaskCommand(
                 id=2,
                 task_id=task_id,
@@ -1357,10 +1359,10 @@ async def test_cancel_without_scope_stays_on_the_a2a_core(
     )
     external_core = AsyncMock()
     monkeypatch.setattr(
-        websocket_api, "cancel_external_task_unserialized", external_core
+        command_execution_service, "cancel_external_task_unserialized", external_core
     )
 
-    await websocket_api._execute_durable_task_command(
+    await command_execution_service._execute_durable_task_command(
         ClaimedTaskCommand(
             id=3,
             task_id=task_id,
@@ -1412,13 +1414,13 @@ async def test_cancel_rejects_an_unknown_scope(
     _broadcast_manager(monkeypatch)
     external_core = AsyncMock()
     monkeypatch.setattr(
-        websocket_api, "cancel_external_task_unserialized", external_core
+        command_execution_service, "cancel_external_task_unserialized", external_core
     )
     a2a_core = AsyncMock()
-    monkeypatch.setattr(a2a_api, "_cancel_task_unserialized", a2a_core)
+    monkeypatch.setattr(a2a_cancel_service, "cancel_a2a_task", a2a_core)
 
     with pytest.raises(TaskCommandRejected) as raised:
-        await websocket_api._execute_durable_task_command(
+        await command_execution_service._execute_durable_task_command(
             ClaimedTaskCommand(
                 id=5,
                 task_id=task_id,

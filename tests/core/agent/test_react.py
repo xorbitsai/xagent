@@ -4625,7 +4625,8 @@ async def test_react_pattern_ask_user_question_pauses_with_structured_payload() 
                             "name": "ask_user_question",
                             "arguments": (
                                 '{"message":"Pick one","interactions":'
-                                '[{"type":"select_one","field":"choice","label":"Choice"}]}'
+                                '[{"type":"select_one","field":"choice","label":"Choice",'
+                                '"options":[{"label":"A","value":"a"}]}]}'
                             ),
                         },
                     }
@@ -4652,11 +4653,14 @@ async def test_react_pattern_ask_user_question_pauses_with_structured_payload() 
     assert outbound_message["expect_response"] is True
     assert outbound_message["visible"] is True
     assert outbound_message["step_id"] == outbound_message["metadata"]["step_id"]
+    # Carries real options: a picker with nothing to select gets the engine's
+    # free-text field appended, which would make this a test of that instead.
     assert outbound_message["metadata"]["interactions"] == [
         {
             "type": "select_one",
             "field": "choice",
             "label": "Choice",
+            "options": [{"label": "A", "value": "a"}],
         }
     ]
     assert pattern.tool_ledger["call_question_form"].status == "completed"
@@ -5189,13 +5193,27 @@ async def test_pause_for_tool_results_deduplicates_normalized_fields() -> None:
         "status": "waiting_for_user",
         "message": "Pick one",
         "message_type": "question",
-        "interactions": [{"type": "select_one", "field": "\ufeffchoice"}],
+        # Options are what keep these answerable, so the published list is the
+        # deduplicated one with no free-text field appended.
+        "interactions": [
+            {
+                "type": "select_one",
+                "field": "\ufeffchoice",
+                "options": [{"label": "A", "value": "a"}],
+            }
+        ],
     }
     result_b = {
         "status": "waiting_for_user",
         "message": "Pick another",
         "message_type": "question",
-        "interactions": [{"type": "select_one", "field": "choice"}],
+        "interactions": [
+            {
+                "type": "select_one",
+                "field": "choice",
+                "options": [{"label": "B", "value": "b"}],
+            }
+        ],
     }
 
     outcome = await pattern._pause_for_tool_results(

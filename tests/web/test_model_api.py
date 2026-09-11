@@ -2010,7 +2010,7 @@ class TestModelAPI:
             == "https://ark.ap-southeast.bytepluses.com/api/v3"
         )
 
-    def test_fetch_deepseek_provider_models_returns_curated_v4_models(
+    def test_fetch_deepseek_provider_models_returns_curated_models(
         self, test_db, regular_user, regular_headers
     ):
         response = client.post(
@@ -2021,8 +2021,9 @@ class TestModelAPI:
 
         assert response.status_code == 200
         data = response.json()
-        assert data["count"] == 2
+        assert data["count"] == 3
         assert [model["id"] for model in data["models"]] == [
+            "deepseek-flash",
             "deepseek-v4-flash",
             "deepseek-v4-pro",
         ]

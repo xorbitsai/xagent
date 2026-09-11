@@ -53,7 +53,7 @@ APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT = frozenset({"facebook", "github", "myob"}
 
 
 def _normalize_oauth_grant_key(value: object) -> str | None:
-    """Case/whitespace-insensitive key, matching mcp.py's _normalize_app_key.
+    """Case/whitespace-insensitive key, matching ``normalize_catalog_key``.
 
     Duplicated rather than imported: mcp.py imports this module, so importing
     back would cycle. An admin-created PublicMCPApp.app_id is free-form (see
@@ -260,7 +260,7 @@ class RemoteOAuthDefinitionOwnership(Enum):
     TEAM = "team"
 
 
-def _normalized_catalog_key(value: object) -> str | None:
+def normalize_catalog_key(value: object) -> str | None:
     """Normalize only for collision detection, never for persisted identity."""
     from ..builtin_identity import canonicalize_builtin_identity
 
@@ -296,11 +296,11 @@ def _strict_catalog_app_by_id(
         )
     app = matches[0]
 
-    normalized_id = _normalized_catalog_key(app_id)
+    normalized_id = normalize_catalog_key(app_id)
     collisions = [
         candidate
         for candidate in catalog_apps
-        if _normalized_catalog_key(candidate.app_id) == normalized_id
+        if normalize_catalog_key(candidate.app_id) == normalized_id
     ]
     if len(collisions) != 1:
         raise BuiltinOAuthServerDefinitionError(
@@ -478,7 +478,7 @@ def _builtin_server_candidates(
     app_id = str(app_info["id"])
     app_name = str(app_info["name"])
     normalized_names = {
-        key for key in map(_normalized_catalog_key, (app_id, app_name)) if key
+        key for key in map(normalize_catalog_key, (app_id, app_name)) if key
     }
     catalog_apps: Sequence[PublicMCPApp] = (
         snapshot.catalog_apps if snapshot is not None else db.query(PublicMCPApp).all()
@@ -504,8 +504,8 @@ def _builtin_server_candidates(
             candidates.append(server)
             continue
         if (
-            _normalized_catalog_key(server_app_id) in normalized_names
-            or _normalized_catalog_key(server.name) in normalized_names
+            normalize_catalog_key(server_app_id) in normalized_names
+            or normalize_catalog_key(server.name) in normalized_names
         ):
             raise BuiltinOAuthServerDefinitionError(
                 f"builtin OAuth app {app_id!r} has an ambiguous reserved server identity"
@@ -542,8 +542,8 @@ def classify_actor_builtin_oauth_server(
     has_app_id = isinstance(auth, Mapping) and "app_id" in auth
     server_app_id = auth.get("app_id") if isinstance(auth, Mapping) else None
     server_name = str(getattr(server, "name", ""))
-    normalized_name = _normalized_catalog_key(server_name)
-    normalized_app_id = _normalized_catalog_key(server_app_id)
+    normalized_name = normalize_catalog_key(server_name)
+    normalized_app_id = normalize_catalog_key(server_app_id)
 
     exact_app = next(
         (
@@ -567,8 +567,8 @@ def classify_actor_builtin_oauth_server(
             normalized_app_id,
         }
         & {
-            _normalized_catalog_key(app_info.get("id")),
-            _normalized_catalog_key(app_info.get("name")),
+            normalize_catalog_key(app_info.get("id")),
+            normalize_catalog_key(app_info.get("name")),
         }
         - {None}
     ]

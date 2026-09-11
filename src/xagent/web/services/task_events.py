@@ -53,3 +53,38 @@ async def publish_task_event(message: dict[str, Any], task_id: int) -> None:
             )
         return
     await _task_event_sink(message, task_id)
+
+
+CommandReply = Callable[[dict[str, Any]], Awaitable[None]]
+
+
+class TaskCommandDelivery(Protocol):
+    """Host-owned personal replies and their command-scoped lifetime."""
+
+    def reply_for(self, command_id: str, task_id: int) -> CommandReply: ...
+
+    def discard_command(self, command_id: str, task_id: int) -> None: ...
+
+
+_task_command_delivery: TaskCommandDelivery | None = None
+
+
+def set_task_command_delivery(delivery: TaskCommandDelivery | None) -> None:
+    """Attach a host without making command execution depend on connections."""
+    global _task_command_delivery
+    _task_command_delivery = delivery
+
+
+async def discard_command_reply(_message: dict[str, Any]) -> None:
+    """A recovered or remote command has no local personal reply recipient."""
+
+
+def command_reply(command_id: str, task_id: int) -> CommandReply:
+    if _task_command_delivery is None:
+        return discard_command_reply
+    return _task_command_delivery.reply_for(command_id, task_id)
+
+
+def finish_task_command_delivery(command_id: str, task_id: int) -> None:
+    if _task_command_delivery is not None:
+        _task_command_delivery.discard_command(command_id, task_id)

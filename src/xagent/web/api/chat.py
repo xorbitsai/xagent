@@ -351,7 +351,7 @@ async def create_task(
                     return None
 
             db_model = core_storage.get_db_model(model_ref)
-            if not db_model:
+            if not db_model or not bool(db_model.is_active):
                 return None
 
             # Two-step access check: own → shared from visible users
@@ -417,8 +417,10 @@ async def create_task(
                 shared_defaults = (
                     db.query(UserDefaultModel)
                     .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                    .join(DBModel, UserDefaultModel.model_id == DBModel.id)
                     .filter(
                         UserDefaultModel.config_type.in_(config_types),
+                        DBModel.is_active,
                         UserModel.is_shared.is_(True),
                         UserDefaultModel.user_id.in_(visible_ids),
                     )

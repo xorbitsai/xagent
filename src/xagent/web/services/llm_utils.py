@@ -647,11 +647,14 @@ class UserAwareModelStorage:
         try:
             # Try to get by model_id first, then by model_name
             logger.info(f"Looking for model: {model_name} for user {user_id}")
-            model_config = self.core_storage.load(model_name)
             db_model = self.core_storage.get_db_model(model_name)
             if not db_model:
                 logger.warning(f"Cannot find model for id: {model_name}")
                 return None
+            if not bool(getattr(db_model, "is_active", True)):
+                logger.warning(f"Model '{model_name}' is inactive")
+                return None
+            model_config = self.core_storage.load(model_name)
             logger.info(
                 f"Found model: id={db_model.id}, model_id={db_model.model_id}, model_name={db_model.model_name}"
             )
@@ -844,6 +847,9 @@ class UserAwareModelStorage:
     ) -> Optional[BaseLLM]:
         """Create a default model, hydrating configured Auto when necessary."""
 
+        if not bool(getattr(db_model, "is_active", True)):
+            return None
+
         model_id = str(db_model.model_id)
         model_config = self.core_storage.load(model_id)
         if (
@@ -1005,6 +1011,7 @@ class UserAwareModelStorage:
                     )
                     .filter(
                         UserDefaultModel.config_type.in_(config_types),
+                        UserDefaultModel.model.has(Model.is_active),
                         UserModel.is_shared.is_(True),
                         UserDefaultModel.user_id.in_(visible_ids),
                     )
@@ -1098,18 +1105,22 @@ class UserAwareModelStorage:
         vision_name = llm_names[2]
         compact_name = llm_names[3]
 
-        # Get default LLM (required)
-        if not default_name:
-            logger.error(
-                "Default model name is required but not provided. Using configured defaults."
-            )
-            return self.get_configured_defaults(user_id)
-
-        default_llm = self.get_llm_by_name_with_access(default_name, user_id)
+        # Resolve the required general slot independently. A missing or unavailable
+        # general model must not discard valid explicit models in the other slots.
+        default_llm = (
+            self.get_llm_by_name_with_access(default_name, user_id)
+            if default_name
+            else None
+        )
         if not default_llm:
-            logger.warning(
-                f"Default LLM '{default_name}' not found or no access, falling back to configured default"
-            )
+            if default_name:
+                logger.warning(
+                    f"Default LLM '{default_name}' not found or no access, falling back to configured default"
+                )
+            else:
+                logger.warning(
+                    "Default model name is not available; using configured default"
+                )
             default_llm, _, _, _ = self.get_configured_defaults(
                 user_id, config_types=("general",)
             )
@@ -1136,8 +1147,8 @@ class UserAwareModelStorage:
         missing_defaults = tuple(
             kind
             for kind, needed in (
-                ("small_fast", bool(fast_name) and fast_llm is None),
-                ("visual", bool(vision_name) and vision_llm is None),
+                ("small_fast", fast_llm is None),
+                ("visual", vision_llm is None),
                 ("compact", compact_llm is None),
             )
             if needed
@@ -1149,16 +1160,18 @@ class UserAwareModelStorage:
                 )
             )
 
-        if fast_name and not fast_llm:
-            logger.warning(
-                f"Fast LLM '{fast_name}' not found or no access, using configured fast default"
-            )
+        if not fast_llm:
+            if fast_name:
+                logger.warning(
+                    f"Fast LLM '{fast_name}' not found or no access, using configured fast default"
+                )
             fast_llm = default_fast_llm
 
-        if vision_name and not vision_llm:
-            logger.warning(
-                f"Vision LLM '{vision_name}' not found or no access, using configured vision default"
-            )
+        if not vision_llm:
+            if vision_name:
+                logger.warning(
+                    f"Vision LLM '{vision_name}' not found or no access, using configured vision default"
+                )
             vision_llm = default_vision_llm
 
         if compact_name:
@@ -1325,13 +1338,17 @@ def make_normalize_model_id(core_storage: CoreStorage) -> Callable:
         if model_id:
             db_model = core_storage.get_db_model(model_id)
             if db_model:
-                return str(db_model.model_id)
+                return str(db_model.model_id) if bool(db_model.is_active) else None
             # Preserve stored identifier even if the backing model row no longer exists.
             # This avoids API inconsistencies when models are deleted/migrated.
             return str(model_id).strip() if isinstance(model_id, str) else str(model_id)
         if model_name:
             db_model = core_storage.get_db_model(str(model_name))
-            return str(db_model.model_id) if db_model else None
+            return (
+                str(db_model.model_id)
+                if db_model and bool(db_model.is_active)
+                else None
+            )
         return None
 
     return normalize_model_id

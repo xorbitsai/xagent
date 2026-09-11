@@ -15,6 +15,11 @@ from typing import Any, Dict, List, Optional, TypeVar
 
 from ..... import config as _root_config
 
+ACTOR_STDIO_SESSION_RUNTIME_UNAVAILABLE_REASON = (
+    "actor_stdio_session_runtime_unavailable"
+)
+ACTOR_STDIO_SHADOWED_REASON = "actor_stdio_shadowed_by_visible_connection"
+
 
 class MCPFailurePolicy(str, Enum):
     """Caller-owned behavior when a selected MCP server is unavailable."""
@@ -65,6 +70,8 @@ async def run_with_tool_runtime_cleanup(
 
 _PUBLIC_MCP_UNAVAILABLE_REASONS = frozenset(
     {
+        ACTOR_STDIO_SESSION_RUNTIME_UNAVAILABLE_REASON,
+        ACTOR_STDIO_SHADOWED_REASON,
         "adapter_construction",
         "authorization_required",
         "catalog_app_not_found",
@@ -264,6 +271,16 @@ class BaseToolConfig(ABC):
     async def get_mcp_server_configs(self) -> List[Dict[str, Any]]:
         """Get MCP server configurations."""
         pass
+
+    def get_actor_mcp_stdio_session_identities(self) -> Dict[str, Any]:
+        """Return host-only session identities keyed by exact MCP server name."""
+
+        return {}
+
+    def get_actor_mcp_stdio_session_consumer(self) -> Any:
+        """Return the optional host-side execution-scoped stdio consumer."""
+
+        return None
 
     def get_mcp_failure_policy(self) -> MCPFailurePolicy:
         """Return the MCP setup failure policy for this execution."""

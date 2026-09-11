@@ -20,7 +20,10 @@ from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth
 from xagent.web.services import connector_team_scope
-from xagent.web.services.mcp_runtime import MCPBuiltinOAuthActorPolicy
+from xagent.web.services.mcp_runtime import (
+    MCPActorAuthorizationPolicy,
+    MCPBuiltinOAuthActorPolicy,
+)
 from xagent.web.tools import config as web_tools_config
 from xagent.web.tools.config import (
     ResolvedToken,
@@ -246,14 +249,38 @@ def _token(config: dict) -> str:
     return config["config"]["env"]["ACTOR_ACCESS_TOKEN"]
 
 
-def test_actor_policy_is_frozen_normalized_and_owner_only() -> None:
+def test_actor_policy_is_frozen_normalized_and_stdio_disabled_by_default() -> None:
     policy = MCPBuiltinOAuthActorPolicy(resource_owner_key=f"  {OWNER_A}  ")
 
     assert policy.resource_owner_key == OWNER_A
-    assert [field.name for field in fields(policy)] == ["resource_owner_key"]
+    assert policy.allow_builtin_stdio is False
+    assert [field.name for field in fields(policy)] == [
+        "resource_owner_key",
+        "allow_builtin_stdio",
+    ]
     assert OWNER_A not in repr(policy)
     with pytest.raises(FrozenInstanceError):
         policy.resource_owner_key = OWNER_B  # type: ignore[misc]
+
+
+def test_general_actor_policy_keeps_legacy_type_identity() -> None:
+    policy = MCPActorAuthorizationPolicy(
+        resource_owner_key=OWNER_A,
+        allow_builtin_stdio=True,
+    )
+
+    assert MCPBuiltinOAuthActorPolicy is MCPActorAuthorizationPolicy
+    assert isinstance(policy, MCPBuiltinOAuthActorPolicy)
+    assert policy.allow_builtin_stdio is True
+
+
+@pytest.mark.parametrize("value", [None, 0, 1, "true"])
+def test_actor_policy_rejects_non_boolean_stdio_capability(value: object) -> None:
+    with pytest.raises(ValueError, match="allow_builtin_stdio must be a boolean"):
+        MCPActorAuthorizationPolicy(
+            resource_owner_key=OWNER_A,
+            allow_builtin_stdio=value,  # type: ignore[arg-type]
+        )
 
 
 @pytest.mark.parametrize("value", [None, 7, True, "", "   "])

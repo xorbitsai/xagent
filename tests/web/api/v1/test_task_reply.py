@@ -1,11 +1,11 @@
 """Integration tests for ``POST /v1/chat/tasks/{task_id}/reply``.
 
 Mirrors the structure of ``tests/web/api/test_a2a_api.py``'s
-input-required resume tests, since ``task_reply.py`` copies that
-resume's mechanics. Where a2a's test patches
-``xagent.web.api.a2a._schedule_waiting_a2a_resume`` to avoid spinning
+input-required resume tests; both drive the runner-owned recovery
+mechanics through their original protocol entry points. Where a2a's test patches
+``xagent.web.services.task_resume._schedule_waiting_a2a_resume`` to avoid spinning
 up a real background execution, these tests patch the analogous
-``xagent.web.api.v1.task_reply._schedule_waiting_reply_resume``.
+``xagent.web.services.task_resume._schedule_waiting_reply_resume``.
 """
 
 import asyncio
@@ -30,6 +30,7 @@ from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.schemas.v1 import ReplyRequest
 from xagent.web.services import task_execution as task_execution_service
+from xagent.web.services import task_resume
 from xagent.web.services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
 from xagent.web.services.llm_utils import AutoModelUnavailableError
 from xagent.web.services.task_execution_controller import TaskControlState
@@ -218,7 +219,7 @@ def test_reply_happy_path_resumes_the_same_run(mock_start_task):
     with (
         agent_patch,
         patch(
-            "xagent.web.api.v1.task_reply._schedule_waiting_reply_resume",
+            "xagent.web.services.task_resume._schedule_waiting_reply_resume",
             new=AsyncMock(),
         ) as schedule_resume,
     ):
@@ -250,6 +251,8 @@ def test_reply_happy_path_resumes_the_same_run(mock_start_task):
         task = db.query(Task).filter(Task.id == task_id).one()
         assert task.status == TaskStatus.RUNNING
         assert task.run_id == "run-original"
+        assert body["state_version"] == task.state_version
+        assert body["control_state"] == task.control_state
         assert task.input == "yes, continue"
         assert task.output is None
         assert task.error_message is None
@@ -275,7 +278,7 @@ def test_reply_turn_id_is_never_reused_across_retries(mock_start_task):
     with (
         agent_patch,
         patch(
-            "xagent.web.api.v1.task_reply._schedule_waiting_reply_resume",
+            "xagent.web.services.task_resume._schedule_waiting_reply_resume",
             new=AsyncMock(),
         ),
     ):
@@ -308,7 +311,7 @@ def test_reply_turn_id_is_never_reused_across_retries(mock_start_task):
     with (
         agent_patch,
         patch(
-            "xagent.web.api.v1.task_reply._schedule_waiting_reply_resume",
+            "xagent.web.services.task_resume._schedule_waiting_reply_resume",
             new=AsyncMock(),
         ),
     ):
@@ -371,7 +374,7 @@ def test_reply_waiting_status_is_not_rejected_by_the_status_gate(mock_start_task
     with (
         agent_patch,
         patch(
-            "xagent.web.api.v1.task_reply._schedule_waiting_reply_resume",
+            "xagent.web.services.task_resume._schedule_waiting_reply_resume",
             new=AsyncMock(),
         ),
     ):
@@ -591,7 +594,7 @@ def test_reply_closes_the_legacy_resume_interaction_row_on_successful_injection(
     with (
         agent_patch,
         patch(
-            "xagent.web.api.v1.task_reply._schedule_waiting_reply_resume",
+            "xagent.web.services.task_resume._schedule_waiting_reply_resume",
             new=AsyncMock(),
         ),
     ):
@@ -678,18 +681,18 @@ def test_reply_reads_the_interaction_row_before_injecting(
     with (
         agent_patch,
         patch(
-            "xagent.web.api.v1.task_reply._schedule_waiting_reply_resume",
+            "xagent.web.services.task_resume._schedule_waiting_reply_resume",
             new=AsyncMock(),
         ),
         patch(
-            "xagent.web.api.v1.task_reply.active_interaction_id_sync",
+            "xagent.web.services.task_resume.active_interaction_id_sync",
             side_effect=record_read,
         ),
         patch(
-            "xagent.web.api.v1.task_reply.close_legacy_resume_interaction",
+            "xagent.web.services.task_resume.close_legacy_resume_interaction",
             return_value=1,
         ) as close_mock,
-        caplog.at_level(logging.INFO, logger="xagent.web.api.v1.task_reply"),
+        caplog.at_level(logging.INFO, logger="xagent.web.services.task_resume"),
     ):
         resp = client.post(
             f"/v1/chat/tasks/{task_id}/reply",
@@ -763,7 +766,7 @@ def test_update_reply_input_rolls_back_the_interaction_close_with_the_fence() ->
     stale_lease = TaskLease(
         task_id=task_id, runner_id="a-different-runner", run_id="run-reply-atomicity"
     )
-    updated = task_reply_module._update_reply_input_sync(
+    updated = task_resume._update_reply_input_sync(
         stale_lease, "attempted text", row_id
     )
 
@@ -991,7 +994,7 @@ async def test_concurrent_reply_race_exactly_one_winner(mock_start_task):
     with (
         agent_patch,
         patch(
-            "xagent.web.api.v1.task_reply._schedule_waiting_reply_resume",
+            "xagent.web.services.task_resume._schedule_waiting_reply_resume",
             new=AsyncMock(),
         ),
     ):
@@ -1091,7 +1094,7 @@ async def test_reply_resume_binds_the_coordinator_to_the_leased_run() -> None:
             side_effect=execute_resume_background,
         ),
     ):
-        await task_reply_module._schedule_waiting_reply_resume(
+        await task_resume._schedule_waiting_reply_resume(
             task_id=4242,
             agent_service=MagicMock(),
             task_owner_user_id=1,

@@ -38,11 +38,13 @@ from tests.web.services.task_interaction_schema_shared import (
 )
 from xagent.db.sqlite import apply_sqlite_concurrency_pragmas
 from xagent.web.api import websocket as websocket_api
+from xagent.web.api.websocket import _make_command_reply
 from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.services import agent_service_manager as agent_runtime_service
 from xagent.web.services import ops_signals
+from xagent.web.services import task_command_execution as command_execution_service
 from xagent.web.services import task_execution as task_execution_service
 from xagent.web.services.task_interaction_close import (
     ACTIVE_INTERACTION_UNAVAILABLE_REASONS,
@@ -236,7 +238,9 @@ async def test_legacy_resume_without_a_receipt_is_refused_with_an_active_row(
         # task row, so answer "no foreign owner" explicitly.
         stack.enter_context(
             patch.object(
-                websocket_api, "task_has_live_foreign_runner", return_value=False
+                command_execution_service,
+                "task_has_live_foreign_runner",
+                return_value=False,
             )
         )
         agent_manager = MagicMock()
@@ -249,8 +253,8 @@ async def test_legacy_resume_without_a_receipt_is_refused_with_an_active_row(
             )
         )
 
-        await websocket_api._handle_resume_task_unserialized(
-            MagicMock(),
+        await command_execution_service.resume_task(
+            _make_command_reply(MagicMock()),
             _seeded_task,
             {"user": SimpleNamespace(id=OWNER_ID, is_admin=False)},
         )
@@ -320,7 +324,9 @@ async def test_legacy_resume_without_a_receipt_is_refused_on_the_fallback_path(
         # task row, so answer "no foreign owner" explicitly.
         stack.enter_context(
             patch.object(
-                websocket_api, "task_has_live_foreign_runner", return_value=False
+                command_execution_service,
+                "task_has_live_foreign_runner",
+                return_value=False,
             )
         )
         agent_manager = MagicMock()
@@ -333,8 +339,8 @@ async def test_legacy_resume_without_a_receipt_is_refused_on_the_fallback_path(
             )
         )
 
-        await websocket_api._handle_resume_task_unserialized(
-            MagicMock(),
+        await command_execution_service.resume_task(
+            _make_command_reply(MagicMock()),
             _seeded_task,
             {"user": SimpleNamespace(id=OWNER_ID, is_admin=False)},
         )
@@ -424,7 +430,9 @@ async def test_legacy_resume_is_not_refused_when_the_task_marker_is_null(
         # task row, so answer "no foreign owner" explicitly.
         stack.enter_context(
             patch.object(
-                websocket_api, "task_has_live_foreign_runner", return_value=False
+                command_execution_service,
+                "task_has_live_foreign_runner",
+                return_value=False,
             )
         )
         stack.enter_context(
@@ -444,8 +452,8 @@ async def test_legacy_resume_is_not_refused_when_the_task_marker_is_null(
             )
         )
 
-        await websocket_api._handle_resume_task_unserialized(
-            MagicMock(),
+        await command_execution_service.resume_task(
+            _make_command_reply(MagicMock()),
             _seeded_task,
             {"user": SimpleNamespace(id=OWNER_ID, is_admin=False)},
         )
@@ -609,7 +617,9 @@ async def test_receipts_the_seam_cannot_verify_are_refused(
         # task row, so answer "no foreign owner" explicitly.
         stack.enter_context(
             patch.object(
-                websocket_api, "task_has_live_foreign_runner", return_value=False
+                command_execution_service,
+                "task_has_live_foreign_runner",
+                return_value=False,
             )
         )
         agent_manager = MagicMock()
@@ -622,8 +632,8 @@ async def test_receipts_the_seam_cannot_verify_are_refused(
             )
         )
 
-        await websocket_api._handle_resume_task_unserialized(
-            MagicMock(),
+        await command_execution_service.resume_task(
+            _make_command_reply(MagicMock()),
             _seeded_task,
             payload,
         )
@@ -699,7 +709,9 @@ async def test_resume_with_a_matching_receipt_is_not_refused(
         # task row, so answer "no foreign owner" explicitly.
         stack.enter_context(
             patch.object(
-                websocket_api, "task_has_live_foreign_runner", return_value=False
+                command_execution_service,
+                "task_has_live_foreign_runner",
+                return_value=False,
             )
         )
         stack.enter_context(
@@ -719,8 +731,8 @@ async def test_resume_with_a_matching_receipt_is_not_refused(
             )
         )
 
-        await websocket_api._handle_resume_task_unserialized(
-            MagicMock(),
+        await command_execution_service.resume_task(
+            _make_command_reply(MagicMock()),
             _seeded_task,
             {
                 "user": SimpleNamespace(id=OWNER_ID, is_admin=False),
@@ -797,7 +809,9 @@ async def test_stale_run_active_row_does_not_trip_the_seam(
         # task row, so answer "no foreign owner" explicitly.
         stack.enter_context(
             patch.object(
-                websocket_api, "task_has_live_foreign_runner", return_value=False
+                command_execution_service,
+                "task_has_live_foreign_runner",
+                return_value=False,
             )
         )
         stack.enter_context(
@@ -817,8 +831,8 @@ async def test_stale_run_active_row_does_not_trip_the_seam(
             )
         )
 
-        await websocket_api._handle_resume_task_unserialized(
-            MagicMock(),
+        await command_execution_service.resume_task(
+            _make_command_reply(MagicMock()),
             _seeded_task,
             {"user": SimpleNamespace(id=OWNER_ID, is_admin=False)},
         )
@@ -864,7 +878,7 @@ async def test_legacy_resume_is_not_refused_when_the_active_interaction_read_is_
     """
 
     monkeypatch.setattr(
-        websocket_api,
+        command_execution_service,
         "active_interaction_id_sync",
         lambda task_id: ActiveInteractionUnavailable(reason),
     )
@@ -912,7 +926,9 @@ async def test_legacy_resume_is_not_refused_when_the_active_interaction_read_is_
         # task row, so answer "no foreign owner" explicitly.
         stack.enter_context(
             patch.object(
-                websocket_api, "task_has_live_foreign_runner", return_value=False
+                command_execution_service,
+                "task_has_live_foreign_runner",
+                return_value=False,
             )
         )
         stack.enter_context(
@@ -933,8 +949,8 @@ async def test_legacy_resume_is_not_refused_when_the_active_interaction_read_is_
             caplog.at_level(logging.INFO, logger="xagent.web.api.websocket")
         )
 
-        result = await websocket_api._handle_resume_task_unserialized(
-            MagicMock(),
+        result = await command_execution_service.resume_task(
+            _make_command_reply(MagicMock()),
             _seeded_task,
             {"user": SimpleNamespace(id=OWNER_ID, is_admin=False)},
         )
@@ -954,7 +970,7 @@ async def test_legacy_resume_is_not_refused_when_the_active_interaction_read_is_
         ops_signals.INTERACTION_LEGACY_RESUME_SHIM
         not in ops_signals.active_degradations()
     )
-    assert result.outcome is not websocket_api.ResumeCommandOutcome.REJECTED
+    assert result.outcome is not command_execution_service.ResumeCommandOutcome.REJECTED
     assert [
         record.getMessage()
         for record in caplog.records

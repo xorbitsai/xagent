@@ -2,8 +2,8 @@ import asyncio
 
 import pytest
 
-from xagent.web.api.websocket import _task_status_uses_live_control
 from xagent.web.models.task import TaskStatus
+from xagent.web.services.task_command_execution import _task_status_uses_live_control
 from xagent.web.services.task_execution import (
     BackgroundTaskManager,
     _clear_task_pause_accepted,

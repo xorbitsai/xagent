@@ -74,6 +74,7 @@ ERROR_PAYLOAD_SINKS = {
     "broadcast_to_task",
     "send_text",
     "publish_task_event",
+    "reply",
 }
 
 # Both render in the client's conversation, so both are the same disclosure
@@ -359,6 +360,7 @@ def _error_payload_messages(
 
 
 ATTRIBUTE_CALL_RECEIVERS = {
+    "send_message_delivery": {"command_execution_service"},
     "broadcast_to_task": {"manager"},
     "dumps": {"json"},
     "send_personal_message": {"manager"},
@@ -1023,7 +1025,12 @@ def _is_execution_helper_import(
     return (
         binding in module.body
         and binding.level == 2
-        and binding.module == "services.task_execution"
+        and binding.module
+        == (
+            "services.task_command_execution"
+            if node.id == "_read_task_error_payload_offloop"
+            else "services.task_execution"
+        )
         and [
             alias.name
             for alias in binding.names

@@ -31,10 +31,6 @@ from tests.web.services.task_lease_shared import (
 from xagent.core.agent.runner import UserMessageInjectionOutcome
 from xagent.db.sqlite import apply_sqlite_concurrency_pragmas
 from xagent.web.api import websocket as websocket_api
-from xagent.web.api.websocket import (
-    _load_command_message_delivery_status,
-    execute_durable_task_command,
-)
 from xagent.web.models import database as database_module
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import (
@@ -48,8 +44,13 @@ from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.task_command_terminal_event import TaskCommandTerminalEvent
 from xagent.web.models.user import User
+from xagent.web.services import task_command_execution as command_execution_service
 from xagent.web.services import task_command_transport as task_command_transport_module
 from xagent.web.services import task_execution as task_execution_service
+from xagent.web.services.task_command_execution import (
+    _load_command_message_delivery_status,
+    execute_durable_task_command,
+)
 from xagent.web.services.task_command_transport import (
     COMMAND_COMPLETED,
     COMMAND_FAILED,
@@ -593,7 +594,7 @@ async def test_cancel_command_does_not_require_persisted_actor(db_session) -> No
     )
 
     with (
-        patch.object(websocket_api, "_load_command_actor") as load_actor,
+        patch.object(command_execution_service, "_load_command_actor") as load_actor,
         pytest.raises(ValueError, match="Agent ID is missing"),
     ):
         await execute_durable_task_command(command)

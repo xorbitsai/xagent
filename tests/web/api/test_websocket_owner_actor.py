@@ -41,15 +41,10 @@ from xagent.core.execution_scope import (
 )
 from xagent.web.api import websocket as websocket_api
 from xagent.web.api.websocket import (
-    _claim_user_message_delivery_isolated,
-    _execute_durable_task_command,
-    _handle_chat_message_unserialized,
-    _handle_pause_task_unserialized,
-    _handle_resume_task_unserialized,
+    _make_command_reply,
     handle_chat_message,
     handle_pause_task,
     handle_resume_task,
-    make_delivery_notifier,
     send_message_delivery,
 )
 from xagent.web.models.chat_message import TaskChatMessage
@@ -59,12 +54,21 @@ from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
+from xagent.web.services import task_command_execution as command_execution_service
 from xagent.web.services import task_execution as task_execution_service
 from xagent.web.services import task_orchestrator
 from xagent.web.services.chat_history_service import DELIVERY_FAILED, DELIVERY_PENDING
 from xagent.web.services.managed_file_ref import (
     DurableObjectIntegrityError,
     DurableStorageOperationError,
+)
+from xagent.web.services.task_command_execution import (
+    _claim_user_message_delivery_isolated,
+    _execute_durable_task_command,
+    handle_task_message,
+    make_delivery_notifier,
+    pause_task,
+    resume_task,
 )
 from xagent.web.services.task_command_transport import (
     COMMAND_COMPLETED,
@@ -398,8 +402,8 @@ async def test_unserialized_chat_non_owner_keeps_the_neutral_contract(
     ws_manager = MagicMock(send_personal_message=AsyncMock())
 
     with patch("xagent.web.api.websocket.manager", ws_manager):
-        await _handle_chat_message_unserialized(
-            MagicMock(),
+        await handle_task_message(
+            _make_command_reply(MagicMock()),
             int(task.id),
             {
                 "message": "try direct execution",
@@ -424,8 +428,8 @@ async def test_chat_invalid_shape_uses_the_invalid_message_contract() -> None:
     ws_manager = MagicMock(send_personal_message=AsyncMock())
 
     with patch("xagent.web.api.websocket.manager", ws_manager):
-        await _handle_chat_message_unserialized(
-            MagicMock(),
+        await handle_task_message(
+            _make_command_reply(MagicMock()),
             7,
             {
                 "message": {"operator_detail": "must not escape"},
@@ -463,7 +467,7 @@ async def test_chat_new_turn_releases_request_transaction_before_orchestrator(
     session_closed_before_begin: list[bool] = []
     closed_sessions: list[bool] = []
     SessionLocal = get_session_local()
-    prepare_turn = websocket_api._prepare_websocket_turn_sync
+    prepare_turn = command_execution_service._prepare_task_message_sync
 
     class TrackingSessionContext:
         def __init__(self) -> None:
@@ -492,11 +496,11 @@ async def test_chat_new_turn_releases_request_transaction_before_orchestrator(
     )
     with (
         patch(
-            "xagent.web.api.websocket._prepare_websocket_turn_sync",
+            "xagent.web.services.task_command_execution._prepare_task_message_sync",
             side_effect=tracked_prepare_turn,
         ),
         patch(
-            "xagent.web.api.websocket.get_session_local",
+            "xagent.web.services.task_command_execution.get_session_local",
             return_value=tracking_session_factory,
         ),
         patch("xagent.web.api.websocket.manager", ws_manager),
@@ -505,8 +509,8 @@ async def test_chat_new_turn_releases_request_transaction_before_orchestrator(
             side_effect=begin_turn,
         ),
     ):
-        await _handle_chat_message_unserialized(
-            MagicMock(),
+        await handle_task_message(
+            _make_command_reply(MagicMock()),
             task_id,
             {
                 "message": "follow-up",
@@ -581,9 +585,11 @@ async def test_chat_turn_releases_one_slot_pool_before_task_info_broadcast(
     begin_turn = AsyncMock()
 
     monkeypatch.setattr(websocket_api, "get_db", local_get_db)
-    monkeypatch.setattr(websocket_api, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(
+        command_execution_service, "get_session_local", lambda: SessionLocal
+    )
     monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
-    prepare_turn = websocket_api._prepare_websocket_turn_sync
+    prepare_turn = command_execution_service._prepare_task_message_sync
     monkeypatch.setattr(websocket_api, "manager", local_manager)
     monkeypatch.setattr(
         "xagent.web.services.task_orchestrator.TaskTurnOrchestrator.begin_turn",
@@ -595,14 +601,14 @@ async def test_chat_turn_releases_one_slot_pool_before_task_info_broadcast(
     # raises on a task-info checkout that collides with preparation.
     probe = _EventLoopLivenessProbe()
     monkeypatch.setattr(
-        websocket_api,
-        "_prepare_websocket_turn_sync",
+        command_execution_service,
+        "_prepare_task_message_sync",
         probe.gate(prepare_turn),
     )
     try:
         await asyncio.wait_for(
-            _handle_chat_message_unserialized(
-                websocket,  # type: ignore[arg-type]
+            handle_task_message(
+                _make_command_reply(websocket),  # type: ignore[arg-type]
                 task_id,
                 {
                     "message": "follow-up",
@@ -689,9 +695,11 @@ async def test_pause_accepted_wait_releases_one_slot_pool_before_previous_run(
     begin_turn = AsyncMock()
 
     monkeypatch.setattr(websocket_api, "get_db", local_get_db)
-    monkeypatch.setattr(websocket_api, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(
+        command_execution_service, "get_session_local", lambda: SessionLocal
+    )
     monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
-    prepare_turn = websocket_api._prepare_websocket_turn_sync
+    prepare_turn = command_execution_service._prepare_task_message_sync
     monkeypatch.setattr(websocket_api, "manager", ws_manager)
     monkeypatch.setattr(
         task_execution_service,
@@ -706,14 +714,14 @@ async def test_pause_accepted_wait_releases_one_slot_pool_before_previous_run(
     task_execution_service._mark_task_pause_accepted(task_id)
     probe = _EventLoopLivenessProbe()
     monkeypatch.setattr(
-        websocket_api,
-        "_prepare_websocket_turn_sync",
+        command_execution_service,
+        "_prepare_task_message_sync",
         probe.gate(prepare_turn),
     )
     try:
         await asyncio.wait_for(
-            _handle_chat_message_unserialized(
-                MagicMock(),
+            handle_task_message(
+                _make_command_reply(MagicMock()),
                 task_id,
                 {
                     "message": "continue after pause",
@@ -817,7 +825,9 @@ async def test_missing_task_create_commits_claim_message_file_and_prelease_toget
     ws_manager = AtomicCreateManager()
     schedule = AsyncMock()
     begin_turn = AsyncMock()
-    monkeypatch.setattr(websocket_api, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(
+        command_execution_service, "get_session_local", lambda: SessionLocal
+    )
     monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
     monkeypatch.setattr(websocket_api, "manager", ws_manager)
     monkeypatch.setattr(
@@ -830,8 +840,8 @@ async def test_missing_task_create_commits_claim_message_file_and_prelease_toget
     )
 
     try:
-        await _handle_chat_message_unserialized(
-            MagicMock(),
+        await handle_task_message(
+            _make_command_reply(MagicMock()),
             987654,
             {
                 "message": "start atomically",
@@ -902,7 +912,9 @@ async def test_missing_task_file_bind_race_rolls_back_the_whole_create(
         send_personal_message=AsyncMock(),
     )
     schedule = AsyncMock()
-    monkeypatch.setattr(websocket_api, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(
+        command_execution_service, "get_session_local", lambda: SessionLocal
+    )
     monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
     monkeypatch.setattr(websocket_api, "manager", ws_manager)
     monkeypatch.setattr(
@@ -916,8 +928,8 @@ async def test_missing_task_file_bind_race_rolls_back_the_whole_create(
     )
 
     try:
-        await _handle_chat_message_unserialized(
-            MagicMock(),
+        await handle_task_message(
+            _make_command_reply(MagicMock()),
             654321,
             {
                 "message": "rollback raced create",
@@ -987,7 +999,9 @@ async def test_missing_task_send_failure_leaves_only_ttl_owned_running_claim(
     )
     ws_manager.broadcast_to_task = AsyncMock()
     schedule = AsyncMock()
-    monkeypatch.setattr(websocket_api, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(
+        command_execution_service, "get_session_local", lambda: SessionLocal
+    )
     monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
     monkeypatch.setattr(websocket_api, "manager", ws_manager)
     monkeypatch.setattr(
@@ -997,8 +1011,8 @@ async def test_missing_task_send_failure_leaves_only_ttl_owned_running_claim(
 
     try:
         with pytest.raises(RuntimeError, match="socket send failed"):
-            await _handle_chat_message_unserialized(
-                MagicMock(),
+            await handle_task_message(
+                _make_command_reply(MagicMock()),
                 876543,
                 {
                     "message": "send may fail",
@@ -1061,7 +1075,7 @@ async def test_missing_task_cancel_after_atomic_create_never_leaves_pending(
 
     worker_finished = threading.Event()
     release_worker = threading.Event()
-    prepare_turn = websocket_api._prepare_websocket_turn_sync
+    prepare_turn = command_execution_service._prepare_task_message_sync
 
     def blocked_prepare_turn(**kwargs):
         preparation = prepare_turn(**kwargs)
@@ -1070,11 +1084,13 @@ async def test_missing_task_cancel_after_atomic_create_never_leaves_pending(
         return preparation
 
     schedule = AsyncMock()
-    monkeypatch.setattr(websocket_api, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(
+        command_execution_service, "get_session_local", lambda: SessionLocal
+    )
     monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
     monkeypatch.setattr(
-        websocket_api,
-        "_prepare_websocket_turn_sync",
+        command_execution_service,
+        "_prepare_task_message_sync",
         blocked_prepare_turn,
     )
     monkeypatch.setattr(
@@ -1083,8 +1099,8 @@ async def test_missing_task_cancel_after_atomic_create_never_leaves_pending(
     )
 
     handler = asyncio.create_task(
-        _handle_chat_message_unserialized(
-            MagicMock(),
+        handle_task_message(
+            _make_command_reply(MagicMock()),
             765432,
             {
                 "message": "cancel after commit",
@@ -1199,16 +1215,16 @@ async def test_chat_turn_rejection_payload_is_loaded_off_loop(
             side_effect=TaskTurnError(reason),
         ),
         patch(
-            "xagent.web.api.websocket._read_task_error_payload_isolated",
+            "xagent.web.services.task_command_execution._read_task_error_payload_isolated",
             side_effect=read_payload,
         ),
         patch(
-            "xagent.web.api.websocket._task_error_payload",
+            "xagent.web.services.task_command_execution._task_error_payload",
             side_effect=AssertionError("payload query ran on the event loop"),
         ),
     ):
-        await _handle_chat_message_unserialized(
-            MagicMock(),
+        await handle_task_message(
+            _make_command_reply(MagicMock()),
             int(task.id),
             {
                 "message": "follow-up",
@@ -1382,11 +1398,11 @@ async def test_legacy_continuation_runtime_fails_closed_without_side_effects(
         ),
         patch("xagent.web.api.websocket.manager", ws_manager),
         patch(
-            "xagent.web.api.websocket.mark_user_message_delivery_sync",
+            "xagent.web.services.task_command_execution.mark_user_message_delivery_sync",
         ) as mark_delivery,
     ):
-        await _handle_chat_message_unserialized(
-            MagicMock(),
+        await handle_task_message(
+            _make_command_reply(MagicMock()),
             int(task.id),
             {
                 "message": "must not enter legacy continuation",
@@ -1504,7 +1520,7 @@ async def test_running_chat_message_uses_one_offloop_scope_and_no_request_sessio
         with (
             patch("xagent.web.api.websocket.get_db", side_effect=tracked_get_db),
             patch(
-                "xagent.web.api.websocket._claim_user_message_delivery_isolated",
+                "xagent.web.services.task_command_execution._claim_user_message_delivery_isolated",
                 side_effect=claim_delivery,
             ),
             patch(
@@ -1528,8 +1544,8 @@ async def test_running_chat_message_uses_one_offloop_scope_and_no_request_sessio
                 ),
             ),
         ):
-            await _handle_chat_message_unserialized(
-                MagicMock(),
+            await handle_task_message(
+                _make_command_reply(MagicMock()),
                 int(task.id),
                 {
                     "message": "continue safely",
@@ -1809,8 +1825,8 @@ async def test_durable_failure_keeps_detail_sender_only(
         ),
         patch("xagent.web.services.task_execution.background_task_manager", bg_mgr),
     ):
-        await _handle_chat_message_unserialized(
-            origin_socket,
+        await handle_task_message(
+            _make_command_reply(origin_socket),
             int(task.id),
             payload,
         )
@@ -1916,12 +1932,12 @@ async def test_attachment_bind_race_keeps_specific_failure_on_origin_lane(
         patch("xagent.web.api.websocket.manager", connection_manager),
         patch("xagent.web.services.task_execution.background_task_manager", bg_manager),
         patch(
-            "xagent.web.api.websocket.bind_turn_files_no_commit",
+            "xagent.web.services.task_command_execution.bind_turn_files_no_commit",
             return_value=["bind-race-file"],
         ),
     ):
-        await _handle_chat_message_unserialized(
-            origin,  # type: ignore[arg-type]
+        await handle_task_message(
+            _make_command_reply(origin),  # type: ignore[arg-type]
             int(task.id),
             {
                 "message": "Use my attachment",
@@ -2066,12 +2082,12 @@ async def test_live_marker_failure_after_registered_handoff_is_still_accepted(
             "xagent.web.services.task_execution.execute_resume_background", AsyncMock()
         ),
         patch(
-            "xagent.web.api.websocket.mark_user_message_delivery_sync",
+            "xagent.web.services.task_command_execution.mark_user_message_delivery_sync",
             side_effect=RuntimeError("marker unavailable"),
         ),
     ):
-        await _handle_chat_message_unserialized(
-            MagicMock(),
+        await handle_task_message(
+            _make_command_reply(MagicMock()),
             int(task.id),
             {
                 "message": "Apply this once",
@@ -2162,17 +2178,17 @@ async def test_live_resume_reads_the_interaction_row_before_injecting(
             "xagent.web.services.task_execution.execute_resume_background", AsyncMock()
         ),
         patch(
-            "xagent.web.api.websocket.active_interaction_id_sync",
+            "xagent.web.services.task_command_execution.active_interaction_id_sync",
             side_effect=record_read,
         ),
         patch(
-            "xagent.web.api.websocket.close_legacy_resume_interaction_sync",
+            "xagent.web.services.task_command_execution.close_legacy_resume_interaction_sync",
             return_value=1,
         ) as close_mock,
         caplog.at_level(logging.INFO, logger="xagent.web.api.websocket"),
     ):
-        await _handle_chat_message_unserialized(
-            MagicMock(),
+        await handle_task_message(
+            _make_command_reply(MagicMock()),
             int(task.id),
             {
                 "message": "Apply this once",
@@ -2259,11 +2275,11 @@ async def test_live_injection_skips_the_close_on_a_replayed_turn_id(
             "xagent.web.services.task_execution.execute_resume_background", AsyncMock()
         ),
         patch(
-            "xagent.web.api.websocket.close_legacy_resume_interaction_sync",
+            "xagent.web.services.task_command_execution.close_legacy_resume_interaction_sync",
         ) as close_mock,
     ):
-        await _handle_chat_message_unserialized(
-            MagicMock(),
+        await handle_task_message(
+            _make_command_reply(MagicMock()),
             task_id,
             {
                 "message": "a retried delivery",
@@ -2315,12 +2331,12 @@ async def test_live_close_failure_after_registered_handoff_is_still_accepted(
             "xagent.web.services.task_execution.execute_resume_background", AsyncMock()
         ),
         patch(
-            "xagent.web.api.websocket.close_legacy_resume_interaction_sync",
+            "xagent.web.services.task_command_execution.close_legacy_resume_interaction_sync",
             side_effect=RuntimeError("interaction close unavailable"),
         ) as close_mock,
     ):
-        await _handle_chat_message_unserialized(
-            MagicMock(),
+        await handle_task_message(
+            _make_command_reply(MagicMock()),
             int(task.id),
             {
                 "message": "Apply this once",
@@ -2383,12 +2399,12 @@ async def test_live_close_cancellation_does_not_abort_registered_handoff(
             "xagent.web.services.task_execution.execute_resume_background", AsyncMock()
         ),
         patch(
-            "xagent.web.api.websocket.close_legacy_resume_interaction_sync",
+            "xagent.web.services.task_command_execution.close_legacy_resume_interaction_sync",
             side_effect=raise_cancelled,
         ) as close_mock,
     ):
-        await _handle_chat_message_unserialized(
-            MagicMock(),
+        await handle_task_message(
+            _make_command_reply(MagicMock()),
             int(task.id),
             {
                 "message": "Apply this once",
@@ -2485,7 +2501,7 @@ def test_live_claim_unique_loser_returns_the_committed_winner(
     db_session.commit()
 
     with patch(
-        "xagent.web.api.websocket.claim_user_message_delivery_no_commit",
+        "xagent.web.services.task_command_execution.claim_user_message_delivery_no_commit",
         side_effect=IntegrityError(
             "INSERT task_chat_messages",
             {},
@@ -2528,7 +2544,7 @@ def test_live_claim_unique_loser_returns_conflicting_winner_with_files(
     db_session.commit()
 
     with patch(
-        "xagent.web.api.websocket.claim_user_message_delivery_no_commit",
+        "xagent.web.services.task_command_execution.claim_user_message_delivery_no_commit",
         side_effect=IntegrityError(
             "INSERT task_chat_messages",
             {},
@@ -2615,8 +2631,8 @@ async def test_message_handoff_registers_the_minted_run_not_the_stale_one(
             side_effect=resume_forever,
         ) as resume_bg,
     ):
-        await _handle_chat_message_unserialized(
-            MagicMock(),
+        await handle_task_message(
+            _make_command_reply(MagicMock()),
             int(task.id),
             {
                 "message": "resume a legacy row",
@@ -2709,13 +2725,13 @@ async def test_live_marker_cancellation_does_not_cancel_registered_handoff(
             side_effect=resume_forever,
         ),
         patch(
-            "xagent.web.api.websocket.mark_user_message_delivery_sync",
+            "xagent.web.services.task_command_execution.mark_user_message_delivery_sync",
             side_effect=mark_delivery,
         ),
     ):
         handling = asyncio.get_running_loop().create_task(
-            _handle_chat_message_unserialized(
-                MagicMock(),
+            handle_task_message(
+                _make_command_reply(MagicMock()),
                 int(task.id),
                 {
                     "message": "Apply despite disconnect",
@@ -2831,14 +2847,14 @@ def test_websocket_commit_reconciliation_read_failure_stays_unknown(
     session = MagicMock()
     session.query.side_effect = RuntimeError("reconciliation database unavailable")
     monkeypatch.setattr(
-        websocket_api,
+        command_execution_service,
         "get_session_local",
         lambda: lambda: session,
     )
-    monkeypatch.setattr(websocket_api.time, "sleep", MagicMock())
+    monkeypatch.setattr(command_execution_service.time, "sleep", MagicMock())
 
     assert (
-        websocket_api._reconcile_websocket_acceptance_graph(
+        command_execution_service._reconcile_command_acceptance_graph(
             task_id=123,
             task_owner_user_id=456,
             turn_id="read-failure-turn",
@@ -2872,7 +2888,7 @@ def test_websocket_commit_reconciliation_rejects_failed_delivery(
     db_session.commit()
 
     assert (
-        websocket_api._reconcile_websocket_acceptance_graph(
+        command_execution_service._reconcile_command_acceptance_graph(
             task_id=int(task.id),
             task_owner_user_id=int(owner.id),
             turn_id="failed-reconciliation-turn",
@@ -2902,7 +2918,7 @@ def test_missing_task_prepare_reconciles_a_commit_acknowledgement_failure(
 
     monkeypatch.setattr(Session, "commit", acknowledge_then_disconnect)
 
-    preparation = websocket_api._prepare_websocket_turn_sync(
+    preparation = command_execution_service._prepare_task_message_sync(
         requested_task_id=987654,
         actor_user_id=int(owner.id),
         actor_is_admin=False,
@@ -2939,8 +2955,8 @@ def test_missing_task_prepare_keeps_an_absent_commit_outcome_unknown(
 
     monkeypatch.setattr(Session, "commit", lose_commit_before_acknowledgement)
 
-    with pytest.raises(websocket_api._WebSocketCommitOutcomeUnknown):
-        websocket_api._prepare_websocket_turn_sync(
+    with pytest.raises(command_execution_service._TaskCommandCommitOutcomeUnknown):
+        command_execution_service._prepare_task_message_sync(
             requested_task_id=987655,
             actor_user_id=int(owner.id),
             actor_is_admin=False,
@@ -2991,16 +3007,16 @@ async def test_live_control_delivery_failure_pool_timeout_is_not_retried(
         patch("xagent.web.api.websocket.manager", ws_manager),
         patch("xagent.web.services.task_execution.background_task_manager", bg_mgr),
         patch(
-            "xagent.web.api.websocket.mark_user_message_delivery_sync",
+            "xagent.web.services.task_command_execution.mark_user_message_delivery_sync",
             mark_delivery,
         ),
         patch(
-            "xagent.web.api.websocket._read_task_error_payload_isolated",
+            "xagent.web.services.task_command_execution._read_task_error_payload_isolated",
             error_payload_reader,
         ),
     ):
-        await _handle_chat_message_unserialized(
-            MagicMock(),
+        await handle_task_message(
+            _make_command_reply(MagicMock()),
             int(task.id),
             {
                 "message": "apply once",
@@ -3066,13 +3082,13 @@ async def test_delivery_failure_persistence_drains_before_cancellation(
         patch("xagent.web.api.websocket.manager", ws_manager),
         patch("xagent.web.services.task_execution.background_task_manager", bg_manager),
         patch(
-            "xagent.web.api.websocket.mark_user_message_delivery_sync",
+            "xagent.web.services.task_command_execution.mark_user_message_delivery_sync",
             side_effect=blocking_mark_delivery,
         ),
     ):
         handling = asyncio.create_task(
-            _handle_chat_message_unserialized(
-                MagicMock(),
+            handle_task_message(
+                _make_command_reply(MagicMock()),
                 int(task.id),
                 {
                     "message": "apply once",
@@ -3284,8 +3300,8 @@ async def test_pending_same_id_delivery_reports_unknown_outcome(db_session) -> N
     )
 
     with patch("xagent.web.api.websocket.manager", ws_manager):
-        await _handle_chat_message_unserialized(
-            MagicMock(),
+        await handle_task_message(
+            _make_command_reply(MagicMock()),
             int(task.id),
             {
                 "message": "Pending guidance",
@@ -3346,13 +3362,13 @@ async def test_durable_pause_propagates_stale_run_error(db_session) -> None:
         ),
         patch("xagent.web.api.websocket.manager", ws_manager),
         patch(
-            "xagent.web.api.websocket._apply_pause_requested_isolated",
+            "xagent.web.services.task_command_execution._apply_pause_requested_isolated",
             side_effect=StaleTaskRunError("run rotated"),
         ),
         pytest.raises(StaleTaskRunError, match="run rotated"),
     ):
-        await _handle_pause_task_unserialized(
-            MagicMock(),
+        await pause_task(
+            _make_command_reply(MagicMock()),
             int(task.id),
             {"user": owner, "_durable_ack_sent": True},
         )
@@ -3381,8 +3397,8 @@ async def test_durable_resume_propagates_stale_run_error(db_session) -> None:
         ),
         pytest.raises(StaleTaskRunError, match="run rotated"),
     ):
-        await _handle_resume_task_unserialized(
-            MagicMock(),
+        await resume_task(
+            _make_command_reply(MagicMock()),
             int(task.id),
             {"user": owner, "_durable_ack_sent": True},
         )
@@ -3393,8 +3409,8 @@ async def test_durable_resume_propagates_stale_run_error(db_session) -> None:
 @pytest.mark.parametrize(
     ("kind", "handler_name"),
     [
-        (TaskCommandKind.PAUSE, "_handle_pause_task_unserialized"),
-        (TaskCommandKind.RESUME, "_handle_resume_task_unserialized"),
+        (TaskCommandKind.PAUSE, "pause_task"),
+        (TaskCommandKind.RESUME, "resume_task"),
     ],
 )
 async def test_durable_control_converts_handler_stale_run_to_terminal_rejection(
@@ -3421,7 +3437,7 @@ async def test_durable_control_converts_handler_stale_run_to_terminal_rejection(
     with (
         patch.object(websocket_api.manager, "connections_for_task", return_value=[]),
         patch(
-            f"xagent.web.api.websocket.{handler_name}",
+            f"xagent.web.services.task_command_execution.{handler_name}",
             new=AsyncMock(side_effect=StaleTaskRunError("run rotated")),
         ),
         pytest.raises(TaskCommandRejected) as exc_info,
@@ -3476,12 +3492,17 @@ async def test_durable_command_targets_the_registered_origin_not_list_order(
                 return_value=True,
             ),
             patch(
-                "xagent.web.api.websocket._handle_pause_task_unserialized",
+                "xagent.web.services.task_command_execution.pause_task",
                 new=AsyncMock(return_value=None),
             ) as handler,
         ):
             await _execute_durable_task_command(command)
-        assert handler.await_args.args[0] is origin
+        with patch.object(
+            websocket_api.manager, "send_personal_message", new=AsyncMock()
+        ) as send_reply:
+            payload = {"type": "task_paused", "task_id": int(task.id)}
+            await handler.await_args.args[0](payload)
+            send_reply.assert_awaited_once_with(payload, origin)
 
         # Without a registration, real connections in the list are ignored.
         websocket_api._command_origins.discard_command(command.command_id, int(task.id))
@@ -3492,20 +3513,18 @@ async def test_durable_command_targets_the_registered_origin_not_list_order(
                 return_value=[first_real],
             ),
             patch(
-                "xagent.web.api.websocket._handle_pause_task_unserialized",
+                "xagent.web.services.task_command_execution.pause_task",
                 new=AsyncMock(return_value=None),
             ) as handler,
         ):
             await _execute_durable_task_command(command)
-        assert isinstance(
-            handler.await_args.args[0], websocket_api._DiscardingCommandWebSocket
-        )
+        assert handler.await_args.args[0] is websocket_api.discard_command_reply
     finally:
         websocket_api._command_origins.discard_command(command.command_id, int(task.id))
 
 
 @pytest.mark.asyncio
-async def test_durable_command_falls_back_to_discarding_websocket_when_all_connections_are_broadcast_only(
+async def test_durable_command_falls_back_to_discarding_reply_when_all_connections_are_broadcast_only(
     db_session,
 ) -> None:
     """When every registered connection for the task is broadcast-only
@@ -3528,19 +3547,17 @@ async def test_durable_command_falls_back_to_discarding_websocket_when_all_conne
             return_value=[broadcast_only],
         ),
         patch(
-            "xagent.web.api.websocket._handle_pause_task_unserialized",
+            "xagent.web.services.task_command_execution.pause_task",
             new=AsyncMock(return_value=None),
         ) as handler,
     ):
         await _execute_durable_task_command(command)
 
-    assert isinstance(
-        handler.await_args.args[0], websocket_api._DiscardingCommandWebSocket
-    )
+    assert handler.await_args.args[0] is websocket_api.discard_command_reply
 
 
 @pytest.mark.asyncio
-async def test_durable_command_falls_back_to_discarding_websocket_when_no_connections(
+async def test_durable_command_falls_back_to_discarding_reply_when_no_connections(
     db_session,
 ) -> None:
     """An empty connection list still routes to the discarding sink,
@@ -3555,15 +3572,13 @@ async def test_durable_command_falls_back_to_discarding_websocket_when_no_connec
     with (
         patch.object(websocket_api.manager, "connections_for_task", return_value=[]),
         patch(
-            "xagent.web.api.websocket._handle_pause_task_unserialized",
+            "xagent.web.services.task_command_execution.pause_task",
             new=AsyncMock(return_value=None),
         ) as handler,
     ):
         await _execute_durable_task_command(command)
 
-    assert isinstance(
-        handler.await_args.args[0], websocket_api._DiscardingCommandWebSocket
-    )
+    assert handler.await_args.args[0] is websocket_api.discard_command_reply
 
 
 @pytest.mark.asyncio
@@ -4163,7 +4178,7 @@ async def test_resume_failure_rejection_redacts_exception_text(db_session) -> No
             task_owner_user_id=int(owner.id),
             delivery_turn_id="resume-rejection-turn",
             delivery_notifier=make_delivery_notifier(
-                MagicMock(), "resume-rejection-turn"
+                _make_command_reply(MagicMock()), "resume-rejection-turn"
             ),
         )
 
@@ -4228,7 +4243,7 @@ async def test_deferred_injection_failure_rejects_before_any_acceptance(
             },
             delivery_turn_id="deferred-injection-failure",
             delivery_notifier=make_delivery_notifier(
-                MagicMock(), "deferred-injection-failure"
+                _make_command_reply(MagicMock()), "deferred-injection-failure"
             ),
         )
 
@@ -4298,7 +4313,7 @@ async def test_deferred_injection_marker_failure_does_not_abort_resume(
     )
 
     def mark_delivery(_task_id: int, _turn_id: str, status: str):
-        if status == websocket_api.DELIVERY_DISPATCHED:
+        if status == command_execution_service.DELIVERY_DISPATCHED:
             raise RuntimeError("delivery marker unavailable")
         return None
 
@@ -4324,12 +4339,14 @@ async def test_deferred_injection_marker_failure_does_not_abort_resume(
             },
             delivery_turn_id="deferred-marker-turn",
             delivery_notifier=make_delivery_notifier(
-                MagicMock(), "deferred-marker-turn"
+                _make_command_reply(MagicMock()), "deferred-marker-turn"
             ),
         )
 
     mark_mock.assert_any_call(
-        int(task.id), "deferred-marker-turn", websocket_api.DELIVERY_DISPATCHED
+        int(task.id),
+        "deferred-marker-turn",
+        command_execution_service.DELIVERY_DISPATCHED,
     )
     agent.resume_execution_by_id.assert_awaited_once_with(str(task.id))
     accepted = [
@@ -4387,7 +4404,7 @@ async def test_deferred_injection_marker_cancellation_does_not_abort_resume(
     )
 
     def mark_delivery(_task_id: int, _turn_id: str, status: str):
-        if status == websocket_api.DELIVERY_DISPATCHED:
+        if status == command_execution_service.DELIVERY_DISPATCHED:
             raise asyncio.CancelledError
         return None
 
@@ -4413,12 +4430,14 @@ async def test_deferred_injection_marker_cancellation_does_not_abort_resume(
             },
             delivery_turn_id="deferred-marker-cancel-turn",
             delivery_notifier=make_delivery_notifier(
-                MagicMock(), "deferred-marker-cancel-turn"
+                _make_command_reply(MagicMock()), "deferred-marker-cancel-turn"
             ),
         )
 
     mark_mock.assert_any_call(
-        int(task.id), "deferred-marker-cancel-turn", websocket_api.DELIVERY_DISPATCHED
+        int(task.id),
+        "deferred-marker-cancel-turn",
+        command_execution_service.DELIVERY_DISPATCHED,
     )
     agent.resume_execution_by_id.assert_awaited_once_with(str(task.id))
     accepted = [
@@ -4520,7 +4539,7 @@ async def test_deferred_injection_close_failure_does_not_abort_resume(
             },
             delivery_turn_id="deferred-close-failure-turn",
             delivery_notifier=make_delivery_notifier(
-                MagicMock(), "deferred-close-failure-turn"
+                _make_command_reply(MagicMock()), "deferred-close-failure-turn"
             ),
         )
 
@@ -4612,7 +4631,7 @@ async def test_deferred_injection_closes_the_row_the_online_handler_observed(
             },
             delivery_turn_id="deferred-carry-turn",
             delivery_notifier=make_delivery_notifier(
-                MagicMock(), "deferred-carry-turn"
+                _make_command_reply(MagicMock()), "deferred-carry-turn"
             ),
         )
 
@@ -4723,7 +4742,7 @@ async def test_deferred_injection_skips_the_close_on_a_replayed_turn_id(
             },
             delivery_turn_id="deferred-replay-turn",
             delivery_notifier=make_delivery_notifier(
-                MagicMock(), "deferred-replay-turn"
+                _make_command_reply(MagicMock()), "deferred-replay-turn"
             ),
         )
 
@@ -4823,7 +4842,7 @@ async def test_deferred_injection_close_cancellation_does_not_abort_resume(
             },
             delivery_turn_id="deferred-close-cancel-turn",
             delivery_notifier=make_delivery_notifier(
-                MagicMock(), "deferred-close-cancel-turn"
+                _make_command_reply(MagicMock()), "deferred-close-cancel-turn"
             ),
         )
 
@@ -4892,7 +4911,7 @@ async def test_deferred_injection_rejects_before_post_when_lease_is_denied(
             },
             delivery_turn_id="deferred-lease-denied",
             delivery_notifier=make_delivery_notifier(
-                MagicMock(), "deferred-lease-denied"
+                _make_command_reply(MagicMock()), "deferred-lease-denied"
             ),
         )
 
@@ -4989,19 +5008,19 @@ async def test_durable_attachment_failure_keeps_the_storage_key_off_the_socket(
         broadcast_to_task=AsyncMock(),
         send_personal_message=AsyncMock(),
     )
-    logger_name = "xagent.web.api.websocket"
+    logger_name = command_execution_service.__name__
 
     with (
         patch(
-            "xagent.web.api.websocket._prepare_websocket_turn_sync",
+            "xagent.web.services.task_command_execution._prepare_task_message_sync",
             side_effect=failing_prepare,
         ),
         patch("xagent.web.api.websocket.manager", ws_manager),
         caplog.at_level(logging.WARNING, logger=logger_name),
     ):
         with pytest.raises(DurableStorageOperationError):
-            await _handle_chat_message_unserialized(
-                MagicMock(),
+            await handle_task_message(
+                _make_command_reply(MagicMock()),
                 task_id,
                 {
                     "message": "with an attachment",
@@ -5088,7 +5107,7 @@ async def test_a_dispatch_fault_is_labelled_with_the_message_that_failed(
         send_personal_message=AsyncMock(),
         broadcast_to_task=AsyncMock(),
     )
-    logger_name = "xagent.web.api.websocket"
+    logger_name = websocket_api.__name__
 
     with (
         patch.object(websocket_api, "manager", ws_manager),
@@ -5165,19 +5184,19 @@ async def test_a_durable_integrity_fault_is_answered_as_corruption_not_an_outage
         broadcast_to_task=AsyncMock(),
         send_personal_message=AsyncMock(),
     )
-    logger_name = "xagent.web.api.websocket"
+    logger_name = command_execution_service.__name__
 
     with (
         patch(
-            "xagent.web.api.websocket._prepare_websocket_turn_sync",
+            "xagent.web.services.task_command_execution._prepare_task_message_sync",
             side_effect=failing_prepare,
         ),
         patch("xagent.web.api.websocket.manager", ws_manager),
         caplog.at_level(logging.WARNING, logger=logger_name),
     ):
         with pytest.raises(DurableObjectIntegrityError):
-            await _handle_chat_message_unserialized(
-                MagicMock(),
+            await handle_task_message(
+                _make_command_reply(MagicMock()),
                 task_id,
                 {
                     "message": "with a corrupted attachment",

@@ -4,7 +4,7 @@ import hashlib
 import json
 import os
 from copy import deepcopy
-from typing import Any
+from typing import Any, Literal
 
 import sqlalchemy as sa
 from sqlalchemy.engine import Connection
@@ -1550,6 +1550,11 @@ _BUILTIN_EXECUTION_FIELD_NAMES = (
     "launch_config",
 )
 
+# Runtime policy must not become part of the persisted PublicMCPApp catalog
+# descriptor. Keeping this allowlist separate also preserves frozen migration
+# rows while making execution-scoped admission code-owned and fail-closed.
+_EXECUTION_SCOPED_STDIO_APP_IDS = frozenset({"chrome-devtools"})
+
 
 def _matches_builtin_provenance(
     canonical_row: dict[str, Any], persisted_launch_config: Any
@@ -1602,6 +1607,17 @@ def get_builtin_execution_fields(app_id: str) -> dict[str, Any] | None:
     return deepcopy(
         {field_name: row[field_name] for field_name in _BUILTIN_EXECUTION_FIELD_NAMES}
     )
+
+
+def get_builtin_stdio_session_scope(
+    app_id: str,
+) -> Literal["per_call", "execution"]:
+    """Return code-owned stdio session scope; ordinary apps are per-call."""
+
+    row = get_builtin_public_mcp_app(app_id)
+    if row is not None and app_id in _EXECUTION_SCOPED_STDIO_APP_IDS:
+        return "execution"
+    return "per_call"
 
 
 def get_builtin_execution_fields_and_optional_scopes(

@@ -8,9 +8,11 @@ from sqlalchemy import event
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
 from xagent.web.api import websocket as websocket_api
+from xagent.web.api.websocket import _make_command_reply
 from xagent.web.models.database import get_engine
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
+from xagent.web.services import task_command_execution as command_execution_service
 from xagent.web.services import task_execution as task_execution_service
 from xagent.web.services.task_execution import _terminal_task_error_payload
 from xagent.web.services.task_lease_service import TaskLease, get_runner_id
@@ -329,7 +331,7 @@ async def test_legacy_handler_does_not_steal_live_foreign_lease(
         return real_session_factory
 
     monkeypatch.setattr(
-        websocket_api,
+        command_execution_service if handler_name == "chat" else websocket_api,
         "get_session_local",
         tracked_get_session_local,
     )
@@ -340,8 +342,8 @@ async def test_legacy_handler_does_not_steal_live_foreign_lease(
         "user": SimpleNamespace(id=user_id, is_admin=False),
     }
     if handler_name == "chat":
-        await websocket_api._handle_chat_message_unserialized(
-            object(),
+        await command_execution_service.handle_task_message(
+            _make_command_reply(object()),
             task_id,
             message_data,
         )

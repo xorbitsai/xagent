@@ -4,7 +4,7 @@ Four production sites inject a WebSocket, A2A, or v1 SDK user message
 straight into a checkpoint instead of going through the native interaction
 protocol's answer path: the online WebSocket injection, the deferred
 WebSocket injection (``execute_resume_background``), the A2A resume-input
-path, and the v1 ``POST .../reply`` resume-input path (``task_reply.py``).
+path, and the v1 ``POST .../reply`` resume-input path (``task_resume.py``).
 Each of those sites, once its own message write has succeeded, must retire
 the run's active ``task_interaction_requests`` row (if any) as
 ``terminated`` / ``answered_via_legacy_resume`` and clear
@@ -52,11 +52,11 @@ close call (``mark_user_message_delivery_sync``) the identical log-only
 way, for the identical reason; see the inline comments beside each pair.
 The A2A and v1 reply sites are different: each close call runs inside its
 own resume-input fence transaction (``_update_a2a_resume_input_sync`` in
-``a2a.py``, ``_update_reply_input_sync`` in ``task_reply.py``), committed
+``task_resume.py``, ``_update_reply_input_sync`` in the same module), committed
 together with the ownership fence UPDATE that precedes it -- that is what
 makes those two sites stronger than the WebSocket sites, not a claim that
 the close is atomic with the message injection itself. The message
-injection (``post_user_message`` at ``a2a.py:464`` / ``task_reply.py:512``)
+injection (``post_user_message`` in ``task_resume.py``)
 commits on its own, earlier, in ``AgentRunner._persist_injected_context``;
 only after that commit has already landed does the caller open the fence
 transaction that writes the resumed input and closes the interaction row
@@ -94,7 +94,7 @@ site cannot quietly become dangerous if it is ever changed to derive its
 own key.
 
 The fourth production caller, the v1 ``POST .../reply`` resume-input
-path (``task_reply.py``), carries no guard at all and needs none: it
+path (``task_resume.py``), carries no guard at all and needs none: it
 builds its turn id as ``f"v1:reply:{task_id}:{uuid4()}"``, a value that
 is fresh on every single call, so it can never present a repeated turn
 id and can never reach the short circuit that produces a replay.
@@ -321,7 +321,7 @@ def active_interaction_id_sync(task_id: int) -> ActiveInteractionRead:
 
     Opens and closes its own short session. Three legacy-resume injection
     paths call it from a point where they hold no session of their own: the
-    two fence-transaction paths (``a2a.py``, ``v1/task_reply.py``) open
+    two fence-transaction paths (both in ``task_resume.py``) open
     their fence only after the injection has already committed, and the
     WebSocket online chat injection holds none at all. The fourth
     legacy-resume path -- the WebSocket deferred injection reached through

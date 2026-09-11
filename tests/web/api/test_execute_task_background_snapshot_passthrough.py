@@ -41,8 +41,12 @@ from xagent.web.models.agent import AgentStatus
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
 from xagent.web.services.llm_utils import AgentRuntimeFields
+from xagent.web.services.mcp_runtime import (
+    MCPActorAuthorizationPolicy,
+    MCPActorExecutionIdentity,
+)
 from xagent.web.services.task_execution import execute_task_background
-from xagent.web.services.task_lease_service import TaskLease
+from xagent.web.services.task_lease_service import TaskLease, current_task_lease
 from xagent.web.services.task_setup_snapshot import (
     RuntimeUserFields,
     TaskSetupSnapshot,
@@ -244,6 +248,59 @@ async def test_snapshot_path_skips_task_and_user_queries() -> None:
     ]
     assert forwarded_snapshot is snapshot
     assert forwarded_snapshot.task.source == "trigger"
+
+
+@pytest.mark.asyncio
+async def test_actor_execution_identity_is_forwarded_before_lease_context_bind() -> (
+    None
+):
+    snapshot = _make_snapshot()
+    agent_service = _build_fake_agent_service()
+    observed: list[MCPActorExecutionIdentity | None] = []
+
+    async def get_agent_for_task(*_args: Any, **kwargs: Any) -> Any:
+        assert current_task_lease() is None
+        observed.append(kwargs.get("mcp_actor_execution_identity"))
+        return agent_service
+
+    agent_manager = MagicMock(
+        get_agent_for_task=AsyncMock(side_effect=get_agent_for_task),
+        execute_task=AsyncMock(
+            return_value={"success": True, "output": "ok", "status": "completed"}
+        ),
+    )
+    lease = TaskLease(
+        task_id=42,
+        runner_id="runner-a",
+        run_id="run-a",
+        attempt_id="attempt-a",
+    )
+    policy = MCPActorAuthorizationPolicy(
+        resource_owner_key="toby:slack:T1:U1",
+        allow_builtin_stdio=True,
+    )
+
+    with _Patches(_common_patches(MagicMock(), agent_service)):
+        await execute_task_background(
+            task_id=42,
+            user_message="hi",
+            context={"turn_id": "turn-a"},
+            agent_manager=agent_manager,
+            task_owner_user_id=1,
+            task_setup_snapshot=snapshot,
+            task_lease=lease,
+            mcp_runtime_authorization_policy=policy,
+            resolved_execution_scope=None,
+        )
+
+    assert observed == [
+        MCPActorExecutionIdentity(
+            task_id=42,
+            run_id="run-a",
+            turn_id="turn-a",
+            lease_attempt_id="attempt-a",
+        )
+    ]
 
 
 @pytest.mark.asyncio

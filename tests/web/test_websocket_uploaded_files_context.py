@@ -12,14 +12,8 @@ from xagent.core.workspace import TaskWorkspace
 from xagent.web.api import websocket as websocket_api
 from xagent.web.api.chat import _build_task_agent_config
 from xagent.web.api.websocket import (
-    _append_uploaded_files_context_to_message,
-    _build_uploaded_files_context,
-    _display_file_refs_from_file_info,
-    _display_message_for_user,
-    _normalize_attachments_for_persistence,
     _normalize_file_outputs,
     _normalize_task_file_outputs,
-    _selected_file_refs_from_task,
     handle_file_upload_for_task,
 )
 from xagent.web.models import Base
@@ -28,6 +22,14 @@ from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 from xagent.web.services import agent_service_manager as agent_runtime_service
 from xagent.web.services import task_execution as task_execution_service
+from xagent.web.services.task_command_execution import (
+    _append_uploaded_files_context_to_message,
+    _build_uploaded_files_context,
+    _display_file_refs_from_file_info,
+    _display_message_for_user,
+    _normalize_attachments_for_persistence,
+    _selected_file_refs_from_task,
+)
 from xagent.web.services.task_execution import (
     _register_uploaded_files_for_agent,
     _rewrite_file_links_to_file_id,

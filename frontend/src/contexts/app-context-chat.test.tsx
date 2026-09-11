@@ -757,6 +757,207 @@ describe("AppProvider websocket message routing", () => {
     })
   })
 
+  it("collapses one assistant question replayed after a reconnect", async () => {
+    render(
+      <AppProvider token="token">
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+    const interactions = [{ type: "confirm", label: "Proceed?" }]
+
+    // Live delivery: the raw prompt, carrying the form.
+    act(() => {
+      onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:00Z",
+        data: {
+          event_id: "question-1",
+          event_type: "agent_message",
+          data: {
+            message: "Round 1: please confirm",
+            expect_response: true,
+            request_id: "req-1",
+            metadata: { interactions },
+          },
+        },
+      })
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "Round 1: please confirm"
+      )
+    })
+
+    // Reconnect replay: same question, same event identity, but the
+    // transcript copy has the rendered interaction list appended, so no
+    // content comparison could pair the two.
+    act(() => {
+      onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:05Z",
+        data: {
+          event_id: "question-1",
+          event_type: "agent_message",
+          data: {
+            message:
+              "Round 1: please confirm\n\nPlease answer the following questions:\n- Proceed?",
+            role: "assistant",
+            source: "chat_history",
+            display: "chat",
+            expect_response: false,
+            visible: true,
+            metadata: { interactions },
+          },
+        },
+      })
+    })
+
+    // A second reconnect replays it again. The issue reported three copies on
+    // screen at this point; the widget session page never clears messages on
+    // reconnect, so nothing but identity stops them accumulating.
+    act(() => {
+      ;(window as typeof window & { clearDuplicateMessageCache?: () => void })
+        .clearDuplicateMessageCache?.()
+      onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:09Z",
+        data: {
+          event_id: "question-1",
+          event_type: "agent_message",
+          data: {
+            message:
+              "Round 1: please confirm\n\nPlease answer the following questions:\n- Proceed?",
+            role: "assistant",
+            source: "chat_history",
+            display: "chat",
+            expect_response: false,
+            visible: true,
+            metadata: { interactions },
+          },
+        },
+      })
+    })
+
+    await waitFor(() => {
+      const messages = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]"
+      ) as Array<{ id: string; role: string; content: string }>
+      const assistant = messages.filter(message => message.role === "assistant")
+      expect(assistant).toHaveLength(1)
+      expect(assistant[0].id).toBe("msg-agent-event-question-1")
+      expect(assistant[0].content).toBe("Round 1: please confirm")
+    })
+  })
+
+  it("does not re-print the question when replay is followed by the waiting re-assert", async () => {
+    // After the snapshot, the server re-asserts WAITING_FOR_USER with the
+    // question text read straight off the transcript row
+    // (get_latest_waiting_question returns TaskChatMessage.content), so it is
+    // byte-identical to the replayed row event. Suppressing the trace twin
+    // must not leave that frame as a fresh third bubble.
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("running")
+    })
+    const interactions = [{ type: "confirm", label: "Proceed?" }]
+    const transcriptText =
+      "Round 1: please confirm\n\nPlease answer the following questions:\n- Proceed?"
+
+    act(() => {
+      onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:00Z",
+        data: {
+          event_id: "question-1",
+          event_type: "agent_message",
+          data: {
+            message: transcriptText,
+            role: "assistant",
+            source: "chat_history",
+            display: "chat",
+            expect_response: false,
+            visible: true,
+            metadata: { interactions },
+          },
+        },
+      })
+      onMessage?.({
+        type: "task_waiting_for_user",
+        timestamp: "2026-05-27T05:00:01Z",
+        question: transcriptText,
+        message: transcriptText,
+        interactions,
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("waiting_for_user")
+    })
+    const messages = JSON.parse(
+      screen.getByTestId("messages").textContent || "[]"
+    ) as Array<{ role: string; content: string }>
+    expect(messages.filter(message => message.role === "assistant")).toHaveLength(1)
+  })
+
+  it("keeps two rounds that ask the same question verbatim", async () => {
+    render(
+      <AppProvider token="token">
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:00Z",
+        data: {
+          event_id: "question-1",
+          event_type: "agent_message",
+          data: {
+            message: "Please confirm",
+            expect_response: true,
+            request_id: "req-1",
+          },
+        },
+      })
+      onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:01Z",
+        data: {
+          event_id: "question-2",
+          event_type: "agent_message",
+          data: {
+            message: "Please confirm",
+            expect_response: true,
+            request_id: "req-2",
+          },
+        },
+      })
+    })
+
+    await waitFor(() => {
+      const messages = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]"
+      ) as Array<{ id: string; role: string; content: string }>
+      expect(messages.filter(message => message.content === "Please confirm"))
+        .toHaveLength(2)
+    })
+  })
+
   it("keeps identical text from distinct user turns", async () => {
     render(
       <AppProvider token="token">

@@ -12,7 +12,7 @@ def test_create_base_llm_returns_deepseek_llm():
     config = ChatModelConfig(
         id="deepseek-model",
         model_provider="deepseek",
-        model_name="deepseek-v4-flash",
+        model_name="deepseek-flash",
         api_key="test-api-key",
     )
 
@@ -20,6 +20,7 @@ def test_create_base_llm_returns_deepseek_llm():
 
     assert hasattr(llm, "_inner")
     assert isinstance(llm._inner, DeepSeekLLM)
+    assert llm.model_name == "deepseek-flash"
 
 
 def test_create_base_llm_accepts_canonicalized_deepseek_provider():
@@ -60,8 +61,9 @@ def test_deepseek_default_base_url():
     assert default_base_url_for_provider("deepseek") == "https://api.deepseek.com"
 
 
-def test_deepseek_curated_models_are_limited_to_v4():
+def test_deepseek_curated_models_include_stable_flash_name_and_v4_aliases():
     assert curated_models_for_provider("deepseek") == (
+        "deepseek-flash",
         "deepseek-v4-flash",
         "deepseek-v4-pro",
     )

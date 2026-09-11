@@ -42,7 +42,6 @@ from ...core.runtime_performance import (
 from ...core.runtime_performance import (
     observe_duration,
     observe_value,
-    run_in_thread_with_telemetry,
 )
 from ..auth_config import (
     ACCESS_TOKEN_EXPIRE_MINUTES,
@@ -54,6 +53,11 @@ from ..auth_config import (
 from ..auth_dependencies import get_current_user
 from ..first_admin_setup import FirstAdminIdentity, run_first_admin_setup_hook
 from ..models.actor_oauth_flow import ActorOAuthFlowState
+from ..models.auth_database import (
+    SyncAuthSessionFactory,
+    get_auth_db,
+    run_auth_db_worker,
+)
 from ..models.database import (
     get_db,
     get_session_local,
@@ -1484,95 +1488,73 @@ def get_user_by_login_identifier(db: Session, identifier: str) -> Optional[User]
     return get_user_by_username(db, login_identifier)
 
 
+def _prepare_login_response(user: User | None, request: LoginRequest) -> Dict[str, Any]:
+    """Build detached response data before commit can expire ORM attributes."""
+    if user is None:
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
+    with observe_duration("xagent.auth.login.password_verify.duration"):
+        valid = verify_password(request.password, str(user.password_hash))
+    if not valid:
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
+    with observe_duration("xagent.auth.login.token_creation.duration"):
+        identity = {"sub": user.username, "user_id": user.id}
+        access_token = create_access_token(
+            data=identity,
+            expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
+        )
+        token = create_refresh_token(data=identity)
+    setattr(user, "refresh_token", token)
+    setattr(
+        user,
+        "refresh_token_expires_at",
+        datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS),
+    )
+    return {
+        "success": True,
+        "message": "Login successful",
+        "user": serialize_auth_user(user, include_login_time=True),
+        "access_token": access_token,
+        "refresh_token": token,
+        "token_type": "bearer",
+        "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        "refresh_expires_in": REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60 * 60,
+        "user_id": user.id,
+    }
+
+
+def _login_in_worker(
+    request: LoginRequest, session_factory: SyncAuthSessionFactory
+) -> Dict[str, Any]:
+    # The same thread creates, queries, commits and closes the Session.
+    with session_factory() as session:
+        with observe_duration("xagent.auth.login.sync_lookup.duration"):
+            user = get_user_by_login_identifier(session, request.username)
+        response = _prepare_login_response(user, request)
+        with observe_duration("xagent.auth.login.sync_commit.duration"):
+            session.commit()
+        # Do not access user here: expire_on_commit=True would issue another SELECT.
+        return response
+
+
 @auth_router.post("/login")
-async def login(request: LoginRequest, db: Session = Depends(get_db)) -> Dict[str, Any]:
-    """User login endpoint"""
+async def login(
+    request: LoginRequest,
+    db: SyncAuthSessionFactory = Depends(get_auth_db),
+) -> Dict[str, Any]:
+    """Authenticate with a single worker-owned database transaction."""
     started_at = time.perf_counter()
     outcome = "error"
     try:
-        # Run synchronous database queries in thread pool to avoid blocking event loop
-        def _get_user_sync() -> User:
-            # Get user from database
-            user = get_user_by_login_identifier(db, request.username)
-            if not user:
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="Incorrect username or password",
-                )
-            return user
-
-        # Execute database query in thread pool to avoid blocking
-        user = await run_in_thread_with_telemetry(
-            "login_user_lookup",
-            _get_user_sync,
+        response = await run_auth_db_worker(
+            "login_database_transaction", lambda: _login_in_worker(request, db)
         )
-
-        # Verify password
-        with observe_duration("xagent.auth.login.password_verify.duration"):
-            password_valid = verify_password(request.password, str(user.password_hash))
-        if not password_valid:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Incorrect username or password",
-            )
-
-        # Create JWT tokens
-        with observe_duration("xagent.auth.login.token_creation.duration"):
-            access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-            access_token = create_access_token(
-                data={"sub": user.username, "user_id": user.id},
-                expires_delta=access_token_expires,
-            )
-
-            # Create refresh token
-            refresh_token = create_refresh_token(
-                data={"sub": user.username, "user_id": user.id}
-            )
-
-        # Store refresh token in database - run in thread pool to avoid blocking
-        def _update_user_sync() -> None:
-            setattr(user, "refresh_token", refresh_token)
-            setattr(
-                user,
-                "refresh_token_expires_at",
-                datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS),
-            )
-            db.commit()
-
-        # Execute database update in thread pool to avoid blocking
-        await run_in_thread_with_telemetry(
-            "login_refresh_token_commit",
-            _update_user_sync,
-        )
-
-        # Login successful
         outcome = "succeeded"
-        return {
-            "success": True,
-            "message": "Login successful",
-            "user": serialize_auth_user(user, include_login_time=True),
-            "access_token": access_token,
-            "refresh_token": refresh_token,
-            "token_type": "bearer",
-            "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,  # seconds
-            "refresh_expires_in": REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60 * 60,  # seconds
-            "user_id": user.id,
-        }
-
+        return response
     except HTTPException:
-        # Re-raise HTTP exceptions
         outcome = "rejected"
         raise
     except Exception:
-        # str(e) is not put in the response: _update_user_sync's db.commit()
-        # above persists the just-issued refresh_token as a bound SQL
-        # parameter, and a SQLAlchemy StatementError's default __str__
-        # would otherwise echo that live session token back to the client
-        # -- the same class of leak fixed in generic_oauth_callback's
-        # callback handler. hide_parameters=True on the engine
-        # (models/database.py) now hides it there too, but this handler
-        # doesn't rely on that alone. logger.exception still captures it
-        # server-side.
+        # SQL errors may contain bound refresh tokens. Never expose them to clients.
         logger.exception("Login failed")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -2042,91 +2024,68 @@ async def update_current_user_preferences(
         )
 
 
+def _prepare_refresh_response(
+    user: User | None, request: RefreshTokenRequest
+) -> RefreshTokenResponse:
+    if user is None:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+    token = getattr(user, "refresh_token", None)
+    expires = getattr(user, "refresh_token_expires_at", None)
+    if token != request.refresh_token or expires is None:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+    now = datetime.now(timezone.utc)
+    if getattr(expires, "tzinfo", None) is None:
+        now = now.replace(tzinfo=None)
+    if expires < now:
+        raise HTTPException(status_code=401, detail="Refresh token has expired")
+    identity = {"sub": user.username, "user_id": user.id}
+    access_token = create_access_token(
+        data=identity, expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    )
+    new_token = create_refresh_token(data=identity)
+    setattr(user, "refresh_token", new_token)
+    setattr(
+        user,
+        "refresh_token_expires_at",
+        datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS),
+    )
+    return RefreshTokenResponse(
+        success=True,
+        message="Token refreshed successfully",
+        access_token=access_token,
+        refresh_token=new_token,
+        expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        refresh_expires_in=REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60 * 60,
+    )
+
+
+def _refresh_in_worker(
+    request: RefreshTokenRequest,
+    user_id: Any,
+    session_factory: SyncAuthSessionFactory,
+) -> RefreshTokenResponse:
+    with session_factory() as session:
+        user = session.query(User).filter(User.id == user_id).first()
+        response = _prepare_refresh_response(user, request)
+        session.commit()
+        return response
+
+
 @auth_router.post("/refresh", response_model=RefreshTokenResponse)
 async def refresh_token(
     request: RefreshTokenRequest,
-    db: Session = Depends(get_db),
+    db: SyncAuthSessionFactory = Depends(get_auth_db),
 ) -> RefreshTokenResponse:
-    """Refresh JWT access token using refresh token"""
+    """Refresh tokens without sharing a synchronous Session across threads."""
     try:
-        # Verify refresh token
         payload = verify_refresh_token(request.refresh_token)
         if not payload:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid refresh token",
-            )
-
-        # Get user from database
+            raise HTTPException(status_code=401, detail="Invalid refresh token")
         user_id = payload.get("user_id")
-        user = db.query(User).filter(User.id == user_id).first()
-
-        if not user:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid refresh token",
-            )
-
-        # Check if refresh token matches and is not expired
-        user_refresh_token = getattr(user, "refresh_token", None)
-        refresh_token_expires_at = getattr(user, "refresh_token_expires_at", None)
-        if (
-            user_refresh_token != request.refresh_token
-            or refresh_token_expires_at is None
-        ):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid refresh token",
-            )
-
-        # Check expiration - handle timezone-aware and naive datetimes
-        now = datetime.now(timezone.utc)
-        if (
-            hasattr(refresh_token_expires_at, "tzinfo")
-            and getattr(refresh_token_expires_at, "tzinfo", None) is not None
-        ):
-            # Timezone-aware datetime
-            if cast(Any, refresh_token_expires_at) < now:
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="Refresh token has expired",
-                )
-        else:
-            # Naive datetime - assume UTC
-            if cast(Any, refresh_token_expires_at) < now.replace(tzinfo=None):
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="Refresh token has expired",
-                )
-
-        # Create new access token
-        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-        access_token = create_access_token(
-            data={"sub": user.username, "user_id": user.id},
-            expires_delta=access_token_expires,
+        return await run_auth_db_worker(
+            "refresh_database_transaction",
+            lambda: _refresh_in_worker(request, user_id, db),
         )
-
-        # Optionally: Create new refresh token (rotation)
-        new_refresh_token = create_refresh_token(
-            data={"sub": user.username, "user_id": user.id}
-        )
-        setattr(user, "refresh_token", new_refresh_token)
-        setattr(
-            user,
-            "refresh_token_expires_at",
-            datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS),
-        )
-        db.commit()
-
-        return RefreshTokenResponse(
-            success=True,
-            message="Token refreshed successfully",
-            access_token=access_token,
-            refresh_token=new_refresh_token,
-            expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60,  # seconds
-            refresh_expires_in=REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60 * 60,  # seconds
-        )
-
     except HTTPException:
         raise
     except SQLAlchemyError:

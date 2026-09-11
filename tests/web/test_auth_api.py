@@ -14,9 +14,11 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
 
+from tests.shared.auth_database import auth_db_override
 from xagent.web.api import auth as auth_api
 from xagent.web.api.auth import RefreshTokenResponse, auth_router, hash_password
 from xagent.web.models import database as database_module
+from xagent.web.models.auth_database import get_auth_db
 from xagent.web.models.database import Base, configure_db, get_db, get_engine
 from xagent.web.models.user import User
 from xagent.web.services import agent_service_manager as agent_runtime_service
@@ -45,6 +47,7 @@ def override_get_db():
 test_app = FastAPI()
 test_app.include_router(auth_router)
 test_app.dependency_overrides[get_db] = override_get_db
+test_app.dependency_overrides[get_auth_db] = auth_db_override(override_get_db)
 
 # Create test client
 client = TestClient(test_app)

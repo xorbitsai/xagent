@@ -14,11 +14,13 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from tests.shared.auth_database import auth_db_override
 from xagent.core.tools.adapters.vibe.config import (
     ToolFactoryRuntimeSessionBoundaryError,
 )
 from xagent.web.api.auth import auth_router
 from xagent.web.api.tools import _create_tool_info, tools_router
+from xagent.web.models.auth_database import get_auth_db
 from xagent.web.models.database import Base, get_db, get_engine, init_db
 from xagent.web.models.task import Task, TraceEvent
 from xagent.web.models.tool_config import ToolConfig
@@ -40,6 +42,7 @@ test_app = FastAPI()
 test_app.include_router(auth_router)
 test_app.include_router(tools_router)
 test_app.dependency_overrides[get_db] = override_get_db
+test_app.dependency_overrides[get_auth_db] = auth_db_override(override_get_db)
 
 # Create test client
 client = TestClient(test_app)

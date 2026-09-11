@@ -4,10 +4,12 @@ import tempfile
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from tests.shared.auth_database import auth_db_override
 from xagent.core.tools.adapters.vibe.agent_tool_names import gen_agent_tool_name
 from xagent.web.api.agents import router as agents_router
 from xagent.web.api.auth import auth_router
 from xagent.web.api.tools import tools_router
+from xagent.web.models.auth_database import get_auth_db
 from xagent.web.models.database import Base, get_db, get_engine
 
 
@@ -26,6 +28,7 @@ app_for_tests.include_router(auth_router)
 app_for_tests.include_router(agents_router)
 app_for_tests.include_router(tools_router)
 app_for_tests.dependency_overrides[get_db] = override_get_db
+app_for_tests.dependency_overrides[get_auth_db] = auth_db_override(override_get_db)
 client = TestClient(app_for_tests)
 
 

@@ -12,6 +12,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 import xagent.web.api.mcp as mcp_api
+from tests.shared.auth_database import auth_db_override
 from xagent.web.api.admin_mcp import (
     PublicMCPAppCreate,
     PublicMCPAppUpdate,
@@ -24,6 +25,7 @@ from xagent.web.api.auth import (
     auth_router,
 )
 from xagent.web.api.mcp import mcp_router
+from xagent.web.models.auth_database import get_auth_db
 from xagent.web.models.database import Base, get_db, get_engine
 from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.oauth_provider import OAuthProvider
@@ -47,6 +49,7 @@ app_for_tests.include_router(auth_router)
 app_for_tests.include_router(mcp_router)
 app_for_tests.include_router(admin_mcp_router)
 app_for_tests.dependency_overrides[get_db] = override_get_db
+app_for_tests.dependency_overrides[get_auth_db] = auth_db_override(override_get_db)
 client = TestClient(app_for_tests)
 
 

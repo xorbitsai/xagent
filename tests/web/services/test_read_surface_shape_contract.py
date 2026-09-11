@@ -53,6 +53,7 @@ from sqlalchemy.orm import Session
 
 import xagent.web.api.websocket as websocket_module
 import xagent.web.services.task_interaction_service as interaction_service_module
+from tests.shared.auth_database import auth_db_override
 from tests.web.services.task_interaction_schema_shared import anchor_event_id
 from xagent.core.agent.checkpoint import CHECKPOINT_EVENT_TYPE
 from xagent.core.agent.transcript import build_assistant_transcript_content
@@ -60,6 +61,7 @@ from xagent.web.api.agents import router as agents_router
 from xagent.web.api.auth import auth_router
 from xagent.web.api.chat import chat_router
 from xagent.web.api.v1 import v1_router
+from xagent.web.models.auth_database import get_auth_db
 from xagent.web.models.database import (
     Base,
     get_db,
@@ -172,6 +174,7 @@ def _environment(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_Environm
     app.include_router(chat_router)
     app.include_router(v1_router)
     app.dependency_overrides[get_db] = _override_get_db
+    app.dependency_overrides[get_auth_db] = auth_db_override(_override_get_db)
     client = TestClient(app)
 
     status_response = client.get("/api/auth/setup-status")

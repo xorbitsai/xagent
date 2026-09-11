@@ -10,11 +10,13 @@ import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
+from tests.shared.auth_database import auth_db_override
 from xagent.core.model.chat.basic.base import BaseLLM
 from xagent.core.task_runtime import TaskRuntimeClientError
 from xagent.web.api.auth import auth_router
 from xagent.web.api.chat import chat_router
 from xagent.web.api.model import model_router
+from xagent.web.models.auth_database import get_auth_db
 from xagent.web.models.database import Base, get_db, get_engine
 from xagent.web.schemas.chat import MAX_SEED_INTERACTIONS
 from xagent.web.services.agent_service_manager import (
@@ -39,6 +41,7 @@ test_app.include_router(auth_router)
 test_app.include_router(model_router)
 test_app.include_router(chat_router)
 test_app.dependency_overrides[get_db] = override_get_db
+test_app.dependency_overrides[get_auth_db] = auth_db_override(override_get_db)
 
 client = TestClient(test_app)
 

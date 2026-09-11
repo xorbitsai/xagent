@@ -10,6 +10,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.exc import IntegrityError
 
+from tests.shared.auth_database import auth_db_override
 from xagent.web.api.auth import auth_router, hash_password
 from xagent.web.api.templates import (
     get_agent_capability_lists,
@@ -19,6 +20,7 @@ from xagent.web.api.templates import (
 )
 from xagent.web.api.templates import router as templates_router
 from xagent.web.models.agent import Agent, AgentOrigin, AgentStatus
+from xagent.web.models.auth_database import get_auth_db
 from xagent.web.models.database import Base, get_db, get_engine
 from xagent.web.models.template_stats import TemplateStats, UserTemplateRelation
 from xagent.web.models.user import User
@@ -40,6 +42,7 @@ test_app = FastAPI()
 test_app.include_router(auth_router)
 test_app.include_router(templates_router)
 test_app.dependency_overrides[get_db] = override_get_db
+test_app.dependency_overrides[get_auth_db] = auth_db_override(override_get_db)
 
 # Create test client
 client = TestClient(test_app)

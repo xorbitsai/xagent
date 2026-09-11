@@ -9,8 +9,10 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from tests.shared.auth_database import auth_db_override
 from xagent.web.api.agents import router as agents_router
 from xagent.web.api.auth import auth_router
+from xagent.web.models.auth_database import get_auth_db
 from xagent.web.models.database import Base, get_db, get_engine
 from xagent.web.services.agent_prompt import enhance_system_prompt_with_kb
 
@@ -29,6 +31,7 @@ app_for_tests = FastAPI()
 app_for_tests.include_router(auth_router)
 app_for_tests.include_router(agents_router)
 app_for_tests.dependency_overrides[get_db] = _override_get_db
+app_for_tests.dependency_overrides[get_auth_db] = auth_db_override(_override_get_db)
 client = TestClient(app_for_tests)
 
 

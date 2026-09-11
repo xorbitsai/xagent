@@ -11,10 +11,12 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from tests.shared.auth_database import auth_db_override
 from xagent.core.model.model import ChatModelConfig, EmbeddingModelConfig
 from xagent.web.api import model as model_module
 from xagent.web.api.auth import auth_router
 from xagent.web.api.model import model_router
+from xagent.web.models.auth_database import get_auth_db
 from xagent.web.models.auto_model import AutoModelCandidate, AutoModelConfig
 from xagent.web.models.database import Base, get_db, get_engine
 from xagent.web.models.model import Model as DBModel
@@ -45,6 +47,7 @@ test_app = FastAPI()
 test_app.include_router(auth_router)
 test_app.include_router(model_router)
 test_app.dependency_overrides[get_db] = override_get_db
+test_app.dependency_overrides[get_auth_db] = auth_db_override(override_get_db)
 
 # Create test client
 client = TestClient(test_app)

@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import event
 from sqlalchemy.orm import Session
 
+from tests.shared.auth_database import auth_db_override
 from xagent.core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
 from xagent.web.api.auth import auth_router, create_access_token
 from xagent.web.api.chat import chat_router
@@ -26,6 +27,7 @@ from xagent.web.channels.feishu.bot import FeishuBotInstance
 from xagent.web.channels.telegram import bot as telegram_bot_module
 from xagent.web.channels.telegram.bot import TelegramBotInstance
 from xagent.web.models.agent import Agent, AgentOrigin, AgentStatus
+from xagent.web.models.auth_database import get_auth_db
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.custom_api import CustomApi, UserCustomApi
 from xagent.web.models.database import (
@@ -65,6 +67,7 @@ app.include_router(chat_router)
 app.include_router(widget_router)
 app.include_router(share_router)
 app.dependency_overrides[get_db] = _override_get_db
+app.dependency_overrides[get_auth_db] = auth_db_override(_override_get_db)
 client = TestClient(app, raise_server_exceptions=False)
 
 

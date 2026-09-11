@@ -14,6 +14,7 @@ from .utils import (
     ensure_rrule_prefix,
     is_bare_date,
     parse_rrule,
+    reject_reversed_window,
     resolve_zoneinfo,
     setup_proxy_env,
     success_with_capped_dict,
@@ -27,6 +28,10 @@ setup_proxy_env()
 
 mcp = FastMCP("calendar-mcp")
 
+_GOOGLE_SUPPORTED_RRULE_FREQUENCIES = frozenset(
+    {"DAILY", "WEEKLY", "MONTHLY", "YEARLY"}
+)
+
 
 def _normalize_rrule(recurrence: str, dtstart: str, timezone: str | None = None) -> str:
     """Validate `recurrence` and return it as a single RRULE line, with
@@ -36,7 +41,13 @@ def _normalize_rrule(recurrence: str, dtstart: str, timezone: str | None = None)
     dateTime with no UTC offset) before validation, so it can be compared
     against a "Z"-suffixed UNTIL without dateutil rejecting the mismatch.
     """
-    parse_rrule(recurrence, dtstart, timezone)
+    parts = parse_rrule(recurrence, dtstart, timezone)
+    if parts["FREQ"] not in _GOOGLE_SUPPORTED_RRULE_FREQUENCIES:
+        supported = ", ".join(sorted(_GOOGLE_SUPPORTED_RRULE_FREQUENCIES))
+        raise ValueError(
+            f"Google Calendar does not support FREQ={parts['FREQ']}; "
+            f"use one of {supported}"
+        )
     return ensure_rrule_prefix(recurrence)
 
 
@@ -54,7 +65,7 @@ def _classify_event_time(value: str, field_name: str) -> bool:
         len(value) < 11
         or value[4] != "-"
         or value[7] != "-"
-        or value[10] not in {"T", "t", " "}
+        or value[10] not in {"T", "t"}
     ):
         raise ValueError(
             f"{field_name} must be a valid YYYY-MM-DD date or RFC3339 dateTime"
@@ -401,31 +412,18 @@ def google_calendar_create_events(
     For an all-day event, end_time is exclusive and must be later than
     start_time: use the following date for a one-day event. Both values
     must be the same kind, never a mix.
-    recurrence, if given, is a single RFC 5545 RRULE string describing a
-    repeating series for this event (the "RRULE:" prefix is optional; it
-    must not contain embedded newlines), e.g.
-    'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;UNTIL=20260911T235959Z' for "every
-    weekday until Sep 11, 2026". It's validated before being sent to
-    Google and rejected with a clear error if it can't be parsed, rather
-    than silently landing as inert text with no actual recurrence. There
-    must be a bare-date UNTIL (e.g. UNTIL=20260911) for an all-day event;
-    a timed event with timezone uses a UTC UNTIL ending in Z. There is no
-    way to clear a recurrence back to a single event once set,
-    through this tool or google_calendar_update_events.
-    timezone is an IANA timezone name (e.g. 'America/Los_Angeles'). Google
-    requires it for a non-all-day recurring event specifically - and does
-    so unconditionally, even when start_time/end_time already carry their
-    own UTC offset, since timezone governs how the recurrence itself
-    expands (e.g. across DST transitions) while the offset only fixes
-    this one occurrence's instant - so it's required here whenever
-    recurrence is set on one; an all-day recurring event doesn't need it
-    and it has no effect at all when passed to an all-day event without
-    recurrence either (Google doesn't attach a timeZone to a date-only
-    event). Outside of recurrence, timezone also localizes a naive
-    start_time/end_time (no UTC offset) for the purposes of comparing
-    recurrence's UNTIL against them, and is only written to a side that
-    doesn't already carry its own offset (there it's optional, so it's
-    skipped rather than risk disagreeing with that offset).
+    recurrence, if given, is one RFC 5545 RRULE with DAILY, WEEKLY,
+    MONTHLY, or YEARLY frequency; the "RRULE:" prefix is optional and
+    embedded newlines are rejected. For example,
+    'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;UNTIL=20260911T235959Z'. An all-day
+    event must use a bare-date UNTIL such as UNTIL=20260911; a timed event
+    with timezone must use a UTC UNTIL ending in Z.
+    timezone is an IANA name such as 'America/Los_Angeles' and is required
+    for timed recurring events, including when start_time/end_time carry
+    their own offsets. It is ignored for all-day events.
+    Do not use google_calendar_update_events to reschedule an all-day or
+    recurring event yet; that tool cannot preserve their date/timeZone
+    fields. Metadata-only updates remain safe.
     attendees is a list of email addresses to add to the event. Adding attendees does not, by
     itself, email them; set notify_attendees=True to have Google Calendar send them a native
     invite immediately. Confirm the recipient list with the user before setting notify_attendees=True.
@@ -445,6 +443,8 @@ def google_calendar_create_events(
         # valid values that carry incidental surrounding whitespace.
         start_time = start_time.strip()
         end_time = end_time.strip()
+        if timezone is not None:
+            timezone = timezone.strip() or None
         start_is_all_day = _classify_event_time(start_time, "start_time")
         end_is_all_day = _classify_event_time(end_time, "end_time")
         if start_is_all_day != end_is_all_day:
@@ -460,6 +460,8 @@ def google_calendar_create_events(
                 "end_time is exclusive for an all-day event and must be later "
                 "than start_time; use the following date for a one-day event"
             )
+        if not start_is_all_day:
+            reject_reversed_window(start_time, end_time)
         if recurrence is not None and not start_is_all_day and not timezone:
             raise ValueError(
                 "timezone is required when recurrence is set (Google expands "
@@ -472,6 +474,12 @@ def google_calendar_create_events(
             # leaving an invalid timezone on a non-recurring event to
             # surface as Google's own opaque server-side error instead.
             resolve_zoneinfo(timezone)
+
+        normalized_recurrence = (
+            _normalize_rrule(recurrence, start_time, timezone)
+            if recurrence is not None
+            else None
+        )
 
         service = get_calendar_service()
 
@@ -491,8 +499,8 @@ def google_calendar_create_events(
             event["description"] = description
         if location:
             event["location"] = location
-        if recurrence is not None:
-            event["recurrence"] = [_normalize_rrule(recurrence, start_time, timezone)]
+        if normalized_recurrence is not None:
+            event["recurrence"] = [normalized_recurrence]
         _merge_attendees(event, attendees)
         requested_conference = _apply_conference_request(event, add_google_meet)
 

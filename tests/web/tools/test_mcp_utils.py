@@ -131,6 +131,11 @@ def test_ensure_rrule_prefix_keeps_existing_prefix_and_uppercases():
     )
 
 
+def test_ensure_rrule_prefix_rejects_embedded_newlines():
+    with pytest.raises(ValueError, match="embedded newlines"):
+        utils.ensure_rrule_prefix("FREQ=DAILY\nEXDATE:20260902")
+
+
 def test_is_bare_date_accepts_a_bare_date():
     assert utils.is_bare_date("2026-08-26")
 
@@ -376,16 +381,46 @@ def test_parse_rrule_rejects_invalid_frequency_combinations(rule, message):
 
 
 @pytest.mark.parametrize(
-    "rule",
+    ("rule", "expected"),
     [
-        "FREQ=MONTHLY;BYDAY=1MO;COUNT=3",
-        "FREQ=YEARLY;BYWEEKNO=1;BYDAY=MO;COUNT=3",
-        "FREQ=YEARLY;BYYEARDAY=1;COUNT=3",
-        "FREQ=MONTHLY;BYMONTHDAY=1;BYSETPOS=1;COUNT=3",
+        (
+            "FREQ=MONTHLY;BYDAY=1MO;COUNT=3",
+            {"FREQ": "MONTHLY", "BYDAY": "1MO", "COUNT": "3"},
+        ),
+        (
+            "FREQ=YEARLY;BYWEEKNO=1;BYDAY=MO;COUNT=3",
+            {"FREQ": "YEARLY", "BYWEEKNO": "1", "BYDAY": "MO", "COUNT": "3"},
+        ),
+        (
+            "FREQ=YEARLY;BYYEARDAY=1;COUNT=3",
+            {"FREQ": "YEARLY", "BYYEARDAY": "1", "COUNT": "3"},
+        ),
+        (
+            "FREQ=MONTHLY;BYMONTHDAY=1;BYSETPOS=1;COUNT=3",
+            {
+                "FREQ": "MONTHLY",
+                "BYMONTHDAY": "1",
+                "BYSETPOS": "1",
+                "COUNT": "3",
+            },
+        ),
     ],
 )
-def test_parse_rrule_accepts_valid_frequency_combinations(rule):
-    assert utils.parse_rrule(rule, "2026-08-26T07:00:00")["FREQ"]
+def test_parse_rrule_accepts_valid_frequency_combinations(rule, expected):
+    assert utils.parse_rrule(rule, "2026-08-26T07:00:00") == expected
+
+
+def test_parse_rrule_strips_string_dtstart_before_parsing():
+    assert utils.parse_rrule("FREQ=DAILY;COUNT=3", "  2026-08-26T07:00:00  ") == {
+        "FREQ": "DAILY",
+        "COUNT": "3",
+    }
+
+
+def test_parse_rrule_reports_invalid_byday_without_calling_it_numeric():
+    with pytest.raises(ValueError, match="invalid recurrence rule") as exc_info:
+        utils.parse_rrule("FREQ=FORTNIGHTLY;BYDAY=MOO", "2026-08-26T07:00:00")
+    assert "numeric BYDAY" not in str(exc_info.value)
 
 
 def test_parse_rrule_rejects_space_separated_dtstart_paired_with_bare_date_until():

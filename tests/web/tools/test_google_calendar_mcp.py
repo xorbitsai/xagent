@@ -185,6 +185,26 @@ def test_create_events_requires_timezone_when_recurrence_is_set(monkeypatch):
     service.events.return_value.insert.assert_not_called()
 
 
+def test_create_events_treats_empty_timezone_as_not_provided(monkeypatch):
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="All day recurring",
+            start_time="2026-09-01",
+            end_time="2026-09-02",
+            recurrence="FREQ=DAILY;COUNT=3",
+            timezone="  ",
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.insert.call_args
+    assert "timeZone" not in kwargs["body"]["start"]
+    assert "timeZone" not in kwargs["body"]["end"]
+
+
 def test_create_events_rejects_an_invalid_timezone_even_without_recurrence(
     monkeypatch,
 ):
@@ -257,7 +277,8 @@ def test_create_events_rejects_invalid_recurrence_without_calling_the_api(
     originally reported failure mode - silently accepted as inert text
     with no actual recurrence."""
     service = _fake_service({"id": "created"})
-    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+    get_calendar_service = Mock(return_value=service)
+    monkeypatch.setattr(calendar, "get_calendar_service", get_calendar_service)
 
     result = json.loads(
         calendar.google_calendar_create_events(
@@ -271,7 +292,30 @@ def test_create_events_rejects_invalid_recurrence_without_calling_the_api(
 
     assert result["status"] == "error"
     assert "invalid recurrence rule" in result["message"]
+    get_calendar_service.assert_not_called()
     service.events.return_value.insert.assert_not_called()
+
+
+@pytest.mark.parametrize("frequency", ["SECONDLY", "MINUTELY", "HOURLY"])
+def test_create_events_rejects_frequencies_google_does_not_support(
+    monkeypatch, frequency
+):
+    get_calendar_service = Mock()
+    monkeypatch.setattr(calendar, "get_calendar_service", get_calendar_service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Too frequent",
+            start_time="2026-09-01T09:00:00+08:00",
+            end_time="2026-09-01T09:15:00+08:00",
+            recurrence=f"FREQ={frequency};COUNT=3",
+            timezone="Asia/Shanghai",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert f"does not support FREQ={frequency}" in result["message"]
+    get_calendar_service.assert_not_called()
 
 
 def test_create_events_rejects_explicit_empty_recurrence(monkeypatch):
@@ -450,14 +494,12 @@ def test_create_events_accepts_a_whitespace_padded_all_day_recurrence(monkeypatc
     assert result["status"] == "success"
 
 
-def test_create_events_treats_a_space_separated_datetime_as_timed_not_all_day(
+def test_create_events_rejects_a_space_separated_datetime(
     monkeypatch,
 ):
-    """Confirmed bug: RFC3339 permits a space in place of "T" as the
-    date/time separator ("2026-09-01 10:00:00"), so a check that only
-    looked for the absence of "t" misclassified this as a bare date,
-    silently dropping the time-of-day and sending Google a malformed
-    {"date": "2026-09-01 10:00:00"}."""
+    """ISO 8601 permits a space separator, but Google's EventDateTime
+    contract requires RFC3339. Reject it locally instead of forwarding a
+    value the API may reject."""
     service = _fake_service({"id": "created"})
     monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
 
@@ -469,10 +511,53 @@ def test_create_events_treats_a_space_separated_datetime_as_timed_not_all_day(
         )
     )
 
-    assert result["status"] == "success"
-    _, kwargs = service.events.return_value.insert.call_args
-    assert kwargs["body"]["start"] == {"dateTime": "2026-09-01 10:00:00"}
-    assert kwargs["body"]["end"] == {"dateTime": "2026-09-01 11:00:00"}
+    assert result["status"] == "error"
+    assert "RFC3339 dateTime" in result["message"]
+    service.events.return_value.insert.assert_not_called()
+
+
+@pytest.mark.parametrize("value", ["20260826T070000", "2026W011T070000"])
+def test_create_events_rejects_non_rfc3339_datetime_shapes(monkeypatch, value):
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Invalid datetime shape",
+            start_time=value,
+            end_time="2026-09-01T11:00:00",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "RFC3339 dateTime" in result["message"]
+    service.events.return_value.insert.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("start_time", "end_time"),
+    [
+        ("2026-09-01T10:00:00+08:00", "2026-09-01T10:00:00+08:00"),
+        ("2026-09-01T11:00:00+08:00", "2026-09-01T10:00:00+08:00"),
+    ],
+)
+def test_create_events_rejects_nonpositive_timed_ranges(
+    monkeypatch, start_time, end_time
+):
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Invalid timed range",
+            start_time=start_time,
+            end_time=end_time,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "must be after start" in result["message"]
+    service.events.return_value.insert.assert_not_called()
 
 
 def test_create_events_rejects_mixed_bare_date_and_datetime(monkeypatch):

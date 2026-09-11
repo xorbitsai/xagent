@@ -14,6 +14,7 @@ from ....config import get_tool_max_output_length
 
 _DIGITS_ONLY_RE = re.compile(r"[0-9]+")
 _BARE_DATE_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+_NUMERIC_BYDAY_RE = re.compile(r"[+-]?[0-9]{1,2}(MO|TU|WE|TH|FR|SA|SU)")
 # RFC 5545 UNTIL is always in "basic" form - no "-"/":" separators, unlike
 # ISO8601's "extended" form that dateutil's isoparse also happily accepts
 # (e.g. "2026-09-11T23:59:59+08:00"). dateutil.rrule.rrulestr's own RFC
@@ -670,7 +671,10 @@ def _validate_rrule_constraints(
 
     byday = parts.get("BYDAY")
     has_numeric_byday = bool(
-        byday and any(len(value.strip()) > 2 for value in byday.split(","))
+        byday
+        and any(
+            _NUMERIC_BYDAY_RE.fullmatch(value.strip()) for value in byday.split(",")
+        )
     )
     if has_numeric_byday and freq not in {"MONTHLY", "YEARLY"}:
         raise ValueError(
@@ -725,6 +729,8 @@ def ensure_rrule_prefix(rrule_text: str) -> str:
     otherwise reach Google's API as literal text at whatever case the
     caller happened to use.
     """
+    if "\n" in rrule_text or "\r" in rrule_text:
+        raise ValueError("recurrence rule must not contain embedded newlines")
     return f"RRULE:{_strip_rrule_prefix(rrule_text).upper()}"
 
 
@@ -770,6 +776,8 @@ def parse_rrule(
     dateutil's internal representation, just confirmation that the text is
     valid RFC 5545.
     """
+    if isinstance(dtstart, str):
+        dtstart = dtstart.strip()
     if "\n" in rrule_text or "\r" in rrule_text:
         raise ValueError(
             "recurrence rule must not contain embedded newlines (this could "

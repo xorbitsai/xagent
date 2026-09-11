@@ -1690,6 +1690,36 @@ def test_update_events_non_scope_error_on_the_organizer_backfill_is_also_skipped
     assert len(fake_service._events.update_calls) == 1
 
 
+def test_update_events_missing_scope_on_the_organizer_backfill_rejects_the_write_by_default(
+    fake_service,
+):
+    """Companion to the two tests above: without ignore_conflicts, a
+    missing-scope failure on the organizer-email backfill must reject
+    the write outright, same as its two sibling calendars().get() call
+    sites (the all-day-timezone lookup and the identity-fallback
+    comparison) already do - not silently proceed as if the caller had
+    opted out of the check."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+        "attendees": [],
+        # No "organizer" field at all - triggers the backfill attempt.
+    }
+    fake_service._calendars = FakeCalendars(raise_error=_insufficient_scope_error())
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            attendees=["me@example.com"],
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "reconnect" in result["message"].lower()
+    assert fake_service._events.update_calls == []
+
+
 def test_update_events_organizer_self_true_needs_no_identity_api_call(
     fake_service,
 ):

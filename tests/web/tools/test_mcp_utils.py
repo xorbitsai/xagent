@@ -291,6 +291,25 @@ def test_window_delta_segments_empty_when_new_window_itself_is_unparseable():
     )
 
 
+def test_window_delta_segments_empty_when_only_one_of_the_new_window_parses():
+    """Regression test: the guard is `new_start AND new_end` both being
+    real datetimes - a MIXED pair (one parses, one doesn't) must still
+    return [], not fall through and try to build a segment out of a
+    half-valid window. A prior test only exercised BOTH sides failing
+    together, which can't tell `and` apart from a mistakenly-broadened
+    `or` in that guard - this fixture, with exactly one side invalid,
+    can."""
+    old_start, old_end = (
+        _key("2026-08-27T10:00:00+00:00"),
+        _key("2026-08-27T10:30:00+00:00"),
+    )
+    new_start = _key("2026-08-27T14:00:00+00:00")
+    assert utils.window_delta_segments(old_start, old_end, new_start, "also-not") == []
+    assert (
+        utils.window_delta_segments(old_start, old_end, "not-a-date", new_start) == []
+    )
+
+
 def test_reject_reversed_window_raises_when_end_is_not_after_start():
     with pytest.raises(ValueError, match="must be after"):
         utils.reject_reversed_window(

@@ -583,12 +583,10 @@ def _event_response(
             extra["conference_status"] = status_code
 
     # The event itself (description, attendees, recurrence rules, ...) can be
-    # large enough to blow past the platform's output-length budget; cap it
-    # the same way the rest of this package caps large single-record
-    # responses, then splice the convenience fields back in afterwards so
-    # capping never has to reason about them.
-    response = json.loads(success_with_capped_dict("event", event))
-    response.update(extra)
+    # large enough to blow past the platform's output-length budget. Include
+    # the convenience fields in the fixed portion of that budget so adding a
+    # Meet link/status cannot push an otherwise-capped response back over it.
+    response = json.loads(success_with_capped_dict("event", event, extra_fields=extra))
     if not unchecked_attendees:
         return json.dumps(response, ensure_ascii=False)
 

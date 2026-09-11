@@ -103,7 +103,12 @@ def url_path_id(value: str, field_name: str) -> str:
     return quote(value, safe="")
 
 
-def success_with_capped_dict(field_name: str, data: Any) -> str:
+def success_with_capped_dict(
+    field_name: str,
+    data: Any,
+    *,
+    extra_fields: dict[str, Any] | None = None,
+) -> str:
     """Build a ``{"status": "success", ...}`` payload, trimming a dict
     until it fits the platform's output limit.
 
@@ -123,20 +128,34 @@ def success_with_capped_dict(field_name: str, data: Any) -> str:
     the residual case -- a dict with no list/dict-valued keys at all (e.g.
     a handful of scalar keys with huge string values) -- and drops whole
     keys, exactly as phase 1 replaces; it's guaranteed to terminate at {}.
-    """
-    max_output_length = get_tool_max_output_length()
-    response = json.dumps(
-        {"status": "success", field_name: data, "truncated": False},
-        ensure_ascii=False,
-    )
-    if not isinstance(data, dict) or len(response) <= max_output_length:
-        return response
 
-    def _build(payload: dict[str, Any], truncated: bool) -> str:
+    ``extra_fields`` adds fixed top-level response fields that must be counted
+    while trimming the dict, such as a calendar event's derived Meet link.
+    Reserved envelope keys cannot be overridden.
+    """
+    extras = extra_fields or {}
+    reserved_fields = {"status", field_name, "truncated"}
+    if reserved_fields.intersection(extras):
+        raise ValueError(
+            "extra_fields must not override status, the capped field, or truncated"
+        )
+
+    max_output_length = get_tool_max_output_length()
+
+    def _build(payload: Any, truncated: bool) -> str:
         return json.dumps(
-            {"status": "success", field_name: payload, "truncated": truncated},
+            {
+                "status": "success",
+                field_name: payload,
+                **extras,
+                "truncated": truncated,
+            },
             ensure_ascii=False,
         )
+
+    response = _build(data, False)
+    if not isinstance(data, dict) or len(response) <= max_output_length:
+        return response
 
     working = dict(data)
     truncated = False

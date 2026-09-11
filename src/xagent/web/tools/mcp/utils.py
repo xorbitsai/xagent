@@ -230,8 +230,10 @@ def conflict_response(
     single real conflict isn't fully dropped just to make room for a
     still-oversized `unchecked_attendees` list (unconditionally halving
     `conflicts` first would zero out a 1-item list in a single step,
-    regardless of whether that was actually necessary) - the small
-    `hint` field is never touched.
+    regardless of whether that was actually necessary). If the fixed
+    envelope itself is too large, the response falls back to a compact,
+    valid JSON object instead of relying on the framework to truncate the
+    serialized JSON at an arbitrary character boundary.
     """
     payload: dict[str, Any] = {
         "status": "conflict",
@@ -272,6 +274,23 @@ def conflict_response(
         payload["unchecked_attendees"] = remaining_unchecked
         payload["truncated"] = True
         response = json.dumps(payload, ensure_ascii=False)
+
+    if len(response) > max_output_length:
+        compact_payloads = (
+            {
+                "status": "conflict",
+                "message": "Scheduling conflict detected; details truncated.",
+                "conflicts": [],
+                "unchecked_attendees": [],
+                "truncated": True,
+            },
+            {"status": "conflict", "truncated": True},
+            {},
+        )
+        for compact_payload in compact_payloads:
+            compact_response = json.dumps(compact_payload, ensure_ascii=False)
+            if len(compact_response) <= max_output_length:
+                return compact_response
     return response
 
 

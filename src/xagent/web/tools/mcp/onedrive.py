@@ -3,9 +3,10 @@ import json
 import logging
 import mimetypes
 import os
+import time
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote
 
 import requests
 from mcp.server.fastmcp import FastMCP
@@ -45,6 +46,9 @@ _SIMPLE_UPLOAD_MAX_BYTES = 4_000_000
 # (327,680 bytes) per Graph's requirement for every non-final chunk; 5 MiB
 # is exactly 16 * 320 KiB.
 _UPLOAD_SESSION_CHUNK_SIZE = 5 * 1024 * 1024
+_UPLOAD_CHUNK_MAX_ATTEMPTS = 3
+_UPLOAD_RETRY_BASE_SECONDS = 1.0
+_UPLOAD_RETRY_MAX_SECONDS = 10.0
 # Not a Graph API limit (OneDrive itself supports files far larger than
 # this via the resumable upload session) -- a guard-rail against a
 # mistargeted file (a generated artifact pointed at the wrong path, an
@@ -56,6 +60,11 @@ _UPLOAD_SESSION_CHUNK_SIZE = 5 * 1024 * 1024
 _MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
 
 _UPLOAD_ALLOWED_DIRS_ENV_VAR = "XAGENT_ONEDRIVE_FILE_ALLOWED_DIRS"
+
+
+class _UploadError(RuntimeError):
+    """Upload failure whose message is safe to expose to the caller."""
+
 
 # stdlib mimetypes.guess_type() only recognizes these extensions when a
 # system mime.types file happens to be installed (e.g. Apache's, common on
@@ -195,86 +204,63 @@ def _graph_headers(extra_headers: dict[str, str] | None = None) -> dict[str, str
     return headers
 
 
-def _raise_for_status_with_body(response: Any) -> None:
-    """Like response.raise_for_status(), but a non-2xx status raises a
-    RuntimeError with Graph's own error body appended -- a bare HTTPError's
-    default message carries only the status line, not the JSON error detail
-    Graph actually returns. Shared by every call site in this module that
-    talks to Graph directly (both _graph_request and the per-chunk PUTs in
-    _upload_large_file_content, which can't go through _graph_request itself
-    -- see its own Authorization-header note) so a future change to the
-    message format only needs to happen once.
+def _raise_upload_status(response: Any) -> None:
+    """Raise a credential-safe error for a rejected upload fragment.
+
+    Upload-session URLs are preauthenticated secrets. An intermediary can
+    echo them into an error body with arbitrary escaping, so no part of the
+    response body is forwarded to the caller or logs.
     """
     try:
         response.raise_for_status()
     except requests.HTTPError as exc:
-        response_text = response.text.strip()
-        message = str(exc)
-        if response_text:
-            message = f"{message} - {response_text}"
-        raise RuntimeError(message) from exc
+        status_code = getattr(response, "status_code", "unknown")
+        raise _UploadError(
+            f"OneDrive upload fragment failed with HTTP {status_code}"
+        ) from exc
 
 
-def _redact_upload_url(message: str, upload_url: str) -> str:
-    """Strip ``upload_url`` (a preauthenticated, bearer-token-equivalent
-    Graph upload-session URL) out of ``message`` as thoroughly as possible.
-
-    A plain ``message.replace(upload_url, ...)`` only catches the case
-    where the exception's own message happens to contain the exact,
-    complete "scheme://host/path?query" string. Verified directly against
-    a real failed request: urllib3's own ConnectionError/SSLError messages
-    never do that -- they report the host separately (inside
-    "HTTPSConnectionPool(host=..., port=...)") from the path+query (inside
-    "Max retries exceeded with url: /path?query"), so the whole-string
-    match silently misses them and the query string -- which carries the
-    session's actual bearer-equivalent token -- passes through unredacted.
-    Redacting the host and the path+query independently (in addition to
-    the full URL, for whichever call site does happen to embed it whole)
-    closes that gap without depending on any particular exception's message
-    shape.
-    """
-    redacted = message.replace(upload_url, "<redacted-upload-session-url>")
-    parsed = urlsplit(upload_url)
-    path_and_query = parsed.path + (f"?{parsed.query}" if parsed.query else "")
-    # Excludes a bare "/" with no query: that's indistinguishable from any
-    # other single slash that might appear elsewhere in the message, so
-    # using it as a blanket replace target would mangle the whole string
-    # instead of redacting anything meaningful. Not reachable against a
-    # real Graph upload-session URL (its path is always a specific,
-    # multi-segment session identifier), but nothing stops a test double
-    # or a future API change from producing one this short.
-    if path_and_query and path_and_query != "/":
-        redacted = redacted.replace(path_and_query, "<redacted-upload-session-url>")
-    if parsed.query:
-        redacted = redacted.replace(parsed.query, "<redacted-upload-session-token>")
-    if parsed.netloc:
-        redacted = redacted.replace(parsed.netloc, "<redacted-upload-session-host>")
-    return redacted
+def _safe_upload_error_message(exc: BaseException) -> str:
+    """Describe an upload failure without copying a request URL from it."""
+    if isinstance(exc, _UploadError):
+        return str(exc)
+    cause = exc
+    if isinstance(cause, requests.Timeout):
+        return "OneDrive upload fragment timed out"
+    if isinstance(cause, requests.ConnectionError):
+        return "OneDrive upload fragment connection failed"
+    if isinstance(cause, requests.RequestException):
+        return "OneDrive upload fragment request failed"
+    return f"OneDrive upload failed ({type(exc).__name__})"
 
 
 def _is_retriable_upload_error(exc: BaseException) -> bool:
-    """Whether ``exc`` might succeed on a future attempt against the SAME
-    upload session, so it's worth leaving that session's state (and
-    Graph's ``nextExpectedRanges``) alone rather than actively destroying
-    it via a cancellation DELETE.
+    """Whether ``exc`` might succeed on another bounded fragment attempt.
 
     A network-level failure (no response was ever received) and Graph's
-    own documented retriable statuses (429, and any 5xx) are retriable;
-    anything else -- a non-retriable 4xx Graph rejected outright, or a
-    validation failure this module raised itself about the *local* file
-    (a short read, an unparsable/incomplete final response) -- is not:
-    retrying against the same session wouldn't help either of those, so
-    there's no reason to withhold the immediate cleanup. By the time an
-    HTTPError reaches here it's already been converted to a plain
-    RuntimeError by _raise_for_status_with_body, so the original
-    exception (with its .response) is recovered via __cause__ rather than
-    expected on ``exc`` directly.
+    documented retriable statuses (429 and any 5xx) are retriable. The
+    HTTPError behind an _UploadError is recovered through ``__cause__``.
     """
-    cause = exc.__cause__ if isinstance(exc, RuntimeError) else exc
+    cause = exc.__cause__ if isinstance(exc, _UploadError) else exc
     status_code = getattr(getattr(cause, "response", None), "status_code", None)
     if isinstance(status_code, int):
         return status_code == 429 or 500 <= status_code < 600
     return isinstance(cause, (requests.ConnectionError, requests.Timeout))
+
+
+def _upload_retry_delay(exc: BaseException, retry_number: int) -> float:
+    """Return a bounded Retry-After or exponential-backoff delay."""
+    cause = exc.__cause__ if isinstance(exc, _UploadError) else exc
+    response = getattr(cause, "response", None)
+    headers = getattr(response, "headers", {}) or {}
+    retry_after = headers.get("Retry-After")
+    if retry_after is not None:
+        try:
+            return min(max(float(retry_after), 0.0), _UPLOAD_RETRY_MAX_SECONDS)
+        except (TypeError, ValueError):
+            pass
+    exponential_delay = _UPLOAD_RETRY_BASE_SECONDS * (2.0 ** (retry_number - 1))
+    return min(exponential_delay, _UPLOAD_RETRY_MAX_SECONDS)
 
 
 def _graph_request(
@@ -454,11 +440,9 @@ def _upload_large_file_content(
     one chunk of the file in memory at a time, unlike holding the whole
     file as a single ``bytes`` object would.
 
-    This uses the session only for chunking, not for actual resumability:
-    failures are not retried from Graph's ``nextExpectedRanges``.
-    Sessions are cancelled only for non-retriable failures, so a transient
-    mid-upload failure means the whole file is re-sent from byte 0 on the
-    next call, not resumed from where it left off.
+    Transient fragment failures are retried with bounded backoff on the same
+    session. Cross-call resume state is not persisted, so an exhausted or
+    non-retriable failure cancels the session before returning an error.
     """
     if total <= 0:
         # Not reachable through onedrive_upload_file today (it rejects an
@@ -496,7 +480,7 @@ def _upload_large_file_content(
                     # waiting for bytes that never arrive or desynchronize
                     # every later chunk's byte-range accounting. Fail loudly
                     # instead.
-                    raise RuntimeError(
+                    raise _UploadError(
                         f"expected to read {end - start} bytes at offset "
                         f"{start} but got {len(chunk)} -- the local file "
                         "may have changed size during upload"
@@ -514,17 +498,35 @@ def _upload_large_file_content(
                 # Content-Length/Content-Range are documented there), but
                 # sending it costs nothing and is the closest available
                 # lever to the simple path's behavior.
-                response = http.put(
-                    upload_url,
-                    data=chunk,
-                    headers={
-                        "Content-Length": str(end - start),
-                        "Content-Range": f"bytes {start}-{end - 1}/{total}",
-                        "Content-Type": mime_type,
-                    },
-                    timeout=_BINARY_UPLOAD_TIMEOUT_SECONDS,
-                )
-                _raise_for_status_with_body(response)
+                for attempt in range(1, _UPLOAD_CHUNK_MAX_ATTEMPTS + 1):
+                    try:
+                        response = http.put(
+                            upload_url,
+                            data=chunk,
+                            headers={
+                                "Content-Length": str(end - start),
+                                "Content-Range": f"bytes {start}-{end - 1}/{total}",
+                                "Content-Type": mime_type,
+                            },
+                            timeout=_BINARY_UPLOAD_TIMEOUT_SECONDS,
+                        )
+                        _raise_upload_status(response)
+                        break
+                    except Exception as exc:
+                        if (
+                            not _is_retriable_upload_error(exc)
+                            or attempt == _UPLOAD_CHUNK_MAX_ATTEMPTS
+                        ):
+                            raise
+                        delay = _upload_retry_delay(exc, attempt)
+                        logger.warning(
+                            "Retrying OneDrive upload fragment after a transient "
+                            "failure (attempt %s/%s, delay %.1fs)",
+                            attempt + 1,
+                            _UPLOAD_CHUNK_MAX_ATTEMPTS,
+                            delay,
+                        )
+                        time.sleep(delay)
                 # Only the final chunk's response carries the completed
                 # item; Graph's intermediate (202) responses return upload-
                 # progress info, not the item -- checked explicitly
@@ -543,95 +545,43 @@ def _upload_large_file_content(
                         # failure, even though it's still reported as an
                         # error here (the caller has no completed item to
                         # act on either way).
-                        raise RuntimeError(
+                        raise _UploadError(
                             "OneDrive accepted the final chunk but "
-                            f"returned an unparsable response: {exc}"
+                            "returned an unparsable response"
                         ) from exc
                     if "id" not in result:
                         # The final chunk's response didn't actually carry
                         # a completed driveItem (e.g. an unexpected 202 on
                         # what this loop computed as the last range).
-                        raise RuntimeError(
-                            "OneDrive did not confirm the upload completed "
-                            f"(final response: {result!r})"
+                        raise _UploadError(
+                            "OneDrive did not confirm the upload completed"
                         )
         except Exception as exc:
-            # Redact upload_url out of the failure's own message before it
-            # goes anywhere else -- this catches every source uniformly
-            # (an HTTP error response whose body happens to echo the
-            # request URL via an intervening proxy/WAF, and -- the gap a
-            # status-code-keyed sanitize flag on the PUT call alone would
-            # miss -- a transport-level failure before any response
-            # existed at all: requests/urllib3's own ConnectionError/
-            # Timeout/SSLError messages embed the full request URL,
-            # verified directly against a real failed request). A plain
-            # `except requests.HTTPError` (or a flag passed only to the
-            # PUT's own status check) would leave those other paths
-            # unsanitized, so this wraps every exception the chunk loop
-            # can raise instead of trusting each one individually to avoid
-            # the URL. See _redact_upload_url's own docstring for why a
-            # bare whole-string replace isn't enough on its own.
-            redacted_message = _redact_upload_url(str(exc), upload_url)
-            if _is_retriable_upload_error(exc):
-                # A 429/5xx/network failure might still succeed against
-                # this SAME session on a later attempt -- actively
-                # cancelling it here would destroy Graph's
-                # nextExpectedRanges state for no benefit (this module
-                # doesn't currently retry/resume itself, but a future
-                # attempt manually resuming this exact session, or a
-                # resume feature added later, still could). Left alone,
-                # the session and its uploaded ranges simply persist until
-                # Graph's own ~15-minute expiry -- strictly no worse than
-                # cancelling it outright, and possibly better.
+            # No cross-call resume state is persisted. Once bounded retries
+            # are exhausted, cancel the unusable session instead of leaving
+            # partial data until its provider-defined expiration time.
+            try:
+                cancel_response = http.delete(
+                    upload_url, timeout=DEFAULT_TIMEOUT_SECONDS
+                )
+            except Exception as cleanup_exc:
+                # Never log cleanup exception text: requests exceptions can
+                # contain the preauthenticated upload URL.
                 logger.warning(
-                    "OneDrive upload session left intact after a "
-                    "retriable failure (not cancelled): %s",
-                    redacted_message,
+                    "Failed to cancel abandoned OneDrive upload session (%s)",
+                    type(cleanup_exc).__name__,
                 )
             else:
-                # Best-effort: free the abandoned session immediately
-                # instead of leaving it for Graph's own ~15-minute expiry
-                # -- unlike the retriable case above, nothing about this
-                # failure would change on a retry against the same
-                # session, so there's no reason to keep it around. A
-                # failure here must never mask the real error above, and
-                # uses the short, small-request timeout -- this DELETE
-                # carries no body, so it shouldn't compound a slow failure
-                # with another wait as long as a multi-megabyte upload's
-                # own timeout.
-                try:
-                    cancel_response = http.delete(
-                        upload_url, timeout=DEFAULT_TIMEOUT_SECONDS
-                    )
-                except Exception as cleanup_exc:
-                    cleanup_message = _redact_upload_url(str(cleanup_exc), upload_url)
+                if (
+                    not (200 <= cancel_response.status_code < 300)
+                    and cancel_response.status_code != 404
+                ):
                     logger.warning(
-                        "Failed to cancel abandoned OneDrive upload session: %s",
-                        cleanup_message,
+                        "OneDrive upload session cancellation returned HTTP %s "
+                        "instead of success",
+                        cancel_response.status_code,
                     )
-                else:
-                    # requests does not raise for an HTTP error status on
-                    # its own -- a 429/5xx here would otherwise look like a
-                    # successful cancellation while the session (and its
-                    # partial upload) actually lingers until Graph's own
-                    # expiry. A 404 is also treated as fine (not warned
-                    # on): it means the session is already gone -- expired,
-                    # or completed/cancelled by a previous attempt -- which
-                    # is the outcome this cleanup wants, not a failure of
-                    # it. Status only, no body: nothing about the response
-                    # is expected to carry the upload_url, but there's no
-                    # reason to risk it for a log line that only needs the
-                    # status.
-                    if (
-                        not (200 <= cancel_response.status_code < 300)
-                        and cancel_response.status_code != 404
-                    ):
-                        logger.warning(
-                            "OneDrive upload session cancellation returned "
-                            "HTTP %s instead of success",
-                            cancel_response.status_code,
-                        )
-            raise RuntimeError(redacted_message) from None
+            raise RuntimeError(_safe_upload_error_message(exc)) from None
 
     return result
 

@@ -925,8 +925,22 @@ class FakeFreebusy:
 
 
 class FakeCalendars:
-    def __init__(self, timezone: str = "UTC", *, raise_error: Exception | None = None):
+    def __init__(
+        self,
+        timezone: str = "UTC",
+        *,
+        email: str = "me@example.com",
+        raise_error: Exception | None = None,
+    ):
         self._timezone = timezone
+        # The connected account's own address (the "id" field
+        # calendars().get returns on a real primary calendar) - defaults
+        # to the same
+        # "me@example.com" convention most fixtures already use for the
+        # caller/organizer, so a test that never customizes this and
+        # never means to simulate a different-organizer scenario keeps
+        # caller_is_organizer=True without having to set this explicitly.
+        self._email = email
         self._raise_error = raise_error
         self.get_calls: list[dict[str, Any]] = []
 
@@ -934,7 +948,7 @@ class FakeCalendars:
         self.get_calls.append(kwargs)
         if self._raise_error is not None:
             raise self._raise_error
-        return _Exec({"timeZone": self._timezone})
+        return _Exec({"id": self._email, "timeZone": self._timezone})
 
 
 class FakeService:
@@ -1443,6 +1457,94 @@ def test_update_events_adding_the_organizer_as_an_attendee_still_catches_a_real_
     assert result["status"] == "conflict"
     assert [c["summary"] for c in result["conflicts"]] == ["Board sync"]
     assert fake_service._freebusy.query_calls == []
+
+
+def test_update_events_on_someone_elses_event_reports_the_real_organizer_unchecked(
+    fake_service,
+):
+    """Regression test: check_organizer queries calendarId="primary",
+    which is always the AUTHENTICATED CALLER's own calendar, not
+    necessarily this event's organizer - a guest with edit permission
+    (guestsCanModify) can update an event they didn't organize. Before
+    this fix, the organizer's email was unconditionally excluded from the
+    freebusy-checked set on the assumption check_organizer already
+    covered them, which is only true when the caller IS the organizer;
+    here they differ, so the real organizer (boss@example.com) must be
+    reported as unchecked rather than silently treated as clear - and
+    "primary" (the caller's own calendar) must not be queried and
+    mislabeled as the organizer's. With nothing else to check here, the
+    write still proceeds (same as any other "can't verify this one
+    attendee" gap elsewhere in this module, e.g. one absent from a
+    freebusy response) - it just surfaces the gap in the response."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+        "attendees": [{"email": "boss@example.com"}],
+        "organizer": {"email": "boss@example.com"},
+    }
+    # Default FakeCalendars() resolves the connected account's own
+    # address as "me@example.com" - different from the organizer above.
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-27T14:00:00+08:00",  # disjoint move
+            end_time="2026-08-27T14:30:00+08:00",
+        )
+    )
+
+    assert result["status"] == "success"
+    assert result["unchecked_attendees"] == ["boss@example.com"]
+    # Never queried "primary" (the caller's own calendar) as if it were
+    # the organizer's, and never freebusy-checked the real organizer
+    # either (which would have self-conflicted on their own copy of this
+    # event, same as the caller-is-organizer case this exclusion was
+    # originally written for).
+    assert fake_service._events.list_calls == []
+    assert fake_service._freebusy.query_calls == []
+
+
+def test_update_events_on_someone_elses_event_still_catches_another_attendees_conflict(
+    fake_service,
+):
+    """Companion to the test above: the real organizer being unverifiable
+    must not swallow a genuinely different, checkable attendee's real
+    conflict."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+        "attendees": [{"email": "boss@example.com"}],
+        "organizer": {"email": "boss@example.com"},
+    }
+    fake_service._freebusy = FakeFreebusy(
+        {
+            "calendars": {
+                "coworker@example.com": {
+                    "busy": [
+                        {
+                            "start": "2026-08-27T14:10:00+08:00",
+                            "end": "2026-08-27T14:20:00+08:00",
+                        }
+                    ]
+                }
+            }
+        }
+    )
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-27T14:00:00+08:00",
+            end_time="2026-08-27T14:30:00+08:00",
+            attendees=["coworker@example.com"],
+        )
+    )
+
+    assert result["status"] == "conflict"
+    assert [c["calendar"] for c in result["conflicts"]] == ["coworker@example.com"]
+    assert set(result["unchecked_attendees"]) == {"boss@example.com"}
 
 
 def test_update_events_treats_existing_attendee_case_insensitively(fake_service):
@@ -2126,6 +2228,39 @@ def test_update_events_organizer_only_new_attendee_on_all_day_event_widens_corre
     assert list_call["timeMax"] == "2026-08-28T00:00:00+08:00"
 
 
+def test_update_events_all_day_with_existing_attendees_resubmitted_unchanged_skips_the_timezone_lookup(
+    fake_service,
+):
+    """Regression test: an all-day event that already has attendees,
+    resubmitted with neither a new window nor new attendees (e.g. a
+    summary-only edit), must not trigger the calendar's real timezone
+    lookup at all - a resubmission that never moves the window makes any
+    retained attendee's delta segment trivially empty regardless of
+    timezone precision, so needs_real_calendar_timezone correctly stays
+    False here. Pins that this genuinely common "just editing the title"
+    case doesn't regress into an unnecessary API call (or a scope-403 for
+    a token that predates calendar.calendars.readonly, on an edit that
+    never needed timezone precision at all)."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"date": "2026-08-27"},
+        "end": {"date": "2026-08-28"},
+        "attendees": [{"email": "existing@example.com"}],
+    }
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            summary="Renamed",
+        )
+    )
+
+    assert result["status"] == "success"
+    assert fake_service._calendars.get_calls == []
+    assert fake_service._events.list_calls == []
+    assert fake_service._freebusy.query_calls == []
+
+
 def test_update_events_calendar_timezone_lookup_missing_scope_rejects_the_write(
     fake_service,
 ):
@@ -2691,4 +2826,33 @@ def test_update_events_conflict_response_still_reports_unchecked_attendees(
     )
 
     assert result["status"] == "conflict"
+    assert result["unchecked_attendees"] == ["ghost@example.com"]
+
+
+def test_update_events_widening_both_boundaries_does_not_duplicate_unchecked_attendees(
+    fake_service,
+):
+    """Regression test: widening a window on BOTH sides produces two
+    delta segments (window_delta_segments), and a retained attendee who's
+    unverifiable for a reason unrelated to which segment ran (here,
+    absent from every freebusy response) gets checked - and appended to
+    unchecked_attendees - once per segment, not once overall."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T10:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T10:30:00+08:00"},
+        "attendees": [{"email": "ghost@example.com"}],
+    }
+    fake_service._events._list_result = {"items": []}
+    fake_service._freebusy = FakeFreebusy({"calendars": {}})
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-27T09:45:00+08:00",  # widened earlier...
+            end_time="2026-08-27T10:45:00+08:00",  # ...and later
+        )
+    )
+
+    assert result["status"] == "success"
     assert result["unchecked_attendees"] == ["ghost@example.com"]

@@ -217,9 +217,9 @@ def _find_conflicts(
                 raise InsufficientScopeError(
                     "Missing the calendar.freebusy permission needed to "
                     "check attendee availability - reconnect the Google "
-                    "Calendar connector to grant it, or pass "
-                    "ignore_conflicts=true if the user has confirmed "
-                    "they want to proceed without this check.",
+                    "Calendar connector to grant it. This is a missing "
+                    "permission on our own credential, not a real "
+                    "scheduling conflict to route around.",
                     conflicts,
                     # Every attendee from this failed batch onward is
                     # unchecked - every remaining batch would hit this
@@ -261,9 +261,15 @@ def _find_conflicts(
     return conflicts, unchecked_attendees
 
 
-def _primary_calendar_timezone(service: Any) -> str:
-    """The primary calendar's own configured IANA timezone (falls back to
-    UTC if somehow absent - Google's Calendar resource always carries a
+def _primary_calendar_info(service: Any) -> tuple[str, str]:
+    """The connected account's own (email, timezone) for its primary
+    calendar - a single calendars().get(calendarId="primary") call serves
+    both needs: `id` is the connected account's own address (used to tell
+    whether the authenticated caller is actually a given event's
+    organizer, since "primary" always means the caller's own calendar,
+    never an arbitrary other attendee's or organizer's), and `timeZone`
+    is the calendar's configured IANA zone, falling back to UTC if
+    somehow absent (Google's Calendar resource always carries a
     timeZone, so this is a defensive last resort, not the expected path).
 
     Needs the calendar.calendars.readonly scope (see the
@@ -277,21 +283,30 @@ def _primary_calendar_timezone(service: Any) -> str:
         if exc.resp.status == 403 and _is_insufficient_scope_error(exc):
             # This connection's OAuth token predates the
             # calendar.calendars.readonly scope. Without the calendar's
-            # own timezone, an all-day boundary can't be safely widened
-            # for the conflict check that's about to run - reject rather
-            # than silently guessing (e.g. defaulting to UTC), which
-            # could misjudge the query window by the calendar's real
-            # UTC offset.
-            raise ValueError(
+            # own identity/timezone, neither an all-day boundary nor a
+            # different-organizer conflict check can be safely resolved -
+            # reject rather than silently guessing (e.g. defaulting to
+            # UTC, or assuming the caller is the organizer), either of
+            # which could misjudge the query window or silently skip a
+            # real conflict.
+            # Raised as InsufficientScopeError (a ValueError subclass, so
+            # existing `except ValueError` call sites still catch it
+            # unchanged) rather than a bare ValueError, for consistency
+            # with every other scope-error site in this module - nothing
+            # has been confirmed by this helper itself, so both
+            # accumulator args are empty.
+            raise InsufficientScopeError(
                 "Missing the calendar.calendars.readonly permission "
-                "needed to look up the calendar's timezone for this "
-                "all-day event - reconnect the Google Calendar "
-                "connector to grant it, or pass ignore_conflicts=true "
-                "if the user has confirmed they want to proceed without "
-                "this check."
+                "needed to look up the calendar's own identity/timezone "
+                "for this update - reconnect the Google Calendar "
+                "connector to grant it. This is a missing permission on "
+                "our own credential, not a real scheduling conflict to "
+                "route around.",
+                [],
+                [],
             ) from exc
         raise
-    return calendar.get("timeZone") or "UTC"
+    return calendar.get("id") or "", calendar.get("timeZone") or "UTC"
 
 
 def _event_boundary(field: dict[str, Any] | None, tz_name: str) -> str | None:
@@ -730,6 +745,21 @@ def google_calendar_update_events(
             _require_offset_datetime(end_time, "end_time")
         service = get_calendar_service()
 
+        # Lazily fetched and cached (as a one-element list, mutated
+        # rather than rebound, so the closure needs no `nonlocal`) - this
+        # single calendars().get(calendarId="primary") call resolves both
+        # the connected account's own identity (needed below to tell
+        # whether the caller is actually this event's organizer) and its
+        # timezone (needed further down only for an all-day boundary),
+        # so a call site that only needs one doesn't force a redundant
+        # second round-trip when the other site already fetched it.
+        primary_calendar_cache: list[tuple[str, str]] = []
+
+        def primary_calendar_info() -> tuple[str, str]:
+            if not primary_calendar_cache:
+                primary_calendar_cache.append(_primary_calendar_info(service))
+            return primary_calendar_cache[0]
+
         # First get the existing event
         event = service.events().get(calendarId="primary", eventId=event_id).execute()
 
@@ -847,10 +877,18 @@ def google_calendar_update_events(
         )
         try:
             calendar_timezone = (
-                _primary_calendar_timezone(service)
-                if needs_real_calendar_timezone
-                else "UTC"
+                primary_calendar_info()[1] if needs_real_calendar_timezone else "UTC"
             )
+            # _event_boundary can itself raise ValueError (via
+            # resolve_zoneinfo) when a stored event's own dateTime is
+            # offsetless and its sibling timeZone field is unresolvable -
+            # kept inside this same try so that case is governed by
+            # ignore_conflicts too, not just a bad calendar_timezone
+            # lookup. Otherwise a malformed event would hard-fail this
+            # call even when the caller explicitly opted out of the
+            # check the docstring says this guards.
+            existing_start = _event_boundary(event.get("start"), calendar_timezone)
+            existing_end = _event_boundary(event.get("end"), calendar_timezone)
         except ValueError:
             if not ignore_conflicts:
                 raise
@@ -859,10 +897,14 @@ def google_calendar_update_events(
             # 403 here would only ever be surfaced by that check (or by
             # the reversed-window sanity check below, which is fine to
             # run a little less precisely against UTC than to block a
-            # write the caller explicitly opted out of checking).
+            # write the caller explicitly opted out of checking). Leaving
+            # the existing boundaries unresolved (None) is safe: the
+            # conflict-check block below is itself gated on `not
+            # ignore_conflicts`, and the write payload only ever uses the
+            # caller-supplied start_time/end_time, never these.
             calendar_timezone = "UTC"
-        existing_start = _event_boundary(event.get("start"), calendar_timezone)
-        existing_end = _event_boundary(event.get("end"), calendar_timezone)
+            existing_start = None
+            existing_end = None
         effective_start = start_time or existing_start
         effective_end = end_time or existing_end
         if (start_time or end_time) and effective_start and effective_end:
@@ -885,6 +927,22 @@ def google_calendar_update_events(
 
         unchecked_attendees: list[str] = []
         if not ignore_conflicts and effective_start and effective_end:
+            # check_organizer queries calendarId="primary", which is
+            # always the AUTHENTICATED CALLER's own calendar - not
+            # necessarily this event's organizer. Google copies an event
+            # onto every attendee's own calendar too, and a guest with
+            # edit permission (guestsCanModify) can call this tool on an
+            # event they didn't organize; event["organizer"]["email"]
+            # would then differ from the caller's own address. Comparing
+            # against the calendar's own resolved identity (rather than
+            # assuming caller==organizer, as an earlier version did)
+            # catches that case rather than silently checking - and
+            # excluding from freebusy - the wrong person's calendar.
+            caller_is_organizer = True
+            if organizer_email_lower is not None:
+                caller_is_organizer = (
+                    primary_calendar_info()[0].lower() == organizer_email_lower
+                )
             # A newly-added organizer is checked via the organizer path
             # (events.list, which can actually exclude this event by id/
             # recurringEventId) rather than freebusy - without also
@@ -893,8 +951,32 @@ def google_calendar_update_events(
             # `attendees_to_check` empty (organizer filtered out above)
             # and `window_changed` false, skipping their calendar
             # entirely instead of just skipping the self-conflicting
-            # freebusy path for them.
-            check_organizer = window_changed or organizer_newly_added
+            # freebusy path for them. Independent of whether an explicit
+            # `organizer` field is even present on the event - Google
+            # omits it whenever the organizer is just the calendar owner
+            # (the overwhelmingly common case), and this must still
+            # trigger then, same as before this identity fix.
+            organizer_needs_verification = window_changed or organizer_newly_added
+            # Only actually query "primary" for the organizer's own
+            # conflicts when the caller genuinely IS the organizer -
+            # otherwise "primary" is someone else's calendar entirely,
+            # and mislabeling their busy blocks as the organizer's would
+            # be actively wrong, not just incomplete.
+            check_organizer = organizer_needs_verification and caller_is_organizer
+            if (
+                organizer_email
+                and organizer_needs_verification
+                and not caller_is_organizer
+            ):
+                # The real organizer's own copy of this event would
+                # self-conflict via freebusy (same problem
+                # attendees_to_check's exclusion above avoids), and we
+                # have no calendarId to query their actual calendar
+                # directly (only "primary", which is the caller's) - so
+                # there is no available mechanism to actually verify
+                # them. Report as unchecked rather than silently treating
+                # them as clear.
+                unchecked_attendees.append(organizer_email)
             all_conflicts: list[dict[str, Any]] = []
             # Tracks the most recent InsufficientScopeError seen across
             # EITHER block below, re-raised only once both blocks have
@@ -967,6 +1049,38 @@ def google_calendar_update_events(
                         # scope error too - nothing left to gain by
                         # attempting them.
                         break
+
+            # A both-sides-widened window produces two delta segments
+            # (the new territory on each side), both checked against the
+            # SAME existing_attendees_to_check list - an attendee who's
+            # unverifiable for a reason unrelated to which segment ran
+            # (absent from every freebusy response, or their own
+            # per-attendee error) would otherwise land in
+            # unchecked_attendees once per segment. Dedup both
+            # accumulators once, after every block above has had its
+            # chance to contribute, rather than per-block (which would
+            # miss a duplicate straddling the organizer/attendee split).
+            deduped_unchecked: list[str] = []
+            seen_unchecked: set[str] = set()
+            for attendee in unchecked_attendees:
+                if attendee not in seen_unchecked:
+                    seen_unchecked.add(attendee)
+                    deduped_unchecked.append(attendee)
+            unchecked_attendees = deduped_unchecked
+
+            deduped_conflicts: list[dict[str, Any]] = []
+            seen_conflicts: set[tuple[Any, Any, Any, Any]] = set()
+            for conflict in all_conflicts:
+                conflict_key = (
+                    conflict.get("calendar"),
+                    conflict.get("summary"),
+                    conflict.get("start"),
+                    conflict.get("end"),
+                )
+                if conflict_key not in seen_conflicts:
+                    seen_conflicts.add(conflict_key)
+                    deduped_conflicts.append(conflict)
+            all_conflicts = deduped_conflicts
 
             if pending_scope_error is not None and not all_conflicts:
                 raise pending_scope_error

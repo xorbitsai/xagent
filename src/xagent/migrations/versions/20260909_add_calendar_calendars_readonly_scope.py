@@ -1,8 +1,10 @@
 """add calendar.calendars.readonly to the Google Calendar connector's OAuth scope
 
 The all-day conflict-check path calls Google's ``calendars.get`` endpoint (via
-``_primary_calendar_timezone``) to widen an all-day boundary using the primary
-calendar's own configured timezone. That endpoint is not authorized by
+``_primary_calendar_info``) to widen an all-day boundary using the primary
+calendar's own configured timezone (the same call also resolves the
+connected account's own address, used to tell whether the caller is
+actually a given event's organizer). That endpoint is not authorized by
 ``.../auth/calendar.events`` or ``.../auth/calendar.freebusy`` (per Google's
 own Calendar API scope reference for ``calendars.get``) -- it needs one of
 ``calendar``, ``calendar.readonly``, ``calendar.app.created``,

@@ -49,6 +49,16 @@ def _upload_allowed_dirs_env(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
+async def test_upload_file_is_registered_with_expected_schema():
+    tools = {tool.name: tool for tool in await onedrive.mcp.list_tools()}
+
+    assert "onedrive_upload_file" in tools
+    schema = tools["onedrive_upload_file"].inputSchema
+    assert schema["required"] == ["file_path"]
+    assert set(schema["properties"]) == {"file_path", "remote_path", "mime_type"}
+
+
 def test_upload_file_sends_real_binary_content(monkeypatch, _upload_allowed_dirs_env):
     """Regression guard for the actual production bug: uploading an
     already-generated spreadsheet must send its real bytes with a real

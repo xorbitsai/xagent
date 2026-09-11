@@ -276,7 +276,7 @@ def conflict_response(
         response = json.dumps(payload, ensure_ascii=False)
 
     if len(response) > max_output_length:
-        compact_payloads = (
+        compact_payloads: tuple[dict[str, Any], ...] = (
             {
                 "status": "conflict",
                 "message": "Scheduling conflict detected; details truncated.",

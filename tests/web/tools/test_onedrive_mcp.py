@@ -1092,7 +1092,22 @@ def test_upload_file_resolves_real_mime_type_for_ambiguous_extensions(
     An earlier version of this fix applied the override inside
     _guess_mime_type itself, which also corrupted this tool's real
     Content-Type resolution (sending "text/plain" for what Graph is told
-    is a ".ts" file) whenever no explicit mime_type is passed."""
+    is a ".ts" file) whenever no explicit mime_type is passed.
+
+    What mimetypes.guess_type() itself resolves ".ts" to is host-dependent
+    -- confirmed directly: this file's own dev host resolves it to
+    "video/mp2t", while a CI run on a different OS/Python resolved it to
+    "text/vnd.trolltech.linguist" (Qt Linguist translation source, yet
+    another real format that happens to share this extension) instead.
+    Monkeypatching mimetypes.guess_type to a fixed value makes this test
+    deterministic instead of depending on whichever mime.types database
+    happens to be installed on whatever machine runs it -- what's actually
+    under test is that _guess_mime_type's real answer reaches Content-Type
+    unmodified, not what that real answer happens to be for ".ts"
+    specifically."""
+    monkeypatch.setattr(
+        onedrive.mimetypes, "guess_type", lambda name: ("video/mp2t", None)
+    )
     local_file = _upload_allowed_dirs_env / "segment001.ts"
     local_file.write_bytes(b"\x47" * 100)  # MPEG-TS sync byte, not text
 

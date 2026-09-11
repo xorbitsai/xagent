@@ -171,12 +171,11 @@ _BINARY_MIME_TYPES = {
     "application/x-sqlite3",
     "application/x-mspublisher",  # .pub -- a real binary format, verified
     "application/postscript",  # .ps -- pre-existing behavior, unchanged
-    # Found while re-auditing _KNOWN_BINARY_EXTENSIONS_WITHOUT_MIME_GUESS's
-    # own extensions against a host WITH a system mime.types installed
-    # (unlike the bare-stdlib probe that motivated that fallback set in the
-    # first place) -- these four resolve to a real, specific mimetype
-    # there instead of None, so the "no mimetype at all" fallback alone
-    # would miss them on such a host.
+    # Found while re-auditing _KNOWN_BINARY_EXTENSIONS's own extensions
+    # against a host WITH a system mime.types installed (unlike the
+    # bare-stdlib probe that motivated that set in the first place) --
+    # these four resolve to a real, specific mimetype there instead of
+    # None.
     "application/x-mobipocket-ebook",  # .mobi
     "application/x-apple-diskimage",  # .dmg
     "application/x-iso9660-image",  # .iso
@@ -202,13 +201,21 @@ def _is_binary_mime_type(mime_type: str) -> bool:
     )
 
 
-# Extensions of unambiguously binary formats that resolve to no mime type
-# at all (neither _MIME_TYPE_OVERRIDES nor a bare stdlib mimetypes install
-# recognizes them), so _name_looks_binary's mime-type check alone would
-# silently miss them. onedrive_upload_text_file's content is always UTF-8
+# Extensions of unambiguously binary formats, checked unconditionally --
+# regardless of what (if anything) mimetypes.guess_type() resolves them to
+# on the current host. This started as a fallback consulted only when
+# guess_type() returned no mimetype at all, but that's not host-independent
+# enough on its own: verified directly against a CI run (Ubuntu, Python
+# 3.12) that .deb/.p12/.pfx/.swf resolve there to *some* mimetype (not
+# None) that isn't in _BINARY_MIME_TYPES, even though this same set of
+# extensions either resolved to None or to a _BINARY_MIME_TYPES-covered
+# value on other hosts tested. For an extension already known to be an
+# unambiguously binary format, trusting this set outright is more reliable
+# than trusting whatever string a given host's mimetypes database happens
+# to produce for it. onedrive_upload_text_file's content is always UTF-8
 # text (see below), so a binary-looking target name is always a caller
 # mistake, not a valid use.
-_KNOWN_BINARY_EXTENSIONS_WITHOUT_MIME_GUESS = {
+_KNOWN_BINARY_EXTENSIONS = {
     ".mobi", ".psd",
     ".ogg", ".flac", ".m4a",
     ".mkv", ".wmv",
@@ -217,16 +224,11 @@ _KNOWN_BINARY_EXTENSIONS_WITHOUT_MIME_GUESS = {
     ".woff", ".woff2", ".ttf", ".otf",
     ".parquet", ".sqlite", ".sqlite3", ".db", ".db3",
     ".numbers", ".pages", ".key", ".blend", ".indd", ".pub",
-    # Resolve to a real, specific mimetype on a host with a full system
-    # mime.types (so they're already caught by _BINARY_MIME_TYPES/prefixes
-    # there) but to None on a bare stdlib install -- verified directly via
-    # MimeTypes(filenames=()) -- so they're listed here too for host
-    # independence, same rationale as the rest of this set.
     ".jar", ".class", ".cab", ".deb", ".torrent", ".m4v",
-    # Resolve to no mimetype at all on any host tested (bare stdlib or
-    # system mime.types) -- camera raw photo and generic macOS/executable
-    # bundle formats mimetypes has no opinion on whatsoever.
     ".raw", ".cr2", ".app",
+    # Resolved to a mimetype covered by _BINARY_MIME_TYPES on every host
+    # tested locally, but not on CI's -- see this set's own docstring.
+    ".p12", ".pfx", ".swf",
 }  # fmt: skip
 
 
@@ -419,21 +421,26 @@ def _name_looks_binary(name: str) -> bool:
     to "not binary" -- these extensions' real mimetypes collide with an
     unrelated binary format (see that set's own docstring), which only
     matters for this text/binary guard, not for _guess_mime_type's real
-    Content-Type resolution. Otherwise, a resolvable mime type (override or
-    stdlib) is binary only if _is_binary_mime_type says so -- anything
-    else, including a mime type nobody anticipated, defaults to "not
-    binary" (see that function's own docstring for why a positive binary
-    list is the safer default here). An unresolvable mime type falls back
-    to the small hand-maintained set of formats mimetypes has no opinion
-    on at all (_KNOWN_BINARY_EXTENSIONS_WITHOUT_MIME_GUESS above).
+    Content-Type resolution. _KNOWN_BINARY_EXTENSIONS is checked next and
+    unconditionally, regardless of what mimetypes resolves the name to (or
+    doesn't) -- see that set's own docstring for why trusting a known
+    extension outright is more reliable than trusting a given host's
+    mimetypes database. Only once neither of those settles it does a
+    resolvable mime type (override or stdlib) get consulted, and it's
+    binary only if _is_binary_mime_type says so -- anything else,
+    including a mime type nobody anticipated, defaults to "not binary"
+    (see that function's own docstring for why a positive binary list is
+    the safer default here).
     """
     suffix = Path(name).suffix.lower()
     if suffix in _AMBIGUOUS_TEXT_EXTENSIONS:
         return False
+    if suffix in _KNOWN_BINARY_EXTENSIONS:
+        return True
     guessed = _guess_mime_type(name)
     if guessed is not None:
         return _is_binary_mime_type(guessed)
-    return suffix in _KNOWN_BINARY_EXTENSIONS_WITHOUT_MIME_GUESS
+    return False
 
 
 def _allowed_upload_dirs() -> list[Path]:

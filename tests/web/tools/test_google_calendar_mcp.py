@@ -1600,12 +1600,15 @@ def test_update_events_treats_existing_attendee_case_insensitively(fake_service)
     with different casing must still be recognized as "already there" -
     otherwise it's treated as newly-added, gets checked against the
     unchanged window, and always self-conflicts on its own busy block for
-    this very event."""
+    this very event. Uses mismatched casing on BOTH sides (the event's own
+    stored casing, and the caller's resubmitted casing) - a fixture using
+    lowercase on the stored side alone can't tell a correct fold from a
+    mutation that drops .lower() on just that side."""
     fake_service._events._get_result = {
         "id": "self-1",
         "start": {"dateTime": "2026-08-27T10:00:00+08:00"},
         "end": {"dateTime": "2026-08-27T10:30:00+08:00"},
-        "attendees": [{"email": "old@example.com"}],
+        "attendees": [{"email": "Old@Example.com"}],
     }
     fake_service._freebusy = FakeFreebusy(
         {
@@ -1629,7 +1632,7 @@ def test_update_events_treats_existing_attendee_case_insensitively(fake_service)
     result = json.loads(
         calendar.google_calendar_update_events(
             event_id="self-1",
-            attendees=["Old@Example.com", "new@example.com"],
+            attendees=["old@example.com", "new@example.com"],
         )
     )
 

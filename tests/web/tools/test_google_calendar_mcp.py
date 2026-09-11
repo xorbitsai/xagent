@@ -39,6 +39,66 @@ def _fake_service(execute_result: dict, existing_event: dict | None = None):
     return service
 
 
+def test_is_bare_date_accepts_a_bare_date():
+    assert mcp_utils.is_bare_date("2026-08-26")
+
+
+def test_is_bare_date_rejects_a_datetime():
+    assert not mcp_utils.is_bare_date("2026-08-26T07:00:00")
+
+
+def test_is_bare_date_rejects_a_space_separated_datetime():
+    assert not mcp_utils.is_bare_date("2026-08-26 07:00:00")
+
+
+def test_is_bare_date_accepts_a_lowercase_variant_with_whitespace():
+    assert mcp_utils.is_bare_date("  2026-08-26  ")
+
+
+def test_has_own_utc_offset_true_for_a_z_suffix():
+    assert calendar._has_own_utc_offset("2026-08-26T07:00:00Z")
+
+
+def test_has_own_utc_offset_true_for_an_explicit_offset():
+    assert calendar._has_own_utc_offset("2026-08-26T07:00:00+08:00")
+
+
+def test_has_own_utc_offset_false_for_a_naive_datetime():
+    assert not calendar._has_own_utc_offset("2026-08-26T07:00:00")
+
+
+def test_has_own_utc_offset_false_for_unparseable_input():
+    assert not calendar._has_own_utc_offset("not-a-date")
+
+
+def test_merge_recurrence_replaces_the_rrule_but_keeps_other_lines():
+    existing = ["RRULE:FREQ=DAILY", "EXDATE:20260827T090000Z", "RDATE:20260830T090000Z"]
+    merged = calendar._merge_recurrence(existing, "RRULE:FREQ=WEEKLY")
+    assert merged == [
+        "RRULE:FREQ=WEEKLY",
+        "EXDATE:20260827T090000Z",
+        "RDATE:20260830T090000Z",
+    ]
+
+
+def test_merge_recurrence_drops_a_lowercase_existing_rrule_line_too():
+    merged = calendar._merge_recurrence(["rrule:freq=daily"], "RRULE:FREQ=WEEKLY")
+    assert merged == ["RRULE:FREQ=WEEKLY"]
+
+
+def test_merge_recurrence_with_no_existing_recurrence():
+    assert calendar._merge_recurrence(None, "RRULE:FREQ=WEEKLY") == [
+        "RRULE:FREQ=WEEKLY"
+    ]
+
+
+def test_normalize_rrule_returns_a_prefixed_uppercased_string():
+    assert (
+        calendar._normalize_rrule("freq=daily;count=3", "2026-08-26T07:00:00")
+        == "RRULE:FREQ=DAILY;COUNT=3"
+    )
+
+
 def test_create_events_sets_recurrence(monkeypatch):
     service = _fake_service({"id": "created"})
     monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
@@ -62,15 +122,15 @@ def test_create_events_sets_recurrence(monkeypatch):
     assert kwargs["body"]["end"]["timeZone"] == "Asia/Shanghai"
 
 
-def test_create_events_does_not_stamp_timezone_on_a_side_with_its_own_offset(
+def test_create_events_stamps_timezone_even_when_recurrence_has_its_own_offset(
     monkeypatch,
 ):
-    """Confirmed bug: timezone used to be stamped onto start/end
-    unconditionally whenever it was given, even when start_time/end_time
-    already carried their own UTC offset - producing an internally
-    contradictory EventDateTime (e.g. dateTime says "+08:00", timeZone
-    says "America/Los_Angeles"). Must be skipped for a side that's
-    already self-describing."""
+    """Google's EventDateTime reference requires timeZone unconditionally
+    for a recurring event, regardless of whether start_time/end_time
+    already carry their own UTC offset - the offset only fixes this one
+    occurrence's instant, while timeZone governs how the recurrence
+    itself expands (e.g. across DST transitions). Must NOT be skipped
+    here just because the value is already self-describing."""
     service = _fake_service({"id": "created"})
     monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
 
@@ -81,6 +141,30 @@ def test_create_events_does_not_stamp_timezone_on_a_side_with_its_own_offset(
             end_time="2026-08-26T10:00:00+08:00",
             timezone="America/Los_Angeles",
             recurrence="FREQ=WEEKLY;COUNT=5",
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.insert.call_args
+    assert kwargs["body"]["start"]["timeZone"] == "America/Los_Angeles"
+    assert kwargs["body"]["end"]["timeZone"] == "America/Los_Angeles"
+
+
+def test_create_events_skips_timezone_on_its_own_offset_without_recurrence(
+    monkeypatch,
+):
+    """Without recurrence, timeZone is merely optional (per Google's own
+    docs), so a side that already carries its own UTC offset is skipped
+    instead of risking a disagreeing zone on an optional field."""
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="One-off",
+            start_time="2026-08-26T09:00:00+08:00",
+            end_time="2026-08-26T10:00:00+08:00",
+            timezone="America/Los_Angeles",
         )
     )
 
@@ -108,6 +192,31 @@ def test_create_events_requires_timezone_when_recurrence_is_set(monkeypatch):
 
     assert result["status"] == "error"
     assert "timezone is required" in result["message"]
+    service.events.return_value.insert.assert_not_called()
+
+
+def test_create_events_rejects_an_invalid_timezone_even_without_recurrence(
+    monkeypatch,
+):
+    """Confirmed bug: an invalid IANA timezone name was only ever caught
+    by resolve_zoneinfo when recurrence was also set (parse_rrule is its
+    only caller) - without recurrence, a bad timezone silently reached
+    Google's API and surfaced as an opaque server-side error instead of
+    this connector's own clean message."""
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Standup",
+            start_time="2026-08-26T09:00:00",
+            end_time="2026-08-26T09:15:00",
+            timezone="Not/AZone",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "unknown timezone" in result["message"]
     service.events.return_value.insert.assert_not_called()
 
 
@@ -235,6 +344,30 @@ def test_create_events_creates_an_all_day_event_from_bare_dates(monkeypatch):
     assert kwargs["body"]["end"] == {"date": "2026-09-02"}
 
 
+def test_create_events_strips_whitespace_from_a_bare_date_before_sending_it(
+    monkeypatch,
+):
+    """is_bare_date strips surrounding whitespace to decide the shape, but
+    the raw start_time/end_time used to be written into the payload as-is
+    - a bare date with incidental whitespace would reach Google as
+    something other than the exact "YYYY-MM-DD" it requires."""
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="All day thing",
+            start_time="  2026-09-01  ",
+            end_time="  2026-09-02  ",
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.insert.call_args
+    assert kwargs["body"]["start"] == {"date": "2026-09-01"}
+    assert kwargs["body"]["end"] == {"date": "2026-09-02"}
+
+
 def test_create_events_treats_a_space_separated_datetime_as_timed_not_all_day(
     monkeypatch,
 ):
@@ -348,6 +481,26 @@ def test_update_events_requires_timezone_when_recurrence_is_set_on_a_timed_event
     service.events.return_value.update.assert_not_called()
 
 
+def test_update_events_rejects_an_invalid_timezone_even_without_recurrence(
+    monkeypatch,
+):
+    """Same fix as create_events: an invalid IANA timezone name must be
+    caught here directly, not only when recurrence is also set."""
+    service = _fake_service({"id": "existing-1"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            timezone="Not/AZone",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "unknown timezone" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
 def test_update_events_reuses_the_existing_events_own_timezone(monkeypatch):
     """When timezone isn't passed to the update, the event's own existing
     timeZone must be reused rather than requiring the caller to repeat
@@ -371,6 +524,33 @@ def test_update_events_reuses_the_existing_events_own_timezone(monkeypatch):
     _, kwargs = service.events.return_value.update.call_args
     assert kwargs["body"]["start"]["timeZone"] == "Asia/Manila"
     assert kwargs["body"]["end"]["timeZone"] == "Asia/Manila"
+
+
+def test_update_events_reuses_each_sides_own_timezone_when_they_differ(monkeypatch):
+    """Confirmed bug: the recurrence branch used to fall back to start's
+    existing timeZone for *both* sides, silently overwriting a genuinely
+    different existing end timeZone (e.g. a flight event) - Google allows
+    start/end to legitimately differ, so end must reuse its own existing
+    zone, not start's."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "Asia/Shanghai"},
+        "end": {"dateTime": "2026-08-26T11:00:00", "timeZone": "America/Los_Angeles"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=WEEKLY;COUNT=3",
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["body"]["start"]["timeZone"] == "Asia/Shanghai"
+    assert kwargs["body"]["end"]["timeZone"] == "America/Los_Angeles"
 
 
 def test_update_events_reuses_existing_timezone_even_when_moving_the_event(
@@ -464,15 +644,13 @@ def test_update_events_explicit_timezone_overrides_existing_one_on_reschedule(
     assert kwargs["body"]["end"]["timeZone"] == "America/New_York"
 
 
-def test_update_events_does_not_stamp_timezone_on_a_side_with_its_own_offset(
+def test_update_events_stamps_timezone_even_when_recurrence_has_its_own_offset(
     monkeypatch,
 ):
-    """Confirmed bug: an explicit timezone used to be stamped onto
-    start/end unconditionally, even when the new start_time/end_time
-    already carried their own UTC offset - producing an internally
-    contradictory EventDateTime, the same class of bug the existing-
-    timeZone reuse fallback already guards against for the no-explicit-
-    timezone case."""
+    """Google's EventDateTime reference requires timeZone unconditionally
+    for a recurring event, regardless of whether the new start_time/
+    end_time already carry their own UTC offset - must NOT be skipped
+    here just because the value is already self-describing."""
     existing_event = {
         "id": "existing-1",
         "start": {"dateTime": "2026-08-19T09:00:00+08:00", "timeZone": "Asia/Shanghai"},
@@ -488,6 +666,35 @@ def test_update_events_does_not_stamp_timezone_on_a_side_with_its_own_offset(
             end_time="2026-08-26T10:00:00+08:00",
             timezone="America/Los_Angeles",
             recurrence="FREQ=WEEKLY;COUNT=5",
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["body"]["start"]["timeZone"] == "America/Los_Angeles"
+    assert kwargs["body"]["end"]["timeZone"] == "America/Los_Angeles"
+
+
+def test_update_events_skips_timezone_on_its_own_offset_without_recurrence(
+    monkeypatch,
+):
+    """Without recurrence, timeZone is merely optional, so a side whose
+    new value already carries its own UTC offset is skipped instead of
+    risking a disagreeing zone on an optional field."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-19T09:00:00+08:00", "timeZone": "Asia/Shanghai"},
+        "end": {"dateTime": "2026-08-19T10:00:00+08:00", "timeZone": "Asia/Shanghai"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-08-26T09:00:00+08:00",
+            end_time="2026-08-26T10:00:00+08:00",
+            timezone="America/Los_Angeles",
         )
     )
 
@@ -535,6 +742,11 @@ def test_update_events_preserves_existing_exdate_when_replacing_the_rrule(
 def test_update_events_rejects_invalid_recurrence_without_calling_the_api(
     monkeypatch,
 ):
+    """Confirmed bug in the test itself: without an explicit timezone (and
+    an existing event with none either), the "timezone is required"
+    check fired first, so this test passed without ever actually
+    exercising recurrence validation - asserting only on
+    result["status"] would let it keep passing for a wrong reason."""
     existing_event = {
         "id": "existing-1",
         "start": {"dateTime": "2026-08-26T07:00:00+08:00"},
@@ -547,10 +759,12 @@ def test_update_events_rejects_invalid_recurrence_without_calling_the_api(
         calendar.google_calendar_update_events(
             event_id="existing-1",
             recurrence="FREQ=FORTNIGHTLY",
+            timezone="Asia/Shanghai",
         )
     )
 
     assert result["status"] == "error"
+    assert "invalid recurrence rule" in result["message"]
     service.events.return_value.update.assert_not_called()
 
 
@@ -959,7 +1173,11 @@ def test_update_events_recurrence_survives_a_missing_end_key(monkeypatch):
     """Confirmed bug: a malformed fetched event missing the "end" key
     entirely (Google always returns both in practice, but this is
     defensive) used to raise a raw, opaque KeyError('end') instead of
-    either a clean error or a graceful degradation."""
+    either a clean error or a graceful degradation. Also confirms a
+    second, previously-untested bug: the recurrence branch used to stamp
+    a bare {"timeZone": ...} onto "end" regardless, a structurally
+    invalid EventDateTime with no "dateTime"/"date" - "end" must instead
+    be left alone entirely when there's nothing to attach a zone to."""
     existing_event = {
         "id": "existing-1",
         "start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "Asia/Manila"},
@@ -975,6 +1193,8 @@ def test_update_events_recurrence_survives_a_missing_end_key(monkeypatch):
     )
 
     assert result["status"] == "success"
+    _, kwargs = service.events.return_value.update.call_args
+    assert "end" not in kwargs["body"]
 
 
 def test_update_events_survives_an_explicit_none_start_and_end(monkeypatch):

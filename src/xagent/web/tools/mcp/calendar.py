@@ -11,7 +11,9 @@ from mcp.server.fastmcp import FastMCP
 
 from .utils import (
     ensure_rrule_prefix,
+    is_bare_date,
     parse_rrule,
+    resolve_zoneinfo,
     setup_proxy_env,
     success_with_capped_dict,
 )
@@ -25,19 +27,16 @@ setup_proxy_env()
 mcp = FastMCP("calendar-mcp")
 
 
-def _normalize_rrule(
-    recurrence: str, dtstart: str, timezone: str | None = None
-) -> list[str]:
-    """Validate `recurrence` and return it as the single-item RRULE list
-    Google's `events` resource expects, with the "RRULE:" prefix added if
-    the caller omitted it.
+def _normalize_rrule(recurrence: str, dtstart: str, timezone: str | None = None) -> str:
+    """Validate `recurrence` and return it as a single RRULE line, with
+    the "RRULE:" prefix added if the caller omitted it.
 
     `timezone`, when given, localizes a naive `dtstart` (e.g. an RFC3339
     dateTime with no UTC offset) before validation, so it can be compared
     against a "Z"-suffixed UNTIL without dateutil rejecting the mismatch.
     """
     parse_rrule(recurrence, dtstart, timezone)
-    return [ensure_rrule_prefix(recurrence)]
+    return ensure_rrule_prefix(recurrence)
 
 
 def _merge_recurrence(
@@ -60,21 +59,6 @@ def _merge_recurrence(
     return [new_rrule, *preserved]
 
 
-def _is_bare_date(value: str) -> bool:
-    """Whether a caller-supplied start_time/end_time string is a bare
-    "date" (Google's all-day form, e.g. "2026-08-26") rather than a
-    "dateTime".
-
-    Checked structurally (exactly three hyphen-separated all-digit parts)
-    rather than by the absence of a "T"/"t" date/time separator: RFC3339
-    also permits a space in place of "T" for readability, so
-    "2026-08-26 07:00:00" contains no "t" either and would otherwise be
-    misclassified as a bare date.
-    """
-    parts = value.strip().split("-")
-    return len(parts) == 3 and all(part.isdigit() for part in parts)
-
-
 def _has_own_utc_offset(dt_string: str) -> bool:
     """Whether an RFC3339 dateTime string carries its own explicit UTC
     offset or "Z" suffix, as opposed to a naive local time meant to be
@@ -86,6 +70,42 @@ def _has_own_utc_offset(dt_string: str) -> bool:
         return _date_parser.isoparse(dt_string).tzinfo is not None
     except ValueError:
         return False
+
+
+def _stamp_timezone(
+    event: dict[str, Any],
+    side: str,
+    current_value: str | None,
+    timezone: str,
+    *,
+    force: bool,
+) -> None:
+    """Write `timezone` onto ``event[side]["timeZone"]``, skipping only
+    when doing so would be malformed or, for a non-recurring event,
+    redundant.
+
+    Skipped entirely when `current_value` is None: this side has no
+    "dateTime"/"date" value at all (a malformed fetched event), and
+    stamping a bare {"timeZone": ...} would send Google a structurally
+    invalid EventDateTime carrying neither key.
+
+    Otherwise skipped only when `force` is False and `current_value`
+    already carries its own UTC offset, to avoid a possibly-disagreeing
+    zone on a field Google only requires unconditionally for a
+    *recurring* event (`force=True`, passed by the recurrence branch) -
+    Google's own EventDateTime reference states timeZone is required for
+    a recurring event regardless of any offset already in dateTime, since
+    the offset fixes this occurrence's instant while timeZone governs how
+    the recurrence itself expands (e.g. across DST transitions); they are
+    not redundant. For a plain reschedule timeZone is merely optional, so
+    it's skipped there instead when the value is already self-describing.
+    """
+    if current_value is None:
+        return
+    if not force and _has_own_utc_offset(current_value):
+        return
+    event[side] = event.get(side) or {}
+    event[side]["timeZone"] = timezone
 
 
 def get_calendar_service() -> Any:
@@ -365,20 +385,27 @@ def google_calendar_create_events(
     or both a bare date (e.g. '2024-01-01') to create an all-day event -
     they must both be the same kind, never a mix.
     recurrence, if given, is a single RFC 5545 RRULE string describing a
-    repeating series for this event (the "RRULE:" prefix is optional), e.g.
+    repeating series for this event (the "RRULE:" prefix is optional; it
+    must not contain embedded newlines), e.g.
     'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;UNTIL=20260911T235959Z' for "every
     weekday until Sep 11, 2026". It's validated before being sent to
     Google and rejected with a clear error if it can't be parsed, rather
-    than silently landing as inert text with no actual recurrence.
+    than silently landing as inert text with no actual recurrence. There
+    is no way to clear a recurrence back to a single event once set,
+    through this tool or google_calendar_update_events.
     timezone is an IANA timezone name (e.g. 'America/Los_Angeles'). Google
-    requires it for a non-all-day recurring event specifically (it's what
-    the recurrence is expanded in), so it's required here whenever
+    requires it for a non-all-day recurring event specifically - and does
+    so unconditionally, even when start_time/end_time already carry their
+    own UTC offset, since timezone governs how the recurrence itself
+    expands (e.g. across DST transitions) while the offset only fixes
+    this one occurrence's instant - so it's required here whenever
     recurrence is set on one; an all-day recurring event doesn't need it
-    (Google doesn't attach a timeZone to a date-only event). When
-    start_time/end_time have no UTC offset, timezone also localizes them
-    so recurrence's UNTIL can be compared against them correctly, and it's
-    skipped for a side that already carries its own offset to avoid the
-    two disagreeing.
+    (Google doesn't attach a timeZone to a date-only event). Outside of
+    recurrence, timezone also localizes a naive start_time/end_time (no
+    UTC offset) for the purposes of comparing recurrence's UNTIL against
+    them, and is only written to a side that doesn't already carry its
+    own offset (there it's optional, so it's skipped rather than risk
+    disagreeing with that offset).
     attendees is a list of email addresses to add to the event. Adding attendees does not, by
     itself, email them; set notify_attendees=True to have Google Calendar send them a native
     invite immediately. Confirm the recipient list with the user before setting notify_attendees=True.
@@ -393,8 +420,8 @@ def google_calendar_create_events(
     """
     requested_conference = False
     try:
-        start_is_all_day = _is_bare_date(start_time)
-        end_is_all_day = _is_bare_date(end_time)
+        start_is_all_day = is_bare_date(start_time)
+        end_is_all_day = is_bare_date(end_time)
         if start_is_all_day != end_is_all_day:
             raise ValueError(
                 "start_time and end_time must both be a bare date or both "
@@ -406,25 +433,34 @@ def google_calendar_create_events(
                 "timezone is required when recurrence is set (Google expands "
                 "a recurring event's occurrences in this timezone)"
             )
+        if timezone:
+            # Validate eagerly with a clean, actionable message - the only
+            # other path that would otherwise catch a bad IANA name is
+            # parse_rrule, which only runs when recurrence is also set,
+            # leaving an invalid timezone on a non-recurring event to
+            # surface as Google's own opaque server-side error instead.
+            resolve_zoneinfo(timezone)
 
         service = get_calendar_service()
 
+        # Stripped once here so the value written into the payload always
+        # matches what is_bare_date actually validated - is_bare_date
+        # strips internally for the shape check, but a raw start_time with
+        # incidental surrounding whitespace would otherwise still reach
+        # Google verbatim.
+        start_value = start_time.strip() if start_is_all_day else start_time
+        end_value = end_time.strip() if end_is_all_day else end_time
         event: dict[str, Any] = {
             "summary": summary,
             "start": (
-                {"date": start_time} if start_is_all_day else {"dateTime": start_time}
+                {"date": start_value} if start_is_all_day else {"dateTime": start_value}
             ),
-            "end": {"date": end_time} if end_is_all_day else {"dateTime": end_time},
+            "end": {"date": end_value} if end_is_all_day else {"dateTime": end_value},
         }
         if timezone and not start_is_all_day:
-            # Skip a side whose value already carries its own UTC offset -
-            # stamping timezone there too could disagree with it (e.g. a
-            # "+08:00" dateTime alongside a "America/Los_Angeles"
-            # timeZone), an internally-contradictory EventDateTime.
-            if not _has_own_utc_offset(start_time):
-                event["start"]["timeZone"] = timezone
-            if not _has_own_utc_offset(end_time):
-                event["end"]["timeZone"] = timezone
+            force = recurrence is not None
+            _stamp_timezone(event, "start", start_time, timezone, force=force)
+            _stamp_timezone(event, "end", end_time, timezone, force=force)
 
         if description:
             event["description"] = description
@@ -438,9 +474,9 @@ def google_calendar_create_events(
             # about a timeZone for a date-only event. UTC is only used
             # here for that comparison; it's never written to the event.
             localization_timezone = timezone or ("UTC" if start_is_all_day else None)
-            event["recurrence"] = _normalize_rrule(
-                recurrence, start_time, localization_timezone
-            )
+            event["recurrence"] = [
+                _normalize_rrule(recurrence, start_time, localization_timezone)
+            ]
         _merge_attendees(event, attendees)
         requested_conference = _apply_conference_request(event, add_google_meet)
 
@@ -502,11 +538,25 @@ def google_calendar_update_events(
     event (e.g. a previously-cancelled single occurrence) are kept -
     there is no way to clear an existing recurrence back to a single
     event through this parameter.
-    timezone is an IANA timezone name; Google requires one for recurring
-    events. If recurrence is set and timezone is omitted, the event's own
-    existing timeZone is reused; if the event has none either, this call
-    is rejected with a clear error rather than sending an incomplete
-    request to Google.
+    timezone is an IANA timezone name; Google requires one for a
+    non-all-day recurring event - and does so unconditionally, even when
+    start_time/end_time (or the event's existing values) already carry
+    their own UTC offset. If recurrence is set and timezone is omitted,
+    each of the event's start/end reuses its own existing timeZone (they
+    can legitimately differ, e.g. a flight); if a side has none at all, it
+    falls back to the other side's rather than being left without one, and
+    if neither side has one either, this call is rejected with a clear
+    error rather than sending an incomplete request to Google. Passing
+    timezone without also passing start_time/end_time reinterprets the
+    event's existing wall-clock time under the new zone rather than
+    converting the underlying instant - e.g. an event stored as
+    07:00/Asia/Manila becomes 07:00/America/New_York, a ~12h shift in
+    absolute time, not a same-instant re-labeling; pass start_time/
+    end_time as well to actually convert the instant. timezone is
+    otherwise optional and, outside of recurrence, is skipped for a side
+    that already carries its own offset (there it's merely optional, so
+    it's skipped rather than risk disagreeing with that offset) and has
+    no effect at all on an all-day event.
     attendees is a list of email addresses to add to the event; attendees already on the event are
     kept, and there is no way to remove an attendee through this parameter. Adding attendees does
     not, by itself, email anyone; set notify_attendees=True to have Google Calendar send a native
@@ -526,6 +576,14 @@ def google_calendar_update_events(
     """
     requested_conference = False
     try:
+        if timezone:
+            # Validate eagerly with a clean, actionable message - the
+            # only other path that would otherwise catch a bad IANA name
+            # is parse_rrule, which only runs when recurrence is also
+            # set, leaving an invalid timezone on a plain reschedule to
+            # surface as Google's own opaque server-side error instead.
+            resolve_zoneinfo(timezone)
+
         service = get_calendar_service()
 
         # First get the existing event
@@ -543,8 +601,12 @@ def google_calendar_update_events(
         if summary:
             event["summary"] = summary
         if start_time:
-            if _is_bare_date(start_time):
-                event["start"] = {"date": start_time}
+            if is_bare_date(start_time):
+                # Stripped so the payload always matches what is_bare_date
+                # actually validated - it strips internally for the shape
+                # check, but a raw start_time with incidental surrounding
+                # whitespace would otherwise still reach Google verbatim.
+                event["start"] = {"date": start_time.strip()}
             else:
                 event["start"] = {"dateTime": start_time}
                 # Only fall back to the event's existing timeZone when the
@@ -559,8 +621,8 @@ def google_calendar_update_events(
                 ):
                     event["start"]["timeZone"] = existing_start_timezone
         if end_time:
-            if _is_bare_date(end_time):
-                event["end"] = {"date": end_time}
+            if is_bare_date(end_time):
+                event["end"] = {"date": end_time.strip()}
             else:
                 event["end"] = {"dateTime": end_time}
                 if (
@@ -579,7 +641,7 @@ def google_calendar_update_events(
         # treating it as all-day.
         start_dict = event.get("start") or {}
         current_start_value = start_dict.get("dateTime") or start_dict.get("date")
-        is_all_day = current_start_value is not None and _is_bare_date(
+        is_all_day = current_start_value is not None and is_bare_date(
             current_start_value
         )
         # Google requires start and end to be the SAME kind (both a bare
@@ -589,7 +651,7 @@ def google_calendar_update_events(
         # its old shape, producing a payload Google's API would reject.
         end_dict = event.get("end") or {}
         current_end_value = end_dict.get("dateTime") or end_dict.get("date")
-        end_is_all_day = current_end_value is not None and _is_bare_date(
+        end_is_all_day = current_end_value is not None and is_bare_date(
             current_end_value
         )
         if (
@@ -605,19 +667,9 @@ def google_calendar_update_events(
             )
 
         if timezone and not is_all_day:
-            # Skip a side whose current value already carries its own UTC
-            # offset - stamping timezone there too could disagree with it,
-            # an internally-contradictory EventDateTime (the same concern
-            # the existing-timeZone reuse fallback above already guards
-            # against for the no-explicit-timezone case).
-            if current_start_value is None or not _has_own_utc_offset(
-                current_start_value
-            ):
-                event["start"] = event.get("start") or {}
-                event["start"]["timeZone"] = timezone
-            if current_end_value is None or not _has_own_utc_offset(current_end_value):
-                event["end"] = event.get("end") or {}
-                event["end"]["timeZone"] = timezone
+            force = recurrence is not None
+            _stamp_timezone(event, "start", current_start_value, timezone, force=force)
+            _stamp_timezone(event, "end", current_end_value, timezone, force=force)
         if description:
             event["description"] = description
         if location:
@@ -628,43 +680,56 @@ def google_calendar_update_events(
                     "could not determine the event's start time or date to "
                     "validate the recurrence rule; pass start_time explicitly"
                 )
-            effective_timezone = timezone or existing_start_timezone
-            if not is_all_day and not effective_timezone:
+            # Computed per side, not one shared value: start and end can
+            # legitimately have different timeZones (e.g. a flight), so
+            # falling back to *start's* existing zone for *end* too would
+            # silently clobber a genuinely-different existing end zone.
+            # effective_end_timezone only falls further back to
+            # effective_start_timezone as a last resort, when end has no
+            # timezone of its own to preserve at all - Google requires
+            # both start.timeZone and end.timeZone for a recurring event,
+            # so end still needs *something* in that case.
+            effective_start_timezone = timezone or existing_start_timezone
+            effective_end_timezone = (
+                timezone or existing_end_timezone or effective_start_timezone
+            )
+            if not is_all_day and not effective_start_timezone:
                 raise ValueError(
                     "timezone is required to set a recurrence rule on this "
                     "event (Google expands a recurring event's occurrences "
                     "in this timezone, and the event doesn't already have one)"
                 )
-            if effective_timezone and not is_all_day:
-                # Not direct indexing or .setdefault: a malformed fetched
-                # event missing "start"/"end" entirely, or carrying an
-                # explicit None for one (Google always returns both as
-                # objects in practice, but this avoids a raw KeyError/
-                # AttributeError leaking through as an opaque error message
-                # if it ever doesn't), still gets a clean dict to write into.
-                # Same own-offset skip as the plain-reschedule branch above.
-                if current_start_value is None or not _has_own_utc_offset(
-                    current_start_value
-                ):
-                    event["start"] = event.get("start") or {}
-                    event["start"]["timeZone"] = effective_timezone
-                if current_end_value is None or not _has_own_utc_offset(
-                    current_end_value
-                ):
-                    event["end"] = event.get("end") or {}
-                    event["end"]["timeZone"] = effective_timezone
+            if not is_all_day:
+                # force=True: Google requires timeZone unconditionally for
+                # a recurring event, regardless of any offset already in
+                # current_start_value/current_end_value - see
+                # _stamp_timezone's docstring. Skipped only when the side
+                # has no dateTime/date at all (a malformed fetched event),
+                # never sending Google a bare {"timeZone": ...} shell.
+                assert effective_start_timezone is not None
+                assert effective_end_timezone is not None
+                _stamp_timezone(
+                    event,
+                    "start",
+                    current_start_value,
+                    effective_start_timezone,
+                    force=True,
+                )
+                _stamp_timezone(
+                    event, "end", current_end_value, effective_end_timezone, force=True
+                )
             # An all-day event's naive date anchor still needs *some*
             # timezone to compare against an aware ("Z"-suffixed) UNTIL -
             # RFC 5545 requires DTSTART and UNTIL to either both be aware or
             # both be floating, regardless of whether Google itself cares
             # about a timeZone for a date-only event. UTC is only used here
             # for that comparison; it's never written to the event.
-            localization_timezone = effective_timezone or (
+            localization_timezone = effective_start_timezone or (
                 "UTC" if is_all_day else None
             )
             new_rrule = _normalize_rrule(
                 recurrence, current_start_value, localization_timezone
-            )[0]
+            )
             event["recurrence"] = _merge_recurrence(event.get("recurrence"), new_rrule)
         _merge_attendees(event, attendees)
         requested_conference = _apply_conference_request(event, add_google_meet)

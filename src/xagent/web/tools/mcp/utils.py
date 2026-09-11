@@ -123,6 +123,20 @@ def success_with_capped_dict(field_name: str, data: Any) -> str:
     return response
 
 
+def is_bare_date(value: str) -> bool:
+    """Whether a caller-supplied date/time string is a bare "date" (e.g.
+    Google's all-day form, "2026-08-26") rather than a "dateTime".
+
+    Checked structurally (exactly three hyphen-separated all-digit parts,
+    after stripping outer whitespace) rather than by the absence of a
+    "T"/"t" date/time separator: RFC3339 also permits a space in place of
+    "T" for readability, so "2026-08-26 07:00:00" contains no "t" either
+    and would otherwise be misclassified as a bare date.
+    """
+    parts = value.strip().split("-")
+    return len(parts) == 3 and all(part.isdigit() for part in parts)
+
+
 def resolve_zoneinfo(timezone: str) -> ZoneInfo:
     """Resolve an IANA timezone name to a stdlib ZoneInfo, raising a clean
     ValueError (naming the bad value) instead of letting ZoneInfoNotFoundError
@@ -258,25 +272,18 @@ def parse_rrule(
     # value and not the string's own shape would let something like
     # "INTERVAL=1_0" or "COUNT=+5" slip through to the live API as invalid
     # RRULE text.
-    if "INTERVAL" in parts and not _DIGITS_ONLY_RE.fullmatch(parts["INTERVAL"]):
-        raise ValueError(
-            f"invalid recurrence rule: INTERVAL must be an integer, "
-            f"got {parts['INTERVAL']!r}"
-        )
-    if "COUNT" in parts and not _DIGITS_ONLY_RE.fullmatch(parts["COUNT"]):
-        raise ValueError(
-            f"invalid recurrence rule: COUNT must be an integer, got {parts['COUNT']!r}"
-        )
-    if "INTERVAL" in parts and int(parts["INTERVAL"]) < 1:
-        raise ValueError(
-            "invalid recurrence rule: INTERVAL must be a positive integer, "
-            f"got {int(parts['INTERVAL'])}"
-        )
-    if "COUNT" in parts and int(parts["COUNT"]) < 1:
-        raise ValueError(
-            "invalid recurrence rule: COUNT must be a positive integer, "
-            f"got {int(parts['COUNT'])}"
-        )
+    for key in ("INTERVAL", "COUNT"):
+        if key not in parts:
+            continue
+        if not _DIGITS_ONLY_RE.fullmatch(parts[key]):
+            raise ValueError(
+                f"invalid recurrence rule: {key} must be an integer, got {parts[key]!r}"
+            )
+        if int(parts[key]) < 1:
+            raise ValueError(
+                f"invalid recurrence rule: {key} must be a positive integer, "
+                f"got {int(parts[key])}"
+            )
 
     # Parsed before the anchor is localized below, since whether to
     # localize at all now depends on UNTIL's own value type.
@@ -297,19 +304,7 @@ def parse_rrule(
     # offset) or an already-`datetime` object (as Outlook's caller always
     # passes, already localized aware) - represents DATE-TIME, which RFC
     # 5545 requires UNTIL to match: aware, not floating.
-    # Checked structurally (exactly three hyphen-separated all-digit
-    # parts) rather than by the absence of a "T"/"t" separator: RFC3339
-    # also permits a space in place of "T" for readability, so a
-    # dtstart like "2026-08-26 07:00:00" contains no "t" either and would
-    # otherwise be misclassified as a bare date, disabling the anchor
-    # localization this check exists to gate and letting a genuine
-    # DATE-TIME + floating-UNTIL mismatch slip past validation.
-    dtstart_is_bare_date = False
-    if isinstance(dtstart, str):
-        dtstart_parts = dtstart.strip().split("-")
-        dtstart_is_bare_date = len(dtstart_parts) == 3 and all(
-            part.isdigit() for part in dtstart_parts
-        )
+    dtstart_is_bare_date = isinstance(dtstart, str) and is_bare_date(dtstart)
 
     if isinstance(dtstart, datetime):
         anchor = dtstart

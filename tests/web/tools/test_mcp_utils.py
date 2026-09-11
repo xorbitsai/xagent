@@ -267,7 +267,7 @@ def test_parse_rrule_rejects_space_separated_dtstart_paired_with_bare_date_until
     all-day DATE. That let it silently pair with a floating (bare-date)
     UNTIL instead of being rejected as the DATE-TIME-dtstart/floating-
     UNTIL mismatch it actually is."""
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="invalid recurrence rule"):
         utils.parse_rrule(
             "FREQ=DAILY;UNTIL=20260911",
             "2026-08-26 07:00:00",

@@ -42,6 +42,15 @@ def _fake_service(execute_result: dict, existing_event: dict | None = None):
     service.freebusy.return_value = Mock(
         query=Mock(return_value=Mock(execute=Mock(return_value={"calendars": {}})))
     )
+    service.calendars.return_value = Mock(
+        get=Mock(
+            return_value=Mock(
+                execute=Mock(
+                    return_value={"id": "organizer@example.com", "timeZone": "UTC"}
+                )
+            )
+        )
+    )
     return service
 
 

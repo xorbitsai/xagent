@@ -118,65 +118,78 @@ def _find_conflicts(
     unchecked_attendees: list[str] = []
 
     if check_organizer:
-        organizer_events: list[dict[str, Any]] = []
         page_token: str | None = None
         while True:
-            page = (
-                service.events()
-                .list(
-                    calendarId="primary",
-                    timeMin=time_min,
-                    timeMax=time_max,
-                    singleEvents=True,
-                    orderBy="startTime",
-                    pageToken=page_token,
+            try:
+                page = (
+                    service.events()
+                    .list(
+                        calendarId="primary",
+                        timeMin=time_min,
+                        timeMax=time_max,
+                        singleEvents=True,
+                        orderBy="startTime",
+                        pageToken=page_token,
+                    )
+                    .execute()
                 )
-                .execute()
-            )
-            organizer_events.extend(page.get("items") or [])
+            except HttpError as exc:
+                if exc.resp.status == 403 and _is_insufficient_scope_error(exc):
+                    raise InsufficientScopeError(
+                        "Missing the calendar.events permission needed to "
+                        "check organizer availability - reconnect the Google "
+                        "Calendar connector to grant it. This is a missing "
+                        "permission on our own credential, not a real "
+                        "scheduling conflict to route around.",
+                        conflicts,
+                        unchecked_attendees + attendees,
+                    ) from exc
+                raise
+
+            for item in page.get("items") or []:
+                if item.get("status") == "cancelled":
+                    continue
+                if item.get("transparency") == "transparent":
+                    continue
+                # A recurring event's instances (from singleEvents=True
+                # expansion) carry their OWN id, never the master's - e.g.
+                # "<masterId>_<recurrenceStamp>" - so excluding only by `id`
+                # never matches when `exclude_event_id` names the master
+                # itself (the normal way to address a recurring series).
+                # `recurringEventId` is the field Google's own Events
+                # resource documents as reporting the master's id on each
+                # instance; without also checking it, rescheduling or adding
+                # an attendee to a recurring event's master would report the
+                # event as conflicting with its own instances.
+                if exclude_event_id and exclude_event_id in (
+                    item.get("id"),
+                    item.get("recurringEventId"),
+                ):
+                    continue
+                # NOTE: declining an invite (attendees[].responseStatus ==
+                # "declined" for the organizer's own self entry) is NOT used
+                # as a busy/free signal here - Google's own Events docs treat
+                # responseStatus and transparency as independent fields, with
+                # no documented guarantee that declining clears transparency
+                # to "transparent". An earlier version of this check skipped
+                # declined events outright, which silently treated a
+                # still-opaque declined event as free and permitted a real
+                # double booking. `transparency` above is the one field
+                # Google actually documents as the busy/free predicate.
+                start = item.get("start") or {}
+                end = item.get("end") or {}
+                conflicts.append(
+                    {
+                        "calendar": "organizer",
+                        "summary": item.get("summary") or "(no title)",
+                        "start": start.get("dateTime") or start.get("date"),
+                        "end": end.get("dateTime") or end.get("date"),
+                    }
+                )
+
             page_token = page.get("nextPageToken")
             if not page_token:
                 break
-        for item in organizer_events:
-            if item.get("status") == "cancelled":
-                continue
-            if item.get("transparency") == "transparent":
-                continue
-            # A recurring event's instances (from singleEvents=True
-            # expansion) carry their OWN id, never the master's - e.g.
-            # "<masterId>_<recurrenceStamp>" - so excluding only by `id`
-            # never matches when `exclude_event_id` names the master
-            # itself (the normal way to address a recurring series).
-            # `recurringEventId` is the field Google's own Events
-            # resource documents as reporting the master's id on each
-            # instance; without also checking it, rescheduling or adding
-            # an attendee to a recurring event's master would report the
-            # event as conflicting with its own instances.
-            if exclude_event_id and exclude_event_id in (
-                item.get("id"),
-                item.get("recurringEventId"),
-            ):
-                continue
-            # NOTE: declining an invite (attendees[].responseStatus ==
-            # "declined" for the organizer's own self entry) is NOT used
-            # as a busy/free signal here - Google's own Events docs treat
-            # responseStatus and transparency as independent fields, with
-            # no documented guarantee that declining clears transparency
-            # to "transparent". An earlier version of this check skipped
-            # declined events outright, which silently treated a
-            # still-opaque declined event as free and permitted a real
-            # double booking. `transparency` above is the one field
-            # Google actually documents as the busy/free predicate.
-            start = item.get("start") or {}
-            end = item.get("end") or {}
-            conflicts.append(
-                {
-                    "calendar": "organizer",
-                    "summary": item.get("summary") or "(no title)",
-                    "start": start.get("dateTime") or start.get("date"),
-                    "end": end.get("dateTime") or end.get("date"),
-                }
-            )
 
     # freebusy.query caps the number of calendars per call
     # (Google's calendarExpansionMax) - chunk rather than giving up on the

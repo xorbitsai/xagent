@@ -15,6 +15,7 @@ import weakref
 from collections.abc import Coroutine, Iterator
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import (
     Annotated,
     Any,
@@ -66,6 +67,10 @@ class MCPFailurePhase(str, Enum):
     SANDBOX_LIST_TOOLS = "sandbox_list_tools"
     SANDBOX_TOOL_WRAP = "sandbox_tool_wrap"
     NO_TOOLS_RETURNED = "no_tools_returned"
+
+
+class _WorkspaceFileRefUnavailable(ValueError):
+    """A public-safe failure resolving a connector workspace file handle."""
 
 
 _DEFAULT_UNAVAILABLE_MCP_MESSAGE = "MCP server credentials are unavailable."
@@ -944,6 +949,11 @@ class MCPToolAdapter(AbstractBaseTool):
         runtime_config = connection if isinstance(connection, Mapping) else {}
         self._runtime_bindings = runtime_bindings_from_config(runtime_config)
         self._connector_runtime = connector_runtime_from_config(runtime_config)
+        self._workspace = runtime_config.get("_workspace")
+        raw_file_bindings = runtime_config.get("workspace_file_ref_env")
+        self._workspace_file_ref_env = (
+            dict(raw_file_bindings) if isinstance(raw_file_bindings, Mapping) else {}
+        )
         from .base import ToolCategory
 
         self.category = ToolCategory.MCP
@@ -1425,6 +1435,14 @@ class MCPToolAdapter(AbstractBaseTool):
                 "is_error": True,
             }
 
+        except _WorkspaceFileRefUnavailable as e:
+            payload = {"status": "error", "message": str(e)}
+            return {
+                "content": [{"text": json.dumps(payload)}],
+                "structured_content": payload,
+                "is_error": True,
+            }
+
         except Exception as e:
             logger.error(
                 "MCP tool %s execution failed with %s",
@@ -1442,7 +1460,8 @@ class MCPToolAdapter(AbstractBaseTool):
         tool_args: Mapping[str, Any],
         tool_meta: Mapping[str, Any],
     ) -> dict[str, Any]:
-        async with create_session(connection) as session:
+        scoped_connection = self._connection_with_workspace_file(connection, tool_args)
+        async with create_session(scoped_connection) as session:
             await session.initialize()
             result = await session.call_tool(
                 self.mcp_tool.name,
@@ -1473,6 +1492,66 @@ class MCPToolAdapter(AbstractBaseTool):
                 "structured_content": other_fields.get("structuredContent"),
                 "is_error": bool(other_fields.get("isError")),
             }
+
+    def _connection_with_workspace_file(
+        self,
+        connection: Connection,
+        tool_args: Mapping[str, Any],
+    ) -> Connection:
+        """Inject one task-scoped FileRef resolution into a new stdio process."""
+        env_name = self._workspace_file_ref_env.get(self.mcp_tool.name)
+        if not isinstance(env_name, str):
+            return connection
+        if connection.get("transport") != "stdio" or not env_name:
+            raise _WorkspaceFileRefUnavailable(
+                "Workspace file upload is unavailable for this connector."
+            )
+
+        raw_file_id = tool_args.get("file_id")
+        file_id = str(raw_file_id).strip() if isinstance(raw_file_id, str) else ""
+        resolver = getattr(self._workspace, "resolve_file_id", None)
+        if not file_id or not callable(resolver):
+            raise _WorkspaceFileRefUnavailable(
+                "Workspace file is unavailable for this task."
+            )
+        try:
+            resolved = resolver(file_id)
+        except Exception as exc:
+            logger.warning(
+                "Workspace FileRef resolution failed for MCP tool %s (%s)",
+                self.mcp_tool.name,
+                type(exc).__name__,
+            )
+            raise _WorkspaceFileRefUnavailable(
+                "Workspace file is unavailable for this task."
+            ) from exc
+        if resolved is None:
+            raise _WorkspaceFileRefUnavailable(
+                "Workspace file is unavailable for this task."
+            )
+
+        resolved_path = Path(resolved).resolve()
+        workspace_root_value = getattr(self._workspace, "workspace_dir", None)
+        workspace_root = (
+            Path(workspace_root_value).resolve() if workspace_root_value else None
+        )
+        if (
+            workspace_root is None
+            or not resolved_path.is_relative_to(workspace_root)
+            or not resolved_path.is_file()
+        ):
+            raise _WorkspaceFileRefUnavailable(
+                "Workspace file is unavailable for this task."
+            )
+
+        scoped = dict(connection)
+        raw_env = connection.get("env")
+        env = dict(raw_env) if isinstance(raw_env, Mapping) else {}
+        env[env_name] = str(resolved_path)
+        env[f"{env_name}_ID"] = file_id
+        env[f"{env_name}_ROOT"] = str(workspace_root)
+        scoped["env"] = env
+        return cast(Connection, scoped)
 
     async def _retry_after_authorization_failure(
         self,

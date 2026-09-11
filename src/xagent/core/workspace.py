@@ -1288,13 +1288,11 @@ class TaskWorkspace:
             cached_path = self._file_id_to_path.get(file_id)
         if cached_path is not None:
             if cached_path.exists():
-                logger.debug(
-                    f"resolve_file_id: Found in cache: {file_id} -> {cached_path}"
-                )
+                logger.debug("resolve_file_id: Found file in cache: %s", file_id)
                 return cached_path
             else:
                 logger.warning(
-                    f"resolve_file_id: Cached path doesn't exist: {cached_path}"
+                    "resolve_file_id: Cached file is unavailable: %s", file_id
                 )
                 # Remove stale cache entry
                 with self._registration_lock:
@@ -1304,9 +1302,8 @@ class TaskWorkspace:
         internal_path = self._resolve_internal_file_id(file_id)
         if internal_path is not None:
             logger.debug(
-                "resolve_file_id: Found workspace-internal file: %s -> %s",
+                "resolve_file_id: Found workspace-internal file: %s",
                 file_id,
-                internal_path,
             )
             return internal_path
         if file_id.startswith("internal-"):

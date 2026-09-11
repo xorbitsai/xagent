@@ -1032,6 +1032,7 @@ class ToolFactory:
     async def _create_mcp_tools_from_configs(
         mcp_configs: list[dict[str, Any]],
         sandbox: Optional["Sandbox"] = None,
+        workspace: Any = None,
     ) -> list[Tool]:
         """Create MCP tools from configurations."""
         try:
@@ -1113,6 +1114,11 @@ class ToolFactory:
                             "transport": transport,
                             **inner_config,
                         }
+                        if workspace is not None:
+                            # create_session filters private connection keys;
+                            # the MCP adapter consumes this object locally to
+                            # resolve opaque workspace FileRefs before launch.
+                            connection_config["_workspace"] = workspace
                         for runtime_key in (
                             "runtime_bindings",
                             "runtime_input_schema",

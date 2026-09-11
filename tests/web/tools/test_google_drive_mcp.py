@@ -34,7 +34,7 @@ def _output_dir_env(tmp_path, monkeypatch):
     return tmp_path
 
 
-@pytest.fixture(autouse=True)
+@pytest.fixture
 def _upload_allowed_dirs_env(tmp_path, monkeypatch):
     """Scope google_drive_upload_file's read allowlist to an isolated
     per-test directory, mirroring _output_dir_env above for the write
@@ -43,6 +43,11 @@ def _upload_allowed_dirs_env(tmp_path, monkeypatch):
     allowed_dir = tmp_path / "workspace"
     allowed_dir.mkdir()
     monkeypatch.setenv("XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS", str(allowed_dir))
+    monkeypatch.setattr(
+        google_drive,
+        "_resolve_workspace_upload",
+        google_drive._resolve_upload_file_path,
+    )
     return allowed_dir
 
 
@@ -2731,7 +2736,7 @@ def test_resolve_upload_file_path_rejects_relative_path_resolved_against_cwd(
 def test_resolve_upload_file_path_rejects_missing_file_inside_allowed_dir(
     _upload_allowed_dirs_env,
 ):
-    with pytest.raises(FileNotFoundError, match="report.pdf"):
+    with pytest.raises(FileNotFoundError, match="File not found"):
         google_drive._resolve_upload_file_path(
             str(_upload_allowed_dirs_env / "report.pdf")
         )
@@ -2759,7 +2764,7 @@ def test_upload_file_tool_rejects_file_outside_allowlist_via_symlink(
 
 
 def test_upload_file_tool_falls_back_to_cwd_when_allowlist_env_unset(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, _upload_allowed_dirs_env
 ):
     """Minor #6 regression guard: with XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS
     unset, the tool must still work for a file inside the process's own
@@ -2819,26 +2824,107 @@ def test_upload_file_sends_real_binary_content(monkeypatch, _upload_allowed_dirs
     assert media.size() == len(b"%PDF-1.4 fake pdf bytes")
 
 
-def test_upload_file_accepts_explicit_name_and_mime_type(
+def test_upload_file_does_not_accept_model_supplied_name_or_mime_type(
     monkeypatch, _upload_allowed_dirs_env
 ):
-    local_file = _upload_allowed_dirs_env / "data.bin"
-    local_file.write_bytes(b"\x00\x01\x02")
-
     files = Mock()
     files.create.return_value.execute.return_value = {"id": "f1"}
     _mock_drive_service_with_files(monkeypatch, files)
 
-    result = json.loads(
+    with pytest.raises(TypeError):
         google_drive.google_drive_upload_file(
-            str(local_file), name="custom.dat", mime_type="application/octet-stream"
+            "workspace-file-id",
+            name="custom.dat",
+            mime_type="application/octet-stream",
         )
+    files.create.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_upload_file_schema_accepts_only_workspace_file_id_and_parent():
+    tools = {tool.name: tool for tool in await google_drive.mcp.list_tools()}
+
+    schema = tools["google_drive_upload_file"].inputSchema
+
+    assert set(schema["properties"]) == {"file_id", "parent_id"}
+    assert schema["required"] == ["file_id"]
+    assert (
+        "Filesystem paths are not accepted"
+        in tools["google_drive_upload_file"].description
     )
 
+
+def test_upload_file_rejects_unbound_path_shaped_file_id(monkeypatch, tmp_path):
+    local_file = tmp_path / "secret.pdf"
+    local_file.write_bytes(b"secret")
+    monkeypatch.delenv(google_drive._WORKSPACE_UPLOAD_ENV_VAR, raising=False)
+    monkeypatch.delenv(f"{google_drive._WORKSPACE_UPLOAD_ENV_VAR}_ID", raising=False)
+    files = Mock()
+    _mock_drive_service_with_files(monkeypatch, files)
+
+    result = json.loads(google_drive.google_drive_upload_file(str(local_file)))
+
+    assert result == {
+        "status": "error",
+        "message": "Workspace file is unavailable for this task",
+    }
+    assert str(local_file) not in result["message"]
+    files.create.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("filename", "expected_mime", "content"),
+    [
+        (
+            "deck.pptx",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            b"PK\x03\x04pptx\x00bytes",
+        ),
+        ("brief.pdf", "application/pdf", b"%PDF-1.7\x00bytes"),
+        ("photo.png", "image/png", b"\x89PNG\r\n\x1a\nbytes"),
+    ],
+)
+def test_upload_file_preserves_exact_binary_bytes_and_authoritative_metadata(
+    monkeypatch, tmp_path, filename, expected_mime, content
+):
+    local_file = tmp_path / filename
+    local_file.write_bytes(content)
+    monkeypatch.setenv(google_drive._WORKSPACE_UPLOAD_ENV_VAR, str(local_file))
+    monkeypatch.setenv(
+        f"{google_drive._WORKSPACE_UPLOAD_ENV_VAR}_ID", "workspace-file-id"
+    )
+    monkeypatch.setenv(f"{google_drive._WORKSPACE_UPLOAD_ENV_VAR}_ROOT", str(tmp_path))
+    captured = {}
+
+    class _CapturingUpload:
+        def __init__(self, fh, *, mimetype, resumable):
+            captured["bytes"] = fh.read()
+            captured["mime_type"] = mimetype
+            captured["resumable"] = resumable
+
+    monkeypatch.setattr(google_drive, "MediaIoBaseUpload", _CapturingUpload)
+    files = Mock()
+    files.create.return_value.execute.return_value = {
+        "id": "drive-id",
+        "name": filename,
+        "mimeType": expected_mime,
+    }
+    _mock_drive_service_with_files(monkeypatch, files)
+
+    result = json.loads(google_drive.google_drive_upload_file("workspace-file-id"))
+
     assert result["status"] == "success"
-    _, kwargs = files.create.call_args
-    assert kwargs["body"]["name"] == "custom.dat"
-    assert kwargs["body"]["mimeType"] == "application/octet-stream"
+    assert captured == {
+        "bytes": content,
+        "mime_type": expected_mime,
+        "resumable": True,
+    }
+    assert result["source"] == {
+        "file_id": "workspace-file-id",
+        "name": filename,
+        "mime_type": expected_mime,
+        "size": len(content),
+    }
 
 
 def test_upload_file_defaults_mime_type_when_unguessable(

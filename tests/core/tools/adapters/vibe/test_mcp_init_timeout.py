@@ -235,6 +235,7 @@ async def test_create_mcp_tools_releases_db_before_network_init(monkeypatch):
     from xagent.core.tools.adapters.vibe.mcp_tools import create_mcp_tools
 
     calls: list[str] = []
+    workspace = object()
 
     class FakeConfig:
         def get_tool_selection_spec(self):
@@ -259,7 +260,11 @@ async def test_create_mcp_tools_releases_db_before_network_init(monkeypatch):
         def get_sandbox(self):
             return None
 
-    async def fake_create(mcp_configs, sandbox=None):
+        def get_task_runtime_workspace(self):
+            return workspace
+
+    async def fake_create(mcp_configs, sandbox=None, **kwargs):
+        assert kwargs["workspace"] is workspace
         calls.append("network_init")
         return []
 

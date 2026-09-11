@@ -1,7 +1,4 @@
-"""Tests for injecting the file-upload allowlist directory into OAuth-transport
-MCP subprocess environments (LinkedIn's image upload, Slack's file upload,
-Gmail's message attachments, Google Drive's file upload) and Google Drive's
-dedicated write-target output directory."""
+"""Tests for OAuth MCP workspace file boundaries and Drive output paths."""
 
 from types import SimpleNamespace
 
@@ -38,9 +35,7 @@ def test_transport_config_sets_all_allowlist_vars_when_workspace_has_a_task(
     assert transport_config["env"]["XAGENT_SLACK_FILE_ALLOWED_DIRS"] == expected_dir
     assert transport_config["env"]["XAGENT_LINKEDIN_IMAGE_ALLOWED_DIRS"] == expected_dir
     assert transport_config["env"]["XAGENT_GMAIL_FILE_ALLOWED_DIRS"] == expected_dir
-    assert (
-        transport_config["env"]["XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS"] == expected_dir
-    )
+    assert "XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS" not in transport_config["env"]
     assert transport_config["env"]["XAGENT_GOOGLE_DRIVE_OUTPUT_DIR"] == expected_dir
 
 
@@ -60,7 +55,7 @@ def test_transport_config_omits_allowlist_vars_without_a_task_id():
     assert "XAGENT_SLACK_FILE_ALLOWED_DIRS" not in transport_config["env"]
     assert "XAGENT_LINKEDIN_IMAGE_ALLOWED_DIRS" not in transport_config["env"]
     assert "XAGENT_GMAIL_FILE_ALLOWED_DIRS" not in transport_config["env"]
-    assert "XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS" not in transport_config["env"]
+    assert "workspace_file_ref_env" not in transport_config
     assert "XAGENT_GOOGLE_DRIVE_OUTPUT_DIR" not in transport_config["env"]
 
 
@@ -94,9 +89,29 @@ def test_drive_output_dir_excludes_external_dirs_unlike_the_read_allowlists(
     assert str(external_dir.resolve()) in transport_config["env"][
         "XAGENT_SLACK_FILE_ALLOWED_DIRS"
     ].split(",")
-    assert str(external_dir.resolve()) in transport_config["env"][
-        "XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS"
-    ].split(",")
+    assert "XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS" not in transport_config["env"]
+
+
+def test_drive_transport_declares_the_scoped_file_ref_binding(tmp_path):
+    cfg = WebToolConfig(
+        db=None,
+        request=None,
+        task_id="task-123",
+        workspace_base_dir=str(tmp_path),
+    )
+
+    transport_config = cfg._build_oauth_mcp_stdio_transport_config(
+        server=SimpleNamespace(name="Google Drive"),
+        app_info=_app_info("google_drive", "GOOGLE_ACCESS_TOKEN"),
+        access_token="user-access-token",
+    )
+
+    assert transport_config["workspace_file_ref_env"] == {
+        "google_drive_upload_file": "XAGENT_GOOGLE_DRIVE_UPLOAD_FILE"
+    }
+    assert transport_config["env"]["GOOGLE_ACCESS_TOKEN"] == "user-access-token"
+    assert "XAGENT_GOOGLE_DRIVE_UPLOAD_FILE" not in transport_config["env"]
+    assert "XAGENT_GOOGLE_DRIVE_UPLOAD_FILE_ID" not in transport_config["env"]
 
 
 def test_drive_output_dir_omitted_when_only_external_dirs_are_configured(
@@ -120,6 +135,4 @@ def test_drive_output_dir_omitted_when_only_external_dirs_are_configured(
     assert str(external_dir.resolve()) in transport_config["env"][
         "XAGENT_SLACK_FILE_ALLOWED_DIRS"
     ].split(",")
-    assert str(external_dir.resolve()) in transport_config["env"][
-        "XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS"
-    ].split(",")
+    assert "XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS" not in transport_config["env"]

@@ -3332,3 +3332,96 @@ def test_only_read_only_is_a_safe_reading():
         MCPWriteHint.DESTRUCTIVE,
         MCPWriteHint.UNDECLARED,
     }
+
+
+def _workspace_upload_adapter(workspace) -> MCPToolAdapter:
+    schema = {
+        "type": "object",
+        "properties": {"file_id": {"type": "string"}},
+        "required": ["file_id"],
+    }
+    connection = {
+        "transport": "stdio",
+        "command": "python",
+        "args": [],
+        "workspace_file_ref_env": {
+            "google_drive_upload_file": "XAGENT_GOOGLE_DRIVE_UPLOAD_FILE"
+        },
+        "_workspace": workspace,
+    }
+    return MCPToolAdapter(
+        mcp_tool=SimpleNamespace(
+            name="google_drive_upload_file",
+            description="Upload a workspace file",
+            inputSchema=schema,
+        ),
+        connection=connection,
+    )
+
+
+@pytest.mark.asyncio
+async def test_workspace_upload_resolves_file_id_into_one_call_environment(
+    monkeypatch, tmp_path
+):
+    source = tmp_path / "deck.pptx"
+    source.write_bytes(b"PK\x03\x04exact-pptx")
+    workspace = SimpleNamespace(
+        workspace_dir=tmp_path, resolve_file_id=lambda file_id: source
+    )
+    adapter = _workspace_upload_adapter(workspace)
+    captured = {}
+
+    assert adapter.write_hint is MCPWriteHint.UNDECLARED
+
+    class _FakeSession:
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, name, arguments, **kwargs):
+            captured["name"] = name
+            captured["arguments"] = arguments
+            return CallToolResult(content=[], isError=False)
+
+    @asynccontextmanager
+    async def _fake_create_session(connection):
+        captured["connection"] = connection
+        yield _FakeSession()
+
+    monkeypatch.setattr(mcp_adapter_module, "create_session", _fake_create_session)
+
+    result = await adapter.run_json_async({"file_id": "xagent-file-id"})
+
+    assert result["is_error"] is False
+    assert captured["arguments"] == {"file_id": "xagent-file-id"}
+    env = captured["connection"]["env"]
+    assert env["XAGENT_GOOGLE_DRIVE_UPLOAD_FILE"] == str(source.resolve())
+    assert env["XAGENT_GOOGLE_DRIVE_UPLOAD_FILE_ID"] == "xagent-file-id"
+    assert env["XAGENT_GOOGLE_DRIVE_UPLOAD_FILE_ROOT"] == str(tmp_path.resolve())
+    assert str(source) not in json.dumps(captured["arguments"])
+
+
+@pytest.mark.asyncio
+async def test_workspace_upload_unknown_and_cross_workspace_ids_fail_closed(
+    monkeypatch, tmp_path
+):
+    current = tmp_path / "current"
+    current.mkdir()
+    sibling = tmp_path / "other" / "secret.pptx"
+    sibling.parent.mkdir()
+    sibling.write_bytes(b"secret")
+    create_session_mock = AsyncMock()
+    monkeypatch.setattr(mcp_adapter_module, "create_session", create_session_mock)
+
+    for resolved in (None, sibling):
+        workspace = SimpleNamespace(
+            workspace_dir=current, resolve_file_id=lambda file_id: resolved
+        )
+        result = await _workspace_upload_adapter(workspace).run_json_async(
+            {"file_id": "/etc/passwd"}
+        )
+        assert result["is_error"] is True
+        assert result["structured_content"]["message"] == (
+            "Workspace file is unavailable for this task."
+        )
+        assert "/etc/passwd" not in json.dumps(result)
+    create_session_mock.assert_not_called()

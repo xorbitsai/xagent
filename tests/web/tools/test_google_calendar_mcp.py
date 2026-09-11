@@ -387,6 +387,27 @@ def test_create_events_strips_whitespace_from_a_bare_date_before_sending_it(
     assert kwargs["body"]["end"] == {"date": "2026-09-02"}
 
 
+def test_create_events_accepts_a_whitespace_padded_all_day_recurrence(monkeypatch):
+    """Confirmed bug: the payload used the stripped bare-date value, but
+    recurrence validation was passed the raw, unstripped start_time - so
+    the exact same all-day start_time that succeeds without recurrence
+    was rejected as an "invalid start time" the moment recurrence was
+    also set."""
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="All day thing",
+            start_time="  2026-09-01  ",
+            end_time="  2026-09-02  ",
+            recurrence="FREQ=DAILY;COUNT=3",
+        )
+    )
+
+    assert result["status"] == "success"
+
+
 def test_create_events_treats_a_space_separated_datetime_as_timed_not_all_day(
     monkeypatch,
 ):
@@ -691,6 +712,38 @@ def test_update_events_reschedules_an_already_recurring_event_with_a_naive_time_
     _, kwargs = service.events.return_value.update.call_args
     assert kwargs["body"]["start"]["timeZone"] == "Asia/Shanghai"
     assert kwargs["body"]["end"]["timeZone"] == "Asia/Shanghai"
+
+
+def test_update_events_rejects_a_naive_reschedule_of_a_recurring_event_with_no_zone_anywhere(
+    monkeypatch,
+):
+    """Confirmed bug: a naive (no-offset) reschedule of an already-
+    recurring event whose start/end have no timeZone at all used to
+    silently send an update with no timeZone whatsoever - the
+    contradiction guard above only fires for an offset-bearing move, and
+    the plain per-field reuse fallback had nothing to reuse. Must be
+    rejected and ask for an explicit timezone, the same as setting
+    recurrence for the first time on a zoneless event already is."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-19T09:00:00"},
+        "end": {"dateTime": "2026-08-19T10:00:00"},
+        "recurrence": ["RRULE:FREQ=DAILY;UNTIL=20261231T235959Z"],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-09-01T09:00:00",
+            end_time="2026-09-01T10:00:00",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "timezone is required" in result["message"]
+    service.events.return_value.update.assert_not_called()
 
 
 def test_update_events_reschedules_an_already_recurring_event_with_an_explicit_timezone(
@@ -1124,6 +1177,7 @@ def test_update_events_rejects_bare_date_until_on_a_timed_event(monkeypatch):
     )
 
     assert result["status"] == "error"
+    assert "invalid recurrence rule" in result["message"]
     service.events.return_value.update.assert_not_called()
 
 
@@ -1463,6 +1517,60 @@ def test_update_events_rejects_recurrence_when_no_start_information_exists(
     assert result["status"] == "error"
     assert "start time" in result["message"]
     service.events.return_value.update.assert_not_called()
+
+
+def test_update_events_rejects_setting_recurrence_on_a_single_occurrence(monkeypatch):
+    """google_calendar_search_events lists occurrences of a recurring
+    series with singleEvents=True, each carrying a recurringEventId
+    pointing at the actual series - passing one of those ids here with
+    recurrence set would target the wrong resource (the occurrence, not
+    the series) rather than doing what the caller almost certainly
+    intends. Must be rejected with a clear error instead of silently
+    sending Google a request against the wrong event."""
+    existing_event = {
+        "id": "instance-1",
+        "recurringEventId": "master-1",
+        "start": {"dateTime": "2026-08-19T09:00:00", "timeZone": "Asia/Shanghai"},
+        "end": {"dateTime": "2026-08-19T10:00:00", "timeZone": "Asia/Shanghai"},
+    }
+    service = _fake_service({"id": "instance-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="instance-1",
+            recurrence="FREQ=DAILY;COUNT=5",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "single occurrence" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_events_allows_non_recurrence_changes_on_a_single_occurrence(
+    monkeypatch,
+):
+    """The recurringEventId guard is specifically about *setting*
+    recurrence on an occurrence - a plain reschedule/summary change on
+    one must still work normally."""
+    existing_event = {
+        "id": "instance-1",
+        "recurringEventId": "master-1",
+        "start": {"dateTime": "2026-08-19T09:00:00", "timeZone": "Asia/Shanghai"},
+        "end": {"dateTime": "2026-08-19T10:00:00", "timeZone": "Asia/Shanghai"},
+    }
+    service = _fake_service({"id": "instance-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="instance-1",
+            summary="Rescheduled just this one",
+        )
+    )
+
+    assert result["status"] == "success"
 
 
 def test_create_event_without_attendees_or_meet_sends_conference_version_and_no_invites(

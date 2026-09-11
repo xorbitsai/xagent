@@ -227,6 +227,16 @@ def test_parse_rrule_rejects_an_extended_iso8601_until_with_a_clean_message():
         )
 
 
+def test_parse_rrule_accepts_a_floating_local_time_until():
+    """Confirmed bug: the previous fix for the extended-ISO8601 UNTIL
+    problem was too strict - RFC 5545 permits UNTIL as a floating "DATE
+    WITH LOCAL TIME" (no "Z") whenever DTSTART is also floating local
+    time, not only the aware "DATE WITH UTC TIME" form. This combination
+    was wrongly rejected with no test catching the regression."""
+    parts = utils.parse_rrule("FREQ=DAILY;UNTIL=20260911T235959", "2026-08-26T07:00:00")
+    assert parts["UNTIL"] == "20260911T235959"
+
+
 def test_parse_rrule_uppercases_component_values_not_just_keys():
     """Confirmed bug: only the FREQ/UNTIL/etc. *keys* were uppercased, not
     their values - a lowercase "freq=daily" produced {"FREQ": "daily"}.

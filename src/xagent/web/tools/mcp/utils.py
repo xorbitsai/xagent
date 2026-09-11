@@ -18,7 +18,10 @@ _DIGITS_ONLY_RE = re.compile(r"[0-9]+")
 # (e.g. "2026-09-11T23:59:59+08:00"). dateutil.rrule.rrulestr's own RFC
 # 5545 line parser expects exactly this basic shape and raises a raw,
 # uninformative "too many values to unpack" if it isn't - see parse_rrule.
-_UNTIL_RE = re.compile(r"[0-9]{8}(T[0-9]{6}Z)?")
+# The trailing "Z" is itself optional: RFC 5545 permits UNTIL as a
+# floating "DATE WITH LOCAL TIME" (no "Z") whenever DTSTART is also
+# floating local time, not just the aware "DATE WITH UTC TIME" form.
+_UNTIL_RE = re.compile(r"[0-9]{8}(T[0-9]{6}Z?)?")
 
 
 def require_clean_identifier(value: str, field_name: str) -> str:
@@ -194,7 +197,7 @@ def parse_rrule(
 ) -> dict[str, str]:
     """Validate an RFC 5545 RRULE string and return its components (FREQ,
     INTERVAL, BYDAY, UNTIL, COUNT, ...) as a plain dict of upper-cased keys
-    to raw string values.
+    to upper-cased string values.
 
     ``dtstart`` anchors a validation pass through ``dateutil.rrule.rrulestr``
     so a rule that's syntactically plausible but semantically broken (e.g.

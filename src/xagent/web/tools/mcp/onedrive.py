@@ -5,7 +5,7 @@ import mimetypes
 import os
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import requests
 from mcp.server.fastmcp import FastMCP
@@ -21,12 +21,39 @@ mcp = FastMCP("onedrive-mcp")
 
 GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
 DEFAULT_TIMEOUT_SECONDS = 30
-# Allow more time for binary content than for small Graph JSON requests.
+# Sized for a single binary PUT of up to a few megabytes over a slow link,
+# not just a small JSON Graph call -- DEFAULT_TIMEOUT_SECONDS' 30s is
+# realistic for the API calls elsewhere in this module but can legitimately
+# be too short for a multi-megabyte binary transfer. Used for both the
+# simple-PUT branch (up to _SIMPLE_UPLOAD_MAX_BYTES) and each chunk of the
+# resumable upload-session path.
 _BINARY_UPLOAD_TIMEOUT_SECONDS = 120
-# Deliberate limit for this tool's single-request implementation.
-# Larger files require upload-session support, delivered separately.
+# Microsoft's own docs disagree on the simple content PUT's real limit:
+# the OneDrive API concepts page ("Uploading files") says simple upload is
+# "available for items with less than 4 MB of content", while the Graph
+# v1.0 API reference for the same endpoint (driveitem-put-content) says it
+# "supports files up to 250 MB in size". Rather than trying to resolve
+# which page is authoritative, this deliberately keeps the smaller, more
+# conservative bound -- some Graph deployments enforce it as the decimal
+# 4,000,000 bytes rather than 4 MiB (4,194,304 bytes), so the decimal
+# figure is used here too. This means a file anywhere in the 4MB-250MB gap
+# always takes the resumable upload-session path instead of ever risking a
+# rejection at the simple-PUT boundary; the only cost of guessing wrong
+# this way is an unnecessary chunked upload, never a failed one.
 _SIMPLE_UPLOAD_MAX_BYTES = 4_000_000
-
+# Chunk size for the upload-session path. Must be a multiple of 320 KiB
+# (327,680 bytes) per Graph's requirement for every non-final chunk; 5 MiB
+# is exactly 16 * 320 KiB.
+_UPLOAD_SESSION_CHUNK_SIZE = 5 * 1024 * 1024
+# Not a Graph API limit (OneDrive itself supports files far larger than
+# this via the resumable upload session) -- a guard-rail against a
+# mistargeted file (a generated artifact pointed at the wrong path, an
+# entire log directory, etc.) tying up a chunked upload for a long time
+# with no feedback until it eventually finishes or fails. Unlike gmail.py's
+# _MAX_ATTACHMENT_BYTES (a real derivation of Gmail's documented 25MB
+# message-size limit), this is a deliberately arbitrary product choice, not
+# a limit either this module or Graph actually enforces elsewhere.
+_MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
 
 _UPLOAD_ALLOWED_DIRS_ENV_VAR = "XAGENT_ONEDRIVE_FILE_ALLOWED_DIRS"
 
@@ -166,6 +193,88 @@ def _graph_headers(extra_headers: dict[str, str] | None = None) -> dict[str, str
     if extra_headers:
         headers.update(extra_headers)
     return headers
+
+
+def _raise_for_status_with_body(response: Any) -> None:
+    """Like response.raise_for_status(), but a non-2xx status raises a
+    RuntimeError with Graph's own error body appended -- a bare HTTPError's
+    default message carries only the status line, not the JSON error detail
+    Graph actually returns. Shared by every call site in this module that
+    talks to Graph directly (both _graph_request and the per-chunk PUTs in
+    _upload_large_file_content, which can't go through _graph_request itself
+    -- see its own Authorization-header note) so a future change to the
+    message format only needs to happen once.
+    """
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        response_text = response.text.strip()
+        message = str(exc)
+        if response_text:
+            message = f"{message} - {response_text}"
+        raise RuntimeError(message) from exc
+
+
+def _redact_upload_url(message: str, upload_url: str) -> str:
+    """Strip ``upload_url`` (a preauthenticated, bearer-token-equivalent
+    Graph upload-session URL) out of ``message`` as thoroughly as possible.
+
+    A plain ``message.replace(upload_url, ...)`` only catches the case
+    where the exception's own message happens to contain the exact,
+    complete "scheme://host/path?query" string. Verified directly against
+    a real failed request: urllib3's own ConnectionError/SSLError messages
+    never do that -- they report the host separately (inside
+    "HTTPSConnectionPool(host=..., port=...)") from the path+query (inside
+    "Max retries exceeded with url: /path?query"), so the whole-string
+    match silently misses them and the query string -- which carries the
+    session's actual bearer-equivalent token -- passes through unredacted.
+    Redacting the host and the path+query independently (in addition to
+    the full URL, for whichever call site does happen to embed it whole)
+    closes that gap without depending on any particular exception's message
+    shape.
+    """
+    redacted = message.replace(upload_url, "<redacted-upload-session-url>")
+    parsed = urlsplit(upload_url)
+    path_and_query = parsed.path + (f"?{parsed.query}" if parsed.query else "")
+    # Excludes a bare "/" with no query: that's indistinguishable from any
+    # other single slash that might appear elsewhere in the message, so
+    # using it as a blanket replace target would mangle the whole string
+    # instead of redacting anything meaningful. Not reachable against a
+    # real Graph upload-session URL (its path is always a specific,
+    # multi-segment session identifier), but nothing stops a test double
+    # or a future API change from producing one this short.
+    if path_and_query and path_and_query != "/":
+        redacted = redacted.replace(path_and_query, "<redacted-upload-session-url>")
+    if parsed.query:
+        redacted = redacted.replace(parsed.query, "<redacted-upload-session-token>")
+    if parsed.netloc:
+        redacted = redacted.replace(parsed.netloc, "<redacted-upload-session-host>")
+    return redacted
+
+
+def _is_retriable_upload_error(exc: BaseException) -> bool:
+    """Whether ``exc`` might succeed on a future attempt against the SAME
+    upload session, so it's worth leaving that session's state (and
+    Graph's ``nextExpectedRanges``) alone rather than actively destroying
+    it via a cancellation DELETE.
+
+    A network-level failure (no response was ever received) and Graph's
+    own documented retriable statuses (429, and any 5xx) are retriable;
+    anything else -- a non-retriable 4xx Graph rejected outright, or a
+    validation failure this module raised itself about the *local* file
+    (a short read, an unparsable/incomplete final response) -- is not:
+    retrying against the same session wouldn't help either of those, so
+    there's no reason to withhold the immediate cleanup. By the time an
+    HTTPError reaches here it's already been converted to a plain
+    RuntimeError by _raise_for_status_with_body, so the original
+    exception (with its .response) is recovered via __cause__ rather than
+    expected on ``exc`` directly.
+    """
+    cause = exc.__cause__ if isinstance(exc, RuntimeError) else exc
+    status_code = getattr(getattr(cause, "response", None), "status_code", None)
+    if isinstance(status_code, int):
+        return status_code == 429 or 500 <= status_code < 600
+    return isinstance(cause, (requests.ConnectionError, requests.Timeout))
 
 
 def _graph_request(
@@ -336,6 +445,197 @@ def _resolve_upload_file_path(local_file_path: str) -> Path:
     return local_path
 
 
+def _upload_large_file_content(
+    remote_path: str, fh: Any, total: int, mime_type: str
+) -> dict[str, Any]:
+    """Upload the next ``total`` bytes readable from ``fh`` (too large for
+    the simple content PUT) via Graph's upload-session API, in 320 KiB-
+    aligned chunks read straight off disk -- never materializing more than
+    one chunk of the file in memory at a time, unlike holding the whole
+    file as a single ``bytes`` object would.
+
+    This uses the session only for chunking, not for actual resumability:
+    failures are not retried from Graph's ``nextExpectedRanges``.
+    Sessions are cancelled only for non-retriable failures, so a transient
+    mid-upload failure means the whole file is re-sent from byte 0 on the
+    next call, not resumed from where it left off.
+    """
+    if total <= 0:
+        # Not reachable through onedrive_upload_file today (it rejects an
+        # empty file before choosing a path, and anything <= 0 bytes would
+        # take the simple-PUT branch regardless) -- guarded directly here
+        # too since `for start in range(0, 0, chunk_size)` would otherwise
+        # silently skip the whole loop and return the empty `result` this
+        # function initializes below, bypassing the "did OneDrive actually
+        # confirm this" check that only runs inside the loop.
+        raise ValueError(f"total must be positive, got {total}")
+    session = _graph_request(
+        "POST",
+        f"{_item_path(remote_path)}/createUploadSession",
+        body={"item": {"@microsoft.graph.conflictBehavior": "replace"}},
+    )
+    upload_url = session.get("uploadUrl")
+    if not upload_url:
+        raise RuntimeError("OneDrive did not return an upload session URL")
+
+    # One Session for every chunk of this upload -- a fresh top-level
+    # requests.put() per chunk would pay a new TCP+TLS handshake each time,
+    # which adds up over the ~100 requests a 500MB upload needs.
+    with requests.Session() as http:
+        result: dict[str, Any] = {}
+        try:
+            for start in range(0, total, _UPLOAD_SESSION_CHUNK_SIZE):
+                end = min(start + _UPLOAD_SESSION_CHUNK_SIZE, total)
+                chunk = fh.read(end - start)
+                if len(chunk) != end - start:
+                    # A short read here means the local file shrank out from
+                    # under this upload (a concurrent rewrite/truncation, or
+                    # an unusual filesystem) -- sending Content-Length/
+                    # Content-Range computed from the size we *expected*
+                    # rather than what we actually read would either hang
+                    # waiting for bytes that never arrive or desynchronize
+                    # every later chunk's byte-range accounting. Fail loudly
+                    # instead.
+                    raise RuntimeError(
+                        f"expected to read {end - start} bytes at offset "
+                        f"{start} but got {len(chunk)} -- the local file "
+                        "may have changed size during upload"
+                    )
+                # The upload session URL is itself pre-authenticated (a
+                # token in its query string) -- Microsoft's own docs for
+                # createUploadSession confirm this explicitly: "If you
+                # include the Authorization header when issuing the PUT
+                # call, it might result in an HTTP 401 Unauthorized
+                # response. ... Don't include it when issuing the PUT
+                # call." So this goes straight through the plain Session
+                # rather than _graph_request (which always attaches one).
+                # Graph's docs don't confirm Content-Type is honored on a
+                # chunk PUT the way it is on the simple-PUT endpoint (only
+                # Content-Length/Content-Range are documented there), but
+                # sending it costs nothing and is the closest available
+                # lever to the simple path's behavior.
+                response = http.put(
+                    upload_url,
+                    data=chunk,
+                    headers={
+                        "Content-Length": str(end - start),
+                        "Content-Range": f"bytes {start}-{end - 1}/{total}",
+                        "Content-Type": mime_type,
+                    },
+                    timeout=_BINARY_UPLOAD_TIMEOUT_SECONDS,
+                )
+                _raise_for_status_with_body(response)
+                # Only the final chunk's response carries the completed
+                # item; Graph's intermediate (202) responses return upload-
+                # progress info, not the item -- checked explicitly
+                # (end == total) rather than "the last response that
+                # happened to have a body", which would silently pick up an
+                # unrelated intermediate body if Graph's progress responses
+                # ever started including one.
+                if end == total:
+                    try:
+                        result = response.json() if response.content else {}
+                    except ValueError as exc:
+                        # The PUT itself succeeded (no HTTPError above) --
+                        # OneDrive has already committed the file at this
+                        # point, so this is "the transfer worked but the
+                        # confirmation can't be read", not a transfer
+                        # failure, even though it's still reported as an
+                        # error here (the caller has no completed item to
+                        # act on either way).
+                        raise RuntimeError(
+                            "OneDrive accepted the final chunk but "
+                            f"returned an unparsable response: {exc}"
+                        ) from exc
+                    if "id" not in result:
+                        # The final chunk's response didn't actually carry
+                        # a completed driveItem (e.g. an unexpected 202 on
+                        # what this loop computed as the last range).
+                        raise RuntimeError(
+                            "OneDrive did not confirm the upload completed "
+                            f"(final response: {result!r})"
+                        )
+        except Exception as exc:
+            # Redact upload_url out of the failure's own message before it
+            # goes anywhere else -- this catches every source uniformly
+            # (an HTTP error response whose body happens to echo the
+            # request URL via an intervening proxy/WAF, and -- the gap a
+            # status-code-keyed sanitize flag on the PUT call alone would
+            # miss -- a transport-level failure before any response
+            # existed at all: requests/urllib3's own ConnectionError/
+            # Timeout/SSLError messages embed the full request URL,
+            # verified directly against a real failed request). A plain
+            # `except requests.HTTPError` (or a flag passed only to the
+            # PUT's own status check) would leave those other paths
+            # unsanitized, so this wraps every exception the chunk loop
+            # can raise instead of trusting each one individually to avoid
+            # the URL. See _redact_upload_url's own docstring for why a
+            # bare whole-string replace isn't enough on its own.
+            redacted_message = _redact_upload_url(str(exc), upload_url)
+            if _is_retriable_upload_error(exc):
+                # A 429/5xx/network failure might still succeed against
+                # this SAME session on a later attempt -- actively
+                # cancelling it here would destroy Graph's
+                # nextExpectedRanges state for no benefit (this module
+                # doesn't currently retry/resume itself, but a future
+                # attempt manually resuming this exact session, or a
+                # resume feature added later, still could). Left alone,
+                # the session and its uploaded ranges simply persist until
+                # Graph's own ~15-minute expiry -- strictly no worse than
+                # cancelling it outright, and possibly better.
+                logger.warning(
+                    "OneDrive upload session left intact after a "
+                    "retriable failure (not cancelled): %s",
+                    redacted_message,
+                )
+            else:
+                # Best-effort: free the abandoned session immediately
+                # instead of leaving it for Graph's own ~15-minute expiry
+                # -- unlike the retriable case above, nothing about this
+                # failure would change on a retry against the same
+                # session, so there's no reason to keep it around. A
+                # failure here must never mask the real error above, and
+                # uses the short, small-request timeout -- this DELETE
+                # carries no body, so it shouldn't compound a slow failure
+                # with another wait as long as a multi-megabyte upload's
+                # own timeout.
+                try:
+                    cancel_response = http.delete(
+                        upload_url, timeout=DEFAULT_TIMEOUT_SECONDS
+                    )
+                except Exception as cleanup_exc:
+                    cleanup_message = _redact_upload_url(str(cleanup_exc), upload_url)
+                    logger.warning(
+                        "Failed to cancel abandoned OneDrive upload session: %s",
+                        cleanup_message,
+                    )
+                else:
+                    # requests does not raise for an HTTP error status on
+                    # its own -- a 429/5xx here would otherwise look like a
+                    # successful cancellation while the session (and its
+                    # partial upload) actually lingers until Graph's own
+                    # expiry. A 404 is also treated as fine (not warned
+                    # on): it means the session is already gone -- expired,
+                    # or completed/cancelled by a previous attempt -- which
+                    # is the outcome this cleanup wants, not a failure of
+                    # it. Status only, no body: nothing about the response
+                    # is expected to carry the upload_url, but there's no
+                    # reason to risk it for a log line that only needs the
+                    # status.
+                    if (
+                        not (200 <= cancel_response.status_code < 300)
+                        and cancel_response.status_code != 404
+                    ):
+                        logger.warning(
+                            "OneDrive upload session cancellation returned "
+                            "HTTP %s instead of success",
+                            cancel_response.status_code,
+                        )
+            raise RuntimeError(redacted_message) from None
+
+    return result
+
+
 @mcp.tool()
 def onedrive_get_profile() -> str:
     """Get the current Microsoft 365 user profile for OneDrive operations."""
@@ -480,10 +780,11 @@ def onedrive_upload_file(
     overwriting any existing file there; defaults to the local file's own
     name at the OneDrive root.
     mime_type: defaults to a guess from the remote filename, then the local
-    filename, falling back to "application/octet-stream".
+    filename, falling back to "application/octet-stream". It is sent on both
+    simple uploads and upload-session chunks.
 
-    Supports non-empty files up to 4,000,000 bytes (4 MB). Larger files
-    are rejected before any upload request is sent.
+    Rejects a file over _MAX_UPLOAD_BYTES (2 GiB) -- a guard-rail against a
+    mistargeted upload, not a OneDrive/Graph limit.
     """
     try:
         local_path = _resolve_upload_file_path(local_file_path)
@@ -495,7 +796,20 @@ def onedrive_upload_file(
                 _guess_mime_type(local_path.name) or "application/octet-stream"
             )
 
-        # Check size and read content through the same open handle.
+        # Read from one open handle throughout -- the size check, the small-
+        # file read, and the large-file chunk reads all use this same fh
+        # rather than each re-opening/re-stat'ing the file. For a file over
+        # _SIMPLE_UPLOAD_MAX_BYTES, _upload_large_file_content reads it
+        # chunk-by-chunk straight off this handle rather than this function
+        # first loading the whole file into memory -- the resumable upload-
+        # session path exists specifically so a large file's memory
+        # footprint stays bounded to one chunk at a time.
+        # A fresh by-path open, not the same descriptor
+        # _resolve_upload_file_path used for its allowlist check -- a
+        # symlink swapped in during that window wouldn't be caught.
+        # Accepted risk: holding a file descriptor open across the whole
+        # allowlist resolution isn't worth it for a local, non-shared task
+        # workspace (same tradeoff google_drive_upload_file makes).
         try:
             fh_ctx = local_path.open("rb")
         except OSError as e:
@@ -509,12 +823,8 @@ def onedrive_upload_file(
             logger.warning("Failed to open upload file %s: %s", local_path, e)
             raise ValueError("Could not read the file at the given path") from e
         with fh_ctx as fh:
-            # A stat-then-unbounded-read sequence can exceed the limit if
-            # another process appends to the file between those operations.
-            # Reading one byte past the cap bounds memory and makes the bytes
-            # actually sent authoritative for both the empty and size checks.
-            content = fh.read(_SIMPLE_UPLOAD_MAX_BYTES + 1)
-            if not content:
+            file_size = os.fstat(fh.fileno()).st_size
+            if file_size == 0:
                 # A deliberate product choice, not an API constraint: Graph
                 # itself accepts a 0-byte file. An agent uploading an empty
                 # file is almost always a symptom of an upstream mistake
@@ -522,20 +832,32 @@ def onedrive_upload_file(
                 # so this is rejected here rather than silently creating a
                 # placeholder-empty item on OneDrive.
                 raise ValueError(f"File is empty: {local_file_path}")
-            if len(content) > _SIMPLE_UPLOAD_MAX_BYTES:
+            if file_size > _MAX_UPLOAD_BYTES:
                 raise ValueError(
-                    f"File is over the {_SIMPLE_UPLOAD_MAX_BYTES:,}-byte "
-                    "(4 MB) limit for "
-                    "onedrive_upload_file. Large-file uploads are not supported yet."
+                    f"File is {file_size} bytes, over the "
+                    f"{_MAX_UPLOAD_BYTES // (1024 * 1024 * 1024)}GB limit for "
+                    "onedrive_upload_file"
                 )
 
-        result = _graph_request(
-            "PUT",
-            content_path,
-            extra_headers={"Content-Type": resolved_mime_type},
-            data=content,
-            timeout=_BINARY_UPLOAD_TIMEOUT_SECONDS,
-        )
+            if file_size <= _SIMPLE_UPLOAD_MAX_BYTES:
+                # Bound the read even if another process appends after fstat.
+                content = fh.read(_SIMPLE_UPLOAD_MAX_BYTES + 1)
+                if not content:
+                    raise ValueError(f"File is empty: {local_file_path}")
+                if len(content) > _SIMPLE_UPLOAD_MAX_BYTES:
+                    raise RuntimeError("the local file grew during upload")
+                result = _graph_request(
+                    "PUT",
+                    content_path,
+                    extra_headers={"Content-Type": resolved_mime_type},
+                    data=content,
+                    timeout=_BINARY_UPLOAD_TIMEOUT_SECONDS,
+                )
+            else:
+                result = _upload_large_file_content(
+                    resolved_remote_path, fh, file_size, resolved_mime_type
+                )
+
         if not isinstance(result, dict) or not result.get("id"):
             raise RuntimeError("OneDrive did not confirm the upload completed")
 

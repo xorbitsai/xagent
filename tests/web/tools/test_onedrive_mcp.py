@@ -129,6 +129,44 @@ def test_upload_file_defaults_mime_type_when_unguessable(
     assert kwargs["headers"]["Content-Type"] == "application/octet-stream"
 
 
+def test_upload_file_guesses_mime_type_from_remote_name(
+    monkeypatch, _upload_allowed_dirs_env
+):
+    local_file = _upload_allowed_dirs_env / "generated-artifact"
+    local_file.write_bytes(b"%PDF-1.7")
+    mock_request = Mock(return_value=MockResponse({"id": "item-1"}))
+    monkeypatch.setattr(onedrive.requests, "request", mock_request)
+
+    result = json.loads(
+        onedrive.onedrive_upload_file(
+            str(local_file), remote_path="Documents/report.pdf"
+        )
+    )
+
+    assert result["status"] == "success"
+    assert mock_request.call_args.kwargs["headers"]["Content-Type"] == (
+        "application/pdf"
+    )
+
+
+def test_upload_file_falls_back_to_local_name_for_mime_type(
+    monkeypatch, _upload_allowed_dirs_env
+):
+    local_file = _upload_allowed_dirs_env / "report.pdf"
+    local_file.write_bytes(b"%PDF-1.7")
+    mock_request = Mock(return_value=MockResponse({"id": "item-1"}))
+    monkeypatch.setattr(onedrive.requests, "request", mock_request)
+
+    result = json.loads(
+        onedrive.onedrive_upload_file(str(local_file), remote_path="report")
+    )
+
+    assert result["status"] == "success"
+    assert mock_request.call_args.kwargs["headers"]["Content-Type"] == (
+        "application/pdf"
+    )
+
+
 @pytest.mark.parametrize(
     "file_name,inner_type",
     [("report.pdf.gz", "application/pdf"), ("data.csv.gz", "text/csv")],
@@ -269,7 +307,13 @@ def test_upload_file_accepts_remote_path_with_folder_and_filename(
 
 @pytest.mark.parametrize(
     "traversal_remote_path",
-    ["../../etc/passwd", "../../../../me/messages", "foo/../../bar", "./secret"],
+    [
+        "../../etc/passwd",
+        "../../../../me/messages",
+        "foo/../../bar",
+        "./secret",
+        r"..\..\me\messages",
+    ],
 )
 def test_upload_file_rejects_dot_segments_in_remote_path(
     monkeypatch, _upload_allowed_dirs_env, traversal_remote_path
@@ -366,6 +410,36 @@ def test_upload_file_at_exact_boundary_uses_simple_put(
     session_factory.assert_not_called()
 
 
+def test_upload_file_bounds_the_actual_read_before_upload(
+    monkeypatch, _upload_allowed_dirs_env
+):
+    local_file = _upload_allowed_dirs_env / "growing.bin"
+    local_file.write_bytes(b"initially small")
+    requested_sizes = []
+
+    class GrowingFile:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        def read(self, size):
+            requested_sizes.append(size)
+            return b"x" * size
+
+    monkeypatch.setattr(onedrive.Path, "open", lambda self, mode: GrowingFile())
+    mock_request = Mock()
+    monkeypatch.setattr(onedrive.requests, "request", mock_request)
+
+    result = json.loads(onedrive.onedrive_upload_file(str(local_file)))
+
+    assert result["status"] == "error"
+    assert "4 MB" in result["message"]
+    assert requested_sizes == [onedrive._SIMPLE_UPLOAD_MAX_BYTES + 1]
+    mock_request.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "file_path",
     [
@@ -424,10 +498,11 @@ def test_upload_file_at_exact_boundary_uses_simple_put(
         "disk.vmdk",
         "disk.qcow2",
         "store.jks",
-        "model.sav",
+        "model.sav",  # codespell:ignore sav
         "mesh.stl",
         "weights.h5",
         "weights.hdf5",
+        "settings.plist",
         # Deliberately excluded from _KNOWN_TEXT_EXTENSIONS despite often
         # being PEM/text in practice -- see that set's own docstring on
         # why ".crt" specifically isn't given the same "text" judgment
@@ -528,6 +603,21 @@ def test_upload_text_file_rejects_dotfile_shaped_binary_extension(monkeypatch):
     result = json.loads(onedrive.onedrive_upload_text_file(".pdf", "some text"))
 
     assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
+def test_upload_text_file_rejects_nested_dotfile_shaped_binary_extension(
+    monkeypatch,
+):
+    mock_request = Mock()
+    monkeypatch.setattr(onedrive.requests, "request", mock_request)
+
+    result = json.loads(
+        onedrive.onedrive_upload_text_file("Documents/.pdf", "some text")
+    )
+
+    assert result["status"] == "error"
+    assert "onedrive_upload_file" in result["message"]
     mock_request.assert_not_called()
 
 
@@ -715,6 +805,23 @@ def test_upload_file_rejects_missing_file(monkeypatch, _upload_allowed_dirs_env)
     mock_request.assert_not_called()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="symlink creation requires privileges")
+def test_upload_file_does_not_leak_path_from_symlink_loop(
+    monkeypatch, _upload_allowed_dirs_env
+):
+    loop = _upload_allowed_dirs_env / "loop.pdf"
+    loop.symlink_to(loop)
+    mock_request = Mock()
+    monkeypatch.setattr(onedrive.requests, "request", mock_request)
+
+    result = json.loads(onedrive.onedrive_upload_file(str(loop)))
+
+    assert result["status"] == "error"
+    assert result["message"] == "Could not resolve file_path"
+    assert str(loop) not in result["message"]
+    mock_request.assert_not_called()
+
+
 def test_upload_file_rejects_directory_with_a_distinct_message(
     monkeypatch, _upload_allowed_dirs_env
 ):
@@ -801,6 +908,23 @@ def test_upload_file_returns_error_payload_on_api_failure(
     assert "boom" in result["message"]
 
 
+def test_upload_file_requires_completed_item_confirmation(
+    monkeypatch, _upload_allowed_dirs_env
+):
+    local_file = _upload_allowed_dirs_env / "report.pdf"
+    local_file.write_bytes(b"content")
+    monkeypatch.setattr(
+        onedrive.requests,
+        "request",
+        Mock(return_value=MockResponse({}, status_code=204, content=b"")),
+    )
+
+    result = json.loads(onedrive.onedrive_upload_file(str(local_file)))
+
+    assert result["status"] == "error"
+    assert "did not confirm" in result["message"]
+
+
 # ---------------------------------------------------------------------------
 # onedrive_upload_text_file — binary-content guard
 # ---------------------------------------------------------------------------
@@ -821,6 +945,19 @@ def test_upload_text_file_rejects_binary_looking_names(monkeypatch, file_path):
 
     assert result["status"] == "error"
     assert "onedrive_upload_file" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_upload_text_file_rejects_folder_shaped_path(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(onedrive.requests, "request", mock_request)
+
+    result = json.loads(
+        onedrive.onedrive_upload_text_file("Documents/Reports/", "text")
+    )
+
+    assert result["status"] == "error"
+    assert "filename" in result["message"]
     mock_request.assert_not_called()
 
 

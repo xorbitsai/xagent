@@ -3,6 +3,7 @@ MCP subprocess environments (LinkedIn's image upload, Slack's file upload,
 Gmail's message attachments, OneDrive's file upload, Google Drive's file
 upload) and Google Drive's dedicated write-target output directory."""
 
+import json
 from types import SimpleNamespace
 
 from xagent.web.tools.config import WebToolConfig
@@ -38,7 +39,9 @@ def test_transport_config_sets_all_allowlist_vars_when_workspace_has_a_task(
     assert transport_config["env"]["XAGENT_SLACK_FILE_ALLOWED_DIRS"] == expected_dir
     assert transport_config["env"]["XAGENT_LINKEDIN_IMAGE_ALLOWED_DIRS"] == expected_dir
     assert transport_config["env"]["XAGENT_GMAIL_FILE_ALLOWED_DIRS"] == expected_dir
-    assert transport_config["env"]["XAGENT_ONEDRIVE_FILE_ALLOWED_DIRS"] == expected_dir
+    assert json.loads(transport_config["env"]["XAGENT_ONEDRIVE_FILE_ALLOWED_DIRS"]) == [
+        expected_dir
+    ]
     assert (
         transport_config["env"]["XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS"] == expected_dir
     )
@@ -96,9 +99,9 @@ def test_drive_output_dir_excludes_external_dirs_unlike_the_read_allowlists(
     assert str(external_dir.resolve()) in transport_config["env"][
         "XAGENT_SLACK_FILE_ALLOWED_DIRS"
     ].split(",")
-    assert str(external_dir.resolve()) in transport_config["env"][
-        "XAGENT_ONEDRIVE_FILE_ALLOWED_DIRS"
-    ].split(",")
+    assert str(external_dir.resolve()) in json.loads(
+        transport_config["env"]["XAGENT_ONEDRIVE_FILE_ALLOWED_DIRS"]
+    )
     assert str(external_dir.resolve()) in transport_config["env"][
         "XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS"
     ].split(",")
@@ -125,9 +128,32 @@ def test_drive_output_dir_omitted_when_only_external_dirs_are_configured(
     assert str(external_dir.resolve()) in transport_config["env"][
         "XAGENT_SLACK_FILE_ALLOWED_DIRS"
     ].split(",")
-    assert str(external_dir.resolve()) in transport_config["env"][
-        "XAGENT_ONEDRIVE_FILE_ALLOWED_DIRS"
-    ].split(",")
+    assert str(external_dir.resolve()) in json.loads(
+        transport_config["env"]["XAGENT_ONEDRIVE_FILE_ALLOWED_DIRS"]
+    )
     assert str(external_dir.resolve()) in transport_config["env"][
         "XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS"
     ].split(",")
+
+
+def test_onedrive_allowlist_preserves_comma_in_directory_name(tmp_path):
+    workspace_base = tmp_path / "workspaces,active"
+    external_dir = tmp_path / "knowledge,base"
+    cfg = WebToolConfig(
+        db=None,
+        request=None,
+        task_id="task-123",
+        workspace_base_dir=str(workspace_base),
+    )
+    cfg._workspace_config["allowed_external_dirs"] = [str(external_dir)]
+
+    transport_config = cfg._build_oauth_mcp_stdio_transport_config(
+        server=SimpleNamespace(name="OneDrive"),
+        app_info=_app_info("onedrive", "AUTH_TOKEN"),
+        access_token="user-access-token",
+    )
+
+    assert json.loads(transport_config["env"]["XAGENT_ONEDRIVE_FILE_ALLOWED_DIRS"]) == [
+        str((workspace_base / "task-123").resolve()),
+        str(external_dir.resolve()),
+    ]

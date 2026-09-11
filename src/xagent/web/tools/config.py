@@ -8,6 +8,7 @@ and other web-specific sources.
 import asyncio
 import copy
 import inspect
+import json
 import logging
 import os
 import random
@@ -1865,6 +1866,10 @@ class WebToolConfig(BaseToolConfig):
 
     def _build_mcp_file_allowed_dirs(self) -> str:
         """Build comma-separated file roots that local MCP tools may read."""
+        return ",".join(self._mcp_file_allowed_dir_paths())
+
+    def _mcp_file_allowed_dir_paths(self) -> list[str]:
+        """Build unique, resolved file roots for local MCP read tools."""
         dirs: list[str] = []
         base_dir = Path(str(self._workspace_config.get("base_dir", get_uploads_dir())))
         task_id = self._workspace_config.get("task_id")
@@ -1880,7 +1885,7 @@ class WebToolConfig(BaseToolConfig):
             if dir_path not in seen:
                 unique_dirs.append(dir_path)
                 seen.add(dir_path)
-        return ",".join(unique_dirs)
+        return unique_dirs
 
     def _build_mcp_task_output_dir(self) -> str:
         """Single write-target root for connectors that create new files in
@@ -3733,12 +3738,18 @@ class WebToolConfig(BaseToolConfig):
                     "http_proxy": os.environ.get("http_proxy", ""),
                 }
             )
-            allowed_file_dirs = self._build_mcp_file_allowed_dirs()
-            if allowed_file_dirs:
+            allowed_file_dir_paths = self._mcp_file_allowed_dir_paths()
+            if allowed_file_dir_paths:
+                allowed_file_dirs = ",".join(allowed_file_dir_paths)
                 env["XAGENT_LINKEDIN_IMAGE_ALLOWED_DIRS"] = allowed_file_dirs
                 env["XAGENT_SLACK_FILE_ALLOWED_DIRS"] = allowed_file_dirs
                 env["XAGENT_GMAIL_FILE_ALLOWED_DIRS"] = allowed_file_dirs
-                env["XAGENT_ONEDRIVE_FILE_ALLOWED_DIRS"] = allowed_file_dirs
+                # JSON preserves commas inside directory names. OneDrive's
+                # parser also accepts the legacy comma-delimited form for
+                # manually configured standalone deployments.
+                env["XAGENT_ONEDRIVE_FILE_ALLOWED_DIRS"] = json.dumps(
+                    allowed_file_dir_paths
+                )
                 env["XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS"] = allowed_file_dirs
             # Distinct from the five read allowlists above: Google Drive's
             # download tool writes NEW files into the task workspace, so it

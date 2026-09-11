@@ -1,3 +1,5 @@
+import json
+import os
 import re
 from pathlib import Path
 
@@ -162,6 +164,36 @@ def test_allowed_dirs_from_env_parses_multiple_dirs_with_whitespace(
         dir_a.resolve(),
         dir_b.resolve(),
     ]
+
+
+def test_allowed_dirs_from_env_parses_json_paths_containing_commas(
+    monkeypatch, tmp_path
+):
+    directory = tmp_path / "reports,final"
+    monkeypatch.setenv(_TEST_ALLOWED_DIRS_ENV_VAR, json.dumps([str(directory)]))
+
+    assert utils.allowed_dirs_from_env(_TEST_ALLOWED_DIRS_ENV_VAR) == [
+        directory.resolve()
+    ]
+
+
+@pytest.mark.parametrize("raw_value", ["[", '["ok", 42]'])
+def test_allowed_dirs_from_env_rejects_invalid_json(monkeypatch, raw_value):
+    monkeypatch.setenv(_TEST_ALLOWED_DIRS_ENV_VAR, raw_value)
+
+    with pytest.raises(ValueError, match="JSON array"):
+        utils.allowed_dirs_from_env(_TEST_ALLOWED_DIRS_ENV_VAR)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink creation requires privileges")
+def test_allowed_dirs_from_env_rejects_unresolvable_path(monkeypatch, tmp_path):
+    loop = tmp_path / "loop"
+    loop.symlink_to(loop)
+    monkeypatch.setenv(_TEST_ALLOWED_DIRS_ENV_VAR, json.dumps([str(loop)]))
+
+    with pytest.raises(ValueError, match="invalid path") as exc_info:
+        utils.allowed_dirs_from_env(_TEST_ALLOWED_DIRS_ENV_VAR)
+    assert str(loop) not in str(exc_info.value)
 
 
 def test_allowed_dirs_from_env_expands_user_home(monkeypatch, tmp_path):

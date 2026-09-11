@@ -102,55 +102,13 @@ def _split_stem_suffix(base: str) -> tuple[str, str]:
     return Path(base).stem, suffix
 
 
-# Extensions of formats confidently known to be plain UTF-8 text. Default a
-# NAME to "looks binary" unless its extension is in this allowlist (or it
-# has no extension at all -- an extensionless name like "Dockerfile" or
-# "README" isn't itself evidence of binary intent) -- the opposite of a
-# binary-extension blocklist, which can never enumerate every binary format
-# that exists: five separate review rounds each found more gaps in this
-# module's blocklist attempts (an initial hand list, then mimetypes-based
-# variants, then a "known-binary" positive list that still missed common
-# ML/data-science/VM-image/keystore formats like .safetensors/.pkl/.h5/
-# .accdb/.vmdk/.jks). A false positive here (a legitimate but unlisted text
-# extension) is a clear, actionable rejection pointing at
-# onedrive_upload_file; a false negative in a blocklist is a silently
-# mislabeled file, a strictly worse outcome, so this list defaults toward
-# rejecting the unfamiliar rather than accepting it.
-#
-# Mirrors google_drive.py's own _KNOWN_TEXT_EXTENSIONS (the equivalent guard
-# for that connector, from sibling PR #2275) rather than deriving from
-# mimetypes: that function's result for anything beyond a small hardcoded
-# core depends on whatever mime.types database happens to be installed on
-# the *host* -- verified directly across this module's own review history,
-# several of these extensions (.sql, .tex, .dart, .tcl, .dtd) came back
-# non-text on one development machine and were silently absent (making them
-# "not text" under the old design's logic) in a minimal CI/production
-# container. A fixed, in-source list is the only way to get identical
-# behavior everywhere this code runs. Kept as its own local copy rather than
-# imported from google_drive.py -- consolidating both connectors' identical
-# lists into one shared definition (in mcp/utils.py, alongside
-# allowed_dirs_from_env) is a reasonable follow-up, not done here to avoid
-# touching google_drive.py's already-merged, unrelated code in this PR.
-#
-# ".bat", ".ts", ".scm", ".sc", and ".tpl" are included as text (batch
-# script, TypeScript, Scheme source, Scala worksheet/SuperCollider,
-# template) even though each also names a real, registered binary format
-# elsewhere (a Windows .exe-like executable, an MPEG-2 transport stream, a
-# Lotus ScreenCam recording, an obscure and effectively dead IBM "secure
-# container" format, and -- verified directly against mimetypes.guess_type
-# -- Groove Networks' equally dead "Tool Template" format for ".tpl") --
-# a judgment call in favor of what an agent generating files is
-# overwhelmingly more likely to mean (a live template engine like Smarty/
-# Twig, not a discontinued-circa-2010 Microsoft product), no different from
-# google_drive.py's own identical call on the first three. ".srt"
-# (subtitles) is unambiguous text with no competing registered format at
-# all. ".crt" is deliberately NOT included despite frequently being PEM/
-# text in practice -- unlike the extensions above, a real X.509
-# certificate can also be DER-encoded binary under the identical ".crt"
-# extension in *common, current* use (not just an obscure/dead one), with
-# no reliable way to tell which from the name alone, and this list's whole
-# design principle is to default toward rejecting exactly that kind of case
-# rather than guessing.
+# Stable text-extension allowlist shared in shape with the Google Drive
+# guard. Host MIME databases vary, so they cannot safely decide whether the
+# text-only tool may use a filename. Unknown extensions are rejected; names
+# without an extension remain valid for files such as README and Dockerfile.
+# Ambiguous but commonly textual source extensions such as .ts and .bat are
+# allowed, while formats with common binary variants such as .crt and .plist
+# are not.
 _KNOWN_TEXT_EXTENSIONS = {
     # plain text / docs / dotfiles
     ".txt", ".md", ".markdown", ".mdx", ".rst", ".adoc", ".rtf", ".log",
@@ -160,7 +118,7 @@ _KNOWN_TEXT_EXTENSIONS = {
     # structured/data formats
     ".json", ".json5", ".xml", ".yaml", ".yml", ".csv", ".tsv", ".dtd",
     ".xsd", ".xsl", ".xslt", ".proto", ".graphql", ".gql", ".thrift",
-    ".avsc", ".ipynb", ".jsonl", ".ndjson", ".geojson", ".plist",
+    ".avsc", ".ipynb", ".jsonl", ".ndjson", ".geojson",
     # web
     ".html", ".htm", ".css", ".scss", ".sass", ".less", ".svg",
     ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx",
@@ -275,6 +233,8 @@ def _normalize_path(path: str | None) -> str | None:
     value = path.strip().strip("/")
     if not value:
         return None
+    if "\\" in value:
+        raise ValueError("path must use '/' separators and must not contain '\\'")
     if any(segment in (".", "..") for segment in value.split("/")):
         raise ValueError(f"path must not contain '.' or '..' segments: {path!r}")
     return value
@@ -319,6 +279,10 @@ def _children_path(folder_path: str | None) -> str:
 
 
 def _content_path(file_path: str) -> str:
+    if file_path.strip().endswith("/"):
+        raise ValueError(
+            "file_path must include a filename, not end with a folder separator"
+        )
     normalized = _normalize_path(file_path)
     if not normalized:
         raise ValueError("file_path is required")
@@ -347,26 +311,28 @@ def _name_looks_binary(name: str) -> bool:
     it as extensionless (accepted) -- exactly the kind of mislabeling this
     guard exists to catch, just via a name pathlib refuses to split.
     """
-    suffix = _split_stem_suffix(name.strip())[1].lower()
+    suffix = _split_stem_suffix(Path(name.strip()).name)[1].lower()
     return bool(suffix) and suffix not in _KNOWN_TEXT_EXTENSIONS
 
 
 def _resolve_upload_file_path(file_path: str) -> Path:
     """Restrict onedrive_upload_file to files under an allowlisted
-    directory, mirroring slack_upload_file's and google_drive_upload_file's
-    equivalent defenses (the latter from sibling PR #2275, merged into this
-    branch's base) -- without it an agent could be tricked into
-    exfiltrating arbitrary host files through this tool.
+    directory, mirroring the equivalent defenses used by other local-file
+    upload tools.
 
     Containment is checked before existence, so a path that is both
     outside the allowlist and nonexistent reports the allowlist message,
     not "not found" -- the latter would leak whether that host path
     exists at all to a caller who has no business finding out.
     """
-    local_path = Path(file_path).expanduser()
-    if not local_path.is_absolute():
-        local_path = Path.cwd() / local_path
-    local_path = local_path.resolve()
+    try:
+        local_path = Path(file_path).expanduser()
+        if not local_path.is_absolute():
+            local_path = Path.cwd() / local_path
+        local_path = local_path.resolve()
+    except (OSError, RuntimeError) as exc:
+        logger.warning("Could not resolve OneDrive upload path %r: %s", file_path, exc)
+        raise ValueError("Could not resolve file_path") from exc
 
     allowed_dirs = allowed_dirs_from_env(_UPLOAD_ALLOWED_DIRS_ENV_VAR)
     if not any(local_path.is_relative_to(d) for d in allowed_dirs):
@@ -526,16 +492,15 @@ def onedrive_upload_file(
 
     file_path: path to a file already on disk, e.g. something written to
     the task workspace. Must be inside an allowed directory (automatically
-    scoped to the current task workspace) with a process working-directory fallback when unconfigured; this is
-    not an absolute guarantee against access to host files. Pass an absolute path — a
-    relative path resolves against this process's own working directory,
-    not the allowed directory, and will not find a file written to the
-    task workspace.
+    scoped to the current task workspace). When no allowlist is configured,
+    the process working directory is used as a fallback, so this is not an
+    absolute guarantee against access to host files. Pass an absolute path;
+    a relative path resolves against this process's working directory.
     remote_path: the OneDrive path to upload to (e.g. "Documents/report.pdf"),
     overwriting any existing file there; defaults to the local file's own
     name at the OneDrive root.
-    mime_type: defaults to a guess from the file's extension, falling back
-    to "application/octet-stream" when it cannot be guessed.
+    mime_type: defaults to a guess from the remote filename, then the local
+    filename, falling back to "application/octet-stream".
 
     Supports non-empty files up to 4,000,000 bytes (4 MB). Larger files
     are rejected before any upload request is sent.
@@ -559,11 +524,11 @@ def onedrive_upload_file(
                 "path -- otherwise the file would be uploaded with the "
                 "folder's own name instead of being placed inside it"
             )
-        resolved_mime_type = (
-            mime_type.strip()
-            or _guess_mime_type(local_path.name)
-            or "application/octet-stream"
-        )
+        resolved_mime_type = mime_type.strip() or _guess_mime_type(resolved_remote_path)
+        if resolved_mime_type is None:
+            resolved_mime_type = (
+                _guess_mime_type(local_path.name) or "application/octet-stream"
+            )
 
         # Check size and read content through the same open handle.
         try:
@@ -579,8 +544,12 @@ def onedrive_upload_file(
             logger.warning("Failed to open upload file %s: %s", local_path, e)
             raise ValueError("Could not read the file at the given path") from e
         with fh_ctx as fh:
-            file_size = os.fstat(fh.fileno()).st_size
-            if file_size == 0:
+            # A stat-then-unbounded-read sequence can exceed the limit if
+            # another process appends to the file between those operations.
+            # Reading one byte past the cap bounds memory and makes the bytes
+            # actually sent authoritative for both the empty and size checks.
+            content = fh.read(_SIMPLE_UPLOAD_MAX_BYTES + 1)
+            if not content:
                 # A deliberate product choice, not an API constraint: Graph
                 # itself accepts a 0-byte file. An agent uploading an empty
                 # file is almost always a symptom of an upstream mistake
@@ -588,10 +557,10 @@ def onedrive_upload_file(
                 # so this is rejected here rather than silently creating a
                 # placeholder-empty item on OneDrive.
                 raise ValueError(f"File is empty: {file_path}")
-            if file_size > _SIMPLE_UPLOAD_MAX_BYTES:
+            if len(content) > _SIMPLE_UPLOAD_MAX_BYTES:
                 raise ValueError(
-                    f"File is {file_size} bytes, over the "
-                    f"{_SIMPLE_UPLOAD_MAX_BYTES:,}-byte (4 MB) limit for "
+                    f"File is over the {_SIMPLE_UPLOAD_MAX_BYTES:,}-byte "
+                    "(4 MB) limit for "
                     "onedrive_upload_file. Large-file uploads are not supported yet."
                 )
 
@@ -599,9 +568,11 @@ def onedrive_upload_file(
                 "PUT",
                 _content_path(resolved_remote_path),
                 extra_headers={"Content-Type": resolved_mime_type},
-                data=fh.read(),
+                data=content,
                 timeout=_BINARY_UPLOAD_TIMEOUT_SECONDS,
             )
+            if not isinstance(result, dict) or not result.get("id"):
+                raise RuntimeError("OneDrive did not confirm the upload completed")
 
         return _success(item=result)
     except Exception as e:

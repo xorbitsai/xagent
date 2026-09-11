@@ -10,13 +10,29 @@ from ....config import get_tool_max_output_length
 
 
 def allowed_dirs_from_env(env_var_name: str) -> list[Path]:
-    """Parse directory roots, falling back to CWD when no entries remain."""
+    """Parse JSON or legacy comma-separated roots, falling back to CWD."""
     raw_dirs = os.environ.get(env_var_name, "")
-    parsed_dirs = [
-        Path(stripped).expanduser().resolve()
-        for raw_dir in raw_dirs.split(",")
-        if (stripped := raw_dir.strip())
-    ]
+    stripped_raw_dirs = raw_dirs.strip()
+    if stripped_raw_dirs.startswith("["):
+        try:
+            decoded_dirs = json.loads(stripped_raw_dirs)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{env_var_name} must contain a valid JSON array") from exc
+        if not isinstance(decoded_dirs, list) or not all(
+            isinstance(raw_dir, str) for raw_dir in decoded_dirs
+        ):
+            raise ValueError(f"{env_var_name} must contain a JSON array of paths")
+        raw_dir_values = decoded_dirs
+    else:
+        raw_dir_values = raw_dirs.split(",")
+    try:
+        parsed_dirs = [
+            Path(stripped).expanduser().resolve()
+            for raw_dir in raw_dir_values
+            if (stripped := raw_dir.strip())
+        ]
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"{env_var_name} contains an invalid path") from exc
     return parsed_dirs or [Path.cwd().resolve()]
 
 

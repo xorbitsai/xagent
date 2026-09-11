@@ -18,6 +18,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Dict,
+    Iterable,
     Iterator,
     List,
     Literal,
@@ -1001,6 +1002,57 @@ def _is_duplicate_user_message_turn(
         return True
     seen_turn_ids.add(turn_id)
     return False
+
+
+def _clarification_request_id(result: Any) -> Optional[str]:
+    """The waiting round's stable identity, read off a normalized result.
+
+    The runtime mints one ``event_id`` per ask and threads it through the
+    clarification draft (``core/agent/clarification.py``: "event_id is the
+    clarification's stable identity"). Frames that assert WAITING_FOR_USER
+    carry it as ``request_id`` so a client can bind replies - and its
+    retry gate (#1500) - to the exact round, across live delivery, resume,
+    replay, and restore. Tolerates both the draft dataclass and its
+    ``to_dict`` form; anything else reads as "no identity", never a throw,
+    because these calls sit on broadcast paths.
+    """
+
+    if not isinstance(result, dict):
+        return None
+    draft = result.get("clarification_draft")
+    if isinstance(draft, dict):
+        event_id = draft.get("event_id")
+    else:
+        event_id = getattr(draft, "event_id", None)
+    if isinstance(event_id, str) and event_id:
+        return event_id
+    return None
+
+
+def _latest_ask_event_id(trace_events: Iterable[Any]) -> Optional[str]:
+    """The most recent persisted ask's ``event_id``, for id-less surfaces.
+
+    Restore/reassert paths have no normalized result in hand; the persisted
+    ask trace row (an ``agent_message`` with ``expect_response``) is the
+    durable copy of the same identity. The scan stops at the newest ask so
+    an older round's id can never label a newer question.
+
+    Delegated-child asks cannot shadow the parent round: only the top-level
+    runtime's outbound handler persists ``expect_response`` rows, and a
+    waiting child is hard-classified as an unsupported nested interaction
+    before it could ever produce one (agent_tool.py).
+    """
+
+    latest: Optional[str] = None
+    for event in trace_events:
+        data = getattr(event, "data", None)
+        if not isinstance(data, dict):
+            continue
+        if data.get("expect_response") is not True:
+            continue
+        event_id = data.get("event_id")
+        latest = event_id if isinstance(event_id, str) and event_id else None
+    return latest
 
 
 def create_stream_event(
@@ -2924,6 +2976,18 @@ async def execute_task_background(
                             "agent_id": broadcast_agent_meta["agent_id"],
                             "agent_name": broadcast_agent_meta["agent_name"],
                             "agent_logo_url": broadcast_agent_meta["agent_logo_url"],
+                            # The waiting round's identity (#1500) - see
+                            # _clarification_request_id. Key present only
+                            # when an id exists, matching the replay frames.
+                            **(
+                                {"request_id": waiting_request_id}
+                                if (
+                                    waiting_request_id := _clarification_request_id(
+                                        result
+                                    )
+                                )
+                                else {}
+                            ),
                             **control_event_state,
                         },
                         broadcast_meta["updated_at"] or None,
@@ -3922,6 +3986,20 @@ async def execute_resume_background(
                         "agent_id": task_agent_id,
                         "agent_name": agent_name,
                         "agent_logo_url": agent_logo_url,
+                        # The waiting round's identity (#1500) - see
+                        # _clarification_request_id. Key present only when
+                        # an id exists (never for "interrupted"), matching
+                        # the replay frames.
+                        **(
+                            {"request_id": resume_waiting_request_id}
+                            if status == "waiting_for_user"
+                            and (
+                                resume_waiting_request_id := _clarification_request_id(
+                                    result
+                                )
+                            )
+                            else {}
+                        ),
                         **control_event_state,
                     },
                 ),
@@ -8006,6 +8084,19 @@ def _load_historical_stream_snapshot_sync(
                 .all()
             )
 
+            # The waiting round's identity for this replay (#1500): the
+            # persisted ask trace row is the durable copy of the id the live
+            # ask carried. Backfill the task_info built above - the trace
+            # rows were not loaded yet at that point - and stamp the
+            # reassertion frame below from the same source.
+            replay_ask_request_id = (
+                _latest_ask_event_id(trace_events)
+                if task.status == TaskStatus.WAITING_FOR_USER
+                else None
+            )
+            if replay_ask_request_id and isinstance(task_event.get("data"), dict):
+                task_event["data"]["request_id"] = replay_ask_request_id
+
             # DAG execution info is now directly provided by DAG plan-execute trace events
 
             # DAG execution events are now directly sent by DAG plan-execute, no need to rebuild
@@ -8358,6 +8449,11 @@ def _load_historical_stream_snapshot_sync(
                     status_event["question"] = question_message
                 if isinstance(question_interactions, list):
                     status_event["interactions"] = question_interactions
+                if replay_ask_request_id:
+                    # The reasserted round keeps its identity (#1500), so a
+                    # reloading client can rebind its reply - and its retry
+                    # gate - to the same ask.
+                    status_event["request_id"] = replay_ask_request_id
                 cached_stream_events.append(status_event)
 
             detached_events = [

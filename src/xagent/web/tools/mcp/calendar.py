@@ -803,6 +803,26 @@ def google_calendar_update_events(
         # calendar entirely, in the specific case where the organizer's
         # own email was the only thing making a raw set non-empty.
         organizer_email = (event.get("organizer") or {}).get("email")
+        if organizer_email is None and added_attendees:
+            # Google omits the top-level `organizer` field whenever the
+            # organizer is just the calendar owner (the overwhelmingly
+            # common case) - the caller's own resolved address (from the
+            # same calendars().get(calendarId="primary") already used
+            # for caller_is_organizer/all-day widening below) IS the
+            # organizer then. Only resolved when there's a newly-added
+            # attendee to check this against - a retained attendee's
+            # delta-segment query never re-scans the event's OLD window
+            # (where their own footprint would live), so it can't
+            # self-conflict regardless of this exclusion, and a
+            # metadata-only edit has no attendee to need it for at all.
+            # Without this, adding the caller's OWN address as a "new"
+            # attendee on an event with no explicit organizer field
+            # would never be excluded from the freebusy batch below and
+            # would always find this very event's own busy block on
+            # their calendar - the exact self-conflict class this
+            # exclusion exists to prevent for the explicit-organizer-
+            # field case already.
+            organizer_email = primary_calendar_info()[0]
         # None never equals a real address's lowercased form, so this
         # filter is a no-op (keeps everything) when there's no organizer
         # email to exclude - same effect as branching on `organizer_email`
@@ -997,6 +1017,37 @@ def google_calendar_update_events(
             # the case that stops `_merge_scope_error` from re-raising).
             pending_scope_error: InsufficientScopeError | None = None
 
+            def _run_and_accumulate(
+                time_min: str, time_max: str, attendees: list[str], *, check_org: bool
+            ) -> bool:
+                """Runs one _find_conflicts call, folding its result (or,
+                on a scope error, whatever it had already confirmed) into
+                the shared all_conflicts/unchecked_attendees accumulators.
+                Returns True on a scope error, so a segment loop can stop
+                attempting further segments (every remaining one would
+                hit the same error) - a `for/break`, not a re-raise,
+                since the OTHER accumulation block below must still get
+                its own chance to run regardless.
+                """
+                nonlocal pending_scope_error
+                try:
+                    conflicts, unchecked = _find_conflicts(
+                        service,
+                        time_min,
+                        time_max,
+                        attendees,
+                        exclude_event_id=event_id,
+                        check_organizer=check_org,
+                    )
+                    all_conflicts.extend(conflicts)
+                    unchecked_attendees.extend(unchecked)
+                    return False
+                except InsufficientScopeError as exc:
+                    all_conflicts.extend(exc.conflicts)
+                    unchecked_attendees.extend(exc.unchecked_attendees)
+                    pending_scope_error = exc
+                    return True
+
             # A newly-added attendee has no footprint on this event
             # at all, so the FULL effective window is safe (and
             # necessary) to check for them - same call also covers
@@ -1004,21 +1055,12 @@ def google_calendar_update_events(
             # by window, so `window_changed` alone (not a
             # disjoint-move test) decides whether to re-check them.
             if check_organizer or attendees_to_check:
-                try:
-                    conflicts, unchecked = _find_conflicts(
-                        service,
-                        effective_start,
-                        effective_end,
-                        attendees_to_check,
-                        exclude_event_id=event_id,
-                        check_organizer=check_organizer,
-                    )
-                    all_conflicts.extend(conflicts)
-                    unchecked_attendees.extend(unchecked)
-                except InsufficientScopeError as exc:
-                    all_conflicts.extend(exc.conflicts)
-                    unchecked_attendees.extend(exc.unchecked_attendees)
-                    pending_scope_error = exc
+                _run_and_accumulate(
+                    effective_start,
+                    effective_end,
+                    attendees_to_check,
+                    check_org=check_organizer,
+                )
 
             # A retained attendee's own busy block for THIS event
             # covers the entire OLD window - querying that overlap
@@ -1036,24 +1078,15 @@ def google_calendar_update_events(
                     effective_start_key,
                     effective_end_key,
                 ):
-                    try:
-                        conflicts, unchecked = _find_conflicts(
-                            service,
-                            seg_start.isoformat(),
-                            seg_end.isoformat(),
-                            existing_attendees_to_check,
-                            exclude_event_id=event_id,
-                            check_organizer=False,
-                        )
-                        all_conflicts.extend(conflicts)
-                        unchecked_attendees.extend(unchecked)
-                    except InsufficientScopeError as exc:
-                        all_conflicts.extend(exc.conflicts)
-                        unchecked_attendees.extend(exc.unchecked_attendees)
-                        pending_scope_error = exc
-                        # Every remaining segment would hit this same
-                        # scope error too - nothing left to gain by
-                        # attempting them.
+                    hit_scope_error = _run_and_accumulate(
+                        seg_start.isoformat(),
+                        seg_end.isoformat(),
+                        existing_attendees_to_check,
+                        check_org=False,
+                    )
+                    # Every remaining segment would hit this same scope
+                    # error too - nothing left to gain by attempting them.
+                    if hit_scope_error:
                         break
 
             # A both-sides-widened window produces two delta segments

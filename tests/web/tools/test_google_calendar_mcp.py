@@ -1426,6 +1426,54 @@ def test_update_events_adding_the_organizer_as_an_attendee_does_not_self_conflic
     assert len(fake_service._events.list_calls) == 1
 
 
+def test_update_events_adding_self_as_attendee_with_no_organizer_field_does_not_self_conflict(
+    fake_service,
+):
+    """Regression test: Google omits the top-level `organizer` field
+    whenever the organizer is just the calendar owner - the overwhelmingly
+    common case, and the ONE this exclusion must also cover, not just the
+    explicit-organizer-field case the sibling test above pins. Without
+    resolving the caller's own identity as a fallback organizer address
+    here, adding the caller's own email as a "new" attendee would never
+    be excluded from the freebusy batch and would always find this very
+    event's own busy block on their calendar."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T10:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T10:30:00+08:00"},
+        "attendees": [],
+        # No "organizer" field at all - implicit organizer is the caller,
+        # whose own resolved address defaults to "me@example.com" (see
+        # FakeCalendars).
+    }
+    fake_service._events._list_result = {"items": []}
+    fake_service._freebusy = FakeFreebusy(
+        {
+            "calendars": {
+                "me@example.com": {
+                    "busy": [
+                        {
+                            "start": "2026-08-27T10:00:00+08:00",
+                            "end": "2026-08-27T10:30:00+08:00",
+                        }
+                    ]
+                },
+            }
+        }
+    )
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            attendees=["me@example.com"],
+        )
+    )
+
+    assert result["status"] == "success"
+    assert fake_service._freebusy.query_calls == []
+    assert len(fake_service._events.list_calls) == 1
+
+
 def test_update_events_adding_the_organizer_as_an_attendee_still_catches_a_real_conflict(
     fake_service,
 ):

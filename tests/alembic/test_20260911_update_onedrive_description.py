@@ -28,7 +28,9 @@ def _operations(connection):
     return Operations(MigrationContext.configure(connection))
 
 
-def _create_table(connection, description: str, with_description_column: bool = True):
+def _create_table(
+    connection, description: str | None, with_description_column: bool = True
+):
     description_column = "description TEXT," if with_description_column else ""
     connection.execute(
         text(
@@ -115,6 +117,19 @@ def test_upgrade_preserves_admin_customized_description(tmp_path):
         with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()
         assert _description(connection) == "Our internal storage connector"
+
+
+def test_upgrade_preserves_null_description(tmp_path):
+    """NULL is not the previous seeded default, so the migration must not
+    guess whether it represents an intentional customization or damaged data.
+    """
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection, description=None)
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+        assert _description(connection) is None
 
 
 def test_downgrade_preserves_admin_customized_description(tmp_path):

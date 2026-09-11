@@ -34,20 +34,18 @@ CURRENT_DESCRIPTION = (
 )
 
 
-def _columns_present(
-    bind: sa.engine.Connection, table_name: str, required_columns: set[str]
-) -> bool:
-    """Whether ``table_name`` exists and has all of ``required_columns``.
+def _required_columns_present(bind: sa.engine.Connection) -> bool:
+    """Whether the target table has the columns this migration needs.
 
     This migration must be a no-op (not an error) against a database
     mid-way through a schema this old, or an admin's reduced-schema table,
     rather than assume a table shape that matches only the current model.
     """
     inspector = sa.inspect(bind)
-    if table_name not in set(inspector.get_table_names()):
+    if "public_mcp_apps" not in set(inspector.get_table_names()):
         return False
-    columns = {c["name"] for c in inspector.get_columns(table_name)}
-    return required_columns.issubset(columns)
+    columns = {c["name"] for c in inspector.get_columns("public_mcp_apps")}
+    return {"app_id", "description"}.issubset(columns)
 
 
 def _set_description_if_unchanged(
@@ -72,7 +70,7 @@ def _set_description_if_unchanged(
     source registry has moved on (mirrors
     20260908_update_google_drive_description.py's identical rationale).
     """
-    if not _columns_present(bind, "public_mcp_apps", {"app_id", "description"}):
+    if not _required_columns_present(bind):
         return
 
     bind.execute(

@@ -177,6 +177,15 @@ def test_allowed_dirs_from_env_parses_json_paths_containing_commas(
     ]
 
 
+@pytest.mark.parametrize("raw_value", ["[]", '[""]', '["   "]'])
+def test_allowed_dirs_from_env_treats_empty_json_paths_as_deny_all(
+    monkeypatch, raw_value
+):
+    monkeypatch.setenv(_TEST_ALLOWED_DIRS_ENV_VAR, raw_value)
+
+    assert utils.allowed_dirs_from_env(_TEST_ALLOWED_DIRS_ENV_VAR) == []
+
+
 @pytest.mark.parametrize("raw_value", ["[", '["ok", 42]'])
 def test_allowed_dirs_from_env_rejects_invalid_json(monkeypatch, raw_value):
     monkeypatch.setenv(_TEST_ALLOWED_DIRS_ENV_VAR, raw_value)

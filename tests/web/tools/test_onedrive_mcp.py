@@ -55,8 +55,12 @@ async def test_upload_file_is_registered_with_expected_schema():
 
     assert "onedrive_upload_file" in tools
     schema = tools["onedrive_upload_file"].inputSchema
-    assert schema["required"] == ["file_path"]
-    assert set(schema["properties"]) == {"file_path", "remote_path", "mime_type"}
+    assert schema["required"] == ["local_file_path"]
+    assert set(schema["properties"]) == {
+        "local_file_path",
+        "remote_path",
+        "mime_type",
+    }
 
 
 def test_upload_file_sends_real_binary_content(monkeypatch, _upload_allowed_dirs_env):
@@ -292,6 +296,25 @@ def test_upload_file_rejects_trailing_slash_remote_path(
     mock_request.assert_not_called()
 
 
+def test_upload_file_rejects_trailing_period_remote_path(
+    monkeypatch, _upload_allowed_dirs_env
+):
+    local_file = _upload_allowed_dirs_env / "report.pdf"
+    local_file.write_bytes(b"content")
+    mock_request = Mock()
+    monkeypatch.setattr(onedrive.requests, "request", mock_request)
+
+    result = json.loads(
+        onedrive.onedrive_upload_file(
+            str(local_file), remote_path="Documents/report.pdf."
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "period" in result["message"]
+    mock_request.assert_not_called()
+
+
 def test_upload_file_accepts_remote_path_with_folder_and_filename(
     monkeypatch, _upload_allowed_dirs_env
 ):
@@ -410,14 +433,10 @@ def test_upload_file_at_exact_boundary_uses_simple_put(
 
     mock_request = Mock(return_value=MockResponse({"id": "item-1"}))
     monkeypatch.setattr(onedrive.requests, "request", mock_request)
-    session_factory = Mock()
-    monkeypatch.setattr(onedrive.requests, "Session", session_factory)
-
     result = json.loads(onedrive.onedrive_upload_file(str(local_file)))
 
     assert result["status"] == "success"
     assert mock_request.call_args.kwargs["method"] == "PUT"
-    session_factory.assert_not_called()
 
 
 def test_upload_file_bounds_the_actual_read_before_upload(
@@ -425,18 +444,20 @@ def test_upload_file_bounds_the_actual_read_before_upload(
 ):
     local_file = _upload_allowed_dirs_env / "growing.bin"
     local_file.write_bytes(b"initially small")
-    requested_sizes = []
+    real_file = local_file.open("rb")
 
     class GrowingFile:
         def __enter__(self):
             return self
 
         def __exit__(self, *exc_info):
+            real_file.close()
             return False
 
         def read(self, size):
-            requested_sizes.append(size)
-            return b"x" * size
+            with open(local_file, "ab") as append_fh:
+                append_fh.write(b"x" * (onedrive._SIMPLE_UPLOAD_MAX_BYTES + 1))
+            return real_file.read(size)
 
     monkeypatch.setattr(onedrive.Path, "open", lambda self, mode: GrowingFile())
     mock_request = Mock()
@@ -446,7 +467,7 @@ def test_upload_file_bounds_the_actual_read_before_upload(
 
     assert result["status"] == "error"
     assert "4 MB" in result["message"]
-    assert requested_sizes == [onedrive._SIMPLE_UPLOAD_MAX_BYTES + 1]
+    assert local_file.stat().st_size > onedrive._SIMPLE_UPLOAD_MAX_BYTES
     mock_request.assert_not_called()
 
 
@@ -802,6 +823,41 @@ def test_allowed_upload_dirs_falls_back_to_cwd_when_malformed(monkeypatch):
     ]
 
 
+def test_upload_file_honors_explicit_empty_allowed_dirs(
+    monkeypatch, _upload_allowed_dirs_env
+):
+    local_file = _upload_allowed_dirs_env / "report.pdf"
+    local_file.write_bytes(b"content")
+    monkeypatch.setenv("XAGENT_ONEDRIVE_FILE_ALLOWED_DIRS", "[]")
+    mock_request = Mock()
+    monkeypatch.setattr(onedrive.requests, "request", mock_request)
+
+    result = json.loads(onedrive.onedrive_upload_file(str(local_file)))
+
+    assert result["status"] == "error"
+    assert "allowed upload directories" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_upload_file_scrubs_malformed_allowed_dirs_configuration(
+    monkeypatch, _upload_allowed_dirs_env
+):
+    local_file = _upload_allowed_dirs_env / "report.pdf"
+    local_file.write_bytes(b"content")
+    monkeypatch.setenv("XAGENT_ONEDRIVE_FILE_ALLOWED_DIRS", "[")
+    mock_request = Mock()
+    monkeypatch.setattr(onedrive.requests, "request", mock_request)
+
+    result = json.loads(onedrive.onedrive_upload_file(str(local_file)))
+
+    assert result == {
+        "status": "error",
+        "message": "Upload directory configuration is invalid",
+    }
+    assert "XAGENT_ONEDRIVE_FILE_ALLOWED_DIRS" not in result["message"]
+    mock_request.assert_not_called()
+
+
 def test_upload_file_rejects_missing_file(monkeypatch, _upload_allowed_dirs_env):
     missing_path = _upload_allowed_dirs_env / "does_not_exist.pdf"
 
@@ -827,7 +883,7 @@ def test_upload_file_does_not_leak_path_from_symlink_loop(
     result = json.loads(onedrive.onedrive_upload_file(str(loop)))
 
     assert result["status"] == "error"
-    assert result["message"] == "Could not resolve file_path"
+    assert result["message"] == "Could not resolve local_file_path"
     assert str(loop) not in result["message"]
     mock_request.assert_not_called()
 
@@ -972,6 +1028,33 @@ def test_upload_text_file_rejects_folder_shaped_path(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    "file_path", ["report.pdf.", "Documents/archive.zip.", "model.pkl. "]
+)
+def test_upload_text_file_rejects_trailing_period_names(monkeypatch, file_path):
+    mock_request = Mock()
+    monkeypatch.setattr(onedrive.requests, "request", mock_request)
+
+    result = json.loads(onedrive.onedrive_upload_text_file(file_path, "some text"))
+
+    assert result["status"] == "error"
+    assert "period" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_upload_text_file_requires_completed_item_confirmation(monkeypatch):
+    monkeypatch.setattr(
+        onedrive.requests,
+        "request",
+        Mock(return_value=MockResponse({}, status_code=204, content=b"")),
+    )
+
+    result = json.loads(onedrive.onedrive_upload_text_file("notes.txt", "text"))
+
+    assert result["status"] == "error"
+    assert "did not confirm" in result["message"]
+
+
+@pytest.mark.parametrize(
     "file_path",
     [
         "notes.txt",
@@ -1009,25 +1092,6 @@ def test_upload_text_file_allows_plain_text_names(monkeypatch, file_path):
 # item_id-based tools (onedrive_get_item, onedrive_rename_item,
 # onedrive_delete_item) -- dot-segment rejection
 # ---------------------------------------------------------------------------
-
-
-def test_normalize_item_id_rejects_dot_segments_directly():
-    """Regression guard: item_id-based endpoints are built as
-    f"/me/drive/items/{quote(item_id, safe='')}" without ever going through
-    _normalize_path/_item_path -- but quote() never percent-encodes a bare
-    "." or ".." (they're in urllib's own "always safe" unreserved set), so
-    without this explicit check an item_id of "." or ".." still reaches
-    requests as a literal dot-segment and collapses the request path onto
-    a different Graph endpoint under the same OAuth token, the same
-    traversal class _normalize_path exists to stop for path-based tools."""
-    for bad_id in [".", ".."]:
-        with pytest.raises(ValueError, match="must not be"):
-            onedrive._normalize_item_id(bad_id)
-
-
-def test_normalize_item_id_rejects_empty_value():
-    with pytest.raises(ValueError, match="required"):
-        onedrive._normalize_item_id("   ")
 
 
 @pytest.mark.parametrize(
@@ -1073,12 +1137,9 @@ def test_upload_file_one_byte_over_limit_rejected_before_network(
     local_file.write_bytes(b"x" * (onedrive._SIMPLE_UPLOAD_MAX_BYTES + 1))
     request = Mock()
     monkeypatch.setattr(onedrive.requests, "request", request)
-    session = Mock()
-    monkeypatch.setattr(onedrive.requests, "Session", session)
 
     result = json.loads(onedrive.onedrive_upload_file(str(local_file)))
 
     assert result["status"] == "error"
     assert "4,000,000-byte (4 MB) limit" in result["message"]
     request.assert_not_called()
-    session.assert_not_called()

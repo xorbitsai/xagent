@@ -1864,10 +1864,6 @@ class WebToolConfig(BaseToolConfig):
         self._browser_locale_resolved = False
         self._cached_browser_locale: Optional[str] = None
 
-    def _build_mcp_file_allowed_dirs(self) -> str:
-        """Build comma-separated file roots that local MCP tools may read."""
-        return ",".join(self._mcp_file_allowed_dir_paths())
-
     def _mcp_file_allowed_dir_paths(self) -> list[str]:
         """Build unique, resolved file roots for local MCP read tools."""
         dirs: list[str] = []
@@ -1891,8 +1887,8 @@ class WebToolConfig(BaseToolConfig):
         """Single write-target root for connectors that create new files in
         the task workspace (currently just Google Drive's download tool).
 
-        Deliberately distinct from _build_mcp_file_allowed_dirs() above:
-        that one is a read allowlist that may reasonably include
+        Deliberately distinct from _mcp_file_allowed_dir_paths() above:
+        that method builds a read allowlist that may reasonably include
         allowed_external_dirs (e.g. read-only KB folders) alongside the
         task dir, and multiple consumers of it pick whichever entry a
         requested path happens to fall under. A write target has no such

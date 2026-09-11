@@ -10,7 +10,7 @@ from urllib.parse import quote
 import requests
 from mcp.server.fastmcp import FastMCP
 
-from .utils import allowed_dirs_from_env, setup_proxy_env
+from .utils import allowed_dirs_from_env, setup_proxy_env, url_path_id
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("onedrive-mcp")
@@ -168,22 +168,6 @@ def _graph_headers(extra_headers: dict[str, str] | None = None) -> dict[str, str
     return headers
 
 
-def _raise_for_status_with_body(response: Any) -> None:
-    """Like response.raise_for_status(), but a non-2xx status raises a
-    RuntimeError with Graph's own error body appended -- a bare HTTPError's
-    default message carries only the status line, not the JSON error detail
-    Graph actually returns. Used by _graph_request to report API failures consistently.
-    """
-    try:
-        response.raise_for_status()
-    except requests.HTTPError as exc:
-        response_text = response.text.strip()
-        message = str(exc)
-        if response_text:
-            message = f"{message} - {response_text}"
-        raise RuntimeError(message) from exc
-
-
 def _graph_request(
     method: str,
     path: str,
@@ -204,7 +188,14 @@ def _graph_request(
         data=data,
         timeout=timeout,
     )
-    _raise_for_status_with_body(response)
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        response_text = response.text.strip()
+        message = str(exc)
+        if response_text:
+            message = f"{message} - {response_text}"
+        raise RuntimeError(message) from exc
 
     if raw:
         return response.content
@@ -240,30 +231,6 @@ def _normalize_path(path: str | None) -> str | None:
     return value
 
 
-def _normalize_item_id(item_id: str) -> str:
-    """Validate an item_id used directly in a /me/drive/items/{id} request
-    URL (onedrive_get_item, onedrive_rename_item, onedrive_delete_item).
-
-    These never go through _normalize_path/_item_path -- they're opaque
-    Graph item identifiers, not Drive-relative paths -- but they're still
-    quoted with safe='' and spliced into the request URL the same way, so
-    the same collapsing behavior applies: quote() never percent-encodes a
-    bare "." or ".." (they're in urllib's own "always safe" unreserved
-    set), so an item_id of exactly "." or ".." reaches requests as a
-    literal dot-segment and collapses "/me/drive/items/.." down to
-    "/me/drive/" -- a different Graph endpoint under the same OAuth token.
-    quote(..., safe='') does escape "/", so a multi-segment "../.." can't
-    reach this path, but the single-segment case still could without this
-    check.
-    """
-    value = item_id.strip()
-    if not value:
-        raise ValueError("item_id is required")
-    if value in (".", ".."):
-        raise ValueError(f"item_id must not be '.' or '..': {item_id!r}")
-    return value
-
-
 def _item_path(base_path: str | None) -> str:
     normalized = _normalize_path(base_path)
     if not normalized:
@@ -278,14 +245,17 @@ def _children_path(folder_path: str | None) -> str:
     return f"/me/drive/root:/{quote(normalized, safe='/')}:/children"
 
 
-def _content_path(file_path: str) -> str:
-    if file_path.strip().endswith("/"):
+def _content_path(file_path: str, *, field_name: str = "file_path") -> str:
+    stripped_path = file_path.strip()
+    if stripped_path.endswith("/"):
         raise ValueError(
-            "file_path must include a filename, not end with a folder separator"
+            f"{field_name} must include a filename, not end with a folder separator"
         )
+    if Path(stripped_path).name.endswith("."):
+        raise ValueError(f"{field_name} filename must not end with a period")
     normalized = _normalize_path(file_path)
     if not normalized:
-        raise ValueError("file_path is required")
+        raise ValueError(f"{field_name} is required")
     return f"/me/drive/root:/{quote(normalized, safe='/')}:/content"
 
 
@@ -315,7 +285,7 @@ def _name_looks_binary(name: str) -> bool:
     return bool(suffix) and suffix not in _KNOWN_TEXT_EXTENSIONS
 
 
-def _resolve_upload_file_path(file_path: str) -> Path:
+def _resolve_upload_file_path(local_file_path: str) -> Path:
     """Restrict onedrive_upload_file to files under an allowlisted
     directory, mirroring the equivalent defenses used by other local-file
     upload tools.
@@ -326,15 +296,23 @@ def _resolve_upload_file_path(file_path: str) -> Path:
     exists at all to a caller who has no business finding out.
     """
     try:
-        local_path = Path(file_path).expanduser()
-        if not local_path.is_absolute():
-            local_path = Path.cwd() / local_path
-        local_path = local_path.resolve()
+        candidate_path = Path(local_file_path).expanduser()
+        if not candidate_path.is_absolute():
+            candidate_path = Path.cwd() / candidate_path
+        local_path = candidate_path.resolve()
+        if candidate_path.is_symlink():
+            local_path = candidate_path.resolve(strict=True)
     except (OSError, RuntimeError) as exc:
-        logger.warning("Could not resolve OneDrive upload path %r: %s", file_path, exc)
-        raise ValueError("Could not resolve file_path") from exc
+        logger.warning(
+            "Could not resolve OneDrive upload path %r: %s", local_file_path, exc
+        )
+        raise ValueError("Could not resolve local_file_path") from exc
 
-    allowed_dirs = allowed_dirs_from_env(_UPLOAD_ALLOWED_DIRS_ENV_VAR)
+    try:
+        allowed_dirs = allowed_dirs_from_env(_UPLOAD_ALLOWED_DIRS_ENV_VAR)
+    except ValueError as exc:
+        logger.warning("Invalid OneDrive upload directory configuration: %s", exc)
+        raise ValueError("Upload directory configuration is invalid") from None
     if not any(local_path.is_relative_to(d) for d in allowed_dirs):
         logger.warning(
             "Rejected onedrive_upload_file path %s outside allowed directories: %s",
@@ -342,7 +320,7 @@ def _resolve_upload_file_path(file_path: str) -> Path:
             ", ".join(str(path) for path in allowed_dirs),
         )
         raise PermissionError(
-            "file_path is outside the allowed upload directories; ask the "
+            "local_file_path is outside the allowed upload directories; ask the "
             "user for a file inside the task workspace or another allowed "
             "location"
         )
@@ -352,9 +330,9 @@ def _resolve_upload_file_path(file_path: str) -> Path:
         # etc.) from "does not exist" -- both used to raise the same
         # FileNotFoundError, which reads as "retry, it'll show up" to a
         # caller/agent even though a directory will never become a file.
-        raise ValueError(f"Not a regular file: {file_path}")
+        raise ValueError("The given path is not a regular file")
     if not local_path.is_file():
-        raise FileNotFoundError(f"File not found: {file_path}")
+        raise FileNotFoundError("File not found at the given path")
     return local_path
 
 
@@ -413,7 +391,7 @@ def onedrive_get_item(path: str | None = None, item_id: str | None = None) -> st
         if item_id:
             result = _graph_request(
                 "GET",
-                f"/me/drive/items/{quote(_normalize_item_id(item_id), safe='')}",
+                f"/me/drive/items/{url_path_id(item_id, 'item_id')}",
             )
         elif path:
             result = _graph_request("GET", _item_path(path))
@@ -474,6 +452,8 @@ def onedrive_upload_text_file(
             extra_headers={"Content-Type": "text/plain; charset=utf-8"},
             data=content.encode("utf-8"),
         )
+        if not isinstance(result, dict) or not result.get("id"):
+            raise RuntimeError("OneDrive did not confirm the upload completed")
         return _success(item=result)
     except Exception as e:
         logger.error("Error uploading OneDrive text file %s: %s", file_path, e)
@@ -482,7 +462,7 @@ def onedrive_upload_text_file(
 
 @mcp.tool()
 def onedrive_upload_file(
-    file_path: str, remote_path: str = "", mime_type: str = ""
+    local_file_path: str, remote_path: str = "", mime_type: str = ""
 ) -> str:
     """
     Upload a local file's real bytes to OneDrive -- use this (not
@@ -490,7 +470,7 @@ def onedrive_upload_file(
     other binary content, including a file this agent already generated
     into the task workspace (e.g. an exported PDF report).
 
-    file_path: path to a file already on disk, e.g. something written to
+    local_file_path: path to a file already on disk, e.g. something written to
     the task workspace. Must be inside an allowed directory (automatically
     scoped to the current task workspace). When no allowlist is configured,
     the process working directory is used as a fallback, so this is not an
@@ -506,24 +486,9 @@ def onedrive_upload_file(
     are rejected before any upload request is sent.
     """
     try:
-        local_path = _resolve_upload_file_path(file_path)
+        local_path = _resolve_upload_file_path(local_file_path)
         resolved_remote_path = remote_path.strip() or local_path.name
-        # Require a file destination before building the Graph URL.
-        if not _normalize_path(resolved_remote_path):
-            raise ValueError("remote_path must not be empty or just '/'")
-        # A trailing "/" (e.g. "Documents/") reads as "put it in this
-        # folder" -- the obvious way an LLM caller expresses that intent --
-        # but _normalize_path strips it right off, so without this check
-        # the file would silently be uploaded as an item literally *named*
-        # "Documents" at the drive root instead of placed inside that
-        # folder, with no error and nothing to signal the mistake.
-        if remote_path.strip().endswith("/"):
-            raise ValueError(
-                f"remote_path {remote_path.strip()!r} must include a "
-                "filename (e.g. 'Documents/report.pdf'), not just a folder "
-                "path -- otherwise the file would be uploaded with the "
-                "folder's own name instead of being placed inside it"
-            )
+        content_path = _content_path(resolved_remote_path, field_name="remote_path")
         resolved_mime_type = mime_type.strip() or _guess_mime_type(resolved_remote_path)
         if resolved_mime_type is None:
             resolved_mime_type = (
@@ -556,7 +521,7 @@ def onedrive_upload_file(
                 # (e.g. a generation step that silently produced nothing),
                 # so this is rejected here rather than silently creating a
                 # placeholder-empty item on OneDrive.
-                raise ValueError(f"File is empty: {file_path}")
+                raise ValueError(f"File is empty: {local_file_path}")
             if len(content) > _SIMPLE_UPLOAD_MAX_BYTES:
                 raise ValueError(
                     f"File is over the {_SIMPLE_UPLOAD_MAX_BYTES:,}-byte "
@@ -564,19 +529,19 @@ def onedrive_upload_file(
                     "onedrive_upload_file. Large-file uploads are not supported yet."
                 )
 
-            result = _graph_request(
-                "PUT",
-                _content_path(resolved_remote_path),
-                extra_headers={"Content-Type": resolved_mime_type},
-                data=content,
-                timeout=_BINARY_UPLOAD_TIMEOUT_SECONDS,
-            )
-            if not isinstance(result, dict) or not result.get("id"):
-                raise RuntimeError("OneDrive did not confirm the upload completed")
+        result = _graph_request(
+            "PUT",
+            content_path,
+            extra_headers={"Content-Type": resolved_mime_type},
+            data=content,
+            timeout=_BINARY_UPLOAD_TIMEOUT_SECONDS,
+        )
+        if not isinstance(result, dict) or not result.get("id"):
+            raise RuntimeError("OneDrive did not confirm the upload completed")
 
         return _success(item=result)
     except Exception as e:
-        logger.error("Error uploading OneDrive file %s: %s", file_path, e)
+        logger.error("Error uploading OneDrive file %s: %s", local_file_path, e)
         return _error(str(e))
 
 
@@ -616,7 +581,7 @@ def onedrive_rename_item(item_id: str, new_name: str) -> str:
             raise ValueError("new_name is required")
         result = _graph_request(
             "PATCH",
-            f"/me/drive/items/{quote(_normalize_item_id(item_id), safe='')}",
+            f"/me/drive/items/{url_path_id(item_id, 'item_id')}",
             body={"name": new_name},
         )
         return _success(item=result)
@@ -631,7 +596,7 @@ def onedrive_delete_item(item_id: str) -> str:
     try:
         _graph_request(
             "DELETE",
-            f"/me/drive/items/{quote(_normalize_item_id(item_id), safe='')}",
+            f"/me/drive/items/{url_path_id(item_id, 'item_id')}",
         )
         return _success(message="Item deleted successfully")
     except Exception as e:

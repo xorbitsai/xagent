@@ -513,6 +513,50 @@ def test_upload_large_file_content_never_leaks_upload_url_on_transport_failure(
         assert sentinel_url not in record.getMessage()
 
 
+def test_upload_large_file_content_never_leaks_token_when_host_and_path_are_reported_separately(
+    monkeypatch, caplog
+):
+    """Regression guard for the real urllib3 message shape, not just a
+    synthetic one: verified directly against an actual failed request that
+    a genuine ConnectionError/SSLError never embeds "scheme://host/path?
+    query" as one contiguous string the way the test above's synthetic
+    message does -- it reports the host separately (inside
+    "HTTPSConnectionPool(host=..., port=...)") from the path+query (inside
+    "Max retries exceeded with url: /path?query"). A sanitize step built
+    around a single `message.replace(upload_url, ...)` passes the
+    synthetic-message test above while still leaking the token-bearing
+    query string here."""
+    sentinel_host = "upload.example.invalid"
+    sentinel_token = "SECRETTOKEN123"
+    sentinel_url = f"https://{sentinel_host}/session-1?token={sentinel_token}"
+    total_size = onedrive._UPLOAD_SESSION_CHUNK_SIZE + 10
+    fh = io.BytesIO(b"\x00" * total_size)
+
+    monkeypatch.setattr(
+        onedrive.requests,
+        "request",
+        Mock(return_value=MockResponse({"uploadUrl": sentinel_url})),
+    )
+    transport_error = requests.ConnectionError(
+        f"HTTPSConnectionPool(host='{sentinel_host}', port=443): Max "
+        f"retries exceeded with url: /session-1?token={sentinel_token} "
+        "(Caused by SSLError(...))"
+    )
+    _patch_session(monkeypatch, _FakeSession(put=Mock(side_effect=transport_error)))
+
+    with caplog.at_level("WARNING"):
+        with pytest.raises(RuntimeError) as exc_info:
+            onedrive._upload_large_file_content(
+                "big.bin", fh, total_size, "application/octet-stream"
+            )
+
+    assert sentinel_token not in str(exc_info.value)
+    assert sentinel_host not in str(exc_info.value)
+    for record in caplog.records:
+        assert sentinel_token not in record.getMessage()
+        assert sentinel_host not in record.getMessage()
+
+
 def test_upload_large_file_content_treats_cleanup_404_as_fine(monkeypatch, caplog):
     """Regression guard: a 404 on the cancellation DELETE means the session
     is already gone (expired, or already completed/cancelled) -- exactly
@@ -898,6 +942,52 @@ def test_upload_text_file_rejects_additional_binary_extensions(monkeypatch, file
 
 
 @pytest.mark.parametrize(
+    "file_path",
+    [
+        "app.jar",
+        "Main.class",
+        "installer.cab",
+        "package.deb",
+        "file.torrent",
+        "keystore.p12",
+        "cert.pfx",
+        "movie.swf",
+    ],
+)
+def test_upload_text_file_rejects_further_binary_extensions(monkeypatch, file_path):
+    """Regression guard: a follow-up self-review sweep of the positive
+    _BINARY_MIME_TYPES/fallback-set design found these archive/executable/
+    key-bundle formats were still missing (verified directly against
+    mimetypes.guess_type on both a bare-stdlib and a full-mime.types host),
+    so they used to sail through the guard as "text" the same way the
+    extensions above once did."""
+    mock_request = Mock()
+    monkeypatch.setattr(onedrive.requests, "request", mock_request)
+
+    result = json.loads(onedrive.onedrive_upload_text_file(file_path, "some text"))
+
+    assert result["status"] == "error"
+    assert "onedrive_upload_file" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_upload_text_file_allows_svg(monkeypatch):
+    """Regression guard: "image/svg+xml" starts with the "image/" prefix
+    in _BINARY_MIME_PREFIXES, but SVG is a plain-text XML format an agent
+    may legitimately generate and upload as text -- without the
+    _TEXT_SAFE_MIME_SUFFIXES carve-out for "+xml"/"+json"/"+yaml", the
+    positive-list redesign would misclassify it as binary, reproducing the
+    exact false-positive bug class this whole redesign exists to fix."""
+    monkeypatch.setattr(
+        onedrive.requests, "request", Mock(return_value=MockResponse({"id": "f1"}))
+    )
+
+    result = json.loads(onedrive.onedrive_upload_text_file("chart.svg", "<svg></svg>"))
+
+    assert result["status"] == "success"
+
+
+@pytest.mark.parametrize(
     "file_path", ["app.ts", "deploy.bat", "session.scm", "worksheet.sc"]
 )
 def test_upload_text_file_allows_ambiguous_extensions_that_collide_with_binary_mimetypes(
@@ -987,6 +1077,31 @@ def test_upload_text_file_allows_ps1_regardless_of_host_mimetypes(monkeypatch):
     result = json.loads(onedrive.onedrive_upload_text_file("deploy.ps1", "some text"))
 
     assert result["status"] == "success"
+
+
+def test_upload_file_resolves_real_mime_type_for_ambiguous_extensions(
+    monkeypatch, _upload_allowed_dirs_env
+):
+    """Regression guard: _AMBIGUOUS_TEXT_EXTENSIONS forces ".ts"/".bat"/
+    ".scm"/".sc"/".ps1" to be treated as non-binary by the
+    onedrive_upload_text_file guard, but onedrive_upload_file uploads a
+    real local file's real bytes -- a genuine ".ts" file is very commonly
+    an actual MPEG transport-stream video chunk, not TypeScript source.
+    An earlier version of this fix applied the override inside
+    _guess_mime_type itself, which also corrupted this tool's real
+    Content-Type resolution (sending "text/plain" for what Graph is told
+    is a ".ts" file) whenever no explicit mime_type is passed."""
+    local_file = _upload_allowed_dirs_env / "segment001.ts"
+    local_file.write_bytes(b"\x47" * 100)  # MPEG-TS sync byte, not text
+
+    mock_request = Mock(return_value=MockResponse({"id": "f1"}))
+    monkeypatch.setattr(onedrive.requests, "request", mock_request)
+
+    result = json.loads(onedrive.onedrive_upload_file(str(local_file)))
+
+    assert result["status"] == "success"
+    sent_headers = mock_request.call_args.kwargs["headers"]
+    assert sent_headers["Content-Type"] == "video/mp2t"
 
 
 def test_upload_file_raises_when_upload_session_has_no_url(
@@ -1259,3 +1374,64 @@ def test_upload_text_file_allows_plain_text_names(monkeypatch, file_path):
     result = json.loads(onedrive.onedrive_upload_text_file(file_path, "hello world"))
 
     assert result["status"] == "success"
+
+
+# ---------------------------------------------------------------------------
+# item_id-based tools (onedrive_get_item, onedrive_rename_item,
+# onedrive_delete_item) -- dot-segment rejection
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_item_id_rejects_dot_segments_directly():
+    """Regression guard: item_id-based endpoints are built as
+    f"/me/drive/items/{quote(item_id, safe='')}" without ever going through
+    _normalize_path/_item_path -- but quote() never percent-encodes a bare
+    "." or ".." (they're in urllib's own "always safe" unreserved set), so
+    without this explicit check an item_id of "." or ".." still reaches
+    requests as a literal dot-segment and collapses the request path onto
+    a different Graph endpoint under the same OAuth token, the same
+    traversal class _normalize_path exists to stop for path-based tools."""
+    for bad_id in [".", ".."]:
+        with pytest.raises(ValueError, match="must not be"):
+            onedrive._normalize_item_id(bad_id)
+
+
+def test_normalize_item_id_rejects_empty_value():
+    with pytest.raises(ValueError, match="required"):
+        onedrive._normalize_item_id("   ")
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda item_id: onedrive.onedrive_get_item(item_id=item_id),
+        lambda item_id: onedrive.onedrive_rename_item(item_id, "new-name.txt"),
+        lambda item_id: onedrive.onedrive_delete_item(item_id),
+    ],
+    ids=["onedrive_get_item", "onedrive_rename_item", "onedrive_delete_item"],
+)
+@pytest.mark.parametrize("bad_id", [".", ".."])
+def test_item_id_tools_reject_dot_segments(monkeypatch, call, bad_id):
+    """Regression guard: each of the three item_id-based tools must refuse
+    a "." or ".." item_id before ever making a request, not just when a
+    Drive-relative path is used instead."""
+    mock_request = Mock()
+    monkeypatch.setattr(onedrive.requests, "request", mock_request)
+
+    result = json.loads(call(bad_id))
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
+def test_get_item_by_item_id_still_works_for_a_normal_id(monkeypatch):
+    monkeypatch.setattr(
+        onedrive.requests,
+        "request",
+        Mock(return_value=MockResponse({"id": "abc123", "name": "report.pdf"})),
+    )
+
+    result = json.loads(onedrive.onedrive_get_item(item_id="abc123"))
+
+    assert result["status"] == "success"
+    assert result["item"]["id"] == "abc123"

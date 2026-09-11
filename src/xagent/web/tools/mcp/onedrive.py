@@ -5,7 +5,7 @@ import mimetypes
 import os
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import requests
 from mcp.server.fastmcp import FastMCP
@@ -74,12 +74,15 @@ _MIME_TYPE_OVERRIDES = {
 # (MPEG transport stream, not TypeScript), ".bat" -> "application/x-msdownload",
 # ".scm" -> "application/vnd.lotus-screencam" (not Scheme source), ".sc" ->
 # "application/vnd.ibm.secure-container" (an obscure, effectively dead IBM
-# format, not Scala/SuperCollider source). Consulted by _guess_mime_type
-# itself (so onedrive_upload_file's own Content-Type guess for a real file
-# with one of these names is also right, not just the binary/text guard
-# below) -- for these four the mimetype signal is actively wrong, not
-# merely unavailable, so it's overridden to "text/plain" rather than left
-# to resolve to the colliding binary type.
+# format, not Scala/SuperCollider source).
+#
+# Consulted only by _name_looks_binary's text/binary guard, NOT by
+# _guess_mime_type -- a real ".ts" file uploaded through onedrive_upload_file
+# (a genuine MPEG transport stream, not TypeScript source) still needs its
+# actual "video/mp2t" Content-Type, not "text/plain". Forcing the override
+# into _guess_mime_type itself (an earlier version of this fix did that)
+# would fix the text-upload guard's false positive at the cost of mislabeling
+# the exact binary format the collision names.
 _AMBIGUOUS_TEXT_EXTENSIONS = {
     ".ts", ".bat", ".scm", ".sc",
     # Not a verified collision like the four above -- mimetypes.guess_type
@@ -92,17 +95,27 @@ _AMBIGUOUS_TEXT_EXTENSIONS = {
 
 
 def _guess_mime_type(name: str) -> str | None:
-    """Guess a mime type from ``name``'s extension: _AMBIGUOUS_TEXT_EXTENSIONS
-    first (see above), then _MIME_TYPE_OVERRIDES for the formats stdlib
-    mimetypes can't reliably identify on its own, then stdlib itself."""
+    """Guess ``name``'s real mime type for actual Content-Type resolution:
+    _MIME_TYPE_OVERRIDES first, for the formats stdlib mimetypes can't
+    reliably identify on its own, then stdlib itself. Deliberately does not
+    consult _AMBIGUOUS_TEXT_EXTENSIONS -- see that set's own docstring."""
     suffix = Path(name).suffix.lower()
-    if suffix in _AMBIGUOUS_TEXT_EXTENSIONS:
-        return "text/plain"
     override = _MIME_TYPE_OVERRIDES.get(suffix)
     if override is not None:
         return override
     return mimetypes.guess_type(name)[0]
 
+
+# Mime types ending in one of these suffixes are XML/JSON/YAML-based text
+# formats even when their registered top-level type collides with a
+# _BINARY_MIME_PREFIXES prefix -- verified directly: "image/svg+xml" (a
+# plain-text vector format an agent may legitimately generate and upload via
+# onedrive_upload_text_file) starts with "image/" and would otherwise be
+# misclassified as binary by that prefix check alone. Checked before the
+# prefix/positive-list check in _is_binary_mime_type so a real image/audio/
+# video/font format that happens to also be XML/JSON/YAML-encoded text is
+# never caught by the broader prefix.
+_TEXT_SAFE_MIME_SUFFIXES = ("+xml", "+json", "+yaml")
 
 # Mime-type prefixes that are unambiguously binary media containers.
 _BINARY_MIME_PREFIXES = ("image/", "audio/", "video/", "font/")
@@ -161,10 +174,22 @@ _BINARY_MIME_TYPES = {
     "application/x-apple-diskimage",  # .dmg
     "application/x-iso9660-image",  # .iso
     "application/vnd.android.package-archive",  # .apk
+    # Found via a follow-up sweep of common archive/executable/key-bundle
+    # formats not covered by the categories above -- each verified directly
+    # against mimetypes.guess_type.
+    "application/java-archive",  # .jar
+    "application/java-vm",  # .class
+    "application/x-shockwave-flash",  # .swf
+    "application/vnd.ms-cab-compressed",  # .cab
+    "application/x-debian-package",  # .deb
+    "application/x-bittorrent",  # .torrent
+    "application/x-pkcs12",  # .p12, .pfx -- private key/certificate bundles
 }
 
 
 def _is_binary_mime_type(mime_type: str) -> bool:
+    if mime_type.endswith(_TEXT_SAFE_MIME_SUFFIXES):
+        return False
     return (
         mime_type.startswith(_BINARY_MIME_PREFIXES) or mime_type in _BINARY_MIME_TYPES
     )
@@ -185,6 +210,16 @@ _KNOWN_BINARY_EXTENSIONS_WITHOUT_MIME_GUESS = {
     ".woff", ".woff2", ".ttf", ".otf",
     ".parquet", ".sqlite", ".sqlite3", ".db", ".db3",
     ".numbers", ".pages", ".key", ".blend", ".indd", ".pub",
+    # Resolve to a real, specific mimetype on a host with a full system
+    # mime.types (so they're already caught by _BINARY_MIME_TYPES/prefixes
+    # there) but to None on a bare stdlib install -- verified directly via
+    # MimeTypes(filenames=()) -- so they're listed here too for host
+    # independence, same rationale as the rest of this set.
+    ".jar", ".class", ".cab", ".deb", ".torrent", ".m4v",
+    # Resolve to no mimetype at all on any host tested (bare stdlib or
+    # system mime.types) -- camera raw photo and generic macOS/executable
+    # bundle formats mimetypes has no opinion on whatsoever.
+    ".raw", ".cr2", ".app",
 }  # fmt: skip
 
 
@@ -232,6 +267,36 @@ def _raise_for_status_with_body(response: Any) -> None:
         if response_text:
             message = f"{message} - {response_text}"
         raise RuntimeError(message) from exc
+
+
+def _redact_upload_url(message: str, upload_url: str) -> str:
+    """Strip ``upload_url`` (a preauthenticated, bearer-token-equivalent
+    Graph upload-session URL) out of ``message`` as thoroughly as possible.
+
+    A plain ``message.replace(upload_url, ...)`` only catches the case
+    where the exception's own message happens to contain the exact,
+    complete "scheme://host/path?query" string. Verified directly against
+    a real failed request: urllib3's own ConnectionError/SSLError messages
+    never do that -- they report the host separately (inside
+    "HTTPSConnectionPool(host=..., port=...)") from the path+query (inside
+    "Max retries exceeded with url: /path?query"), so the whole-string
+    match silently misses them and the query string -- which carries the
+    session's actual bearer-equivalent token -- passes through unredacted.
+    Redacting the host and the path+query independently (in addition to
+    the full URL, for whichever call site does happen to embed it whole)
+    closes that gap without depending on any particular exception's message
+    shape.
+    """
+    redacted = message.replace(upload_url, "<redacted-upload-session-url>")
+    parsed = urlsplit(upload_url)
+    path_and_query = parsed.path + (f"?{parsed.query}" if parsed.query else "")
+    if path_and_query:
+        redacted = redacted.replace(path_and_query, "<redacted-upload-session-url>")
+    if parsed.query:
+        redacted = redacted.replace(parsed.query, "<redacted-upload-session-token>")
+    if parsed.netloc:
+        redacted = redacted.replace(parsed.netloc, "<redacted-upload-session-host>")
+    return redacted
 
 
 def _graph_request(
@@ -288,6 +353,30 @@ def _normalize_path(path: str | None) -> str | None:
     return value
 
 
+def _normalize_item_id(item_id: str) -> str:
+    """Validate an item_id used directly in a /me/drive/items/{id} request
+    URL (onedrive_get_item, onedrive_rename_item, onedrive_delete_item).
+
+    These never go through _normalize_path/_item_path -- they're opaque
+    Graph item identifiers, not Drive-relative paths -- but they're still
+    quoted with safe='' and spliced into the request URL the same way, so
+    the same collapsing behavior applies: quote() never percent-encodes a
+    bare "." or ".." (they're in urllib's own "always safe" unreserved
+    set), so an item_id of exactly "." or ".." reaches requests as a
+    literal dot-segment and collapses "/me/drive/items/.." down to
+    "/me/drive/" -- a different Graph endpoint under the same OAuth token.
+    quote(..., safe='') does escape "/", so a multi-segment "../.." can't
+    reach this path, but the single-segment case still could without this
+    check.
+    """
+    value = item_id.strip()
+    if not value:
+        raise ValueError("item_id is required")
+    if value in (".", ".."):
+        raise ValueError(f"item_id must not be '.' or '..': {item_id!r}")
+    return value
+
+
 def _item_path(base_path: str | None) -> str:
     normalized = _normalize_path(base_path)
     if not normalized:
@@ -319,7 +408,11 @@ def _decode_bytes(content: bytes) -> tuple[str | None, str | None]:
 def _name_looks_binary(name: str) -> bool:
     """Whether ``name``'s extension names an unambiguously binary format.
 
-    A resolvable mime type (override, ambiguous-extension override, or
+    _AMBIGUOUS_TEXT_EXTENSIONS is checked first and short-circuits straight
+    to "not binary" -- these extensions' real mimetypes collide with an
+    unrelated binary format (see that set's own docstring), which only
+    matters for this text/binary guard, not for _guess_mime_type's real
+    Content-Type resolution. Otherwise, a resolvable mime type (override or
     stdlib) is binary only if _is_binary_mime_type says so -- anything
     else, including a mime type nobody anticipated, defaults to "not
     binary" (see that function's own docstring for why a positive binary
@@ -327,10 +420,13 @@ def _name_looks_binary(name: str) -> bool:
     to the small hand-maintained set of formats mimetypes has no opinion
     on at all (_KNOWN_BINARY_EXTENSIONS_WITHOUT_MIME_GUESS above).
     """
+    suffix = Path(name).suffix.lower()
+    if suffix in _AMBIGUOUS_TEXT_EXTENSIONS:
+        return False
     guessed = _guess_mime_type(name)
     if guessed is not None:
         return _is_binary_mime_type(guessed)
-    return Path(name).suffix.lower() in _KNOWN_BINARY_EXTENSIONS_WITHOUT_MIME_GUESS
+    return suffix in _KNOWN_BINARY_EXTENSIONS_WITHOUT_MIME_GUESS
 
 
 def _allowed_upload_dirs() -> list[Path]:
@@ -506,10 +602,9 @@ def _upload_large_file_content(
             # PUT's own status check) would leave those other paths
             # unsanitized, so this wraps every exception the chunk loop
             # can raise instead of trusting each one individually to avoid
-            # the URL.
-            redacted_message = str(exc).replace(
-                upload_url, "<redacted-upload-session-url>"
-            )
+            # the URL. See _redact_upload_url's own docstring for why a
+            # bare whole-string replace isn't enough on its own.
+            redacted_message = _redact_upload_url(str(exc), upload_url)
             # Best-effort: free the abandoned session immediately instead
             # of leaving it for Graph's own ~15-minute expiry. A failure
             # here must never mask the real error above, and uses the
@@ -521,9 +616,7 @@ def _upload_large_file_content(
                     upload_url, timeout=DEFAULT_TIMEOUT_SECONDS
                 )
             except Exception as cleanup_exc:
-                cleanup_message = str(cleanup_exc).replace(
-                    upload_url, "<redacted-upload-session-url>"
-                )
+                cleanup_message = _redact_upload_url(str(cleanup_exc), upload_url)
                 logger.warning(
                     "Failed to cancel abandoned OneDrive upload session: %s",
                     cleanup_message,
@@ -609,7 +702,7 @@ def onedrive_get_item(path: str | None = None, item_id: str | None = None) -> st
         if item_id:
             result = _graph_request(
                 "GET",
-                f"/me/drive/items/{quote(item_id, safe='')}",
+                f"/me/drive/items/{quote(_normalize_item_id(item_id), safe='')}",
             )
         elif path:
             result = _graph_request("GET", _item_path(path))
@@ -745,7 +838,7 @@ def onedrive_upload_file(
             if file_size > _MAX_UPLOAD_BYTES:
                 raise ValueError(
                     f"File is {file_size} bytes, over the "
-                    f"{_MAX_UPLOAD_BYTES // (1024 * 1024)}MB limit for "
+                    f"{_MAX_UPLOAD_BYTES // (1024 * 1024 * 1024)}GB limit for "
                     "onedrive_upload_file"
                 )
 
@@ -804,7 +897,7 @@ def onedrive_rename_item(item_id: str, new_name: str) -> str:
             raise ValueError("new_name is required")
         result = _graph_request(
             "PATCH",
-            f"/me/drive/items/{quote(item_id, safe='')}",
+            f"/me/drive/items/{quote(_normalize_item_id(item_id), safe='')}",
             body={"name": new_name},
         )
         return _success(item=result)
@@ -817,7 +910,10 @@ def onedrive_rename_item(item_id: str, new_name: str) -> str:
 def onedrive_delete_item(item_id: str) -> str:
     """Delete a OneDrive file or folder by item_id."""
     try:
-        _graph_request("DELETE", f"/me/drive/items/{quote(item_id, safe='')}")
+        _graph_request(
+            "DELETE",
+            f"/me/drive/items/{quote(_normalize_item_id(item_id), safe='')}",
+        )
         return _success(message="Item deleted successfully")
     except Exception as e:
         logger.error("Error deleting OneDrive item %s: %s", item_id, e)

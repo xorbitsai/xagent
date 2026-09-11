@@ -10,9 +10,29 @@ import logging
 import re
 from typing import Any, Optional
 
-from ..core.exceptions import ConfigurationError
+from ..core.exceptions import ConfigurationError, DocumentValidationError
 
 logger = logging.getLogger(__name__)
+
+
+def validate_search_common_inputs(
+    collection: str,
+    model_tag: str,
+    top_k: int,
+) -> None:
+    """Validate inputs shared by all public search modes."""
+    if not collection or not isinstance(collection, str):
+        raise DocumentValidationError("Collection must be a non-empty string")
+    if not model_tag or not isinstance(model_tag, str):
+        raise DocumentValidationError("model_tag must be a non-empty string")
+    if top_k <= 0 or top_k > 1000:
+        raise DocumentValidationError("top_k must be between 1 and 1000")
+
+
+def validate_search_query_text(query_text: str) -> None:
+    """Validate the text query used by sparse and hybrid search."""
+    if not query_text or not isinstance(query_text, str):
+        raise DocumentValidationError("query_text must be a non-empty string")
 
 
 def validate_and_convert_user_id(user_id: Any) -> Optional[int]:

@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pandas as pd
 import pytest
 
+from xagent.core.tools.core.RAG_tools.core.exceptions import DocumentValidationError
 from xagent.core.tools.core.RAG_tools.core.schemas import (
     DenseSearchResponse,
     IndexStatus,
@@ -19,6 +20,10 @@ from xagent.core.tools.core.RAG_tools.core.schemas import (
 )
 from xagent.core.tools.core.RAG_tools.kb.collection_handle import (
     LanceDBCollectionHandle,
+)
+from xagent.core.tools.core.RAG_tools.storage.contracts import (
+    FilterCondition,
+    FilterOperator,
 )
 
 
@@ -134,6 +139,50 @@ async def test_search_dense_async_success():
     assert kwargs["user_id"] == 7 and kwargs["is_admin"] is False
 
 
+@pytest.mark.parametrize(
+    "custom_filter",
+    [
+        FilterCondition("vector_dimension", FilterOperator.GTE, 2),
+        (
+            FilterCondition("vector_dimension", FilterOperator.GTE, 2),
+            FilterCondition("model", FilterOperator.EQ, "model-x"),
+        ),
+        [
+            FilterCondition("doc_id", FilterOperator.EQ, "d1"),
+            FilterCondition("doc_id", FilterOperator.EQ, "d2"),
+        ],
+    ],
+)
+def test_search_dense_preserves_prebuilt_filter_expression(custom_filter):
+    handle, _, store, _ = _make_handle()
+    store.create_index.return_value = _index_result()
+    store.search_vectors_by_model.return_value = []
+
+    handle.search_dense("model-x", [0.1], filters=custom_filter)
+
+    filter_expr = store.search_vectors_by_model.call_args.kwargs["filters"]
+    assert isinstance(filter_expr, tuple)
+    assert filter_expr[1] == custom_filter
+
+
+@pytest.mark.asyncio
+async def test_search_dense_async_preserves_or_filter_expression():
+    handle, _, store, _ = _make_handle()
+    store.create_index.return_value = _index_result()
+    store.search_vectors_by_model_async = AsyncMock(return_value=[])
+    custom_filter = [
+        FilterCondition("doc_id", FilterOperator.EQ, "d1"),
+        FilterCondition("doc_id", FilterOperator.EQ, "d2"),
+    ]
+
+    await handle.search_dense_async("model-x", [0.1], filters=custom_filter)
+
+    filter_expr = store.search_vectors_by_model_async.call_args.kwargs["filters"]
+    assert isinstance(filter_expr, tuple)
+    assert isinstance(filter_expr[1], list)
+    assert filter_expr[1] == custom_filter
+
+
 # ---------------------------------------------------------------------------
 # Sparse search tests
 # ---------------------------------------------------------------------------
@@ -174,6 +223,58 @@ def test_search_sparse_fts_hit_scores_normalized():
     assert resp.status == "success"
     assert resp.fts_enabled is True
     assert resp.results[0].score == pytest.approx(0.75)  # 3/(1+3)
+
+
+@pytest.mark.parametrize(
+    ("filters", "expected_doc_ids"),
+    [
+        ({"vector_dimension": {"operator": "eq", "value": 2}}, ["d2"]),
+        ({"vector_dimension": {"operator": "ne", "value": 2}}, ["d1", "d3"]),
+        ({"vector_dimension": {"operator": "gt", "value": 1}}, ["d2", "d3"]),
+        ({"vector_dimension": {"operator": "gte", "value": 2}}, ["d2", "d3"]),
+        ({"vector_dimension": {"operator": "lt", "value": 2}}, ["d1"]),
+        ({"vector_dimension": {"operator": "lte", "value": 2}}, ["d1", "d2"]),
+        ({"doc_id": {"operator": "in", "value": ["d1", "d3"]}}, ["d1", "d3"]),
+    ],
+)
+def test_substring_fallback_applies_legacy_operators(
+    filters: dict, expected_doc_ids: list[str]
+):
+    handle, _, store, _ = _make_handle()
+    table = MagicMock()
+    store.open_embeddings_table.return_value = (table, "embeddings_model-x")
+    store.create_index.return_value = _index_result()
+    store.build_filter_expression.return_value = "filter"
+    search_query = MagicMock()
+    table.search.return_value.limit.return_value = search_query
+    search_query.where.return_value = search_query
+    search_query.to_pandas.return_value = pd.DataFrame()
+    batch = MagicMock()
+    batch.to_pandas.return_value = pd.DataFrame(
+        {
+            "collection": ["col1", "col1", "col1"],
+            "doc_id": ["d1", "d2", "d3"],
+            "chunk_id": ["c1", "c2", "c3"],
+            "text": ["needle", "needle", "needle"],
+            "parse_hash": ["h1", "h2", "h3"],
+            "created_at": ["2026", "2026", "2026"],
+            "metadata": [None, None, None],
+            "vector_dimension": [1, 2, 3],
+        }
+    )
+    table.to_batches.return_value = [batch]
+
+    response = handle.search_sparse(
+        "model-x",
+        "needle",
+        top_k=5,
+        filters=filters,
+    )
+
+    assert response.status == "success"
+    assert [result.doc_id for result in response.results] == expected_doc_ids
+    requested_columns = table.to_batches.call_args.kwargs["columns"]
+    assert "page_number" not in requested_columns
 
 
 # ---------------------------------------------------------------------------
@@ -356,6 +457,14 @@ async def test_search_hybrid_async_capability_unsupported():
 
 
 @pytest.mark.asyncio
+async def test_search_hybrid_async_validates_inputs_before_fan_out():
+    handle, _, _, _ = _make_handle()
+
+    with pytest.raises(DocumentValidationError):
+        await handle.search_hybrid_async("model-x", "", [0.1], top_k=5)
+
+
+@pytest.mark.asyncio
 async def test_search_hybrid_async_fetches_double_top_k_and_fuses(monkeypatch):
     from xagent.core.tools.core.RAG_tools.core.schemas import (
         DenseSearchResponse,
@@ -438,25 +547,6 @@ def test_all_modes_degrade_when_search_unsupported(call):
     resp = call(handle)
     assert resp.status == "failed"
     assert any(w.code == "SEARCH_NOT_SUPPORTED" for w in resp.warnings)
-
-
-# ---------------------------------------------------------------------------
-# Rollback-scope filter test
-# ---------------------------------------------------------------------------
-
-
-def test_dense_passes_collection_and_user_scope_to_store():
-    # Rollback-incomplete remnants must still be filtered: assert the store call
-    # always carries the collection filter + user scope so a stray row in another
-    # collection / another user cannot leak.
-    handle, ctx, store, _ = _make_handle()
-    store.create_index.return_value = _index_result()
-    store.search_vectors_by_model.return_value = []
-    handle.search_dense("m", [0.1], top_k=3, user_id=42, is_admin=False)
-    kwargs = store.search_vectors_by_model.call_args.kwargs
-    assert kwargs["user_id"] == 42 and kwargs["is_admin"] is False
-    # collection filter present in the FilterExpression
-    assert kwargs["filters"] is not None
 
 
 @pytest.mark.asyncio
@@ -619,7 +709,7 @@ def test_dense_invalid_filter_returns_failed_response():
         "model-a",
         [0.5],
         top_k=5,
-        filters={"page_number": {"operator": "between", "value": [1, 3]}},
+        filters={"vector_dimension": {"operator": "between", "value": [1, 3]}},
         user_id=7,
         is_admin=False,
     )

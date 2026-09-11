@@ -12,6 +12,11 @@ from ..core.schemas import (
     HybridSearchResponse,
     SearchResult,
 )
+from ..utils.validation_utils import (
+    validate_search_common_inputs,
+    validate_search_query_text,
+)
+from ..vector_storage.vector_manager import validate_query_vector
 
 if TYPE_CHECKING:
     from ..kb import KBLegacyStepCompatibilityFacade
@@ -187,7 +192,15 @@ def search_hybrid(
     user_id: Optional[int] = None,
     is_admin: bool = False,
 ) -> HybridSearchResponse:
-    """Performs hybrid search, combining dense and sparse retrieval."""
+    """Perform hybrid search, combining dense and sparse retrieval.
+
+    Raises:
+        DocumentValidationError: If collection, model_tag, query_text, or top_k is invalid.
+        VectorValidationError: If query-vector validation fails.
+    """
+    validate_search_common_inputs(collection, model_tag, top_k)
+    validate_search_query_text(query_text)
+    validate_query_vector(query_vector)
     return _get_legacy_step_compatibility_facade().search_hybrid(
         collection=collection,
         model_tag=model_tag,

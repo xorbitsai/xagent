@@ -74,6 +74,7 @@ from ..retrieval.search_hybrid import _linear_fusion, _rrf_fusion
 from ..storage.contracts import (
     FilterCondition,
     FilterExpression,
+    FilterInput,
     FilterOperator,
     IngestionStatusStore,
     MainPointerStore,
@@ -85,6 +86,10 @@ from ..utils.filter_utils import parse_legacy_filters, validate_filter_depth
 from ..utils.hash_utils import compute_chunk_hash
 from ..utils.metadata_utils import deserialize_metadata, serialize_metadata
 from ..utils.string_utils import generate_deterministic_doc_id
+from ..utils.validation_utils import (
+    validate_search_common_inputs,
+    validate_search_query_text,
+)
 from .models import KBBackendCapabilities, KBCollectionContext, KBStorageBackend
 from .version_compatibility import (
     KBMainPointerSnapshot,
@@ -163,6 +168,89 @@ def validate_query_vector_format(query_vector: list[float]) -> None:
             raise VectorValidationError(
                 "query_vector contains invalid values (NaN or infinity)"
             )
+
+
+def _collect_filter_fields(expr: FilterExpression | None) -> set[str]:
+    """Collect fields referenced anywhere in a recursive filter expression."""
+    if expr is None:
+        return set()
+    if isinstance(expr, FilterCondition):
+        return {expr.field}
+    if isinstance(expr, (tuple, list)):
+        return set().union(*(_collect_filter_fields(item) for item in expr))
+    raise TypeError(f"Unsupported filter expression: {type(expr).__name__}")
+
+
+def _build_collection_search_filter(
+    collection: str,
+    filters: FilterInput | None,
+) -> FilterExpression | None:
+    """Combine the collection guard with a legacy or prebuilt filter."""
+    collection_filter = (
+        FilterCondition(
+            field="collection",
+            operator=FilterOperator.EQ,
+            value=collection,
+        )
+        if collection
+        else None
+    )
+    user_filter = (
+        parse_legacy_filters(filters) if isinstance(filters, dict) else filters
+    )
+    if collection_filter is None:
+        combined = user_filter
+    elif user_filter is None:
+        combined = collection_filter
+    else:
+        combined = (collection_filter, user_filter)
+    validate_filter_depth(combined)
+    return combined
+
+
+def _evaluate_filter_expression(
+    batch_df: pd.DataFrame,
+    expr: FilterExpression,
+) -> pd.Series[bool]:
+    """Evaluate a backend-agnostic filter expression against one pandas batch."""
+    if isinstance(expr, tuple):
+        mask = pd.Series(True, index=batch_df.index, dtype=bool)
+        for item in expr:
+            mask &= _evaluate_filter_expression(batch_df, item)
+        return mask
+    if isinstance(expr, list):
+        mask = pd.Series(False, index=batch_df.index, dtype=bool)
+        for item in expr:
+            mask |= _evaluate_filter_expression(batch_df, item)
+        return mask
+    if not isinstance(expr, FilterCondition):
+        raise TypeError(f"Unsupported filter expression: {type(expr).__name__}")
+    if expr.field not in batch_df.columns:
+        return pd.Series(False, index=batch_df.index, dtype=bool)
+
+    series = batch_df[expr.field]
+    operator = expr.operator
+    non_null = series.notna()
+    if operator == FilterOperator.EQ:
+        if isinstance(expr.value, (list, tuple, set)):
+            result = series.isin(list(expr.value))
+        else:
+            result = series.eq(expr.value)
+    elif operator == FilterOperator.NE:
+        result = series.ne(expr.value)
+    elif operator == FilterOperator.GT:
+        result = series.gt(expr.value)
+    elif operator == FilterOperator.GTE:
+        result = series.ge(expr.value)
+    elif operator == FilterOperator.LT:
+        result = series.lt(expr.value)
+    elif operator == FilterOperator.LTE:
+        result = series.le(expr.value)
+    elif operator == FilterOperator.IN:
+        result = series.isin(expr.value)
+    else:
+        raise ValueError(f"Unsupported filter operator: {operator}")
+    return (non_null & result).fillna(False).astype(bool)
 
 
 class KBHandleProvider:
@@ -471,7 +559,7 @@ class KBCollectionHandle(ABC):
         query_vector: list[float],
         *,
         top_k: int = 10,
-        filters: dict[str, Any] | None = None,
+        filters: FilterInput | None = None,
         readonly: bool = False,
         nprobes: int | None = None,
         refine_factor: int | None = None,
@@ -487,7 +575,7 @@ class KBCollectionHandle(ABC):
         query_vector: list[float],
         *,
         top_k: int = 10,
-        filters: dict[str, Any] | None = None,
+        filters: FilterInput | None = None,
         readonly: bool = False,
         nprobes: int | None = None,
         refine_factor: int | None = None,
@@ -1985,7 +2073,7 @@ class LanceDBCollectionHandle(KBCollectionHandle):
         query_vector: list[float],
         *,
         top_k: int,
-        filters: dict | None,
+        filters: FilterInput | None,
         readonly: bool,
         nprobes: int | None,
         refine_factor: int | None,
@@ -1994,37 +2082,10 @@ class LanceDBCollectionHandle(KBCollectionHandle):
     ) -> tuple[list[SearchResult], str, str | None]:
         try:
             vector_store = self.vector_index_store
+            filter_expr = _build_collection_search_filter(collection, filters)
             index_result_obj = vector_store.create_index(model_tag, readonly)
             index_status = index_result_obj.status
             index_advice = index_result_obj.advice
-            filter_expr: FilterExpression | None = None
-            if collection or filters:
-                conditions: list[FilterExpression] = []
-                if collection:
-                    conditions.append(
-                        FilterCondition(
-                            field="collection",
-                            operator=FilterOperator.EQ,
-                            value=collection,
-                        )
-                    )
-                if filters:
-                    parsed = (
-                        parse_legacy_filters(filters)
-                        if isinstance(filters, dict)
-                        else None
-                    )
-                    if parsed is not None:
-                        if isinstance(parsed, tuple):
-                            conditions.extend(parsed)
-                        else:
-                            conditions.append(parsed)
-                if len(conditions) == 1:
-                    filter_expr = conditions[0]
-                elif len(conditions) > 1:
-                    filter_expr = tuple(conditions)
-            if filter_expr is not None:
-                validate_filter_depth(filter_expr)
             raw_results = vector_store.search_vectors_by_model(
                 model_tag=model_tag,
                 query_vector=query_vector,
@@ -2064,7 +2125,7 @@ class LanceDBCollectionHandle(KBCollectionHandle):
         query_vector: list[float],
         *,
         top_k: int,
-        filters: dict | None,
+        filters: FilterInput | None,
         readonly: bool,
         nprobes: int | None,
         refine_factor: int | None,
@@ -2073,37 +2134,10 @@ class LanceDBCollectionHandle(KBCollectionHandle):
     ) -> tuple[list[SearchResult], str, str | None]:
         try:
             vector_store = self.vector_index_store
+            filter_expr = _build_collection_search_filter(collection, filters)
             index_result_obj = vector_store.create_index(model_tag, readonly)
             index_status = index_result_obj.status
             index_advice = index_result_obj.advice
-            filter_expr: FilterExpression | None = None
-            if collection or filters:
-                conditions: list[FilterExpression] = []
-                if collection:
-                    conditions.append(
-                        FilterCondition(
-                            field="collection",
-                            operator=FilterOperator.EQ,
-                            value=collection,
-                        )
-                    )
-                if filters:
-                    parsed = (
-                        parse_legacy_filters(filters)
-                        if isinstance(filters, dict)
-                        else None
-                    )
-                    if parsed is not None:
-                        if isinstance(parsed, tuple):
-                            conditions.extend(parsed)
-                        else:
-                            conditions.append(parsed)
-                if len(conditions) == 1:
-                    filter_expr = conditions[0]
-                elif len(conditions) > 1:
-                    filter_expr = tuple(conditions)
-            if filter_expr is not None:
-                validate_filter_depth(filter_expr)
             raw_results = await vector_store.search_vectors_by_model_async(
                 model_tag=model_tag,
                 query_vector=query_vector,
@@ -2142,7 +2176,7 @@ class LanceDBCollectionHandle(KBCollectionHandle):
         query_vector: list[float],
         *,
         top_k: int = 10,
-        filters: dict | None = None,
+        filters: FilterInput | None = None,
         readonly: bool = False,
         nprobes: int | None = None,
         refine_factor: int | None = None,
@@ -2210,7 +2244,7 @@ class LanceDBCollectionHandle(KBCollectionHandle):
         query_vector: list[float],
         *,
         top_k: int = 10,
-        filters: dict | None = None,
+        filters: FilterInput | None = None,
         readonly: bool = False,
         nprobes: int | None = None,
         refine_factor: int | None = None,
@@ -2314,11 +2348,10 @@ class LanceDBCollectionHandle(KBCollectionHandle):
         self,
         *,
         table: Any,
-        collection: str,
         query_text: str,
         model_tag: str,
         top_k: int,
-        filters: Optional[Dict[str, Any]],
+        filter_expr: FilterExpression | None,
         current_warnings: List[SearchWarning],
         batch_size: int = 2048,
     ) -> List[SearchResult]:
@@ -2333,8 +2366,7 @@ class LanceDBCollectionHandle(KBCollectionHandle):
             "created_at",
             "metadata",
         }
-        if filters and isinstance(filters, dict):
-            desired_columns.update(filters.keys())
+        desired_columns.update(_collect_filter_fields(filter_expr))
 
         results: List[SearchResult] = []
 
@@ -2358,15 +2390,11 @@ class LanceDBCollectionHandle(KBCollectionHandle):
         for batch in batch_iter:
             batch_df = batch.to_pandas()
 
-            mask = batch_df["collection"] == collection
-            if filters and isinstance(filters, dict):
-                for key, value in filters.items():
-                    if key not in batch_df.columns:
-                        continue
-                    if isinstance(value, (list, tuple, set)):
-                        mask &= batch_df[key].isin(list(value))
-                    else:
-                        mask &= batch_df[key] == value
+            mask = (
+                _evaluate_filter_expression(batch_df, filter_expr)
+                if filter_expr is not None
+                else pd.Series(True, index=batch_df.index, dtype=bool)
+            )
 
             if not mask.any():
                 continue
@@ -2434,7 +2462,6 @@ class LanceDBCollectionHandle(KBCollectionHandle):
 
         vector_store = self.vector_index_store
         results: List[SearchResult] = []
-
         # Build query filters
         query_filters: Dict[str, Any] = {"collection": collection}
         if filters and isinstance(filters, dict):
@@ -2555,6 +2582,7 @@ class LanceDBCollectionHandle(KBCollectionHandle):
         table = None
         try:
             vector_store = self.vector_index_store
+            filter_expr = _build_collection_search_filter(collection, filters)
 
             # Open embeddings table with legacy fallback (handled by abstraction layer)
             # open_embeddings_table will handle adding the "embeddings_" prefix
@@ -2577,54 +2605,6 @@ class LanceDBCollectionHandle(KBCollectionHandle):
                 )
 
             search_query = table.search(query_text, query_type="fts").limit(top_k)
-
-            # Convert legacy dict format to FilterExpression if needed
-            filter_expr: Optional[FilterExpression] = None
-            if collection or filters:
-                # Build filter conditions
-                conditions: List[FilterExpression] = []
-
-                # Add collection filter
-                if collection:
-                    conditions.append(
-                        FilterCondition(
-                            field="collection",
-                            operator=FilterOperator.EQ,
-                            value=collection,
-                        )
-                    )
-
-                # Add custom filters
-                if filters:
-                    if isinstance(filters, dict):
-                        # Legacy format: use parser
-                        parsed_filters = parse_legacy_filters(filters)
-                        # parsed_filters can be FilterCondition or tuple (AND combination)
-                        if parsed_filters is not None:
-                            if isinstance(parsed_filters, tuple):
-                                # Type narrowing: tuple of FilterConditions
-                                conditions.extend(parsed_filters)
-                            else:
-                                # Type narrowing: single FilterCondition
-                                conditions.append(parsed_filters)
-                    elif isinstance(filters, (tuple, list)):
-                        # Already FilterExpression
-                        conditions.extend(
-                            filters if isinstance(filters, tuple) else list(filters)
-                        )
-                    else:
-                        # Single FilterCondition
-                        conditions.append(filters)
-
-                # Combine conditions with AND
-                if len(conditions) == 1:
-                    filter_expr = conditions[0]
-                elif len(conditions) > 1:
-                    filter_expr = tuple(conditions)
-
-            # Validate filter expression depth to prevent DoS
-            if filter_expr is not None:
-                validate_filter_depth(filter_expr)
 
             # Use abstract filter builder to get backend-specific syntax
             if filter_expr:
@@ -2679,11 +2659,10 @@ class LanceDBCollectionHandle(KBCollectionHandle):
             )
             fallback_results = self._substring_fallback(
                 table=table,
-                collection=collection,
                 query_text=query_text,
                 model_tag=model_tag,
                 top_k=top_k,
-                filters=filters,
+                filter_expr=filter_expr,
                 current_warnings=current_warnings,
             )
 
@@ -2934,6 +2913,9 @@ class LanceDBCollectionHandle(KBCollectionHandle):
         is_admin: bool = False,
     ) -> HybridSearchResponse:
         """Execute hybrid (dense + sparse) search with fusion for this collection."""
+        validate_search_common_inputs(self.context.collection, model_tag, top_k)
+        validate_search_query_text(query_text)
+        validate_query_vector_format(query_vector)
         if not self.capabilities.supports_search:
             return self._hybrid_unsupported(model_tag, fusion_config)
 
@@ -3091,6 +3073,9 @@ class LanceDBCollectionHandle(KBCollectionHandle):
         is_admin: bool = False,
     ) -> HybridSearchResponse:
         """Async hybrid (dense + sparse) search with fusion for this collection."""
+        validate_search_common_inputs(self.context.collection, model_tag, top_k)
+        validate_search_query_text(query_text)
+        validate_query_vector_format(query_vector)
         if not self.capabilities.supports_search:
             return self._hybrid_unsupported(model_tag, fusion_config)
 

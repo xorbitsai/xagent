@@ -11,12 +11,20 @@ from xagent.core.memory.base import MemoryStore
 from xagent.core.memory.core import MemoryNote
 
 from ..auth_dependencies import get_current_user
-from ..dynamic_memory_store import get_memory_store_manager
+from ..dynamic_memory_store import (
+    MEMORY_STORE_RESTART_REQUIRED_DETAIL,
+    MemoryStoreRestartRequired,
+    get_memory_store_manager,
+)
 from ..models.user import User
 from ..user_isolated_memory import UserContext
 
 logger = logging.getLogger(__name__)
 MEMORY_READ_UNAVAILABLE_DETAIL = "Memory storage is temporarily unavailable."
+
+
+def _restart_required_http_error() -> HTTPException:
+    return HTTPException(status_code=503, detail=MEMORY_STORE_RESTART_REQUIRED_DETAIL)
 
 
 class MemoryListRequest(BaseModel):
@@ -153,6 +161,8 @@ class MemoryManagementRouter:
                             )
                         else:
                             memories = self.memory_store.list_all(filters)
+                    except MemoryStoreRestartRequired:
+                        raise _restart_required_http_error() from None
                     except Exception:
                         logger.exception("Memory list read failed")
                         raise HTTPException(
@@ -186,6 +196,8 @@ class MemoryManagementRouter:
                     )
             except HTTPException:
                 raise
+            except MemoryStoreRestartRequired:
+                raise _restart_required_http_error() from None
             except Exception:
                 logger.exception("Failed to build memory list response")
                 raise HTTPException(
@@ -211,6 +223,8 @@ class MemoryManagementRouter:
                         )
             except HTTPException:
                 raise
+            except MemoryStoreRestartRequired:
+                raise _restart_required_http_error() from None
             except Exception as e:
                 raise HTTPException(
                     status_code=500, detail=f"Failed to delete memory: {str(e)}"
@@ -276,6 +290,8 @@ class MemoryManagementRouter:
 
             except HTTPException:
                 raise
+            except MemoryStoreRestartRequired:
+                raise _restart_required_http_error() from None
             except Exception as e:
                 raise HTTPException(
                     status_code=500, detail=f"Failed to update memory: {str(e)}"
@@ -290,6 +306,8 @@ class MemoryManagementRouter:
                 with UserContext(int(user.id)):
                     stats = self.memory_store.get_stats()
                     return MemoryStatsResponse(**stats)
+            except MemoryStoreRestartRequired:
+                raise _restart_required_http_error() from None
             except Exception as e:
                 raise HTTPException(
                     status_code=500, detail=f"Failed to get memory stats: {str(e)}"
@@ -327,6 +345,8 @@ class MemoryManagementRouter:
                             detail=response.error or "Failed to create memory",
                         )
 
+            except MemoryStoreRestartRequired:
+                raise _restart_required_http_error() from None
             except Exception as e:
                 raise HTTPException(
                     status_code=500, detail=f"Failed to create memory: {str(e)}"
@@ -361,6 +381,8 @@ class MemoryManagementRouter:
                         )
             except HTTPException:
                 raise
+            except MemoryStoreRestartRequired:
+                raise _restart_required_http_error() from None
             except Exception as e:
                 raise HTTPException(
                     status_code=500, detail=f"Failed to get memory: {str(e)}"

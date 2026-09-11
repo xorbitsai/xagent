@@ -10,6 +10,10 @@ from .openai import OpenAIEmbedding
 from .xinference import XinferenceEmbedding
 
 
+class UnsupportedEmbeddingProviderError(ValueError):
+    """Raised when no embedding adapter exists for the configured provider."""
+
+
 def retry_on(e: Exception) -> bool:
     ERRORS = requests.exceptions.Timeout
 
@@ -69,7 +73,7 @@ class EmbeddingModelAdapter(BaseEmbedding):
                 dimension=self.model_config.dimension,
             )
         else:
-            raise ValueError(
+            raise UnsupportedEmbeddingProviderError(
                 f"Unsupported model provider: {self.model_config.model_provider}"
             )
 

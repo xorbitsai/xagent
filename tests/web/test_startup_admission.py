@@ -19,10 +19,30 @@ from xagent.web.models.user import User
 from xagent.web.startup_admission import register_host_startup_admission
 
 
+def test_startup_memory_log_reports_admitted_text_only_capability(caplog) -> None:
+    with caplog.at_level("INFO"):
+        app_module._log_memory_store_info(
+            {
+                "is_lancedb": True,
+                "supports_vector_search": False,
+                "embedding_model_id": 7,
+                "similarity_threshold": 1.5,
+            }
+        )
+
+    assert "text-only search capabilities" in caplog.text
+    assert "with vector search capabilities" not in caplog.text
+
+
 def _patch_runtime_starts(
     monkeypatch: pytest.MonkeyPatch,
     events: list[str],
 ) -> None:
+    monkeypatch.setattr(
+        app_module,
+        "run_memory_compatibility_lifecycle",
+        lambda: events.append("memory lifecycle"),
+    )
     monkeypatch.setattr(
         app_module, "register_local_browser_runtime", lambda: events.append("runtime")
     )
@@ -61,6 +81,7 @@ async def test_no_host_admission_preserves_runtime_startup_order(
 
     assert events == [
         "database",
+        "memory lifecycle",
         "runtime",
         "task admission",
         "file sync",
@@ -95,8 +116,8 @@ async def test_host_admissions_run_after_database_and_before_runtime(
         "database",
         "first admission",
         "second admission",
+        "memory lifecycle",
         "runtime",
-        "task admission",
     ]
 
 
@@ -129,6 +150,27 @@ async def test_host_admission_stops_at_first_error_and_propagates_it(
 
     assert raised.value is rejection
     assert events == ["database", "first admission", "rejected admission"]
+
+
+@pytest.mark.asyncio
+async def test_memory_lifecycle_failure_prevents_runtime_ingress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    failure = OSError("memory I/O failed")
+    monkeypatch.setattr(app_module, "init_db", lambda: events.append("database"))
+    _patch_runtime_starts(monkeypatch, events)
+    monkeypatch.setattr(
+        app_module,
+        "run_memory_compatibility_lifecycle",
+        lambda: (_ for _ in ()).throw(failure),
+    )
+
+    with pytest.raises(OSError) as raised:
+        await app_module._initialize_database_and_admit_runtime(FastAPI())
+
+    assert raised.value is failure
+    assert events == ["database"]
 
 
 @pytest.mark.asyncio

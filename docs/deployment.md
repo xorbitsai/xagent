@@ -1,5 +1,45 @@
 # Deployment changes
 
+## 2026-09-10 — Persistent-memory compatibility admission
+
+Application startup now serializes LanceDB memory-table compatibility work
+across workers that use the same local database and table. The lock protects
+new-table creation, vectorless-table recreation, identity classification, and
+the post-create scope-maintenance marker. Workers that start later re-open the
+table after acquiring the lock and observe the first worker's completed upgrade.
+
+The lock coordinates only workers running this release. A rolling deployment
+with old writers is unsafe because an old process does not acquire the admission
+lock and can write while a vectorless table is being replaced. Before deploying
+this change, quiesce every old API, worker, and scheduler process that can write
+persistent memory. Start only new-version processes, wait for startup admission
+to complete, and then reopen memory-writing ingress. Use the same quiescence for
+rollback or offline remediation.
+
+The admitted store is a startup snapshot. Every shared-store acquisition checks
+the current authoritative administrator embedding default, model/provider/name,
+endpoint, dimension, instruction, retry policy, and credential fingerprint. A
+change after startup fails closed with a restart-required response; workers do
+not reload adapters online and never continue with the stale store. Quiesce all
+API, task worker, and scheduler memory writers, restart every worker, wait for
+startup admission on all of them, and only then reopen memory ingress. Credential
+material is represented in the fingerprint only by an irreversible SHA-256
+digest and is never included in errors or logs.
+
+If an identity-changing edit requires existing vectors to be repaired or
+re-embedded, keep all writers quiesced and perform that work offline before the
+coordinated restart. A missing eligible administrator default does not hide an
+existing table: startup admits a valid existing table as text-only storage. If
+legacy rows cannot be projected safely, startup preserves the previous manager
+state and fails with an offline-repair instruction instead of publishing a
+projection-dependent store or permitting request-time migration.
+
+Vector tables created before identity metadata was introduced remain vector
+enabled only for the exact historical DashScope identity (provider, model,
+endpoint, dimension, and instruction). A non-exact legacy table is admitted in
+text-only mode. Quiesce writers and re-embed or repair that table offline; do not
+change the configured endpoint or dimension merely to bypass the identity check.
+
 ## 2026-08-11 — New public-task File Operation isolation
 
 ### Deployment impact

@@ -11,6 +11,7 @@ import pyarrow as pa  # type: ignore
 
 from ..model.model import EmbeddingModelConfig
 from ..tools.core.RAG_tools.LanceDB.schema_manager import _safe_close_table
+from ..tools.core.RAG_tools.utils.lancedb_query_utils import list_table_names
 from .scope_columns import SCOPE_DIMS_COLUMN, USER_ID_COLUMN, derive_scope_columns
 
 VECTOR_IDENTITY_METADATA_KEY = b"xagent.memory.vector_space"
@@ -186,6 +187,18 @@ def inspect_lancedb_vector_compatibility(
         _safe_close_table(table)
 
 
+def open_lancedb_table_if_exists(connection: Any, table_name: str) -> Any | None:
+    """Return a fresh table handle, or ``None`` when listing proves it absent.
+
+    Listing and opening failures deliberately propagate. In particular, a
+    ``ValueError`` or ``OSError`` from ``open_table`` is not reclassified by
+    matching backend-specific error text.
+    """
+    if table_name not in list_table_names(connection):
+        return None
+    return connection.open_table(table_name)
+
+
 def _vector_capable_data(
     identity: EmbeddingIdentity, existing: Any | None = None
 ) -> _ArrowTable:
@@ -253,11 +266,7 @@ def create_or_recreate_vector_capable_table(
     existing = None
     table = None
     try:
-        try:
-            table = connection.open_table(table_name)
-        except ValueError as error:
-            if "was not found" not in str(error):
-                raise
+        table = open_lancedb_table_if_exists(connection, table_name)
         if table is not None:
             if "vector" in table.schema.names:
                 return classify_vector_compatibility(table.schema, identity)

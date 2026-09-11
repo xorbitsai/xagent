@@ -380,10 +380,10 @@ async def resolve_agent_service_memory_policy_async(
 ) -> AgentServiceMemoryPolicy:
     """Resolve runtime memory without blocking the asyncio event loop.
 
-    ``get_memory_store`` refreshes its embedding-model configuration through
-    synchronous SQLAlchemy queries. Task setup supplies detached task/config
-    data here, while the worker owns the short database Session used by the
-    dynamic store manager.
+    The shared store is admitted and published during startup, so request-time
+    acquisition does not refresh its embedding-model configuration. Keep this
+    worker boundary because trusted host policy resolvers are synchronous
+    extension points and may perform blocking work.
     """
 
     return await run_db_io_cancellation_safe(

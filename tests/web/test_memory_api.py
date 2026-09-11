@@ -16,6 +16,10 @@ from xagent.core.memory.core import MemoryNote
 from xagent.web.api.auth import auth_router, hash_password
 from xagent.web.api.memory import MemoryManagementRouter
 from xagent.web.auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
+from xagent.web.dynamic_memory_store import (
+    MEMORY_STORE_RESTART_REQUIRED_DETAIL,
+    MemoryStoreRestartRequired,
+)
 from xagent.web.models.database import Base, get_db
 from xagent.web.models.user import User
 
@@ -308,6 +312,22 @@ class TestMemoryListEndpoint:
         assert response.status_code == 503
         assert response.json()["detail"] == "Memory storage is temporarily unavailable."
         assert "internal-host" not in response.text
+
+    def test_restart_required_is_exposed_as_explicit_unavailable_contract(
+        self, auth_headers
+    ):
+        def unavailable_store():
+            raise MemoryStoreRestartRequired(MEMORY_STORE_RESTART_REQUIRED_DETAIL)
+
+        app = FastAPI()
+        app.include_router(auth_router)
+        app.include_router(MemoryManagementRouter(unavailable_store).get_router())
+        app.dependency_overrides[get_db] = override_get_db
+
+        response = TestClient(app).get("/api/memory/list", headers=auth_headers)
+
+        assert response.status_code == 503
+        assert response.json()["detail"] == MEMORY_STORE_RESTART_REQUIRED_DETAIL
 
 
 class TestMemoryGetEndpoint:

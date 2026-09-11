@@ -35,6 +35,8 @@ from .scope_columns import (
 
 logger = logging.getLogger(__name__)
 
+LEXICAL_SCAN_BATCH_SIZE = 256
+
 
 class LanceDBMemoryStore(MemoryStore):
     """LanceDB-based memory store implementation with vector search capabilities."""
@@ -47,6 +49,8 @@ class LanceDBMemoryStore(MemoryStore):
         collection_name: str = "memories",
         embedding_model: Optional[Union[BaseEmbedding, EmbeddingModelConfig]] = None,
         similarity_threshold: float = 1.0,
+        initialize_schema: bool = True,
+        include_null_vector_fallback: bool = False,
         **embedding_kwargs: Any,
     ):
         """
@@ -57,6 +61,8 @@ class LanceDBMemoryStore(MemoryStore):
             collection_name: Collection name for storing memories
             embedding_model: Optional BaseEmbedding instance or EmbeddingModel config
             similarity_threshold: Cosine distance threshold for vector search (lower = more strict)
+            initialize_schema: Whether construction may create or migrate the table
+            include_null_vector_fallback: Whether ANN searches include text-only rows
             **embedding_kwargs: Additional arguments for embedding model
         """
         self._collection_name = collection_name
@@ -87,9 +93,13 @@ class LanceDBMemoryStore(MemoryStore):
                 f"Unsupported embedding model type: {type(embedding_model)}"
             )
         self._similarity_threshold = similarity_threshold
-        self._vector_store = LanceDBVectorStore(db_dir, collection_name)
+        self._include_null_vector_fallback = include_null_vector_fallback
+        self._vector_store = LanceDBVectorStore(
+            db_dir, collection_name, ensure_table=initialize_schema
+        )
         self._conn_manager = LanceDBConnectionManager()
-        self._ensure_table_schema()
+        if initialize_schema:
+            self._ensure_table_schema()
 
     def _ensure_table_schema(self) -> None:
         """Ensure the table has the correct schema for memory storage.
@@ -707,7 +717,7 @@ class LanceDBMemoryStore(MemoryStore):
             k=k,
             filters=filters,
             similarity_threshold=similarity_threshold,
-            include_null_vector_fallback=False,
+            include_null_vector_fallback=self._include_null_vector_fallback,
         )
 
     def search_with_null_vector_fallback(
@@ -730,34 +740,69 @@ class LanceDBMemoryStore(MemoryStore):
         self,
         table: Any,
         query: str,
-        filters: Optional[dict[str, Any]],
+        residual_filters: Optional[dict[str, Any]],
         *,
+        scope_where: str | None,
         null_vectors_only: bool,
+        candidate_limit: int,
+        excluded_ids: Optional[set[str]] = None,
+        batch_size: int = LEXICAL_SCAN_BATCH_SIZE,
     ) -> list[MemoryNote]:
-        scan = table.search()
+        """Stream all backend-eligible rows while retaining bounded global top-k."""
+        where_terms = [f"({scope_where})"] if scope_where else []
         if null_vectors_only:
-            scan = scan.where("vector IS NULL")
-        rows = scan.limit(None).to_arrow().to_pylist()
-        other_filters = self._flat_other_filters(filters)
+            where_terms.append("vector IS NULL")
+        batch_kwargs: dict[str, Any] = {
+            "columns": ["id", "text", "metadata"],
+            "batch_size": batch_size,
+        }
+        if where_terms:
+            batch_kwargs["filter"] = " AND ".join(where_terms)
+        other_filters = self._flat_other_filters(residual_filters)
         needle = query.casefold()
         ranked: list[tuple[tuple[int, int, str], MemoryNote]] = []
-        for row in rows:
-            text = row.get("text") or ""
-            folded = text.casefold()
-            if needle and needle not in folded:
-                continue
-            try:
-                note = self._dict_to_memory_note(row)
-            except Exception as row_error:
-                logger.warning("Skipping malformed lexical memory row: %s", row_error)
-                continue
-            if filters and not self._matches_filters(note, filters, other_filters):
-                continue
-            match_kind = (
-                0 if folded == needle else 1 if folded.startswith(needle) else 2
+        excluded = excluded_ids or set()
+        if hasattr(table, "to_batches"):
+            batches = table.to_batches(**batch_kwargs)
+        else:
+            # LanceDB 0.24-0.34 exposes streaming on the query builder rather
+            # than LanceTable. Keep the same backend filter and projection.
+            scan = table.search()
+            if where_terms:
+                scan = scan.where(batch_kwargs["filter"])
+            batches = scan.select(batch_kwargs["columns"]).to_batches(
+                batch_size=batch_size
             )
-            ranked.append(((match_kind, -folded.count(needle), str(note.id)), note))
-        ranked.sort(key=lambda item: item[0])
+        for batch in batches:
+            for row in batch.to_pylist():
+                text = row.get("text") or ""
+                folded = text.casefold()
+                if needle and needle not in folded:
+                    continue
+                try:
+                    note = self._dict_to_memory_note(row)
+                except Exception as row_error:
+                    logger.warning(
+                        "Skipping malformed lexical memory row: %s", row_error
+                    )
+                    continue
+                identity = str(note.id)
+                if identity in excluded:
+                    continue
+                if residual_filters and not self._matches_filters(
+                    note, residual_filters, other_filters
+                ):
+                    continue
+                match_kind = (
+                    0 if folded == needle else 1 if folded.startswith(needle) else 2
+                )
+                rank = (match_kind, -folded.count(needle), identity)
+                if candidate_limit <= 0:
+                    continue
+                ranked.append((rank, note))
+                ranked.sort(key=lambda item: item[0])
+                if len(ranked) > candidate_limit:
+                    ranked.pop()
         return [note for _rank, note in ranked]
 
     def _search(
@@ -910,8 +955,11 @@ class LanceDBMemoryStore(MemoryStore):
                     self._lexical_candidates(
                         table,
                         query,
-                        filters,
+                        residual_filters,
+                        scope_where=where_sql,
                         null_vectors_only=ann_search_completed,
+                        candidate_limit=k - len(results),
+                        excluded_ids=seen_ids,
                     )
                     if len(results) < k
                     else []

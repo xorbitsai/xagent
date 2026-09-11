@@ -70,7 +70,6 @@ from ..services.llm_utils import (
     is_platform_model_id,
 )
 from ..services.model_store import ModelSharingConflictError, ModelStore
-from ..user_isolated_memory import UserContext
 
 logger = logging.getLogger(__name__)
 
@@ -1892,22 +1891,6 @@ async def set_user_default_model(
         config_type=config_type,
         user_model=user_model,
     )
-
-    # If this is an embedding model configuration, trigger memory store check
-    if config.config_type == "embedding":
-        try:
-            from ..dynamic_memory_store import get_memory_store_manager
-
-            manager = get_memory_store_manager()
-            with UserContext(int(user.id)):
-                if manager.check_embedding_model_change():
-                    logger.info(
-                        f"Memory store updated for user {user.id} after setting default embedding model"
-                    )
-        except Exception as e:
-            logger.error(
-                f"Error updating memory store after setting default embedding model: {e}"
-            )
 
     return UserDefaultModelResponse.model_validate(user_default)
 

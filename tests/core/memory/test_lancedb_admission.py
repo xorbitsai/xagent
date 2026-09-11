@@ -1,7 +1,6 @@
 """Real-LanceDB coverage for dormant memory admission primitives."""
 
 import json
-from types import SimpleNamespace
 
 import lancedb  # type: ignore
 import pyarrow as pa  # type: ignore
@@ -19,7 +18,6 @@ from xagent.core.memory.vector_compatibility import (
 from xagent.core.model.embedding import BaseEmbedding
 from xagent.core.tools.core.RAG_tools.LanceDB.schema_manager import _safe_close_table
 from xagent.providers.vector_store.lancedb import clear_connection_cache
-from xagent.web.dynamic_memory_store import DynamicMemoryStoreManager
 
 IDENTITY = EmbeddingIdentity(
     "openai", "text-embedding-3-small", "https://api.openai.com/v1/embeddings", 4, None
@@ -111,6 +109,137 @@ def test_standard_search_does_not_enable_null_vector_supplement(store):
     assert [note.id for note in store.search("alpha", k=2)] == ["ann"]
 
 
+def test_real_null_vector_fallback_streams_to_tail_exact_winner(store):
+    table = store._vector_store.get_raw_connection().open_table("memories")
+    _add_raw_rows(
+        table,
+        [
+            *[
+                _raw_row(f"row-{index:03d}", "alpha broad match", 7)
+                for index in range(300)
+            ],
+            _raw_row("tail-exact", "alpha", 7),
+        ],
+    )
+    _safe_close_table(table)
+    store._embedding_model = None
+
+    result = store.search_with_null_vector_fallback(
+        "alpha", k=1, filters={"metadata": {"user_id": 7}}
+    )
+
+    assert [note.id for note in result] == ["tail-exact"]
+
+
+def test_real_scope_pushdown_prevents_foreign_rows_from_consuming_scan_cap(store):
+    table = store._vector_store.get_raw_connection().open_table("memories")
+    _add_raw_rows(
+        table,
+        [
+            *[_raw_row(f"foreign-{index:03d}", "alpha", 8) for index in range(150)],
+            _raw_row("tenant-hit", "alpha", 7),
+        ],
+    )
+    _safe_close_table(table)
+    store._embedding_model = None
+
+    result = store.search_with_null_vector_fallback(
+        "alpha", k=1, filters={"metadata": {"user_id": 7}}
+    )
+
+    assert [note.id for note in result] == ["tenant-hit"]
+
+
+def test_null_fallback_streams_projected_backend_filtered_batches(store):
+    observed = {}
+
+    class Table:
+        def to_batches(self, **kwargs):
+            observed.update(kwargs)
+            return iter([pa.record_batch({"id": [], "text": [], "metadata": []})])
+
+    assert (
+        store._lexical_candidates(
+            Table(),
+            "alpha",
+            {},
+            scope_where="user_id = 7",
+            null_vectors_only=True,
+            candidate_limit=1,
+        )
+        == []
+    )
+    assert observed == {
+        "filter": "(user_id = 7) AND vector IS NULL",
+        "columns": ["id", "text", "metadata"],
+        "batch_size": 256,
+    }
+
+
+def test_streaming_fallback_skips_ineligible_early_batches_and_malformed_rows(store):
+    table = store._vector_store.get_raw_connection().open_table("memories")
+    rows = [
+        _raw_row(f"drop-{index:03d}", "alpha", 7, priority="drop")
+        for index in range(280)
+    ]
+    malformed = _raw_row("malformed", "alpha", 7)
+    malformed["metadata"] = json.dumps(
+        {"content": "alpha", "user_id": 7, "timestamp": "not-a-date"}
+    )
+    rows.extend([malformed, _raw_row("eligible", "alpha", 7)])
+    _add_raw_rows(table, rows)
+    _safe_close_table(table)
+    store._embedding_model = None
+
+    result = store.search_with_null_vector_fallback(
+        "alpha",
+        k=1,
+        filters={"metadata": {"user_id": 7}, "priority": "keep"},
+    )
+
+    assert [note.id for note in result] == ["eligible"]
+
+
+def test_streaming_fallback_ranks_stably_across_batches(store):
+    table = store._vector_store.get_raw_connection().open_table("memories")
+    _add_raw_rows(
+        table,
+        [
+            *[
+                _raw_row(f"broad-{index:03d}", "prefix alpha", 7)
+                for index in range(260)
+            ],
+            _raw_row("z-prefix", "alpha suffix", 7),
+            _raw_row("a-prefix", "alpha suffix", 7),
+        ],
+    )
+    _safe_close_table(table)
+    store._embedding_model = None
+
+    first = store.search_with_null_vector_fallback("alpha", k=2)
+    second = store.search_with_null_vector_fallback("alpha", k=2)
+
+    assert [note.id for note in first] == ["a-prefix", "z-prefix"]
+    assert [note.id for note in second] == ["a-prefix", "z-prefix"]
+
+
+def test_ann_duplicate_does_not_consume_streaming_lexical_quota(store):
+    assert store.add(MemoryNote(id="ann", content="semantic winner")).success
+    table = store._vector_store.get_raw_connection().open_table("memories")
+    _add_raw_rows(
+        table,
+        [
+            _raw_row("ann", "alpha", None),
+            _raw_row("fallback", "alpha", None),
+        ],
+    )
+    _safe_close_table(table)
+
+    result = store.search_with_null_vector_fallback("alpha", k=2)
+
+    assert [note.id for note in result] == ["ann", "fallback"]
+
+
 def test_create_and_recreate_use_typed_vectors_and_canonical_identity(tmp_path):
     connection = lancedb.connect(tmp_path)
     assert (
@@ -161,6 +290,9 @@ def test_recreation_propagates_real_io_errors(tmp_path, failure_point):
     _safe_close_table(table)
 
     class FailingConnection:
+        def list_tables(self):
+            return ["memories"]
+
         def open_table(self, name):
             if failure_point == "open":
                 raise OSError("real open failure")
@@ -173,25 +305,3 @@ def test_recreation_propagates_real_io_errors(tmp_path, failure_point):
         create_or_recreate_vector_capable_table(
             FailingConnection(), "memories", IDENTITY
         )
-
-
-def test_failed_manager_replacement_preserves_all_previous_state(monkeypatch):
-    manager = DynamicMemoryStoreManager()
-    previous_store = manager._memory_store
-    manager._is_lancedb = True
-    manager._last_embedding_model_id = 1
-    manager._last_embedding_model_fingerprint = (1, "old")
-    model = SimpleNamespace(id=2, updated_at="new")
-    monkeypatch.setattr(manager, "_get_embedding_model_from_db", lambda: model)
-    monkeypatch.setattr(
-        manager,
-        "_create_lancedb_store",
-        lambda _model: (_ for _ in ()).throw(OSError("construction failed")),
-    )
-
-    manager._check_and_update_store()
-
-    assert manager._memory_store is previous_store
-    assert manager._is_lancedb is True
-    assert manager._last_embedding_model_id == 1
-    assert manager._last_embedding_model_fingerprint == (1, "old")

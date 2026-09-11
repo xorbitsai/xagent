@@ -295,6 +295,8 @@ class LanceDBVectorStore(VectorStore):
         db_dir: str,
         collection_name: str = "vectors",
         connection_manager: Optional[LanceDBConnectionManager] = None,
+        *,
+        ensure_table: bool = True,
     ):
         """
         Initialize LanceDB vector store.
@@ -303,12 +305,14 @@ class LanceDBVectorStore(VectorStore):
             db_dir: Database directory path
             collection_name: Collection/table name for vectors
             connection_manager: Optional connection manager instance
+            ensure_table: Whether construction may create the backing table
         """
         self._db_dir = db_dir
         self._collection_name = collection_name
         self._conn_manager = connection_manager or LanceDBConnectionManager()
         self._conn = self._conn_manager.get_connection(db_dir)
-        self._ensure_table()
+        if ensure_table:
+            self._ensure_table()
 
     def _ensure_table(self) -> None:
         """Ensure the vector table exists."""

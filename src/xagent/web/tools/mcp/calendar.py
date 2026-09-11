@@ -938,11 +938,6 @@ def google_calendar_update_events(
             # assuming caller==organizer, as an earlier version did)
             # catches that case rather than silently checking - and
             # excluding from freebusy - the wrong person's calendar.
-            caller_is_organizer = True
-            if organizer_email_lower is not None:
-                caller_is_organizer = (
-                    primary_calendar_info()[0].lower() == organizer_email_lower
-                )
             # A newly-added organizer is checked via the organizer path
             # (events.list, which can actually exclude this event by id/
             # recurringEventId) rather than freebusy - without also
@@ -957,6 +952,17 @@ def google_calendar_update_events(
             # (the overwhelmingly common case), and this must still
             # trigger then, same as before this identity fix.
             organizer_needs_verification = window_changed or organizer_newly_added
+            # Gated on organizer_needs_verification too - caller_is_organizer
+            # is only ever consulted below when the organizer needs
+            # (re)verifying at all, so a metadata-only edit (summary/
+            # description/location, no window or attendee change) on an
+            # event with an explicit organizer field must not pay for
+            # this API call when nothing downstream would use its result.
+            caller_is_organizer = True
+            if organizer_needs_verification and organizer_email_lower is not None:
+                caller_is_organizer = (
+                    primary_calendar_info()[0].lower() == organizer_email_lower
+                )
             # Only actually query "primary" for the organizer's own
             # conflicts when the caller genuinely IS the organizer -
             # otherwise "primary" is someone else's calendar entirely,

@@ -2261,6 +2261,136 @@ def test_update_events_all_day_with_existing_attendees_resubmitted_unchanged_ski
     assert fake_service._freebusy.query_calls == []
 
 
+def test_update_events_metadata_only_edit_on_someone_elses_event_skips_the_identity_lookup(
+    fake_service,
+):
+    """Regression test: caller_is_organizer must only be resolved (via a
+    calendars().get(calendarId="primary") call) when the organizer
+    actually needs (re)verifying at all (window_changed or
+    organizer_newly_added) - a metadata-only edit (here, just a summary
+    change) on an event with a different organizer must not pay for that
+    API call when nothing downstream would use its result."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+        "attendees": [{"email": "boss@example.com"}],
+        "organizer": {"email": "boss@example.com"},
+    }
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            summary="Renamed",
+        )
+    )
+
+    assert result["status"] == "success"
+    assert fake_service._calendars.get_calls == []
+
+
+def test_update_events_organizer_identity_comparison_is_case_insensitive(
+    fake_service,
+):
+    """Regression test: the caller-is-organizer comparison must fold case
+    on both sides - a mutation dropping either side's .lower() would pass
+    every other organizer-identity test in this file, since they all
+    happen to use already-lowercase addresses on both sides."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+        "attendees": [],
+        "organizer": {"email": "Me@Example.com"},
+    }
+    fake_service._calendars = FakeCalendars(email="me@EXAMPLE.com")
+    fake_service._events._list_result = {
+        "items": [_confirmed_event(event_id="other-1")]
+    }
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-27T14:00:00+08:00",  # disjoint move
+            end_time="2026-08-27T14:30:00+08:00",
+        )
+    )
+
+    # caller_is_organizer must resolve True despite the differing case,
+    # so the organizer conflict is found via "primary" (check_organizer)
+    # rather than the caller being wrongly treated as a different person
+    # (which would instead report "Me@Example.com" as unchecked).
+    assert result["status"] == "conflict"
+    assert [c["summary"] for c in result["conflicts"]] == ["1:1 with Hazel"]
+    assert result.get("unchecked_attendees", []) == []
+
+
+def test_update_events_all_day_with_a_different_organizer_shares_one_calendar_lookup(
+    fake_service,
+):
+    """Regression test: an all-day event whose organizer differs from the
+    caller needs BOTH the real calendar timezone (to widen the all-day
+    boundary) and the caller's own identity (to know they aren't the
+    organizer) - both come from the same calendars().get(calendarId=
+    "primary") call, so this must fire exactly once, not twice, and the
+    real organizer must still end up in unchecked_attendees using a
+    correctly-widened (non-UTC-defaulted) window."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"date": "2026-08-27"},
+        "end": {"date": "2026-08-28"},
+        "attendees": [],
+        "organizer": {"email": "boss@example.com"},
+    }
+    fake_service._calendars = FakeCalendars(
+        timezone="Asia/Singapore", email="me@example.com"
+    )
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-28T00:00:00+08:00",  # moves the all-day window
+            end_time="2026-08-29T00:00:00+08:00",
+        )
+    )
+
+    assert result["status"] == "success"
+    assert len(fake_service._calendars.get_calls) == 1
+    assert result["unchecked_attendees"] == ["boss@example.com"]
+    assert fake_service._events.list_calls == []
+
+
+def test_update_events_missing_scope_at_the_identity_check_rejects_the_write(
+    fake_service,
+):
+    """Regression test: the calendars.get call also drives caller-is-
+    organizer identity resolution (not just all-day timezone widening) -
+    a missing calendar.calendars.readonly scope must reject the write via
+    THIS call site too, on a plain timed event whose organizer differs
+    from the caller (needs_real_calendar_timezone stays False here, so
+    only the identity check would ever trigger this lookup)."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+        "attendees": [],
+        "organizer": {"email": "boss@example.com"},
+    }
+    fake_service._calendars = FakeCalendars(raise_error=_insufficient_scope_error())
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-27T14:00:00+08:00",  # disjoint move
+            end_time="2026-08-27T14:30:00+08:00",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "reconnect" in result["message"].lower()
+    assert fake_service._events.update_calls == []
+
+
 def test_update_events_calendar_timezone_lookup_missing_scope_rejects_the_write(
     fake_service,
 ):

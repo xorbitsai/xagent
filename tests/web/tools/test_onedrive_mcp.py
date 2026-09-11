@@ -1227,11 +1227,35 @@ def test_upload_text_file_rejects_binary_looking_names(monkeypatch, file_path):
     mock_request.assert_not_called()
 
 
-def test_upload_text_file_allows_plain_text_names(monkeypatch):
+@pytest.mark.parametrize(
+    "file_path",
+    [
+        "notes.txt",
+        "README.md",
+        "config.json",
+        "config.yaml",
+        "config.yml",
+        "data.csv",
+        "script.py",
+        "page.html",
+        "server.log",
+        "styles.css",
+        "main.js",
+        "data.xml",
+        "notes",
+    ],
+)
+def test_upload_text_file_allows_plain_text_names(monkeypatch, file_path):
+    """Regression guard: the only broad "should be accepted" case used to
+    be ".txt" alone, with every other positive case a narrow one-off added
+    reactively after a specific extension was found broken in a prior
+    round -- which is exactly how ".sh" shipped genuinely broken for a
+    whole round before anyone tested it. This covers a broader set of
+    everyday text formats an agent is likely to actually generate."""
     monkeypatch.setattr(
         onedrive.requests, "request", Mock(return_value=MockResponse({"id": "f1"}))
     )
 
-    result = json.loads(onedrive.onedrive_upload_text_file("notes.txt", "hello world"))
+    result = json.loads(onedrive.onedrive_upload_text_file(file_path, "hello world"))
 
     assert result["status"] == "success"

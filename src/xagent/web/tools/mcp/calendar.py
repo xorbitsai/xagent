@@ -890,6 +890,41 @@ def _resolve_side(
     return current_value, current_value is not None and is_bare_date(current_value)
 
 
+def _validate_kind_conversion(
+    event: dict[str, Any], start_value: str, is_all_day: bool, timezone: str | None
+) -> None:
+    """Validate the resulting recurrence when DTSTART changes value type.
+
+    Existing exception dates cannot be inferred under a new value type.
+    Check stored rules even when the caller did not pass recurrence.
+    """
+    lines = event.get("recurrence") or []
+    if not isinstance(lines, list) or any(
+        not isinstance(line, str) or not line.strip().upper().startswith("RRULE:")
+        for line in lines
+    ):
+        raise ValueError(
+            "cannot convert this event between all-day and timed while it has "
+            "EXDATE/RDATE/EXRULE or unsupported recurrence lines; "
+            "their conversion is not supported"
+        )
+    for line in lines:
+        parts = parse_rrule(line, start_value, timezone)
+        until = parts.get("UNTIL")
+        if until and (len(until) == 8) != is_all_day:
+            raise ValueError(
+                "cannot convert this event: recurrence UNTIL must match the "
+                "new start value type; pass a compatible recurrence in the same call"
+            )
+        if is_all_day and any(
+            key in parts for key in ("BYHOUR", "BYMINUTE", "BYSECOND")
+        ):
+            raise ValueError(
+                "cannot convert this event to all-day with BYHOUR/BYMINUTE/BYSECOND; "
+                "pass a date-only recurrence in the same call"
+            )
+
+
 def get_calendar_service() -> Any:
     token = os.environ.get("GOOGLE_ACCESS_TOKEN")
     refresh_token = os.environ.get("GOOGLE_REFRESH_TOKEN")
@@ -1333,9 +1368,9 @@ def google_calendar_update_events(
     """
     Update an existing event in Google Calendar.
     start_time and end_time must be RFC3339 formatted if provided, or
-    a bare date (e.g. '2024-01-01') for an existing all-day event.
-    Updates must preserve the event's existing kind (all-day or timed);
-    conversion between the two kinds is not supported.
+    both a bare date (e.g. '2024-01-01') to convert the event to/from
+    all-day - if only one of the two is given, it must match the kind
+    (dateTime vs. bare date) the event already has on its other side.
     recurrence works like it does in google_calendar_create_events: a
     single RFC 5545 RRULE string turns this event into a repeating series,
     or replaces its existing one. Any EXDATE/RDATE/EXRULE lines already on
@@ -1344,12 +1379,16 @@ def google_calendar_update_events(
     event through this parameter. Because those auxiliary lines can change
     the meaning of a replacement rule, an event that has them requires
     recurrence, start_time, and timezone together when its rule, series start,
-    or timezone changes (an all-day event does not require timezone). The caller
-    must ensure the retained absolute EXDATE/RDATE values still identify the
-    intended occurrences after that fully-specified change. Google does not
-    offer an atomic operation that checks separately stored instance exceptions
-    and updates their recurring master together. Therefore, changing an existing
-    series' rule, start time, or expansion timezone also requires:
+    or timezone changes (an all-day event does not require timezone). Converting
+    between all-day and timed requires both start_time and end_time and is not
+    supported when the event has existing EXDATE/RDATE/EXRULE lines. Any retained RRULE is
+    revalidated against the new start; pass a compatible replacement recurrence
+    in the same call when needed. The caller must ensure the retained absolute
+    EXDATE/RDATE values still identify the intended occurrences after a
+    fully-specified change. Google does not offer an atomic operation that checks
+    separately stored instance exceptions and updates their recurring master
+    together. Therefore, changing an existing series' rule, start time, or
+    expansion timezone also requires:
     - acknowledge_recurring_exception_risk=True after the user verifies that
       retained EXDATE/RDATE/EXRULE values still identify the intended occurrences;
     - acceptance that another client could create, edit, or cancel an exception
@@ -1583,15 +1622,6 @@ def google_calendar_update_events(
                 "both bare dates for an all-day event or both dateTimes for a "
                 "timed event"
             )
-        if (
-            original_start_value is not None
-            and start_input_is_all_day is not None
-            and original_is_all_day != start_input_is_all_day
-        ):
-            raise ValueError(
-                "conversion between all-day and timed events is not supported; "
-                "keep start_time and end_time in the event's existing kind"
-            )
         if start_input_is_all_day and end_input_is_all_day:
             _reject_nonpositive_event_window(
                 cast(str, start_time), cast(str, end_time), is_all_day=True
@@ -1743,6 +1773,15 @@ def google_calendar_update_events(
                 for line in existing_recurrence
                 if _recurrence_property_name(line) != "RRULE"
             ]
+            if (
+                auxiliary_recurrence
+                and original_start_value is not None
+                and original_is_all_day != resulting_start_is_all_day
+            ):
+                raise ValueError(
+                    "cannot convert this event between all-day and timed while it "
+                    "has EXDATE/RDATE/EXRULE lines; their conversion is not supported"
+                )
             timezone_changes_schedule_zone = bool(
                 not resulting_start_is_all_day
                 and timezone
@@ -2397,11 +2436,6 @@ def google_calendar_update_events(
                 "both bare dates for an all-day event or both dateTimes for a "
                 "timed event"
             )
-        if original_start_value is not None and original_is_all_day != is_all_day:
-            raise ValueError(
-                "conversion between all-day and timed events is not supported; "
-                "keep start_time and end_time in the event's existing kind"
-            )
         if timing_update_requested and (
             current_start_value is None or current_end_value is None
         ):
@@ -2594,6 +2628,14 @@ def google_calendar_update_events(
                 recurrence, cast(str, current_start_value), effective_start_timezone
             )
             event["recurrence"] = _merge_recurrence(existing_recurrence, new_rrule)
+        if (
+            original_start_value is not None
+            and original_is_all_day != is_all_day
+            and current_start_value is not None
+        ):
+            _validate_kind_conversion(
+                event, current_start_value, is_all_day, effective_start_timezone
+            )
         if added_attendees:
             # Only append the newly-added attendees - existing entries are
             # left completely untouched (dict identity and all), so their

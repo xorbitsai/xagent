@@ -2,10 +2,36 @@ import json
 import os
 import re
 import urllib.request
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
 from ....config import get_tool_max_output_length
+
+
+def allowed_dirs_from_env(env_var_name: str) -> list[Path]:
+    """Parse a comma-separated directory allowlist from an env var, falling
+    back to the current working directory when it's unset or blank.
+
+    Previously duplicated near-identically across gmail.py, slack.py,
+    linkedin.py, google_drive.py, and onedrive.py -- each connector's own
+    copy of this exact parsing logic, with no shared source of truth. That
+    drift already produced a real bug: falling back to CWD only when the
+    env var was entirely empty (not also when it normalizes to no real
+    entries, e.g. "," or " , ") turns the documented fail-open CWD default
+    into an unintended fail-closed "every upload rejected" for a malformed
+    value, with no diagnostic pointing at the env var as the cause --
+    google_drive.py's copy already guarded against this; the others hadn't.
+    Consolidating here means that fix (and any future one) only has to
+    happen once.
+    """
+    raw_dirs = os.environ.get(env_var_name, "")
+    parsed_dirs = [
+        Path(stripped).expanduser().resolve()
+        for raw_dir in raw_dirs.split(",")
+        if (stripped := raw_dir.strip())
+    ]
+    return parsed_dirs or [Path.cwd().resolve()]
 
 
 def require_clean_identifier(value: str, field_name: str) -> str:

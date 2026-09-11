@@ -1,4 +1,5 @@
 import re
+from pathlib import Path
 
 import pytest
 import requests
@@ -115,3 +116,58 @@ def test_url_path_id_output_survives_requests_url_normalization():
 
     with pytest.raises(ValueError):
         utils.url_path_id("..", "record_id")
+
+
+_TEST_ALLOWED_DIRS_ENV_VAR = "XAGENT_TEST_FILE_ALLOWED_DIRS"
+
+
+def test_allowed_dirs_from_env_falls_back_to_cwd_when_unset(monkeypatch):
+    monkeypatch.delenv(_TEST_ALLOWED_DIRS_ENV_VAR, raising=False)
+    assert utils.allowed_dirs_from_env(_TEST_ALLOWED_DIRS_ENV_VAR) == [
+        Path.cwd().resolve()
+    ]
+
+
+def test_allowed_dirs_from_env_falls_back_to_cwd_when_blank(monkeypatch):
+    monkeypatch.setenv(_TEST_ALLOWED_DIRS_ENV_VAR, "   ")
+    assert utils.allowed_dirs_from_env(_TEST_ALLOWED_DIRS_ENV_VAR) == [
+        Path.cwd().resolve()
+    ]
+
+
+@pytest.mark.parametrize("raw_value", [",", " , ", ",,,"])
+def test_allowed_dirs_from_env_falls_back_to_cwd_when_malformed(monkeypatch, raw_value):
+    """Regression guard for the real bug this consolidation was written to
+    fix: a lone comma (or several) parses to zero real entries, and
+    without this fallback that becomes an empty allowlist that silently
+    rejects every upload with nothing pointing at the env var as the
+    cause -- previously true for onedrive.py/gmail.py/slack.py/linkedin.py,
+    but not google_drive.py, whose copy already guarded against it."""
+    monkeypatch.setenv(_TEST_ALLOWED_DIRS_ENV_VAR, raw_value)
+    assert utils.allowed_dirs_from_env(_TEST_ALLOWED_DIRS_ENV_VAR) == [
+        Path.cwd().resolve()
+    ]
+
+
+def test_allowed_dirs_from_env_parses_multiple_dirs_with_whitespace(
+    monkeypatch, tmp_path
+):
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+    monkeypatch.setenv(_TEST_ALLOWED_DIRS_ENV_VAR, f" {dir_a} , {dir_b} ")
+
+    assert utils.allowed_dirs_from_env(_TEST_ALLOWED_DIRS_ENV_VAR) == [
+        dir_a.resolve(),
+        dir_b.resolve(),
+    ]
+
+
+def test_allowed_dirs_from_env_expands_user_home(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv(_TEST_ALLOWED_DIRS_ENV_VAR, "~/workspace")
+
+    assert utils.allowed_dirs_from_env(_TEST_ALLOWED_DIRS_ENV_VAR) == [
+        (tmp_path / "workspace").resolve()
+    ]

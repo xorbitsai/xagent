@@ -712,7 +712,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
         {
             "app_id": "onedrive",
             "name": "OneDrive",
-            "description": "Connect to OneDrive to browse files, download content, and manage cloud storage.",
+            "description": "Connect to OneDrive to browse files, download content, upload files, and manage cloud storage.",
             "icon": "https://www.google.com/s2/favicons?domain=onedrive.live.com&sz=128",
             "transport": "oauth",
             "provider_name": "microsoft",

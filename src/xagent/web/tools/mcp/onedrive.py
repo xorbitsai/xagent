@@ -28,11 +28,18 @@ DEFAULT_TIMEOUT_SECONDS = 30
 # simple-PUT branch (up to _SIMPLE_UPLOAD_MAX_BYTES) and each chunk of the
 # resumable upload-session path.
 _BINARY_UPLOAD_TIMEOUT_SECONDS = 120
-# Microsoft's docs describe the simple content PUT's limit as "4 MB"; some
-# Graph deployments enforce that as the decimal 4,000,000 bytes rather than
-# 4 MiB (4,194,304 bytes). Using the smaller, decimal figure here means a
-# file in that ambiguous ~194KB gap always takes the resumable upload-session
-# path instead of risking a rejection right at the simple-PUT boundary.
+# Microsoft's own docs disagree on the simple content PUT's real limit:
+# the OneDrive API concepts page ("Uploading files") says simple upload is
+# "available for items with less than 4 MB of content", while the Graph
+# v1.0 API reference for the same endpoint (driveitem-put-content) says it
+# "supports files up to 250 MB in size". Rather than trying to resolve
+# which page is authoritative, this deliberately keeps the smaller, more
+# conservative bound -- some Graph deployments enforce it as the decimal
+# 4,000,000 bytes rather than 4 MiB (4,194,304 bytes), so the decimal
+# figure is used here too. This means a file anywhere in the 4MB-250MB gap
+# always takes the resumable upload-session path instead of ever risking a
+# rejection at the simple-PUT boundary; the only cost of guessing wrong
+# this way is an unnecessary chunked upload, never a failed one.
 _SIMPLE_UPLOAD_MAX_BYTES = 4_000_000
 # Chunk size for the upload-session path. Must be a multiple of 320 KiB
 # (327,680 bytes) per Graph's requirement for every non-final chunk; 5 MiB
@@ -538,15 +545,18 @@ def _upload_large_file_content(
                         "may have changed size during upload"
                     )
                 # The upload session URL is itself pre-authenticated (a
-                # token in its query string) -- Graph 401s a chunk request
-                # that also carries our own Authorization header, so this
-                # goes straight through the plain Session rather than
-                # _graph_request (which always attaches one). Graph's docs
-                # don't confirm Content-Type is honored on a chunk PUT the
-                # way it is on the simple-PUT endpoint (only Content-Length/
-                # Content-Range are documented there), but sending it costs
-                # nothing and is the closest available lever to the simple
-                # path's behavior.
+                # token in its query string) -- Microsoft's own docs for
+                # createUploadSession confirm this explicitly: "If you
+                # include the Authorization header when issuing the PUT
+                # call, it might result in an HTTP 401 Unauthorized
+                # response. ... Don't include it when issuing the PUT
+                # call." So this goes straight through the plain Session
+                # rather than _graph_request (which always attaches one).
+                # Graph's docs don't confirm Content-Type is honored on a
+                # chunk PUT the way it is on the simple-PUT endpoint (only
+                # Content-Length/Content-Range are documented there), but
+                # sending it costs nothing and is the closest available
+                # lever to the simple path's behavior.
                 response = http.put(
                     upload_url,
                     data=chunk,

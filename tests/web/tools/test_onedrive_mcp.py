@@ -821,13 +821,15 @@ def test_upload_large_file_content_rejects_short_chunk_read(monkeypatch):
 
 
 def test_simple_upload_max_bytes_is_at_or_below_graphs_4mb_limit():
-    """Regression guard for the actual production boundary bug: Graph's
-    simple content PUT is documented as accepting files up to "4 MB", which
-    some deployments enforce as the decimal 4,000,000 bytes rather than the
-    binary 4 MiB (4,194,304 bytes). The cutoff must stay at or below the
-    smaller, decimal figure so a file in that ambiguous gap always takes the
-    resumable upload-session path instead of risking rejection right at the
-    simple-PUT boundary."""
+    """Regression guard for the actual production boundary bug: Microsoft's
+    own docs disagree on the simple content PUT's real limit (the OneDrive
+    API concepts page says "4 MB", the Graph v1.0 API reference for the
+    same endpoint says "250 MB" -- see _SIMPLE_UPLOAD_MAX_BYTES's own
+    comment), and some deployments enforce the smaller figure as the
+    decimal 4,000,000 bytes rather than the binary 4 MiB (4,194,304 bytes).
+    The cutoff must stay at or below the smaller, decimal figure so a file
+    anywhere in the ambiguous gap always takes the resumable upload-session
+    path instead of ever risking rejection at the simple-PUT boundary."""
     assert onedrive._SIMPLE_UPLOAD_MAX_BYTES <= 4_000_000
 
 

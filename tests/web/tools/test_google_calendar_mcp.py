@@ -1337,6 +1337,134 @@ def test_update_events_excludes_a_recurring_events_own_instances_from_its_confli
     assert [c["summary"] for c in result["conflicts"]] == ["Board sync"]
 
 
+def test_update_events_refuses_to_move_a_recurring_masters_time(fake_service):
+    """Regression test: the conflict check only ever evaluates the single
+    window this call computes - it has no way to expand a recurring
+    master's RRULE and check every occurrence it generates. Moving the
+    master's own time (recurrence present on the fetched event) must be
+    refused outright rather than silently succeed having only verified
+    one occurrence, since a later occurrence at the new time could have a
+    real conflict this call never looked at."""
+    fake_service._events._get_result = {
+        "id": "series-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+        "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=TH"],
+    }
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="series-1",
+            start_time="2026-08-27T10:00:00+08:00",
+            end_time="2026-08-27T10:30:00+08:00",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "recurring" in result["message"].lower()
+    assert fake_service._events.update_calls == []
+
+
+def test_update_events_refuses_to_add_an_attendee_to_a_recurring_master(fake_service):
+    """Companion to the test above: adding a genuinely new attendee to a
+    recurring master is refused for the same reason - their availability
+    can only be checked against the one occurrence this call computes,
+    not the whole series."""
+    fake_service._events._get_result = {
+        "id": "series-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+        "attendees": [],
+        "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=TH"],
+    }
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="series-1",
+            attendees=["new@example.com"],
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "recurring" in result["message"].lower()
+    assert fake_service._events.update_calls == []
+
+
+def test_update_events_allows_metadata_only_edits_on_a_recurring_master(fake_service):
+    """A pure metadata edit (no time/attendee change) on a recurring
+    master is unaffected by the new restriction - it never needed the
+    per-occurrence conflict check the restriction exists to guard."""
+    fake_service._events._get_result = {
+        "id": "series-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+        "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=TH"],
+    }
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="series-1",
+            summary="Renamed series",
+        )
+    )
+
+    assert result["status"] == "success"
+    assert len(fake_service._events.update_calls) == 1
+
+
+def test_update_events_recurring_master_restriction_can_be_bypassed_with_ignore_conflicts(
+    fake_service,
+):
+    """ignore_conflicts=True is the caller's explicit escape hatch for a
+    check that can't run at all - including this one, once the user has
+    confirmed they've verified every occurrence themselves."""
+    fake_service._events._get_result = {
+        "id": "series-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+        "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=TH"],
+    }
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="series-1",
+            start_time="2026-08-27T10:00:00+08:00",
+            end_time="2026-08-27T10:30:00+08:00",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    assert len(fake_service._events.update_calls) == 1
+
+
+def test_update_events_moving_a_single_occurrence_is_unaffected_by_the_recurring_master_restriction(
+    fake_service,
+):
+    """A single occurrence (addressed by its own event id, carrying
+    recurringEventId rather than its own recurrence) is a single event
+    like any other for conflict-checking purposes - the restriction only
+    targets the master itself."""
+    fake_service._events._get_result = {
+        "id": "series-1_20260827T010000Z",
+        "recurringEventId": "series-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+    }
+    fake_service._events._list_result = {"items": []}
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="series-1_20260827T010000Z",
+            start_time="2026-08-27T10:00:00+08:00",
+            end_time="2026-08-27T10:30:00+08:00",
+        )
+    )
+
+    assert result["status"] == "success"
+    assert len(fake_service._events.update_calls) == 1
+
+
 def test_update_events_metadata_only_edit_never_checks_conflicts(fake_service):
     """A pure metadata edit (no time/attendee change) must never run the
     conflict check at all - not just tolerate it, since even running the

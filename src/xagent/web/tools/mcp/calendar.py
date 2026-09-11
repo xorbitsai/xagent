@@ -290,12 +290,11 @@ def _primary_calendar_info(service: Any) -> tuple[str, str]:
             # UTC, or assuming the caller is the organizer), either of
             # which could misjudge the query window or silently skip a
             # real conflict.
-            # Raised as InsufficientScopeError (a ValueError subclass, so
-            # existing `except ValueError` call sites still catch it
-            # unchanged) rather than a bare ValueError, for consistency
-            # with every other scope-error site in this module - nothing
-            # has been confirmed by this helper itself, so both
-            # accumulator args are empty.
+            # Raised as InsufficientScopeError rather than a validation
+            # ValueError so broad input-validation handlers cannot
+            # accidentally swallow a credential failure. Nothing has been
+            # confirmed by this helper itself, so both accumulator args
+            # are empty.
             raise InsufficientScopeError(
                 "Missing the calendar.calendars.readonly permission "
                 "needed to look up the calendar's own identity/timezone "

@@ -1193,19 +1193,16 @@ def google_calendar_update_events(
             # _primary_calendar_info hit some OTHER failure (rate limiting,
             # a transient 5xx, an unrelated 403) that it re-raises unchanged.
             # All three mean this conflict-only lookup could not run.
-            if not ignore_conflicts:
+            if not ignore_conflicts or bool(start_time) != bool(end_time):
                 raise
             # ignore_conflicts=True means the caller has already decided
-            # the conflict check doesn't need to run - this lookup
-            # failing for ANY reason here would only ever be surfaced by
-            # that check (or by the reversed-window sanity check below,
-            # which is fine to run a little less precisely against UTC
-            # than to block a write the caller explicitly opted out of
-            # checking). Leaving the existing boundaries unresolved
-            # (None) is safe: the conflict-check block below is itself
-            # gated on `not ignore_conflicts`, and the write payload only
-            # ever uses the caller-supplied start_time/end_time, never
-            # these.
+            # the availability check does not need to run. Leaving the
+            # existing boundaries unresolved is safe only when neither
+            # boundary is being changed, or when both replacements were
+            # supplied and can be ordered without the stored values. A
+            # one-sided time change still needs the unresolved counterpart
+            # for the non-optional reversed-window invariant, so it is
+            # re-raised above even with the conflict bypass enabled.
             calendar_timezone = "UTC"
             existing_start = None
             existing_end = None

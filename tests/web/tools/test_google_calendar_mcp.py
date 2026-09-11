@@ -733,6 +733,32 @@ def test_update_with_missing_boundary_fails_closed_before_write(monkeypatch):
     service.events.return_value.update.assert_not_called()
 
 
+def test_ignore_conflicts_cannot_bypass_one_sided_window_validation(monkeypatch):
+    service = _fake_service(
+        {"id": "evt1"},
+        existing_event={
+            "start": {"dateTime": "2026-09-07T15:00:00+08:00"},
+            "end": {
+                "dateTime": "2026-09-07T16:00:00",
+                "timeZone": "Not/AZone",
+            },
+        },
+    )
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="evt1",
+            start_time="2026-09-07T17:00:00+08:00",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "recognized IANA zone name" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
 def test_update_with_real_window_checks_a_new_attendee_before_write(monkeypatch):
     service = _fake_service(
         {"id": "evt1"},

@@ -17,11 +17,13 @@ from xagent.core.execution_scope import (
     set_execution_scope_snapshot_loader,
 )
 from xagent.web.api import websocket as websocket_api
+from xagent.web.api.websocket import _make_command_reply
 from xagent.web.models import database as database_module
 from xagent.web.models.database import Base, get_db, get_engine, init_db
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
 from xagent.web.services import agent_service_manager as agent_runtime_service
+from xagent.web.services import task_command_execution as command_execution_service
 from xagent.web.services import task_execution as task_execution_service
 from xagent.web.services import task_setup_snapshot as snapshot_module
 from xagent.web.services.task_execution_controller import (
@@ -95,10 +97,12 @@ async def test_pause_handler_keeps_database_work_off_the_event_loop(
     # Pause is a control operation on an already-running task, so it resolves
     # off-turn: it must stay available while the scope is in dispute.
     monkeypatch.setattr(
-        websocket_api, "resolve_execution_scope_off_turn", resolve_scope_off_turn
+        command_execution_service,
+        "resolve_execution_scope_off_turn",
+        resolve_scope_off_turn,
     )
     monkeypatch.setattr(
-        websocket_api,
+        command_execution_service,
         "_apply_pause_requested_isolated",
         finalize_pause,
         raising=False,
@@ -110,8 +114,8 @@ async def test_pause_handler_keeps_database_work_off_the_event_loop(
     monkeypatch.setattr(websocket_api, "manager", connection_manager)
 
     try:
-        await websocket_api._handle_pause_task_unserialized(
-            MagicMock(),
+        await command_execution_service.pause_task(
+            _make_command_reply(MagicMock()),
             task_id,
             {"user": actor},
         )
@@ -175,7 +179,7 @@ async def test_pause_survives_a_scope_authority_mismatch(
         snapshot_module, "load_task_setup_snapshot_sync", lambda *a, **k: snapshot
     )
     monkeypatch.setattr(
-        websocket_api,
+        command_execution_service,
         "_apply_pause_requested_isolated",
         lambda *a, **k: True,
         raising=False,
@@ -186,8 +190,8 @@ async def test_pause_survives_a_scope_authority_mismatch(
     monkeypatch.setattr(websocket_api, "manager", connection_manager)
 
     try:
-        await websocket_api._handle_pause_task_unserialized(
-            MagicMock(), task_id, {"user": actor}
+        await command_execution_service.pause_task(
+            _make_command_reply(MagicMock()), task_id, {"user": actor}
         )
     finally:
         task_execution_service._clear_task_pause_accepted(task_id)
@@ -228,7 +232,7 @@ def test_pause_transition_updates_only_the_expected_running_run(
 ) -> None:
     task = _running_task(db_session)
 
-    applied = websocket_api._apply_pause_requested_isolated(
+    applied = command_execution_service._apply_pause_requested_isolated(
         int(task.id),
         expected_run_id="run-1",
     )
@@ -246,7 +250,7 @@ def test_pause_transition_rejects_a_replacement_run(db_session: Session) -> None
     task = _running_task(db_session, run_id="replacement-run")
 
     with pytest.raises(StaleTaskRunError, match="run changed"):
-        websocket_api._apply_pause_requested_isolated(
+        command_execution_service._apply_pause_requested_isolated(
             int(task.id),
             expected_run_id="original-run",
         )
@@ -266,7 +270,7 @@ def test_pause_transition_leaves_a_terminal_task_unchanged(
     setattr(task, "control_state", TaskControlState.COMPLETED.value)
     db_session.commit()
 
-    applied = websocket_api._apply_pause_requested_isolated(
+    applied = command_execution_service._apply_pause_requested_isolated(
         int(task.id),
         expected_run_id="run-1",
     )

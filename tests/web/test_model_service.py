@@ -1,5 +1,6 @@
 """Test model service functionality"""
 
+from contextlib import ExitStack
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -9,15 +10,24 @@ from sqlalchemy.orm import sessionmaker
 from xagent.web.models.database import Base
 from xagent.web.models.model import Model
 from xagent.web.models.user import User, UserDefaultModel, UserModel
+from xagent.web.services.llm_utils import UserAwareModelStorage
 from xagent.web.services.model_service import (
     _create_default_llm_instance,
     _is_model_visible_to_user,
     get_asr_models,
+    get_compact_model,
+    get_default_asr_model,
     get_default_embedding_model,
+    get_default_image_edit_model,
+    get_default_image_generate_model,
     get_default_model,
     get_default_music_model,
     get_default_rerank_model,
     get_default_sound_effect_model,
+    get_default_tts_model,
+    get_default_vision_model,
+    get_embedding_model,
+    get_fast_model,
     get_image_models,
     get_music_models,
     get_sound_effect_models,
@@ -122,6 +132,169 @@ class TestModelService:
             "router-auto", 7
         )
         legacy_create.assert_not_called()
+
+    def test_user_aware_shared_default_query_skips_inactive_model(
+        self, db_session, admin_user, regular_user, monkeypatch
+    ):
+        model = Model(
+            model_id="shared-general",
+            category="llm",
+            model_provider="openai",
+            model_name="shared-general",
+            api_key="test-api-key",
+            abilities=["chat"],
+            is_active=False,
+        )
+        db_session.add(model)
+        db_session.flush()
+        db_session.add_all(
+            [
+                UserModel(
+                    user_id=admin_user.id,
+                    model_id=model.id,
+                    is_owner=True,
+                    is_shared=True,
+                ),
+                UserDefaultModel(
+                    user_id=admin_user.id,
+                    model_id=model.id,
+                    config_type="general",
+                ),
+            ]
+        )
+        db_session.commit()
+
+        storage = UserAwareModelStorage(db_session)
+        monkeypatch.setattr(
+            storage,
+            "_create_default_model",
+            lambda db_model, user_id: str(db_model.model_id),
+        )
+        monkeypatch.setattr(
+            "xagent.web.services.llm_utils.create_llm_from_env", lambda: None
+        )
+
+        assert (
+            storage.get_configured_defaults(regular_user.id, config_types=("general",))[
+                0
+            ]
+            is None
+        )
+
+        model.is_active = True
+        db_session.commit()
+
+        assert (
+            storage.get_configured_defaults(regular_user.id, config_types=("general",))[
+                0
+            ]
+            == "shared-general"
+        )
+
+    @pytest.mark.parametrize(
+        ("resolver_name", "config_type", "category", "factory_kind"),
+        [
+            ("vision", "visual", "llm", "chat"),
+            ("general", "general", "llm", "chat"),
+            ("fast", "small_fast", "llm", "chat"),
+            ("compact", "compact", "llm", "chat"),
+            ("embedding_instance", "embedding", "embedding", "embedding"),
+            ("image_generate", "image", "image", "image"),
+            ("image_edit", "image_edit", "image", "image"),
+            ("embedding_id", "embedding", "embedding", None),
+            ("rerank_id", "rerank", "rerank", None),
+            ("asr", "asr", "asr", "asr"),
+            ("tts", "tts", "tts", "tts"),
+        ],
+    )
+    def test_shared_default_resolvers_skip_inactive_models(
+        self,
+        db_session,
+        admin_user,
+        resolver_name,
+        config_type,
+        category,
+        factory_kind,
+    ):
+        model = Model(
+            model_id=f"shared-{resolver_name}",
+            category=category,
+            model_provider="openai",
+            model_name=f"shared-{resolver_name}",
+            api_key="test-api-key",
+            abilities=["chat", "generate"],
+            is_active=False,
+        )
+        db_session.add(model)
+        db_session.flush()
+        db_session.add_all(
+            [
+                UserModel(
+                    user_id=admin_user.id,
+                    model_id=model.id,
+                    is_owner=True,
+                    is_shared=True,
+                ),
+                UserDefaultModel(
+                    user_id=admin_user.id,
+                    model_id=model.id,
+                    config_type=config_type,
+                ),
+            ]
+        )
+        db_session.commit()
+
+        resolvers = {
+            "vision": lambda: get_default_vision_model(None, db=db_session),
+            "general": lambda: get_default_model(None),
+            "fast": lambda: get_fast_model(None),
+            "compact": lambda: get_compact_model(None),
+            "embedding_instance": lambda: get_embedding_model(None),
+            "image_generate": lambda: get_default_image_generate_model(
+                None, db=db_session
+            ),
+            "image_edit": lambda: get_default_image_edit_model(None, db=db_session),
+            "embedding_id": lambda: get_default_embedding_model(None, db=db_session),
+            "rerank_id": lambda: get_default_rerank_model(None, db=db_session),
+            "asr": lambda: get_default_asr_model(None, db=db_session),
+            "tts": lambda: get_default_tts_model(None, db=db_session),
+        }
+        factory_targets = {
+            "chat": "xagent.web.services.model_service._create_default_llm_instance",
+            "embedding": "xagent.web.services.llm_utils._create_llm_instance",
+            "image": "xagent.core.model.image.adapter.get_image_model_instance",
+            "asr": "xagent.core.model.asr.adapter.get_asr_model_instance",
+            "tts": "xagent.core.model.tts.adapter.get_tts_model_instance",
+        }
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch(
+                    "xagent.web.models.database.get_db",
+                    side_effect=lambda: iter([db_session]),
+                )
+            )
+            factory = (
+                stack.enter_context(patch(factory_targets[factory_kind]))
+                if factory_kind
+                else None
+            )
+            if factory is not None:
+                factory.return_value = MagicMock(name=f"{resolver_name}-instance")
+
+            assert resolvers[resolver_name]() is None
+            if factory is not None:
+                factory.assert_not_called()
+
+            model.is_active = True
+            db_session.commit()
+            result = resolvers[resolver_name]()
+
+            if factory is None:
+                assert result == model.model_id
+            else:
+                factory.assert_called_once()
+                assert result is factory.return_value
 
     def test_get_default_model_user_specific(self):
         """Test getting user-specific default model"""
@@ -844,7 +1017,7 @@ class TestModelService:
         mock_db, session_factory = owned_model_session
         shared_default = MagicMock()
         shared_default.model.model_id = "shared-text-model"
-        shared_query = mock_db.query.return_value.join.return_value.filter.return_value
+        shared_query = mock_db.query.return_value.join.return_value.join.return_value.filter.return_value
         shared_query.limit.return_value.all.return_value = [shared_default]
         monkeypatch.setattr(
             "xagent.web.services.model_service._get_visible_user_ids",
@@ -911,9 +1084,7 @@ class TestModelService:
         self, get_default, monkeypatch
     ):
         caller_db = MagicMock()
-        shared_query = (
-            caller_db.query.return_value.join.return_value.filter.return_value
-        )
+        shared_query = caller_db.query.return_value.join.return_value.join.return_value.filter.return_value
         shared_query.limit.return_value.all.return_value = []
         monkeypatch.setattr(
             "xagent.web.services.model_service._get_visible_user_ids",

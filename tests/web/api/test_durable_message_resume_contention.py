@@ -15,15 +15,16 @@ from tests.web.services.task_lease_shared import (
 )
 from xagent.core.agent.runner import UserMessageInjectionOutcome
 from xagent.web.api import websocket as websocket_api
-from xagent.web.api.websocket import execute_durable_task_command
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import Base, get_db, get_engine, init_db
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.task_command_terminal_event import TaskCommandTerminalEvent
 from xagent.web.models.user import User
+from xagent.web.services import task_command_execution as command_execution_service
 from xagent.web.services import task_execution as task_execution_service
 from xagent.web.services.chat_history_service import DELIVERY_PENDING
+from xagent.web.services.task_command_execution import execute_durable_task_command
 from xagent.web.services.task_command_transport import (
     COMMAND_COMPLETED,
     COMMAND_FAILED,
@@ -310,9 +311,9 @@ async def test_dispatcher_reclaims_and_applies_message_after_contention_clears(
         # real close still executes for its own side effects (the DB
         # write), keeping the rest of the test's assertions valid.
         with patch.object(
-            websocket_api,
+            command_execution_service,
             "close_legacy_resume_interaction_sync",
-            wraps=websocket_api.close_legacy_resume_interaction_sync,
+            wraps=command_execution_service.close_legacy_resume_interaction_sync,
         ) as close_spy:
             assert await dispatch_one_task_command(
                 execute_durable_task_command,

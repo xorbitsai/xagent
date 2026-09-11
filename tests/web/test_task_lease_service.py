@@ -1746,7 +1746,7 @@ def test_task_lease_snapshot_carries_the_routing_epoch() -> None:
     """A routing key includes the epoch; it must resolve to a local holder."""
     from types import SimpleNamespace
 
-    from xagent.web.api.websocket import _task_lease_snapshot
+    from xagent.web.services.task_command_execution import _task_lease_snapshot
 
     row = SimpleNamespace(
         id=7,

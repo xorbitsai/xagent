@@ -30,6 +30,11 @@ class TaskChatMessage(Base):  # type: ignore
     content = Column(Text, nullable=False)
     message_type = Column(String(64), nullable=False)
     interactions = Column(JSON, nullable=True)
+    # Identity of the assistant TraceEvent this row was written from, so
+    # historical replay can drop the trace twin of a question instead of
+    # printing the same clarification form twice (#2292). NULL on rows
+    # written before the column existed; replay derives those instead.
+    source_event_id = Column(String(255), nullable=True)
     # Stable per-user-turn identity shared with user_message trace events. Used
     # by historical replay to reconcile trace rows with transcript rows without
     # collapsing distinct turns that happen to share text/attachments.

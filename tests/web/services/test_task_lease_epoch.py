@@ -10,11 +10,12 @@ from tests.web.services.test_task_execution_event_store import engine as engine_
 from tests.web.services.test_task_execution_event_store import (
     task_id as task_id_fixture,
 )
-from xagent.web.api.websocket import _task_lease_snapshot
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.services import agent_service_manager as agent_runtime_service
 from xagent.web.services import task_execution as task_execution_service
 from xagent.web.services import task_lease_service as leases
+from xagent.web.services import task_resume
+from xagent.web.services.task_command_execution import _task_lease_snapshot
 
 engine = engine_fixture
 task_id = task_id_fixture
@@ -219,8 +220,6 @@ def test_old_acquisition_cannot_commit_any_execution_result(
     from xagent.core.agent.checkpoint import CHECKPOINT_EVENT_TYPE, CHECKPOINT_TYPE
     from xagent.core.agent.runner import UserMessageInjectionOutcome
     from xagent.core.agent.trace import TraceEvent as CoreTraceEvent
-    from xagent.web.api import a2a
-    from xagent.web.api.v1 import task_reply
     from xagent.web.models.chat_message import TaskChatMessage
     from xagent.web.models.task import TraceEvent
     from xagent.web.models.task_execution_event import TaskExecutionEvent
@@ -233,8 +232,7 @@ def test_old_acquisition_cannot_commit_any_execution_result(
     factory, tid = lease_database
     monkeypatch.setattr(task_execution_service, "get_db", lambda: iter([factory()]))
     monkeypatch.setattr(task_execution_service, "get_session_local", lambda: factory)
-    monkeypatch.setattr(a2a, "get_session_local", lambda: factory)
-    monkeypatch.setattr(task_reply, "get_session_local", lambda: factory)
+    monkeypatch.setattr(task_resume, "get_session_local", lambda: factory)
     with factory() as db:
         old = leases.acquire_task_lease(db, tid, runner_id="worker", new_run=True)
         current = leases.acquire_task_lease(
@@ -289,11 +287,11 @@ def test_old_acquisition_cannot_commit_any_execution_result(
                 tid, "stale", task_lease=old
             )
         elif writer == "a2a_input":
-            assert not a2a._update_a2a_resume_input_sync(
+            assert not task_resume._update_a2a_resume_input_sync(
                 old, "stale", None, UserMessageInjectionOutcome.NOT_POSTED
             )
         elif writer == "reply_input":
-            assert not task_reply._update_reply_input_sync(old, "stale", None)
+            assert not task_resume._update_reply_input_sync(old, "stale", None)
         elif writer == "usage":
             from xagent.web.tracking.task_tracker import (
                 TokenUsage,

@@ -64,6 +64,29 @@ class TestDeepSeekLLM:
         with pytest.raises(ValueError, match="Unsupported DeepSeek model"):
             DeepSeekLLM(model_name="not-a-deepseek-model", api_key="test-api-key")
 
+    @pytest.mark.asyncio
+    async def test_stable_flash_name_is_forwarded_to_direct_api(self, mocker):
+        message = SimpleNamespace(content="ok", tool_calls=None, reasoning_content=None)
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=message)],
+            usage=None,
+            model_dump=lambda: {"id": "deepseek-stable-flash"},
+        )
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = response
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = DeepSeekLLM(model_name="deepseek-flash", api_key="test-api-key")
+        result = await llm.chat([{"role": "user", "content": "Hello"}])
+
+        assert result["content"] == "ok"
+        assert mock_client.chat.completions.create.call_args.kwargs["model"] == (
+            "deepseek-flash"
+        )
+
     def test_structured_output_capabilities(self, llm):
         assert llm.supports_json_schema_response_format is False
         assert llm.supports_json_object_response_format is True
@@ -928,10 +951,11 @@ class TestDeepSeekLLM:
         }
 
     @pytest.mark.asyncio
-    async def test_list_available_models_returns_curated_v4_models(self):
+    async def test_list_available_models_returns_curated_models(self):
         models = await DeepSeekLLM.list_available_models("test-api-key")
 
         assert [model["id"] for model in models] == [
+            "deepseek-flash",
             "deepseek-v4-flash",
             "deepseek-v4-pro",
         ]

@@ -46,8 +46,10 @@ from xagent.core.execution_scope import (
 )
 from xagent.core.workspace import scoped_user_root
 from xagent.web.api import websocket as websocket_api
+from xagent.web.api.websocket import _make_command_reply
 from xagent.web.models.task import TaskStatus
 from xagent.web.services import agent_service_manager as agent_runtime_service
+from xagent.web.services import task_command_execution as command_execution_service
 from xagent.web.services import task_execution as task_execution_service
 from xagent.web.services import task_setup_snapshot as snapshot_module
 from xagent.web.services.agent_service_manager import AgentServiceManager
@@ -179,13 +181,15 @@ async def test_pause_cache_miss_builds_under_resolver_namespace_not_snapshot(
         )
         stack.enter_context(
             patch.object(
-                websocket_api, "_apply_pause_requested_isolated", lambda *a, **k: True
+                command_execution_service,
+                "_apply_pause_requested_isolated",
+                lambda *a, **k: True,
             )
         )
         _enter_build_only_patches(stack, manager)
         try:
-            await websocket_api._handle_pause_task_unserialized(
-                MagicMock(),
+            await command_execution_service.pause_task(
+                _make_command_reply(MagicMock()),
                 TASK_ID,
                 {"user": SimpleNamespace(id=OWNER_ID, is_admin=False)},
             )
@@ -272,7 +276,9 @@ async def test_resume_cache_miss_builds_under_resolver_namespace_not_snapshot(
         # task row, so answer "no foreign owner" explicitly.
         stack.enter_context(
             patch.object(
-                websocket_api, "task_has_live_foreign_runner", return_value=False
+                command_execution_service,
+                "task_has_live_foreign_runner",
+                return_value=False,
             )
         )
         stack.enter_context(
@@ -283,8 +289,8 @@ async def test_resume_cache_miss_builds_under_resolver_namespace_not_snapshot(
             )
         )
         _enter_build_only_patches(stack, manager)
-        await websocket_api._handle_resume_task_unserialized(
-            MagicMock(),
+        await command_execution_service.resume_task(
+            _make_command_reply(MagicMock()),
             TASK_ID,
             {"user": SimpleNamespace(id=OWNER_ID, is_admin=False)},
         )
@@ -349,8 +355,8 @@ async def test_pause_abstention_mismatch_fails_closed_with_no_workspace_residue(
         )
         _enter_build_only_patches(stack, manager)
         with pytest.raises(ExecutionScopeAbstentionMismatchError):
-            await websocket_api._handle_pause_task_unserialized(
-                MagicMock(),
+            await command_execution_service.pause_task(
+                _make_command_reply(MagicMock()),
                 TASK_ID,
                 {"user": SimpleNamespace(id=OWNER_ID, is_admin=False)},
             )
@@ -404,7 +410,9 @@ async def test_pause_cache_hit_returns_running_agent_without_new_namespace(
         stack.enter_context(patch.object(websocket_api, "manager", connection_manager))
         stack.enter_context(
             patch.object(
-                websocket_api, "_apply_pause_requested_isolated", lambda *a, **k: True
+                command_execution_service,
+                "_apply_pause_requested_isolated",
+                lambda *a, **k: True,
             )
         )
         stack.enter_context(
@@ -423,8 +431,8 @@ async def test_pause_cache_hit_returns_running_agent_without_new_namespace(
             patch("xagent.web.sandbox_manager.get_sandbox_manager", return_value=None)
         )
         try:
-            await websocket_api._handle_pause_task_unserialized(
-                MagicMock(),
+            await command_execution_service.pause_task(
+                _make_command_reply(MagicMock()),
                 TASK_ID,
                 {"user": SimpleNamespace(id=OWNER_ID, is_admin=False)},
             )

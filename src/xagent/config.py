@@ -223,6 +223,7 @@ OPENROUTER_OFFICIAL_PROVIDERS_ONLY = "XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY"
 XROUTER_EXCLUDED_MODELS = "XAGENT_XROUTER_EXCLUDED_MODELS"
 MCP_OAUTH_ALLOW_PRIVATE_HOSTS = "XAGENT_MCP_OAUTH_ALLOW_PRIVATE_HOSTS"
 MCP_OAUTH_PROXY_URL = "XAGENT_MCP_OAUTH_PROXY_URL"
+TOBY_PERSONAL_STDIO_ENABLED = "XAGENT_TOBY_PERSONAL_STDIO_ENABLED"
 TRUSTED_EGRESS_PROXY = "XAGENT_TRUSTED_EGRESS_PROXY"
 
 TOOL_MAX_OUTPUT_LENGTH = "XAGENT_TOOL_MAX_OUTPUT_LENGTH"
@@ -688,6 +689,12 @@ def get_mcp_oauth_allow_private_hosts() -> bool:
     servers. Production deployments should leave it disabled.
     """
     return _get_bool_env(MCP_OAUTH_ALLOW_PRIVATE_HOSTS, False)
+
+
+def get_toby_personal_stdio_enabled() -> bool:
+    """Return whether trusted Toby actor executions may use personal stdio."""
+
+    return _get_bool_env(TOBY_PERSONAL_STDIO_ENABLED, False)
 
 
 def get_trusted_egress_proxy_enabled() -> bool:

@@ -374,6 +374,10 @@ import {
   shouldBufferMessageForHistoricalReplay,
 } from "@/lib/streaming-final-answer"
 import { extractSharedChatResponse } from "@/lib/chat-response"
+import {
+  isStableAssistantMessageId,
+  stableAssistantMessageId,
+} from "@/lib/assistant-message-identity"
 
 // Unique ID generator for messages
 let messageIdCounter = 0
@@ -1413,6 +1417,39 @@ function projectAppState(state: AppState, action: AppAction): AppState {
           if (streamingIndex >= 0) {
             return replaceMessageAt(streamingIndex)
           }
+        }
+      }
+
+      // One assistant question can be delivered twice -- live, then replayed
+      // from the transcript after a reconnect -- under one event identity but
+      // with different text, because the replayed copy carries the rendered
+      // interaction list. Identity decides, never text: #2250 is the record
+      // of what text matching costs. The mounted bubble is kept rather than
+      // replaced so an open clarification form is not remounted under the
+      // visitor; the re-delivery only fills in what the bubble lacks. Content
+      // is deliberately not among those fields: one event id is one question,
+      // and the replayed copy differs only by the rendered interaction list
+      // the form already draws.
+      if (messageToAdd.role === "assistant" && isStableAssistantMessageId(messageToAdd.id)) {
+        const deliveredIndex = state.messages.findIndex(
+          message => message.role === "assistant" && message.id === messageToAdd.id,
+        )
+        if (deliveredIndex >= 0) {
+          const updatedMessages = state.messages.map((message, index) =>
+            index === deliveredIndex
+              ? {
+                ...message,
+                interactions: message.interactions ?? messageToAdd.interactions,
+                interactionRequestId:
+                  message.interactionRequestId ?? messageToAdd.interactionRequestId,
+                traceEvents: mergeTraceEventsById(
+                  message.traceEvents,
+                  messageToAdd.traceEvents,
+                ),
+              }
+              : message
+          )
+          return { ...state, messages: updatedMessages, traceEvents: newTraceEvents }
         }
       }
 
@@ -3249,7 +3286,12 @@ export function AppProvider({
             )) {
               return
             }
-            const msgId = generateMessageId("msg-agent")
+            const msgId =
+              (isAgentMessage
+                ? stableAssistantMessageId(
+                  message.event_id || traceEventData.event_id || eventData.event_id,
+                )
+                : null) ?? generateMessageId("msg-agent")
             dispatch({
               type: "ADD_MESSAGE",
               payload: {

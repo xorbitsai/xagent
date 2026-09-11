@@ -1781,7 +1781,7 @@ async def startup_event() -> None:
 
     # Recover accepted-but-unfinished task commands only after the runtime,
     # skill/template managers, tracing, and sandbox services are ready.
-    from .api.websocket import execute_durable_task_command
+    from .services.task_command_execution import execute_durable_task_command
     from .services.task_command_transport import start_task_command_dispatcher
 
     global _task_command_dispatcher_task

@@ -202,16 +202,21 @@ async def test_waiting_return_via_tool_carries_tool_waiting_draft() -> None:
 
 
 @pytest.mark.asyncio
-async def test_empty_message_send_message_reaches_waiting_with_no_draft() -> None:
+async def test_empty_message_send_message_still_yields_an_answerable_draft() -> None:
     """A ``send_message`` call with an empty ``message`` and
     ``expect_response=True`` is schema-valid (the tool only requires the
     ``message`` key to be present, not non-empty) and reaches
-    ``waiting_for_user`` with no derivable draft.
+    ``waiting_for_user``.
 
-    This is the reachable production case documented on
-    ``draft_from_waiting_request``: the waiting request carries no message,
-    no ``"interactions"`` key, and no ``"requests"`` list, so
-    ``clarification_draft`` is ``None`` rather than a typed draft.
+    It used to derive no draft at all -- no message, no ``"interactions"``
+    key, no ``"requests"`` list -- which is the worst version of the bug the
+    default free-text field exists for: nothing to read and nothing to answer
+    with. The appended field now supplies the ``"interactions"`` key, so a
+    draft is derivable. Only the draft: a blank message is still refused
+    downstream (``resolve_publishable_clarification`` returns
+    ``NotApplicable("empty_question")``, and ``websocket.py`` persists no chat
+    row for an empty message), so this case ends the turn with an answerable
+    field published and nothing durable holding it.
     """
 
     llm = FakeLLM(
@@ -239,7 +244,11 @@ async def test_empty_message_send_message_reaches_waiting_with_no_draft() -> Non
     result = await pattern.run(context=context, tools=[], llm=llm)
 
     assert result["status"] == "waiting_for_user"
-    assert result["clarification_draft"] is None
+    draft = result["clarification_draft"]
+    assert draft is not None
+    assert draft.source == "send_message"
+    assert draft.message == ""
+    assert [item["field"] for item in draft.interactions] == ["response"]
 
 
 @pytest.mark.asyncio

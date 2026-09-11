@@ -45,6 +45,10 @@ from xagent.web.models.task import DAGExecution, Task, TaskStatus, TraceEvent
 from xagent.web.models.user import User
 from xagent.web.services.agent_service_manager import AgentServiceManager
 from xagent.web.services.llm_utils import AutoModelUnavailableError
+from xagent.web.services.mcp_runtime import (
+    MCPActorAuthorizationPolicy,
+    MCPActorExecutionIdentity,
+)
 from xagent.web.services.task_setup_snapshot import (
     RuntimeUserFields,
     TaskOwnerMismatchError,
@@ -189,7 +193,11 @@ def _build_db(
     return db
 
 
-def _stub_downstream(manager: AgentServiceManager):
+def _stub_downstream(
+    manager: AgentServiceManager,
+    *,
+    create_tools: AsyncMock | None = None,
+):
     """Patch the heavy work past the reconstruct decision so the test
     asserts only on whether reconstruct was called.
 
@@ -228,7 +236,7 @@ def _stub_downstream(manager: AgentServiceManager):
         ),
         patch(
             "xagent.web.services.agent_service_manager.create_default_tools",
-            new=AsyncMock(return_value=([], MagicMock())),
+            new=create_tools or AsyncMock(return_value=([], MagicMock())),
         ),
         patch(
             "xagent.web.sandbox_manager.get_sandbox_manager",
@@ -236,6 +244,41 @@ def _stub_downstream(manager: AgentServiceManager):
         ),
         patch("xagent.web.services.agent_service_manager.AgentService"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_fresh_actor_tool_build_receives_explicit_execution_identity() -> None:
+    manager = AgentServiceManager()
+    user = _make_user()
+    task = _make_task(TaskStatus.RUNNING, agent_id=7)
+    task.agent_config = {
+        "__xagent_mcp_runtime_authorization_policy_required": True,
+        "mcp_runtime_authorization_policy_identity": "actor:alice",
+    }
+    snapshot = _build_snapshot(task, user)
+    create_tools = AsyncMock(return_value=([], MagicMock()))
+    identity = MCPActorExecutionIdentity(
+        task_id=42,
+        run_id="run-a",
+        turn_id="turn-a",
+        lease_attempt_id="attempt-a",
+    )
+    policy = MCPActorAuthorizationPolicy(
+        resource_owner_key="actor:alice",
+        allow_builtin_stdio=True,
+    )
+
+    with _Patches(_stub_downstream(manager, create_tools=create_tools)):
+        await manager.get_agent_for_task(
+            task_id=42,
+            db=_build_db(task, agent=_make_agent(), user=user),
+            user=user,
+            task_setup_snapshot=snapshot,
+            mcp_runtime_authorization_policy=policy,
+            mcp_actor_execution_identity=identity,
+        )
+
+    assert create_tools.await_args.kwargs["mcp_actor_execution_identity"] is identity
 
 
 @pytest.mark.asyncio
@@ -338,6 +381,7 @@ async def test_running_with_prior_trace_event_runs_reconstruct() -> None:
         task_setup_snapshot=snapshot,
         connector_runtime_turn_id=None,
         mcp_runtime_authorization_policy=None,
+        mcp_actor_execution_identity=None,
     )
     snapshot_loader.assert_called_once_with(42, None)
 
@@ -490,6 +534,7 @@ async def test_running_with_dag_plan_runs_reconstruct() -> None:
         task_setup_snapshot=snapshot,
         connector_runtime_turn_id=None,
         mcp_runtime_authorization_policy=None,
+        mcp_actor_execution_identity=None,
     )
     snapshot_loader.assert_called_once_with(42, None)
 
@@ -539,6 +584,7 @@ async def test_paused_with_no_history_still_runs_reconstruct() -> None:
         task_setup_snapshot=snapshot,
         connector_runtime_turn_id=None,
         mcp_runtime_authorization_policy=None,
+        mcp_actor_execution_identity=None,
     )
     snapshot_loader.assert_called_once_with(42, None)
 
@@ -584,6 +630,7 @@ async def test_waiting_for_user_with_no_history_still_runs_reconstruct() -> None
         task_setup_snapshot=snapshot,
         connector_runtime_turn_id=None,
         mcp_runtime_authorization_policy=None,
+        mcp_actor_execution_identity=None,
     )
     snapshot_loader.assert_called_once_with(42, None)
 
@@ -624,10 +671,12 @@ async def test_reconstruct_return_path_syncs_connector_runtime_turn() -> None:
         task_setup_snapshot: TaskSetupSnapshot | None = None,
         connector_runtime_turn_id: str | None = None,
         mcp_runtime_authorization_policy: Any = None,
+        mcp_actor_execution_identity: Any = None,
     ) -> None:
         assert task_setup_snapshot is snapshot
         assert connector_runtime_turn_id == "turn-reconstructed"
         assert mcp_runtime_authorization_policy is None
+        assert mcp_actor_execution_identity is None
         manager._agents[task_id] = reconstructed_agent
 
     with (

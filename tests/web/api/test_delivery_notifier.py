@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from xagent.web.api import websocket
+from xagent.web.services import task_command_execution
 
 
 @pytest.mark.asyncio
@@ -14,9 +14,11 @@ async def test_delivery_notifier_forwards_identity_and_outcome(
     monkeypatch, turn_id, accepted
 ):
     send = AsyncMock()
-    monkeypatch.setattr(websocket, "send_message_delivery", send)
-    connection = object()
-    notifier = websocket.make_delivery_notifier(connection, "client-message")
+    monkeypatch.setattr(task_command_execution, "send_message_delivery", send)
+    connection = AsyncMock()
+    notifier = task_command_execution.make_delivery_notifier(
+        connection, "client-message"
+    )
     assert notifier is not None
     outcome = {
         "accepted": accepted,
@@ -35,4 +37,4 @@ async def test_delivery_notifier_forwards_identity_and_outcome(
 
 
 def test_delivery_notifier_without_client_message_id():
-    assert websocket.make_delivery_notifier(object(), None) is None
+    assert task_command_execution.make_delivery_notifier(AsyncMock(), None) is None

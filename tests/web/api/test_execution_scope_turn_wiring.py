@@ -38,10 +38,11 @@ from xagent.core.execution_scope import (
     get_execution_scope,
     set_execution_scope_snapshot_loader,
 )
-from xagent.web.api.websocket import _handle_resume_task_unserialized
+from xagent.web.api.websocket import _make_command_reply
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
 from xagent.web.services.client_error_messages import CLIENT_SAFE_TASK_FAILURE
+from xagent.web.services.task_command_execution import resume_task
 from xagent.web.services.task_execution import (
     ResumeReservationOutcome,
     _acquire_resume_task_lease,
@@ -630,7 +631,7 @@ async def test_resume_handler_resolves_scope_once_off_loop_for_agent_lookup() ->
             # live lease before scheduling; this suite drives it without a
             # task row, so answer "no foreign owner" explicitly.
             patch(
-                "xagent.web.api.websocket.task_has_live_foreign_runner",
+                "xagent.web.services.task_command_execution.task_has_live_foreign_runner",
                 return_value=False,
             ),
             patch(
@@ -639,8 +640,8 @@ async def test_resume_handler_resolves_scope_once_off_loop_for_agent_lookup() ->
             ),
         ]
     ):
-        await _handle_resume_task_unserialized(
-            MagicMock(),
+        await resume_task(
+            _make_command_reply(MagicMock()),
             42,
             {"user": SimpleNamespace(id=1, is_admin=False)},
         )
@@ -735,7 +736,7 @@ async def test_resume_survives_a_scope_authority_mismatch() -> None:
             # live lease before scheduling; this suite drives it without a
             # task row, so answer "no foreign owner" explicitly.
             patch(
-                "xagent.web.api.websocket.task_has_live_foreign_runner",
+                "xagent.web.services.task_command_execution.task_has_live_foreign_runner",
                 return_value=False,
             ),
             patch(
@@ -744,8 +745,8 @@ async def test_resume_survives_a_scope_authority_mismatch() -> None:
             ),
         ]
     ):
-        await _handle_resume_task_unserialized(
-            MagicMock(),
+        await resume_task(
+            _make_command_reply(MagicMock()),
             42,
             {"user": SimpleNamespace(id=1, is_admin=False)},
         )

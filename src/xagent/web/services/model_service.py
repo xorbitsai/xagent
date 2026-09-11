@@ -197,8 +197,10 @@ def get_default_vision_model(
                 admin_vision_defaults = (
                     model_db.query(UserDefaultModel)
                     .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                    .join(DBModel, UserDefaultModel.model_id == DBModel.id)
                     .filter(
                         UserDefaultModel.config_type == "visual",
+                        DBModel.is_active,
                         UserModel.is_shared.is_(True),
                         UserDefaultModel.user_id.in_(
                             _get_visible_user_ids(model_db, user_id)
@@ -267,8 +269,10 @@ def get_default_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
             admin_defaults = (
                 db.query(UserDefaultModel)
                 .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                .join(DBModel, UserDefaultModel.model_id == DBModel.id)
                 .filter(
                     UserDefaultModel.config_type == "general",
+                    DBModel.is_active,
                     UserModel.is_shared.is_(True),
                     UserDefaultModel.user_id.in_(_get_visible_user_ids(db, user_id)),
                 )
@@ -335,8 +339,10 @@ def get_fast_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
             admin_fast_defaults = (
                 db.query(UserDefaultModel)
                 .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                .join(DBModel, UserDefaultModel.model_id == DBModel.id)
                 .filter(
                     UserDefaultModel.config_type == "small_fast",
+                    DBModel.is_active,
                     UserModel.is_shared.is_(True),
                     UserDefaultModel.user_id.in_(_get_visible_user_ids(db, user_id)),
                 )
@@ -403,8 +409,10 @@ def get_compact_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
             admin_compact_defaults = (
                 db.query(UserDefaultModel)
                 .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                .join(DBModel, UserDefaultModel.model_id == DBModel.id)
                 .filter(
                     UserDefaultModel.config_type == "compact",
+                    DBModel.is_active,
                     UserModel.is_shared.is_(True),
                     UserDefaultModel.user_id.in_(_get_visible_user_ids(db, user_id)),
                 )
@@ -472,8 +480,10 @@ def get_embedding_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
             admin_embedding_defaults = (
                 db.query(UserDefaultModel)
                 .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                .join(DBModel, UserDefaultModel.model_id == DBModel.id)
                 .filter(
                     UserDefaultModel.config_type == "embedding",
+                    DBModel.is_active,
                     UserModel.is_shared.is_(True),
                     UserDefaultModel.user_id.in_(_get_visible_user_ids(db, user_id)),
                 )
@@ -774,6 +784,7 @@ def get_default_image_generate_model(
                     .join(DBModel, UserModel.model_id == DBModel.id)
                     .filter(
                         UserDefaultModel.config_type == "image",
+                        DBModel.is_active,
                         UserModel.is_shared.is_(True),
                         UserDefaultModel.user_id.in_(
                             _get_visible_user_ids(model_db, user_id)
@@ -865,8 +876,10 @@ def get_default_image_edit_model(
                 admin_image_defaults = (
                     model_db.query(UserDefaultModel)
                     .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                    .join(DBModel, UserDefaultModel.model_id == DBModel.id)
                     .filter(
                         UserDefaultModel.config_type == "image_edit",
+                        DBModel.is_active,
                         UserModel.is_shared.is_(True),
                         UserDefaultModel.user_id.in_(
                             _get_visible_user_ids(model_db, user_id)
@@ -1040,8 +1053,10 @@ def get_default_embedding_model(
         admin_embedding_defaults = (
             model_db.query(UserDefaultModel)
             .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+            .join(DBModel, UserDefaultModel.model_id == DBModel.id)
             .filter(
                 UserDefaultModel.config_type == "embedding",
+                DBModel.is_active,
                 UserModel.is_shared.is_(True),
                 UserDefaultModel.user_id.in_(_get_visible_user_ids(model_db, user_id)),
             )
@@ -1091,8 +1106,10 @@ def get_default_rerank_model(
             admin_rerank_defaults = (
                 model_db.query(UserDefaultModel)
                 .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                .join(DBModel, UserDefaultModel.model_id == DBModel.id)
                 .filter(
                     UserDefaultModel.config_type == "rerank",
+                    DBModel.is_active,
                     UserModel.is_shared.is_(True),
                     UserDefaultModel.user_id.in_(
                         _get_visible_user_ids(model_db, user_id)
@@ -1366,6 +1383,7 @@ def get_default_asr_model(
                     .join(DBModel, UserModel.model_id == DBModel.id)
                     .filter(
                         UserDefaultModel.config_type == "asr",
+                        DBModel.is_active,
                         UserModel.is_shared.is_(True),
                         UserDefaultModel.user_id.in_(
                             _get_visible_user_ids(model_db, user_id)
@@ -1442,6 +1460,7 @@ def get_default_tts_model(
                     .join(DBModel, UserModel.model_id == DBModel.id)
                     .filter(
                         UserDefaultModel.config_type == "tts",
+                        DBModel.is_active,
                         UserModel.is_shared.is_(True),
                         UserDefaultModel.user_id.in_(
                             _get_visible_user_ids(model_db, user_id)

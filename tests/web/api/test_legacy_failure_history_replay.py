@@ -163,7 +163,7 @@ def _history_cache_entry(task_id: int, events: list[dict]) -> dict[str, object]:
             or 0
         )
         return {
-            "trace_scope": "public-v1",
+            "trace_scope": "public-v2",
             "updated_at": cache_version_token(task.updated_at),
             "max_trace_event_id": 0,
             "max_chat_message_id": int(max_chat_message_id),

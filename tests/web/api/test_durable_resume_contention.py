@@ -14,12 +14,16 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from xagent.web.api import websocket as websocket_api
-from xagent.web.api.websocket import ResumeCommandOutcome, _execute_durable_task_command
 from xagent.web.models.database import Base, get_db, get_engine, init_db
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.user import User
+from xagent.web.services import task_command_execution as command_execution_service
 from xagent.web.services import task_execution as task_execution_service
+from xagent.web.services.task_command_execution import (
+    ResumeCommandOutcome,
+    _execute_durable_task_command,
+)
 from xagent.web.services.task_command_transport import (
     COMMAND_PENDING,
     ClaimedTaskCommand,
@@ -132,12 +136,21 @@ def _resume_runtime_patches(
     stack.enter_context(patch.object(websocket_api, "manager", connection_manager))
     stack.enter_context(
         patch.object(
+            websocket_api._command_origins,
+            "resolve",
+            return_value=MagicMock(name="verified-command-origin"),
+        )
+    )
+    stack.enter_context(
+        patch.object(
             task_execution_service, "background_task_manager", background_manager
         )
     )
     stack.enter_context(
         patch.object(
-            websocket_api, "resolve_execution_scope_off_turn", return_value=None
+            command_execution_service,
+            "resolve_execution_scope_off_turn",
+            return_value=None,
         )
     )
     with stack:
@@ -493,7 +506,7 @@ async def test_settling_turn_with_a_foreign_live_lease_defers_resume(
     db_session.commit()
 
     with (
-        caplog.at_level(logging.INFO, logger="xagent.web.api.websocket"),
+        caplog.at_level(logging.INFO, logger=command_execution_service.__name__),
         _resume_runtime_patches(outcome=ResumeReservationOutcome.RESERVED) as (
             _background_manager,
             _connection_manager,
@@ -505,7 +518,7 @@ async def test_settling_turn_with_a_foreign_live_lease_defers_resume(
         # deferral broadcast reduced to the generic string is indistinguishable
         # from an outright failure.
         with pytest.raises(
-            websocket_api.ClientVisibleTaskCommandDeferred,
+            command_execution_service.ClientVisibleTaskCommandDeferred,
             match="active task lease owner",
         ):
             await _execute_durable_task_command(
@@ -713,7 +726,9 @@ async def test_two_concurrent_durable_resumes_schedule_one_execution(
         patch.object(websocket_api, "manager", connection_manager),
         patch.object(task_execution_service, "background_task_manager", real_manager),
         patch.object(
-            websocket_api, "resolve_execution_scope_off_turn", return_value=None
+            command_execution_service,
+            "resolve_execution_scope_off_turn",
+            return_value=None,
         ),
         patch.object(
             websocket_api.task_execution_controller, "transition", new=transition
@@ -956,7 +971,7 @@ async def test_resume_defers_when_the_row_moves_under_the_admission_snapshot(
             return None
 
         with patch.object(
-            websocket_api,
+            command_execution_service,
             "resolve_execution_scope_off_turn",
             side_effect=land_cancel_then_resolve,
         ):

@@ -36,6 +36,7 @@ from xagent.web.api import websocket as websocket_api
 from xagent.web.api.v1 import tasks as v1_tasks
 from xagent.web.api.v1.errors import V1ApiError
 from xagent.web.models.user import User
+from xagent.web.services import task_command_execution
 from xagent.web.services.managed_file_ref import (
     _MAX_LOG_VALUE_LENGTH,
     DURABLE_FAULT_LOG_PREFIX,
@@ -851,7 +852,7 @@ def test_chat_is_unlabelled_only_because_its_arms_report_first() -> None:
     """The omission above must stay true of the handler, not just of a comment.
 
     Leaving ``chat`` out of the label map is only correct while every
-    ``DurableStorageOperationError`` arm in ``_handle_chat_message_unserialized``
+    ``DurableStorageOperationError`` arm in ``handle_task_message``
     that re-raises calls ``log_durable_storage_fault`` first: the logger marks
     the instance, so the endpoint-level call stays a no-op. If an arm stops
     logging before its bare ``raise``, the fault reaches the endpoint arm
@@ -865,12 +866,10 @@ def test_chat_is_unlabelled_only_because_its_arms_report_first() -> None:
     test proves that every statement of the handler sits inside a durable
     ``try``.
     """
-    func = _function_named(
-        _module_ast(websocket_api), "_handle_chat_message_unserialized"
-    )
+    func = _function_named(_module_ast(task_command_execution), "handle_task_message")
     durable_arms = _arms_catching(func, "DurableStorageOperationError")
     assert durable_arms, (
-        "_handle_chat_message_unserialized no longer has a "
+        "handle_task_message no longer has a "
         "DurableStorageOperationError arm, so a chat fault reaches the endpoint "
         "arm unreported and 'chat' needs a label in _DISPATCH_OPERATIONS again"
     )
@@ -955,7 +954,8 @@ def test_a_type_is_unlabelled_only_because_its_handler_swallows(
 # not derived.)
 _MODULES_WITH_DURABLE_ARM_PAIRS = (
     ("web/api/files.py", 7, lambda: files_api),
-    ("web/api/websocket.py", 3, lambda: websocket_api),
+    ("web/api/websocket.py", 1, lambda: websocket_api),
+    ("web/services/task_command_execution.py", 2, lambda: task_command_execution),
     ("web/api/v1/tasks.py", 1, lambda: v1_tasks),
     (
         "core/tools/adapters/vibe/file_ingestion_tool.py",
@@ -994,11 +994,15 @@ _DIRECT_HELPER_SITES = frozenset(
             ("task_id", "owner_user_id", "file_ids"),
         ),
         (
-            "web/api/websocket.py",
+            "web/services/task_command_execution.py",
             "websocket chat turn preparation",
             ("task_id",),
         ),
-        ("web/api/websocket.py", "websocket agent execution", ("task_id",)),
+        (
+            "web/services/task_command_execution.py",
+            "websocket agent execution",
+            ("task_id",),
+        ),
         (
             "core/tools/adapters/vibe/file_ingestion_tool.py",
             "knowledge-base file restore",
@@ -1125,9 +1129,7 @@ def test_the_inner_durable_arms_still_notify_the_task() -> None:
     #1522 covers), so this pins the routing rather than the frames. It fails
     if an arm reverts to calling ``finish_delivery_failure`` directly.
     """
-    func = _function_named(
-        _module_ast(websocket_api), "_handle_chat_message_unserialized"
-    )
+    func = _function_named(_module_ast(task_command_execution), "handle_task_message")
     inner_arms = [
         arm
         for arm in _arms_catching(func, "DurableStorageOperationError")
@@ -1201,14 +1203,16 @@ def test_the_integrity_arm_precedes_its_parent_at_every_site(
     ``preview_file`` and the first ``public_preview_file`` pair (by the five
     ``*_checksum_mismatch_asks_user_to_reupload`` tests), ``v1/tasks.py`` and
     ``file_ingestion_tool`` (by the real-path injections in this file and
-    ``test_kb_creation_tools``), and the outer ``websocket.py`` pair (by
+    ``test_kb_creation_tools``), and the outer ``task_command_execution.py``
+    pair (by
     ``test_a_durable_integrity_fault_is_answered_as_corruption_not_an_outage``).
 
     The five where a swapped or deleted arm changes behaviour with no
     behavioural test failing are ``preview_pptx_as_pdf``,
     ``public_download_file``, the second ``public_preview_file`` pair (the
-    task-asset one), and the two remaining ``websocket.py`` pairs -- the inner
-    agent-execution one and the endpoint-level one. Those are what this check
+    task-asset one), and the two remaining pairs -- the inner agent-execution
+    one in ``task_command_execution.py`` and the endpoint-level one in
+    ``websocket.py``. Those are what this check
     is load-bearing for; giving them real end-to-end coverage is #1522.
 
     This does not replace the behavioural tests: it proves ordering, not that

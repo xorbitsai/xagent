@@ -21,6 +21,7 @@ from xagent.web.models.agent import Agent
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.task_command_terminal_event import TaskCommandTerminalEvent
+from xagent.web.services import task_command_execution as command_execution_service
 from xagent.web.services import task_execution as task_execution_service
 from xagent.web.services.external_task_input import (
     EXTERNAL_INPUT_NOT_APPLIED_MESSAGE,
@@ -128,7 +129,7 @@ def _forbid_first_party_chat(monkeypatch: pytest.MonkeyPatch) -> None:
             "the first-party chat core must not run for a scoped MESSAGE"
         )
 
-    monkeypatch.setattr(websocket_api, "_handle_chat_message_unserialized", _fail)
+    monkeypatch.setattr(command_execution_service, "handle_task_message", _fail)
 
 
 # ---------------------------------------------------------------------------
@@ -206,7 +207,7 @@ async def test_external_scope_message_routes_to_the_registered_executor(
         payload={"scope": "external", "message": "the answer"}
     )
 
-    result = await websocket_api._execute_durable_task_command(command)
+    result = await command_execution_service._execute_durable_task_command(command)
 
     assert observed == [command]
     assert result == {"delivered": True}
@@ -234,7 +235,7 @@ async def test_external_scope_message_deferral_crosses_the_adapter(
     )
 
     with pytest.raises(TaskCommandDeferred, match="resume lease"):
-        await websocket_api._execute_durable_task_command(command)
+        await command_execution_service._execute_durable_task_command(command)
 
 
 @pytest.mark.asyncio
@@ -253,7 +254,7 @@ async def test_external_scope_message_without_a_registered_core_is_terminal(
     )
 
     with pytest.raises(TaskCommandRejected, match="no external input execution core"):
-        await websocket_api._execute_durable_task_command(command)
+        await command_execution_service._execute_durable_task_command(command)
 
 
 @pytest.mark.asyncio
@@ -274,7 +275,7 @@ async def test_foreign_scope_message_is_rejected_terminally(
             payload={"scope": scope_value, "message": "x"}
         )
         with pytest.raises(TaskCommandRejected, match="has no execution core"):
-            await websocket_api._execute_durable_task_command(command)
+            await command_execution_service._execute_durable_task_command(command)
 
 
 @pytest.mark.asyncio
@@ -293,14 +294,14 @@ async def test_scopeless_message_stays_on_the_first_party_path(
     async def record_chat(_ws: Any, task_id: int, _data: dict[str, Any]) -> None:
         first_party_calls.append(task_id)
 
-    monkeypatch.setattr(websocket_api, "_handle_chat_message_unserialized", record_chat)
+    monkeypatch.setattr(command_execution_service, "handle_task_message", record_chat)
     monkeypatch.setattr(
-        websocket_api,
+        command_execution_service,
         "_load_command_actor",
         lambda _actor_id: SimpleNamespace(id=7, is_admin=False),
     )
     monkeypatch.setattr(
-        websocket_api,
+        command_execution_service,
         "_load_command_message_delivery_status",
         lambda _task_id, _turn_id: "dispatched",
     )
@@ -316,7 +317,7 @@ async def test_scopeless_message_stays_on_the_first_party_path(
         attempt_count=1,
     )
 
-    result = await websocket_api._execute_durable_task_command(command)
+    result = await command_execution_service._execute_durable_task_command(command)
 
     assert first_party_calls == [55]
     assert result == {"task_id": 55, "command_id": "chat-1", "kind": "message"}
@@ -413,7 +414,7 @@ async def test_deferred_external_input_spends_the_defer_budget_not_failures() ->
         db.close()
 
     processed = await dispatch_one_task_command(
-        websocket_api.execute_durable_task_command
+        command_execution_service.execute_durable_task_command
     )
     assert processed is True
 
@@ -435,7 +436,7 @@ async def test_deferred_external_input_spends_the_defer_budget_not_failures() ->
         db.close()
 
     processed = await dispatch_one_task_command(
-        websocket_api.execute_durable_task_command
+        command_execution_service.execute_durable_task_command
     )
     assert processed is True
 
@@ -514,7 +515,7 @@ async def test_exhausted_external_deferral_withholds_command_identity(
         db.close()
 
     processed = await dispatch_one_task_command(
-        websocket_api.execute_durable_task_command
+        command_execution_service.execute_durable_task_command
     )
     assert processed is True
 
@@ -621,7 +622,7 @@ async def test_defer_exhaustion_boundary_uses_the_effective_budget(
     # spend budget, not terminalize.
     seed_defer_count(MAX_COMMAND_DEFERS - 1)
     processed = await dispatch_one_task_command(
-        websocket_api.execute_durable_task_command
+        command_execution_service.execute_durable_task_command
     )
     assert processed is True
     broadcast_manager.broadcast_to_task.assert_not_awaited()
@@ -648,7 +649,7 @@ async def test_defer_exhaustion_boundary_uses_the_effective_budget(
     # its broadcast asserts only uncertainty.
     seed_defer_count(budget - 1)
     processed = await dispatch_one_task_command(
-        websocket_api.execute_durable_task_command
+        command_execution_service.execute_durable_task_command
     )
     assert processed is True
 
@@ -728,7 +729,7 @@ async def test_exhausted_generic_failure_reports_an_unconfirmed_outcome(
         db.close()
 
     processed = await dispatch_one_task_command(
-        websocket_api.execute_durable_task_command
+        command_execution_service.execute_durable_task_command
     )
     assert processed is True
 
@@ -822,7 +823,7 @@ async def test_rejected_external_input_broadcasts_and_keeps_the_bound_draft(
         db.close()
 
     processed = await dispatch_one_task_command(
-        websocket_api.execute_durable_task_command
+        command_execution_service.execute_durable_task_command
     )
     assert processed is True
 
@@ -903,7 +904,7 @@ async def test_rejected_external_input_without_a_bound_draft_gets_the_fallback(
         db.close()
 
     processed = await dispatch_one_task_command(
-        websocket_api.execute_durable_task_command
+        command_execution_service.execute_durable_task_command
     )
     assert processed is True
 
@@ -997,7 +998,7 @@ async def test_rejection_broadcast_failure_does_not_supersede_the_disposition(
         db.close()
 
     processed = await dispatch_one_task_command(
-        websocket_api.execute_durable_task_command
+        command_execution_service.execute_durable_task_command
     )
     assert processed is True
     broadcast_manager.broadcast_to_task.assert_awaited()

@@ -66,6 +66,60 @@ class _UploadError(RuntimeError):
     """Upload failure whose message is safe to expose to the caller."""
 
 
+class _QuickXorHash:
+    """Streaming implementation of OneDrive's 160-bit QuickXorHash."""
+
+    _WIDTH_BITS = 160
+    _WIDTH_BYTES = _WIDTH_BITS // 8
+    _MASK = (1 << _WIDTH_BITS) - 1
+
+    def __init__(self) -> None:
+        self._column_xor = 0
+        self._tail = b""
+        self._length = 0
+
+    def update(self, data: bytes) -> None:
+        """Add bytes while reducing full 160-byte periods in C-sized blocks."""
+        self._length += len(data)
+        if self._tail:
+            needed = self._WIDTH_BYTES - len(self._tail)
+            if len(data) < needed:
+                self._tail += data
+                return
+            self._column_xor ^= int.from_bytes(self._tail + data[:needed], "little")
+            data = data[needed:]
+            self._tail = b""
+
+        full_length = len(data) - (len(data) % self._WIDTH_BYTES)
+        view = memoryview(data)
+        for offset in range(0, full_length, self._WIDTH_BYTES):
+            self._column_xor ^= int.from_bytes(
+                view[offset : offset + self._WIDTH_BYTES], "little"
+            )
+        self._tail = bytes(view[full_length:])
+
+    def base64_digest(self) -> str:
+        """Return the Base64 value exposed as ``file.hashes.quickXorHash``."""
+        columns = self._column_xor
+        if self._tail:
+            columns ^= int.from_bytes(self._tail, "little")
+
+        value = 0
+        for index, byte in enumerate(columns.to_bytes(self._WIDTH_BYTES, "little")):
+            shift = (index * 11) % self._WIDTH_BITS
+            rotated = (
+                byte
+                if shift == 0
+                else ((byte << shift) | (byte >> (self._WIDTH_BITS - shift)))
+            )
+            value ^= rotated & self._MASK
+
+        digest = bytearray(value.to_bytes(self._WIDTH_BYTES, "little"))
+        for index, byte in enumerate(self._length.to_bytes(8, "little")):
+            digest[self._WIDTH_BYTES - 8 + index] ^= byte
+        return base64.b64encode(digest).decode("ascii")
+
+
 # stdlib mimetypes.guess_type() only recognizes these extensions when a
 # system mime.types file happens to be installed (e.g. Apache's, common on
 # a dev laptop) -- on a minimal/slim host with no such file (a stripped-down
@@ -234,6 +288,16 @@ def _safe_upload_error_message(exc: BaseException) -> str:
     return f"OneDrive upload failed ({type(exc).__name__})"
 
 
+def _request_error_cause(exc: BaseException) -> BaseException:
+    """Unwrap nested safe errors to their underlying requests exception."""
+    cause = exc
+    seen: set[int] = set()
+    while cause.__cause__ is not None and id(cause) not in seen:
+        seen.add(id(cause))
+        cause = cause.__cause__
+    return cause
+
+
 def _is_retriable_upload_error(exc: BaseException) -> bool:
     """Whether ``exc`` might succeed on another bounded fragment attempt.
 
@@ -241,7 +305,7 @@ def _is_retriable_upload_error(exc: BaseException) -> bool:
     documented retriable statuses (429 and any 5xx) are retriable. The
     HTTPError behind an _UploadError is recovered through ``__cause__``.
     """
-    cause = exc.__cause__ if isinstance(exc, _UploadError) else exc
+    cause = _request_error_cause(exc)
     status_code = getattr(getattr(cause, "response", None), "status_code", None)
     if isinstance(status_code, int):
         return status_code == 429 or 500 <= status_code < 600
@@ -250,7 +314,7 @@ def _is_retriable_upload_error(exc: BaseException) -> bool:
 
 def _upload_retry_delay(exc: BaseException, retry_number: int) -> float:
     """Return a bounded Retry-After or exponential-backoff delay."""
-    cause = exc.__cause__ if isinstance(exc, _UploadError) else exc
+    cause = _request_error_cause(exc)
     response = getattr(cause, "response", None)
     headers = getattr(response, "headers", {}) or {}
     retry_after = headers.get("Retry-After")
@@ -265,7 +329,7 @@ def _upload_retry_delay(exc: BaseException, retry_number: int) -> float:
 
 def _upload_status_code(exc: BaseException) -> int | None:
     """Return an HTTP status from a credential-safe upload error."""
-    cause = exc.__cause__ if isinstance(exc, _UploadError) else exc
+    cause = _request_error_cause(exc)
     status_code = getattr(getattr(cause, "response", None), "status_code", None)
     return status_code if isinstance(status_code, int) else None
 
@@ -283,20 +347,13 @@ def _next_expected_upload_offset(response: Any) -> int:
     return min(offsets)
 
 
-def _upload_item_fingerprint(item: Any) -> tuple[Any, Any, Any, Any] | None:
-    """Return fields that change when an existing destination is replaced."""
-    if not isinstance(item, dict) or not item.get("id"):
-        return None
-    return (item.get("id"), item.get("eTag"), item.get("cTag"), item.get("size"))
-
-
 def _current_upload_item(remote_path: str) -> dict[str, Any] | None:
     """Read destination metadata, treating an absent item as no baseline."""
     try:
         item = _graph_request(
             "GET",
             _item_path(remote_path),
-            params={"$select": "id,name,size,eTag,cTag"},
+            params={"$select": "id,name,size,file"},
         )
     except RuntimeError as exc:
         cause = exc.__cause__
@@ -309,25 +366,38 @@ def _current_upload_item(remote_path: str) -> dict[str, Any] | None:
 def _completed_upload_item(
     remote_path: str,
     total: int,
-    previous_fingerprint: tuple[Any, Any, Any, Any] | None,
+    expected_quickxor_hash: str,
 ) -> dict[str, Any]:
-    """Confirm a final fragment whose response was lost via drive metadata."""
-    try:
-        item = _current_upload_item(remote_path)
-    except Exception as exc:
-        raise _UploadError(
-            "OneDrive upload completed ambiguously and could not be confirmed"
-        ) from exc
-    if (
-        not isinstance(item, dict)
-        or not item.get("id")
-        or item.get("size") != total
-        or _upload_item_fingerprint(item) == previous_fingerprint
-    ):
-        raise _UploadError(
-            "OneDrive upload completed ambiguously and could not be confirmed"
-        )
-    return item
+    """Bind ambiguous completion to the exact uploaded bytes via QuickXorHash."""
+    last_error: BaseException | None = None
+    for attempt in range(1, _UPLOAD_CHUNK_MAX_ATTEMPTS + 1):
+        try:
+            item = _current_upload_item(remote_path)
+            remote_hash = (
+                item.get("file", {}).get("hashes", {}).get("quickXorHash")
+                if isinstance(item, dict)
+                else None
+            )
+            if (
+                isinstance(item, dict)
+                and item.get("id")
+                and item.get("size") == total
+                and remote_hash == expected_quickxor_hash
+            ):
+                return item
+            last_error = _UploadError(
+                "OneDrive upload completed ambiguously and could not be confirmed"
+            )
+        except Exception as exc:
+            last_error = exc
+            if not _is_retriable_upload_error(exc):
+                break
+        if attempt < _UPLOAD_CHUNK_MAX_ATTEMPTS:
+            delay_source = last_error or _UploadError("confirmation pending")
+            time.sleep(_upload_retry_delay(delay_source, attempt))
+    raise _UploadError(
+        "OneDrive upload completed ambiguously and could not be confirmed"
+    ) from last_error
 
 
 def _reconcile_upload_progress(
@@ -337,18 +407,18 @@ def _reconcile_upload_progress(
     start: int,
     end: int,
     total: int,
-    previous_fingerprint: tuple[Any, Any, Any, Any] | None,
+    expected_quickxor_hash: str,
 ) -> tuple[bool, dict[str, Any] | None]:
     """Return whether an ambiguous fragment was accepted, plus a final item."""
     last_error: BaseException | None = None
+    completed = False
     for attempt in range(1, _UPLOAD_CHUNK_MAX_ATTEMPTS + 1):
         try:
             response = http.get(upload_url, timeout=DEFAULT_TIMEOUT_SECONDS)
             if response.status_code == 404:
                 if end == total:
-                    return True, _completed_upload_item(
-                        remote_path, total, previous_fingerprint
-                    )
+                    completed = True
+                    break
                 raise _UploadError(
                     "OneDrive upload session disappeared before completion"
                 )
@@ -358,9 +428,8 @@ def _reconcile_upload_progress(
                 return False, None
             if next_offset >= end:
                 if end == total:
-                    return True, _completed_upload_item(
-                        remote_path, total, previous_fingerprint
-                    )
+                    completed = True
+                    break
                 return True, None
             raise _UploadError("OneDrive returned inconsistent upload-session progress")
         except Exception as exc:
@@ -370,9 +439,14 @@ def _reconcile_upload_progress(
             if attempt == _UPLOAD_CHUNK_MAX_ATTEMPTS:
                 break
             time.sleep(_upload_retry_delay(exc, attempt))
-    raise _UploadError(
-        "Could not determine OneDrive upload-session progress"
-    ) from last_error
+    else:
+        raise _UploadError(
+            "Could not determine OneDrive upload-session progress"
+        ) from last_error
+
+    if completed:
+        return True, _completed_upload_item(remote_path, total, expected_quickxor_hash)
+    raise _UploadError("Could not determine OneDrive upload-session progress")
 
 
 def _graph_request(
@@ -565,7 +639,6 @@ def _upload_large_file_content(
         # function initializes below, bypassing the "did OneDrive actually
         # confirm this" check that only runs inside the loop.
         raise ValueError(f"total must be positive, got {total}")
-    previous_fingerprint = _upload_item_fingerprint(_current_upload_item(remote_path))
     session = _graph_request(
         "POST",
         f"{_item_path(remote_path)}/createUploadSession",
@@ -580,6 +653,7 @@ def _upload_large_file_content(
     # which adds up over the ~100 requests a 500MB upload needs.
     with requests.Session() as http:
         result: dict[str, Any] = {}
+        quickxor_hash = _QuickXorHash()
         try:
             for start in range(0, total, _UPLOAD_SESSION_CHUNK_SIZE):
                 end = min(start + _UPLOAD_SESSION_CHUNK_SIZE, total)
@@ -599,6 +673,9 @@ def _upload_large_file_content(
                         f"{start} but got {len(chunk)} -- the local file "
                         "may have changed size during upload"
                     )
+                # Hash each byte once when it is first read. Fragment retries
+                # reuse ``chunk`` and therefore cannot double-count it.
+                quickxor_hash.update(chunk)
                 # Detect growth after the caller's fstat snapshot before a
                 # truncated final item is committed. Keeping this as a
                 # separate read preserves the one-chunk memory bound.
@@ -632,6 +709,26 @@ def _upload_large_file_content(
                             timeout=_BINARY_UPLOAD_TIMEOUT_SECONDS,
                         )
                         _raise_upload_status(response)
+                        if end == total and response.status_code not in (200, 201):
+                            accepted, completed_item = _reconcile_upload_progress(
+                                http,
+                                upload_url,
+                                remote_path,
+                                start,
+                                end,
+                                total,
+                                quickxor_hash.base64_digest(),
+                            )
+                            if accepted:
+                                if completed_item is not None:
+                                    result = completed_item
+                                break
+                            if attempt == _UPLOAD_CHUNK_MAX_ATTEMPTS:
+                                raise _UploadError(
+                                    "OneDrive did not confirm the upload completed"
+                                )
+                            time.sleep(_UPLOAD_RETRY_BASE_SECONDS)
+                            continue
                         break
                     except Exception as exc:
                         status_code = _upload_status_code(exc)
@@ -644,7 +741,7 @@ def _upload_large_file_content(
                             start,
                             end,
                             total,
-                            previous_fingerprint,
+                            quickxor_hash.base64_digest(),
                         )
                         if accepted:
                             if completed_item is not None:
@@ -672,26 +769,21 @@ def _upload_large_file_content(
                     if result.get("id"):
                         continue
                     try:
-                        result = response.json() if response.content else {}
-                    except ValueError as exc:
-                        # The PUT itself succeeded (no HTTPError above) --
-                        # OneDrive has already committed the file at this
-                        # point, so this is "the transfer worked but the
-                        # confirmation can't be read", not a transfer
-                        # failure, even though it's still reported as an
-                        # error here (the caller has no completed item to
-                        # act on either way).
-                        raise _UploadError(
-                            "OneDrive accepted the final chunk but "
-                            "returned an unparsable response"
-                        ) from exc
-                    if "id" not in result:
-                        # The final chunk's response didn't actually carry
-                        # a completed driveItem (e.g. an unexpected 202 on
-                        # what this loop computed as the last range).
-                        raise _UploadError(
-                            "OneDrive did not confirm the upload completed"
-                        )
+                        final_item = response.json() if response.content else {}
+                    except ValueError:
+                        final_item = {}
+                    if isinstance(final_item, dict) and final_item.get("id"):
+                        result = final_item
+                        continue
+
+                    # A 200/201 final PUT can still lose or omit its JSON
+                    # driveItem response. Bind destination metadata to the
+                    # exact local bytes before reporting success.
+                    result = _completed_upload_item(
+                        remote_path,
+                        total,
+                        quickxor_hash.base64_digest(),
+                    )
         except Exception as exc:
             # No cross-call resume state is persisted. Once bounded retries
             # are exhausted, cancel the unusable session instead of leaving

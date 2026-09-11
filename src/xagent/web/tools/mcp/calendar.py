@@ -802,26 +802,40 @@ def google_calendar_update_events(
         # timezone lookup, or (worse) skip checking the organizer's
         # calendar entirely, in the specific case where the organizer's
         # own email was the only thing making a raw set non-empty.
-        organizer_email = (event.get("organizer") or {}).get("email")
-        if organizer_email is None and added_attendees:
-            # Google omits the top-level `organizer` field whenever the
-            # organizer is just the calendar owner (the overwhelmingly
-            # common case) - the caller's own resolved address (from the
-            # same calendars().get(calendarId="primary") already used
-            # for caller_is_organizer/all-day widening below) IS the
-            # organizer then. Only resolved when there's a newly-added
-            # attendee to check this against - a retained attendee's
-            # delta-segment query never re-scans the event's OLD window
+        organizer = event.get("organizer") or {}
+        organizer_email = organizer.get("email")
+        # Google's own documented signal for "is the organizer this
+        # connected account" (per the Events resource: "Whether the
+        # organizer corresponds to the calendar on which this copy of
+        # the event appears") - reading it directly here is more
+        # reliable than comparing email strings (no case-folding to get
+        # wrong) and, in the common case where it's present, needs no
+        # extra API call at all for identity purposes. None only when
+        # the whole `organizer` object is absent or lacks this field -
+        # not actually documented to happen for a self-organized event,
+        # but handled the same as "assume self" purely as a defensive
+        # fallback, not because it's expected in practice.
+        organizer_self = organizer.get("self")
+        if organizer_email is None and organizer_self is not False and added_attendees:
+            # Whether via organizer.self=True or a wholly-missing
+            # organizer object/field, the caller is (or is assumed to
+            # be) the organizer here - but neither case gives us an
+            # actual email to exclude from the freebusy batch below.
+            # Resolved via the same calendars().get(calendarId="primary")
+            # already used for caller_is_organizer/all-day widening
+            # below (the closure caches it, so this never fetches
+            # twice). Only resolved when there's a newly-added attendee
+            # to check this against - a retained attendee's delta-
+            # segment query never re-scans the event's OLD window
             # (where their own footprint would live), so it can't
             # self-conflict regardless of this exclusion, and a
             # metadata-only edit has no attendee to need it for at all.
             # Without this, adding the caller's OWN address as a "new"
-            # attendee on an event with no explicit organizer field
-            # would never be excluded from the freebusy batch below and
-            # would always find this very event's own busy block on
-            # their calendar - the exact self-conflict class this
-            # exclusion exists to prevent for the explicit-organizer-
-            # field case already.
+            # attendee on such an event would never be excluded from
+            # the freebusy batch and would always find this very
+            # event's own busy block on their calendar - the exact
+            # self-conflict class this exclusion exists to prevent for
+            # the known-organizer-email case already.
             organizer_email = primary_calendar_info()[0]
         # None never equals a real address's lowercased form, so this
         # filter is a no-op (keeps everything) when there's no organizer
@@ -966,23 +980,28 @@ def google_calendar_update_events(
             # `attendees_to_check` empty (organizer filtered out above)
             # and `window_changed` false, skipping their calendar
             # entirely instead of just skipping the self-conflicting
-            # freebusy path for them. Independent of whether an explicit
-            # `organizer` field is even present on the event - Google
-            # omits it whenever the organizer is just the calendar owner
-            # (the overwhelmingly common case), and this must still
-            # trigger then, same as before this identity fix.
+            # freebusy path for them. Independent of whether the
+            # organizer's own identity is resolvable at all - even an
+            # event with no organizer info whatsoever must still trigger
+            # this the same as before this identity fix.
             organizer_needs_verification = window_changed or organizer_newly_added
             # Gated on organizer_needs_verification too - caller_is_organizer
             # is only ever consulted below when the organizer needs
             # (re)verifying at all, so a metadata-only edit (summary/
             # description/location, no window or attendee change) on an
             # event with an explicit organizer field must not pay for
-            # this API call when nothing downstream would use its result.
+            # an API call when nothing downstream would use its result.
             caller_is_organizer = True
-            if organizer_needs_verification and organizer_email_lower is not None:
-                caller_is_organizer = (
-                    primary_calendar_info()[0].lower() == organizer_email_lower
-                )
+            if organizer_needs_verification:
+                if organizer_self is not None:
+                    # The documented, direct signal - no email
+                    # comparison (and its case-folding risk) or extra
+                    # API call needed when Google already told us.
+                    caller_is_organizer = organizer_self
+                elif organizer_email_lower is not None:
+                    caller_is_organizer = (
+                        primary_calendar_info()[0].lower() == organizer_email_lower
+                    )
             # Only actually query "primary" for the organizer's own
             # conflicts when the caller genuinely IS the organizer -
             # otherwise "primary" is someone else's calendar entirely,

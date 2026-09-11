@@ -1553,6 +1553,71 @@ def test_update_events_on_someone_elses_event_reports_the_real_organizer_uncheck
     assert fake_service._freebusy.query_calls == []
 
 
+def test_update_events_organizer_self_false_needs_no_identity_api_call(
+    fake_service,
+):
+    """Regression test: Google's own organizer.self field ("Whether the
+    organizer corresponds to the calendar on which this copy of the
+    event appears") directly answers caller_is_organizer - when present,
+    no calendars().get(calendarId="primary") call is needed at all for
+    identity purposes, unlike the email-comparison fallback this uses
+    when organizer.self is absent."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+        "attendees": [{"email": "boss@example.com"}],
+        "organizer": {"email": "boss@example.com", "self": False},
+    }
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-27T14:00:00+08:00",  # disjoint move
+            end_time="2026-08-27T14:30:00+08:00",
+        )
+    )
+
+    assert result["status"] == "success"
+    assert result["unchecked_attendees"] == ["boss@example.com"]
+    assert fake_service._events.list_calls == []
+    assert fake_service._freebusy.query_calls == []
+    # The whole point: organizer.self answered caller_is_organizer
+    # directly, so the connected account's own identity never needed
+    # looking up via calendars().get() at all.
+    assert fake_service._calendars.get_calls == []
+
+
+def test_update_events_organizer_self_true_needs_no_identity_api_call(
+    fake_service,
+):
+    """Companion to the test above: organizer.self=True must resolve
+    caller_is_organizer without an identity API call either, and let the
+    organizer-calendar check run normally."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+        "attendees": [],
+        "organizer": {"email": "me@example.com", "self": True},
+    }
+    fake_service._events._list_result = {
+        "items": [_confirmed_event(event_id="other-1")]
+    }
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-27T14:00:00+08:00",  # disjoint move
+            end_time="2026-08-27T14:30:00+08:00",
+        )
+    )
+
+    assert result["status"] == "conflict"
+    assert [c["summary"] for c in result["conflicts"]] == ["1:1 with Hazel"]
+    assert fake_service._calendars.get_calls == []
+
+
 def test_update_events_on_someone_elses_event_still_catches_another_attendees_conflict(
     fake_service,
 ):

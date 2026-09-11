@@ -698,9 +698,6 @@ def _list_search(
     # adding pagination metadata so this adapter never indexes a field the
     # shared capper was allowed to discard.
     result_wrapper = capped.setdefault(result_key, {})
-    if not isinstance(result_wrapper, dict):
-        result_wrapper = {}
-        capped[result_key] = result_wrapper
     result_wrapper.setdefault(result_key, [])
     capped["has_more"] = has_more
     capped["next_page"] = current_page + 1 if has_more else None

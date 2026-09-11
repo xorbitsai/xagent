@@ -403,14 +403,19 @@ def incomplete_check_response(
     unchecked_attendees: list[str],
     start: str,
     end: str,
+    *,
+    message: str | None = None,
 ) -> str:
     """Return a bounded pre-write response when required calendars could
     not be checked. The caller may retry with ``ignore_conflicts=True`` only
     after the user explicitly accepts proceeding without complete checks.
+    ``message`` can describe a non-calendar prerequisite, such as a malformed
+    event window, while preserving the same bounded response contract.
     """
     payload: dict[str, Any] = {
         "status": "conflict_check_incomplete",
-        "message": (
+        "message": message
+        or (
             f"Availability could not be checked for {len(unchecked_attendees)} "
             f"calendar(s) for {start} - {end}. No event was written."
         ),
@@ -471,12 +476,12 @@ def attendees_to_add(
     ""), matching its own convention, as well as for a caller-supplied
     list/string that turns out to name only people already on the event.
     """
-    if attendees is None or not attendees_were_given(attendees):
+    if not attendees_were_given(attendees):
         return []
     existing = {email.strip().lower() for email in existing_attendee_emails}
     return [
         address
-        for address in normalize_addresses(attendees)
+        for address in normalize_addresses(attendees or [])
         if address.lower() not in existing
     ]
 

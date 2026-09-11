@@ -32,15 +32,14 @@ def _fake_service(execute_result: dict, existing_event: dict | None = None):
     # These Meet-focused tests do not exercise scheduling-conflict discovery.
     # Return empty availability data so they continue to isolate event writes.
     events.list = Mock(return_value=Mock(execute=Mock(return_value={"items": []})))
-    events.get = Mock(
-        return_value=Mock(
-            execute=Mock(
-                return_value=copy.deepcopy(existing_event)
-                if existing_event
-                else {"id": "evt1"}
-            )
-        )
-    )
+    fetched_event = {
+        "id": "evt1",
+        "start": {"dateTime": "2026-09-07T15:00:00+08:00"},
+        "end": {"dateTime": "2026-09-07T16:00:00+08:00"},
+    }
+    if existing_event:
+        fetched_event.update(copy.deepcopy(existing_event))
+    events.get = Mock(return_value=Mock(execute=Mock(return_value=fetched_event)))
     service = Mock()
     service.events.return_value = events
 
@@ -700,12 +699,60 @@ def test_create_events_rejects_a_reversed_mixed_offset_window_after_normalizing(
             start_time="2026-09-01T09:00:00+08:00",
             end_time="2026-09-01T00:30:00",
             timezone="UTC",
+            ignore_conflicts=True,
         )
     )
 
     assert result["status"] == "error"
     assert "after start" in result["message"]
     service.events.return_value.insert.assert_not_called()
+
+
+def test_event_boundary_returns_none_for_a_malformed_non_dict_boundary():
+    assert calendar._event_boundary(["not", "an", "object"], "UTC") is None
+
+
+def test_update_with_missing_boundary_fails_closed_before_write(monkeypatch):
+    service = _fake_service(
+        {"id": "evt1"},
+        existing_event={
+            "start": ["not", "an", "object"],
+            "end": {"dateTime": "2026-09-07T16:00:00+08:00"},
+        },
+    )
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="evt1", attendees=["new@example.com"]
+        )
+    )
+
+    assert result["status"] == "conflict_check_incomplete"
+    assert "complete start/end window" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_with_real_window_checks_a_new_attendee_before_write(monkeypatch):
+    service = _fake_service(
+        {"id": "evt1"},
+        existing_event={
+            "start": {"dateTime": "2026-09-07T15:00:00+08:00"},
+            "end": {"dateTime": "2026-09-07T16:00:00+08:00"},
+        },
+    )
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="evt1", attendees=["new@example.com"]
+        )
+    )
+
+    assert result["status"] == "success"
+    query_kwargs = service.freebusy.return_value.query.call_args.kwargs
+    assert query_kwargs["body"]["items"] == [{"id": "new@example.com"}]
+    service.events.return_value.update.assert_called_once()
 
 
 def test_create_event_without_attendees_or_meet_sends_conference_version_and_no_invites(
@@ -1000,6 +1047,7 @@ def test_update_event_notify_attendees_notifies_existing_attendees_without_repas
     calendar.google_calendar_update_events(
         event_id="evt1",
         start_time="2026-09-08T15:00:00+08:00",
+        end_time="2026-09-08T16:00:00+08:00",
         notify_attendees=True,
     )
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import pytest
 from fastapi import FastAPI
 
@@ -44,7 +46,7 @@ async def test_login_rejection_emits_metrics(monkeypatch, metric_reader):
     monkeypatch.setattr(auth, "get_user_by_login_identifier", lambda *_: None)
     with pytest.raises(HTTPException) as error:
         await auth.login(
-            auth.LoginRequest(username="unknown", password="test"), db=None
+            auth.LoginRequest(username="unknown", password="test"), db=nullcontext
         )
     assert error.value.status_code == 401
     metrics = collected_metrics(metric_reader)

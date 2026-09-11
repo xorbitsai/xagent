@@ -803,6 +803,14 @@ def google_calendar_update_events(
         # calendar entirely, in the specific case where the organizer's
         # own email was the only thing making a raw set non-empty.
         organizer = event.get("organizer") or {}
+        # The organizer's REAL, event-provided email only - never
+        # backfilled. Used later for the identity-fallback comparison
+        # and for naming the organizer in `unchecked_attendees`; a
+        # backfilled guess has no business appearing in either (the
+        # identity question is already answered directly by
+        # organizer_self whenever a backfill would apply, and reporting
+        # a *guessed* address to the caller as "the organizer" would be
+        # actively misleading).
         organizer_email = organizer.get("email")
         # Google's own documented signal for "is the organizer this
         # connected account" (per the Events resource: "Whether the
@@ -816,7 +824,15 @@ def google_calendar_update_events(
         # but handled the same as "assume self" purely as a defensive
         # fallback, not because it's expected in practice.
         organizer_self = organizer.get("self")
-        if organizer_email is None and organizer_self is not False and added_attendees:
+        # The address actually excluded from the freebusy-checked
+        # attendee lists below - separate from organizer_email because
+        # this one MAY fall back to the caller's own resolved address
+        # when the real organizer email is missing. Conflating the two
+        # would make the later identity-fallback comparison compare a
+        # backfilled value against itself (always trivially True,
+        # answering nothing) instead of a real, independent check.
+        exclude_email = organizer_email
+        if exclude_email is None and organizer_self is not False and added_attendees:
             # Whether via organizer.self=True or a wholly-missing
             # organizer object/field, the caller is (or is assumed to
             # be) the organizer here - but neither case gives us an
@@ -836,18 +852,37 @@ def google_calendar_update_events(
             # event's own busy block on their calendar - the exact
             # self-conflict class this exclusion exists to prevent for
             # the known-organizer-email case already.
-            organizer_email = primary_calendar_info()[0]
+            try:
+                exclude_email = primary_calendar_info()[0]
+            except InsufficientScopeError:
+                if not ignore_conflicts:
+                    raise
+                # ignore_conflicts=True means the caller has already
+                # decided the conflict check doesn't need to run - a
+                # missing-scope 403 here would only ever be surfaced by
+                # that check (which is skipped entirely below when
+                # ignore_conflicts is set), so leaving exclude_email
+                # unresolved is safe: nothing downstream that consults
+                # it runs in that case either. Without this, a token
+                # missing calendar.calendars.readonly would hard-fail
+                # this call even though the caller explicitly opted out
+                # of the check the docstring says this guards.
         # None never equals a real address's lowercased form, so this
-        # filter is a no-op (keeps everything) when there's no organizer
-        # email to exclude - same effect as branching on `organizer_email`
+        # filter is a no-op (keeps everything) when there's no address
+        # to exclude - same effect as branching on `exclude_email`
         # explicitly, without a duplicated ternary.
-        organizer_email_lower = organizer_email.lower() if organizer_email else None
+        exclude_email_lower = exclude_email.lower() if exclude_email else None
         attendees_to_check = [
-            a for a in added_attendees if a.lower() != organizer_email_lower
+            a for a in added_attendees if a.lower() != exclude_email_lower
         ]
         existing_attendees_to_check = [
-            a for a in existing_attendees_raw if a.lower() != organizer_email_lower
+            a for a in existing_attendees_raw if a.lower() != exclude_email_lower
         ]
+        # None never equals a real address's lowercased form either -
+        # used below only for the identity-fallback comparison and for
+        # naming the organizer in unchecked_attendees, both of which
+        # need the REAL email, not exclude_email's backfilled guess.
+        organizer_email_lower = organizer_email.lower() if organizer_email else None
         # Whether the organizer's own email was itself one of the
         # genuinely-new additions (filtered out of attendees_to_check
         # above) - if so, their availability still needs verifying, just
@@ -862,7 +897,7 @@ def google_calendar_update_events(
         # Recovered as a length comparison rather than a separate scan -
         # `added_attendees` is already case-insensitively deduplicated
         # (via normalize_addresses), so at most one entry can match
-        # `organizer_email_lower` - which also keeps this fact and
+        # `exclude_email_lower` - which also keeps this fact and
         # `attendees_to_check`'s own filtering from drifting apart (both
         # the timezone-lookup gate below and the organizer-check gate
         # further down must account for this consistently).

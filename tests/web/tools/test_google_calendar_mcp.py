@@ -1588,6 +1588,76 @@ def test_update_events_organizer_self_false_needs_no_identity_api_call(
     assert fake_service._calendars.get_calls == []
 
 
+def test_update_events_organizer_self_false_with_no_email_still_checks_the_new_attendee(
+    fake_service,
+):
+    """Regression test: organizer.self=False with no organizer.email at
+    all must NOT trigger the "backfill organizer_email to the caller's
+    own address" fallback - that fallback exists for the "no organizer
+    info whatsoever" case, and backfilling here would wrongly exclude a
+    genuinely different, newly-added attendee ("me@example.com" - the
+    caller's own address, added as an ordinary attendee to someone
+    else's event) from the freebusy batch, silently skipping a real
+    conflict check for them."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+        "attendees": [],
+        "organizer": {"self": False},
+    }
+    fake_service._freebusy = FakeFreebusy(
+        {"calendars": {"me@example.com": {"busy": []}}}
+    )
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            attendees=["me@example.com"],
+        )
+    )
+
+    assert result["status"] == "success"
+    queried_emails = {
+        item["id"]
+        for call in fake_service._freebusy.query_calls
+        for item in call["body"]["items"]
+    }
+    assert queried_emails == {"me@example.com"}
+    assert fake_service._calendars.get_calls == []
+
+
+def test_update_events_missing_scope_on_the_organizer_backfill_is_skipped_with_ignore_conflicts(
+    fake_service,
+):
+    """Regression test: the organizer-email backfill (resolving the
+    caller's own address when the event has no organizer info at all)
+    calls the same calendars().get(calendarId="primary") endpoint as the
+    all-day-timezone lookup, and must respect ignore_conflicts the same
+    way that sibling call site already does - a token missing
+    calendar.calendars.readonly must not hard-fail a call the caller
+    explicitly opted out of checking."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+        "attendees": [],
+        # No "organizer" field at all - triggers the backfill attempt.
+    }
+    fake_service._calendars = FakeCalendars(raise_error=_insufficient_scope_error())
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            attendees=["me@example.com"],
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    assert len(fake_service._events.update_calls) == 1
+
+
 def test_update_events_organizer_self_true_needs_no_identity_api_call(
     fake_service,
 ):
@@ -1665,15 +1735,17 @@ def test_update_events_treats_existing_attendee_case_insensitively(fake_service)
     with different casing must still be recognized as "already there" -
     otherwise it's treated as newly-added, gets checked against the
     unchanged window, and always self-conflicts on its own busy block for
-    this very event. Uses mismatched casing on BOTH sides (the event's own
-    stored casing, and the caller's resubmitted casing) - a fixture using
-    lowercase on the stored side alone can't tell a correct fold from a
-    mutation that drops .lower() on just that side."""
+    this very event. Uses two DIFFERENT non-canonical casings (neither one
+    plain-lowercase, and the two not equal to each other without folding)
+    on the stored side vs. the resubmitted side - a fixture where either
+    side happens to already be lowercase can't tell a correct fold on
+    that side from a mutation that drops .lower() on it specifically,
+    since a dropped .lower() on an already-lowercase value is invisible."""
     fake_service._events._get_result = {
         "id": "self-1",
         "start": {"dateTime": "2026-08-27T10:00:00+08:00"},
         "end": {"dateTime": "2026-08-27T10:30:00+08:00"},
-        "attendees": [{"email": "Old@Example.com"}],
+        "attendees": [{"email": "OLD@EXAMPLE.COM"}],
     }
     fake_service._freebusy = FakeFreebusy(
         {
@@ -1697,7 +1769,7 @@ def test_update_events_treats_existing_attendee_case_insensitively(fake_service)
     result = json.loads(
         calendar.google_calendar_update_events(
             event_id="self-1",
-            attendees=["old@example.com", "new@example.com"],
+            attendees=["Old@Example.Com", "new@example.com"],
         )
     )
 

@@ -5,6 +5,9 @@ consumption and persisted completion status, alongside independent login and
 /health probes. This measures performance; it does not isolate runtime workers.
 
 Safety and setup:
+  --base-url must reach the backend JSON /health, not nginx's text-only liveness
+  route. For Compose, run from its network against the backend service; this
+  harness does not change proxy routing or expose the backend publicly.
   Use a dedicated test deployment, database/storage root and account. Login
   replaces the account's refresh token. Tasks persist, consume model quota and
   may invoke tools with external side effects. Use controlled local model/tool
@@ -24,8 +27,12 @@ Fixed workload:
     }
   Pin all four slots with canonical model_id strings, not aliases or DB PKs.
   agent_id is not supported: this harness does not snapshot agent configuration.
-  The create response must match these IDs before execution; this verifies task
-  configuration, not provider revisions or concurrent server configuration edits.
+  Before stages, /api/models/test must pass for every distinct ID. This performs
+  one small model request per ID outside the measured window (quota/warm-up cost).
+  The endpoint constructs each requested model without default-model fallback.
+  Creation must also echo the pinned IDs. Those IDs are persisted configuration,
+  not authoritative per-call runtime identity. Keep server/model configuration
+  unchanged during the run; provider revisions and concurrent edits are not frozen.
   Avoid automatic routing. The short prompt validates the harness, not the
   multi-round workload. To reproduce that workload, configure a local model
   with fixed delays, response sizes and tool-call rounds, plus harmless local
@@ -59,7 +66,7 @@ Scheduling and failure handling:
 
 Reports and interpretation:
   report.json contains config, payload SHA-256, stage timestamps, per-attempt
-  timings/outcomes, task IDs, verified model IDs, health degradation names,
+  timings/outcomes, task IDs, persisted model IDs, model-preflight results, health degradation names,
   summaries, throughput and optional raw Prometheus series. report.md summarizes
   p95/p99 and outcomes. Credentials, tokens, task contents, raw response bodies
   and exception messages are not written by the
@@ -329,6 +336,31 @@ class Runner:
                 "degradations": signals,
             }
 
+    async def verify_models(self, session):
+        """Exercise the existing non-fallback model test before measuring tasks."""
+        expected = set(self.expected_models)
+        async with session.post(
+            self.base_url + "/api/models/test",
+            json={"model_ids": sorted(expected)},
+            headers={"Authorization": f"Bearer {self.token}"},
+        ) as response:
+            if response.status != 200:
+                return {"outcome": "http_error", "status": response.status}
+            data = await response.json()
+        # Do not persist provider responses/errors, which may include secrets.
+        if not isinstance(data, list) or len(data) != len(expected):
+            return {"outcome": "invalid_model_preflight"}
+        passed = {
+            row.get("model_id")
+            for row in data
+            if isinstance(row, dict)
+            and isinstance(row.get("model_id"), str)
+            and row.get("status") == "passed"
+        }
+        if passed != expected:
+            return {"outcome": "model_preflight_failed"}
+        return {"outcome": "success", "tested_model_ids": sorted(passed)}
+
     async def task(self, session):
         record = {"outcome": "error"}
         task_id = None
@@ -358,7 +390,7 @@ class Runner:
                     self.stop_new_tasks = True
                     record["outcome"] = "model_mismatch"
                     return record
-                record["effective_model_ids"] = effective
+                record["persisted_model_ids"] = effective
                 async with session.ws_connect(
                     f"{self.ws_url}/ws/chat/{task_id}",
                     params={"token": self.token},
@@ -514,6 +546,9 @@ async def run(args):
             report["health_preflight"] = await runner.health(probes)
             if report["health_preflight"]["outcome"] != "success":
                 raise ValueError("Health preflight failed")
+            report["model_preflight"] = await runner.verify_models(probes)
+            if report["model_preflight"]["outcome"] != "success":
+                raise ValueError("Model preflight failed")
             for cap in args.stages:
                 records = []
                 stage = {"cap": cap, "started_at": time.time(), "records": records}

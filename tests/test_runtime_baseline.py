@@ -73,6 +73,12 @@ async def target():
     async def health(request):
         return web.json_response(state.get("health", {"status": "ok"}))
 
+    async def test_models(request):
+        assert (await request.json())["model_ids"] == ["test"]
+        return web.json_response(
+            state.get("model_test", [{"model_id": "test", "status": "passed"}])
+        )
+
     async def create(request):
         assert request.headers["Authorization"] == "Bearer secret-test-token"
         state["created"] += 1
@@ -101,6 +107,7 @@ async def target():
 
     app.router.add_post("/api/auth/login", login)
     app.router.add_get("/health", health)
+    app.router.add_post("/api/models/test", test_models)
     app.router.add_post("/api/chat/task/create", create)
     app.router.add_get("/api/chat/task/{id}/status", status)
     app.router.add_get("/ws/chat/{id}", socket)
@@ -158,7 +165,11 @@ async def test_complete_runner_and_secret_free_report(
     task_record = next(
         r for r in report["stages"][1]["records"] if r["operation"] == "task"
     )
-    assert task_record["effective_model_ids"] == ["test"] * 4
+    assert task_record["persisted_model_ids"] == ["test"] * 4
+    assert report["model_preflight"] == {
+        "outcome": "success",
+        "tested_model_ids": ["test"],
+    }
     stage = report["stages"][1]
     assert stage["successful_tasks_per_second"] == pytest.approx(
         1 / (stage["ended_at"] - stage["started_at"])
@@ -409,11 +420,27 @@ async def test_sparse_probe_stop_wakes_and_drains_admitted_work():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure", ["health", "unsupported_model", "missing_model", "wrong_model"]
+)
 async def test_degraded_preflight_is_saved_without_creating_tasks(
-    target, tmp_path, monkeypatch
+    target, tmp_path, monkeypatch, failure
 ):
     base, state = target
-    state["health"] = {"status": "ok", "degradations": ["runtime_unavailable"]}
+    if failure == "health":
+        state["health"] = {"status": "ok", "degradations": ["runtime_unavailable"]}
+    else:
+        state["model_test"] = {
+            "unsupported_model": [
+                {
+                    "model_id": "test",
+                    "status": "failed",
+                    "error": "secret-provider-error",
+                }
+            ],
+            "missing_model": [],
+            "wrong_model": [{"model_id": "fallback", "status": "passed"}],
+        }[failure]
     monkeypatch.setenv("XAGENT_BENCH_USERNAME", "test")
     monkeypatch.setenv("XAGENT_BENCH_PASSWORD", "secret-test-password")
     payload = tmp_path / "payload.json"
@@ -430,11 +457,15 @@ async def test_degraded_preflight_is_saved_without_creating_tasks(
             "--confirm-test-environment",
         ]
     )
-    with pytest.raises(ValueError, match="Health preflight failed"):
+    with pytest.raises(ValueError, match="preflight failed"):
         await run(args)
     report = json.loads((output / "report.json").read_text())
-    assert report["health_preflight"]["outcome"] == "degraded"
-    assert report["health_preflight"]["degradations"] == ["runtime_unavailable"]
+    if failure == "health":
+        assert report["health_preflight"]["outcome"] == "degraded"
+        assert report["health_preflight"]["degradations"] == ["runtime_unavailable"]
+    else:
+        assert report["model_preflight"]["outcome"] != "success"
+        assert "secret-provider-error" not in json.dumps(report)
     assert state["created"] == 0
 
 

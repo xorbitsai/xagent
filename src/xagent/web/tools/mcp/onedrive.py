@@ -82,15 +82,17 @@ class _QuickXorHash:
         self._tail = b""
         self._length = 0
 
-    def update(self, data: bytes) -> None:
+    def update(self, data: bytes | bytearray) -> None:
         """Add bytes while reducing full 160-byte periods in C-sized blocks."""
         self._length += len(data)
         if self._tail:
             needed = self._INPUT_PERIOD_BYTES - len(self._tail)
             if len(data) < needed:
-                self._tail += data
+                self._tail += bytes(data)
                 return
-            self._column_xor ^= int.from_bytes(self._tail + data[:needed], "little")
+            self._column_xor ^= int.from_bytes(
+                self._tail + bytes(data[:needed]), "little"
+            )
             data = data[needed:]
             self._tail = b""
 
@@ -446,6 +448,10 @@ def _reconcile_upload_progress(
                 raise _UploadError(
                     "OneDrive returned inconsistent upload-session progress"
                 )
+            if next_offset > end:
+                raise _UploadError(
+                    "OneDrive returned progress beyond the submitted fragment"
+                )
             if next_offset == total and end < total:
                 raise _UploadError(
                     "OneDrive reported completion before the local final fragment"
@@ -679,11 +685,43 @@ def _upload_large_file_content(
     with requests.Session() as http:
         result: dict[str, Any] = {}
         quickxor_hash = _QuickXorHash()
+
+        def refill_fragment(
+            chunk: bytearray, fragment_start: int, next_offset: int
+        ) -> int:
+            """Drop an accepted prefix and refill a non-final fragment.
+
+            Graph can report an arbitrary missing-byte offset. Sending only
+            the old fragment's suffix could make a non-final PUT shorter than
+            the required 320 KiB multiple, so extend it back to the configured
+            chunk size while keeping only one fragment buffer resident.
+            """
+            accepted_size = next_offset - fragment_start
+            del chunk[:accepted_size]
+            new_end = min(next_offset + _UPLOAD_SESSION_CHUNK_SIZE, total)
+            extra_size = new_end - next_offset - len(chunk)
+            if extra_size:
+                extra = fh.read(extra_size)
+                if len(extra) != extra_size:
+                    raise _UploadError(
+                        f"expected to read {extra_size} bytes at offset "
+                        f"{next_offset + len(chunk)} but got {len(extra)} -- the "
+                        "local file may have changed size during upload"
+                    )
+                quickxor_hash.update(extra)
+                chunk.extend(extra)
+                if new_end == total and fh.read(1):
+                    raise _UploadError(
+                        "the local file may have changed size during upload"
+                    )
+            return new_end
+
         try:
-            for start in range(0, total, _UPLOAD_SESSION_CHUNK_SIZE):
+            start = 0
+            while start < total:
                 end = min(start + _UPLOAD_SESSION_CHUNK_SIZE, total)
                 expected_size = end - start
-                chunk = fh.read(expected_size)
+                chunk = bytearray(fh.read(expected_size))
                 if len(chunk) != expected_size:
                     # A short read here means the local file shrank out from
                     # under this upload (a concurrent rewrite/truncation, or
@@ -726,11 +764,7 @@ def _upload_large_file_content(
                     try:
                         response = http.put(
                             upload_url,
-                            data=(
-                                chunk
-                                if fragment_start == start
-                                else memoryview(chunk)[fragment_start - start :]
-                            ),
+                            data=chunk,
                             headers={
                                 "Content-Length": str(end - fragment_start),
                                 "Content-Range": (
@@ -754,8 +788,9 @@ def _upload_large_file_content(
                             if completed_item is not None:
                                 result = completed_item
                                 break
-                            if next_offset >= end:
+                            if next_offset == end:
                                 break
+                            end = refill_fragment(chunk, fragment_start, next_offset)
                             fragment_start = next_offset
                             if attempt == _UPLOAD_CHUNK_MAX_ATTEMPTS:
                                 raise _UploadError(
@@ -780,8 +815,9 @@ def _upload_large_file_content(
                         if completed_item is not None:
                             result = completed_item
                             break
-                        if next_offset >= end:
+                        if next_offset == end:
                             break
+                        end = refill_fragment(chunk, fragment_start, next_offset)
                         fragment_start = next_offset
                         if attempt == _UPLOAD_CHUNK_MAX_ATTEMPTS:
                             raise
@@ -803,14 +839,14 @@ def _upload_large_file_content(
                 # ever started including one.
                 if end == total:
                     if result.get("id"):
-                        continue
+                        break
                     try:
                         final_item = response.json() if response.content else {}
                     except ValueError:
                         final_item = {}
                     if isinstance(final_item, dict) and final_item.get("id"):
                         result = final_item
-                        continue
+                        break
 
                     # A 200/201 final PUT can still lose or omit its JSON
                     # driveItem response. Bind destination metadata to the
@@ -820,6 +856,8 @@ def _upload_large_file_content(
                         total,
                         quickxor_hash.base64_digest(),
                     )
+                    break
+                start = end
         except Exception as exc:
             # No cross-call resume state is persisted. Once bounded retries
             # are exhausted, cancel the unusable session instead of leaving

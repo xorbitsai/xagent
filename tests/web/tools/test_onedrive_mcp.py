@@ -1099,8 +1099,11 @@ def test_upload_large_file_content_advances_when_server_has_fragment(
 
 def test_upload_large_file_content_resumes_inside_ambiguous_fragment(monkeypatch):
     chunk_size = onedrive._UPLOAD_SESSION_CHUNK_SIZE
-    partial_offset = 320 * 1024
-    total_size = chunk_size + 10
+    # Graph explicitly says nextExpectedRanges need not use the client's
+    # fragment boundaries. Choose an unaligned offset so this test catches a
+    # retry that sends only the old suffix (an invalid non-final fragment).
+    partial_offset = 12_345
+    total_size = 2 * chunk_size + 10
     content = b"a" * partial_offset + b"b" * (total_size - partial_offset)
     fh = io.BytesIO(content)
     monkeypatch.setattr(
@@ -1127,10 +1130,16 @@ def test_upload_large_file_content_resumes_inside_ambiguous_fragment(monkeypatch
     assert result == {"id": "item-1"}
     resumed = mock_put.call_args_list[1].kwargs
     assert resumed["headers"]["Content-Range"] == (
-        f"bytes {partial_offset}-{chunk_size - 1}/{total_size}"
+        f"bytes {partial_offset}-{partial_offset + chunk_size - 1}/{total_size}"
     )
-    assert resumed["headers"]["Content-Length"] == str(chunk_size - partial_offset)
-    assert bytes(resumed["data"]) == content[partial_offset:chunk_size]
+    assert resumed["headers"]["Content-Length"] == str(chunk_size)
+    assert (
+        bytes(resumed["data"]) == content[partial_offset : partial_offset + chunk_size]
+    )
+    final = mock_put.call_args_list[2].kwargs
+    assert final["headers"]["Content-Range"] == (
+        f"bytes {partial_offset + chunk_size}-{total_size - 1}/{total_size}"
+    )
 
 
 def test_upload_large_file_content_retries_transient_reconciliation_get(monkeypatch):
@@ -1557,6 +1566,28 @@ def test_reconcile_exhaustion_preserves_retriable_cause(monkeypatch):
         )
 
     assert onedrive._is_retriable_upload_error(exc_info.value)
+
+
+def test_reconcile_rejects_progress_beyond_submitted_fragment():
+    chunk_size = onedrive._UPLOAD_SESSION_CHUNK_SIZE
+    http = _FakeSession(
+        get=Mock(
+            return_value=MockResponse({"nextExpectedRanges": [f"{chunk_size + 1}-"]})
+        )
+    )
+
+    with pytest.raises(
+        onedrive._UploadError, match="progress beyond the submitted fragment"
+    ):
+        onedrive._reconcile_upload_progress(
+            http,
+            "https://upload.example/s",
+            "big.bin",
+            0,
+            chunk_size,
+            2 * chunk_size,
+            "unused-hash",
+        )
 
 
 def test_upload_large_file_content_retries_unaccepted_final_202(monkeypatch):

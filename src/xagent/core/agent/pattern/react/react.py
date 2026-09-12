@@ -60,7 +60,8 @@ import hashlib
 import inspect
 import json
 import logging
-from dataclasses import dataclass, replace
+from collections.abc import Sequence
+from dataclasses import dataclass, field, replace
 from datetime import timezone
 from enum import Enum
 from typing import Any, cast
@@ -90,9 +91,15 @@ from ...context.enrichment import (
     pending_user_response_lifecycle,
     pending_user_response_marker,
 )
+from ...context.execution import (
+    COMPACT_DROPPED_TOOL_NAME_MAX_CHARS,
+    COMPACT_DROPPED_TOOL_NOTICE_MAX_CHARS,
+    COMPACT_DROPPED_TOOL_NOTICE_MAX_NAMES,
+    bounded_notice_lines,
+)
 from ...context.memory_tool import build_memory_tools
 from ...context.skill_tool import build_load_skill_tool
-from ...grounding import grounding_rule
+from ...grounding import VALUE_KINDS, grounding_rule
 from ...language import final_answer_language_rule
 from ...result import (
     CONTROL_TOOL_NAMES,
@@ -151,6 +158,29 @@ REACT_RESPONSE_LANGUAGE_DESCRIPTION = (
     "Follow the canonical request-language policy in the system context; do not "
     "collapse Chinese variants into generic Chinese."
 )
+# Written into the checkpoint's lost_tool_evidence payload and compared on
+# read-back. The record's meaning depends on what one entry stands for: a
+# build that accounts per call and a build that accounted per tool name would
+# both accept the other's payload as a well-formed dict and mean something
+# different by the same field, so the payload states its own accounting unit
+# and a mismatch is treated as unreadable rather than silently reinterpreted.
+LOST_TOOL_EVIDENCE_GRANULARITY = "tool_call_id"
+# Caps how many call ids a read-back of the lost-evidence record accepts. The
+# ids come from a run's own tool calls, so the only bound on how many there
+# can be is how many iterations the run has gone through -- nothing in this
+# module limits that. A payload over the cap is truncated to the first this
+# many ids (by sorted order) with the loss explicitly recorded, rather than
+# silently shortened into a record that looks complete when it is not.
+LOST_TOOL_EVIDENCE_MAX_CALL_IDS = 200
+# Reserves room in the bounded tool-name budget for the one trailing line
+# that reports how many names were left out, which _bounded_tool_names
+# appends after the shared renderer has already spent the rest of the
+# budget on names. Without this reserve, that trailing line lands on top of
+# a list already filled to the budget's edge, so the assembled result can
+# run past COMPACT_DROPPED_TOOL_NOTICE_MAX_CHARS by however long the line
+# is. 64 is comfortably more than the longest such line this code can
+# produce.
+LOST_TOOL_NAME_OMISSION_ALLOWANCE = 64
 
 
 @dataclass
@@ -193,6 +223,105 @@ class ToolCallRecord:
             error=data.get("error"),
             turn_id=str(data["turn_id"]) if data.get("turn_id") else None,
         )
+
+
+@dataclass
+class LostToolEvidence:
+    """Observations compaction destroyed that no later call has fetched back.
+
+    There is one of these per run, not per turn. It lives on the pattern
+    instance for the whole life of the run and travels in the checkpoint the
+    same way the rest of ``ReActPattern`` state does, so a turn that runs long
+    after the turn whose compaction destroyed the evidence can still see that
+    it happened.
+
+    Each entry in ``call_ids`` is one destroyed tool call, identified by its
+    ``tool_call_id``. A later call to the same tool with different arguments
+    does not bring back the observation the earlier call produced, so the
+    tool name recurring is never enough to say the lost value came back; only
+    seeing that exact call id's observation again would be, and this record
+    does not attempt that -- it only remembers which ids are still owed.
+
+    ``unnameable`` records that something was destroyed that this record
+    cannot identify at all: a destroyed observation that carried no call id
+    of its own, a checkpoint payload this build could not read, or a payload
+    naming more ids than this build accepts. It is a boolean rather than a
+    counter for two reasons. First, replaying the same turn after an
+    interrupt must not double-count the same loss as if it happened twice.
+    Second, and more importantly, nothing but the end of the run is allowed
+    to turn it back off: no successful call can prove that an observation
+    nobody can name has come back, because nobody can name it to check.
+    """
+
+    call_ids: set[str] = field(default_factory=set)
+    unnameable: bool = False
+
+    def still_missing(self) -> bool:
+        return bool(self.call_ids) or self.unnameable
+
+    def to_state(self) -> dict[str, Any]:
+        # call_ids is sorted so the checkpoint payload is stable across
+        # writes of the same logical state -- a set has no defined order of
+        # its own, and an unstable payload would make every checkpoint diff
+        # noisy even when nothing changed.
+        return {
+            "granularity": LOST_TOOL_EVIDENCE_GRANULARITY,
+            "call_ids": sorted(self.call_ids),
+            "unnameable": self.unnameable,
+        }
+
+    @classmethod
+    def from_state(cls, raw: Any) -> "LostToolEvidence":
+        """Read a checkpointed record back, or say it cannot be read.
+
+        This only handles a present value. ``load_state`` decides separately
+        whether the key was present at all -- that is a different fact from
+        anything checked here, and the two must not share a branch.
+
+        Every failure below reads as ``unnameable=True`` with no call ids,
+        never as an empty record. A payload that fails one of these checks
+        was still written by some turn, so something really was destroyed;
+        reading it as "nothing was lost" is the one direction that could let
+        a later answer rest on evidence that is actually gone. An absent key
+        is the opposite fact -- nothing was ever written -- and that case is
+        handled in ``load_state``, not here.
+        """
+        if not isinstance(raw, dict):
+            return cls(set(), unnameable=True)
+        if raw.get("granularity") != LOST_TOOL_EVIDENCE_GRANULARITY:
+            return cls(set(), unnameable=True)
+        raw_call_ids = raw.get("call_ids")
+        if not isinstance(raw_call_ids, list) or not all(
+            isinstance(call_id, str) and call_id for call_id in raw_call_ids
+        ):
+            return cls(set(), unnameable=True)
+        raw_unnameable = raw.get("unnameable")
+        if not isinstance(raw_unnameable, bool):
+            return cls(set(), unnameable=True)
+        if len(raw_call_ids) > LOST_TOOL_EVIDENCE_MAX_CALL_IDS:
+            # Over the cap: keep the first LOST_TOOL_EVIDENCE_MAX_CALL_IDS ids
+            # from the sorted list and force unnameable so the truncation
+            # itself is not silently lost.
+            truncated = sorted(raw_call_ids)[:LOST_TOOL_EVIDENCE_MAX_CALL_IDS]
+            return cls(set(truncated), unnameable=True)
+        return cls(set(raw_call_ids), unnameable=raw_unnameable)
+
+
+@dataclass(frozen=True)
+class CompactionLoss:
+    """What one compaction destroyed, as far as this turn can account for it.
+
+    ``call_ids`` and ``unaccounted`` are read independently from the same
+    compaction metadata rather than one being derived unconditionally from
+    the other, because compaction can report a positive
+    ``dropped_tool_result_count`` while the id list that should explain it is
+    missing or malformed. "Compaction destroyed N observations but this turn
+    can identify none of them" is a real outcome, and it must read as
+    evidence missing, not as nothing having happened.
+    """
+
+    call_ids: tuple[str, ...]
+    unaccounted: int
 
 
 # Every code point that Python's str.strip() or JavaScript's
@@ -512,6 +641,7 @@ class ReActPattern(AgentPattern):
         self.pending_tool_calls: list[dict[str, Any]] = []
         self.pending_tool_call_content: dict[str, str] = {}
         self.tool_ledger: dict[str, ToolCallRecord] = {}
+        self.lost_tool_evidence = LostToolEvidence()
         self.force_final_answer_next = False
         self.repeated_tool_decision: dict[str, Any] | None = None
         self.waiting_for_user_request: dict[str, Any] | None = None
@@ -692,12 +822,35 @@ class ReActPattern(AgentPattern):
             self.current_iteration = iteration
             if self.pending_tool_calls:
                 self._ensure_pending_tool_call_envelope(context)
+                # The list of call dicts is snapshotted before the await
+                # because _execute_pending_tool_calls rebinds
+                # self.pending_tool_calls as it runs each segment, so reading
+                # it afterward would see only what is left over. The ids are
+                # read from that snapshot only after the await, though: a
+                # call dict that arrived without an id survives as the same
+                # object throughout execution, and gets one stamped onto it
+                # in place partway through -- reading ids beforehand would
+                # miss exactly those calls.
+                batch_calls = list(self.pending_tool_calls)
                 pending_result = await self._execute_pending_tool_calls(
                     context=context,
                     tools=tools,
                     llm=llm,
                     runtime=runtime,
                 )
+                batch_call_ids = [
+                    call_id
+                    for call_id in (str(call.get("id") or "") for call in batch_calls)
+                    if call_id
+                ]
+                # One of the two points in this loop where a tool batch
+                # finishes. Both carry the discharge, because hanging it on
+                # one of them would make whether a fetched-back observation
+                # is credited depend on whether that batch happened to run
+                # through the resume path or the in-turn path below. It runs
+                # ahead of the early return so that a batch that completed
+                # some work and then paused still gets credit for that work.
+                self._discharge_lost_tool_evidence(batch_call_ids)
                 if pending_result is not None:
                     return pending_result
                 self.current_iteration = iteration + 1
@@ -731,6 +884,10 @@ class ReActPattern(AgentPattern):
             if interrupted is not None:
                 return interrupted
 
+            # Built only to pick a model for this call (prepare_llm_for_context
+            # inspects message shape); this rendering never reaches the
+            # provider as the turn's actual prompt, so it carries none of the
+            # evidence-dropped wording the real prompt below needs.
             route_messages = self._messages_for_llm(
                 context,
                 has_tools=bool(tool_schemas),
@@ -746,7 +903,7 @@ class ReActPattern(AgentPattern):
                 "iteration": iteration,
                 **resolved_llm_metadata(call_llm),
             }
-            await runtime.compact_context_if_needed(
+            compact_result = await runtime.compact_context_if_needed(
                 context=context,
                 # Fall back to the main model when no compact model is
                 # configured. PatternRuntime skips summarization entirely
@@ -765,11 +922,46 @@ class ReActPattern(AgentPattern):
                 llm=compact_llm if compact_llm is not None else call_llm,
                 metadata={"iteration": iteration},
             )
+            # The turn whose compaction destroys an observation is frequently
+            # not the turn that later has to answer without it. That one fact
+            # shapes both statements below: the record is written on every
+            # turn, and the gate reads the record rather than this
+            # iteration's own compact_result. Folding the loss in only on a
+            # turn that is already answering, or gating on this iteration's
+            # own result, each drops exactly that interleaving.
+            #
+            # Neither statement may be wrapped in a try. Swallowing here
+            # turns "this turn destroyed evidence" into "this turn did
+            # nothing", which is the failure this record exists to prevent.
+            self._record_lost_tool_evidence(self._dropped_tool_evidence(compact_result))
+            evidence_dropped = (
+                force_final_answer_now and self.lost_tool_evidence.still_missing()
+            )
+            if evidence_dropped:
+                # Resolved for this operator-facing log line only. The
+                # instruction built below reports that observations were
+                # removed without naming them, so nothing resolved here
+                # reaches the model.
+                names, unnamed = self._lost_tool_names()
+                names_field: list[str] | str = (
+                    self._bounded_tool_names(names) if names else "unknown"
+                )
+                logger.warning(
+                    "Forced answer turn is missing tool evidence compaction destroyed; it will "
+                    "be named as unavailable rather than answered from. missing_calls=%d "
+                    "named_count=%d named=%s unnamed=%s execution_id=%s",
+                    len(self.lost_tool_evidence.call_ids),
+                    len(names),
+                    names_field,
+                    unnamed,
+                    getattr(context, "execution_id", None),
+                )
 
             messages = self._messages_for_llm(
                 context,
                 has_tools=bool(tool_schemas),
                 force_final_answer=force_final_answer_now,
+                evidence_dropped=evidence_dropped,
                 tool_names=self._schema_tool_names(tool_schemas),
             )
             await runtime.checkpoint("before_llm", context=context, pattern=self)
@@ -845,6 +1037,12 @@ class ReActPattern(AgentPattern):
                         force_final_answer=(
                             force_final_answer_now and not unavailable_tool_call
                         ),
+                        # The retry rebuilds the whole prompt from scratch, and
+                        # on a turn whose evidence is gone this is the call
+                        # that actually reaches the user -- without forwarding
+                        # this, the repair would hand back the stale wording
+                        # this turn's first call already replaced.
+                        evidence_dropped=evidence_dropped,
                         recovery_reason=exc.code,
                     )
                 except LLMCallInterrupted:
@@ -938,6 +1136,11 @@ class ReActPattern(AgentPattern):
                         force_final_answer=(
                             force_final_answer_now and not recover_full_tool_set
                         ),
+                        # Same reason as the other retry call site above: this
+                        # rebuilds the whole prompt and may be the call that
+                        # actually reaches the user, so it needs the same
+                        # evidence-dropped wording as the call it is repairing.
+                        evidence_dropped=evidence_dropped,
                         recovery_reason=recovery_reason,
                         empty_final_answer=empty_final_answer is not None,
                     )
@@ -1023,6 +1226,13 @@ class ReActPattern(AgentPattern):
                 self._remember_tool_call_content(tool_calls, assistant_content)
                 self.status = "acting"
                 self.pending_tool_calls = list(tool_calls)
+                # Same snapshot-before-await, read-ids-after rule as the
+                # loop-top call site above: batch_calls is taken from
+                # tool_calls (not self.pending_tool_calls, which
+                # _execute_pending_tool_calls rebinds as it runs) so the call
+                # dicts survive, and a call that arrived without an id has
+                # one stamped onto that same dict during execution.
+                batch_calls = list(tool_calls)
                 await runtime.checkpoint("after_llm", context=context, pattern=self)
                 pending_result = await self._execute_pending_tool_calls(
                     context=context,
@@ -1030,6 +1240,13 @@ class ReActPattern(AgentPattern):
                     llm=llm,
                     runtime=runtime,
                 )
+                batch_call_ids = [
+                    call_id
+                    for call_id in (str(call.get("id") or "") for call in batch_calls)
+                    if call_id
+                ]
+                # Same discharge rule as the loop-top call site above.
+                self._discharge_lost_tool_evidence(batch_call_ids)
                 if pending_result is not None:
                     return pending_result
                 self.current_iteration = iteration + 1
@@ -1045,6 +1262,7 @@ class ReActPattern(AgentPattern):
                 )
 
         self.status = "max_iterations"
+        self._clear_lost_tool_evidence_at_run_end()
         await runtime.checkpoint("max_iterations", context=context, pattern=self)
         return PatternResult(
             success=False,
@@ -1081,6 +1299,7 @@ class ReActPattern(AgentPattern):
         )
         if answer_streamer is not None:
             await answer_streamer.fail(stream_failure_message)
+        self._clear_lost_tool_evidence_at_run_end()
         await runtime.checkpoint(
             "invalid_tool_protocol",
             context=context,
@@ -1161,17 +1380,60 @@ class ReActPattern(AgentPattern):
         *,
         has_tools: bool,
         force_final_answer: bool = False,
+        evidence_dropped: bool = False,
         tool_names: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         messages = list(context.get_messages_for_llm())
         if force_final_answer:
+            # Kept inside each opening rather than hoisted into the shared
+            # tail below, because the two openings place it differently: the
+            # ordinary one keeps it between its own two sentences, which is
+            # where every forced turn reads it, and the honest one ends with
+            # it.
+            tool_call_rule = (
+                "Do not call any other tool and do not output "
+                "tool-call markup as plain text. "
+            )
+            if evidence_dropped:
+                # Conditional on a summary being present, never on which
+                # compaction strategy ran this turn. The message-dropping
+                # backstop only trims a tail window, so a summary an earlier
+                # turn's own compaction wrote can still be standing above --
+                # a sentence that branched on strategy would tell the model
+                # there is no summary while one is sitting right there.
+                #
+                # The outcome=completed rule below is a conditional, not a
+                # flat ban: a removed observation is not always a removed
+                # read. A write whose result message compaction later
+                # discarded already happened, and a flat "completed is
+                # unavailable this turn" would make the model under-report
+                # work that genuinely finished.
+                opening = (
+                    "Produce the final user-facing answer by calling the "
+                    "final_answer control tool exactly once. Compaction removed "
+                    "tool observations from this run's context and their values "
+                    "can no longer be read. If a compaction "
+                    "summary stands above, treat any value not literally present "
+                    f"in that summary -- {VALUE_KINDS} -- as unavailable rather "
+                    "than recalled. Do not reconstruct, estimate, or illustrate a "
+                    "removed value, and do not present one as an example. Do not "
+                    "rest an outcome=completed claim on an observation that was "
+                    "removed; set outcome=partial when part of the request is "
+                    "still answerable from what remains and outcome=blocked when "
+                    f"none of it is. {tool_call_rule}"
+                )
+            else:
+                opening = (
+                    "Produce the final user-facing answer by calling the final_answer "
+                    "control tool exactly once using the accumulated conversation and "
+                    f"tool results. {tool_call_rule}"
+                    "Set outcome=completed only when every requested "
+                    "action or verification succeeded; otherwise set outcome=partial "
+                    "or outcome=blocked and say what remains. "
+                )
             instruction = (
-                "Produce the final user-facing answer by calling the final_answer "
-                "control tool exactly once using the accumulated conversation and "
-                "tool results. Do not call any other tool and do not output "
-                "tool-call markup as plain text. Set outcome=completed only when "
-                "every requested action or verification succeeded; otherwise set "
-                "outcome=partial or outcome=blocked and say what remains. If a "
+                f"{opening}"
+                "If a "
                 "previous ask_user_question narrowed the request to a selected "
                 "subset of items or resources, the final answer must cover only "
                 "that subset — leave out anything outside it even if an earlier "
@@ -1280,6 +1542,7 @@ class ReActPattern(AgentPattern):
         iteration: int,
         tool_schemas: list[dict[str, Any]],
         force_final_answer: bool,
+        evidence_dropped: bool = False,
         recovery_reason: str | None = None,
         empty_final_answer: bool = False,
     ) -> tuple[Any, ReActFinalAnswerStreamer]:
@@ -1290,6 +1553,7 @@ class ReActPattern(AgentPattern):
             context,
             has_tools=True,
             force_final_answer=force_final_answer,
+            evidence_dropped=evidence_dropped,
             tool_names=self._schema_tool_names(tools),
         )
         if recovery_reason == "unavailable_tool_call":
@@ -1641,6 +1905,183 @@ class ReActPattern(AgentPattern):
     def _tool_decision_group_for_name(self, tool_name: str) -> str:
         return self._tool_decision_groups_by_name.get(tool_name, tool_name)
 
+    def _dropped_tool_evidence(self, compact_result: Any) -> CompactionLoss:
+        """Read what one compaction destroyed from its ``CompactResult``.
+
+        Every check below is a type check on an attribute or a mapping key,
+        never a ``try``: this method raises nothing, and a caller that wraps
+        it in a ``try`` anyway is defending against a failure mode that
+        cannot occur here.
+        """
+        empty = CompactionLoss(call_ids=(), unaccounted=0)
+        if compact_result is None:
+            return empty
+        # compacted=True does not by itself mean anything was removed -- the
+        # tail-window path in ExecutionContext reports it even when the tail
+        # window kept every message -- so a falsy value here is as much
+        # "nothing to account for" as a missing result is.
+        if not getattr(compact_result, "compacted", False):
+            return empty
+        metadata = getattr(compact_result, "metadata", None)
+        if not isinstance(metadata, dict):
+            return empty
+        count = metadata.get("dropped_tool_result_count")
+        if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
+            return empty
+        raw_call_ids = metadata.get("dropped_tool_result_call_ids")
+        if isinstance(raw_call_ids, list) and all(
+            isinstance(call_id, str) and call_id for call_id in raw_call_ids
+        ):
+            call_ids = tuple(raw_call_ids)
+        else:
+            # The id list is absent or malformed: nothing identifies any of
+            # the destroyed observations, so the whole count is unaccounted
+            # for rather than partially explained.
+            return CompactionLoss(call_ids=(), unaccounted=count)
+        without_call_id = metadata.get("dropped_tool_results_without_call_id")
+        if (
+            isinstance(without_call_id, int)
+            and not isinstance(without_call_id, bool)
+            and without_call_id >= 0
+        ):
+            unaccounted = without_call_id
+        else:
+            unaccounted = max(0, count - len(call_ids))
+        return CompactionLoss(call_ids=call_ids, unaccounted=unaccounted)
+
+    def _record_lost_tool_evidence(self, loss: CompactionLoss) -> None:
+        """Fold one compaction's loss into the run's durable evidence record."""
+        self.lost_tool_evidence.call_ids.update(loss.call_ids)
+        if loss.unaccounted > 0:
+            self.lost_tool_evidence.unnameable = True
+
+    def _discharge_lost_tool_evidence(self, batch_call_ids: Sequence[str]) -> None:
+        """Remove lost-evidence entries whose value the finished batch fetched back.
+
+        A recorded call id leaves ``self.lost_tool_evidence.call_ids`` if and
+        only if ``batch_call_ids`` -- the tool batch that just finished --
+        contains a call whose ledger record has status "completed", whose
+        result passes ``self._tool_result_success``, and whose
+        ``(tool_name, args_hash)`` pair matches the lost call's own pair. An
+        empty ``batch_call_ids`` matches nothing and discharges nothing.
+
+        The match is on the ``(tool_name, args_hash)`` fingerprint, not on
+        tool name alone. A later call to the same tool with different
+        arguments returns a different value: it does not bring back the
+        observation the lost call produced, so matching on name alone would
+        clear an entry whose actual value is still missing.
+
+        The lost call's fingerprint is looked up in ``self.tool_ledger``
+        rather than in the message transcript, because compaction removes
+        messages, not ledger entries. The ledger is written for every tool
+        call and checkpointed as a whole, so it still knows what tool and
+        arguments a lost id belonged to even after the message that carried
+        that call's result is gone. A lost id the ledger cannot resolve is
+        left in the record rather than matched by any other means.
+
+        Every recorded id is resolved to its fingerprint before anything is
+        removed, so the removals this call makes cannot change which entries
+        this same call considers a match.
+
+        ``unnameable`` is never touched here, under any circumstance. It
+        stands for a destroyed observation that carried no call id at all,
+        so no call in any batch can be shown to be the same observation
+        coming back. Only the end of the run clears it, in
+        ``_clear_lost_tool_evidence_at_run_end``.
+
+        Known limitation: when a batch is interrupted partway through, the
+        calls that had already completed before the interrupt are gone from
+        ``pending_tool_calls`` on resume, so the resumed batch's
+        ``batch_call_ids`` covers only the remainder and this method never
+        sees the earlier completions. The error this produces always runs
+        one direction: an entry can stay in the record after its value is
+        actually back, which costs an extra warning later and never a false
+        claim that a value is missing when it has already returned. This
+        method does not attempt to correct that; doing so needs tracking
+        beyond one finished batch.
+        """
+        if not self.lost_tool_evidence.call_ids:
+            return
+
+        lost_fingerprints: dict[str, tuple[str, str]] = {}
+        for call_id in self.lost_tool_evidence.call_ids:
+            record = self.tool_ledger.get(call_id)
+            if record is None:
+                continue
+            lost_fingerprints[call_id] = (record.tool_name, record.args_hash)
+
+        recovered_fingerprints: set[tuple[str, str]] = set()
+        for batch_call_id in batch_call_ids:
+            record = self.tool_ledger.get(batch_call_id)
+            if record is None:
+                continue
+            if record.status != "completed":
+                continue
+            if not self._tool_result_success(record.result):
+                continue
+            recovered_fingerprints.add((record.tool_name, record.args_hash))
+
+        discharged = {
+            call_id
+            for call_id, fingerprint in lost_fingerprints.items()
+            if fingerprint in recovered_fingerprints
+        }
+        self.lost_tool_evidence.call_ids -= discharged
+
+    def _lost_tool_names(self) -> tuple[list[str], bool]:
+        """Name the tools behind this run's still-missing lost-evidence call ids.
+
+        The names come from ``self.tool_ledger`` -- the engine's own record of
+        every tool call this run has made, which compaction never touches --
+        not from anything still readable in the conversation, which is
+        exactly the part a compaction may already have removed.
+
+        The result is sorted alphabetically and deliberately not ranked by
+        how often a tool was lost: ``self.lost_tool_evidence`` accounts for
+        loss per call id, not per tool name, so a frequency ranking is not a
+        fact this record holds.
+
+        A call id the ledger cannot resolve is still something missing. It
+        moves into the returned ``unnameable`` flag rather than being
+        dropped from consideration, because dropping it would let a record
+        that still holds entries report back as though nothing were
+        missing.
+        """
+        names: set[str] = set()
+        unnameable = self.lost_tool_evidence.unnameable
+        for call_id in self.lost_tool_evidence.call_ids:
+            record = self.tool_ledger.get(call_id)
+            if record is None:
+                unnameable = True
+                continue
+            names.add(record.tool_name)
+        return sorted(names), unnameable
+
+    @staticmethod
+    def _bounded_tool_names(names: Sequence[str]) -> list[str]:
+        """Render lost-evidence tool names into one bounded log line.
+
+        Tool names come from runtime MCP server configuration, so a line
+        built from them is unbounded unless it carries the same three caps
+        the in-prompt dropped-tool notice applies: how many names to list,
+        how long each one may be, and a total character budget so the two
+        per-name caps cannot multiply into an unbounded line on their own.
+        A list that was silently cut down would read as the whole set,
+        which is the one thing a line reporting missing evidence must not
+        do.
+        """
+        lines, omitted = bounded_notice_lines(
+            names,
+            render=lambda name: name[:COMPACT_DROPPED_TOOL_NAME_MAX_CHARS],
+            max_chars=COMPACT_DROPPED_TOOL_NOTICE_MAX_CHARS,
+            max_entries=COMPACT_DROPPED_TOOL_NOTICE_MAX_NAMES,
+            chars_used=LOST_TOOL_NAME_OMISSION_ALLOWANCE,
+        )
+        if omitted:
+            name_label = "name" if omitted == 1 else "names"
+            lines.append(f"... {omitted} more {name_label} omitted")
+        return lines
+
     def get_state(self) -> dict[str, Any]:
         """Return JSON-serializable ReAct state for checkpointing."""
         return {
@@ -1671,6 +2112,7 @@ class ReActPattern(AgentPattern):
             "tool_ledger": {
                 key: record.to_dict() for key, record in self.tool_ledger.items()
             },
+            "lost_tool_evidence": self.lost_tool_evidence.to_state(),
         }
 
     def load_state(self, state: dict[str, Any]) -> None:
@@ -1746,6 +2188,16 @@ class ReActPattern(AgentPattern):
             key: ToolCallRecord.from_dict(value)
             for key, value in state.get("tool_ledger", {}).items()
         }
+        if "lost_tool_evidence" not in state:
+            # A checkpoint written before this key existed has nothing
+            # missing to report, so it reads as an empty record. Reading an
+            # absent key as "something is missing" would put every
+            # pre-existing run into the missing-evidence path for no reason.
+            self.lost_tool_evidence = LostToolEvidence()
+        else:
+            self.lost_tool_evidence = LostToolEvidence.from_state(
+                state["lost_tool_evidence"]
+            )
 
     async def _resume_waiting_for_user_if_needed(
         self,
@@ -3658,6 +4110,18 @@ class ReActPattern(AgentPattern):
             return "blocked"
         return outcome
 
+    def _clear_lost_tool_evidence_at_run_end(self) -> None:
+        """Drop the lost-evidence record before the run's last checkpoint.
+
+        The run is over, so a record left standing in the final checkpoint
+        would hand a later resume a warning about observations that stopped
+        mattering the moment the run ended. Every terminal path calls this,
+        not only the successful one: a run that exhausts its iterations or
+        fails a tool protocol still writes a checkpoint a resume can load
+        from, exactly like a normal completion does.
+        """
+        self.lost_tool_evidence = LostToolEvidence()
+
     async def _finalize_outcome(
         self,
         *,
@@ -3672,6 +4136,7 @@ class ReActPattern(AgentPattern):
         self.waiting_for_user_request = None
         self.pending_tool_interaction_responses = []
         self.force_final_answer_next = False
+        self._clear_lost_tool_evidence_at_run_end()
         self.status = "completed"
         await runtime.checkpoint("final", context=context, pattern=self)
         result = PatternResult(

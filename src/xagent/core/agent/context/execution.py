@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections import Counter
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -164,6 +165,62 @@ COMPACT_DROPPED_TOOL_NOTICE_MAX_NAMES = 20
 CLOCK_TIMEZONE_METADATA_KEY = "timezone"
 
 
+def bounded_notice_lines(
+    entries: Sequence[Any],
+    *,
+    render: Callable[[Any], str],
+    max_chars: int,
+    max_entries: int | None = None,
+    chars_used: int = 0,
+) -> tuple[list[str], int]:
+    """Render entries into notice lines under one shared overflow rule.
+
+    Several notices in this module list things named by runtime MCP server
+    configuration -- tool names, in particular -- rather than by anything
+    checked into this repository. A connected server can register any
+    number of tools with names of any length, so both "how many entries to
+    even consider" and "how many characters the rendered list may cost" are
+    unbounded from this module's point of view, and every such notice needs
+    the same two caps. Sharing this function is what keeps a second,
+    hand-written copy of that arithmetic from drifting from the first the
+    next time either cap changes.
+
+    An entry whose rendered line would overflow ``max_chars`` is skipped and
+    counted as omitted, and rendering continues past it rather than
+    stopping there. Entries are not guaranteed to be sorted by rendered
+    length, so a later entry short enough to fit must still be offered a
+    place in the list; stopping at the first overflow would drop it even
+    though the budget had room for it.
+
+    Everything about how an entry becomes a line stays with the caller: the
+    order entries are passed in, any per-entry clamp such as truncating one
+    over-long name, and the wording used to describe how many entries were
+    left out. Only the overflow decision -- when to stop adding entries and
+    when to skip one instead -- is shared here.
+
+    ``chars_used`` lets a caller pre-charge this budget for characters it
+    has already committed to spend before any entry is rendered, such as a
+    fixed prefix sentence the notice always opens with. That prefix draws
+    from the same ``max_chars`` ceiling the entries share, so the entries
+    must be measured against what remains of it, not against the full
+    budget.
+    """
+    total_entries = len(entries)
+    limit = total_entries if max_entries is None else min(max_entries, total_entries)
+    considered = entries[:limit]
+    omitted = total_entries - limit
+    lines: list[str] = []
+    current_chars = chars_used
+    for entry in considered:
+        line = render(entry)
+        if current_chars + len(line) + 1 > max_chars:
+            omitted += 1
+            continue
+        lines.append(line)
+        current_chars += len(line) + 1
+    return lines, omitted
+
+
 def estimate_provider_prompt_tokens(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None = None,
@@ -231,6 +288,29 @@ class CompactResult:
     final_count: int
     strategy: str
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class DroppedToolObservations:
+    """Tool observations one compaction destroys, counted and identified.
+
+    ``counts`` is per tool name and is exactly what the in-prompt dropped-
+    tool notice is built from. ``call_ids`` identifies the individual calls
+    behind those counts, so a consumer that later sees the same tool name
+    called again can tell a fresh call with different arguments from the
+    very call whose observation this was -- the tool name recurring is not
+    evidence that the lost value came back. ``without_call_id`` counts
+    destroyed observations that carried no ``tool_call_id`` at all, so
+    nothing identifies which call produced them. That is a real outcome
+    this type has to represent on its own, not an edge case to fold into
+    the other two fields: inventing an id for one of these observations, or
+    falling back to its tool name as if that identified the call, would
+    both claim knowledge the data does not carry.
+    """
+
+    counts: dict[str, int]
+    call_ids: tuple[str, ...]
+    without_call_id: int
 
 
 @dataclass
@@ -1338,7 +1418,7 @@ class ExecutionContext:
         # The window is a suffix minus any interior tool fragments sanitized
         # out of it, so diff by object identity rather than slicing a prefix.
         retained_ids = {id(message) for message in retained}
-        dropped_tool_counts = self._dropped_tool_result_counts(
+        dropped_observations = self._dropped_tool_observations(
             [message for message in self.messages if id(message) not in retained_ids]
         )
         self.messages = retained
@@ -1349,8 +1429,12 @@ class ExecutionContext:
             strategy="truncate",
             metadata={
                 "removed_count": removed,
-                "dropped_tool_result_count": sum(dropped_tool_counts.values()),
-                "dropped_tool_results_by_name": dropped_tool_counts,
+                "dropped_tool_result_count": sum(dropped_observations.counts.values()),
+                "dropped_tool_results_by_name": dropped_observations.counts,
+                "dropped_tool_result_call_ids": list(dropped_observations.call_ids),
+                "dropped_tool_results_without_call_id": (
+                    dropped_observations.without_call_id
+                ),
             },
         )
 
@@ -1397,8 +1481,10 @@ class ExecutionContext:
         # next_messages below keeps only the system summary and, at most, a
         # role=="user" message, so no tool observation survives: here the whole
         # list is the diff. truncate needs a real diff; this does not.
-        dropped_tool_counts = self._dropped_tool_result_counts(self.messages)
-        dropped_tools_notice = self._dropped_tool_results_notice(dropped_tool_counts)
+        dropped_observations = self._dropped_tool_observations(self.messages)
+        dropped_tools_notice = self._dropped_tool_results_notice(
+            dropped_observations.counts
+        )
         summary_content = (
             "Compacted conversation summary:\n"
             f"{summary}\n\n"
@@ -1443,8 +1529,16 @@ class ExecutionContext:
                 "compact_model": getattr(llm, "model_name", None),
                 "retained_context_ref_count": len(compacted_context_refs),
                 "dropped_context_ref_count": len(dropped_context_refs),
-                "dropped_tool_result_count": sum(dropped_tool_counts.values()),
-                "dropped_tool_results_by_name": dropped_tool_counts,
+                "dropped_tool_result_count": sum(dropped_observations.counts.values()),
+                "dropped_tool_results_by_name": dropped_observations.counts,
+                # Additive: the two keys above keep their existing meaning
+                # and count, so a reader that does not know about these two
+                # is unaffected. These identify the individual calls behind
+                # those counts.
+                "dropped_tool_result_call_ids": list(dropped_observations.call_ids),
+                "dropped_tool_results_without_call_id": (
+                    dropped_observations.without_call_id
+                ),
                 # The summary body itself, so a later turn can replay it
                 # without re-deriving it. This is the whole point of emitting
                 # it: the in-memory context holding it does not survive the
@@ -1533,8 +1627,8 @@ class ExecutionContext:
         return prefix + "\n".join(lines)
 
     @staticmethod
-    def _dropped_tool_result_counts(messages: list[Message]) -> dict[str, int]:
-        """Count tool observations whose raw result this compaction discards.
+    def _dropped_tool_observations(messages: list[Message]) -> DroppedToolObservations:
+        """Count and identify tool observations this compaction discards.
 
         Superseded observations are excluded: a later observation already
         replaced their content and ``raw_result``, so compacting them away
@@ -1547,6 +1641,8 @@ class ExecutionContext:
         restoring evidence.
         """
         names: list[str] = []
+        call_ids: list[str] = []
+        without_call_id = 0
         for message in messages:
             if message.role != "tool":
                 continue
@@ -1561,7 +1657,16 @@ class ExecutionContext:
             if name in NON_EVIDENCE_TOOL_NAMES:
                 continue
             names.append(name or "unnamed tool")
-        return dict(Counter(names))
+            call_id = message.tool_call_id
+            if isinstance(call_id, str) and call_id:
+                call_ids.append(call_id)
+            else:
+                without_call_id += 1
+        return DroppedToolObservations(
+            counts=dict(Counter(names)),
+            call_ids=tuple(call_ids),
+            without_call_id=without_call_id,
+        )
 
     @staticmethod
     def _dropped_tool_results_notice(counts: dict[str, int]) -> str:
@@ -1585,18 +1690,19 @@ class ExecutionContext:
         # per-name length and the total notice size the way the sibling
         # reference notice does.
         ordered = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
-        listed = ordered[:COMPACT_DROPPED_TOOL_NOTICE_MAX_NAMES]
-        lines: list[str] = []
-        current_chars = len(prefix)
-        omitted = len(ordered) - len(listed)
-        for name, count in listed:
+
+        def render_entry(entry: tuple[str, int]) -> str:
+            name, count = entry
             clamped = name[:COMPACT_DROPPED_TOOL_NAME_MAX_CHARS]
-            line = f"- {clamped} x{count}" if count > 1 else f"- {clamped}"
-            if current_chars + len(line) + 1 > COMPACT_DROPPED_TOOL_NOTICE_MAX_CHARS:
-                omitted += 1
-                continue
-            lines.append(line)
-            current_chars += len(line) + 1
+            return f"- {clamped} x{count}" if count > 1 else f"- {clamped}"
+
+        lines, omitted = bounded_notice_lines(
+            ordered,
+            render=render_entry,
+            max_chars=COMPACT_DROPPED_TOOL_NOTICE_MAX_CHARS,
+            max_entries=COMPACT_DROPPED_TOOL_NOTICE_MAX_NAMES,
+            chars_used=len(prefix),
+        )
         if omitted:
             name_label = "name" if omitted == 1 else "names"
             lines.append(

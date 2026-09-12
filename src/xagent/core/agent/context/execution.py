@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections import Counter
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
@@ -14,6 +15,7 @@ import tiktoken
 
 from ...context_ref import (
     CONTEXT_REFS_KEY,
+    SUPERSEDES_SCOPE_KEY,
     ContextReference,
     normalize_context_references,
     split_tool_result_context_references,
@@ -61,6 +63,8 @@ from .skill_tool import (
     LOADED_SKILLS_METADATA_KEY,
     SKILL_INDEX_METADATA_KEY,
 )
+
+logger = logging.getLogger(__name__)
 
 READ_FILE_CONTEXT_LIMIT = 12_000
 # Set by the web layer into ``ExecutionContext.metadata`` at turn start: the
@@ -322,7 +326,26 @@ class ExecutionContext:
         *,
         context_refs: Any = (),
     ) -> Message:
-        public_result, supersedes_scope = split_tool_result_supersedes_scope(result)
+        public_result = result
+        supersedes_scope: str | None = None
+        try:
+            public_result, supersedes_scope = split_tool_result_supersedes_scope(result)
+        except ValueError as exc:
+            # A malformed supersedes scope is internal bookkeeping for
+            # compacting superseded observations; losing it must degrade
+            # compaction, not the execution. Drop the key, log once with the
+            # tool name, and keep the turn alive (xorbitsai/xagent#2238).
+            # split_tool_result_supersedes_scope validates after popping from
+            # a private copy, so strip the key here before the model sees it.
+            if isinstance(public_result, dict):
+                public_result = dict(public_result)
+                public_result.pop(SUPERSEDES_SCOPE_KEY, None)
+            logger.warning(
+                "Dropping invalid %s from tool '%s' result: %s",
+                SUPERSEDES_SCOPE_KEY,
+                tool_name,
+                exc,
+            )
         public_result, embedded_refs = split_tool_result_context_references(
             public_result
         )

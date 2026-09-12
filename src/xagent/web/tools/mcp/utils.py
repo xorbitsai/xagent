@@ -1147,3 +1147,32 @@ def setup_proxy_env() -> None:
     # If ALL_PROXY is set, ensure HTTPS_PROXY is also set
     if "ALL_PROXY" in os.environ and "HTTPS_PROXY" not in os.environ:
         os.environ["HTTPS_PROXY"] = os.environ["ALL_PROXY"]
+
+
+def unchecked_extra(unchecked_attendees: list[str]) -> dict[str, Any]:
+    """Extra fields for a status="success" envelope when some attendees
+    ended up unchecked - empty (nothing to add) when there's nothing to
+    report."""
+    if not unchecked_attendees:
+        return {}
+    return {"unchecked_attendees": unchecked_attendees}
+
+
+def naive_day_bounds(date_value: str, *, days: int = 1) -> tuple[str, str]:
+    """Return (start, end) NAIVE ISO datetime strings spanning ``days``
+    full calendar day(s) starting at ``date_value``'s date - the
+    zone-agnostic counterpart to ``calendar_day_bounds``, for an API like
+    Outlook's dateTimeTimeZone that wants a naive clock value paired with
+    a separate timeZone field rather than an embedded offset (attaching a
+    zone here and stripping it back off would just be lossy round-tripping
+    for no benefit, since no zone conversion is actually needed - "midnight
+    of this date" is the same clock reading regardless of which zone it's
+    later paired with).
+
+    ``date_value`` may be a bare "YYYY-MM-DD" or a full datetime string
+    (only its date component is used).
+    """
+    day: date = datetime.fromisoformat(date_value).date()
+    start = datetime.combine(day, time.min)
+    end = start + timedelta(days=days)
+    return start.isoformat(), end.isoformat()

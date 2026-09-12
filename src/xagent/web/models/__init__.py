@@ -8,6 +8,7 @@ from .chat_message import TaskChatMessage
 from .custom_api import CustomApi, UserCustomApi
 from .database import Base, get_db, get_engine, get_session_local
 from .deployment import Deployment, DeploymentOwnerType
+from .global_memory_embedding_authority import GlobalMemoryEmbeddingAuthority
 from .gmail_watch import GmailWatchState
 from .kb_ingest_target import KBIngestTarget
 from .mcp import MCPServer, UserMCPServer
@@ -95,6 +96,7 @@ __all__ = [
     "BackgroundJobStatus",
     "BackgroundJobType",
     "GmailWatchState",
+    "GlobalMemoryEmbeddingAuthority",
     "KBIngestTarget",
     "TaskChatMessage",
     "UploadedFile",

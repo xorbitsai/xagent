@@ -55,6 +55,9 @@ from ..core.tracing.langfuse import flush_langfuse, initialize_langfuse
 from .api.a2a import router as a2a_router
 from .api.admin_interaction_rollout import router as admin_interaction_rollout_router
 from .api.admin_mcp import admin_mcp_router
+from .api.admin_memory_embedding_authority import (
+    router as admin_memory_embedding_authority_router,
+)
 from .api.admin_users import router as admin_users_router
 from .api.agent_api_keys import router as agent_api_keys_router
 from .api.agents import router as agents_router
@@ -1229,6 +1232,7 @@ app.include_router(deployment_config_router)
 app.include_router(tools_router)
 app.include_router(admin_users_router)
 app.include_router(admin_interaction_rollout_router)
+app.include_router(admin_memory_embedding_authority_router)
 app.include_router(admin_mcp_router)
 app.include_router(skills_router)
 app.include_router(skill_hub_router)

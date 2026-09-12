@@ -386,6 +386,13 @@ jobs:
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 
+      - name: Test shared execution foundations (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/migrations/test_shared_execution_foundations.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
       - name: Test MCP OAuth lifecycle fencing (Postgres-only)
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |

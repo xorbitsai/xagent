@@ -26,6 +26,7 @@ from ..config import (
     get_gmail_watch_renewal_interval_seconds,
     get_orphan_upload_sweep_interval_seconds,
     get_session_secret,
+    get_shared_task_execution_enabled,
     get_task_lease_recovery_batch_size,
     get_task_lease_recovery_interval_seconds,
     get_taskless_upload_ttl_seconds,
@@ -1328,6 +1329,11 @@ async def _initialize_database_and_admit_runtime(app_instance: FastAPI) -> None:
 async def startup_event() -> None:
     global _migration_task
     logger.info("Agent runtime configured: %s", get_agent_runtime())
+    if get_shared_task_execution_enabled():
+        raise RuntimeError(
+            "XAGENT_SHARED_TASK_EXECUTION_ENABLED must remain false: "
+            "shared worker and event bridge startup are not wired yet."
+        )
     validate_interaction_rollout_at_startup()
     await _initialize_database_and_admit_runtime(app)
 

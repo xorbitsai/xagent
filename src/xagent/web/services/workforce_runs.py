@@ -30,7 +30,7 @@ from .file_turn import bind_turn_files_no_commit
 from .task_orchestrator import (
     TaskTurnOrchestrator,
     TaskTurnPayload,
-    _ClaimedTurn,
+    _PreparedTurn,
     timezone_schedule_context,
 )
 from .workforce_access import ensure_workforce_access, get_workforce_policy
@@ -89,7 +89,7 @@ class _PreparedWorkforceRunStart:
     workforce_run: WorkforceRunStartSnapshot
     task: WorkforceTaskStartSnapshot
     payload: TaskTurnPayload | None
-    claimed_turn: _ClaimedTurn | None
+    claimed_turn: _PreparedTurn | None
     created: bool
 
 
@@ -585,12 +585,15 @@ def _create_claimed_workforce_run_isolated(
                 created=False,
             )
 
-        payload = TaskTurnPayload(transcript_message=request.message)
+        payload = TaskTurnPayload(
+            transcript_message=request.message, file_ids=request.selected_file_ids
+        )
         claimed_turn = TaskTurnOrchestrator.claim_created_turn_no_commit(
             db,
             task_id=int(record.task.id),
             task_owner_user_id=user_id,
             payload=payload,
+            context=timezone_schedule_context(request.timezone),
         )
         sync_workforce_run_status(db, record.task, TaskStatus.RUNNING)
         db.flush()
@@ -669,12 +672,15 @@ def _create_claimed_preview_run_isolated(
             request=request,
         )
 
-        payload = TaskTurnPayload(transcript_message=request.message)
+        payload = TaskTurnPayload(
+            transcript_message=request.message, file_ids=request.selected_file_ids
+        )
         claimed_turn = TaskTurnOrchestrator.claim_created_turn_no_commit(
             db,
             task_id=int(record.task.id),
             task_owner_user_id=user_id,
             payload=payload,
+            context=timezone_schedule_context(request.timezone),
         )
         sync_workforce_run_status(db, record.task, TaskStatus.RUNNING)
         db.flush()
@@ -884,7 +890,7 @@ async def create_preview_workforce_run(
             task_owner_user_id=user_id,
             actor_user_id=user_id,
             payload=cast(TaskTurnPayload, prepared.payload),
-            claimed=cast(_ClaimedTurn, prepared.claimed_turn),
+            claimed=cast(_PreparedTurn, prepared.claimed_turn),
             context=timezone_schedule_context(request.timezone),
         )
         return WorkforceRunStartResult(

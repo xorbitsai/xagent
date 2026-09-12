@@ -15,6 +15,7 @@ from typing import Any, Optional
 
 from sqlalchemy.orm import Session
 
+from ...config import get_shared_task_execution_enabled
 from ..models.agent import Agent
 from ..models.database import get_session_local
 from ..models.task import Task, TaskStatus
@@ -50,7 +51,7 @@ from .task_orchestrator import (
     TaskTurnPayload,
     TurnKind,
     TurnStarted,
-    _ClaimedTurn,
+    _PreparedTurn,
     _retire_turn_session_best_effort,
     commit_claimed_turn_or_reconcile,
     timezone_schedule_context,
@@ -176,9 +177,17 @@ def _store_connector_runtime_values_or_fail(
     task_id: int,
     turn_id: str,
     values_by_ref: dict,
+    db: Session,
 ) -> None:
     try:
-        store_ephemeral_runtime_values(turn_id, values_by_ref)
+        if get_shared_task_execution_enabled():
+            from .task_runtime_secrets import stage_runtime_values
+
+            stage_runtime_values(
+                db, task_id=task_id, turn_id=turn_id, values_by_ref=values_by_ref
+            )
+        else:
+            store_ephemeral_runtime_values(turn_id, values_by_ref)
     except Exception as exc:
         pop_ephemeral_runtime_values(turn_id)
         logger.warning(
@@ -198,7 +207,7 @@ class _PreparedCreateTaskStart:
     task_owner_user_id: int
     created_at: datetime
     payload: TaskTurnPayload
-    claimed_turn: _ClaimedTurn
+    claimed_turn: _PreparedTurn
 
 
 @dataclass(frozen=True)
@@ -209,7 +218,7 @@ class _PreparedAppendTurn:
     agent_id: int
     task_owner_user_id: int
     payload: TaskTurnPayload
-    claimed_turn: _ClaimedTurn
+    claimed_turn: _PreparedTurn
 
 
 def _prepare_created_task_isolated(
@@ -219,6 +228,7 @@ def _prepare_created_task_isolated(
     message: str,
     file_ids: tuple[str, ...],
     connector_runtime_context: tuple[dict[str, Any], ...],
+    timezone: str | None = None,
 ) -> _PreparedCreateTaskStart:
     """Create, claim, and commit the first turn in one DB transaction."""
 
@@ -266,17 +276,29 @@ def _prepare_created_task_isolated(
             plan=runtime_plan,
         )
         payload = _turn_payload(message, file_infos)
+        if get_shared_task_execution_enabled():
+            _store_connector_runtime_values_or_fail(
+                task_id=task_id,
+                turn_id=payload.turn_id,
+                db=db,
+                values_by_ref=runtime_plan.ephemeral_by_ref,
+            )
+
         claimed_turn = TaskTurnOrchestrator.claim_created_turn_no_commit(
             db,
             task_id=task_id,
             task_owner_user_id=task_owner_user_id,
             payload=payload,
+            context=timezone_schedule_context(timezone),
         )
-        _store_connector_runtime_values_or_fail(
-            task_id=task_id,
-            turn_id=payload.turn_id,
-            values_by_ref=runtime_plan.ephemeral_by_ref,
-        )
+        if not get_shared_task_execution_enabled():
+            _store_connector_runtime_values_or_fail(
+                task_id=task_id,
+                turn_id=payload.turn_id,
+                db=db,
+                values_by_ref=runtime_plan.ephemeral_by_ref,
+            )
+
         created_at = db.query(Task.created_at).filter(Task.id == task_id).scalar()
         if created_at is None:
             raise RuntimeError("created task has no creation timestamp")
@@ -297,7 +319,7 @@ def _prepare_created_task_isolated(
         )
     except Exception:
         db.rollback()
-        if payload is not None:
+        if payload is not None and not get_shared_task_execution_enabled():
             pop_ephemeral_runtime_values(payload.turn_id)
         raise
     finally:
@@ -385,17 +407,28 @@ def _prepare_append_turn_isolated(
             task_id=int(task.id),
         )
         payload = _turn_payload(message, file_infos)
+        if get_shared_task_execution_enabled():
+            _store_connector_runtime_values_or_fail(
+                task_id=int(task.id),
+                turn_id=payload.turn_id,
+                db=db,
+                values_by_ref=runtime_plan.ephemeral_by_ref,
+            )
+
         claimed_turn = TaskTurnOrchestrator.claim_append_turn_no_commit(
             db,
             task_id=int(task.id),
             task_owner_user_id=task_owner_user_id,
             payload=payload,
         )
-        _store_connector_runtime_values_or_fail(
-            task_id=int(task.id),
-            turn_id=payload.turn_id,
-            values_by_ref=runtime_plan.ephemeral_by_ref,
-        )
+        if not get_shared_task_execution_enabled():
+            _store_connector_runtime_values_or_fail(
+                task_id=int(task.id),
+                turn_id=payload.turn_id,
+                db=db,
+                values_by_ref=runtime_plan.ephemeral_by_ref,
+            )
+
         prepared = _PreparedAppendTurn(
             task_id=int(task.id),
             agent_id=int(task.agent_id),
@@ -413,7 +446,7 @@ def _prepare_append_turn_isolated(
         return prepared
     except Exception:
         db.rollback()
-        if payload is not None:
+        if payload is not None and not get_shared_task_execution_enabled():
             pop_ephemeral_runtime_values(payload.turn_id)
         raise
     finally:
@@ -493,6 +526,7 @@ async def create_sdk_task(
                 message=message,
                 file_ids=file_ids,
                 connector_runtime_context=connector_runtime_context,
+                timezone=timezone,
             )
         )
         try:
@@ -593,7 +627,7 @@ class _A2ATurnPreparation:
     created_task: bool
     kind: TurnKind
     payload: TaskTurnPayload
-    claimed_turn: _ClaimedTurn | None
+    claimed_turn: _PreparedTurn | None
 
 
 def _prepare_a2a_turn_sync(
@@ -775,6 +809,23 @@ async def execute_existing_task(
     actor_user_id: int,
 ) -> None:
     """Run the legacy command to completion without returning a task handle."""
+    from .task_execution_host import enqueues_task_turns
+
+    if enqueues_task_turns():
+        from .task_completion import wait_for_task_run
+        from .task_existing_command import enqueue_existing_execution
+
+        run_id = await run_db_io_cancellation_safe(
+            lambda: enqueue_existing_execution(
+                task_id=task_id,
+                task_owner_user_id=task_owner_user_id,
+                task_description=task_description,
+                context=context,
+                actor_user_id=actor_user_id,
+            )
+        )
+        await wait_for_task_run(task_id, run_id)
+        return
     background_task = await TaskTurnOrchestrator.schedule_existing_task_execution(
         task_id=task_id,
         task_owner_user_id=task_owner_user_id,

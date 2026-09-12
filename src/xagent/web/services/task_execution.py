@@ -1669,6 +1669,8 @@ def _finalize_task_execution_result_isolated(
                 # Shared readers may observe completion before scheduler
                 # cleanup runs. Publish its durable output in this same
                 # fenced transaction as the terminal state and transcript.
+                # This also runs locally: finish_turn later writes the same
+                # assistant content (or clears output on failure).
                 setattr(
                     task_updated,
                     "output",

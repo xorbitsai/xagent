@@ -331,6 +331,12 @@ async def run_task_lease_recovery_loop(
             )
             if recovered:
                 logger.info("Recovered %s expired task lease(s)", recovered)
+            from ...config import get_shared_task_execution_enabled
+
+            if get_shared_task_execution_enabled():
+                from .task_runtime_secrets import clean_finished_runtime_values
+
+                await run_db_io_cancellation_safe(clean_finished_runtime_values)
         except asyncio.CancelledError:
             raise
         except Exception as exc:

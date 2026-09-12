@@ -65,7 +65,7 @@ from .task_interaction_close import (
 from .task_lease_service import registered_task_lease
 
 if TYPE_CHECKING:
-    from .task_orchestrator import TaskTurnPayload, _ClaimedTurn
+    from .task_orchestrator import TaskTurnPayload, _PreparedTurn
 
 from ..utils.db_timezone import safe_timestamp_to_unix
 from .chat_history_service import (
@@ -128,6 +128,7 @@ from .task_command_transport import (
     COMMAND_ID_PATTERN,
     MAX_COMMAND_FAILURES,
     ClaimedTaskCommand,
+    SettledTaskCommand,
     TaskCommandDeferred,
     TaskCommandKind,
     TaskCommandRejected,
@@ -868,7 +869,7 @@ class _TaskMessagePreparation:
     display_file_refs: tuple[dict[str, Any], ...]
     persisted_attachments: tuple[dict[str, Any], ...]
     turn_payload: "TaskTurnPayload"
-    claimed_created_turn: "_ClaimedTurn | None"
+    claimed_created_turn: "_PreparedTurn | None"
     existing_delivery: _UserMessageDeliverySnapshot | None
     recovered_delivery: _UserMessageDeliverySnapshot | None
     delivery_claimed: bool
@@ -3783,6 +3784,23 @@ async def _terminal_command_event_draft(
 
 
 async def execute_durable_task_command(
+    command: ClaimedTaskCommand,
+) -> dict[str, Any] | None | SettledTaskCommand:
+    from .task_execution_host import claimed_command_execution
+
+    with claimed_command_execution():
+        if command.kind == TaskCommandKind.RESUME_INPUT:
+            from .task_resume_command import execute_resume_input
+
+            return await execute_resume_input(command)
+        if command.kind == TaskCommandKind.START:
+            from .task_start_consumer import execute_task_start
+
+            return await execute_task_start(command)
+        return await _execute_and_report_task_command(command)
+
+
+async def _execute_and_report_task_command(
     command: ClaimedTaskCommand,
 ) -> dict[str, Any] | None:
     """Apply one command and expose only terminal transport failures to clients."""

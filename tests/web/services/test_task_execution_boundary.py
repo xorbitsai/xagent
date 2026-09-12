@@ -358,9 +358,9 @@ def test_control_and_reply_commands_execute_without_api_routes() -> None:
                     agent.pause_execution.return_value = True
                     with patch.object(agent_service_manager, "get_agent_manager") as manager:
                         manager.return_value.get_agent_for_task = AsyncMock(return_value=agent)
-                        control_kinds = (kind for kind in TaskCommandKind if kind != TaskCommandKind.START)
+                        control_kinds = (kind for kind in TaskCommandKind if kind not in (TaskCommandKind.START, TaskCommandKind.RESUME_INPUT))
                         for index, kind in enumerate(control_kinds):
-                            # Exercise the four wired commands; START is protocol-only.
+                            # Exercise the four wired commands; START and RESUME_INPUT have separate handoff tests.
                             task_index = ["message", "pause", "resume", "cancel"].index(kind.value)
                             payload = (
                                 {"client_message_id": "message-command", "message": "hello"}

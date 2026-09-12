@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
 import pytest
@@ -157,34 +158,48 @@ async def test_negative_socket_ack_preserves_connection_error(bridge, monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_socket_writer_ack_follows_send_and_slow_queue_is_bounded():
+@pytest.mark.parametrize("started", [False, True])
+async def test_socket_writer_ack_follows_send_and_slow_queue_is_bounded(started):
     class Socket:
         def __init__(self):
-            self.release = asyncio.Event()
             self.entered = asyncio.Event()
-            self.closed = False
+            self.close_codes = []
 
         async def send_text(self, text):
             self.entered.set()
-            await self.release.wait()
+            await asyncio.Event().wait()
 
         async def close(self, code):
-            self.closed = True
+            self.close_codes.append(code)
 
     socket = Socket()
-    writer = TaskSocketWriter(socket, lambda: None)
+    disconnected = []
+
+    def disconnect():
+        disconnected.append(True)
+        # ConnectionManager.disconnect also stops the writer it removes.
+        writer.stop()
+
+    writer = TaskSocketWriter(socket, disconnect)
     ack = writer.enqueue("first", acknowledge=True)
-    await socket.entered.wait()
+    if started:
+        await asyncio.wait_for(socket.entered.wait(), timeout=1)
     assert not ack.done()
-    for _ in range(256):
+    while not writer.queue.full():
         writer.enqueue("queued")
     with pytest.raises(ConnectionError):
         writer.enqueue("overflow")
-    await asyncio.gather(writer.task)
+    await asyncio.wait_for(
+        asyncio.gather(writer.task, return_exceptions=True), timeout=2
+    )
+    assert writer.close_task is not None
+    await asyncio.wait_for(writer.close_task, timeout=1)
     with pytest.raises(ConnectionError):
-        await ack
+        await asyncio.wait_for(ack, timeout=1)
     assert writer.closed
     assert writer.queue.empty()
+    assert socket.close_codes == [1013]
+    assert disconnected == [True]
 
 
 @pytest.mark.asyncio
@@ -325,8 +340,28 @@ async def test_single_send_failure_closes_socket_for_reconnection(failure):
     acknowledgement = writer.enqueue("one message", acknowledge=True)
     await asyncio.wait_for(writer.task, timeout=8)
     with pytest.raises(ConnectionError, match="send failed"):
-        await acknowledgement
+        await asyncio.wait_for(acknowledgement, timeout=1)
     assert socket.close_codes == [1013]
     assert disconnected == [True]
     assert writer.closed
     assert writer.queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_reply_without_route_is_observable_without_publishing(
+    bridge, monkeypatch, caplog
+):
+    monkeypatch.setattr(module, "_reply_route", lambda *args: None)
+    publish = AsyncMock()
+    counter = Mock()
+    monkeypatch.setattr(bridge, "_publish", publish)
+    monkeypatch.setattr(module, "increment_counter", counter)
+    await bridge.reply_for("command-1", 42)({"content": "private reply content"})
+    publish.assert_not_awaited()
+    counter.assert_called_once_with(
+        "xagent.task.reply.delivery", attributes={"outcome": "no_route"}
+    )
+    assert "no origin route task_id=42 command_id=command-1" in caplog.text
+    assert "private reply content" not in caplog.text
+    assert not bridge._acks
+    await bridge.close()

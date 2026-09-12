@@ -611,3 +611,90 @@ def test_detach_task_connections_removes_forward_and_reverse_membership() -> Non
     assert detached == [first_websocket, second_websocket]
     assert connection_manager.active_connections == {other_task_id: [other_websocket]}
     assert connection_manager._connection_task_ids == {other_websocket: other_task_id}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status", [TaskStatus.RUNNING, TaskStatus.COMPLETED, TaskStatus.WAITING_FOR_USER]
+)
+async def test_shared_reconciliation_reads_persisted_state_and_stops(
+    current_task, monkeypatch, status
+):
+    import threading
+
+    from xagent.web.models.database import get_session_local
+    from xagent.web.services import task_event_bridge, task_stream_snapshot
+
+    with get_session_local()() as db:
+        task = db.get(Task, current_task.id)
+        task.status = status
+        task.control_state = status.value
+        task.output = "complete durable result"
+        task.lease_attempt_id = "attempt-current"
+        db.commit()
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    monkeypatch.setattr(
+        task_event_bridge, "_bridge", SimpleNamespace(discard_recipient=lambda ws: None)
+    )
+    loop_thread = threading.get_ident()
+    read_threads = []
+    load = task_stream_snapshot.load_task_stream_snapshots
+
+    def load_off_loop(task_ids):
+        read_threads.append(threading.get_ident())
+        return load(task_ids)
+
+    monkeypatch.setattr(
+        task_stream_snapshot, "load_task_stream_snapshots", load_off_loop
+    )
+    received = asyncio.Event()
+
+    class Socket(_RecordingWebSocket):
+        async def send_text(self, message):
+            await super().send_text(message)
+            received.set()
+
+    socket = Socket()
+    manager = ConnectionManager()
+    manager.register_connection(socket, current_task.id)
+    writer = manager._writers[socket]
+    manager.start_stream_reconciliation()
+    reconciler = manager._stream_reconciler
+    try:
+        await asyncio.wait_for(received.wait(), timeout=2)
+        frame = json.loads(socket.messages[0])
+        assert frame["type"] == "task_stream_snapshot"
+        assert frame["task_id"] == current_task.id
+        assert frame["run_id"] == "run-current"
+        assert frame["state_version"] == 7
+        assert frame["status"] == status.value
+        assert frame["lease_attempt_id"] == "attempt-current"
+        assert frame["output"] == (
+            "complete durable result" if status == TaskStatus.COMPLETED else None
+        )
+        if status == TaskStatus.WAITING_FOR_USER:
+            assert "question" in frame and "interactions" in frame
+        assert read_threads and loop_thread not in read_threads
+    finally:
+        await asyncio.wait_for(manager.stop_stream_reconciliation(), timeout=2)
+        manager.disconnect(socket)
+        await asyncio.wait_for(
+            asyncio.gather(writer.task, return_exceptions=True), timeout=2
+        )
+    assert reconciler.done()
+    assert manager._stream_reconciler is None
+    assert not manager.active_connections
+
+
+@pytest.mark.asyncio
+async def test_shared_delivery_logs_connection_without_writer(monkeypatch, caplog):
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "false")
+    manager = ConnectionManager()
+    socket = _RecordingWebSocket()
+    manager.register_connection(socket, 42)
+    await manager.deliver_shared_event(
+        {"type": "diagnostic", "content": "private content"}, 42
+    )
+    assert "connection has no writer task_id=42" in caplog.text
+    assert "private content" not in caplog.text
+    manager.disconnect(socket)

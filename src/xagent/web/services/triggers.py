@@ -1844,12 +1844,21 @@ def _mark_trigger_run_running_if_task_running(run_id: int, task_id: int) -> bool
         db.close()
 
 
-def _finish_trigger_run_after_task(start: _PreparedTriggerStart) -> None:
+def _finish_trigger_run_after_task(
+    start: _PreparedTriggerStart,
+    expected_task_run_id: str | None = None,
+) -> None:
     db = _with_session()
     try:
         task = db.query(Task).filter(Task.id == start.task_id).first()
         run = db.query(TriggerRun).filter(TriggerRun.id == start.run_id).first()
-        if task is None or run is None:
+        if (
+            task is None
+            or run is None
+            or (
+                expected_task_run_id is not None and task.run_id != expected_task_run_id
+            )
+        ):
             return
         if task.status == TaskStatus.COMPLETED:
             setattr(run, "status", TriggerRunStatus.COMPLETED.value)
@@ -1943,9 +1952,14 @@ async def _start_prepared_trigger_run_id(
     except Exception:
         logger.debug("Trigger quota record failed", exc_info=True)
 
-    if wait_for_completion and asyncio.isfuture(started.background_task):
-        await started.background_task
-        await asyncio.to_thread(_finish_trigger_run_after_task, start)
+    if wait_for_completion:
+        if started.background_task is None:
+            from .task_completion import wait_for_task_run
+
+            await wait_for_task_run(started.task_id, started.run_id)
+        elif asyncio.isfuture(started.background_task):
+            await started.background_task
+        await asyncio.to_thread(_finish_trigger_run_after_task, start, started.run_id)
 
     return True
 

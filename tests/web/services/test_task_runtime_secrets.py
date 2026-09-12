@@ -1,8 +1,11 @@
-"""Single-turn runtime inputs remain encrypted, scoped and transactional."""
+"""Run-scoped runtime inputs remain encrypted, scoped and transactional."""
 
 import pytest
+from cryptography.fernet import Fernet, InvalidToken
 
 from xagent.core.tools.adapters.vibe.connector_runtime import (
+    ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
+    ERROR_RUNTIME_SECRET_UNAVAILABLE,
     ConnectorRef,
     ConnectorRuntimeError,
 )
@@ -23,6 +26,13 @@ VALUES = {
         "auth_selector": {"account": "synthetic-account"},
     }
 }
+
+
+@pytest.fixture(autouse=True)
+def private_encryption_key(monkeypatch):
+    key = Fernet.generate_key().decode()
+    monkeypatch.setenv("ENCRYPTION_KEY", key)
+    return key
 
 
 @pytest.fixture
@@ -107,18 +117,23 @@ def test_compensation_preserves_queued_and_active_inputs(task_id):
     clean_finished_runtime_values()
     with get_session_local()() as db:
         assert db.query(TaskRuntimeSecret).count() == 1
-        db.get(Task, task_id).status = TaskStatus.PAUSED
+        db.get(Task, task_id).status = TaskStatus.COMPLETED
         db.commit()
     clean_finished_runtime_values()
     with get_session_local()() as db:
         assert db.query(TaskRuntimeSecret).count() == 0
 
 
-def test_compensation_waits_for_waiting_execution_to_release_lease(task_id):
+@pytest.mark.parametrize(
+    "resting_status", [TaskStatus.PAUSED, TaskStatus.WAITING_FOR_USER]
+)
+def test_resumed_execution_reuses_run_values_after_lease_release(
+    task_id, resting_status
+):
     with get_session_local()() as db:
         stage(db, task_id)
         task = db.get(Task, task_id)
-        task.status = TaskStatus.WAITING_FOR_USER
+        task.status = resting_status
         task.runner_id = "worker"
         db.commit()
     clean_finished_runtime_values()
@@ -128,7 +143,13 @@ def test_compensation_waits_for_waiting_execution_to_release_lease(task_id):
         db.commit()
     clean_finished_runtime_values()
     with get_session_local()() as db:
-        assert db.query(TaskRuntimeSecret).count() == 0
+        assert db.query(TaskRuntimeSecret).count() == 1
+        task = db.get(Task, task_id)
+        task.status = TaskStatus.RUNNING
+        task.runner_id = "resumed-worker"
+        assert load_runtime_values(db, task=task, required=True) == {
+            ref.storage_key: values for ref, values in VALUES.items()
+        }
 
 
 def test_cleanup_cannot_observe_inputs_before_transaction_binds_run(task_id):
@@ -152,3 +173,110 @@ def test_cleanup_cannot_observe_inputs_before_transaction_binds_run(task_id):
         assert load_runtime_values(
             observer, task=observer.get(Task, task_id), turn_id="turn-1", required=True
         )
+
+
+@pytest.mark.parametrize(
+    "key",
+    [None, "", "RQMpe38gK3m0szjpSmTNw_sP3Y54r6hDc6JewBoPKXc=", "invalid-key", "非密钥"],
+)
+def test_invalid_key_refuses_staging_without_writing(task_id, monkeypatch, key):
+    monkeypatch.delenv("ENCRYPTION_KEY", raising=False)
+    if key is not None:
+        monkeypatch.setenv("ENCRYPTION_KEY", key)
+    with get_session_local()() as db:
+        with pytest.raises(ConnectorRuntimeError) as error:
+            stage(db, task_id)
+        assert error.value.code == ERROR_CONNECTOR_RUNTIME_UNAVAILABLE
+        assert error.value.status_code == 503
+        assert "synthetic-secret" not in str(error.value)
+        db.commit()
+    with get_session_local()() as observer:
+        assert observer.query(TaskRuntimeSecret).count() == 0
+
+
+def test_store_does_not_reuse_cached_development_cipher(
+    task_id, monkeypatch, private_encryption_key
+):
+    from xagent.core.utils.encryption import get_cipher
+
+    get_cipher.cache_clear()
+    try:
+        monkeypatch.delenv("ENCRYPTION_KEY")
+        development_cipher = get_cipher()
+        monkeypatch.setenv("ENCRYPTION_KEY", private_encryption_key)
+        with get_session_local()() as db:
+            stage(db, task_id)
+            ciphertext = db.query(TaskRuntimeSecret).one().ciphertext.encode()
+            assert b"synthetic-secret" in Fernet(
+                private_encryption_key.encode()
+            ).decrypt(ciphertext)
+            with pytest.raises(InvalidToken):
+                development_cipher.decrypt(ciphertext)
+            assert load_runtime_values(
+                db, task=db.get(Task, task_id), turn_id="turn-1", required=True
+            )
+    finally:
+        get_cipher.cache_clear()
+
+
+@pytest.mark.parametrize("status", [TaskStatus.COMPLETED, TaskStatus.FAILED])
+def test_terminal_cleanup_is_scoped_to_run(task_id, status):
+    with get_session_local()() as db:
+        stage(db, task_id)
+        db.get(Task, task_id).status = status
+        db.commit()
+    clean_finished_runtime_values(task_id=task_id, run_id="other-run")
+    with get_session_local()() as db:
+        assert db.query(TaskRuntimeSecret).count() == 1
+    clean_finished_runtime_values(task_id=task_id, run_id="run-1")
+    with get_session_local()() as db:
+        assert db.query(TaskRuntimeSecret).count() == 0
+
+
+def test_new_run_never_inherits_old_values_and_old_cleanup_preserves_new(task_id):
+    with get_session_local()() as db:
+        stage(db, task_id)
+        task = db.get(Task, task_id)
+        task.run_id = "run-2"
+        db.flush()
+        assert load_runtime_values(db, task=task) is None
+        stage_runtime_values(
+            db, task_id=task_id, turn_id="turn-2", values_by_ref=VALUES
+        )
+        bind_runtime_values_to_run(
+            db, task_id=task_id, turn_id="turn-2", run_id="run-2"
+        )
+        db.commit()
+    clean_finished_runtime_values(task_id=task_id, run_id="run-1")
+    with get_session_local()() as db:
+        assert db.query(TaskRuntimeSecret).one().run_id == "run-2"
+        assert load_runtime_values(db, task=db.get(Task, task_id), required=True)
+
+
+def test_missing_accepted_values_fail_even_when_optional(task_id):
+    from xagent.web.services.task_start_protocol import (
+        TaskStartPayload,
+        stage_task_start_command,
+    )
+
+    with get_session_local()() as db:
+        task = db.get(Task, task_id)
+        stage_task_start_command(
+            db,
+            task_id=task_id,
+            actor_user_id=task.user_id,
+            start=TaskStartPayload(
+                version=1,
+                run_id="run-1",
+                state_version=1,
+                turn_id="turn-1",
+                kind="create",
+                message="hello",
+                runtime_values_ref="turn-1",
+            ),
+        )
+        db.commit()
+    with get_session_local()() as db:
+        with pytest.raises(ConnectorRuntimeError) as error:
+            load_runtime_values(db, task=db.get(Task, task_id))
+        assert error.value.code == ERROR_RUNTIME_SECRET_UNAVAILABLE

@@ -225,12 +225,19 @@ def _workforce_runtime_with_worker_tools(*tool_names: str) -> WorkforceTaskRunti
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("shared", [False, True])
 async def test_create_workforce_run_forwards_the_caller_timezone(
     db_session: Session,
+    shared: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The opening turn starts inside task creation, so the zone has to ride
     the create request; there is no chat frame to carry it."""
+    from xagent.web.models.task_command import TaskExecutionCommand
+    from xagent.web.services import task_event_bridge
+
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", str(shared).lower())
+    monkeypatch.setattr(task_event_bridge, "get_task_event_bridge", lambda: MagicMock())
     scheduled = _patch_schedule_bg(monkeypatch)
 
     user = _create_user(db_session, "tz-owner")
@@ -246,9 +253,22 @@ async def test_create_workforce_run_forwards_the_caller_timezone(
         message="how many shifts do we have on tomorrow?",
         timezone="Australia/Melbourne",
     )
-    await result.background_task
+    if shared:
+        assert result.background_task is None
+        command = (
+            db_session.query(TaskExecutionCommand)
+            .filter_by(task_id=result.task.id)
+            .one()
+        )
+        assert command.status == "pending"
+        assert not scheduled
+    else:
+        await result.background_task
 
-    assert scheduled["context"] == {"timezone": "Australia/Melbourne"}
+    if shared:
+        assert command.payload["timezone"] == "Australia/Melbourne"
+    else:
+        assert scheduled["context"] == {"timezone": "Australia/Melbourne"}
 
 
 @pytest.mark.asyncio
@@ -301,10 +321,17 @@ async def test_create_workforce_run_treats_a_blank_timezone_as_absent(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("shared", [False, True])
 async def test_create_workforce_run_creates_task_run_and_starts_turn(
     db_session: Session,
+    shared: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from xagent.web.models.task_command import TaskExecutionCommand
+    from xagent.web.services import task_event_bridge
+
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", str(shared).lower())
+    monkeypatch.setattr(task_event_bridge, "get_task_event_bridge", lambda: MagicMock())
     scheduled = _patch_schedule_bg(monkeypatch)
 
     user = _create_user(db_session, "owner")
@@ -329,7 +356,17 @@ async def test_create_workforce_run_creates_task_run_and_starts_turn(
         message="Coordinate a launch brief",
         selected_file_ids=["file-1"],
     )
-    await result.background_task
+    if shared:
+        assert result.background_task is None
+        command = (
+            db_session.query(TaskExecutionCommand)
+            .filter_by(task_id=result.task.id)
+            .one()
+        )
+        assert command.status == "pending"
+        assert not scheduled
+    else:
+        await result.background_task
     assert not hasattr(result.task, "_sa_instance_state")
     assert not hasattr(result.workforce_run, "_sa_instance_state")
 
@@ -358,8 +395,13 @@ async def test_create_workforce_run_creates_task_run_and_starts_turn(
     assert workforce_run.status == "running"
     assert workforce_run.is_preview is False
     assert uploaded_file.task_id == task.id
-    assert scheduled["task_id"] == task.id
-    assert scheduled["payload"].transcript_message == "Coordinate a launch brief"
+    if shared:
+        assert task.runner_id is None
+        assert command.payload["message"] == "Coordinate a launch brief"
+        assert command.payload["file_ids"] == ["file-1"]
+    else:
+        assert scheduled["task_id"] == task.id
+        assert scheduled["payload"].transcript_message == "Coordinate a launch brief"
     assert (
         db_session.query(TaskChatMessage)
         .filter(TaskChatMessage.task_id == task.id, TaskChatMessage.role == "user")
@@ -369,10 +411,17 @@ async def test_create_workforce_run_creates_task_run_and_starts_turn(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("shared", [False, True])
 async def test_create_preview_workforce_run_forwards_the_caller_timezone(
     db_session: Session,
+    shared: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from xagent.web.models.task_command import TaskExecutionCommand
+    from xagent.web.services import task_event_bridge
+
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", str(shared).lower())
+    monkeypatch.setattr(task_event_bridge, "get_task_event_bridge", lambda: MagicMock())
     scheduled = _patch_schedule_bg(monkeypatch)
 
     user = _create_user(db_session, "preview-tz-owner")
@@ -396,9 +445,22 @@ async def test_create_preview_workforce_run_forwards_the_caller_timezone(
         message="how many shifts do we have on tomorrow?",
         timezone="Australia/Melbourne",
     )
-    await result.background_task
+    if shared:
+        assert result.background_task is None
+        command = (
+            db_session.query(TaskExecutionCommand)
+            .filter_by(task_id=result.task.id)
+            .one()
+        )
+        assert command.status == "pending"
+        assert not scheduled
+    else:
+        await result.background_task
 
-    assert scheduled["context"] == {"timezone": "Australia/Melbourne"}
+    if shared:
+        assert command.payload["timezone"] == "Australia/Melbourne"
+    else:
+        assert scheduled["context"] == {"timezone": "Australia/Melbourne"}
 
 
 @pytest.mark.asyncio

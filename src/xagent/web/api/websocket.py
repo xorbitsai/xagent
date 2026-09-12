@@ -35,6 +35,7 @@ from sqlalchemy.orm import Session
 
 from ...config import (
     get_external_upload_dirs,
+    get_shared_task_execution_enabled,
     get_uploads_dir,
 )
 from ...core.agent.checkpoint import (
@@ -123,6 +124,8 @@ from ..services.task_command_transport import (
     dispatch_task_command_promptly,
     enqueue_task_command,
 )
+
+# The v1 SSE endpoint imports this shared predicate from this module.
 from ..services.task_event_state import (
     _is_versioned_task_event as _is_versioned_task_event,
 )
@@ -159,13 +162,14 @@ from ..services.task_execution_controller import (
     task_control_snapshot,
 )
 from ..services.task_execution_controller import (
-    task_execution_controller as task_execution_controller,
+    task_execution_controller as task_execution_controller,  # Tests patch this API module's controller.snapshot.
 )
 from ..services.task_interaction_read import get_pending_interaction_question
 from ..services.task_runtime import (
     mcp_runtime_authorization_policy_required,
     task_extension_bindings_from_agent_config,
 )
+from ..services.task_socket_writer import TaskSocketWriter
 from ..services.uploaded_file_store import (
     UploadedFileStore,
     UploadedFileVersionConflict,
@@ -1085,10 +1089,6 @@ class _CommandOriginRegistry:
 _command_origins = _CommandOriginRegistry()
 
 
-from ...config import get_shared_task_execution_enabled  # noqa: E402
-from ..services.task_socket_writer import TaskSocketWriter  # noqa: E402
-
-
 class ConnectionManager:
     def __init__(self) -> None:
         # task_id -> List[WebSocket]
@@ -1187,7 +1187,12 @@ class ConnectionManager:
         encoded = json.dumps(message)
         for connection in self.connections_for_task(task_id):
             writer = self._writers.get(connection)
-            if writer is not None:
+            if writer is None:
+                logger.warning(
+                    "Shared task event skipped: connection has no writer task_id=%s",
+                    task_id,
+                )
+            else:
                 try:
                     writer.enqueue(encoded)
                 except ConnectionError:

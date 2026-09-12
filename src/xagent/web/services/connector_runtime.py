@@ -22,6 +22,7 @@ from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from ...config import get_shared_task_execution_enabled
 from ...core.tools.adapters.vibe.connector_runtime import (
     CONNECTOR_TYPE_CUSTOM_API,
     CONNECTOR_TYPE_MCP,
@@ -302,6 +303,18 @@ def load_connector_runtime_view(
     ephemeral_manifest = (
         get_ephemeral_runtime_manifest(turn_id) if isinstance(turn_id, str) else None
     )
+    if get_shared_task_execution_enabled():
+        from .task_runtime_secrets import load_runtime_values
+
+        ephemeral_by_ref = load_runtime_values(db, task=task)
+        ephemeral_manifest = (
+            {
+                ref: {section: set(values) for section, values in sections.items()}
+                for ref, sections in ephemeral_by_ref.items()
+            }
+            if ephemeral_by_ref is not None
+            else None
+        )
     visible = _load_visible_runtime_connectors(
         db, user_id=task_owner_user_id, agent_team_id=agent_team_id
     )

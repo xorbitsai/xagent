@@ -2887,3 +2887,21 @@ def test_task_event_channel_prefix_default_and_override(monkeypatch):
     assert config.get_task_event_channel_prefix() == "xagent:task-events:v1"
     monkeypatch.setenv(config.TASK_EVENT_CHANNEL_PREFIX, "xagent:staging:v1")
     assert config.get_task_event_channel_prefix() == "xagent:staging:v1"
+
+
+@pytest.mark.parametrize(
+    "key", [None, "", "RQMpe38gK3m0szjpSmTNw_sP3Y54r6hDc6JewBoPKXc="]
+)
+def test_task_runtime_secrets_reject_unconfigured_or_public_key(monkeypatch, key):
+    monkeypatch.delenv(config.ENCRYPTION_KEY, raising=False)
+    if key is not None:
+        monkeypatch.setenv(config.ENCRYPTION_KEY, key)
+    assert config.get_task_runtime_secrets_encryption_key() is None
+
+
+def test_task_runtime_secrets_use_explicit_key(monkeypatch):
+    from cryptography.fernet import Fernet
+
+    key = Fernet.generate_key().decode()
+    monkeypatch.setenv(config.ENCRYPTION_KEY, key)
+    assert config.get_task_runtime_secrets_encryption_key() == key

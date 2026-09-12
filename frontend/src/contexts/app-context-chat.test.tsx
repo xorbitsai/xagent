@@ -636,6 +636,41 @@ describe("AppProvider websocket message routing", () => {
     expect(screen.getByTestId("stream-recovery").textContent).toBe("")
   })
 
+  it.each([false, true])("keeps recovery after a completed answer receives a late start (wrapped=%s)", (wrapped) => {
+    render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
+    const send = (message: Partial<TestWebSocketMessage> & Record<string, unknown>) => act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type: "task_started", task_id: 1, timestamp: "2026-05-27T05:00:02Z", ...message,
+      })
+    })
+    const answerFrame = (type: string, data: Record<string, unknown>) => send({
+      stream_run_id: "run-1", stream_attempt_id: "attempt-1",
+      ...(wrapped ? { type: "trace_event", event_type: type, data: { data } } : { type, data }),
+    })
+    send({ run_id: "run-1", state_version: 1, status: "running", control_state: "running" })
+    answerFrame("final_answer_start", { message_id: "final_answer_1" })
+    answerFrame("final_answer_end", { message_id: "final_answer_1", content: "richer live answer" })
+    const snapshot = {
+      type: "task_stream_snapshot", run_id: "run-1", state_version: 2,
+      status: "completed", control_state: "completed",
+      data: { output: "durable answer", lease_attempt_id: "attempt-1" },
+    }
+    // Healthy completed output keeps its richer live presentation.
+    send(snapshot)
+    expect(screen.getByTestId("messages").textContent).toContain("richer live answer")
+    send({ type: "stream_unavailable" })
+    expect(screen.getByTestId("stream-recovery").textContent).toBe("1")
+    answerFrame("final_answer_start", { message_id: "final_answer_1" })
+    expect(screen.getByTestId("stream-recovery").textContent).toBe("1")
+    answerFrame("final_answer_delta", { message_id: "final_answer_1", delta: "LATE SUFFIX" })
+    expect(screen.getByTestId("messages").textContent).not.toContain("LATE SUFFIX")
+    // An interruption lets durable output replace even an already-complete result.
+    send(snapshot)
+    expect(screen.getByTestId("messages").textContent).toContain("durable answer")
+    expect(screen.getByTestId("messages").textContent).not.toContain("richer live answer")
+    expect(screen.getByTestId("stream-recovery").textContent).toBe("")
+  })
+
   it("resumes shared deltas when a start establishes the missing prefix", () => {
     render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
     const send = (type: string, data: Record<string, unknown>) => act(() => {

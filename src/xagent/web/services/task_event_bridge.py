@@ -16,6 +16,7 @@ from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
 from ...config import get_redis_url, get_task_event_channel_prefix
+from ...core.runtime_performance import increment_counter
 from ..models.database import get_session_local
 from ..models.task_command import TaskExecutionCommand
 from .db_runtime import run_db_io_cancellation_safe
@@ -296,6 +297,14 @@ class TaskEventBridge:
                 lambda: _reply_route(task_id, command_id)
             )
             if route is None:
+                logger.warning(
+                    "Task reply has no origin route task_id=%s command_id=%s",
+                    task_id,
+                    command_id,
+                )
+                increment_counter(
+                    "xagent.task.reply.delivery", attributes={"outcome": "no_route"}
+                )
                 return
             host_id, origin = route
             delivery_id = uuid4().hex

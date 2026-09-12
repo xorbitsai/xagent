@@ -15,7 +15,7 @@ from uuid import uuid4
 
 from sqlalchemy import func
 
-from ...core.agent.checkpoint import CheckpointReadError
+from ...core.agent.checkpoint import CheckpointReadError, CheckpointUnavailableError
 from ...core.agent.runner import UserMessageInjectionOutcome
 from ..models.database import get_session_local
 from ..models.task import Task, TaskStatus
@@ -63,6 +63,10 @@ class TaskResumeNotWaitingError(Exception):
 
 class TaskResumeNotResumableError(Exception):
     """No run-fenced checkpoint accepted the reply."""
+
+
+class TaskResumeRetryableError(CheckpointUnavailableError):
+    """A temporary read failed before injection and its lease was restored."""
 
 
 @dataclass(frozen=True)
@@ -364,13 +368,35 @@ async def resume_a2a_task(
     resumable_status: TaskStatus,
     text: str,
     message_id: str,
+    preacquired_lease: TaskLease | None = None,
 ) -> bool:
     if resumable_status not in {
         TaskStatus.PAUSED,
         TaskStatus.WAITING_FOR_USER,
     }:
         return False
-    task_lease = await acquire_task_lease_cancellation_safe(
+    from .task_execution_host import enqueues_task_turns
+
+    if enqueues_task_turns() and preacquired_lease is None:
+        from uuid import NAMESPACE_URL, uuid5
+
+        from .task_resume_command import enqueue_resume_input
+
+        await enqueue_resume_input(
+            TaskReplyInput(
+                task_id=task_id,
+                agent_id=agent_id,
+                task_owner_user_id=task_owner_user_id,
+                run_id=previous_run_id,
+                status=resumable_status,
+                text=text,
+            ),
+            source="a2a",
+            message_id=message_id,
+            command_id=uuid5(NAMESPACE_URL, f"a2a-reply:{task_id}:{message_id}").hex,
+        )
+        return True
+    task_lease = preacquired_lease or await acquire_task_lease_cancellation_safe(
         lambda: _acquire_a2a_resume_prelease_sync(
             task_id=task_id,
             agent_id=agent_id,
@@ -390,6 +416,7 @@ async def resume_a2a_task(
         run_task_lease_heartbeat(task_lease, heartbeat_stop)
     )
     ownership_transferred = False
+    message_posted = False
     prelease_cleanup_done = False
 
     async def stop_and_restore_prelease() -> bool:
@@ -495,6 +522,7 @@ async def resume_a2a_task(
                 heartbeat_task,
             )
 
+        message_posted = bool(posted)
         if not posted:
             # Untagged or otherwise unreadable legacy checkpoints are never
             # resumed under a fabricated run or transcript fallback. Release
@@ -539,6 +567,10 @@ async def resume_a2a_task(
                 raise TaskLeaseLostError(
                     f"Task {task_id} lease changed before A2A checkpoint-failure fallback"
                 ) from exc
+            if not message_posted and isinstance(exc, CheckpointUnavailableError):
+                # AgentRunner reads the checkpoint baseline before mutating
+                # the context. A read failure here did not inject this reply.
+                raise TaskResumeRetryableError(str(exc)) from exc
         raise
     except BaseException:
         if not ownership_transferred and not prelease_cleanup_done:
@@ -822,7 +854,13 @@ async def _schedule_waiting_reply_resume(
         raise
 
 
-async def resume_task_reply(ctx: TaskReplyInput) -> TaskReplyResumeResult:
+async def resume_task_reply(
+    ctx: TaskReplyInput,
+    *,
+    preacquired_lease: TaskLease | None = None,
+    preacquired_state: dict[str, Any] | None = None,
+    turn_id: str | None = None,
+) -> TaskReplyResumeResult:
     """Resume an authorized SDK reply and return after background registration.
 
     Each SDK request gets a fresh turn ID, preserving its existing lack of
@@ -840,8 +878,14 @@ async def resume_task_reply(ctx: TaskReplyInput) -> TaskReplyResumeResult:
             raise TaskResumeBusyError
         raise TaskResumeNotWaitingError
 
-    prelease_info: dict[str, Any] = {}
-    task_lease = await acquire_task_lease_cancellation_safe(
+    from .task_execution_host import enqueues_task_turns
+
+    if enqueues_task_turns() and preacquired_lease is None:
+        from .task_resume_command import enqueue_resume_input
+
+        return await enqueue_resume_input(ctx, source="sdk", message_id="")
+    prelease_info: dict[str, Any] = preacquired_state or {}
+    task_lease = preacquired_lease or await acquire_task_lease_cancellation_safe(
         lambda: _acquire_reply_prelease_sync(
             task_id=ctx.task_id,
             agent_id=ctx.agent_id,
@@ -936,7 +980,7 @@ async def resume_task_reply(ctx: TaskReplyInput) -> TaskReplyResumeResult:
                 str(task_id),
                 execution_message=ctx.text,
                 display_message=ctx.text,
-                turn_id=f"v1:reply:{task_id}:{uuid4()}",
+                turn_id=turn_id or f"v1:reply:{task_id}:{uuid4()}",
                 request_interrupt=False,
                 reason="V1 interaction response",
             )

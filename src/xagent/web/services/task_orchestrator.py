@@ -48,7 +48,7 @@ import asyncio
 import enum
 import logging
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
@@ -56,6 +56,7 @@ from uuid import uuid4
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from ...config import get_shared_task_execution_enabled
 from ...core.agent.context.execution import CLOCK_TIMEZONE_METADATA_KEY
 from ...core.execution_scope import resolve_execution_scope
 from ...core.tools.adapters.vibe.config import RequiredMCPUnavailableError
@@ -101,6 +102,7 @@ from .task_execution_controller import (
     apply_task_control_transition,
     task_execution_controller,
 )
+from .task_execution_host import enqueues_task_turns
 from .task_lease_service import (
     TaskLease,
     TaskLeaseHeartbeatOutcome,
@@ -286,7 +288,7 @@ class TurnStarted:
     updated_at: Optional[datetime]
     before_message_id: Optional[int]
     task_source: Optional[str]
-    background_task: "asyncio.Task[None]"
+    background_task: "asyncio.Task[None] | None"
     run_id: str = ""
     state_version: int = 0
     control_state: str = TaskControlState.RUNNING.value
@@ -514,7 +516,9 @@ class TaskTurnOrchestrator:
         # strand the row as RUNNING with no worker. One owned child covers
         # claim through scheduling and is drained before cancellation reaches
         # the caller.
-        async def _claim_and_schedule() -> tuple[_ClaimedTurn, "asyncio.Task[None]"]:
+        async def _claim_and_schedule() -> tuple[
+            _PreparedTurn, "asyncio.Task[None] | None"
+        ]:
             # Off-loop atomic claim + persist + commit. Only raises pre-commit
             # (busy / not-found), so a normal exception here means nothing was
             # committed; reaching the schedule means the row is RUNNING.
@@ -524,6 +528,9 @@ class TaskTurnOrchestrator:
                     task_owner_user_id,
                     payload=payload,
                     kind=kind,
+                    context=context,
+                    force_fresh=force_fresh,
+                    actor_user_id=actor_user_id,
                 )
             )
             handle = await _schedule_committed_turn(
@@ -555,7 +562,9 @@ class TaskTurnOrchestrator:
         task_id: int,
         task_owner_user_id: int,
         payload: TaskTurnPayload,
-    ) -> "_ClaimedTurn":
+        context: Optional[dict[str, Any]] = None,
+        mcp_runtime_authorization_policy: MCPBuiltinOAuthActorPolicy | None = None,
+    ) -> "_PreparedTurn":
         """Stage one CREATE turn inside the caller-owned transaction.
 
         This is used only when the task row itself is still uncommitted, so the
@@ -569,7 +578,9 @@ class TaskTurnOrchestrator:
             task_id=task_id,
             task_owner_user_id=task_owner_user_id,
             payload=payload,
+            context=context,
             kind=TurnKind.CREATE,
+            mcp_runtime_authorization_policy=mcp_runtime_authorization_policy,
         )
 
     @staticmethod
@@ -579,7 +590,8 @@ class TaskTurnOrchestrator:
         task_id: int,
         task_owner_user_id: int,
         payload: TaskTurnPayload,
-    ) -> "_ClaimedTurn":
+        context: Optional[dict[str, Any]] = None,
+    ) -> "_PreparedTurn":
         """Stage one APPEND turn inside a domain-owned transaction.
 
         File/runtime domain mutations that must be atomic with acceptance can
@@ -592,6 +604,7 @@ class TaskTurnOrchestrator:
             task_id=task_id,
             task_owner_user_id=task_owner_user_id,
             payload=payload,
+            context=context,
             kind=TurnKind.APPEND,
         )
 
@@ -602,7 +615,7 @@ class TaskTurnOrchestrator:
         task_owner_user_id: int,
         actor_user_id: int | None,
         payload: TaskTurnPayload,
-        claimed: "_ClaimedTurn",
+        claimed: "_PreparedTurn",
         kind: TurnKind,
         force_fresh: bool = False,
         context: Optional[Dict[str, Any]] = None,
@@ -627,7 +640,7 @@ class TaskTurnOrchestrator:
         task_owner_user_id: int,
         actor_user_id: int | None,
         payload: TaskTurnPayload,
-        claimed: "_ClaimedTurn",
+        claimed: "_PreparedTurn",
         kind: TurnKind,
         force_fresh: bool = False,
         context: Optional[Dict[str, Any]] = None,
@@ -675,7 +688,7 @@ class TaskTurnOrchestrator:
         task_owner_user_id: int,
         actor_user_id: int | None,
         payload: TaskTurnPayload,
-        claimed: "_ClaimedTurn",
+        claimed: "_PreparedTurn",
         context: Optional[Dict[str, Any]] = None,
         mcp_runtime_authorization_policy: MCPBuiltinOAuthActorPolicy | None = None,
     ) -> TurnStarted:
@@ -713,18 +726,32 @@ class _ClaimedTurn(_AcceptedTurn):
     task_lease: TaskLease
 
 
+@dataclass(frozen=True, kw_only=True)
+class _EnqueuedTurn(_AcceptedTurn):
+    command_db_id: int
+    command_payload: dict[str, Any]
+
+
+_PreparedTurn = _ClaimedTurn | _EnqueuedTurn
+
+
 async def _schedule_committed_turn(
     *,
     task_id: int,
     task_owner_user_id: int,
     payload: TaskTurnPayload,
-    claimed: _ClaimedTurn,
+    claimed: _PreparedTurn,
     kind: TurnKind,
     force_fresh: bool,
     context: Optional[Dict[str, Any]],
     mcp_runtime_authorization_policy: MCPBuiltinOAuthActorPolicy | None = None,
-) -> "asyncio.Task[None]":
+) -> "asyncio.Task[None] | None":
     """Own scheduling and compensation after a turn claim has committed."""
+    if isinstance(claimed, _EnqueuedTurn):
+        from .task_command_transport import notify_task_command_dispatcher
+
+        notify_task_command_dispatcher()
+        return None
 
     try:
         actor_marked = mcp_runtime_authorization_policy_required(claimed.agent_config)
@@ -941,8 +968,8 @@ def _turn_started_snapshot(
     task_owner_user_id: int,
     actor_user_id: int | None,
     kind: TurnKind,
-    claimed: _ClaimedTurn,
-    background_task: "asyncio.Task[None]",
+    claimed: _PreparedTurn,
+    background_task: "asyncio.Task[None] | None",
 ) -> TurnStarted:
     """Build the detached turn result and emit its owner/actor audit record."""
 
@@ -1183,14 +1210,86 @@ def _claim_turn_no_commit(
     *,
     payload: TaskTurnPayload,
     kind: TurnKind,
-) -> _ClaimedTurn:
+    context: Optional[dict[str, Any]] = None,
+    force_fresh: bool = False,
+    actor_user_id: int | None = None,
+    mcp_runtime_authorization_policy: MCPBuiltinOAuthActorPolicy | None = None,
+) -> _PreparedTurn:
+    if enqueues_task_turns():
+        from .task_event_bridge import get_task_event_bridge
+
+        get_task_event_bridge().require_ready()
+        from .task_actor_policy import bind_shared_actor_policy
+
+        task = db.get(Task, task_id)
+        if task is None or task.user_id != task_owner_user_id:
+            raise TaskTurnNotFoundError(task_id)
+        bind_shared_actor_policy(
+            task, mcp_runtime_authorization_policy, is_create=kind is TurnKind.CREATE
+        )
     accepted = _accept_turn_no_commit(
-        db, task_id, task_owner_user_id, payload=payload, kind=kind
+        db,
+        task_id,
+        task_owner_user_id,
+        payload=payload,
+        kind=kind,
     )
+    if enqueues_task_turns():
+        from .task_runtime_secrets import bind_runtime_values_to_run
+        from .task_start_protocol import TaskStartPayload, stage_task_start_command
+
+        # Trigger metadata already lives on the task. No arbitrary request
+        # context or executable policy object is copied through START.
+        stored = accepted.agent_config or {}
+        clock_timezone = None
+        for key, value in (context or {}).items():
+            if key == CLOCK_TIMEZONE_METADATA_KEY:
+                clock_timezone = value
+            elif (
+                key
+                not in {"trigger_id", "trigger_run_id", "trigger_type", "trigger_test"}
+                or stored.get(key) != value
+            ):
+                raise ValueError(f"Unsupported durable START context field: {key}")
+        has_runtime_values = bind_runtime_values_to_run(
+            db,
+            task_id=task_id,
+            turn_id=payload.turn_id,
+            run_id=accepted.run_id,
+        )
+        start = TaskStartPayload(
+            version=1,
+            run_id=accepted.run_id,
+            state_version=accepted.state_version,
+            turn_id=payload.turn_id,
+            kind=kind.value,
+            message=payload.transcript_message,
+            execution_message=payload.execution_message,
+            file_ids=list(payload.file_ids),
+            before_message_id=accepted.before_message_id,
+            timezone=clock_timezone,
+            force_fresh=force_fresh,
+            runtime_values_ref=payload.turn_id if has_runtime_values else None,
+        )
+        staged = stage_task_start_command(
+            db,
+            task_id=task_id,
+            actor_user_id=actor_user_id or task_owner_user_id,
+            start=start,
+        )
+        if not staged.created or not staged.payload_matches:
+            # A new accepted run cannot adopt a different earlier command.
+            raise TaskTurnError("turn_identity_conflict")
+        return _EnqueuedTurn(
+            **vars(accepted),
+            command_db_id=staged.staged_db_id,
+            command_payload=start.model_dump(mode="json"),
+        )
+
     lease = acquire_task_lease_no_commit(db, task_id, expected_run_id=accepted.run_id)
     if lease is None:
         raise RuntimeError(f"task {task_id} could not stage its exact execution lease")
-    return _ClaimedTurn(**asdict(accepted), task_lease=lease)
+    return _ClaimedTurn(**vars(accepted), task_lease=lease)
 
 
 def _begin_turn_atomic_sync(
@@ -1199,7 +1298,10 @@ def _begin_turn_atomic_sync(
     *,
     payload: TaskTurnPayload,
     kind: TurnKind,
-) -> _ClaimedTurn:
+    context: Optional[dict[str, Any]] = None,
+    force_fresh: bool = False,
+    actor_user_id: int | None = None,
+) -> _PreparedTurn:
     """Atomic claim + user-message persist + commit on its OWN session.
 
     Designed to run under ``asyncio.to_thread`` so the synchronous write
@@ -1227,7 +1329,7 @@ def _begin_turn_atomic_sync(
 
     SessionLocal = get_session_local()
     db = SessionLocal()
-    result: _ClaimedTurn | None = None
+    result: _PreparedTurn | None = None
     session_retired = False
     try:
         try:
@@ -1237,6 +1339,9 @@ def _begin_turn_atomic_sync(
                 task_owner_user_id,
                 payload=payload,
                 kind=kind,
+                context=context,
+                force_fresh=force_fresh,
+                actor_user_id=actor_user_id,
             )
             db.flush()
         except Exception:
@@ -1275,9 +1380,19 @@ def _reconcile_claimed_turn_after_commit_ack_failure(
     task_id: int,
     task_owner_user_id: int,
     payload: TaskTurnPayload,
-    claimed: _ClaimedTurn,
+    claimed: _PreparedTurn,
 ) -> bool:
     """Check the complete accepted turn graph in a fresh owned Session."""
+
+    if isinstance(claimed, _EnqueuedTurn):
+        from .task_start_consumer import reconcile_start_acceptance
+
+        return reconcile_start_acceptance(
+            task_id=task_id,
+            task_owner_user_id=task_owner_user_id,
+            payload=payload,
+            accepted=claimed,
+        )
 
     from ..models.chat_message import TaskChatMessage
     from ..models.database import get_session_local
@@ -1373,7 +1488,7 @@ def commit_claimed_turn_or_reconcile(
     task_id: int,
     task_owner_user_id: int,
     payload: TaskTurnPayload,
-    claimed: _ClaimedTurn,
+    claimed: _PreparedTurn,
 ) -> None:
     """Commit a complete turn graph or prove an ambiguous COMMIT succeeded.
 
@@ -1488,6 +1603,14 @@ def settle_task_lease_isolated(
                             content=client_error_message,
                             message_type=client_message_type,
                         )
+                    if get_shared_task_execution_enabled():
+                        from .task_runtime_secrets import (
+                            delete_runtime_values_no_commit,
+                        )
+
+                        delete_runtime_values_no_commit(
+                            settle_db, task_id=lease.task_id, run_id=lease.run_id
+                        )
                     settle_db.commit()
                     invalidate_task_cache_best_effort(lease.task_id)
                     return True
@@ -1587,6 +1710,13 @@ def finish_turn(
         return False
 
     def commit_terminal(status: TaskStatus, *, changed: bool = True) -> bool:
+        if get_shared_task_execution_enabled() and status in (
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+        ):
+            from .task_runtime_secrets import delete_runtime_values_no_commit
+
+            delete_runtime_values_no_commit(bg_db, task_id=task_id, run_id=fresh.run_id)
         if task_lease is not None:
             released = release_task_lease(bg_db, task_lease, status=status)
             if released:
@@ -1899,14 +2029,40 @@ def _schedule_bg(
                     )
                     nonlocal execution_started
                     execution_started = True
+                    execution_context = _execution_context_with_turn_id(
+                        context, payload.turn_id, files=payload.attachments
+                    )
+                    if get_shared_task_execution_enabled() and payload.file_ids:
+                        from ..models.database import get_session_local
+                        from .file_turn import (
+                            normalize_attachments_for_persistence,
+                            resolve_turn_file_infos,
+                        )
+
+                        def resolve_files() -> list[dict[str, Any]]:
+                            with get_session_local()() as file_db:
+                                infos, missing = resolve_turn_file_infos(
+                                    file_ids=list(payload.file_ids),
+                                    owner_user_id=task_owner_user_id,
+                                    task_id=task_id,
+                                    db=file_db,
+                                )
+                                if missing:
+                                    raise TaskTurnFileBindingError(missing)
+                                return infos
+
+                        infos = await run_db_io_cancellation_safe(resolve_files)
+                        execution_context.update(
+                            {
+                                "file_info": infos,
+                                "uploaded_files": [item["path"] for item in infos],
+                                "files": normalize_attachments_for_persistence(infos),
+                            }
+                        )
                     await execute_task_background(
                         task_id=task_id,
                         user_message=payload.transcript_message,
-                        context=_execution_context_with_turn_id(
-                            context,
-                            payload.turn_id,
-                            files=payload.attachments,
-                        ),
+                        context=execution_context,
                         agent_manager=_get_agent_manager(),
                         task_owner_user_id=task_owner_user_id,
                         before_message_id=before_message_id,
@@ -2163,6 +2319,14 @@ def _schedule_bg(
 
                 if turn_id is not None:
                     pop_ephemeral_runtime_values(turn_id)
+                if get_shared_task_execution_enabled():
+                    from .task_runtime_secrets import clean_finished_runtime_values
+
+                    await run_db_io_cancellation_safe(
+                        lambda: clean_finished_runtime_values(
+                            task_id=task_id, run_id=run_id
+                        )
+                    )
             except Exception:
                 logger.warning(
                     "connector runtime cleanup failed for task %s turn %s",

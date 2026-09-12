@@ -350,7 +350,15 @@ def test_trigger_config_validation_dispatches_through_provider() -> None:
     assert "webhook trigger config invalid" in invalid.json()["detail"]
 
 
-def test_trigger_test_run_creates_hidden_agent_task(mock_bg_scheduler) -> None:
+@pytest.mark.parametrize("shared", [False, True])
+def test_trigger_test_run_creates_hidden_agent_task(
+    mock_bg_scheduler, monkeypatch, shared
+) -> None:
+    from xagent.web.models.task_command import TaskExecutionCommand
+    from xagent.web.services import task_event_bridge
+
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", str(shared).lower())
+    monkeypatch.setattr(task_event_bridge, "get_task_event_bridge", lambda: MagicMock())
     headers = _admin_headers()
     agent_id = _create_agent(headers)
     created = client.post(
@@ -374,11 +382,17 @@ def test_trigger_test_run_creates_hidden_agent_task(mock_bg_scheduler) -> None:
     assert run_body["status"] == TriggerRunStatus.RUNNING.value
     assert run_body["task_id"]
     assert fired.json()["duplicate"] is False
-    assert mock_bg_scheduler.call_count == 1
+    assert mock_bg_scheduler.call_count == (0 if shared else 1)
 
     db = _direct_db_session()
     try:
         task = db.query(Task).filter(Task.id == run_body["task_id"]).one()
+        if shared:
+            command = db.query(TaskExecutionCommand).filter_by(task_id=task.id).one()
+            assert command.status == "pending"
+            assert command.target_run_id == task.run_id
+            assert command.payload["kind"] == "create"
+            assert task.runner_id is None
         assert task.agent_id == agent_id
         assert task.source == "trigger"
         assert task.is_visible is False

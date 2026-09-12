@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import FastAPI
@@ -206,3 +207,17 @@ async def test_failed_admission_with_due_trigger_launches_no_background_work(
             assert persisted.last_run_at is None
     finally:
         drop_all_tables(get_engine())
+
+
+@pytest.mark.asyncio
+async def test_unwired_shared_execution_refuses_startup_before_database(monkeypatch):
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    initialize = AsyncMock()
+    monkeypatch.setattr(
+        app_module, "_initialize_database_and_admit_runtime", initialize
+    )
+    with pytest.raises(
+        RuntimeError, match="XAGENT_SHARED_TASK_EXECUTION_ENABLED must remain false"
+    ):
+        await app_module.startup_event()
+    initialize.assert_not_awaited()

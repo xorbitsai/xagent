@@ -2884,7 +2884,7 @@ export function AppProvider({
           stream.interrupted = false
           dispatch({ type: "SET_STREAM_RECOVERY", payload: null })
         }
-        if (stream.interrupted || stream.complete) return
+        if (stream.interrupted) return
         if (replacesContent) stream.complete = true
       }
     }

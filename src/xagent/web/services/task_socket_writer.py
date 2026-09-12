@@ -14,6 +14,7 @@ class TaskSocketWriter:
         )
         self.bytes = 0
         self.closed = False
+        self.close_task: asyncio.Task[None] | None = None
         self.task = asyncio.create_task(self._run())
 
     def enqueue(
@@ -23,8 +24,9 @@ class TaskSocketWriter:
             raise ConnectionError("Task connection is closed")
         if self.queue.full() or self.bytes + len(text.encode()) > 2 * 1024 * 1024:
             self.stop()
-            self.disconnect()
-            asyncio.create_task(self._close_socket())
+            # Overflow can happen before _run starts, so its finally cannot
+            # own this close. Retain the bounded task until it completes.
+            self.close_task = asyncio.create_task(self._close_socket())
             raise ConnectionError(
                 "Task connection is too slow; reconnect to synchronize"
             )
@@ -40,6 +42,8 @@ class TaskSocketWriter:
             pass
 
     def stop(self) -> None:
+        if self.closed:
+            return
         self.closed = True
         if self.task is not asyncio.current_task():
             self.task.cancel()
@@ -48,6 +52,7 @@ class TaskSocketWriter:
             if future is not None and not future.done():
                 future.set_exception(ConnectionError("Task connection is closed"))
         self.bytes = 0
+        self.disconnect()
 
     async def _run(self) -> None:
         pending = None
@@ -68,6 +73,5 @@ class TaskSocketWriter:
             if pending is not None and not pending.done():
                 pending.set_exception(ConnectionError("Task connection send failed"))
             self.stop()
-            self.disconnect()
             if send_failed:
                 await self._close_socket()

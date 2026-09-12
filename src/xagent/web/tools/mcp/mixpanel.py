@@ -88,13 +88,14 @@ def _success_with_capped_list(key: str, items: Any) -> str:
     capped_response = success_with_capped_dict(key, {key: items})
     capped = json.loads(capped_response)
     capped_payload = capped.get(key)
-    if isinstance(capped_payload, dict) and key in capped_payload:
+    normalized_payload = capped_payload if isinstance(capped_payload, dict) else {}
+    if key in normalized_payload:
         return capped_response
     candidate_response = json.dumps(
         {
             **capped,
             key: {
-                **(capped_payload if isinstance(capped_payload, dict) else {}),
+                **normalized_payload,
                 key: [],
             },
         },

@@ -3,6 +3,7 @@ import logging
 import os
 import uuid
 from datetime import date
+from functools import cache
 from typing import Any
 
 from dateutil import parser as _date_parser
@@ -787,10 +788,9 @@ def google_calendar_create_events(
                 "end_time is exclusive for an all-day event and must be later "
                 "than start_time; use the following date for a one-day event"
             )
-        if not start_is_all_day:
-            if not timezone:
-                _require_offset_datetime(start_time, "start_time")
-                _require_offset_datetime(end_time, "end_time")
+        if not start_is_all_day and not timezone:
+            _require_offset_datetime(start_time, "start_time")
+            _require_offset_datetime(end_time, "end_time")
         if recurrence is not None and not start_is_all_day and not timezone:
             raise ValueError(
                 "timezone is required when recurrence is set (Google expands "
@@ -820,7 +820,7 @@ def google_calendar_create_events(
             else None
         )
         service = get_calendar_service()
-        normalized_attendees = _normalize_addresses(attendees) if attendees else []
+        normalized_attendees = _normalize_addresses(attendees or [])
 
         if normalized_recurrence is not None and not ignore_conflicts:
             raise ValueError(
@@ -930,8 +930,9 @@ def google_calendar_update_events(
     start_time and end_time must be RFC3339 formatted if provided.
     If the update moves the event to a new time, or adds attendees, that change is checked for
     conflicts the same way google_calendar_create_events is; pass ignore_conflicts=True to skip the
-    check once the user has explicitly confirmed a conflict is fine. If any required calendar cannot
-    be checked, the tool returns status="conflict_check_incomplete" and does not update the event.
+    check once the user has explicitly confirmed a conflict is fine. If an individual required
+    calendar cannot be checked, the tool returns status="conflict_check_incomplete" and does not
+    update the event. A missing OAuth scope for the whole check returns status="error" instead.
     The availability check and Calendar write are separate API calls, so another writer can
     still change availability in the brief interval between them.
     ignore_conflicts also skips the whole check outright; only pass it after the user confirms they
@@ -967,20 +968,16 @@ def google_calendar_update_events(
             _require_offset_datetime(end_time, "end_time")
         service = get_calendar_service()
 
-        # Lazily fetched and cached (as a one-element list, mutated
-        # rather than rebound, so the closure needs no `nonlocal`) - this
+        # Lazily fetched and cached - this
         # single calendars().get(calendarId="primary") call resolves both
         # the connected account's own identity (needed below to tell
         # whether the caller is actually this event's organizer) and its
         # timezone (needed further down only for an all-day boundary),
         # so a call site that only needs one doesn't force a redundant
         # second round-trip when the other site already fetched it.
-        primary_calendar_cache: list[tuple[str, str]] = []
-
+        @cache
         def primary_calendar_info() -> tuple[str, str]:
-            if not primary_calendar_cache:
-                primary_calendar_cache.append(_primary_calendar_info(service))
-            return primary_calendar_cache[0]
+            return _primary_calendar_info(service)
 
         # First get the existing event
         event = service.events().get(calendarId="primary", eventId=event_id).execute()
@@ -1206,6 +1203,13 @@ def google_calendar_update_events(
             calendar_timezone = "UTC"
             existing_start = None
             existing_end = None
+        if bool(start_time) != bool(end_time):
+            stored_counterpart = existing_end if start_time else existing_start
+            if stored_counterpart is None:
+                raise ValueError(
+                    "A one-sided time update requires a valid stored counterpart "
+                    "boundary so the resulting event window can be validated."
+                )
         effective_start = start_time or existing_start
         effective_end = end_time or existing_end
         if (start_time or end_time) and effective_start and effective_end:
@@ -1319,6 +1323,17 @@ def google_calendar_update_events(
                 organizer_needs_verification and caller_is_organizer
             )
             if (
+                organizer_needs_verification
+                and not caller_is_organizer
+                and not organizer_email
+            ):
+                # events.get documents organizer.email as always present,
+                # using a generated value when no real address is available.
+                # Still fail closed if an unexpected provider response omits it:
+                # the caller's primary calendar belongs to somebody else, and
+                # there is no organizer calendar id available for free/busy.
+                unchecked_attendees.append("organizer (email unavailable)")
+            if (
                 organizer_email
                 and organizer_needs_verification
                 and not caller_is_organizer
@@ -1366,7 +1381,11 @@ def google_calendar_update_events(
             pending_scope_error: InsufficientScopeError | None = None
 
             def _run_and_accumulate(
-                time_min: str, time_max: str, attendees: list[str], *, check_org: bool
+                time_min: str,
+                time_max: str,
+                attendees: list[str],
+                *,
+                check_primary_calendar: bool,
             ) -> bool:
                 """Runs one _find_conflicts call, folding its result (or,
                 on a scope error, whatever it had already confirmed) into
@@ -1385,7 +1404,7 @@ def google_calendar_update_events(
                         time_max,
                         attendees,
                         exclude_event_id=event_id,
-                        check_primary_calendar=check_org,
+                        check_primary_calendar=check_primary_calendar,
                     )
                     all_conflicts.extend(conflicts)
                     unchecked_attendees.extend(unchecked)
@@ -1407,7 +1426,7 @@ def google_calendar_update_events(
                     effective_start,
                     effective_end,
                     attendees_to_check,
-                    check_org=check_primary_calendar,
+                    check_primary_calendar=check_primary_calendar,
                 )
 
             # A retained attendee's own busy block for THIS event
@@ -1430,7 +1449,7 @@ def google_calendar_update_events(
                         seg_start.isoformat(),
                         seg_end.isoformat(),
                         existing_attendees_to_check,
-                        check_org=False,
+                        check_primary_calendar=False,
                     )
                     # Every remaining segment would hit this same scope
                     # error too - nothing left to gain by attempting them.
@@ -1447,27 +1466,18 @@ def google_calendar_update_events(
             # accumulators once, after every block above has had its
             # chance to contribute, rather than per-block (which would
             # miss a duplicate straddling the organizer/attendee split).
-            deduped_unchecked: list[str] = []
-            seen_unchecked: set[str] = set()
-            for attendee in unchecked_attendees:
-                if attendee not in seen_unchecked:
-                    seen_unchecked.add(attendee)
-                    deduped_unchecked.append(attendee)
-            unchecked_attendees = deduped_unchecked
-
-            deduped_conflicts: list[dict[str, Any]] = []
-            seen_conflicts: set[tuple[Any, Any, Any, Any]] = set()
-            for conflict in all_conflicts:
-                conflict_key = (
-                    conflict.get("calendar"),
-                    conflict.get("summary"),
-                    conflict.get("start"),
-                    conflict.get("end"),
-                )
-                if conflict_key not in seen_conflicts:
-                    seen_conflicts.add(conflict_key)
-                    deduped_conflicts.append(conflict)
-            all_conflicts = deduped_conflicts
+            unchecked_attendees = list(dict.fromkeys(unchecked_attendees))
+            all_conflicts = list(
+                {
+                    (
+                        conflict.get("calendar"),
+                        conflict.get("summary"),
+                        conflict.get("start"),
+                        conflict.get("end"),
+                    ): conflict
+                    for conflict in all_conflicts
+                }.values()
+            )
 
             if pending_scope_error is not None and not all_conflicts:
                 raise pending_scope_error

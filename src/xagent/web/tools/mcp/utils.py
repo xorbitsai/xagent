@@ -205,13 +205,14 @@ def success_with_capped_dict(
     def _build(
         payload: Any,
         truncated: bool,
-        included_extras: dict[str, Any] | None = None,
+        *,
+        with_extras: bool = True,
     ) -> str:
         return json.dumps(
             {
                 "status": "success",
                 field_name: payload,
-                **(extras if included_extras is None else included_extras),
+                **(extras if with_extras else {}),
                 "truncated": truncated,
             },
             ensure_ascii=False,
@@ -258,16 +259,15 @@ def success_with_capped_dict(
         compact_data: dict[str, Any] = {}
         if isinstance(data.get("id"), (str, int, float, bool)):
             compact_data["id"] = data["id"]
-        response = _build(compact_data, True, {})
-        if len(response) > max_output_length and compact_data:
-            response = _build({}, True, {})
-        if len(response) > max_output_length:
-            minimal = json.dumps(
-                {"status": "success", "truncated": True}, ensure_ascii=False
-            )
-            if len(minimal) <= max_output_length:
-                return minimal
-            return json.dumps({"status": "success"}, ensure_ascii=False)
+        candidates = (
+            _build(compact_data, True, with_extras=False),
+            _build({}, True, with_extras=False),
+            json.dumps({"status": "success", "truncated": True}, ensure_ascii=False),
+        )
+        for candidate in candidates:
+            if len(candidate) <= max_output_length:
+                return candidate
+        return json.dumps({"status": "success"}, ensure_ascii=False)
     return response
 
 
@@ -291,6 +291,26 @@ def normalize_addresses(addresses: list[str] | str) -> list[str]:
         seen.add(key)
         deduped.append(address)
     return deduped
+
+
+def _halve_largest_list_fields_until_bounded(
+    payload: dict[str, Any], field_names: tuple[str, ...], max_output_length: int
+) -> str:
+    """Serialize ``payload``, halving its largest named list until bounded."""
+    response = json.dumps(payload, ensure_ascii=False)
+    while len(response) > max_output_length:
+        populated_fields = [name for name in field_names if payload.get(name)]
+        if not populated_fields:
+            break
+        field_name = max(
+            populated_fields,
+            key=lambda name: len(json.dumps(payload[name], ensure_ascii=False)),
+        )
+        values = payload[field_name]
+        payload[field_name] = values[: len(values) // 2]
+        payload["truncated"] = True
+        response = json.dumps(payload, ensure_ascii=False)
+    return response
 
 
 def conflict_response(
@@ -356,26 +376,10 @@ def conflict_response(
     }
     if check_error:
         payload["check_error"] = check_error
-    response = json.dumps(payload, ensure_ascii=False)
     max_output_length = get_tool_max_output_length()
-    if len(response) <= max_output_length:
-        return response
-
-    remaining_conflicts = conflicts
-    remaining_unchecked = unchecked_attendees
-    while (remaining_conflicts or remaining_unchecked) and len(
-        response
-    ) > max_output_length:
-        conflicts_size = len(json.dumps(remaining_conflicts, ensure_ascii=False))
-        unchecked_size = len(json.dumps(remaining_unchecked, ensure_ascii=False))
-        if remaining_conflicts and conflicts_size >= unchecked_size:
-            remaining_conflicts = remaining_conflicts[: len(remaining_conflicts) // 2]
-        else:
-            remaining_unchecked = remaining_unchecked[: len(remaining_unchecked) // 2]
-        payload["conflicts"] = remaining_conflicts
-        payload["unchecked_attendees"] = remaining_unchecked
-        payload["truncated"] = True
-        response = json.dumps(payload, ensure_ascii=False)
+    response = _halve_largest_list_fields_until_bounded(
+        payload, ("conflicts", "unchecked_attendees"), max_output_length
+    )
 
     if len(response) > max_output_length:
         compact_payloads: tuple[dict[str, Any], ...] = (
@@ -428,14 +432,10 @@ def incomplete_check_response(
         ),
         "truncated": False,
     }
-    response = json.dumps(payload, ensure_ascii=False)
     max_output_length = get_tool_max_output_length()
-    remaining = unchecked_attendees
-    while remaining and len(response) > max_output_length:
-        remaining = remaining[: len(remaining) // 2]
-        payload["unchecked_attendees"] = remaining
-        payload["truncated"] = True
-        response = json.dumps(payload, ensure_ascii=False)
+    response = _halve_largest_list_fields_until_bounded(
+        payload, ("unchecked_attendees",), max_output_length
+    )
     if len(response) <= max_output_length:
         return response
 
@@ -536,9 +536,10 @@ def datetime_key_for_comparison(value: str | None) -> datetime | str | None:
         normalized = normalized[:-1] + "+00:00"
     normalized = _OVERLONG_FRACTIONAL_SECONDS.sub(r"\1", normalized)
     try:
-        return datetime.fromisoformat(normalized)
+        parsed: datetime = _date_parser.isoparse(normalized)
     except ValueError:
         return value
+    return parsed
 
 
 def reject_reversed_window(start_value: str, end_value: str) -> None:
@@ -591,7 +592,7 @@ def require_offset_datetime(value: str, field_name: str) -> None:
     its own clear error, not this function's job to preempt.
     """
     try:
-        parsed = datetime.fromisoformat(value)
+        parsed: datetime = _date_parser.isoparse(value)
     except ValueError:
         return
     if parsed.tzinfo is None:
@@ -650,7 +651,7 @@ def offset_datetime_string(value: str, tz_name: str) -> str:
     passing one with an offset already attached is a real, reachable
     input here, not just a theoretical one.
     """
-    parsed = datetime.fromisoformat(value)
+    parsed: datetime = _date_parser.isoparse(value)
     if parsed.tzinfo is not None:
         raise ValueError(
             f"{value!r} already carries a UTC offset; pass a naive "
@@ -675,7 +676,7 @@ def calendar_day_bounds(
     if days <= 0:
         raise ValueError("days must be a positive integer")
     zone = resolve_zoneinfo(tz_name)
-    day: date = datetime.fromisoformat(date_value).date()
+    day: date = _date_parser.isoparse(date_value).date()
     start = datetime.combine(day, time.min, tzinfo=zone)
     # Advance the local calendar date before attaching the timezone again.
     # Adding a timedelta to an aware datetime preserves the original

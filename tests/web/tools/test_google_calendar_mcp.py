@@ -5,9 +5,16 @@ from typing import Any
 from unittest.mock import Mock
 
 import pytest
+from googleapiclient.errors import HttpError
 
 from xagent.web.tools.mcp import calendar
 from xagent.web.tools.mcp import utils as mcp_utils
+
+
+class _HttpResponse:
+    def __init__(self, status: int):
+        self.status = status
+        self.reason = "error"
 
 
 def _fake_service(execute_result: dict, existing_event: dict | None = None):
@@ -1544,3 +1551,191 @@ def test_event_response_does_not_truncate_a_small_event(monkeypatch):
 
     assert result["status"] == "success"
     assert result["truncated"] is False
+
+
+def test_create_event_returns_conflict_for_a_real_overlap(monkeypatch):
+    service = _fake_service({"id": "created"})
+    service.events.return_value.list.return_value.execute.return_value = {
+        "items": [
+            {
+                "id": "busy-event",
+                "summary": "Already booked",
+                "start": {"dateTime": "2026-09-07T15:15:00+08:00"},
+                "end": {"dateTime": "2026-09-07T15:45:00+08:00"},
+            }
+        ]
+    }
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="New meeting",
+            start_time="2026-09-07T15:00:00+08:00",
+            end_time="2026-09-07T16:00:00+08:00",
+        )
+    )
+
+    assert result["status"] == "conflict"
+    assert result["conflicts"][0]["summary"] == "Already booked"
+    service.events.return_value.insert.assert_not_called()
+
+
+def test_find_conflicts_follows_event_pages_and_excludes_recurring_instances():
+    service = _fake_service({"id": "unused"})
+    pages = {
+        None: {
+            "items": [
+                {
+                    "id": "series-instance",
+                    "recurringEventId": "series",
+                    "summary": "This event",
+                    "start": {"dateTime": "2026-09-07T15:00:00+08:00"},
+                    "end": {"dateTime": "2026-09-07T16:00:00+08:00"},
+                }
+            ],
+            "nextPageToken": "second-page",
+        },
+        "second-page": {
+            "items": [
+                {
+                    "id": "other-event",
+                    "summary": "Later-page conflict",
+                    "start": {"dateTime": "2026-09-07T15:30:00+08:00"},
+                    "end": {"dateTime": "2026-09-07T16:00:00+08:00"},
+                }
+            ]
+        },
+    }
+
+    def list_events(**kwargs: Any) -> Mock:
+        return Mock(execute=Mock(return_value=pages[kwargs.get("pageToken")]))
+
+    service.events.return_value.list.side_effect = list_events
+
+    conflicts, unchecked = calendar._find_conflicts(
+        service,
+        "2026-09-07T15:00:00+08:00",
+        "2026-09-07T16:00:00+08:00",
+        [],
+        exclude_event_id="series",
+    )
+
+    assert unchecked == []
+    assert [item["summary"] for item in conflicts] == ["Later-page conflict"]
+    assert [
+        call.kwargs["pageToken"]
+        for call in service.events.return_value.list.call_args_list
+    ] == [None, "second-page"]
+
+
+def test_find_conflicts_batches_more_than_fifty_attendees():
+    service = _fake_service({"id": "unused"})
+    attendees = [f"person{i}@example.com" for i in range(51)]
+
+    conflicts, unchecked = calendar._find_conflicts(
+        service,
+        "2026-09-07T15:00:00+08:00",
+        "2026-09-07T16:00:00+08:00",
+        attendees,
+        check_primary_calendar=False,
+    )
+
+    assert conflicts == []
+    assert unchecked == []
+    assert [
+        len(call.kwargs["body"]["items"])
+        for call in service.freebusy.return_value.query.call_args_list
+    ] == [50, 1]
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        b'{"error":{"errors":[{"reason":"insufficientPermissions"}]}}',
+        b'{"error":{"details":[{"reason":"ACCESS_TOKEN_SCOPE_INSUFFICIENT"}]}}',
+    ],
+)
+def test_is_insufficient_scope_error_supports_both_google_response_shapes(content):
+    error = HttpError(_HttpResponse(403), content)
+
+    assert calendar._is_insufficient_scope_error(error)
+
+
+def test_update_event_sends_the_fetched_etag_as_if_match(monkeypatch):
+    service = _fake_service(
+        {"id": "evt1"},
+        existing_event={"etag": '"version-1"'},
+    )
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="evt1", summary="Updated", ignore_conflicts=True
+        )
+    )
+
+    assert result["status"] == "success"
+    request = service.events.return_value.update.return_value
+    assert request.headers["If-Match"] == '"version-1"'
+
+
+def test_update_event_reports_precondition_failure_without_retrying(monkeypatch):
+    service = _fake_service(
+        {"id": "evt1"},
+        existing_event={"etag": '"version-1"'},
+    )
+    service.events.return_value.update.return_value.execute.side_effect = HttpError(
+        _HttpResponse(412),
+        b'{"error":{"code":412,"message":"Precondition Failed"}}',
+    )
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="evt1", summary="Updated", ignore_conflicts=True
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "changed while its availability was being checked" in result["message"]
+    service.events.return_value.update.assert_called_once()
+
+
+def test_update_fails_closed_if_a_foreign_organizer_email_is_missing(monkeypatch):
+    service = _fake_service(
+        {"id": "evt1"},
+        existing_event={"organizer": {"self": False}},
+    )
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="evt1",
+            start_time="2026-09-07T17:00:00+08:00",
+            end_time="2026-09-07T18:00:00+08:00",
+        )
+    )
+
+    assert result["status"] == "conflict_check_incomplete"
+    assert result["unchecked_attendees"] == ["organizer (email unavailable)"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_ignore_conflicts_cannot_bypass_a_missing_stored_counterpart(monkeypatch):
+    service = _fake_service(
+        {"id": "evt1"},
+        existing_event={"end": {}},
+    )
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="evt1",
+            start_time="2026-09-07T17:00:00+08:00",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "valid stored counterpart" in result["message"]
+    service.events.return_value.update.assert_not_called()

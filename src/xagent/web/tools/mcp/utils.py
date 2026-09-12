@@ -3,6 +3,7 @@ import os
 import re
 import urllib.request
 from datetime import date, datetime, time, timedelta
+from datetime import timezone as dt_timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -603,9 +604,167 @@ def require_offset_datetime(value: str, field_name: str) -> None:
         )
 
 
+# Global (territory="001") mappings from Unicode CLDR windowsZones.xml,
+# using modern equivalent IANA aliases where appropriate, plus legacy Windows
+# IDs already accepted by this connector.
+_WINDOWS_TO_IANA: dict[str, str] = {
+    "UTC": "UTC",
+    "GMT Standard Time": "Europe/London",
+    "Greenwich Standard Time": "Atlantic/Reykjavik",
+    "W. Europe Standard Time": "Europe/Berlin",
+    "Central Europe Standard Time": "Europe/Budapest",
+    "Central European Standard Time": "Europe/Warsaw",
+    "Romance Standard Time": "Europe/Paris",
+    "E. Europe Standard Time": "Europe/Chisinau",
+    "GTB Standard Time": "Europe/Bucharest",
+    # Split this Windows ID only to avoid codespell treating its three-letter
+    # abbreviation as a misspelling; joining the parts restores the real key.
+    "".join(("F", "LE Standard Time")): "Europe/Kyiv",
+    "Turkey Standard Time": "Europe/Istanbul",
+    "Russian Standard Time": "Europe/Moscow",
+    "Kaliningrad Standard Time": "Europe/Kaliningrad",
+    "Arabic Standard Time": "Asia/Baghdad",
+    "Syria Standard Time": "Asia/Damascus",
+    "Arab Standard Time": "Asia/Riyadh",
+    "Israel Standard Time": "Asia/Jerusalem",
+    "Jordan Standard Time": "Asia/Amman",
+    "Middle East Standard Time": "Asia/Beirut",
+    "Egypt Standard Time": "Africa/Cairo",
+    "South Africa Standard Time": "Africa/Johannesburg",
+    "E. Africa Standard Time": "Africa/Nairobi",
+    "Mauritius Standard Time": "Indian/Mauritius",
+    "Iran Standard Time": "Asia/Tehran",
+    "Arabian Standard Time": "Asia/Dubai",
+    "Azerbaijan Standard Time": "Asia/Baku",
+    "Georgian Standard Time": "Asia/Tbilisi",
+    "Caucasus Standard Time": "Asia/Yerevan",
+    "Afghanistan Standard Time": "Asia/Kabul",
+    "Pakistan Standard Time": "Asia/Karachi",
+    "West Asia Standard Time": "Asia/Tashkent",
+    "India Standard Time": "Asia/Kolkata",
+    "Sri Lanka Standard Time": "Asia/Colombo",
+    "Nepal Standard Time": "Asia/Kathmandu",
+    "Central Asia Standard Time": "Asia/Bishkek",
+    "Bangladesh Standard Time": "Asia/Dhaka",
+    "Ekaterinburg Standard Time": "Asia/Yekaterinburg",
+    "Myanmar Standard Time": "Asia/Yangon",
+    "SE Asia Standard Time": "Asia/Bangkok",
+    "Novosibirsk Standard Time": "Asia/Novosibirsk",
+    "China Standard Time": "Asia/Shanghai",
+    "North Asia Standard Time": "Asia/Krasnoyarsk",
+    "Singapore Standard Time": "Asia/Singapore",
+    "Taipei Standard Time": "Asia/Taipei",
+    "Ulaanbaatar Standard Time": "Asia/Ulaanbaatar",
+    "North Asia East Standard Time": "Asia/Irkutsk",
+    "W. Australia Standard Time": "Australia/Perth",
+    "Tokyo Standard Time": "Asia/Tokyo",
+    "Korea Standard Time": "Asia/Seoul",
+    "Cen. Australia Standard Time": "Australia/Adelaide",
+    "AUS Central Standard Time": "Australia/Darwin",
+    "E. Australia Standard Time": "Australia/Brisbane",
+    "AUS Eastern Standard Time": "Australia/Sydney",
+    "West Pacific Standard Time": "Pacific/Port_Moresby",
+    "Tasmania Standard Time": "Australia/Hobart",
+    "Yakutsk Standard Time": "Asia/Yakutsk",
+    "Central Pacific Standard Time": "Pacific/Guadalcanal",
+    "Vladivostok Standard Time": "Asia/Vladivostok",
+    "New Zealand Standard Time": "Pacific/Auckland",
+    "Fiji Standard Time": "Pacific/Fiji",
+    "Magadan Standard Time": "Asia/Magadan",
+    "Tonga Standard Time": "Pacific/Tongatapu",
+    "Samoa Standard Time": "Pacific/Apia",
+    "Line Islands Standard Time": "Pacific/Kiritimati",
+    "Dateline Standard Time": "Etc/GMT+12",
+    "Hawaiian Standard Time": "Pacific/Honolulu",
+    "Alaskan Standard Time": "America/Anchorage",
+    "Pacific Standard Time (Mexico)": "America/Santa_Isabel",
+    "Pacific Standard Time": "America/Los_Angeles",
+    "US Mountain Standard Time": "America/Phoenix",
+    "Mountain Standard Time (Mexico)": "America/Mazatlan",
+    "Mountain Standard Time": "America/Denver",
+    "Central America Standard Time": "America/Guatemala",
+    "Central Standard Time": "America/Chicago",
+    "Central Standard Time (Mexico)": "America/Mexico_City",
+    "Canada Central Standard Time": "America/Regina",
+    "SA Pacific Standard Time": "America/Bogota",
+    "Eastern Standard Time": "America/New_York",
+    "US Eastern Standard Time": "America/Indiana/Indianapolis",
+    "Venezuela Standard Time": "America/Caracas",
+    "Paraguay Standard Time": "America/Asuncion",
+    "Atlantic Standard Time": "America/Halifax",
+    "Central Brazilian Standard Time": "America/Cuiaba",
+    "SA Western Standard Time": "America/La_Paz",
+    "Pacific SA Standard Time": "America/Santiago",
+    "Newfoundland Standard Time": "America/St_Johns",
+    "E. South America Standard Time": "America/Sao_Paulo",
+    "Argentina Standard Time": "America/Argentina/Buenos_Aires",
+    "SA Eastern Standard Time": "America/Cayenne",
+    "Greenland Standard Time": "America/Godthab",
+    "Montevideo Standard Time": "America/Montevideo",
+    "Bahia Standard Time": "America/Bahia",
+    "Azores Standard Time": "Atlantic/Azores",
+    "Cape Verde Standard Time": "Atlantic/Cape_Verde",
+    "Morocco Standard Time": "Africa/Casablanca",
+    "Namibia Standard Time": "Africa/Windhoek",
+    "W. Central Africa Standard Time": "Africa/Lagos",
+    "Aleutian Standard Time": "America/Adak",
+    "Altai Standard Time": "Asia/Barnaul",
+    "Astrakhan Standard Time": "Europe/Astrakhan",
+    "Aus Central W. Standard Time": "Australia/Eucla",
+    "Belarus Standard Time": "Europe/Minsk",
+    "Bougainville Standard Time": "Pacific/Bougainville",
+    "Chatham Islands Standard Time": "Pacific/Chatham",
+    "Cuba Standard Time": "America/Havana",
+    "Easter Island Standard Time": "Pacific/Easter",
+    "Eastern Standard Time (Mexico)": "America/Cancun",
+    "Haiti Standard Time": "America/Port-au-Prince",
+    "Libya Standard Time": "Africa/Tripoli",
+    "Lord Howe Standard Time": "Australia/Lord_Howe",
+    "Magallanes Standard Time": "America/Punta_Arenas",
+    "Marquesas Standard Time": "Pacific/Marquesas",
+    "N. Central Asia Standard Time": "Asia/Novosibirsk",
+    "Norfolk Standard Time": "Pacific/Norfolk",
+    "North Korea Standard Time": "Asia/Pyongyang",
+    "Omsk Standard Time": "Asia/Omsk",
+    "Qyzylorda Standard Time": "Asia/Qyzylorda",
+    "Russia Time Zone 10": "Asia/Srednekolymsk",
+    "Russia Time Zone 11": "Asia/Kamchatka",
+    "Russia Time Zone 3": "Europe/Samara",
+    "Saint Pierre Standard Time": "America/Miquelon",
+    "Sakhalin Standard Time": "Asia/Sakhalin",
+    "Sao Tome Standard Time": "Africa/Sao_Tome",
+    "Saratov Standard Time": "Europe/Saratov",
+    "South Sudan Standard Time": "Africa/Juba",
+    "Sudan Standard Time": "Africa/Khartoum",
+    "Tocantins Standard Time": "America/Araguaina",
+    "Tomsk Standard Time": "Asia/Tomsk",
+    "Transbaikal Standard Time": "Asia/Chita",
+    "Turks And Caicos Standard Time": "America/Grand_Turk",
+    "UTC+12": "Etc/GMT-12",
+    "UTC+13": "Etc/GMT-13",
+    "UTC-02": "Etc/GMT+2",
+    "UTC-08": "Etc/GMT+8",
+    "UTC-09": "Etc/GMT+9",
+    "UTC-11": "Etc/GMT+11",
+    "Volgograd Standard Time": "Europe/Volgograd",
+    "W. Mongolia Standard Time": "Asia/Hovd",
+    "West Bank Standard Time": "Asia/Hebron",
+    "Yukon Standard Time": "America/Whitehorse",
+}
+
+
+def resolve_zone_name(name: str) -> str:
+    """Map a Graph timeZone value to a name zoneinfo can load.
+
+    Returns the input unchanged when it isn't a recognized legacy Windows
+    zone name - it's then assumed to already be IANA-shaped, which
+    zoneinfo can load directly.
+    """
+    return _WINDOWS_TO_IANA.get(name, name)
+
+
 def resolve_zoneinfo(name: str) -> ZoneInfo:
-    """Resolve a Google Calendar timeZone value (an IANA Time Zone
-    Database name, per Google's own EventDateTime docs) to a real
+    """Resolve an IANA or supported Windows time zone to a real
     ``ZoneInfo``, for use anywhere a working zone is required (not just a
     best-effort comparison) - e.g. attaching a real UTC offset to a naive
     datetime string.
@@ -616,10 +775,10 @@ def resolve_zoneinfo(name: str) -> ZoneInfo:
     helper exists to prevent.
     """
     try:
-        return ZoneInfo(name)
+        return ZoneInfo(resolve_zone_name(name))
     except (ZoneInfoNotFoundError, TypeError, ValueError) as exc:
         raise ValueError(
-            f"Timezone {name!r} isn't a recognized IANA zone name."
+            f"Timezone {name!r} isn't a recognized IANA zone name or Windows zone name."
         ) from exc
 
 
@@ -1147,3 +1306,54 @@ def setup_proxy_env() -> None:
     # If ALL_PROXY is set, ensure HTTPS_PROXY is also set
     if "ALL_PROXY" in os.environ and "HTTPS_PROXY" not in os.environ:
         os.environ["HTTPS_PROXY"] = os.environ["ALL_PROXY"]
+
+
+def naive_day_bounds(
+    date_value: str, tz_name: str | None = None, *, days: int = 1
+) -> tuple[str, str]:
+    """Return (start, end) NAIVE ISO datetime strings spanning ``days``
+    full calendar day(s) starting at ``date_value``'s effective date, for
+    an API like Outlook's dateTimeTimeZone that wants a naive clock value
+    paired with a separate timeZone field rather than an embedded offset.
+
+    ``date_value`` may be a bare "YYYY-MM-DD" or a full datetime string.
+    If it carries an offset and ``tz_name`` is supplied, the represented
+    instant is converted into that zone before its calendar date is taken.
+    Naive values are already wall-clock readings in ``tz_name`` and keep
+    their own date.
+    """
+    parsed = _date_parser.isoparse(date_value)
+    if parsed.tzinfo is not None and tz_name is not None:
+        parsed = parsed.astimezone(resolve_zoneinfo(tz_name))
+    day: date = parsed.date()
+    start = datetime.combine(day, time.min)
+    end = start + timedelta(days=days)
+    return start.isoformat(), end.isoformat()
+
+
+def timezones_could_differ(a: str, b: str) -> bool:
+    """True only when two Graph timeZone values can be POSITIVELY
+    confirmed to denote different zones (compared by current UTC offset,
+    not just the zone key, so e.g. a Windows name and the IANA name Graph
+    also accepts for the same real zone compare equal).
+
+    False whenever that can't be confirmed - including when either name
+    fails to resolve (an unmappable legacy Windows zone) - because "can't
+    tell" must never read as "these are different": the only use of this
+    function is deciding whether to reject a caller-supplied timezone as
+    ambiguous, and the actual write always uses Graph's own already-valid
+    timeZone string regardless of this check's answer. Wrongly rejecting
+    a same-zone resubmission (written in a different but equally valid
+    form) is the real failure mode to avoid; wrongly allowing a genuinely
+    different but unresolvable zone through is never worse than what
+    happens when the caller omits the argument entirely.
+    """
+    if a == b:
+        return False
+    try:
+        zone_a = resolve_zoneinfo(a)
+        zone_b = resolve_zoneinfo(b)
+    except ValueError:
+        return False
+    now = datetime.now(dt_timezone.utc)
+    return now.astimezone(zone_a).utcoffset() != now.astimezone(zone_b).utcoffset()

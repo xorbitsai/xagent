@@ -197,6 +197,55 @@ def test_refresh_tokens_are_unique_at_identical_time(monkeypatch):
     )
 
 
+@pytest.mark.parametrize("algorithm", ["HS256", "HS384", "HS512"])
+def test_refresh_token_size_is_independent_of_username(monkeypatch, algorithm):
+    monkeypatch.setattr(auth, "JWT_ALGORITHM", algorithm)
+    token = auth.create_refresh_token({"sub": "用" * 50, "user_id": 2**63 - 1})
+    assert len(token) <= User.__table__.c.refresh_token.type.length
+    payload = auth.verify_refresh_token(token)
+    assert payload["user_id"] == 2**63 - 1
+    assert "sub" not in payload
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("username", ["a" * 50, "用" * 50])
+async def test_long_username_login_and_legacy_refresh(worker_db, username):
+    factory, _, engine = worker_db
+    with Session(engine) as session:
+        user = session.scalar(select(User))
+        user.username = username
+        session.commit()
+    result = await auth.login(
+        auth.LoginRequest(username=username, password="password123"), factory
+    )
+    assert len(result["refresh_token"]) <= 255
+    refreshed = await auth.refresh_token(
+        auth.RefreshTokenRequest(refresh_token=result["refresh_token"]), factory
+    )
+    assert len(refreshed.refresh_token) <= 255
+    assert auth.verify_token(refreshed.access_token)["sub"] == username
+    # Previously issued refresh JWTs with sub and no jti remain valid.
+    with Session(engine) as session:
+        user = session.scalar(select(User))
+        legacy = auth.jwt.encode(
+            {
+                "sub": "worker",
+                "user_id": user.id,
+                "type": "refresh",
+                "exp": auth.datetime.now(auth.timezone.utc) + auth.timedelta(days=1),
+            },
+            auth.JWT_SECRET_KEY,
+            algorithm=auth.JWT_ALGORITHM,
+        )
+        user.refresh_token = legacy
+        session.commit()
+    renewed = await auth.refresh_token(
+        auth.RefreshTokenRequest(refresh_token=legacy), factory
+    )
+    with Session(engine) as session:
+        assert session.scalar(select(User.refresh_token)) == renewed.refresh_token
+
+
 @pytest.mark.asyncio
 async def test_refresh_commit_failure_preserves_old_token(worker_db, monkeypatch):
     factory, events, engine = worker_db

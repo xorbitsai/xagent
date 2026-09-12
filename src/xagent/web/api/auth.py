@@ -960,10 +960,15 @@ def create_access_token(
 
 def create_refresh_token(data: Dict[str, Any]) -> str:
     """Create JWT refresh token with longer expiry"""
-    to_encode = data.copy()
+    # Refresh consumes user_id, never username/sub. Omit that redundant,
+    # unbounded UTF-8 claim to keep the signed token within VARCHAR(255).
+    # Access tokens retain sub; verification still accepts existing refresh JWTs.
+    to_encode = {"user_id": data["user_id"]}
     expire = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
     # Rotation must change the stored value even within one JWT timestamp second.
-    to_encode.update({"exp": expire, "type": "refresh", "jti": secrets.token_hex(16)})
+    to_encode.update(
+        {"exp": expire, "type": "refresh", "jti": secrets.token_urlsafe(16)}
+    )
     encoded_jwt: str = jwt.encode(to_encode, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
     return encoded_jwt
 

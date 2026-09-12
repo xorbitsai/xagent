@@ -60,6 +60,7 @@ _SEAM_REACHING_FUNCTIONS = {
     "xagent.web.api.custom_api.update_custom_api",
     "xagent.web.api.custom_api.delete_custom_api",
     "xagent.web.api.mcp._local_mcp_can_attach",
+    "xagent.web.api.mcp._resolve_mcp_server_for_request",
     # The coroutine that owns app-scoped teardown, ``teardown_mcp_app_server``,
     # is absent on purpose: it hands this helper to ``asyncio.to_thread``
     # instead of calling it, so the seam runs in a worker thread and the
@@ -70,6 +71,7 @@ _SEAM_REACHING_FUNCTIONS = {
     # the offender list.
     "xagent.web.api.mcp._teardown_mcp_app_server_locally",
     "xagent.web.api.mcp.delete_mcp_server",
+    "xagent.web.api.mcp.get_mcp_server",
     "xagent.web.api.mcp.get_mcp_servers",
     "xagent.web.api.mcp.list_mcp_apps",
     "xagent.web.api.mcp.update_mcp_server",
@@ -205,7 +207,9 @@ def _functions_reaching_the_connector_seam() -> dict[str, ast.AST]:
     module's top level -- then closed transitively over plain-name calls to
     another function in the same module already in the reaching set, so that
     a route reaching the seam only through a local helper is enumerated as
-    well. A method defined in a class body is kept, keyed as
+    well: on the MCP side, ``get_mcp_server`` reaches the seam only through
+    ``_resolve_mcp_server_for_request``, and a seed-only check would miss it.
+    A method defined in a class body is kept, keyed as
     ``module.Class.method``, rather than dropped, since these modules already
     have ``async def`` methods.
     """

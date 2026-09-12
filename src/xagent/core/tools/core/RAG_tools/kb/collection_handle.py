@@ -81,7 +81,10 @@ from ..storage.contracts import (
     VectorIndexStore,
 )
 from ..utils import check_file_type, compute_file_hash
-from ..utils.filter_utils import parse_legacy_filters, validate_filter_depth
+from ..utils.filter_utils import (
+    normalize_filter_conditions,
+    validate_filter_depth,
+)
 from ..utils.hash_utils import compute_chunk_hash
 from ..utils.metadata_utils import deserialize_metadata, serialize_metadata
 from ..utils.string_utils import generate_deterministic_doc_id
@@ -136,6 +139,98 @@ def _safe_optional_str(value: Any) -> str | None:
     except Exception:  # noqa: BLE001
         pass
     return str(value)
+
+
+def _table_column_names(table: Any) -> set[str] | None:
+    """Column names the table carries, or None when the schema is unreadable."""
+    try:
+        return {str(name) for name in table.schema.names}
+    except Exception:
+        return None
+
+
+def _condition_fields(conditions: Sequence[FilterExpression]) -> list[str]:
+    """Columns a scan must project so every condition can be evaluated."""
+    return [c.field for c in conditions if isinstance(c, FilterCondition)]
+
+
+def _require_flat_condition(condition: FilterExpression) -> FilterCondition:
+    """A scan evaluates plain conditions only; a nested group has no column."""
+    if not isinstance(condition, FilterCondition):
+        raise ValueError(
+            "Scan fallback cannot evaluate a nested filter expression: "
+            f"{type(condition).__name__}"
+        )
+    return condition
+
+
+def _single_condition_mask(batch_df: Any, condition: FilterCondition) -> Any:
+    """Evaluate one condition against a batch, or say why it cannot be."""
+    field = condition.field
+    if field not in batch_df.columns:
+        raise ValueError(
+            f"Scan fallback cannot filter on {field!r}: the table does not "
+            "carry that column"
+        )
+    column = batch_df[field]
+    operator = condition.operator
+    value = condition.value
+    try:
+        if operator is FilterOperator.IN or (
+            operator is FilterOperator.EQ and isinstance(value, (list, tuple, set))
+        ):
+            return column.isin(list(value))
+        if operator is FilterOperator.EQ:
+            return column == value
+        if operator is FilterOperator.NE:
+            if value is None:
+                # SQL reads `field != NULL` as NULL, which selects nothing.
+                return pd.Series(False, index=column.index)
+            # SQL drops NULL rows on `!=`; pandas would keep them.
+            return (column != value) & column.notna()
+        if operator is FilterOperator.GT:
+            return column > value
+        if operator is FilterOperator.GTE:
+            return column >= value
+        if operator is FilterOperator.LT:
+            return column < value
+        if operator is FilterOperator.LTE:
+            return column <= value
+        if operator is FilterOperator.IS_NULL:
+            return column.isna()
+        if operator is FilterOperator.IS_NOT_NULL:
+            return column.notna()
+        if operator is FilterOperator.CONTAINS:
+            # astype(str) renders NULL as "None"/"nan", which a short needle
+            # would then match; drop those rows before comparing.
+            return column.notna() & column.astype(str).str.contains(
+                str(value), na=False, regex=False
+            )
+    except TypeError as exc:
+        # The backend rejects a mismatched comparison too; say which one.
+        raise ValueError(
+            f"Scan fallback cannot compare {field!r} ({column.dtype}) with "
+            f"{value!r}: {exc}"
+        ) from exc
+    raise ValueError(f"Unsupported filter operator for scan: {operator}")
+
+
+def _condition_row_mask(batch_df: Any, conditions: Sequence[FilterExpression]) -> Any:
+    """AND the conditions into a pandas mask.
+
+    The sync fallback cannot push predicates down and the async one pushes only
+    scalar equality, so what is left is evaluated here against the same parsed
+    conditions the indexed paths hand to the backend. A condition the scan
+    cannot evaluate raises: dropping it would hand back rows the caller
+    filtered out.
+    """
+    mask = None
+    for condition in conditions:
+        column_mask = _single_condition_mask(
+            batch_df, _require_flat_condition(condition)
+        )
+        mask = column_mask if mask is None else (mask & column_mask)
+    return mask
 
 
 def validate_query_vector_format(query_vector: list[float]) -> None:
@@ -2008,17 +2103,7 @@ class LanceDBCollectionHandle(KBCollectionHandle):
                             value=collection,
                         )
                     )
-                if filters:
-                    parsed = (
-                        parse_legacy_filters(filters)
-                        if isinstance(filters, dict)
-                        else None
-                    )
-                    if parsed is not None:
-                        if isinstance(parsed, tuple):
-                            conditions.extend(parsed)
-                        else:
-                            conditions.append(parsed)
+                conditions.extend(normalize_filter_conditions(filters))
                 if len(conditions) == 1:
                     filter_expr = conditions[0]
                 elif len(conditions) > 1:
@@ -2087,17 +2172,7 @@ class LanceDBCollectionHandle(KBCollectionHandle):
                             value=collection,
                         )
                     )
-                if filters:
-                    parsed = (
-                        parse_legacy_filters(filters)
-                        if isinstance(filters, dict)
-                        else None
-                    )
-                    if parsed is not None:
-                        if isinstance(parsed, tuple):
-                            conditions.extend(parsed)
-                        else:
-                            conditions.append(parsed)
+                conditions.extend(normalize_filter_conditions(filters))
                 if len(conditions) == 1:
                     filter_expr = conditions[0]
                 elif len(conditions) > 1:
@@ -2333,8 +2408,14 @@ class LanceDBCollectionHandle(KBCollectionHandle):
             "created_at",
             "metadata",
         }
-        if filters and isinstance(filters, dict):
-            desired_columns.update(filters.keys())
+        scan_conditions = normalize_filter_conditions(filters)
+        # A filtered column absent from the projection would be skipped by the
+        # mask below rather than applied. Projecting one the table does not have
+        # would fail the whole scan, so ask only for what the schema carries.
+        desired_columns.update(_condition_fields(scan_conditions))
+        table_columns = _table_column_names(table)
+        if table_columns is not None:
+            desired_columns &= table_columns
 
         results: List[SearchResult] = []
 
@@ -2359,14 +2440,9 @@ class LanceDBCollectionHandle(KBCollectionHandle):
             batch_df = batch.to_pandas()
 
             mask = batch_df["collection"] == collection
-            if filters and isinstance(filters, dict):
-                for key, value in filters.items():
-                    if key not in batch_df.columns:
-                        continue
-                    if isinstance(value, (list, tuple, set)):
-                        mask &= batch_df[key].isin(list(value))
-                    else:
-                        mask &= batch_df[key] == value
+            condition_mask = _condition_row_mask(batch_df, scan_conditions)
+            if condition_mask is not None:
+                mask &= condition_mask
 
             if not mask.any():
                 continue
@@ -2435,10 +2511,18 @@ class LanceDBCollectionHandle(KBCollectionHandle):
         vector_store = self.vector_index_store
         results: List[SearchResult] = []
 
-        # Build query filters
+        # Only plain scalar equality can be pushed down; the store's dict form
+        # cannot express the operator conditions, so those are scanned here.
         query_filters: Dict[str, Any] = {"collection": collection}
-        if filters and isinstance(filters, dict):
-            query_filters.update(filters)
+        scan_conditions: list[FilterCondition] = []
+        for raw_condition in normalize_filter_conditions(filters):
+            condition = _require_flat_condition(raw_condition)
+            if condition.operator is FilterOperator.EQ and not isinstance(
+                condition.value, (list, tuple, set)
+            ):
+                query_filters[condition.field] = condition.value
+            else:
+                scan_conditions.append(condition)
 
         _table = None
         try:
@@ -2451,14 +2535,23 @@ class LanceDBCollectionHandle(KBCollectionHandle):
                 AsyncIterator[Any],
                 vector_store.iter_batches_async(
                     table_name=table_name,
-                    columns=[
-                        "doc_id",
-                        "chunk_id",
-                        "text",
-                        "parse_hash",
-                        "created_at",
-                        "metadata",
-                    ],
+                    # Scanned conditions need their column present, or the mask
+                    # below would skip them. A repeat of a base column would
+                    # make to_pandas() return duplicate labels, which breaks
+                    # every mask built from it.
+                    columns=list(
+                        dict.fromkeys(
+                            [
+                                "doc_id",
+                                "chunk_id",
+                                "text",
+                                "parse_hash",
+                                "created_at",
+                                "metadata",
+                                *_condition_fields(scan_conditions),
+                            ]
+                        )
+                    ),
                     batch_size=batch_size,
                     filters=query_filters,
                     user_id=user_id,
@@ -2473,6 +2566,9 @@ class LanceDBCollectionHandle(KBCollectionHandle):
                     .astype(str)
                     .str.contains(query_text, na=False, regex=False)
                 )
+                condition_mask = _condition_row_mask(batch_df, scan_conditions)
+                if condition_mask is not None:
+                    text_mask &= condition_mask
                 matching_rows = batch_df[text_mask]
 
                 # Early exit: stop processing if we already have enough results
@@ -2595,26 +2691,7 @@ class LanceDBCollectionHandle(KBCollectionHandle):
                     )
 
                 # Add custom filters
-                if filters:
-                    if isinstance(filters, dict):
-                        # Legacy format: use parser
-                        parsed_filters = parse_legacy_filters(filters)
-                        # parsed_filters can be FilterCondition or tuple (AND combination)
-                        if parsed_filters is not None:
-                            if isinstance(parsed_filters, tuple):
-                                # Type narrowing: tuple of FilterConditions
-                                conditions.extend(parsed_filters)
-                            else:
-                                # Type narrowing: single FilterCondition
-                                conditions.append(parsed_filters)
-                    elif isinstance(filters, (tuple, list)):
-                        # Already FilterExpression
-                        conditions.extend(
-                            filters if isinstance(filters, tuple) else list(filters)
-                        )
-                    else:
-                        # Single FilterCondition
-                        conditions.append(filters)
+                conditions.extend(normalize_filter_conditions(filters))
 
                 # Combine conditions with AND
                 if len(conditions) == 1:
@@ -2782,20 +2859,7 @@ class LanceDBCollectionHandle(KBCollectionHandle):
                         )
                     )
 
-                if filters:
-                    if isinstance(filters, dict):
-                        parsed_filters = parse_legacy_filters(filters)
-                        if parsed_filters is not None:
-                            if isinstance(parsed_filters, tuple):
-                                conditions.extend(parsed_filters)
-                            else:
-                                conditions.append(parsed_filters)
-                    elif isinstance(filters, (tuple, list)):
-                        conditions.extend(
-                            filters if isinstance(filters, tuple) else list(filters)
-                        )
-                    else:
-                        conditions.append(filters)
+                conditions.extend(normalize_filter_conditions(filters))
 
                 if len(conditions) == 1:
                     filter_expr = conditions[0]

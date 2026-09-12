@@ -99,6 +99,13 @@ def parse_legacy_filters(
                     field=field, operator=op_map[op_str], value=spec["value"]
                 )
             )
+        elif isinstance(spec, (list, tuple, set)):
+            # Membership, not equality: EQ would translate to `field == '[...]'`.
+            conditions.append(
+                FilterCondition(
+                    field=field, operator=FilterOperator.IN, value=list(spec)
+                )
+            )
         else:
             conditions.append(
                 FilterCondition(field=field, operator=FilterOperator.EQ, value=spec)
@@ -107,3 +114,32 @@ def parse_legacy_filters(
     if len(conditions) == 1:
         return conditions[0]
     return tuple(conditions)
+
+
+def normalize_filter_conditions(
+    filters: Any,
+    max_depth: int = 10,
+) -> list[FilterExpression]:
+    """Return the conditions to AND together for any accepted filter shape.
+
+    Accepts the legacy dict form, an already-built ``FilterExpression``, or a
+    tuple/list of them. Search engines differed on which shapes they honoured
+    (#671); routing every engine through this keeps one answer per input.
+
+    A tuple is an AND group, so it flattens into the returned list; a list is an
+    OR group (``contracts.FilterExpression``), so it stays one element and keeps
+    its disjunction.
+    """
+    if not filters:
+        return []
+
+    if isinstance(filters, dict):
+        parsed = parse_legacy_filters(filters, max_depth=max_depth)
+        if parsed is None:
+            return []
+        return list(parsed) if isinstance(parsed, tuple) else [parsed]
+
+    if isinstance(filters, tuple):
+        return list(filters)
+
+    return [filters]

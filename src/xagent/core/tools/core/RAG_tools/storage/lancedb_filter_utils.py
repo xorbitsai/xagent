@@ -35,6 +35,9 @@ def translate_condition(condition: FilterCondition) -> str:
     elif op == FilterOperator.LTE:
         return f"{field} <= {format_value(value)}"
     elif op == FilterOperator.IN:
+        if not value:
+            # `field IN ()` is a syntax error; an empty membership is just false.
+            return "FALSE"
         values = ", ".join(format_value(v) for v in value)
         return f"{field} IN ({values})"
     elif op == FilterOperator.CONTAINS:

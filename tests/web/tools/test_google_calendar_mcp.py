@@ -1741,102 +1741,6 @@ def test_ignore_conflicts_cannot_bypass_a_missing_stored_counterpart(monkeypatch
     service.events.return_value.update.assert_not_called()
 
 
-def test_incomplete_check_response_caps_unchecked_attendees_before_write(
-    fake_service, monkeypatch
-):
-    """A large set of unchecked calendars returns a bounded pre-write
-    response instead of allowing the update and warning afterward."""
-    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 300)
-    fake_service._events._get_result = {
-        "id": "self-1",
-        "start": {"dateTime": "2026-08-27T10:00:00+08:00"},
-        "end": {"dateTime": "2026-08-27T10:30:00+08:00"},
-        "attendees": [],
-    }
-    fake_service._freebusy = FakeFreebusy({"calendars": {}})
-
-    raw = calendar.google_calendar_update_events(
-        event_id="self-1",
-        attendees=[f"person{i}@example.com" for i in range(200)],
-    )
-    result = json.loads(raw)
-
-    assert len(raw) <= 300
-    assert result["status"] == "conflict_check_incomplete"
-    assert result["truncated"] is True
-    assert fake_service._events.update_calls == []
-
-
-def test_event_response_counts_hangout_link_in_the_output_cap(monkeypatch):
-    """A derived top-level Meet link must be included in the size budget;
-    otherwise appending it after event truncation can exceed the limit."""
-    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 300)
-    hangout_link = "https://meet.google.com/abc-defg-hij"
-    service = _fake_service(
-        {
-            "id": "evt1",
-            "hangoutLink": hangout_link,
-            "attendees": [{"email": f"person{i}@example.com"} for i in range(200)],
-        }
-    )
-    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
-
-    raw = calendar.google_calendar_create_events(
-        summary="1:1",
-        start_time="2026-09-07T15:00:00+08:00",
-        end_time="2026-09-07T16:00:00+08:00",
-    )
-    result = json.loads(raw)
-
-    assert len(raw) <= 300
-    assert result["status"] == "success"
-    assert result["hangout_link"] == hangout_link
-    assert result["truncated"] is True
-
-
-def test_event_response_fits_a_small_cap_with_a_large_conference_field(monkeypatch):
-    """Fixed response fields must be discardable when even one large value
-    would otherwise leave the success envelope above the output limit."""
-    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 100)
-    service = _fake_service(
-        {"id": "evt1", "hangoutLink": "https://meet.google.com/" + "x" * 200}
-    )
-    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
-
-    raw = calendar.google_calendar_create_events(
-        summary="1:1",
-        start_time="2026-09-07T15:00:00+08:00",
-        end_time="2026-09-07T16:00:00+08:00",
-    )
-    result = json.loads(raw)
-
-    assert len(raw) <= 100
-    assert result["status"] == "success"
-    assert result["truncated"] is True
-
-
-def test_incomplete_check_response_fits_a_small_cap_for_one_attendee(
-    fake_service, monkeypatch
-):
-    """The pre-write failure envelope stays bounded even when there is only
-    one collection item left, which cannot be reduced by list halving."""
-    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 100)
-    fake_service._freebusy = FakeFreebusy({"calendars": {}})
-
-    raw = calendar.google_calendar_create_events(
-        summary="Kickoff",
-        start_time="2026-08-27T10:00:00+08:00",
-        end_time="2026-08-27T10:30:00+08:00",
-        attendees=["person-with-a-long-address@example.com"],
-    )
-    result = json.loads(raw)
-
-    assert len(raw) <= 100
-    assert result["status"] == "conflict_check_incomplete"
-    assert result["truncated"] is True
-    assert fake_service._events.insert_calls == []
-
-
 class _Exec:
     def __init__(self, result: dict[str, Any], *, raise_error: Exception | None = None):
         self._result = result
@@ -1850,38 +1754,21 @@ class _Exec:
 
 
 class FakeEvents:
-    def __init__(
-        self,
-        *,
-        list_result: dict[str, Any] | None = None,
-        get_result: dict[str, Any] | None = None,
-        insert_result: dict[str, Any] | None = None,
-        update_result: dict[str, Any] | None = None,
-        list_error: Exception | None = None,
-        update_error: Exception | None = None,
-    ):
-        self._list_result = list_result if list_result is not None else {"items": []}
-        # Keyed by the request's own pageToken (None for the first page) -
-        # lets a test simulate a multi-page events.list response instead
-        # of always returning the same page regardless of pageToken. Only
-        # used when set; _list_result covers every single-page test.
-        self._list_results_by_page_token: dict[str | None, dict[str, Any]] | None = None
-        self._get_result = get_result or {}
-        self._insert_result = insert_result or {"id": "created"}
-        self._update_result = update_result or {"id": "updated"}
-        self._list_error = list_error
-        self._update_error = update_error
+    def __init__(self):
+        self._list_result: dict[str, Any] = {"items": []}
+        self._get_result: dict[str, Any] = {}
+        self._insert_result: dict[str, Any] = {"id": "created"}
+        self._update_result: dict[str, Any] = {"id": "updated"}
+        self._list_error: Exception | None = None
+        self._update_error: Exception | None = None
         self.list_calls: list[dict[str, Any]] = []
         self.insert_calls: list[dict[str, Any]] = []
         self.update_calls: list[dict[str, Any]] = []
-        self.last_update_request: _Exec | None = None
 
     def list(self, **kwargs: Any) -> _Exec:
         self.list_calls.append(kwargs)
         if self._list_error is not None:
             raise self._list_error
-        if self._list_results_by_page_token is not None:
-            return _Exec(self._list_results_by_page_token[kwargs.get("pageToken")])
         return _Exec(self._list_result)
 
     def get(self, **kwargs: Any) -> _Exec:
@@ -1893,16 +1780,7 @@ class FakeEvents:
 
     def update(self, **kwargs: Any) -> _Exec:
         self.update_calls.append(kwargs)
-        self.last_update_request = _Exec(
-            self._update_result, raise_error=self._update_error
-        )
-        return self.last_update_request
-
-
-class _FakeHttpResp:
-    def __init__(self, status: int):
-        self.status = status
-        self.reason = "error"
+        return _Exec(self._update_result, raise_error=self._update_error)
 
 
 def _insufficient_scope_error() -> HttpError:
@@ -1914,7 +1792,7 @@ def _insufficient_scope_error() -> HttpError:
     is exactly what makes a naive `"insufficientPermissions" in str(exc)`
     substring check unreliable (see `_is_insufficient_scope_error`)."""
     return HttpError(
-        _FakeHttpResp(403),
+        _HttpResponse(403),
         (
             b'{"error": {"code": 403, '
             b'"message": "Request had insufficient authentication scopes.", '
@@ -1934,7 +1812,7 @@ def _legacy_only_insufficient_scope_error() -> HttpError:
     """Older/less-instrumented responses may still carry only the legacy
     field - must keep matching this shape too, not just the dual one."""
     return HttpError(
-        _FakeHttpResp(403),
+        _HttpResponse(403),
         (
             b'{"error": {"errors": [{"reason": "insufficientPermissions"}], '
             b'"message": "Request had insufficient authentication scopes."}}'
@@ -1988,15 +1866,10 @@ class FakeCalendars:
 
 
 class FakeService:
-    def __init__(
-        self,
-        events: FakeEvents | None = None,
-        freebusy: FakeFreebusy | None = None,
-        calendars: FakeCalendars | None = None,
-    ):
-        self._events = events or FakeEvents()
-        self._freebusy = freebusy or FakeFreebusy()
-        self._calendars = calendars or FakeCalendars()
+    def __init__(self):
+        self._events = FakeEvents()
+        self._freebusy = FakeFreebusy()
+        self._calendars = FakeCalendars()
 
     def events(self) -> FakeEvents:
         return self._events
@@ -2013,6 +1886,103 @@ def fake_service(monkeypatch):
     service = FakeService()
     monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
     return service
+
+
+def test_incomplete_check_response_caps_unchecked_attendees_before_write(
+    fake_service, monkeypatch
+):
+    """A large set of unchecked calendars returns a bounded pre-write
+    response instead of allowing the update and warning afterward."""
+    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 300)
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T10:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T10:30:00+08:00"},
+        "attendees": [],
+    }
+    fake_service._freebusy = FakeFreebusy({"calendars": {}})
+
+    raw = calendar.google_calendar_update_events(
+        event_id="self-1",
+        attendees=[f"person{i}@example.com" for i in range(200)],
+    )
+    result = json.loads(raw)
+
+    assert len(raw) <= 300
+    assert result["status"] == "conflict_check_incomplete"
+    assert result["truncated"] is True
+    assert fake_service._events.update_calls == []
+
+
+def test_event_response_counts_hangout_link_in_the_output_cap(
+    fake_service, monkeypatch
+):
+    """A derived top-level Meet link must be included in the size budget;
+    otherwise appending it after event truncation can exceed the limit."""
+    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 300)
+    hangout_link = "https://meet.google.com/abc-defg-hij"
+    fake_service._events._insert_result = {
+        "id": "evt1",
+        "hangoutLink": hangout_link,
+        "attendees": [{"email": f"person{i}@example.com"} for i in range(200)],
+    }
+
+    raw = calendar.google_calendar_create_events(
+        summary="1:1",
+        start_time="2026-09-07T15:00:00+08:00",
+        end_time="2026-09-07T16:00:00+08:00",
+    )
+    result = json.loads(raw)
+
+    assert len(raw) <= 300
+    assert result["status"] == "success"
+    assert result["hangout_link"] == hangout_link
+    assert result["truncated"] is True
+
+
+def test_event_response_fits_a_small_cap_with_a_large_conference_field(
+    fake_service, monkeypatch
+):
+    """Fixed response fields must be discardable when even one large value
+    would otherwise leave the success envelope above the output limit."""
+    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 100)
+    fake_service._events._insert_result = {
+        "id": "evt1",
+        "hangoutLink": "https://meet.google.com/" + "x" * 200,
+    }
+
+    raw = calendar.google_calendar_create_events(
+        summary="1:1",
+        start_time="2026-09-07T15:00:00+08:00",
+        end_time="2026-09-07T16:00:00+08:00",
+    )
+    result = json.loads(raw)
+
+    assert len(raw) <= 100
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+
+
+def test_incomplete_check_response_fits_a_small_cap_for_one_attendee(
+    fake_service, monkeypatch
+):
+    """The pre-write failure envelope stays bounded even when there is only
+    one collection item left, which cannot be reduced by list halving."""
+    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 100)
+    fake_service._freebusy = FakeFreebusy({"calendars": {}})
+
+    raw = calendar.google_calendar_create_events(
+        summary="Kickoff",
+        start_time="2026-08-27T10:00:00+08:00",
+        end_time="2026-08-27T10:30:00+08:00",
+        attendees=["person-with-a-long-address@example.com"],
+    )
+    result = json.loads(raw)
+
+    assert len(raw) <= 100
+    assert result["status"] == "conflict_check_incomplete"
+    assert result["truncated"] is True
+    assert fake_service._events.insert_calls == []
 
 
 def _confirmed_event(
@@ -2502,6 +2472,7 @@ def test_update_events_same_window_only_checks_newly_added_attendee(fake_service
         calendar.google_calendar_update_events(
             event_id="self-1",
             attendees=["old@example.com", "new@example.com"],
+            notify_attendees=True,
         )
     )
 
@@ -2513,25 +2484,33 @@ def test_update_events_same_window_only_checks_newly_added_attendee(fake_service
         for item in call["body"]["items"]
     }
     assert queried_emails == {"new@example.com"}
+    assert fake_service._events.update_calls[0]["sendUpdates"] == "all"
 
 
+@pytest.mark.parametrize(
+    "organizer",
+    [
+        pytest.param({"email": "me@example.com"}, id="explicit-organizer"),
+        pytest.param(None, id="implicit-calendar-owner"),
+    ],
+)
 def test_update_events_adding_the_organizer_as_an_attendee_does_not_self_conflict(
-    fake_service,
+    fake_service, organizer
 ):
-    """Regression test: freebusy.query has no concept of "exclude this
-    event", unlike the organizer-calendar path (excluded by id/
-    recurringEventId). Adding the organizer's own email as a "new"
-    attendee would otherwise be checked via freebusy and always find
-    this very event's own busy block on their calendar - the organizer's
-    own availability is already covered by the organizer-calendar check,
-    so they must be excluded from the freebusy batch."""
-    fake_service._events._get_result = {
+    """Adding the connected account as an attendee must use the organizer
+    events-list check, whether Google returns an explicit organizer field or
+    implies that the calendar owner organized the event. A freebusy query would
+    see this event's own busy block and falsely report a conflict.
+    """
+    existing_event = {
         "id": "self-1",
         "start": {"dateTime": "2026-08-27T10:00:00+08:00"},
         "end": {"dateTime": "2026-08-27T10:30:00+08:00"},
         "attendees": [],
-        "organizer": {"email": "me@example.com"},
     }
+    if organizer is not None:
+        existing_event["organizer"] = organizer
+    fake_service._events._get_result = existing_event
     fake_service._events._list_result = {"items": []}
     fake_service._freebusy = FakeFreebusy(
         {
@@ -2543,66 +2522,14 @@ def test_update_events_adding_the_organizer_as_an_attendee_does_not_self_conflic
                             "end": "2026-08-27T10:30:00+08:00",
                         }
                     ]
-                },
+                }
             }
         }
     )
 
     result = json.loads(
         calendar.google_calendar_update_events(
-            event_id="self-1",
-            attendees=["me@example.com"],
-        )
-    )
-
-    assert result["status"] == "success"
-    assert fake_service._freebusy.query_calls == []
-    # The organizer's own calendar must still have been checked - just via
-    # the id/recurringEventId-excluding events.list path instead of the
-    # self-conflicting freebusy one - not skipped outright.
-    assert len(fake_service._events.list_calls) == 1
-
-
-def test_update_events_adding_self_as_attendee_with_no_organizer_field_does_not_self_conflict(
-    fake_service,
-):
-    """Regression test: Google omits the top-level `organizer` field
-    whenever the organizer is just the calendar owner - the overwhelmingly
-    common case, and the ONE this exclusion must also cover, not just the
-    explicit-organizer-field case the sibling test above pins. Without
-    resolving the caller's own identity as a fallback organizer address
-    here, adding the caller's own email as a "new" attendee would never
-    be excluded from the freebusy batch and would always find this very
-    event's own busy block on their calendar."""
-    fake_service._events._get_result = {
-        "id": "self-1",
-        "start": {"dateTime": "2026-08-27T10:00:00+08:00"},
-        "end": {"dateTime": "2026-08-27T10:30:00+08:00"},
-        "attendees": [],
-        # No "organizer" field at all - implicit organizer is the caller,
-        # whose own resolved address defaults to "me@example.com" (see
-        # FakeCalendars).
-    }
-    fake_service._events._list_result = {"items": []}
-    fake_service._freebusy = FakeFreebusy(
-        {
-            "calendars": {
-                "me@example.com": {
-                    "busy": [
-                        {
-                            "start": "2026-08-27T10:00:00+08:00",
-                            "end": "2026-08-27T10:30:00+08:00",
-                        }
-                    ]
-                },
-            }
-        }
-    )
-
-    result = json.loads(
-        calendar.google_calendar_update_events(
-            event_id="self-1",
-            attendees=["me@example.com"],
+            event_id="self-1", attendees=["me@example.com"]
         )
     )
 
@@ -2897,7 +2824,7 @@ def test_update_events_non_scope_error_on_the_organizer_backfill_is_also_skipped
         # No "organizer" field at all - triggers the backfill attempt.
     }
     fake_service._calendars = FakeCalendars(
-        raise_error=HttpError(_FakeHttpResp(500), b'{"error": {"message": "boom"}}')
+        raise_error=HttpError(_HttpResponse(500), b'{"error": {"message": "boom"}}')
     )
 
     result = json.loads(
@@ -3361,6 +3288,7 @@ def test_freebusy_missing_scope_rejects_the_write_even_with_ignore_conflicts_fal
     )
 
     assert result["status"] == "error"
+    assert "reconnect" in result["message"].lower()
     assert fake_service._events.insert_calls == []
 
 
@@ -3429,32 +3357,28 @@ def test_freebusy_missing_scope_legacy_only_body_still_rejects(fake_service):
     )
 
     assert result["status"] == "error"
+    assert "reconnect" in result["message"].lower()
     assert fake_service._events.insert_calls == []
 
 
-def test_is_insufficient_scope_error_rejects_unrelated_403():
-    other = HttpError(
-        _FakeHttpResp(403),
-        b'{"error": {"errors": [{"reason": "forbiddenForNonOrganizer"}]}}',
-    )
-    assert calendar._is_insufficient_scope_error(other) is False
+@pytest.mark.parametrize(
+    "content",
+    [
+        pytest.param(
+            b'{"error": {"errors": [{"reason": "forbiddenForNonOrganizer"}]}}',
+            id="unrelated-reason",
+        ),
+        pytest.param(b"not json", id="malformed-body"),
+        pytest.param(
+            b'{"error": {"errors": true, "details": 42}}',
+            id="non-list-error-fields",
+        ),
+    ],
+)
+def test_is_insufficient_scope_error_rejects_unrecognized_bodies(content):
+    error = HttpError(_HttpResponse(403), content)
 
-
-def test_is_insufficient_scope_error_tolerates_malformed_body():
-    malformed = HttpError(_FakeHttpResp(403), b"not json")
-    assert calendar._is_insufficient_scope_error(malformed) is False
-
-
-def test_is_insufficient_scope_error_tolerates_non_list_error_fields():
-    """Regression test: valid JSON whose "errors"/"details" field is
-    present but isn't an array (e.g. a boolean/object, from a malformed
-    or unexpected error body) must not crash - `x or []` treats a truthy
-    non-list value as itself, and iterating a non-iterable raises
-    TypeError; must fall through to "can't tell, so False" instead."""
-    non_list_fields = HttpError(
-        _FakeHttpResp(403), b'{"error": {"errors": true, "details": 42}}'
-    )
-    assert calendar._is_insufficient_scope_error(non_list_fields) is False
+    assert calendar._is_insufficient_scope_error(error) is False
 
 
 def test_freebusy_other_http_errors_still_propagate(fake_service):
@@ -3467,7 +3391,7 @@ def test_freebusy_other_http_errors_still_propagate(fake_service):
     would match the reason check, so it actually exercises the status
     gate."""
     other_error = HttpError(
-        _FakeHttpResp(500),
+        _HttpResponse(500),
         (
             b'{"error": {"message": "boom", '
             b'"errors": [{"reason": "insufficientPermissions"}]}}'
@@ -3486,6 +3410,46 @@ def test_freebusy_other_http_errors_still_propagate(fake_service):
 
     assert result["status"] == "error"
     assert "reconnect" not in result["message"].lower()
+
+
+def test_organizer_events_non_scope_http_error_still_propagates(fake_service):
+    fake_service._events._list_error = HttpError(
+        _HttpResponse(403),
+        b'{"error": {"errors": [{"reason": "forbiddenForNonOrganizer"}]}}',
+    )
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Kickoff",
+            start_time="2026-08-27T10:00:00+08:00",
+            end_time="2026-08-27T10:30:00+08:00",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "reconnect" not in result["message"].lower()
+    assert fake_service._events.insert_calls == []
+
+
+def test_update_events_non_precondition_http_error_still_propagates(fake_service):
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "etag": '"version-1"',
+        "start": {"dateTime": "2026-08-27T10:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T10:30:00+08:00"},
+    }
+    fake_service._events._update_error = HttpError(
+        _HttpResponse(500), b'{"error": {"message": "backend unavailable"}}'
+    )
+
+    result = json.loads(
+        calendar.google_calendar_update_events(event_id="self-1", summary="Renamed")
+    )
+
+    assert result["status"] == "error"
+    assert "backend unavailable" in result["message"].lower()
+    assert "changed while its availability was being checked" not in result["message"]
+    assert len(fake_service._events.update_calls) == 1
 
 
 def test_freebusy_attendee_absent_from_response_is_marked_unchecked(fake_service):
@@ -3604,6 +3568,9 @@ def test_update_events_allows_replacing_both_boundaries_on_an_all_day_event(
     )
 
     assert result["status"] == "success"
+    update_call = fake_service._events.update_calls[0]
+    assert update_call["body"]["start"] == {"dateTime": "2026-08-27T10:00:00+08:00"}
+    assert update_call["body"]["end"] == {"dateTime": "2026-08-27T10:30:00+08:00"}
 
 
 def test_update_events_widens_all_day_boundary_in_the_calendars_own_timezone(
@@ -3799,6 +3766,7 @@ def test_update_events_all_day_with_a_different_organizer_shares_one_calendar_lo
     )
 
     assert result["status"] == "conflict_check_incomplete"
+    assert "2026-08-28T00:00:00+08:00 - 2026-08-29T00:00:00+08:00" in result["message"]
     assert len(fake_service._calendars.get_calls) == 1
     assert result["unchecked_attendees"] == ["boss@example.com"]
     assert fake_service._events.list_calls == []
@@ -3934,7 +3902,7 @@ def test_update_events_calendar_timezone_lookup_non_scope_error_also_falls_back_
         "attendees": [],
     }
     fake_service._calendars = FakeCalendars(
-        raise_error=HttpError(_FakeHttpResp(500), b'{"error": {"message": "boom"}}')
+        raise_error=HttpError(_HttpResponse(500), b'{"error": {"message": "boom"}}')
     )
 
     result = json.loads(

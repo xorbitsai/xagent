@@ -22,10 +22,16 @@ import aiohttp
 from pydantic import Field
 
 from ...file_ref import build_workspace_file_ref, guess_mime_type, parse_file_id_ref
+from ...model.chat.token_context import MediaCallType
 from ...model.video.ark import ArkVideoModel
 from ...model.video.base import BaseVideoModel
 from ...model.video.xinference import XinferenceVideoModel
 from ...workspace import TaskWorkspace
+from .media_usage import (
+    coerce_duration,
+    record_media_seconds,
+    resolve_billing_model,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -720,6 +726,41 @@ The generated video URL is temporary on the provider side, so completed videos a
                 ]
 
             result = await video_model.generate_video(**generate_params)
+
+            # Video is duration-billed, so always meter in seconds — never
+            # switch units when the provider omits a duration (async tasks
+            # started with wait_for_result=False have none yet).
+            #
+            # The provider reports one duration but generates n videos and
+            # bills for all of them, so the billable total is duration * n.
+            # Ark rejects n>1; Xinference does not, and previously only the
+            # first video's duration was recorded.
+            per_video_seconds = coerce_duration(result.get("duration"))
+            billable_count = max(1, int(n or 1))
+            billing_model_id = str(actual_model_id)
+            record_media_seconds(
+                per_video_seconds * billable_count
+                if per_video_seconds is not None
+                else None,
+                # `model` is the provider's name and `model_id` the configured
+                # id. Writing the configured id into `model` and leaving
+                # `model_id` empty loses the canonical name for display and
+                # external consumers; the aggregator groups on
+                # `model_id or model`, so populating both keeps the same row
+                # identity while carrying the name.
+                model=resolve_billing_model(
+                    None, video_model, fallback=str(actual_model_id)
+                ),
+                # _model_id_for_model bottoms out at the literal "default" when
+                # a model exposes neither an id nor a name, and that string is
+                # a forbidden billing identity. Drop it rather than persist it,
+                # matching music/sound_effect which pass `configured_id or ""`.
+                # The aggregator groups on `model_id or model`, so an empty id
+                # falls through to the resolved name instead of inventing a
+                # phantom model shared by every unidentifiable provider.
+                model_id=("" if billing_model_id == "default" else billing_model_id),
+                call_type=MediaCallType.VIDEO,
+            )
 
             video_url = result.get("video_url")
             video_path = None

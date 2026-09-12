@@ -8,8 +8,10 @@ from inspect import isawaitable
 from typing import Any, Optional
 
 from ...file_ref import build_workspace_file_ref
+from ...model.chat.token_context import MediaCallType
 from ...model.music import BaseMusicModel, MusicResult
 from ...workspace import TaskWorkspace
+from .media_usage import coerce_duration, record_media_seconds, resolve_billing_model
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +139,45 @@ file_id/file_ref.
                 force_instrumental=force_instrumental,
                 output_format=output_format,
             )
+            # Billing policy for the media tools: a provider call that has
+            # already happened is billable regardless of what fails afterwards,
+            # so usage is recorded before the response is validated. Metering
+            # after the checks below would silently drop every call that
+            # succeeded at the HTTP level but came back empty or malformed —
+            # which the provider still charges for.
+            #
+            # Music is duration-billed: always meter in seconds, even when the
+            # length was auto-selected and no duration came back. `result` is
+            # not yet known to be a MusicResult at this point, so read through
+            # getattr rather than attribute access.
+            raw_response = getattr(result, "raw_response", None)
+            reported_length = (
+                raw_response.get("music_length_seconds")
+                if isinstance(raw_response, dict)
+                else None
+            )
+            seconds = coerce_duration(reported_length) or coerce_duration(
+                music_length_seconds
+            )
+            record_media_seconds(
+                seconds,
+                # `model` carries the provider's name, `model_id` the
+                # configured id. Passing configured_model_id as the first
+                # argument here would return it unchanged, writing the same id
+                # into both fields and losing the provider name entirely.
+                # None is passed instead so the resolver falls through to the
+                # provider's model_name. The fallback keeps the configured id
+                # ahead of the class name -- a provider exposing no model_name
+                # (Xinference's default) would otherwise be billed under a
+                # Python class name while its real id sat unused in scope --
+                # and never the placeholder "default".
+                model=resolve_billing_model(
+                    None, model, fallback=configured_model_id or type(model).__name__
+                ),
+                model_id=configured_model_id or "",
+                call_type=MediaCallType.MUSIC,
+            )
+
             if not isinstance(result, MusicResult):
                 raise RuntimeError(f"Unexpected music response: {type(result)}")
             if not result.audio:

@@ -1368,6 +1368,9 @@ class TelegramBotInstance:
         uploaded_info: list[dict[str, Any]],
         asr_model: Any,
     ) -> dict[str, str]:
+        from ....core.model.asr.usage import record_asr_usage
+        from ....core.tools.core.media_usage import resolve_billing_model
+
         uploaded_by_source_id = {
             str(info.get("telegram_file_id")): info
             for info in uploaded_info
@@ -1387,8 +1390,29 @@ class TelegramBotInstance:
                     asr_model.transcribe(
                         audio=str(file_info["path"]),
                         format=self._audio_format_from_file_info(file_info),
+                        # Without this the provider returns a bare string
+                        # carrying no timings, making every voice message a
+                        # 0-second — unbillable — usage record. Only `text` is
+                        # used below; the extra fields are discarded.
+                        verbose=True,
                     ),
                     timeout=self.voice_transcription_timeout_seconds,
+                )
+                # Telegram calls the ASR provider directly rather than going
+                # through audio_tool, so meter here too. Identity goes through
+                # the shared resolver so all three ASR entry points agree on
+                # the name the aggregator groups by. The explicit fallback
+                # matters: resolve_billing_model's own default is the literal
+                # "default", which the module invariants forbid as a billing
+                # identity, so a provider exposing no model_name would
+                # otherwise be billed under exactly the placeholder this is
+                # meant to avoid. The provider class name is the last identity
+                # that still attributes cost to something real.
+                record_asr_usage(
+                    result,
+                    model_name=resolve_billing_model(
+                        None, asr_model, fallback=type(asr_model).__name__
+                    ),
                 )
             except asyncio.TimeoutError as exc:
                 raise TelegramVoiceTranscriptionError(

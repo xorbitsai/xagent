@@ -1300,6 +1300,21 @@ def _upsert_message_blobs(
     candidates_to_insert = {
         message_hash: blobs_by_hash[message_hash] for message_hash in hashes_to_query
     }
+    bind = db.get_bind()
+    if bind is not None and bind.dialect.name == "postgresql":
+        # Most checkpoint messages already exist. Read only their metadata
+        # before copying/encoding payloads for INSERT. Keep ON CONFLICT and
+        # post-insert validation for misses: another writer can win that race.
+        # Do not use a cross-transaction cache, or pre-read on SQLite where a
+        # read snapshot can make the subsequent write-lock upgrade fail.
+        existing = _existing_message_hashes(
+            db, task_id=task_id, blobs_by_hash=candidates_to_insert
+        )
+        candidates_to_insert = {
+            key: value
+            for key, value in candidates_to_insert.items()
+            if key not in existing
+        }
     if _insert_blob_rows_on_conflict_do_nothing(
         db,
         model=TraceMessageBlob,
@@ -1363,8 +1378,24 @@ def _validate_message_blobs(
     task_id: int,
     blobs_by_hash: dict[str, BlobCandidate],
 ) -> None:
+    found = _existing_message_hashes(db, task_id=task_id, blobs_by_hash=blobs_by_hash)
+    missing = set(blobs_by_hash) - found
+    if missing:
+        raise RuntimeError(
+            f"trace message blob upsert did not persist {len(missing)} row(s) "
+            f"for task {task_id}."
+        )
+
+
+def _existing_message_hashes(
+    db: Session,
+    *,
+    task_id: int,
+    blobs_by_hash: dict[str, BlobCandidate],
+) -> set[str]:
+    """Find stored candidates, preserving the existing byte-count check."""
     if not blobs_by_hash:
-        return
+        return set()
 
     found: set[str] = set()
     chunk_size = _sql_in_clause_chunk_size(db, reserved_binds=1)
@@ -1387,12 +1418,7 @@ def _validate_message_blobs(
                 )
             found.add(message_hash)
 
-    missing = set(blobs_by_hash) - found
-    if missing:
-        raise RuntimeError(
-            f"trace message blob upsert did not persist {len(missing)} row(s) "
-            f"for task {task_id}."
-        )
+    return found
 
 
 def _pending_checkpoint_blob_refs(
@@ -1442,6 +1468,18 @@ def _upsert_checkpoint_blobs(
     candidates_to_insert = {
         blob_ref: blobs_by_ref[blob_ref] for blob_ref in refs_to_query
     }
+    bind = db.get_bind()
+    if bind is not None and bind.dialect.name == "postgresql":
+        # As with messages, only new blobs need payload copies and INSERTs.
+        # The lookup is task- and kind-scoped, and validates existing sizes.
+        existing = _existing_checkpoint_blob_refs(
+            db, task_id=task_id, blobs_by_ref=candidates_to_insert
+        )
+        candidates_to_insert = {
+            key: value
+            for key, value in candidates_to_insert.items()
+            if key not in existing
+        }
     if _insert_blob_rows_on_conflict_do_nothing(
         db,
         model=TraceCheckpointBlob,
@@ -1521,8 +1559,26 @@ def _validate_checkpoint_blobs(
     task_id: int,
     blobs_by_ref: dict[tuple[str, str], BlobCandidate],
 ) -> None:
+    found = _existing_checkpoint_blob_refs(
+        db, task_id=task_id, blobs_by_ref=blobs_by_ref
+    )
+    missing = set(blobs_by_ref) - found
+    if missing:
+        raise RuntimeError(
+            f"trace checkpoint blob upsert did not persist {len(missing)} row(s) "
+            f"for task {task_id}."
+        )
+
+
+def _existing_checkpoint_blob_refs(
+    db: Session,
+    *,
+    task_id: int,
+    blobs_by_ref: dict[tuple[str, str], BlobCandidate],
+) -> set[tuple[str, str]]:
+    """Find stored candidates without loading their JSON payloads."""
     if not blobs_by_ref:
-        return
+        return set()
 
     found: set[tuple[str, str]] = set()
     refs_by_kind: dict[str, set[str]] = {}
@@ -1555,9 +1611,4 @@ def _validate_checkpoint_blobs(
                     )
                 found.add(blob_ref)
 
-    missing = set(blobs_by_ref) - found
-    if missing:
-        raise RuntimeError(
-            f"trace checkpoint blob upsert did not persist {len(missing)} row(s) "
-            f"for task {task_id}."
-        )
+    return found

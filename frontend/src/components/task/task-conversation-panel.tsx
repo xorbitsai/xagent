@@ -21,7 +21,7 @@ import { useI18n } from "@/contexts/i18n-context"
 import { isStreamingFinalAnswerMessage } from "@/lib/streaming-final-answer"
 import { getProcessGroupIndex, getUserTimelineAnchors } from "@/lib/task-timeline"
 import { resolveTraceProcessStatus } from "@/lib/trace-process-status"
-import { cn } from "@/lib/utils"
+import { cn, firstNonEmptyString } from "@/lib/utils"
 
 export type TaskConversationPanelMode = "page" | "embedded-preview"
 
@@ -480,22 +480,71 @@ export function TaskConversationPanel({
     () => findWaitingInteractions(state.currentTask, managerTraceEvents as any[]),
     [managerTraceEvents, state.currentTask]
   )
+  // The waiting round's identity, delivered on the task-state frames
+  // themselves (live/resume waiting task_info, replay task_info, replay
+  // reassertion) - no client-side reconstruction. Undefined only for
+  // backends predating the emission, where rounds stay unidentified.
+  // Gated on the task actually being the one on screen: during a task
+  // switch, currentTask can still describe the previous task while
+  // state.taskId already points at the new one (same guard as the
+  // ChatInput wiring below).
+  const waitingRoundId =
+    state.currentTask?.status === "waiting_for_user"
+    && state.currentTask.id === String(state.taskId)
+      ? state.currentTask.waitingRequestId
+      : undefined
 
   const activeWaitingMessageId = useMemo(() => {
     if (state.currentTask?.status !== "waiting_for_user") {
       return null
     }
 
+    // When the waiting round has an identity, prefer matching by it: the
+    // prompt-text fallback below can pick a message whose text merely equals
+    // the question while the round actually lives on a different item,
+    // leaving TWO instances active at once (the timeline one and the
+    // virtual one) with independently diverging state. A FAILED id-match
+    // falls through rather than short-circuiting: replayed history rows
+    // carry no interactionRequestId, and with the ask sitting as the last
+    // assistant message the virtual bubble is suppressed too - returning
+    // null here would leave zero active reply instances for a waiting task.
+    if (waitingRoundId) {
+      for (let i = messageItems.length - 1; i >= 0; i--) {
+        const item = messageItems[i]
+        if (item.role === "assistant" && item.interactionRequestId === waitingRoundId) {
+          return item.id
+        }
+      }
+    }
+
     if (waitingPrompt) {
       const normalizedPrompt = waitingPrompt.trim()
       for (let i = messageItems.length - 1; i >= 0; i--) {
         const item = messageItems[i]
+        // A row that carries its OWN round id different from the current
+        // round is a lookalike from an earlier ask - electing it would
+        // misbind the reply. Only id-less rows may be text-elected.
+        if (
+          waitingRoundId
+          && item.interactionRequestId
+          && item.interactionRequestId !== waitingRoundId
+        ) {
+          continue
+        }
         if (item.role === "assistant" && typeof item.content === "string" && item.content.trim() === normalizedPrompt) {
           return item.id
         }
       }
     }
 
+    // The bare newest-interactions fallback is for rounds with NO identity
+    // at all. Under a known round id whose item and text both failed to
+    // match, it could only pick an OLDER round's form (a dropped ask frame
+    // for the current round), misbinding the reply - the virtual bubble
+    // showing the current question is the right instance there.
+    if (waitingRoundId) {
+      return null
+    }
     for (let i = messageItems.length - 1; i >= 0; i--) {
       const item = messageItems[i]
       if (item.role === "assistant" && item.interactions && item.interactions.length > 0) {
@@ -504,7 +553,7 @@ export function TaskConversationPanel({
     }
 
     return null
-  }, [messageItems, state.currentTask?.status, waitingPrompt])
+  }, [messageItems, state.currentTask?.status, waitingPrompt, waitingRoundId])
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView?.({ behavior: "smooth" })
@@ -788,7 +837,19 @@ export function TaskConversationPanel({
                         }
                         timestamp={item.timestamp}
                         interactions={item.interactions}
-                        interactionRequestId={item.interactionRequestId}
+                        // The active waiting item speaks for the current
+                        // round: when a replayed row carries no id of its
+                        // own, the resolved round id keeps its reply - and
+                        // the retry gate - bound to the ask instead of
+                        // submitting id-less.
+                        interactionRequestId={
+                          item.id === activeWaitingMessageId
+                            ? firstNonEmptyString(
+                                item.interactionRequestId,
+                                waitingRoundId,
+                              )
+                            : item.interactionRequestId
+                        }
                         interactionsActive={item.id === activeWaitingMessageId}
                         showEmptyStatus={item.showEmptyStatus}
                         contextBadges={item.role === "user" ? userMessageContextBadges : undefined}
@@ -815,8 +876,15 @@ export function TaskConversationPanel({
                       processStatus={state.currentTask?.status}
                       taskStatus={state.currentTask?.status}
                       interactions={state.currentTask?.status === "waiting_for_user" ? waitingInteractions : undefined}
-                      interactionRequestId={state.currentTask?.status === "waiting_for_user" ? state.currentTask.waitingRequestId : undefined}
-                      interactionsActive={state.currentTask?.status === "waiting_for_user"}
+                      interactionRequestId={state.currentTask?.status === "waiting_for_user" ? waitingRoundId : undefined}
+                      // At most one instance of a waiting round is active: a
+                      // timeline message already owning the round keeps the
+                      // virtual copy inert, so two forms can never both
+                      // accept a submission for the same question.
+                      interactionsActive={
+                        state.currentTask?.status === "waiting_for_user"
+                        && activeWaitingMessageId === null
+                      }
                       onOpenExecutionPlan={showDagPreview ? openDagPreview : undefined}
                       onAgentExecutionClick={onAgentExecutionClick}
                     />
@@ -864,7 +932,10 @@ export function TaskConversationPanel({
               currentInteractionRequestId={
                 state.currentTask?.status === "waiting_for_user" &&
                 state.currentTask.id === String(state.taskId)
-                  ? state.currentTask.waitingRequestId
+                  // The same round identity the form path uses - including
+                  // the ask-trace fallback - so a free-text reply after a
+                  // reload still binds to the round.
+                  ? waitingRoundId
                   : undefined
               }
               isLoading={

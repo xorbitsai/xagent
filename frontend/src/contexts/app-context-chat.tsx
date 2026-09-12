@@ -354,7 +354,7 @@ import {
   type WebSocketConnection,
   type WebSocketConnectionFailure,
 } from "@/hooks/use-websocket"
-import { generateClientMessageId, getApiUrl, getUploadApiUrl, shouldAutoOpenTaskPreview } from "@/lib/utils"
+import { generateClientMessageId, getApiUrl, getUploadApiUrl, shouldAutoOpenTaskPreview, firstNonEmptyString } from "@/lib/utils"
 import { apiRequest, classifyUploadError, getApiErrorMessage, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper"
 import { clientErrorTranslationKey, readClientErrorCode } from "@/lib/client-errors"
 import { normalizeUploadFileIds } from "@/lib/upload-file-ids"
@@ -904,6 +904,15 @@ const taskFromTaskInfoData = (
   runtimeExtensionBindings: getStringArray(taskData.runtime_extension_bindings),
   waitingQuestion: taskData.waiting_question as string | undefined,
   waitingInteractions: normalizeInteractions(taskData.waiting_interactions),
+  // The waiting round's identity, emitted on waiting task_info frames
+  // (live, resume, and replay) so a reply binds to the exact ask (#1500).
+  // Key present only when the frame carries one: an explicit undefined
+  // would let SET_CURRENT_TASK's merge wipe an id the waiting handler
+  // already holds when an id-less task_info (a backend predating the
+  // emission) arrives mid-round.
+  ...(firstNonEmptyString(taskData.request_id) !== undefined
+    ? { waitingRequestId: firstNonEmptyString(taskData.request_id) }
+    : {}),
   runId: taskData.run_id as string | null | undefined,
   stateVersion: parseInteger(taskData.state_version),
   controlState: taskData.control_state as TaskControlState | undefined,
@@ -1656,8 +1665,19 @@ function projectAppState(state: AppState, action: AppAction): AppState {
             : undefined,
           waitingRequestId: isWaitingForUser
             ? action.payload.waitingRequestId ?? (
-              action.payload.waitingQuestion === undefined
-              && action.payload.waitingInteractions === undefined
+              // An id-less payload keeps the known id when it asserts
+              // nothing new - and also when it re-asserts the SAME question
+              // text: reload/reconnect reassertion frames re-send the
+              // unchanged question with no id, and wiping the id there
+              // severs the open round's correlation. An id-less payload
+              // carrying a DIFFERENT question (or fresh interactions
+              // without one) is a legacy-backend new round and must not
+              // inherit the previous round's id.
+              (action.payload.waitingQuestion === undefined
+                && action.payload.waitingInteractions === undefined)
+              || (action.payload.waitingQuestion !== undefined
+                && action.payload.waitingQuestion
+                  === state.currentTask.waitingQuestion)
                 ? state.currentTask.waitingRequestId
                 : undefined
             )
@@ -2911,6 +2931,17 @@ export function AppProvider({
     }
 
     const controlEnvelope = extractTaskControlEnvelope(message)
+    // A stale-versioned error frame must not roll task state back, but its
+    // body is not versioned state: it carries the error notice - and, since
+    // #2124, the structured terminal command outcome - which the backend
+    // sends exactly once. Dropping the whole frame silences that notice
+    // forever, so error frames fall through with their control tuple
+    // neutralized (this flag suppresses every status side effect below)
+    // instead of being swallowed. Weaker than the guard's UNversioned-error
+    // rule, deliberately: an unversioned error frame has no version to lose
+    // and passes whole, control tuple included; a stale VERSIONED one lost
+    // the version argument and keeps only its notice.
+    let staleControlErrorFrame = false
     if (controlEnvelope.isStateEvent && controlEnvelope.taskId !== undefined) {
       if (
         !acceptTaskControlVersion(
@@ -2918,13 +2949,16 @@ export function AppProvider({
           controlEnvelope,
           taskStateVersionsRef.current,
         )
-      ) return
+      ) {
+        if (message.type !== "error" && message.type !== "agent_error") return
+        staleControlErrorFrame = true
+      }
 
       // A late event may have an old semantic type (for example
       // ``task_paused``) after a newer run is already RUNNING. The backend
       // rewrites its state tuple to the canonical row; apply only that tuple
       // and skip the stale event-specific side effects.
-      if (!taskEventMatchesControlState(message, controlEnvelope)) {
+      if (!staleControlErrorFrame && !taskEventMatchesControlState(message, controlEnvelope)) {
         if (controlEnvelope.status) {
           dispatch({
             type: "UPDATE_TASK_STATUS",
@@ -3228,9 +3262,17 @@ export function AppProvider({
               return
             }
             const interactions = normalizeInteractions(eventData.metadata?.interactions)
-            const interactionRequestId = typeof eventData.request_id === "string"
-              ? eventData.request_id
-              : undefined
+            // The round identity: no backend emits ``request_id`` today - the
+            // stable per-ask id the runtime mints and every ask frame carries
+            // is ``event_id`` (see core/agent/clarification.py: "event_id is
+            // the clarification's stable identity"). ``request_id`` stays the
+            // preferred field so a backend that later adopts the explicit
+            // name wins over the fallback - but only with a non-empty
+            // string; anything else falls through to the next candidate.
+            const interactionRequestId = firstNonEmptyString(
+              eventData.request_id,
+              eventData.event_id,
+            )
             const isAgentMessage = eventType === "agent_message"
             const isAiMessage = eventType === "ai_message"
             const expectsUserResponse =
@@ -5706,10 +5748,16 @@ export function AppProvider({
         const interactions = normalizeInteractions(
           waitingRoot.interactions ?? waitingData.interactions
         )
-        const waitingRequestIdValue = waitingRoot.request_id ?? waitingData.request_id
-        const waitingRequestId = typeof waitingRequestIdValue === "string"
-          ? waitingRequestIdValue
-          : undefined
+        // ``request_id`` only: the waiting/reassert frames' emitters carry
+        // the round identity under that explicit name (backend #2232) and
+        // never emit ``event_id`` - an event_id fallback here would be dead
+        // code testable only with hand-crafted frames. The ask frame's
+        // ``event_id`` is adopted where it genuinely lives, in the
+        // agent_message trace reader.
+        const waitingRequestId = firstNonEmptyString(
+          waitingRoot.request_id,
+          waitingData.request_id,
+        )
         dispatch({
           type: "UPDATE_TASK_STATUS",
           payload: {
@@ -5768,7 +5816,11 @@ export function AppProvider({
         const agentErrorMessage = agentErrorCode
           ? t(clientErrorTranslationKey(agentErrorCode))
           : getWebSocketErrorMessage(message, trustLegacyErrorProse)
-        const agentErrorTaskStatus = getWebSocketTaskStatus(message)
+        // A stale-versioned frame keeps its notice but asserts nothing about
+        // task state - its control tuple lost to a newer version above.
+        const agentErrorTaskStatus = staleControlErrorFrame
+          ? null
+          : getWebSocketTaskStatus(message)
 
         if (agentErrorTaskStatus) {
           dispatch({
@@ -5796,16 +5848,38 @@ export function AppProvider({
           dispatch({ type: "SET_PROCESSING", payload: false })
         }
 
-        dispatch({
-          type: "ADD_MESSAGE",
-          payload: {
-            id: generateMessageId("msg"),
-            role: "assistant",
-            content: `${t('agent.logs.event.messages.errorPrefix')} ${agentErrorMessage || t('common.errors.unknown')}`,
-            timestamp: message.timestamp,
-            status: "failed",
-          },
-        })
+        const agentErrorData = asMessageRecord(message.data)
+        // A terminal command frame carries a durable identity
+        // (command_id, disambiguated by outcome_version): a duplicated
+        // delivery of the SAME terminal broadcast must not add a second
+        // bubble. Identity-keyed only - never text-keyed - so two distinct
+        // commands failing with identical redacted text both stay visible.
+        const agentErrorOccurrence =
+          typeof agentErrorData.command_id === "string"
+          && agentErrorData.command_id
+            ? `${agentErrorData.command_id}:${String(
+                agentErrorData.outcome_version ?? "",
+              )}`
+            : undefined
+        if (
+          agentErrorOccurrence === undefined
+          || !isDuplicateMessageForViewedTask(
+            agentErrorMessage || "",
+            "agent-error-command",
+            agentErrorOccurrence,
+          )
+        ) {
+          dispatch({
+            type: "ADD_MESSAGE",
+            payload: {
+              id: generateMessageId("msg"),
+              role: "assistant",
+              content: `${t('agent.logs.event.messages.errorPrefix')} ${agentErrorMessage || t('common.errors.unknown')}`,
+              timestamp: message.timestamp,
+              status: "failed",
+            },
+          })
+        }
         break
 
       case "error":
@@ -5817,11 +5891,17 @@ export function AppProvider({
           controlEnvelope,
         })
 
-        if (errorFrame.taskStatus) {
+        // Stale-versioned "error" frames keep their notice but assert
+        // nothing about task state (see staleControlErrorFrame above).
+        // task_error deliberately stays outside that exemption - its bubble
+        // IS the turn's terminal result, mirroring the unversioned rule in
+        // canAcceptTaskControlVersion - so for task_error this guard is
+        // vacuously true.
+        if (errorFrame.taskStatus && !staleControlErrorFrame) {
           dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: errorFrame.taskStatus } })
           dispatch({ type: "TRIGGER_TASK_UPDATE" })
         }
-        if (errorFrame.stopsProcessing) {
+        if (errorFrame.stopsProcessing && !staleControlErrorFrame) {
           dispatch({ type: "SET_PROCESSING", payload: false })
         }
 

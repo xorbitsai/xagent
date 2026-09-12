@@ -5,6 +5,20 @@ export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs))
 }
 
+/**
+ * First candidate that is a non-empty string. Shared by the clarification
+ * round-id extraction sites: nullish coalescing alone would let an empty or
+ * non-string preferred field block the fallback candidates.
+ */
+export function firstNonEmptyString(
+  ...candidates: unknown[]
+): string | undefined {
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate !== "") return candidate
+  }
+  return undefined
+}
+
 export function generateClientMessageId(): string {
   return globalThis.crypto?.randomUUID?.()
     ?? `msg-${Date.now()}-${Math.random().toString(36).slice(2)}`

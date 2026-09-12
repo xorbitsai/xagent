@@ -7212,3 +7212,514 @@ describe("error frame display projection", () => {
     ).toEqual(expected)
   })
 })
+
+describe("clarification round identity (#1500)", () => {
+  beforeEach(() => {
+    webSocketOptions.current = null
+    webSocketOptions.all = []
+    sessionControls = null
+    wsHarness.isConnected = true
+    apiRequestMock.mockReset()
+    routerPushMock.mockReset()
+    sendRawMessageMock.mockReset()
+    sendRawMessageMock.mockReturnValue("sent")
+    sendChatMessageMock.mockReset()
+    sendChatMessageMock.mockResolvedValue({
+      client_message_id: "turn-optimistic",
+      turn_id: "turn-optimistic",
+    })
+    localStorage.clear()
+    ;(window as typeof window & { clearDuplicateMessageCache?: () => void })
+      .clearDuplicateMessageCache?.()
+  })
+
+  afterEach(() => {
+    cleanup()
+    localStorage.clear()
+  })
+
+  it("adopts the waiting frame's request_id as the round id", async () => {
+    // The waiting/reassert frames carry the round identity as request_id
+    // (backend #2232). They never emit event_id, so there is deliberately
+    // no event_id fallback on this handler - the ask frame's event_id is
+    // adopted in the agent_message trace reader instead. An empty-string
+    // request_id reads as no identity.
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.({
+        type: "task_waiting_for_user",
+        timestamp: "2026-05-27T05:00:01Z",
+        task_id: 1,
+        task: { id: 1, status: "waiting_for_user" },
+        message: "Which region should I use?",
+        request_id: "req-round-1",
+        interactions: [
+          { type: "text", prompt: "Which region should I use?" },
+        ],
+      } as TestWebSocketMessage)
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("waiting-request-id").textContent).toBe("req-round-1")
+    })
+
+    act(() => {
+      onMessage?.({
+        type: "task_waiting_for_user",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        task: { id: 1, status: "waiting_for_user" },
+        message: "Which hotel?",
+        request_id: "",
+        event_id: "evt-never-adopted-here",
+        interactions: [
+          { type: "text", prompt: "Which hotel?" },
+        ],
+      } as TestWebSocketMessage)
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain("Which hotel?")
+    })
+    expect(screen.getByTestId("waiting-request-id").textContent).toBe("")
+  })
+
+  it("adopts the live ask's event_id onto the transcript message", async () => {
+    // The one adoption site production always exercises: a live ask arrives
+    // as an agent_message trace event whose data.event_id is the round id,
+    // and the transcript message it produces must carry it as
+    // interactionRequestId.
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:01Z",
+        task_id: 1,
+        data: {
+          event_id: "trace-row-1",
+          event_type: "agent_message",
+          data: {
+            message: "Which region should I use?",
+            expect_response: true,
+            event_id: "evt-live-ask",
+            metadata: {
+              interactions: [
+                { type: "text_input", field: "region", label: "Region" },
+              ],
+            },
+          },
+        },
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      const messages = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]"
+      ) as Array<{ content: string; interactionRequestId?: string }>
+      const ask = messages.find(
+        (m) => m.content === "Which region should I use?"
+      )
+      expect(ask?.interactionRequestId).toBe("evt-live-ask")
+    })
+  })
+
+  it("keeps a held round id when an id-less waiting task_info arrives", async () => {
+    // A backend predating the emission sends waiting task_info frames with
+    // no request_id; SET_CURRENT_TASK's merge must not wipe the id the
+    // waiting handler already extracted for the open round.
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.({
+        type: "task_waiting_for_user",
+        timestamp: "2026-05-27T05:00:01Z",
+        task_id: 1,
+        task: { id: 1, status: "waiting_for_user" },
+        message: "Which region should I use?",
+        request_id: "evt-live-round",
+      } as TestWebSocketMessage)
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("waiting-request-id").textContent).toBe(
+        "evt-live-round"
+      )
+    })
+
+    act(() => {
+      onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        data: {
+          event_id: "task-info-row-2",
+          event_type: "task_info",
+          data: {
+            id: 1,
+            title: "Task",
+            description: "Task",
+            status: "waiting_for_user",
+          },
+        },
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe(
+        "waiting_for_user"
+      )
+    })
+    expect(screen.getByTestId("waiting-request-id").textContent).toBe(
+      "evt-live-round"
+    )
+  })
+
+  it("adopts the waiting task_info frame's request_id as the round id", async () => {
+    // The replay/live waiting task_info now carries request_id; the task
+    // shaping must surface it as waitingRequestId.
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:01Z",
+        task_id: 1,
+        data: {
+          event_id: "task-info-row",
+          event_type: "task_info",
+          data: {
+            id: 1,
+            title: "Task",
+            description: "Task",
+            status: "waiting_for_user",
+            request_id: "evt-info-round",
+          },
+        },
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("waiting-request-id").textContent).toBe(
+        "evt-info-round"
+      )
+    })
+  })
+
+  it("keeps the round id across a same-question reassertion without an id", async () => {
+    // Reload/reconnect reassertion frames re-send the unchanged question
+    // with no id; wiping the id there severs the open round's correlation.
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.({
+        type: "task_waiting_for_user",
+        timestamp: "2026-05-27T05:00:01Z",
+        task_id: 1,
+        task: { id: 1, status: "waiting_for_user" },
+        message: "Which region should I use?",
+        request_id: "evt-round-1",
+      } as TestWebSocketMessage)
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("waiting-request-id").textContent).toBe("evt-round-1")
+    })
+
+    act(() => {
+      onMessage?.({
+        type: "task_waiting_for_user",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        task: { id: 1, status: "waiting_for_user" },
+        message: "Which region should I use?",
+      } as TestWebSocketMessage)
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("waiting-request-id").textContent).toBe("evt-round-1")
+    })
+  })
+
+  it("clears the round id when an id-less frame asks a different question", async () => {
+    // A legacy-backend NEW round (different question, no id) must not
+    // inherit the previous round's id.
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.({
+        type: "task_waiting_for_user",
+        timestamp: "2026-05-27T05:00:01Z",
+        task_id: 1,
+        task: { id: 1, status: "waiting_for_user" },
+        message: "Which region should I use?",
+        request_id: "evt-round-1",
+      } as TestWebSocketMessage)
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("waiting-request-id").textContent).toBe("evt-round-1")
+    })
+
+    act(() => {
+      onMessage?.({
+        type: "task_waiting_for_user",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        task: { id: 1, status: "waiting_for_user" },
+        message: "Which hotel?",
+      } as TestWebSocketMessage)
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("waiting-request-id").textContent).toBe("")
+    })
+  })
+
+  it("adds one bubble for a duplicated terminal command frame", async () => {
+    // A terminal agent_error carries a durable identity (command_id +
+    // outcome_version); a duplicated delivery of the SAME broadcast must
+    // not add a second bubble, while two DISTINCT commands failing with
+    // identical text must both stay visible (identity-keyed, never
+    // text-keyed).
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    const terminalFrame = (commandId: string) => ({
+      type: "agent_error",
+      timestamp: "2026-05-27T05:00:02Z",
+      task_id: 1,
+      data: {
+        type: "agent_error",
+        message: "This message was not applied to the task.",
+        command_id: commandId,
+        command_kind: "message",
+        outcome: "failed",
+        outcome_version: 1,
+        resend_safe: true,
+      },
+    }) as TestWebSocketMessage
+
+    act(() => {
+      onMessage?.(terminalFrame("cmd-dup"))
+    })
+    act(() => {
+      onMessage?.(terminalFrame("cmd-dup"))
+    })
+    act(() => {
+      onMessage?.(terminalFrame("cmd-other"))
+    })
+
+    await waitFor(() => {
+      const messages = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]"
+      ) as Array<{ content: string }>
+      const bubbles = messages.filter((m) =>
+        m.content.includes("This message was not applied to the task.")
+      )
+      expect(bubbles).toHaveLength(2)
+    })
+  })
+
+  it("keeps a stale-versioned plain error notice without rolling back task state", async () => {
+    // The parallel "error"-type path shares the exemption with agent_error.
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.({
+        type: "task_waiting_for_user",
+        timestamp: "2026-05-27T05:00:01Z",
+        task_id: 1,
+        run_id: "run-1",
+        state_version: 6,
+        task: { id: 1, status: "waiting_for_user" },
+        message: "Which region should I use?",
+      } as TestWebSocketMessage)
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("waiting_for_user")
+    })
+
+    act(() => {
+      onMessage?.({
+        type: "error",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        run_id: "run-1",
+        state_version: 5,
+        task: { id: 1, status: "failed" },
+        message: "Task pause is still being applied; please retry shortly.",
+        error_code: "task_pause_in_progress",
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "clientErrors.taskPauseInProgress"
+      )
+    })
+    expect(screen.getByTestId("task-status").textContent).toBe("waiting_for_user")
+  })
+
+  it("still drops a stale-versioned task_error frame whole", async () => {
+    // task_error's bubble is the turn's terminal result; it deliberately
+    // stays outside the stale-frame exemption, mirroring the guard's
+    // unversioned rule.
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.({
+        type: "task_waiting_for_user",
+        timestamp: "2026-05-27T05:00:01Z",
+        task_id: 1,
+        run_id: "run-1",
+        state_version: 6,
+        task: { id: 1, status: "waiting_for_user" },
+        message: "Which region should I use?",
+      } as TestWebSocketMessage)
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("waiting_for_user")
+    })
+
+    act(() => {
+      onMessage?.({
+        type: "task_error",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        run_id: "run-1",
+        state_version: 5,
+        task: { id: 1, status: "failed" },
+        message: "stale terminal result",
+      } as TestWebSocketMessage)
+    })
+
+    // The whole frame is dropped: no bubble, no status change.
+    expect(screen.getByTestId("messages").textContent).not.toContain(
+      "stale terminal result"
+    )
+    expect(screen.getByTestId("task-status").textContent).toBe("waiting_for_user")
+  })
+
+  it("keeps a stale-versioned error notice without rolling back task state", async () => {
+    // The version guard protects task state, but an error frame's body is
+    // not versioned state: it carries a notice (and, since #2124, the
+    // structured terminal command outcome) the backend sends exactly once.
+    // A stale control tuple must lose the state argument yet keep the
+    // notice.
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.({
+        type: "task_waiting_for_user",
+        timestamp: "2026-05-27T05:00:01Z",
+        task_id: 1,
+        run_id: "run-1",
+        state_version: 6,
+        task: { id: 1, status: "waiting_for_user" },
+        message: "Which region should I use?",
+      } as TestWebSocketMessage)
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("waiting_for_user")
+    })
+
+    act(() => {
+      onMessage?.({
+        type: "agent_error",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        run_id: "run-1",
+        state_version: 5,
+        data: {
+          type: "agent_error",
+          message: "This message was not applied to the task.",
+          command_id: "client-msg-1",
+          command_kind: "message",
+          task: { id: 1, status: "failed" },
+        },
+      } as TestWebSocketMessage)
+    })
+
+    // The notice reaches the transcript; the stale status assertion does not.
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "This message was not applied to the task."
+      )
+    })
+    expect(screen.getByTestId("task-status").textContent).toBe("waiting_for_user")
+  })
+})

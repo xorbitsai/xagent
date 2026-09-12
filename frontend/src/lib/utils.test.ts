@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { resolveAgentLogoUrl } from "./utils"
+import { firstNonEmptyString, resolveAgentLogoUrl } from "./utils"
 
 const bigintValue = (globalThis as { BigInt: (value: number) => bigint }).BigInt(1)
 
@@ -173,5 +173,16 @@ describe("resolveAgentLogoUrl", () => {
     expect(resolveAgentLogoUrl("https://assets.example/logo.png", "\u0000invalid")).toBe(
       "https://assets.example/logo.png",
     )
+  })
+})
+
+describe("firstNonEmptyString", () => {
+  it("returns the first non-empty string candidate", () => {
+    expect(firstNonEmptyString(undefined, null, "", 0, "id-1", "id-2")).toBe("id-1")
+  })
+
+  it("skips non-string and empty values entirely", () => {
+    expect(firstNonEmptyString(null, 42, {}, [], "")).toBeUndefined()
+    expect(firstNonEmptyString()).toBeUndefined()
   })
 })

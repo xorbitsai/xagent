@@ -161,6 +161,9 @@ def test_recreation_propagates_real_io_errors(tmp_path, failure_point):
     _safe_close_table(table)
 
     class FailingConnection:
+        uri = connection.uri
+        list_tables = connection.list_tables
+
         def open_table(self, name):
             if failure_point == "open":
                 raise OSError("real open failure")

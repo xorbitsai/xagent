@@ -53,6 +53,7 @@ const ciSummaryFailurePropagationCommands = [
   'check_job "pytest-slow" "${{ needs[\'pytest-slow\'].result }}"',
   'check_job "e2e" "${{ needs.e2e.result }}"',
   frontendSummaryCheckCommand,
+  'check_job "lancedb-memory-compatibility" "${{ needs[\'lancedb-memory-compatibility\'].result }}"',
   // An empty flag skips every work step and leaves only the Skip sentinel, so
   // the job still reports success; the summary rejects anything but a literal
   // true/false.

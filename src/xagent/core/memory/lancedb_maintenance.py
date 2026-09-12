@@ -86,12 +86,17 @@ def _is_complete(table: Any) -> bool:
     )
 
 
-def _lock_path(connection: Any, table_name: str) -> str:
+def lancedb_lock_path(connection: Any, table_name: str, scope: str) -> str:
+    """Validate a local URI and derive a stable, scope-specific lock path."""
     uri = str(getattr(connection, "uri", "") or "")
     if not uri or "://" in uri or not os.path.isdir(uri):
-        raise ValueError("LanceDB maintenance requires a writable local database URI")
+        raise ValueError("LanceDB locking requires a writable local database URI")
     digest = hashlib.sha256(table_name.encode()).hexdigest()[:16]
-    return os.path.join(uri, f".memory-maintenance-{digest}.lock")
+    return os.path.join(uri, f".memory-{scope}-{digest}.lock")
+
+
+def _lock_path(connection: Any, table_name: str) -> str:
+    return lancedb_lock_path(connection, table_name, "maintenance")
 
 
 def _read_rows(table: Any) -> list[dict[str, Any]]:

@@ -329,3 +329,9 @@ Valid only until step 8 restarts the writers. Until that point a v17 server has 
 Roll back rather than repair in place when verification fails after a partial restore under v17. A cluster left half-populated by an interrupted restore is not a state to diagnose during an outage. If the v16 volume copy is unavailable, restore the verified dump from step 3 onto a v16 cluster initialized from `16-bookworm`.
 
 After v17 accepts writes the volume copy is stale, and restoring it discards everything written since the cutover. Recovery from that point means taking a fresh v17 backup and reconciling the two, not a copy-back.
+# LanceDB memory compatibility
+
+Persistent-memory storage admission supports LanceDB `>=0.24.2,<0.38`.
+CI exercises representative versions at the minimum (`0.24.2`), the lockfile
+version (`0.29.2`), and the newest supported minor (`0.37.1`); it does not claim
+that every intervening release is tested individually.

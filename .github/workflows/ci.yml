@@ -899,6 +899,34 @@ jobs:
             || { echo "::error::wheel is missing the Python package (xagent/web/__main__.py)"; exit 1; }
           echo "Wheel bundles the frontend and the full Python package."
 
+  lancedb-memory-compatibility:
+    name: LanceDB Memory Compatibility (${{ matrix.lancedb }})
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    strategy:
+      fail-fast: false
+      matrix:
+        lancedb: ['0.24.2', '0.29.2', '0.37.1']
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install locked test environment
+        shell: bash
+        run: |
+          python -m pip install uv
+          python -m uv sync --locked --no-default-groups --group test
+          python -m uv pip install "lancedb==${{ matrix.lancedb }}"
+
+      - name: Run storage admission compatibility tests
+        run: >-
+          python -m uv run --no-sync python -m pytest
+          tests/core/memory/test_storage_admission_matrix.py -q
+
   ci-summary:
     name: CI Summary
     runs-on: ubuntu-latest
@@ -912,6 +940,7 @@ jobs:
       - pytest-slow
       - e2e
       - frontend-build
+      - lancedb-memory-compatibility
 
     steps:
       - name: Check required jobs
@@ -937,6 +966,7 @@ jobs:
           check_job "pytest-slow" "${{ needs['pytest-slow'].result }}"
           check_job "e2e" "${{ needs.e2e.result }}"
           check_job "frontend-build" "${{ needs['frontend-build'].result }}"
+          check_job "lancedb-memory-compatibility" "${{ needs['lancedb-memory-compatibility'].result }}"
 
           # On an empty outputs value every guarded work step skips, only
           # the Skip sentinel runs, and the job reports success -- so the

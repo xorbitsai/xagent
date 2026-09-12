@@ -772,6 +772,22 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             },
         },
         {
+            "app_id": "meta-ads",
+            "name": "Meta Ads",
+            "description": "Connect to Meta Ads to list ad accounts, inspect campaigns, ad sets, and ads, and pull performance insights.",
+            "icon": "https://www.google.com/s2/favicons?domain=facebook.com&sz=128",
+            "transport": "oauth",
+            "provider_name": "meta",
+            "category": "Marketing",
+            "oauth_scopes": ["ads_read"],
+            "is_visible_in_connector": True,
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.meta_ads"],
+                "env_mapping": {"META_ACCESS_TOKEN": "access_token"},
+            },
+        },
+        {
             "app_id": "zoom",
             "name": "Zoom",
             "description": "Connect to Zoom to look up meetings, and read cloud recordings and transcripts.",

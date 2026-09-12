@@ -38,6 +38,7 @@ from xagent.web.services.external_task_cancel import (
     EXTERNAL_CANCEL_NOT_APPLIED_MESSAGE,
     EXTERNAL_CANCEL_WAIT_SECONDS,
     EXTERNAL_TURN_INTERRUPTED_MESSAGE,
+    _broadcast_external_cancel_terminal_event,
     cancel_external_task_unserialized,
 )
 from xagent.web.services.task_command_terminal_events import (
@@ -1444,3 +1445,70 @@ async def test_cancel_rejects_an_unknown_scope(
     assert untouched.status == TaskStatus.RUNNING
     assert untouched.state_version == 4
     assert untouched.error_message is None
+
+
+@pytest.mark.asyncio
+async def test_external_cancel_terminal_frame_survives_row_deletion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The terminal frame carries its own state tuple past row deletion.
+
+    The finalize commits run/version ``run-external``/5 FAILED, then the
+    Task row disappears before anyone reads it back. The broadcast frame
+    must still parse through ``_event_task_control_state`` with no DB
+    snapshot, or the client's version gate drops the turn's terminal frame.
+    """
+    agent_id, owner_user_id = _create_agent()
+    task_id = _create_task(
+        agent_id=agent_id,
+        owner_user_id=owner_user_id,
+        title="terminal frame survives row deletion",
+    )
+    manager = _broadcast_manager(monkeypatch)
+    monkeypatch.setattr(
+        task_execution_service.background_task_manager,
+        "cancel_task",
+        AsyncMock(return_value=MagicMock(requested=False)),
+    )
+
+    await cancel_external_task_unserialized(
+        task_id=task_id,
+        agent_id=agent_id,
+        expected_run_id="run-external",
+        expected_state_version=4,
+    )
+
+    payloads = _broadcast_payloads(manager)
+    assert [payload["type"] for payload in payloads] == ["task_error"]
+    db = _direct_db_session()
+    try:
+        db.query(Task).filter(Task.id == task_id).delete()
+        db.commit()
+    finally:
+        db.close()
+
+    state = websocket_api._event_task_control_state(payloads[0])
+    assert state is not None
+    assert state["run_id"] == "run-external"
+    assert state["state_version"] == 5
+    assert state["control_state"] == TaskControlState.FAILED.value
+    assert state["status"] == TaskStatus.FAILED.value
+
+
+@pytest.mark.asyncio
+async def test_broadcast_partial_tuple_emits_no_tuple(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A half-supplied tuple is dropped whole, matching the gate's contract."""
+    manager = _broadcast_manager(monkeypatch)
+
+    await _broadcast_external_cancel_terminal_event(
+        424242,
+        control_state=TaskControlState.FAILED.value,
+    )
+
+    payloads = _broadcast_payloads(manager)
+    assert len(payloads) == 1
+    assert websocket_api._event_task_control_state(payloads[0]) is None
+    assert "state_version" not in payloads[0]["task"]
+    assert "control_state" not in payloads[0]["task"]

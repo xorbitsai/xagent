@@ -9,6 +9,20 @@ import requests
 from xagent.web.tools.mcp import utils
 
 
+def test_naive_day_bounds_accepts_a_z_suffixed_datetime():
+    assert utils.naive_day_bounds("2026-08-27T23:30:00Z") == (
+        "2026-08-27T00:00:00",
+        "2026-08-28T00:00:00",
+    )
+
+
+def test_naive_day_bounds_converts_an_instant_before_selecting_the_day():
+    assert utils.naive_day_bounds("2026-08-27T20:00:00Z", "Asia/Singapore") == (
+        "2026-08-28T00:00:00",
+        "2026-08-29T00:00:00",
+    )
+
+
 def test_require_clean_identifier_rejects_empty_and_whitespace():
     with pytest.raises(ValueError, match="record_id"):
         utils.require_clean_identifier("", "record_id")
@@ -542,6 +556,24 @@ def test_resolve_zoneinfo_returns_zoneinfo_for_valid_iana_name():
     from zoneinfo import ZoneInfo
 
     assert utils.resolve_zoneinfo("Asia/Shanghai") == ZoneInfo("Asia/Shanghai")
+
+
+@pytest.mark.parametrize(
+    ("windows_name", "iana_name"),
+    [
+        ("China Standard Time", "Asia/Shanghai"),
+        ("Central Asia Standard Time", "Asia/Bishkek"),
+        ("E. Europe Standard Time", "Europe/Chisinau"),
+        ("Mountain Standard Time (Mexico)", "America/Mazatlan"),
+        ("Aleutian Standard Time", "America/Adak"),
+        ("UTC-11", "Etc/GMT+11"),
+        ("Yukon Standard Time", "America/Whitehorse"),
+    ],
+)
+def test_resolve_zoneinfo_accepts_windows_timezone_names(windows_name, iana_name):
+    from zoneinfo import ZoneInfo
+
+    assert utils.resolve_zoneinfo(windows_name) == ZoneInfo(iana_name)
 
 
 def test_resolve_zoneinfo_rejects_unknown_timezone():

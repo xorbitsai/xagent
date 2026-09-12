@@ -1,12 +1,23 @@
 import json
 import logging
 import os
+from datetime import datetime
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlsplit
 
 import requests
+from dateutil import parser as _date_parser
 from mcp.server.fastmcp import FastMCP
 
+from .utils import InsufficientScopeError
+from .utils import conflict_response as _conflict_response
+from .utils import incomplete_check_response as _incomplete_check_response
+from .utils import merge_scope_error as _merge_scope_error
+from .utils import naive_day_bounds as _naive_day_bounds
+from .utils import normalize_addresses as _normalize_addresses
+from .utils import offset_datetime_string as _offset_datetime_string
+from .utils import reject_reversed_window as _reject_reversed_window
+from .utils import resolve_zoneinfo as _resolve_zoneinfo
 from .utils import setup_proxy_env
 
 logging.basicConfig(level=logging.INFO)
@@ -18,6 +29,39 @@ mcp = FastMCP("outlook-mcp")
 
 GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
 DEFAULT_TIMEOUT_SECONDS = 30
+
+# getSchedule accepts at most this many schedules (users/resources) per call.
+_MAX_ATTENDEES_PER_SCHEDULE_QUERY = 20
+
+
+class _GraphRequestError(RuntimeError):
+    """Raised by _graph_request on any HTTP error response.
+
+    Carries status_code so a caller that needs to distinguish e.g. a 403
+    (likely a missing-scope/permission issue on a /me/... call) from other
+    failures doesn't have to string-match the rendered message - Graph has
+    no single canonical error code for "missing scope" the way Slack does.
+    Still a RuntimeError, so every existing bare `except Exception` call
+    site keeps working unchanged.
+    """
+
+    def __init__(self, message: str, *, status_code: int) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class _ConflictCheckIncompleteError(RuntimeError):
+    """An availability scan that stopped after finding partial results."""
+
+    def __init__(
+        self,
+        message: str,
+        conflicts: list[dict[str, Any]],
+        unchecked_attendees: list[str],
+    ) -> None:
+        super().__init__(message)
+        self.conflicts = conflicts
+        self.unchecked_attendees = unchecked_attendees
 
 
 def _success(**payload: Any) -> str:
@@ -69,17 +113,11 @@ def _graph_request(
         message = str(exc)
         if response_text:
             message = f"{message} - {response_text}"
-        raise RuntimeError(message) from exc
+        raise _GraphRequestError(message, status_code=response.status_code) from exc
 
     if response.status_code == 204 or not response.content:
         return {}
     return response.json()
-
-
-def _normalize_addresses(addresses: list[str] | str) -> list[str]:
-    if isinstance(addresses, str):
-        return [address.strip() for address in addresses.split(",") if address.strip()]
-    return [address.strip() for address in addresses if address and address.strip()]
 
 
 def _recipient_list(addresses: list[str] | str) -> list[dict[str, Any]]:
@@ -104,6 +142,343 @@ def _message_body(content: str, content_type: str) -> dict[str, str]:
     if normalized not in {"text", "html"}:
         raise ValueError("content_type must be either 'text' or 'html'")
     return {"contentType": normalized, "content": content}
+
+
+def _next_link_path(next_link: Any) -> str:
+    """Strip GRAPH_BASE_URL from an @odata.nextLink so it can be re-issued
+    through `_graph_request` as a plain path+query (the link is always an
+    absolute URL; `_graph_request` builds its own URL as
+    ``f"{GRAPH_BASE_URL}{path}"``, so passing the absolute link verbatim as
+    `path` would double up the host instead of following it)."""
+    if not isinstance(next_link, str) or not next_link.startswith(f"{GRAPH_BASE_URL}/"):
+        raise ValueError("Outlook returned an invalid calendarView next link.")
+    # Decode before splitting so an encoded slash cannot hide a dot segment
+    # inside one raw segment (for example ``%2e%2e%2fusers``).
+    if any(
+        segment in {".", ".."}
+        for segment in unquote(urlsplit(next_link).path).split("/")
+    ):
+        raise ValueError("Outlook returned an invalid calendarView next link.")
+    return next_link[len(GRAPH_BASE_URL) :]
+
+
+def _is_midnight_in_timezone(value: str, timezone: str) -> bool:
+    """Whether ``value`` represents midnight in the event timezone."""
+    parsed: datetime = _date_parser.isoparse(value)
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(_resolve_zoneinfo(timezone))
+    return not (parsed.hour or parsed.minute or parsed.second or parsed.microsecond)
+
+
+def _naive_datetime_in_timezone(value: str, timezone: str) -> str:
+    """Return an Outlook dateTimeTimeZone clock value in ``timezone``.
+
+    Graph represents these values as a naive local datetime plus a separate
+    timeZone field. Preserve already-naive wall-clock input, but convert an
+    offset-bearing instant into the requested zone before removing its offset.
+    """
+    normalized = value.strip()
+    if (
+        len(normalized) < 19
+        or normalized[4] != "-"
+        or normalized[7] != "-"
+        or normalized[10] not in {"T", "t"}
+        or normalized[13] != ":"
+        or normalized[16] != ":"
+    ):
+        raise ValueError(
+            "Outlook event datetimes must use the extended ISO format "
+            "YYYY-MM-DDTHH:MM:SS, optionally followed by fractional seconds "
+            "and a UTC offset or Z suffix."
+        )
+    try:
+        parsed: datetime = _date_parser.isoparse(normalized)
+    except ValueError as exc:
+        raise ValueError(
+            "Outlook event datetimes must use the extended ISO format "
+            "YYYY-MM-DDTHH:MM:SS, optionally followed by fractional seconds "
+            "and a UTC offset or Z suffix."
+        ) from exc
+    if parsed.tzinfo is None:
+        return normalized
+    return (
+        parsed.astimezone(_resolve_zoneinfo(timezone)).replace(tzinfo=None).isoformat()
+    )
+
+
+def _reject_invalid_create_window(
+    start_datetime: str, end_datetime: str, *, is_all_day: bool
+) -> None:
+    try:
+        _reject_reversed_window(start_datetime, end_datetime)
+    except ValueError as exc:
+        if is_all_day:
+            raise ValueError(
+                "end_datetime is exclusive for an all-day event and must "
+                "be after start_datetime; use the following day's midnight "
+                "as the end of a one-day event."
+            ) from exc
+        raise
+
+
+# Defensive cap on calendarView pages followed for one organizer-side
+# conflict check - comfortably more than any single-window query should
+# ever need, just bounding the loop against an unexpected/pathological
+# amount of paging rather than looping forever.
+_MAX_CALENDAR_VIEW_PAGES = 20
+
+
+def _find_conflicts(
+    start_datetime: str,
+    end_datetime: str,
+    timezone: str,
+    attendees: list[str],
+    *,
+    exclude_event_id: str | None = None,
+    check_organizer: bool = True,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Check the organizer's own calendar (when check_organizer) plus each
+    attendee's schedule for anything overlapping [start_datetime,
+    end_datetime) in the given timezone.
+
+    `start_datetime`/`end_datetime` are naive (no embedded offset) clock
+    values paired with `timezone` - the same shape Outlook's own
+    dateTimeTimeZone resource uses, and getSchedule's structured
+    startTime/endTime fields accept directly. calendarView's
+    startDateTime/endDateTime query parameters are different: Graph's own
+    docs say they're "interpreted using the timezone offset specified in
+    the value" and "aren't impacted by the value of the Prefer ... header"
+    - a naive value there is silently read as UTC. So only the calendarView
+    call needs an explicit offset attached before it's sent.
+
+    The organizer results are accepted as Graph's own overlap decision for
+    this half-open window; this connector does not apply a second local
+    overlap calculation at the exact start/end edges. Each returned
+    boundary retains its response timezone below so organizer-local and
+    getSchedule UTC values cannot be mistaken for the same clock basis.
+
+    getSchedule has no concept of "exclude this event": it only returns raw
+    busy blocks, so a query against a window an attendee is *already* busy
+    for (because that's the very event being updated) can't be told apart
+    from a genuine conflict here. Callers that aren't moving the event to a
+    new window must restrict `attendees` to only the newly-added ones (see
+    outlook_update_event) rather than relying on this function to exclude
+    the event's own footprint on attendee schedules.
+
+    Returns (conflicts, unchecked_attendees). A missing-scope 403 covering
+    the whole call raises `InsufficientScopeError` (carrying whatever was
+    already confirmed in `conflicts`/`unchecked_attendees` before the
+    error) instead of degrading to unchecked and returning normally -
+    that's OUR OWN credential/policy problem, not a per-attendee
+    visibility gap, and writing an event whose availability was never
+    actually checked would defeat the point of this feature. Every entry
+    that does end up in `unchecked_attendees` on a normal return is the
+    self-explanatory kind (absent from the response, or its own
+    per-attendee error).
+    """
+    conflicts: list[dict[str, Any]] = []
+    unchecked_attendees: list[str] = []
+
+    if check_organizer:
+        offset_start = _offset_datetime_string(start_datetime, timezone)
+        offset_end = _offset_datetime_string(end_datetime, timezone)
+        params: dict[str, Any] | None = {
+            "startDateTime": offset_start,
+            "endDateTime": offset_end,
+            "$top": 250,
+            "$select": "id,subject,start,end,isCancelled,showAs,responseStatus",
+        }
+        next_path: str | None = None
+        for _ in range(_MAX_CALENDAR_VIEW_PAGES):
+            try:
+                calendar_view = _graph_request(
+                    "GET",
+                    next_path if next_path is not None else "/me/calendarView",
+                    params=params if next_path is None else None,
+                    extra_headers={"Prefer": f'outlook.timezone="{timezone}"'},
+                )
+            except _GraphRequestError as exc:
+                if exc.status_code == 403:
+                    raise InsufficientScopeError(
+                        "Missing the calendars.read permission needed to check "
+                        "organizer availability - reconnecting the Outlook "
+                        "connector may grant it; if it already has calendar "
+                        "access, an org-level policy may be blocking the call. "
+                        "This is a credential or policy error, not a scheduling "
+                        "conflict.",
+                        conflicts,
+                        unchecked_attendees + attendees,
+                    ) from exc
+                raise
+            for item in calendar_view.get("value") or []:
+                if item.get("isCancelled"):
+                    continue
+                # Graph's own showAs enum documents "unknown" as an
+                # unclassified value (e.g. an event synced from a
+                # third-party calendar that never set it), not
+                # specifically a permission gap - it can represent a
+                # genuinely busy block. Missing a real conflict is worse
+                # than occasionally over-flagging one the caller can
+                # dismiss with ignore_conflicts, so only skip the values
+                # that are unambiguously not-busy - matching the policy
+                # used for attendees' schedules below.
+                if item.get("showAs") in ("free", "workingElsewhere"):
+                    continue
+                if exclude_event_id and item.get("id") == exclude_event_id:
+                    continue
+                # NOTE: declining an invite (responseStatus.response ==
+                # "declined") is NOT used as a busy/free signal here -
+                # Microsoft's event resource documents responseStatus and
+                # showAs as independent fields, with no documented
+                # guarantee that declining clears showAs to "free". An
+                # earlier version of this check skipped declined events
+                # outright, which silently treated a still-busy declined
+                # event as free and permitted a real double booking.
+                # `showAs` above is the one field Graph actually
+                # documents as the busy/free predicate.
+                start = item.get("start") or {}
+                end = item.get("end") or {}
+                conflicts.append(
+                    {
+                        "calendar": "organizer",
+                        "summary": item.get("subject") or "(no subject)",
+                        "start": start.get("dateTime"),
+                        "end": end.get("dateTime"),
+                        "start_timezone": start.get("timeZone") or timezone,
+                        "end_timezone": end.get("timeZone") or timezone,
+                    }
+                )
+            next_link = calendar_view.get("@odata.nextLink")
+            if next_link is None:
+                break
+            try:
+                next_path = _next_link_path(next_link)
+            except ValueError as exc:
+                raise _ConflictCheckIncompleteError(
+                    str(exc), conflicts, unchecked_attendees + attendees
+                ) from exc
+        else:
+            raise _ConflictCheckIncompleteError(
+                "Outlook calendar conflict check exceeded the pagination limit; "
+                "availability could not be verified completely.",
+                conflicts,
+                unchecked_attendees + attendees,
+            )
+
+    # getSchedule accepts at most _MAX_ATTENDEES_PER_SCHEDULE_QUERY
+    # schedules per call - chunk rather than giving up on the whole batch,
+    # so a large invite list still gets everyone it can check checked.
+    # `range(0, 0, N)` is empty, so this is also just a no-op loop when
+    # `attendees` is empty.
+    for offset in range(0, len(attendees), _MAX_ATTENDEES_PER_SCHEDULE_QUERY):
+        batch = attendees[offset : offset + _MAX_ATTENDEES_PER_SCHEDULE_QUERY]
+        try:
+            schedule = _graph_request(
+                "POST",
+                "/me/calendar/getSchedule",
+                body={
+                    "schedules": batch,
+                    "startTime": {"dateTime": start_datetime, "timeZone": timezone},
+                    "endTime": {"dateTime": end_datetime, "timeZone": timezone},
+                    "availabilityViewInterval": 30,
+                },
+                extra_headers={"Prefer": f'outlook.timezone="{timezone}"'},
+            )
+        except _GraphRequestError as exc:
+            if exc.status_code == 403:
+                # Graph gives no single reliable code for "this is a
+                # missing-scope/permission issue" (unlike Google's
+                # PERMISSION_DENIED/insufficientPermissions pairing) -
+                # but a 403 on this /me/... call for the signed-in
+                # user's own mailbox is not expected to have another
+                # cause here. This is OUR OWN credential/policy problem,
+                # not a per-attendee visibility gap (which genuinely
+                # can't be fixed and still degrades to unchecked below) -
+                # proceeding to write an event whose availability was
+                # never actually checked would defeat the entire point
+                # of this feature, so reject instead of silently booking
+                # over a possible conflict. Carrying `conflicts` (e.g. an
+                # organizer conflict already found above, before this
+                # batch ever ran) lets a caller still report it rather
+                # than silently discarding a known problem just because
+                # this later, unrelated check also failed.
+                raise InsufficientScopeError(
+                    "Missing the calendars.read/schedule permission "
+                    "needed to check attendee availability - "
+                    "reconnecting the Outlook connector may grant it; if "
+                    "the connector already has calendar access, this is "
+                    "more likely an org-level policy blocking this call, "
+                    "which a reconnect won't fix. Pass "
+                    "ignore_conflicts=true if the user has confirmed "
+                    "they want to proceed without this check.",
+                    conflicts,
+                    # Every attendee from this failed batch onward is
+                    # unchecked - every remaining batch would hit this
+                    # same scope error too, so there's nothing left to
+                    # gain by attempting them.
+                    unchecked_attendees + attendees[offset:],
+                ) from exc
+            raise
+
+        # Keyed by Graph's own scheduleId casing for lookup, but every
+        # value reported back below (conflicts and unchecked_attendees)
+        # uses the caller's original attendees casing - matching
+        # google_calendar's _find_conflicts, which iterates `attendees`
+        # for the same reason.
+        by_schedule_id = {
+            (entry.get("scheduleId") or "").lower(): entry
+            for entry in (schedule.get("value") or [])
+        }
+        for email in batch:
+            entry = by_schedule_id.get(email.lower())
+            if entry is None:
+                # Not even present in the response - can't tell
+                # whether they're free, so don't silently report them
+                # as clear.
+                unchecked_attendees.append(email)
+                continue
+            if entry.get("error"):
+                unchecked_attendees.append(email)
+                continue
+            schedule_items = entry.get("scheduleItems") or []
+            found_busy_item = False
+            for item in schedule_items:
+                # See the matching comment on the organizer-side loop
+                # above: "unknown" is unclassified, not confirmed-free,
+                # so it's treated the same way here for consistency -
+                # missing a real conflict is worse than occasionally
+                # over-flagging one the caller can dismiss with
+                # ignore_conflicts.
+                if item.get("status") in ("busy", "tentative", "oof", "unknown"):
+                    found_busy_item = True
+                    start = item.get("start") or {}
+                    end = item.get("end") or {}
+                    conflicts.append(
+                        {
+                            "calendar": email,
+                            "summary": None,
+                            "start": start.get("dateTime"),
+                            "end": end.get("dateTime"),
+                            "start_timezone": start.get("timeZone") or timezone,
+                            "end_timezone": end.get("timeZone") or timezone,
+                        }
+                    )
+            availability_view = entry.get("availabilityView")
+            if not found_busy_item and (
+                not isinstance(availability_view, str)
+                or not availability_view
+                or any(slot not in {"0", "4"} for slot in availability_view)
+            ):
+                # scheduleItems can be withheld even though availabilityView
+                # still reports a busy slot. Graph uses "4" for
+                # workingElsewhere, which follows the same non-blocking policy
+                # as detailed schedule items above. Without item boundaries for
+                # any other non-free state there is
+                # not enough detail to construct a normal conflict entry, but
+                # treating the attendee as free would permit a double booking.
+                unchecked_attendees.append(email)
+
+    return conflicts, unchecked_attendees
 
 
 @mcp.tool()
@@ -282,21 +657,103 @@ def outlook_create_event(
     location: str | None = None,
     attendees: list[str] | str | None = None,
     is_all_day: bool = False,
+    ignore_conflicts: bool = False,
 ) -> str:
-    """Create an Outlook calendar event."""
+    """Create an Outlook calendar event.
+    The organizer's calendar is always checked for scheduling conflicts.
+    attendees, if given, are invited by email (Graph emails them the invite)
+    and their schedules are checked too; a conflict returns status="conflict"
+    instead of creating the event. Pass ignore_conflicts=True to create it
+    anyway once the user has explicitly confirmed a conflict is fine.
+    For an all-day event, end_datetime is an exclusive boundary: use the
+    following day's midnight as the end of a one-day event.
+    """
     try:
+        # Timezone validity is part of the write contract, independent of
+        # whether the caller explicitly bypasses availability checks.
+        _resolve_zoneinfo(timezone)
+        normalized_attendees = _normalize_addresses(attendees) if attendees else []
+
+        # Retain the caller-level ordering check before all-day normalization:
+        # two reversed times on the same date must not become a valid full-day
+        # window merely because both are widened to date boundaries.
+        _reject_invalid_create_window(
+            start_datetime, end_datetime, is_all_day=is_all_day
+        )
+
+        # Graph's dateTimeTimeZone shape carries a naive wall-clock value and
+        # its timezone separately. Convert offset-bearing inputs to that shape
+        # before comparing, querying, or writing them. This also makes a mixed
+        # aware/naive pair comparable instead of letting it bypass the ordering
+        # check when Python refuses to compare the two datetime kinds.
+        effective_start = _naive_datetime_in_timezone(start_datetime, timezone)
+        effective_end = _naive_datetime_in_timezone(end_datetime, timezone)
+
+        # Graph additionally requires all-day boundaries to be midnight in the
+        # same timezone. Normalize both the availability query and the eventual
+        # write, including when ignore_conflicts bypasses the query.
+        if is_all_day:
+            effective_start, _ = _naive_day_bounds(start_datetime, timezone)
+            end_of_its_day, next_day_start = _naive_day_bounds(end_datetime, timezone)
+            end_is_midnight = _is_midnight_in_timezone(end_datetime, timezone)
+            # end_datetime is an exclusive date boundary. A same-day time
+            # range still denotes one all-day event, while a later date is
+            # already the exclusive boundary even if its clock is non-midnight.
+            effective_end = (
+                end_of_its_day
+                if end_is_midnight or end_of_its_day != effective_start
+                else next_day_start
+            )
+
+        # The raw comparison is deliberately unable to compare a mixed
+        # aware/naive pair. Recheck after normalization so that case cannot
+        # bypass the invariant.
+        _reject_invalid_create_window(
+            effective_start, effective_end, is_all_day=is_all_day
+        )
+
+        unchecked_attendees: list[str] = []
+        check_error: str | None = None
+        if not ignore_conflicts:
+            try:
+                conflicts, unchecked_attendees = _find_conflicts(
+                    effective_start, effective_end, timezone, normalized_attendees
+                )
+            except InsufficientScopeError as exc:
+                check_error = str(exc)
+                conflicts, unchecked_attendees = _merge_scope_error(exc, [], [])
+            except _ConflictCheckIncompleteError as exc:
+                check_error = str(exc)
+                conflicts = exc.conflicts
+                unchecked_attendees = exc.unchecked_attendees
+            if conflicts:
+                return _conflict_response(
+                    conflicts,
+                    unchecked_attendees,
+                    effective_start,
+                    effective_end,
+                    check_error=check_error,
+                )
+            if check_error or unchecked_attendees:
+                return _incomplete_check_response(
+                    unchecked_attendees,
+                    effective_start,
+                    effective_end,
+                    message=check_error,
+                )
+
         payload: dict[str, Any] = {
             "subject": subject,
-            "start": {"dateTime": start_datetime, "timeZone": timezone},
-            "end": {"dateTime": end_datetime, "timeZone": timezone},
+            "start": {"dateTime": effective_start, "timeZone": timezone},
+            "end": {"dateTime": effective_end, "timeZone": timezone},
             "isAllDay": is_all_day,
         }
         if body:
             payload["body"] = _message_body(body, "text")
         if location:
             payload["location"] = {"displayName": location}
-        if attendees:
-            payload["attendees"] = _attendee_list(attendees)
+        if normalized_attendees:
+            payload["attendees"] = _attendee_list(normalized_attendees)
 
         result = _graph_request("POST", "/me/events", body=payload)
         return _success(event=result)

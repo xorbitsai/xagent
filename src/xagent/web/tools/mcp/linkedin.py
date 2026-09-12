@@ -9,6 +9,8 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
+from .utils import allowed_dirs_from_env
+
 app = Server("linkedin-mcp")
 
 
@@ -52,14 +54,7 @@ def _get_author_urn(headers: dict, proxies: dict | None) -> str:
 
 
 def _allowed_image_dirs() -> list[Path]:
-    raw_dirs = os.environ.get("XAGENT_LINKEDIN_IMAGE_ALLOWED_DIRS", "")
-    if not raw_dirs.strip():
-        return [Path.cwd().resolve()]
-    return [
-        Path(raw_dir).expanduser().resolve()
-        for raw_dir in raw_dirs.split(",")
-        if raw_dir.strip()
-    ]
+    return allowed_dirs_from_env("XAGENT_LINKEDIN_IMAGE_ALLOWED_DIRS")
 
 
 def _resolve_allowed_image_path(image_path: str) -> Path:

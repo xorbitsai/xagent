@@ -9,7 +9,7 @@ from typing import Any
 import requests
 from mcp.server.fastmcp import FastMCP
 
-from .utils import setup_proxy_env
+from .utils import allowed_dirs_from_env, setup_proxy_env
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("slack-mcp")
@@ -125,14 +125,7 @@ def _resolve_channel_id(channel: str) -> str:
 
 
 def _allowed_file_dirs() -> list[Path]:
-    raw_dirs = os.environ.get("XAGENT_SLACK_FILE_ALLOWED_DIRS", "")
-    if not raw_dirs.strip():
-        return [Path.cwd().resolve()]
-    return [
-        Path(stripped).expanduser().resolve()
-        for raw_dir in raw_dirs.split(",")
-        if (stripped := raw_dir.strip())
-    ]
+    return allowed_dirs_from_env("XAGENT_SLACK_FILE_ALLOWED_DIRS")
 
 
 def _resolve_allowed_file_path(file_path: str) -> Path:

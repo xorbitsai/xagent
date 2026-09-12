@@ -11,7 +11,7 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build  # type: ignore[import-not-found]
 from mcp.server.fastmcp import FastMCP
 
-from .utils import setup_proxy_env
+from .utils import allowed_dirs_from_env, setup_proxy_env
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("gmail-mcp")
@@ -32,14 +32,7 @@ _MAX_ATTACHMENT_BYTES = int(25 * 1024 * 1024 * 3 / 4)
 
 
 def _allowed_file_dirs() -> list[Path]:
-    raw_dirs = os.environ.get("XAGENT_GMAIL_FILE_ALLOWED_DIRS", "")
-    if not raw_dirs.strip():
-        return [Path.cwd().resolve()]
-    return [
-        Path(stripped).expanduser().resolve()
-        for raw_dir in raw_dirs.split(",")
-        if (stripped := raw_dir.strip())
-    ]
+    return allowed_dirs_from_env("XAGENT_GMAIL_FILE_ALLOWED_DIRS")
 
 
 def _resolve_allowed_file_path(file_path: str) -> Path:

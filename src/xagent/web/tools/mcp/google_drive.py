@@ -20,6 +20,7 @@ from mcp.server.fastmcp import FastMCP
 
 from ....config import get_tool_max_output_length
 from .utils import (
+    allowed_dirs_from_env,
     clamp_limit,
     require_clean_identifier,
     setup_proxy_env,
@@ -846,38 +847,7 @@ _UPLOAD_ALLOWED_DIRS_ENV_VAR = "XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS"
 
 
 def _upload_allowed_dirs() -> list[Path]:
-    """Parse XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS's comma-separated
-    directory allowlist, falling back to the current working directory
-    when it's unset.
-
-    That CWD fallback is a fail-open default: with no task workspace and
-    no configured external dirs, an MCP subprocess's own working
-    directory becomes the allowlist. Not reachable from the app's own
-    call sites today — _build_oauth_mcp_stdio_transport_config in
-    config.py always sets this env var whenever a task_id is present —
-    but a standalone or misconfigured launch of this server would fall
-    back to it silently.
-
-    Previously lived in utils.py as a name shared with gmail.py/slack.py's
-    own equivalents in spirit, but google_drive.py's upload tool is its
-    only real caller — gmail.py, slack.py, and linkedin.py each still
-    carry their own separate, near-identical copy rather than having been
-    migrated to a shared helper (a fast-follow, not part of this fix).
-    """
-    raw_dirs = os.environ.get(_UPLOAD_ALLOWED_DIRS_ENV_VAR, "")
-    parsed_dirs = [
-        Path(stripped).expanduser().resolve()
-        for raw_dir in raw_dirs.split(",")
-        if (stripped := raw_dir.strip())
-    ]
-    # Falls back to CWD not just when the env var is entirely unset/blank,
-    # but also when it normalizes to no real entries (e.g. "," or " , ") --
-    # otherwise this would return [] and _resolve_upload_file_path's `any(
-    # local_path.is_relative_to(d) for d in allowed_dirs)` is vacuously
-    # False for every path, turning the documented fail-open CWD default
-    # into an unintended fail-closed "everything rejected" for a malformed
-    # value, rather than the same fallback a fully-empty var gets.
-    return parsed_dirs or [Path.cwd().resolve()]
+    return allowed_dirs_from_env(_UPLOAD_ALLOWED_DIRS_ENV_VAR)
 
 
 def _resolve_upload_file_path(file_path: str) -> Path:

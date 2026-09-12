@@ -11,6 +11,8 @@ from dateutil import parser as _date_parser
 from mcp.server.fastmcp import FastMCP
 
 from .utils import InsufficientScopeError
+from .utils import attendees_to_add as _attendees_to_add
+from .utils import attendees_were_given as _attendees_were_given
 from .utils import conflict_response as _conflict_response
 from .utils import datetime_key_for_comparison as _datetime_key_for_comparison
 from .utils import incomplete_check_response as _incomplete_check_response
@@ -22,6 +24,7 @@ from .utils import reject_reversed_window as _reject_reversed_window
 from .utils import resolve_zoneinfo as _resolve_zoneinfo
 from .utils import setup_proxy_env
 from .utils import timezones_could_differ as _timezones_could_differ
+from .utils import window_delta_segments as _window_delta_segments
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("outlook-mcp")
@@ -812,8 +815,8 @@ def outlook_update_event(
     ignore_conflicts: bool = False,
 ) -> str:
     """Update an existing Outlook calendar event.
-    If the update moves the event to a new time or changes its all-day
-    span, the signed-in calendar is checked for conflicts before the write;
+    If the update moves the event to a new time, or adds attendees, that
+    change is checked for conflicts the same way outlook_create_event is;
     pass ignore_conflicts=True to skip the check once the user has
     explicitly confirmed a conflict is fine. Editing other fields (subject,
     body, location) without moving the event is never blocked.
@@ -828,9 +831,12 @@ def outlook_update_event(
     both new values (defaulting to UTC if also left unset).
     """
     try:
+        attendees_given = _attendees_were_given(attendees)
+
         touches_schedule = (
             start_datetime is not None
             or end_datetime is not None
+            or attendees_given
             or is_all_day is not None
         )
 
@@ -857,8 +863,10 @@ def outlook_update_event(
         # start_datetime+end_datetime replace) with ignore_conflicts=True
         # needs none of them and stays a single PATCH.
         existing: dict[str, Any] = {}
-        needs_existing = single_boundary_update or (
-            not ignore_conflicts and touches_schedule
+        needs_existing = (
+            attendees_given
+            or single_boundary_update
+            or (not ignore_conflicts and touches_schedule)
         )
         if needs_existing:
             existing = _graph_request(
@@ -868,6 +876,15 @@ def outlook_update_event(
                     "$select": "start,end,attendees,isAllDay,originalStartTimeZone"
                 },
             )
+
+        existing_attendees_raw = [
+            a["emailAddress"]["address"]
+            for a in (existing.get("attendees") or [])
+            if (a.get("emailAddress") or {}).get("address")
+        ]
+        existing_attendee_emails = {
+            address.lower() for address in existing_attendees_raw
+        }
 
         if single_boundary_update:
             # A plain GET (no Prefer header, as above) always returns
@@ -1014,12 +1031,62 @@ def outlook_update_event(
             payload["body"] = _message_body(body, "text")
         if location is not None:
             payload["location"] = {"displayName": location}
-        if attendees is not None:
-            payload["attendees"] = _attendee_list(attendees)
+        # attendees fully REPLACES the event's attendee list (matching this
+        # connector's pre-existing base behavior before this tool's
+        # conflict-detection support was added): an explicit [] clears
+        # everyone, and any existing address left out of the new list is
+        # removed. `added_attendees` (genuinely new) and
+        # `retained_attendees_raw` (kept from before) are checked
+        # separately below - a retained attendee only needs checking
+        # against the portion of a moved window that's actually new
+        # territory, while a newly-added one needs the whole query window
+        # checked; a removed attendee needs no check at all.
+        added_attendees = _attendees_to_add(attendees, existing_attendee_emails)
+        if attendees_given:
+            # Reuse each retained attendee's existing raw dict (not just
+            # its address) so its RSVP state (status, type, ...) is never
+            # clobbered by a re-submission - only a genuinely new address
+            # gets a fresh minimal dict.
+            existing_by_email = {
+                a["emailAddress"]["address"].lower(): a
+                for a in (existing.get("attendees") or [])
+                if (a.get("emailAddress") or {}).get("address")
+            }
+            assert (
+                attendees is not None
+            )  # narrows for mypy; attendees_given implies this
+            desired_addresses = _normalize_addresses(attendees)
+            desired_lower = {address.lower() for address in desired_addresses}
+            if desired_lower != existing_attendee_emails:
+                # A byte-identical resubmission (same members, regardless
+                # of order) is not a real change - leaving the field out of
+                # the PATCH entirely, rather than resending a reconstructed
+                # copy of it, is a stronger guarantee against wiping RSVP
+                # state than relying on every entry happening to compare
+                # equal.
+                payload["attendees"] = [
+                    existing_by_email.get(
+                        address.lower(),
+                        {"emailAddress": {"address": address}, "type": "required"},
+                    )
+                    for address in desired_addresses
+                ]
+            retained_attendees_raw = [
+                address
+                for address in existing_attendees_raw
+                if address.lower() in desired_lower
+            ]
+        else:
+            retained_attendees_raw = existing_attendees_raw
         if is_all_day is not None:
             payload["isAllDay"] = is_all_day
 
-        if not payload:
+        if not payload and not attendees_given:
+            # attendees_given alone can leave `payload` empty (the
+            # resubmitted set exactly matches what's already on the event)
+            # without this having been a no-arg call - the caller did
+            # provide a real field, it just happens to be a no-op given the
+            # event's current state.
             raise ValueError("at least one field must be provided to update the event")
 
         # Checked unconditionally, not gated on ignore_conflicts - this is
@@ -1042,12 +1109,40 @@ def outlook_update_event(
 
         unchecked_attendees: list[str] = []
         if not ignore_conflicts and touches_schedule:
-            query_timezone = (
+            # Both boundaries always end up denominated in the same zone
+            # here: when only one of start_datetime/end_datetime is given
+            # (single_boundary_update), `existing_zone` already equals
+            # `resolved_timezone`; when both are given, `resolved_timezone`
+            # is used for the query. Only when NEITHER is given (an
+            # attendees/is_all_day-only edit) does the query need the
+            # existing event's own recorded zone. Whether that zone is
+            # actually known (and, if not, whether that's fatal) is
+            # resolved lazily below, only once it's clear a query will
+            # really run - a same-attendees, same-window resubmission
+            # must stay a no-op PATCH even if the existing event happens
+            # to be missing timezone info that would only matter for a
+            # query nothing here ends up needing.
+            provisional_query_timezone = (
                 resolved_timezone
                 if (start_datetime is not None or end_datetime is not None)
                 else (existing_zone or "UTC")
             )
 
+            # existing_start/existing_end are naive Graph values - they're
+            # only comparable against effective_start/effective_end (also
+            # naive, but not necessarily in the same zone: existing_zone
+            # can be plain UTC from an un-prefixed GET while
+            # query_timezone is whatever the caller/event actually uses)
+            # once both sides carry a real, matching UTC offset. Comparing
+            # the naive strings directly would read a same-instant
+            # resubmission written in a different zone as "the window
+            # moved" - resurrecting the self-conflict bug this whole
+            # timezone-resolution logic exists to prevent. This comparison
+            # only decides whether to widen the attendee check, never what
+            # gets written or queried, so an unknown zone falls back to
+            # UTC here (the conservative direction: a wrong guess makes
+            # the window look more likely to have "changed", which only
+            # means checking more attendees, never fewer).
             def _key(value: str | None, tz_name: str) -> datetime | str | None:
                 return _datetime_key_for_comparison(
                     _offset_datetime_string(value, tz_name) if value else None
@@ -1055,55 +1150,161 @@ def outlook_update_event(
 
             existing_start_key = _key(existing_start, existing_zone or "UTC")
             existing_end_key = _key(existing_end, existing_zone or "UTC")
-            effective_start_key = _key(effective_start, query_timezone)
-            effective_end_key = _key(effective_end, query_timezone)
+            effective_start_key = _key(effective_start, provisional_query_timezone)
+            effective_end_key = _key(effective_end, provisional_query_timezone)
+
+            # is_all_day changes the event's effective span even when the
+            # literal start/end clock values don't move (e.g. turning a
+            # 30-minute meeting into an all-day one) - treat that the same
+            # as a moved window for deciding whether to check the
+            # organizer at all (organizer conflicts are always safe to
+            # re-check: excluded by event id, not by window).
+            literal_window_changed = (effective_start_key, effective_end_key) != (
+                existing_start_key,
+                existing_end_key,
+            )
             existing_is_all_day = bool(existing.get("isAllDay"))
             effective_is_all_day = (
                 is_all_day if is_all_day is not None else existing_is_all_day
             )
-            check_organizer = (effective_start_key, effective_end_key) != (
-                existing_start_key,
-                existing_end_key,
-            ) or effective_is_all_day != existing_is_all_day
+            check_organizer = literal_window_changed or (
+                effective_is_all_day != existing_is_all_day
+            )
 
+            # An all-day event/toggle occupies the *whole* calendar day(s)
+            # it lands on, not just the literal clock-time slot it was
+            # given - widen the actual query window to that before
+            # checking, or a conflict elsewhere that day (or this event's
+            # own now-irrelevant narrow slot) would be missed/misjudged.
+            # Outside that case, query_start/query_end are exactly
+            # effective_start/effective_end, so their keys are exactly
+            # effective_start_key/effective_end_key already computed above
+            # - no need to recompute them from scratch.
             query_start, query_end = effective_start, effective_end
+            query_start_key, query_end_key = effective_start_key, effective_end_key
             if effective_is_all_day and effective_start and effective_end:
-                query_start, _ = _naive_day_bounds(effective_start, query_timezone)
+                query_start, _ = _naive_day_bounds(
+                    effective_start, provisional_query_timezone
+                )
                 end_of_its_day, next_day_start = _naive_day_bounds(
-                    effective_end, query_timezone
+                    effective_end, provisional_query_timezone
                 )
                 end_is_midnight = _is_midnight_in_timezone(
-                    effective_end, query_timezone
+                    effective_end, provisional_query_timezone
                 )
                 query_end = end_of_its_day if end_is_midnight else next_day_start
+                query_start_key = _key(query_start, provisional_query_timezone)
+                query_end_key = _key(query_end, provisional_query_timezone)
 
-            if check_organizer:
-                if not query_start or not query_end:
-                    raise ValueError(
-                        "Existing event has no complete time window; cannot safely "
-                        "check conflicts for this update."
-                    )
+            all_conflicts: list[dict[str, Any]] = []
+
+            # window_delta_segments is safe to call even when existing_zone
+            # is unknown: existing_start_key/existing_end_key and
+            # query_start_key/query_end_key all fall back to the same "UTC"
+            # assumption in that case (see the `_key` closure above), and a
+            # uniform (even if wrong) offset applied to both sides of the
+            # comparison can't change which portion is genuinely new
+            # territory - only the *absolute* query values sent to Graph
+            # below would be wrong, which is exactly what the fatal check
+            # right after this guards against, and only when a query is
+            # actually about to use them.
+            retained_segments = (
+                _window_delta_segments(
+                    existing_start_key, existing_end_key, query_start_key, query_end_key
+                )
+                if retained_attendees_raw
+                else []
+            )
+
+            any_query_needed = (
+                query_start
+                and query_end
+                and (check_organizer or added_attendees or retained_segments)
+            )
+            if any_query_needed:
+                # Only now, with a query actually about to run, does a
+                # missing existing-event timezone (relevant only when
+                # neither start_datetime nor end_datetime was given)
+                # become fatal rather than a moot point - a same-attendees,
+                # same-effective-window resubmission (retained_segments
+                # empty, no organizer/added-attendee query needed) must
+                # stay a no-op PATCH even if the existing event happens to
+                # be missing timezone info that would only matter for a
+                # query nothing here ends up needing.
                 if (
                     start_datetime is None
                     and end_datetime is None
                     and not existing_zone
                 ):
                     raise ValueError(
-                        "Existing event has no timeZone on its start time; cannot "
-                        "safely check conflicts for this update."
+                        "Existing event has no timeZone on its start "
+                        "time; cannot safely check conflicts for this "
+                        "update."
                     )
-                conflicts, unchecked_attendees = _find_conflicts(
+
+            try:
+                if query_start and query_end and (check_organizer or added_attendees):
+                    # A newly-added attendee has no footprint on this
+                    # event at all, so the FULL query window is safe (and
+                    # necessary) to check for them - same call also
+                    # covers the organizer, who's excluded by event id
+                    # rather than by window.
+                    conflicts, unchecked = _find_conflicts(
+                        query_start,
+                        query_end,
+                        provisional_query_timezone,
+                        added_attendees,
+                        exclude_event_id=event_id,
+                        check_organizer=check_organizer,
+                    )
+                    all_conflicts.extend(conflicts)
+                    unchecked_attendees.extend(unchecked)
+
+                # A retained attendee's own busy block for THIS event
+                # covers the entire OLD (unwidened, literal) window -
+                # querying that overlap can't tell "busy because of this
+                # event" from a real conflict. Only the portion of the
+                # query window that's genuinely new territory
+                # (window_delta_segments - empty for an unchanged/shrunk
+                # window, up to two segments for a partial nudge, or the
+                # whole query window for a disjoint move or an is_all_day
+                # widening) can hide a real conflict for them.
+                if retained_segments:
+                    for seg_start, seg_end in retained_segments:
+                        seg_start_naive = seg_start.astimezone(dt_timezone.utc).replace(
+                            tzinfo=None
+                        )
+                        seg_end_naive = seg_end.astimezone(dt_timezone.utc).replace(
+                            tzinfo=None
+                        )
+                        conflicts, unchecked = _find_conflicts(
+                            seg_start_naive.isoformat(),
+                            seg_end_naive.isoformat(),
+                            "UTC",
+                            retained_attendees_raw,
+                            exclude_event_id=event_id,
+                            check_organizer=False,
+                        )
+                        all_conflicts.extend(conflicts)
+                        unchecked_attendees.extend(unchecked)
+            except InsufficientScopeError as exc:
+                all_conflicts, unchecked_attendees = _merge_scope_error(
+                    exc, all_conflicts, unchecked_attendees
+                )
+
+            if all_conflicts:
+                # narrows for mypy: a conflict can only have been found by
+                # a query that ran, and every query above only runs when
+                # query_start/query_end (or the delta segments derived
+                # from them) are real values.
+                assert query_start is not None
+                assert query_end is not None
+                return _conflict_response(
+                    all_conflicts,
+                    unchecked_attendees,
                     query_start,
                     query_end,
-                    query_timezone,
-                    [],
-                    exclude_event_id=event_id,
-                    check_organizer=True,
                 )
-                if conflicts:
-                    return _conflict_response(
-                        conflicts, unchecked_attendees, query_start, query_end
-                    )
 
         result = _graph_request(
             "PATCH",

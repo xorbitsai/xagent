@@ -2397,14 +2397,17 @@ def test_upload_file_resolves_real_mime_type_for_ambiguous_extensions(
     assert sent_headers["Content-Type"] == "video/mp2t"
 
 
-def test_upload_file_raises_when_upload_session_has_no_url(
-    monkeypatch, _upload_allowed_dirs_env
+@pytest.mark.parametrize("session_payload", [{}, [], {"uploadUrl": 123}])
+def test_upload_file_raises_when_upload_session_has_no_valid_url(
+    monkeypatch, _upload_allowed_dirs_env, session_payload
 ):
     local_file = _upload_allowed_dirs_env / "big.bin"
     local_file.write_bytes(b"\x01" * (onedrive._UPLOAD_SESSION_CHUNK_SIZE + 1))
 
     monkeypatch.setattr(
-        onedrive.requests, "request", Mock(return_value=MockResponse({}))
+        onedrive.requests,
+        "request",
+        Mock(return_value=MockResponse(session_payload)),
     )
 
     result = json.loads(onedrive.onedrive_upload_file(str(local_file)))
@@ -2740,6 +2743,25 @@ def test_upload_file_rejects_file_over_max_upload_bytes(
     assert result["status"] == "error"
     assert "limit" in result["message"].lower()
     mock_request.assert_not_called()
+
+
+def test_upload_file_accepts_exact_max_upload_bytes(
+    monkeypatch, _upload_allowed_dirs_env
+):
+    local_file = _upload_allowed_dirs_env / "max-size.bin"
+    local_file.write_bytes(b"x")
+    monkeypatch.setattr(
+        onedrive.os,
+        "fstat",
+        Mock(return_value=Mock(st_size=onedrive._MAX_UPLOAD_BYTES)),
+    )
+    upload_large = Mock(return_value={"id": "item-1"})
+    monkeypatch.setattr(onedrive, "_upload_large_file_content", upload_large)
+
+    result = json.loads(onedrive.onedrive_upload_file(str(local_file)))
+
+    assert result["status"] == "success"
+    assert upload_large.call_args.args[2] == onedrive._MAX_UPLOAD_BYTES
 
 
 def test_upload_file_returns_error_payload_on_api_failure(

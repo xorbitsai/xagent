@@ -737,8 +737,8 @@ def _upload_large_file_content(
         )
     except (RuntimeError, requests.RequestException) as exc:
         raise _UploadError("Could not create OneDrive upload session") from exc
-    upload_url = session.get("uploadUrl")
-    if not upload_url:
+    upload_url = session.get("uploadUrl") if isinstance(session, dict) else None
+    if not isinstance(upload_url, str) or not upload_url:
         raise RuntimeError("OneDrive did not return an upload session URL")
 
     # One Session for every chunk of this upload -- a fresh top-level

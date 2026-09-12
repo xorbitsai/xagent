@@ -373,6 +373,32 @@ def test_create_event_preserves_an_exclusive_z_suffixed_all_day_end(monkeypatch)
     assert calendar_view_call.kwargs["params"]["endDateTime"] == (
         "2026-08-28T00:00:00+00:00"
     )
+    create_call = graph_request.call_args_list[1]
+    assert create_call.kwargs["body"]["start"]["dateTime"] == "2026-08-27T00:00:00"
+    assert create_call.kwargs["body"]["end"]["dateTime"] == "2026-08-28T00:00:00"
+
+
+def test_create_event_normalizes_all_day_payload_when_conflicts_are_ignored(
+    monkeypatch,
+):
+    graph_request = Mock(return_value={"id": "created"})
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_create_event(
+            subject="Company holiday",
+            start_datetime="2026-08-27T09:00:00",
+            end_datetime="2026-08-27T17:00:00",
+            is_all_day=True,
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    create_call = graph_request.call_args
+    assert create_call.args[:2] == ("POST", "/me/events")
+    assert create_call.kwargs["body"]["start"]["dateTime"] == "2026-08-27T00:00:00"
+    assert create_call.kwargs["body"]["end"]["dateTime"] == "2026-08-28T00:00:00"
 
 
 def test_create_event_batch_over_limit_is_chunked_into_multiple_calls(
@@ -661,6 +687,28 @@ def test_create_event_calendarview_follows_pagination(monkeypatch):
     # The nextLink is a complete, already-parameterized URL - no separate
     # params dict should be re-sent alongside it.
     assert second_call.kwargs.get("params") is None
+
+
+def test_create_event_fails_closed_when_calendarview_exceeds_page_limit(monkeypatch):
+    graph_request = Mock(
+        return_value={
+            "value": [],
+            "@odata.nextLink": f"{outlook.GRAPH_BASE_URL}/me/calendarView?%24skip=250",
+        }
+    )
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_create_event(
+            subject="Kickoff",
+            start_datetime="2026-08-27T10:00:00",
+            end_datetime="2026-08-27T10:30:00",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "pagination limit" in result["message"]
+    assert graph_request.call_count == outlook._MAX_CALENDAR_VIEW_PAGES
 
 
 def test_send_message_normalizes_and_dedupes_recipients(monkeypatch):

@@ -248,6 +248,12 @@ def _find_conflicts(
             if not next_link:
                 break
             next_path = _next_link_path(next_link)
+        else:
+            raise RuntimeError(
+                "Outlook calendar conflict check exceeded the pagination limit; "
+                "the event was not created because availability could not be "
+                "verified completely."
+            )
 
     # getSchedule accepts at most _MAX_ATTENDEES_PER_SCHEDULE_QUERY
     # schedules per call - chunk rather than giving up on the whole batch,
@@ -537,36 +543,27 @@ def outlook_create_event(
         _reject_reversed_window(start_datetime, end_datetime)
         normalized_attendees = _normalize_addresses(attendees) if attendees else []
 
+        # Graph requires all-day event boundaries to be midnight in the
+        # same timezone. Normalize both the availability query and the
+        # eventual write, including when ignore_conflicts bypasses the query.
+        effective_start, effective_end = start_datetime, end_datetime
+        if is_all_day:
+            effective_start, _ = _naive_day_bounds(start_datetime)
+            end_of_its_day, next_day_start = _naive_day_bounds(end_datetime)
+            parsed_end = _date_parser.isoparse(end_datetime)
+            end_is_midnight = (
+                parsed_end.hour == 0
+                and parsed_end.minute == 0
+                and parsed_end.second == 0
+                and parsed_end.microsecond == 0
+            )
+            effective_end = end_of_its_day if end_is_midnight else next_day_start
+
         unchecked_attendees: list[str] = []
         if not ignore_conflicts:
-            # An all-day event occupies the *whole* calendar day(s) it
-            # lands on, not just the literal clock-time slot given -
-            # widen the query window to that before checking, or a
-            # conflict elsewhere that day would be missed. Graph itself
-            # doesn't require start/end to already be day-aligned for
-            # isAllDay=True, so a caller passing e.g. business hours with
-            # is_all_day=True must still get the whole day checked.
-            query_start, query_end = start_datetime, end_datetime
-            if is_all_day:
-                query_start, _ = _naive_day_bounds(start_datetime)
-                end_of_its_day, next_day_start = _naive_day_bounds(end_datetime)
-                # end_datetime may already BE a well-formed exclusive day
-                # boundary (exactly midnight) - naive_day_bounds always
-                # treats its input as a day that needs widening to [that
-                # midnight, next midnight), so applying it unconditionally
-                # would push an already-correct boundary one whole day
-                # too far.
-                parsed_end = _date_parser.isoparse(end_datetime)
-                end_is_midnight = (
-                    parsed_end.hour == 0
-                    and parsed_end.minute == 0
-                    and parsed_end.second == 0
-                    and parsed_end.microsecond == 0
-                )
-                query_end = end_of_its_day if end_is_midnight else next_day_start
             try:
                 conflicts, unchecked_attendees = _find_conflicts(
-                    query_start, query_end, timezone, normalized_attendees
+                    effective_start, effective_end, timezone, normalized_attendees
                 )
             except InsufficientScopeError as exc:
                 conflicts, unchecked_attendees = _merge_scope_error(exc, [], [])
@@ -574,14 +571,14 @@ def outlook_create_event(
                 return _conflict_response(
                     conflicts,
                     unchecked_attendees,
-                    query_start,
-                    query_end,
+                    effective_start,
+                    effective_end,
                 )
 
         payload: dict[str, Any] = {
             "subject": subject,
-            "start": {"dateTime": start_datetime, "timeZone": timezone},
-            "end": {"dateTime": end_datetime, "timeZone": timezone},
+            "start": {"dateTime": effective_start, "timeZone": timezone},
+            "end": {"dateTime": effective_end, "timeZone": timezone},
             "isAllDay": is_all_day,
         }
         if body:

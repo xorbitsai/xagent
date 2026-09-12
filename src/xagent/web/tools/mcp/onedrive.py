@@ -1,9 +1,11 @@
 import base64
 import json
 import logging
+import math
 import mimetypes
 import os
 import time
+from datetime import timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
@@ -48,6 +50,10 @@ _SIMPLE_UPLOAD_MAX_BYTES = 4_000_000
 # is exactly 16 * 320 KiB.
 _UPLOAD_SESSION_CHUNK_SIZE = 5 * 1024 * 1024
 _UPLOAD_CHUNK_MAX_ATTEMPTS = 3
+# Forward progress resets the consecutive-failure counter, so keep a separate
+# cap on recovery cycles within one buffered fragment to prevent a server that
+# advances by tiny ranges from extending a synchronous call without bound.
+_UPLOAD_CHUNK_MAX_RECOVERY_CYCLES = 12
 _UPLOAD_RETRY_BASE_SECONDS = 1.0
 _UPLOAD_RETRY_MAX_SECONDS = 10.0
 # Not a Graph API limit (OneDrive itself supports files far larger than
@@ -286,7 +292,7 @@ def _safe_upload_error_message(exc: BaseException) -> str:
     """Describe an upload failure without copying a request URL from it."""
     if isinstance(exc, _UploadError):
         return str(exc)
-    cause = exc
+    cause = _request_error_cause(exc)
     if isinstance(cause, requests.Timeout):
         return "OneDrive upload fragment timed out"
     if isinstance(cause, requests.ConnectionError):
@@ -326,13 +332,20 @@ def _retry_delay(headers: Any, retry_number: int) -> float:
     retry_after = headers.get("Retry-After")
     if retry_after is not None:
         try:
-            return min(max(float(retry_after), 0.0), _UPLOAD_RETRY_MAX_SECONDS)
+            retry_seconds = float(retry_after)
+            if math.isfinite(retry_seconds):
+                return min(max(retry_seconds, 0.0), _UPLOAD_RETRY_MAX_SECONDS)
         except (TypeError, ValueError):
-            try:
-                retry_at = parsedate_to_datetime(str(retry_after)).timestamp()
-                return min(max(retry_at - time.time(), 0.0), _UPLOAD_RETRY_MAX_SECONDS)
-            except (TypeError, ValueError, OverflowError):
-                pass
+            pass
+        try:
+            retry_at = parsedate_to_datetime(str(retry_after))
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=timezone.utc)
+            retry_seconds = retry_at.timestamp() - time.time()
+            if math.isfinite(retry_seconds):
+                return min(max(retry_seconds, 0.0), _UPLOAD_RETRY_MAX_SECONDS)
+        except (TypeError, ValueError, OverflowError):
+            pass
     exponential_delay = _UPLOAD_RETRY_BASE_SECONDS * (2.0 ** (retry_number - 1))
     return min(exponential_delay, _UPLOAD_RETRY_MAX_SECONDS)
 
@@ -377,8 +390,7 @@ def _current_upload_item(remote_path: str) -> dict[str, Any] | None:
             params={"$select": "id,name,size,file"},
         )
     except RuntimeError as exc:
-        cause = exc.__cause__
-        if getattr(getattr(cause, "response", None), "status_code", None) == 404:
+        if _upload_status_code(exc) == 404:
             return None
         raise _UploadError("Could not inspect the OneDrive upload target") from exc
     return item if isinstance(item, dict) and item.get("id") else None
@@ -443,6 +455,23 @@ def _reconcile_upload_progress(
                     "OneDrive upload session disappeared before completion"
                 )
             _raise_upload_status(response)
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                raise _UploadError(
+                    "OneDrive returned invalid upload-session progress"
+                ) from exc
+            if (
+                isinstance(payload, dict)
+                and payload.get("id")
+                and "nextExpectedRanges" not in payload
+            ):
+                if end < total:
+                    raise _UploadError(
+                        "OneDrive reported completion before the local final fragment"
+                    )
+                completed = True
+                break
             next_offset = _next_expected_upload_offset(response, total)
             if next_offset < start:
                 raise _UploadError(
@@ -458,11 +487,10 @@ def _reconcile_upload_progress(
                 )
             if next_offset < end:
                 return next_offset, None
-            if next_offset >= end:
-                if end == total:
-                    completed = True
-                    break
-                return next_offset, None
+            if end == total:
+                completed = True
+                break
+            return next_offset, None
         except Exception as exc:
             last_error = exc
             if not _is_retriable_upload_error(exc):
@@ -760,7 +788,11 @@ def _upload_large_file_content(
                 # Content-Length/Content-Range are documented there), but
                 # sending it costs nothing and is the closest available
                 # lever to the simple path's behavior.
-                for attempt in range(1, _UPLOAD_CHUNK_MAX_ATTEMPTS + 1):
+                consecutive_failures = 0
+                recovery_cycles = 0
+                response: Any | None = None
+                while True:
+                    upload_error: BaseException | None = None
                     try:
                         response = http.put(
                             upload_url,
@@ -775,34 +807,19 @@ def _upload_large_file_content(
                             timeout=_BINARY_UPLOAD_TIMEOUT_SECONDS,
                         )
                         _raise_upload_status(response)
-                        if end == total and response.status_code not in (200, 201):
-                            next_offset, completed_item = _reconcile_upload_progress(
-                                http,
-                                upload_url,
-                                remote_path,
-                                fragment_start,
-                                end,
-                                total,
-                                quickxor_hash.base64_digest(),
-                            )
-                            if completed_item is not None:
-                                result = completed_item
-                                break
-                            if next_offset == end:
-                                break
-                            end = refill_fragment(chunk, fragment_start, next_offset)
-                            fragment_start = next_offset
-                            if attempt == _UPLOAD_CHUNK_MAX_ATTEMPTS:
-                                raise _UploadError(
-                                    "OneDrive did not confirm the upload completed"
-                                )
-                            time.sleep(_retry_delay(response.headers, attempt))
-                            continue
-                        break
+                        if end < total or response.status_code in (200, 201):
+                            break
                     except Exception as exc:
                         status_code = _upload_status_code(exc)
-                        if not (_is_retriable_upload_error(exc) or status_code == 416):
+                        if not (
+                            _is_retriable_upload_error(exc)
+                            or status_code in (404, 409, 416)
+                        ):
                             raise
+                        upload_error = exc
+
+                    recovery_cycles += 1
+                    try:
                         next_offset, completed_item = _reconcile_upload_progress(
                             http,
                             upload_url,
@@ -812,24 +829,54 @@ def _upload_large_file_content(
                             total,
                             quickxor_hash.base64_digest(),
                         )
+                    except Exception as reconcile_error:
+                        if not _is_retriable_upload_error(reconcile_error):
+                            raise
+                        consecutive_failures += 1
+                        if consecutive_failures >= _UPLOAD_CHUNK_MAX_ATTEMPTS:
+                            raise _UploadError(
+                                "Could not determine OneDrive upload-session progress"
+                            ) from reconcile_error
+                        delay = _upload_retry_delay(
+                            reconcile_error, consecutive_failures
+                        )
+                    else:
                         if completed_item is not None:
                             result = completed_item
                             break
                         if next_offset == end:
                             break
-                        end = refill_fragment(chunk, fragment_start, next_offset)
-                        fragment_start = next_offset
-                        if attempt == _UPLOAD_CHUNK_MAX_ATTEMPTS:
-                            raise
-                        delay = _upload_retry_delay(exc, attempt)
-                        logger.warning(
-                            "Retrying OneDrive upload fragment after a transient "
-                            "failure (attempt %s/%s, delay %.1fs)",
-                            attempt + 1,
-                            _UPLOAD_CHUNK_MAX_ATTEMPTS,
-                            delay,
+                        if next_offset > fragment_start:
+                            end = refill_fragment(chunk, fragment_start, next_offset)
+                            fragment_start = next_offset
+                            consecutive_failures = 0
+                        else:
+                            consecutive_failures += 1
+                            if consecutive_failures >= _UPLOAD_CHUNK_MAX_ATTEMPTS:
+                                raise _UploadError(
+                                    "OneDrive upload fragment made no forward progress"
+                                ) from upload_error
+                        retry_number = max(consecutive_failures, 1)
+                        delay = (
+                            _upload_retry_delay(upload_error, retry_number)
+                            if upload_error is not None
+                            else _retry_delay(
+                                getattr(response, "headers", None), retry_number
+                            )
                         )
-                        time.sleep(delay)
+
+                    if recovery_cycles >= _UPLOAD_CHUNK_MAX_RECOVERY_CYCLES:
+                        raise _UploadError(
+                            "OneDrive upload fragment exceeded its recovery budget"
+                        ) from upload_error
+                    logger.warning(
+                        "Retrying OneDrive upload fragment after reconciliation "
+                        "(recovery cycle %s/%s, delay %.1fs)",
+                        recovery_cycles + 1,
+                        _UPLOAD_CHUNK_MAX_RECOVERY_CYCLES,
+                        delay,
+                    )
+                    time.sleep(delay)
                 # Only the final chunk's response carries the completed
                 # item; Graph's intermediate (202) responses return upload-
                 # progress info, not the item -- checked explicitly
@@ -840,6 +887,10 @@ def _upload_large_file_content(
                 if end == total:
                     if result.get("id"):
                         break
+                    if response is None:
+                        raise _UploadError(
+                            "OneDrive did not return a final upload response"
+                        )
                     try:
                         final_item = response.json() if response.content else {}
                     except ValueError:
@@ -1035,8 +1086,8 @@ def onedrive_upload_file(
     filename, falling back to "application/octet-stream". It is sent on both
     simple uploads and upload-session chunks.
 
-    Rejects a file over _MAX_UPLOAD_BYTES (2 GiB) -- a guard-rail against a
-    mistargeted upload, not a OneDrive/Graph limit.
+    Empty files are rejected. Files over 2 GiB are also rejected as a
+    guard-rail against a mistargeted upload, not as a OneDrive/Graph limit.
     """
     try:
         local_path = _resolve_upload_file_path(local_file_path)
@@ -1087,7 +1138,7 @@ def onedrive_upload_file(
             if file_size > _MAX_UPLOAD_BYTES:
                 raise ValueError(
                     f"File is {file_size} bytes, over the "
-                    f"{_MAX_UPLOAD_BYTES // (1024 * 1024 * 1024)}GB limit for "
+                    f"{_MAX_UPLOAD_BYTES // (1024 * 1024 * 1024)} GiB limit for "
                     "onedrive_upload_file"
                 )
 

@@ -631,6 +631,36 @@ def test_upload_large_file_content_reads_bounded_chunks_from_disk(monkeypatch):
     assert _TrackingBuffer.max_read_size <= chunk_size
 
 
+def test_upload_large_file_content_handles_exact_chunk_multiple(monkeypatch):
+    chunk_size = onedrive._UPLOAD_SESSION_CHUNK_SIZE
+    total_size = 2 * chunk_size
+    monkeypatch.setattr(
+        onedrive.requests,
+        "request",
+        Mock(return_value=MockResponse({"uploadUrl": "https://upload.example/s"})),
+    )
+    mock_put = Mock(
+        side_effect=[
+            MockResponse({}, status_code=202),
+            MockResponse({"id": "item-1"}, status_code=201),
+        ]
+    )
+    _patch_session(monkeypatch, _FakeSession(put=mock_put))
+
+    result = onedrive._upload_large_file_content(
+        "big.bin",
+        io.BytesIO(b"\x00" * total_size),
+        total_size,
+        "application/octet-stream",
+    )
+
+    assert result == {"id": "item-1"}
+    assert mock_put.call_count == 2
+    assert mock_put.call_args_list[-1].kwargs["headers"]["Content-Range"] == (
+        f"bytes {chunk_size}-{total_size - 1}/{total_size}"
+    )
+
+
 def test_upload_large_file_content_does_not_forward_chunk_error_body(
     monkeypatch,
 ):
@@ -704,7 +734,7 @@ def test_upload_large_file_content_never_leaks_upload_url_on_chunk_failure(
             )
 
     assert sentinel_url not in str(exc_info.value)
-    assert "HTTP 416" in str(exc_info.value)
+    assert "made no forward progress" in str(exc_info.value)
     for record in caplog.records:
         assert sentinel_url not in record.getMessage()
 
@@ -1177,6 +1207,83 @@ def test_upload_large_file_content_retries_transient_reconciliation_get(monkeypa
     assert mock_put.call_count == 3
 
 
+def test_upload_large_file_content_retries_put_after_reconcile_exhaustion(monkeypatch):
+    chunk_size = onedrive._UPLOAD_SESSION_CHUNK_SIZE
+    total_size = chunk_size + 10
+    monkeypatch.setattr(
+        onedrive.requests,
+        "request",
+        Mock(return_value=MockResponse({"uploadUrl": "https://upload.example/s"})),
+    )
+    mock_put = Mock(
+        side_effect=[
+            requests.ConnectionError("response lost"),
+            MockResponse({}, status_code=202),
+            MockResponse({"id": "item-1"}, status_code=201),
+        ]
+    )
+    mock_get = Mock(
+        side_effect=[
+            MockResponse({}, status_code=503)
+            for _ in range(onedrive._UPLOAD_CHUNK_MAX_ATTEMPTS)
+        ]
+    )
+    _patch_session(monkeypatch, _FakeSession(put=mock_put, get=mock_get))
+
+    result = onedrive._upload_large_file_content(
+        "big.bin",
+        io.BytesIO(b"\x00" * total_size),
+        total_size,
+        "application/octet-stream",
+    )
+
+    assert result == {"id": "item-1"}
+    assert mock_put.call_count == 3
+    assert mock_get.call_count == onedrive._UPLOAD_CHUNK_MAX_ATTEMPTS
+
+
+def test_upload_large_file_content_resets_failures_after_forward_progress(monkeypatch):
+    chunk_size = onedrive._UPLOAD_SESSION_CHUNK_SIZE
+    total_size = 3 * chunk_size
+    partial_offsets = [1 * 1024 * 1024, 2 * 1024 * 1024, 3 * 1024 * 1024]
+    monkeypatch.setattr(
+        onedrive.requests,
+        "request",
+        Mock(return_value=MockResponse({"uploadUrl": "https://upload.example/s"})),
+    )
+    mock_put = Mock(
+        side_effect=[requests.ConnectionError("response lost") for _ in partial_offsets]
+        + [
+            MockResponse({}, status_code=202),
+            MockResponse({}, status_code=202),
+            MockResponse({"id": "item-1"}, status_code=201),
+        ]
+    )
+    mock_get = Mock(
+        side_effect=[
+            MockResponse({"nextExpectedRanges": [f"{offset}-"]})
+            for offset in partial_offsets
+        ]
+    )
+    mock_delete = Mock(return_value=MockResponse({}))
+    _patch_session(
+        monkeypatch,
+        _FakeSession(put=mock_put, get=mock_get, delete=mock_delete),
+    )
+
+    result = onedrive._upload_large_file_content(
+        "big.bin",
+        io.BytesIO(b"\x00" * total_size),
+        total_size,
+        "application/octet-stream",
+    )
+
+    assert result == {"id": "item-1"}
+    assert mock_get.call_count == len(partial_offsets)
+    assert mock_put.call_count == 6
+    mock_delete.assert_not_called()
+
+
 def test_upload_large_file_content_confirms_lost_final_response(monkeypatch):
     chunk_size = onedrive._UPLOAD_SESSION_CHUNK_SIZE
     total_size = chunk_size + 10
@@ -1264,6 +1371,93 @@ def test_upload_large_file_content_treats_empty_ranges_as_final_completion(
     )
 
     assert result["id"] == "item-1"
+    mock_get.assert_called_once()
+
+
+def test_upload_large_file_content_accepts_completed_item_from_status_get(monkeypatch):
+    chunk_size = onedrive._UPLOAD_SESSION_CHUNK_SIZE
+    total_size = chunk_size + 10
+    content = b"\x00" * total_size
+    expected_hash = _quickxor_hash(content)
+    completed_item = {
+        "id": "item-1",
+        "size": total_size,
+        "file": {"hashes": {"quickXorHash": expected_hash}},
+    }
+    monkeypatch.setattr(
+        onedrive.requests,
+        "request",
+        Mock(
+            side_effect=[
+                MockResponse({"uploadUrl": "https://upload.example/s"}),
+                MockResponse(completed_item),
+            ]
+        ),
+    )
+    mock_get = Mock(return_value=MockResponse(completed_item, status_code=200))
+    _patch_session(
+        monkeypatch,
+        _FakeSession(
+            put=Mock(
+                side_effect=[
+                    MockResponse({}, status_code=202),
+                    requests.ConnectionError("final response lost"),
+                ]
+            ),
+            get=mock_get,
+        ),
+    )
+
+    result = onedrive._upload_large_file_content(
+        "big.bin", io.BytesIO(content), total_size, "application/octet-stream"
+    )
+
+    assert result == completed_item
+    mock_get.assert_called_once()
+
+
+@pytest.mark.parametrize("fragment_status", [404, 409])
+def test_upload_large_file_content_reconciles_final_fragment_status(
+    monkeypatch, fragment_status
+):
+    chunk_size = onedrive._UPLOAD_SESSION_CHUNK_SIZE
+    total_size = chunk_size + 10
+    content = b"\x00" * total_size
+    expected_hash = _quickxor_hash(content)
+    completed_item = {
+        "id": "item-1",
+        "size": total_size,
+        "file": {"hashes": {"quickXorHash": expected_hash}},
+    }
+    monkeypatch.setattr(
+        onedrive.requests,
+        "request",
+        Mock(
+            side_effect=[
+                MockResponse({"uploadUrl": "https://upload.example/s"}),
+                MockResponse(completed_item),
+            ]
+        ),
+    )
+    mock_get = Mock(return_value=MockResponse({}, status_code=404))
+    _patch_session(
+        monkeypatch,
+        _FakeSession(
+            put=Mock(
+                side_effect=[
+                    MockResponse({}, status_code=202),
+                    MockResponse({}, status_code=fragment_status),
+                ]
+            ),
+            get=mock_get,
+        ),
+    )
+
+    result = onedrive._upload_large_file_content(
+        "big.bin", io.BytesIO(content), total_size, "application/octet-stream"
+    )
+
+    assert result == completed_item
     mock_get.assert_called_once()
 
 
@@ -1357,6 +1551,21 @@ def test_upload_retry_delay_accepts_http_date(monkeypatch):
     ) == pytest.approx(7.0)
 
 
+@pytest.mark.parametrize("invalid_delay", ["nan", "inf", "-inf"])
+def test_upload_retry_delay_rejects_non_finite_seconds(invalid_delay):
+    assert onedrive._retry_delay({"Retry-After": invalid_delay}, 2) == pytest.approx(
+        2.0
+    )
+
+
+def test_upload_retry_delay_treats_naive_http_date_as_utc(monkeypatch):
+    monkeypatch.setattr(onedrive.time, "time", Mock(return_value=0.0))
+
+    assert onedrive._retry_delay(
+        {"Retry-After": "Thu, 01 Jan 1970 00:00:07"}, 1
+    ) == pytest.approx(7.0)
+
+
 def test_upload_large_file_content_still_cancels_on_a_non_retriable_failure(
     monkeypatch,
 ):
@@ -1417,7 +1626,7 @@ def test_upload_large_file_content_fails_on_a_non_first_chunk(monkeypatch):
         _FakeSession(put=mock_put, get=mock_get, delete=mock_delete),
     )
 
-    with pytest.raises(RuntimeError, match="HTTP 416"):
+    with pytest.raises(RuntimeError, match="made no forward progress"):
         onedrive._upload_large_file_content(
             "big.bin", fh, total_size, "application/octet-stream"
         )

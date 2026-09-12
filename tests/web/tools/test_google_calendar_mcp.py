@@ -198,6 +198,7 @@ def test_update_event_recurrence_rejects_an_exception_on_a_later_list_page(
 ):
     existing_event = {
         "id": "existing-1",
+        "iCalUID": "series@example.com",
         "start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "UTC"},
         "end": {"dateTime": "2026-08-26T08:00:00", "timeZone": "UTC"},
         "recurrence": ["RRULE:FREQ=DAILY;COUNT=5"],
@@ -242,6 +243,7 @@ def test_update_event_recurrence_rejects_an_exception_on_a_later_list_page(
     assert len(list_calls) == 2
     assert list_calls[0].kwargs["singleEvents"] is False
     assert list_calls[0].kwargs["showDeleted"] is True
+    assert list_calls[0].kwargs["iCalUID"] == "series@example.com"
     assert "pageToken" not in list_calls[0].kwargs
     assert list_calls[1].kwargs["pageToken"] == "page-2"
     service.events.return_value.update.assert_not_called()
@@ -682,7 +684,7 @@ def test_create_events_sets_recurrence(monkeypatch):
     assert kwargs["body"]["end"]["timeZone"] == "Asia/Shanghai"
 
 
-def test_create_events_stamps_timezone_even_when_recurrence_has_its_own_offset(
+def test_create_events_stamps_matching_timezone_when_recurrence_has_its_own_offset(
     monkeypatch,
 ):
     """Google's EventDateTime reference requires timeZone unconditionally
@@ -699,7 +701,7 @@ def test_create_events_stamps_timezone_even_when_recurrence_has_its_own_offset(
             summary="Weekly sync",
             start_time="2026-08-26T09:00:00+08:00",
             end_time="2026-08-26T10:00:00+08:00",
-            timezone="America/Los_Angeles",
+            timezone="Asia/Shanghai",
             recurrence="FREQ=WEEKLY;COUNT=5",
             ignore_conflicts=True,
         )
@@ -707,8 +709,28 @@ def test_create_events_stamps_timezone_even_when_recurrence_has_its_own_offset(
 
     assert result["status"] == "success"
     _, kwargs = service.events.return_value.insert.call_args
-    assert kwargs["body"]["start"]["timeZone"] == "America/Los_Angeles"
-    assert kwargs["body"]["end"]["timeZone"] == "America/Los_Angeles"
+    assert kwargs["body"]["start"]["timeZone"] == "Asia/Shanghai"
+    assert kwargs["body"]["end"]["timeZone"] == "Asia/Shanghai"
+
+
+def test_create_events_rejects_recurrence_offset_timezone_conflict(monkeypatch):
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Weekly sync",
+            start_time="2026-08-26T09:00:00+08:00",
+            end_time="2026-08-26T10:00:00+08:00",
+            timezone="America/Los_Angeles",
+            recurrence="FREQ=WEEKLY;COUNT=5",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "start_time offset conflicts with timeZone" in result["message"]
+    service.events.return_value.insert.assert_not_called()
 
 
 def test_create_events_skips_timezone_on_its_own_offset_without_recurrence(

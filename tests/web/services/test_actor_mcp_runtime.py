@@ -8,16 +8,22 @@ import uuid
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
+from mcp.types import Tool as MCPTool
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session
 
+from xagent.core.tools.adapters.vibe import mcp_adapter
 from xagent.core.tools.adapters.vibe.config import (
     ACTOR_STDIO_SESSION_RUNTIME_UNAVAILABLE_REASON,
     ACTOR_STDIO_SHADOWED_REASON,
 )
 from xagent.core.tools.adapters.vibe.factory import ToolFactory
+from xagent.core.tools.adapters.vibe.sandboxed_tool.chrome_session import (
+    ChromeExecutionSessionPool,
+)
 from xagent.web.builtin_mcp_registry import get_builtin_execution_fields
 from xagent.web.models.database import Base
 from xagent.web.models.public_mcp import PublicMCPApp
@@ -1261,6 +1267,76 @@ async def test_web_loader_keeps_chrome_identity_in_host_only_side_channel(
     assert "actor_stdio_session_identity" not in result[0]
     identities = config.get_actor_mcp_stdio_session_identities()
     assert identities["chrome-devtools"].connection.app_id == "chrome-devtools"
+
+
+def test_web_loader_has_no_chrome_consumer_without_session_identity(db: Session):
+    config = WebToolConfig(db=db, request=None, user_id=USER_ID)
+
+    assert config.get_actor_mcp_stdio_session_identities() == {}
+    assert config.get_actor_mcp_stdio_session_consumer() is None
+
+
+@pytest.mark.asyncio
+async def test_storage_to_tool_factory_uses_host_only_chrome_consumer(
+    db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("XAGENT_TOBY_PERSONAL_STDIO_ENABLED", "true")
+    app = _seed_app(db, app_id="chrome-devtools")
+    adapter = _FakeAdapter(_identity(app), None)
+    config = WebToolConfig(
+        db=db,
+        request=None,
+        user_id=USER_ID,
+        mcp_runtime_authorization_policy=_policy(),
+        mcp_actor_stdio_connection_adapter=adapter,
+        mcp_actor_execution_identity=_execution_identity(),
+    )
+    monkeypatch.setattr(
+        config,
+        "_visible_mcp_server_query",
+        lambda _team_ids: SimpleNamespace(all=lambda: []),
+    )
+    configs = await config._load_mcp_server_configs()
+    pool = AsyncMock(spec=ChromeExecutionSessionPool)
+    pool.get_or_create.return_value = SimpleNamespace(sandbox=object())
+    serialized_connections: list[Mapping[str, object]] = []
+
+    async def list_tools(_sandbox: object, connection: Mapping[str, object]):
+        serialized_connections.append(connection)
+        json.dumps(connection)
+        return [
+            MCPTool(
+                name="navigate_page",
+                description="Navigate",
+                inputSchema={"type": "object", "properties": {}},
+            )
+        ]
+
+    monkeypatch.setattr(mcp_adapter, "list_tools_in_sandbox", list_tools)
+    monkeypatch.setattr(
+        "xagent.web.services.chrome_mcp_runtime.get_chrome_execution_session_pool",
+        lambda: pool,
+    )
+
+    tools = await ToolFactory._create_mcp_tools_from_configs(
+        configs,
+        actor_stdio_session_identities=(
+            config.get_actor_mcp_stdio_session_identities()
+        ),
+        actor_stdio_session_consumer=(config.get_actor_mcp_stdio_session_consumer()),
+    )
+
+    assert len(tools) == 1
+    assert serialized_connections
+    assert all("actor_stdio_session_identity" not in item for item in configs)
+    assert all(
+        "actor_stdio_session_identity" not in item for item in serialized_connections
+    )
+    assert OWNER not in repr(serialized_connections)
+    assert all(
+        item.get("env", {}).get("XAGENT_MCP_CALLER_ID") is None
+        for item in serialized_connections
+    )
 
 
 @pytest.mark.parametrize(

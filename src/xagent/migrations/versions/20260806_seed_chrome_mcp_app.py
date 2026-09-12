@@ -45,9 +45,8 @@ ROW = {
     "provider_name": None,
     "category": "Productivity",
     "oauth_scopes": None,
-    # Hidden until the runtime supports execution-scoped (persistent) stdio
-    # MCP sessions — see builtin_mcp_registry.py's chrome row. Admins can
-    # re-enable via PATCH /api/admin/mcp/apps once that lands.
+    # Hidden/default-off. Durable lifecycle ownership and crash reclaim must
+    # land before this connector is enabled; see xorbitsai/xagent#2281.
     "is_visible_in_connector": False,
     # Keyless (non-oauth): no required_env — connecting only creates the
     # per-user association via POST /api/mcp/apps/{id}/connect.

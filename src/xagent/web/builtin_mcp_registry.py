@@ -1008,14 +1008,14 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "provider_name": None,
             "category": "Productivity",
             "oauth_scopes": None,
-            # Hidden until the runtime supports execution-scoped (persistent)
-            # stdio MCP sessions: today every tool call spawns a fresh
-            # chrome-devtools-mcp process (mcp_adapter._execute_mcp_call ->
-            # create_session), so browser/page state does not survive across
-            # calls and any multi-step flow (navigate -> click/fill) breaks.
-            # Once persistent sessions land, admins can re-enable via
-            # PATCH /api/admin/mcp/apps — is_visible_in_connector is not a
-            # builtin-protected field, so no redeploy is needed.
+            # Runtime-only metadata. This is intentionally outside
+            # launch_config so enabling execution-scoped session handling does
+            # not create persisted PublicMCPApp execution drift.
+            "stdio_session_scope": "execution",
+            # Hidden/default-off while execution-scoped sessions remain an
+            # enablement primitive. Durable cross-process ownership and crash
+            # reclaim tracked by xorbitsai/xagent#2281 must land before this is
+            # exposed in a multi-worker deployment.
             "is_visible_in_connector": False,
             # Keyless (non-oauth): no secrets to collect — connecting only
             # creates the per-user association via POST /api/mcp/apps/{id}/connect.
@@ -1029,21 +1029,18 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             # one is configured) independently pre-install this exact
             # version and warm an npx cache for it. That warm-up is
             # intended to make npx resolve locally instead of hitting the
-            # npm registry on every launch, but currently does not: the
-            # MCP stdio launcher this connector's process goes through
-            # only forwards a fixed env allowlist to the spawned npx
-            # child (no NPM_CONFIG_CACHE), so every launch still needs
-            # npm-registry access regardless of the warm-up -- tracked in
-            # xorbitsai/xagent#1869, not yet fixed here.
+            # npm registry on every launch. The execution-scoped controller
+            # explicitly passes NPM_CONFIG_CACHE and disables update checks.
             # No --executablePath/--channel: the default "stable" channel
             # resolution finds Chrome per-platform (/Applications/... on
             # macOS dev hosts, /opt/google/chrome/chrome in both the
             # backend and sandbox images, which each guarantee that path
             # exists) — a hardcoded path here would break every other
             # platform.
-            # --chrome-arg='--no-sandbox'/'--disable-setuid-sandbox': both
-            # the backend and sandbox containers run Chrome as root,
-            # needing the same root/no-sandbox exposure the existing
+            # --chrome-arg='--no-sandbox'/'--disable-setuid-sandbox': the
+            # Docker sandbox backend runs Chrome as root while Boxlite uses
+            # the image's uid 1100. This matches the root/no-sandbox exposure
+            # the existing
             # browser_use tool (core/tools/core/browser_use.py) already
             # carries in the backend image -- not identical flags
             # (browser_use passes only --no-sandbox, plus
@@ -1066,11 +1063,8 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                     # npm-exec flag, must precede the package spec: intended
                     # to let the exact-version cache warmed at image build
                     # time (both Dockerfile.backend and Dockerfile.sandbox)
-                    # skip the npm registry at launch, though that warm-up
-                    # currently doesn't reach this connector's actual npx
-                    # process (xorbitsai/xagent#1869) -- harmless either
-                    # way, since --prefer-offline still falls back to a
-                    # normal fetch on any cache miss.
+                    # skip the npm registry at launch. --prefer-offline still
+                    # falls back to a normal fetch on any cache miss.
                     "--prefer-offline",
                     "chrome-devtools-mcp@1.6.0",
                     "--headless",

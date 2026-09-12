@@ -1942,6 +1942,15 @@ async def shutdown_event() -> None:
     shutdown_task_runtime_hook_executor()
     unregister_local_browser_runtime()
 
+    from .services.chrome_mcp_runtime import (
+        shutdown_chrome_execution_session_pool,
+    )
+
+    try:
+        await shutdown_chrome_execution_session_pool()
+    except Exception:
+        logger.error("Failed to drain Chrome execution sessions", exc_info=True)
+
     # Shutdown all sandboxes
     from .sandbox_manager import get_sandbox_manager
 

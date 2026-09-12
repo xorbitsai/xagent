@@ -2081,6 +2081,18 @@ class WebToolConfig(BaseToolConfig):
 
         return dict(self._mcp_actor_stdio_session_identities)
 
+    def get_actor_mcp_stdio_session_consumer(self) -> Any:
+        """Return the sandbox-only Chrome consumer for host-side identities."""
+
+        if not self._mcp_actor_stdio_session_identities:
+            return None
+
+        from ..services.chrome_mcp_runtime import (
+            consume_chrome_actor_stdio_session,
+        )
+
+        return consume_chrome_actor_stdio_session
+
     def _serialize_mcp_user_id(self) -> str:
         """Return the explicit identity used to isolate an MCP config."""
         if self._user_id is None:

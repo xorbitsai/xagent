@@ -30,8 +30,9 @@ from typing import (
 )
 
 import httpx
+from mcp.types import CallToolResult
 from mcp.types import Tool as MCPTool
-from pydantic import BaseModel, Field, create_model
+from pydantic import BaseModel, Field, ValidationError, create_model
 
 from ..... import config as _root_config
 from .....sandbox.base import Sandbox
@@ -49,7 +50,16 @@ from .connector_runtime import (
     connector_runtime_from_config,
     runtime_bindings_from_config,
 )
+from .sandboxed_tool.chrome_session import (
+    ChromeDaemonLaunchSpec,
+    ChromeExecutionScope,
+    ChromeExecutionSessionPool,
+    ChromeSessionContractError,
+    chrome_metadata_connection,
+)
 from .sandboxed_tool.sandboxed_mcp_tool_helper import (
+    SandboxedMCPLoadResult,
+    list_tools_in_sandbox,
     load_sandboxed_mcp_tools,
     should_sandbox_mcp_connection,
 )
@@ -861,6 +871,43 @@ def _mcp_return_value_as_string(value: Any) -> str:
         return str(value)
 
 
+def _normalized_mcp_call_result(
+    value: Any, *, validate_wire: bool = False
+) -> dict[str, Any]:
+    """Validate a wire result and render the stable agent-facing shape."""
+
+    if validate_wire:
+        if (
+            not isinstance(value, Mapping)
+            or type(value.get("isError", False)) is not bool
+        ):
+            raise ChromeSessionContractError("Chrome daemon returned invalid result")
+        try:
+            result = CallToolResult.model_validate(value)
+        except ValidationError as exc:
+            raise ChromeSessionContractError(
+                "Chrome daemon returned invalid result"
+            ) from exc
+    else:
+        result = value
+    content = []
+    if result.content:
+        for content_item in result.content:
+            if hasattr(content_item, "model_dump"):
+                content.append(content_item.model_dump())
+            else:
+                content.append({"text": str(content_item)})
+    # MCP SDK 1.x and 2.x expose different Python attribute spellings, while
+    # the wire aliases remain stable. Keep aliases here and handle content
+    # separately so nested content metadata is not renamed unexpectedly.
+    other_fields = result.model_dump(by_alias=True, exclude={"content"})
+    return {
+        "content": content,
+        "structured_content": other_fields.get("structuredContent"),
+        "is_error": bool(other_fields.get("isError")),
+    }
+
+
 def _format_unavailable_mcp_tool_name(server_name: str, server_id: Any | None) -> str:
     from .selection_spec import normalize_mcp_server_name
 
@@ -1450,29 +1497,7 @@ class MCPToolAdapter(AbstractBaseTool):
                 meta=dict(tool_meta) or None,
             )
 
-            content = []
-            if result.content:
-                for content_item in result.content:
-                    if hasattr(content_item, "model_dump"):
-                        content.append(content_item.model_dump())
-                    else:
-                        content.append({"text": str(content_item)})
-
-            # Read by wire name (by_alias=True), not by Python attribute name:
-            # the mcp SDK's CallToolResult field naming has changed across
-            # major versions (1.x uses plain camelCase attributes, 2.x uses
-            # snake_case attributes with a camelCase alias), but the MCP
-            # wire/JSON field names ("structuredContent", "isError") are
-            # spec-fixed and stable across both. `content` is excluded and
-            # handled by the loop above instead, since by_alias=True would
-            # also rename each content item's `meta` field to `_meta`.
-            other_fields = result.model_dump(by_alias=True, exclude={"content"})
-
-            return {
-                "content": content,
-                "structured_content": other_fields.get("structuredContent"),
-                "is_error": bool(other_fields.get("isError")),
-            }
+            return _normalized_mcp_call_result(result)
 
     async def _retry_after_authorization_failure(
         self,
@@ -1682,6 +1707,53 @@ class MCPToolAdapter(AbstractBaseTool):
         return _mcp_return_value_as_string(value)
 
 
+class ChromeExecutionMCPToolAdapter(MCPToolAdapter):
+    """MCP adapter whose calls share one sandbox-owned Chrome daemon."""
+
+    def __init__(
+        self,
+        *args: Any,
+        chrome_pool: ChromeExecutionSessionPool,
+        chrome_scope: ChromeExecutionScope,
+        chrome_launch: ChromeDaemonLaunchSpec,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._chrome_pool = chrome_pool
+        self._chrome_scope = chrome_scope
+        self._chrome_launch = chrome_launch
+
+    async def _execute_mcp_call(
+        self,
+        connection: Connection,
+        tool_args: Mapping[str, Any],
+        tool_meta: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        if connection is not self.connection or tool_meta:
+            raise ChromeSessionContractError(
+                "Chrome execution connection changed after identity binding"
+            )
+        result = await self._chrome_pool.invoke_tool(
+            self._chrome_scope,
+            self._chrome_launch,
+            self.mcp_tool.name,
+            tool_args,
+        )
+        try:
+            return _normalized_mcp_call_result(result, validate_wire=True)
+        except ChromeSessionContractError:
+            await self._chrome_pool.close_shielded(self._chrome_scope)
+            raise
+
+    async def teardown(self, task_id: Optional[str] = None) -> None:
+        try:
+            await self._chrome_pool.close_shielded(self._chrome_scope)
+        except asyncio.CancelledError:
+            # The pool-owned cleanup task remains alive. Do not abort Runner's
+            # reverse teardown pass before the remaining tools are visited.
+            return
+
+
 class _UnavailableMCPToolResult(BaseModel):
     success: bool = Field(default=False, description="Whether execution succeeded")
     status: str = Field(default="error", description="Tool execution status")
@@ -1842,6 +1914,96 @@ def _build_mcp_tool_adapter(
         # sandboxed loader attach it, so one builder serves both paths and
         # neither can quietly lose the evidence the other keeps.
         raw_annotations=raw_annotations_for(mcp_tool),
+    )
+
+
+def _build_execution_scoped_chrome_tool_adapter(
+    server_name: str,
+    connection: Connection,
+    mcp_tool: MCPTool,
+    *,
+    pool: ChromeExecutionSessionPool,
+    scope: ChromeExecutionScope,
+    launch: ChromeDaemonLaunchSpec,
+    name_prefix: str,
+    visibility: Optional[ToolVisibility],
+    allow_users: Optional[List[str]],
+    concurrency_safe: bool,
+    concurrent_tools: list[str],
+) -> ChromeExecutionMCPToolAdapter:
+    tool_prefix = f"{name_prefix}{server_name}_" if name_prefix else f"{server_name}_"
+    from .selection_spec import normalize_mcp_server_name
+
+    return ChromeExecutionMCPToolAdapter(
+        mcp_tool=mcp_tool,
+        connection=connection,
+        name_prefix=tool_prefix,
+        visibility=visibility,
+        allow_users=allow_users,
+        source_server=normalize_mcp_server_name(server_name),
+        concurrency_safe=concurrency_safe,
+        concurrent_tools=concurrent_tools,
+        raw_annotations=raw_annotations_for(mcp_tool),
+        chrome_pool=pool,
+        chrome_scope=scope,
+        chrome_launch=launch,
+    )
+
+
+async def load_execution_scoped_chrome_tools(
+    server_name: str,
+    connection: Connection,
+    *,
+    scope: ChromeExecutionScope,
+    name_prefix: str = "mcp_",
+    visibility: Optional[ToolVisibility] = None,
+    allow_users: Optional[List[str]] = None,
+) -> SandboxedMCPLoadResult:
+    # Lazy web import preserves the existing core-only MCP adapter import path.
+    from .....web.services.chrome_mcp_runtime import (
+        get_chrome_execution_session_pool,
+    )
+
+    launch = ChromeDaemonLaunchSpec.from_connection(connection)
+    pool = get_chrome_execution_session_pool()
+    session = await pool.get_or_create(scope, launch)
+    try:
+        mcp_tools = await list_tools_in_sandbox(
+            session.sandbox,
+            chrome_metadata_connection(connection),
+        )
+    except BaseException:
+        await pool.close_shielded(scope)
+        raise
+
+    concurrency_safe, concurrent_tools = _connection_concurrency_config(connection)
+    tools: list[AbstractBaseTool] = []
+    adapter_errors: list[str] = []
+    for mcp_tool in mcp_tools:
+        try:
+            tools.append(
+                _build_execution_scoped_chrome_tool_adapter(
+                    server_name,
+                    connection,
+                    mcp_tool,
+                    pool=pool,
+                    scope=scope,
+                    launch=launch,
+                    name_prefix=name_prefix,
+                    visibility=visibility,
+                    allow_users=allow_users,
+                    concurrency_safe=concurrency_safe,
+                    concurrent_tools=concurrent_tools,
+                )
+            )
+        except Exception as exc:
+            adapter_errors.append(type(exc).__name__)
+    if not tools:
+        await pool.close_shielded(scope)
+    return SandboxedMCPLoadResult(
+        tools=tuple(tools),
+        adapter_error_types=tuple(adapter_errors),
+        wrap_error_types=(),
     )
 
 

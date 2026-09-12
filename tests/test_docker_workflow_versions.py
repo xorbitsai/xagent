@@ -428,6 +428,18 @@ def test_chrome_devtools_mcp_pin_matches_across_dockerfiles_and_registry() -> No
     )
     (pinned_version,) = registry_pins
 
+    controller = read_repo_file(
+        "src/xagent/core/tools/adapters/vibe/sandboxed_tool/chrome_daemon_runner.py"
+    )
+    controller_pins = set(
+        re.findall(
+            r'CHROME_DEVTOOLS_PACKAGE = "chrome-devtools-mcp@([\w.\-]+)"', controller
+        )
+    )
+    assert controller_pins == {pinned_version}, (
+        "the sandbox Chrome daemon controller must use the registry's exact pin"
+    )
+
     for dockerfile_path in ("docker/Dockerfile.backend", "docker/Dockerfile.sandbox"):
         dockerfile = read_repo_file(dockerfile_path)
 
@@ -472,6 +484,18 @@ def test_chrome_devtools_mcp_pin_matches_across_dockerfiles_and_registry() -> No
         "resolver-path existence check -- without it, a broken Chrome/"
         "Chromium install can silently ship instead of failing the build"
     )
+
+
+def test_sandbox_npm_cache_is_owned_by_the_boxlite_runtime_user() -> None:
+    dockerfile = read_repo_file("docker/Dockerfile.sandbox")
+
+    assert "ENV NPM_CONFIG_CACHE=/opt/npm-cache" in dockerfile
+    assert 'chmod 0755 "$NPM_CONFIG_CACHE"' in dockerfile
+    assert 'chown -R 1100:1010 "$NPM_CONFIG_CACHE"' in dockerfile
+    assert (
+        "CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS=1 NPM_CONFIG_OFFLINE=true" in dockerfile
+    )
+    assert "npx -y --offline chrome-devtools-mcp@1.6.0 --help" in dockerfile
 
 
 def test_sandbox_uv_install_uses_buildkit_cache() -> None:

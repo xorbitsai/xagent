@@ -49,7 +49,13 @@ _SIMPLE_UPLOAD_MAX_BYTES = 4_000_000
 # (327,680 bytes) per Graph's requirement for every non-final chunk; 5 MiB
 # is exactly 16 * 320 KiB.
 _UPLOAD_SESSION_CHUNK_SIZE = 5 * 1024 * 1024
-_UPLOAD_CHUNK_MAX_ATTEMPTS = 3
+_UPLOAD_FRAGMENT_MAX_ATTEMPTS = 3
+_UPLOAD_RECONCILE_MAX_ATTEMPTS = 3
+# Destination metadata can lag behind a committed final fragment. Keep this
+# confirmation budget separate from fragment/status retries so an ambiguous
+# completion can wait up to 45 seconds (1+2+4+8+10+10+10) for QuickXorHash
+# without weakening the exact-content check or making ordinary chunks slower.
+_UPLOAD_COMPLETION_MAX_ATTEMPTS = 8
 # Forward progress resets the consecutive-failure counter, so keep a separate
 # cap on recovery cycles within one buffered fragment to prevent a server that
 # advances by tiny ranges from extending a synchronous call without bound.
@@ -71,6 +77,14 @@ _UPLOAD_ALLOWED_DIRS_ENV_VAR = "XAGENT_ONEDRIVE_FILE_ALLOWED_DIRS"
 
 class _UploadError(RuntimeError):
     """Upload failure whose message is safe to expose to the caller."""
+
+
+class _GraphRequestError(RuntimeError):
+    """Graph HTTP failure that retains its status without response parsing."""
+
+    def __init__(self, message: str, status_code: int) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class _QuickXorHash:
@@ -250,6 +264,13 @@ def _success(**payload: Any) -> str:
     return json.dumps({"status": "success", **payload}, ensure_ascii=False)
 
 
+def _caller_safe_drive_item(item: dict[str, Any]) -> dict[str, Any]:
+    """Copy a driveItem without Graph's short-lived preauthenticated URL."""
+    safe_item = dict(item)
+    safe_item.pop("@microsoft.graph.downloadUrl", None)
+    return safe_item
+
+
 def _error(message: str, *, details: Any = None) -> str:
     payload: dict[str, Any] = {"status": "error", "message": message}
     if details is not None:
@@ -291,7 +312,11 @@ def _raise_upload_status(response: Any) -> None:
 def _safe_upload_error_message(exc: BaseException) -> str:
     """Describe an upload failure without copying a request URL from it."""
     if isinstance(exc, _UploadError):
-        return str(exc)
+        status_code = _upload_status_code(exc)
+        message = str(exc)
+        if status_code is not None and "HTTP" not in message:
+            return f"{message} (last HTTP status {status_code})"
+        return message
     cause = _request_error_cause(exc)
     if isinstance(cause, requests.Timeout):
         return "OneDrive upload fragment timed out"
@@ -359,15 +384,22 @@ def _upload_retry_delay(exc: BaseException, retry_number: int) -> float:
 
 def _upload_status_code(exc: BaseException) -> int | None:
     """Return an HTTP status from a credential-safe upload error."""
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        status_code = getattr(current, "status_code", None)
+        if isinstance(status_code, int):
+            return status_code
+        current = current.__cause__
     cause = _request_error_cause(exc)
     status_code = getattr(getattr(cause, "response", None), "status_code", None)
     return status_code if isinstance(status_code, int) else None
 
 
-def _next_expected_upload_offset(response: Any, total: int) -> int:
-    """Parse the first missing offset from an upload-session status response."""
+def _next_expected_upload_offset(payload: Any, total: int) -> int:
+    """Parse the first missing offset from an upload-session status payload."""
     try:
-        payload = response.json()
         ranges = payload["nextExpectedRanges"]
         if not isinstance(ranges, list):
             raise TypeError("nextExpectedRanges must be a list")
@@ -389,7 +421,7 @@ def _current_upload_item(remote_path: str) -> dict[str, Any] | None:
             _item_path(remote_path),
             params={"$select": "id,name,size,file"},
         )
-    except RuntimeError as exc:
+    except (RuntimeError, ValueError, requests.RequestException) as exc:
         if _upload_status_code(exc) == 404:
             return None
         raise _UploadError("Could not inspect the OneDrive upload target") from exc
@@ -399,11 +431,11 @@ def _current_upload_item(remote_path: str) -> dict[str, Any] | None:
 def _completed_upload_item(
     remote_path: str,
     total: int,
-    expected_quickxor_hash: str,
+    expected_final_quickxor_hash: str,
 ) -> dict[str, Any]:
     """Bind ambiguous completion to the exact uploaded bytes via QuickXorHash."""
     last_error: BaseException | None = None
-    for attempt in range(1, _UPLOAD_CHUNK_MAX_ATTEMPTS + 1):
+    for attempt in range(1, _UPLOAD_COMPLETION_MAX_ATTEMPTS + 1):
         try:
             item = _current_upload_item(remote_path)
             file_facet = item.get("file") if isinstance(item, dict) else None
@@ -415,7 +447,7 @@ def _completed_upload_item(
                 isinstance(item, dict)
                 and item.get("id")
                 and item.get("size") == total
-                and remote_hash == expected_quickxor_hash
+                and remote_hash == expected_final_quickxor_hash
             ):
                 return item
             last_error = _UploadError(
@@ -425,7 +457,7 @@ def _completed_upload_item(
             last_error = exc
             if not _is_retriable_upload_error(exc):
                 break
-        if attempt < _UPLOAD_CHUNK_MAX_ATTEMPTS:
+        if attempt < _UPLOAD_COMPLETION_MAX_ATTEMPTS:
             time.sleep(_upload_retry_delay(last_error, attempt))
     raise _UploadError(
         "OneDrive upload completed ambiguously and could not be confirmed"
@@ -439,12 +471,12 @@ def _reconcile_upload_progress(
     start: int,
     end: int,
     total: int,
-    expected_quickxor_hash: str,
+    expected_final_quickxor_hash: str,
 ) -> tuple[int, dict[str, Any] | None]:
     """Return the first missing byte offset, plus a confirmed final item."""
     last_error: BaseException | None = None
     completed = False
-    for attempt in range(1, _UPLOAD_CHUNK_MAX_ATTEMPTS + 1):
+    for attempt in range(1, _UPLOAD_RECONCILE_MAX_ATTEMPTS + 1):
         try:
             response = http.get(upload_url, timeout=DEFAULT_TIMEOUT_SECONDS)
             if response.status_code == 404:
@@ -472,7 +504,7 @@ def _reconcile_upload_progress(
                     )
                 completed = True
                 break
-            next_offset = _next_expected_upload_offset(response, total)
+            next_offset = _next_expected_upload_offset(payload, total)
             if next_offset < start:
                 raise _UploadError(
                     "OneDrive returned inconsistent upload-session progress"
@@ -495,11 +527,13 @@ def _reconcile_upload_progress(
             last_error = exc
             if not _is_retriable_upload_error(exc):
                 raise
-            if attempt == _UPLOAD_CHUNK_MAX_ATTEMPTS:
+            if attempt == _UPLOAD_RECONCILE_MAX_ATTEMPTS:
                 break
             time.sleep(_upload_retry_delay(exc, attempt))
     if completed:
-        return total, _completed_upload_item(remote_path, total, expected_quickxor_hash)
+        return total, _completed_upload_item(
+            remote_path, total, expected_final_quickxor_hash
+        )
     raise _UploadError(
         "Could not determine OneDrive upload-session progress"
     ) from last_error
@@ -532,7 +566,7 @@ def _graph_request(
         message = str(exc)
         if response_text:
             message = f"{message} - {response_text}"
-        raise RuntimeError(message) from exc
+        raise _GraphRequestError(message, response.status_code) from exc
 
     if raw:
         return response.content
@@ -798,7 +832,6 @@ def _upload_large_file_content(
                             upload_url,
                             data=chunk,
                             headers={
-                                "Content-Length": str(end - fragment_start),
                                 "Content-Range": (
                                     f"bytes {fragment_start}-{end - 1}/{total}"
                                 ),
@@ -840,7 +873,7 @@ def _upload_large_file_content(
                         if not _is_retriable_upload_error(reconcile_error):
                             raise
                         consecutive_failures += 1
-                        if consecutive_failures >= _UPLOAD_CHUNK_MAX_ATTEMPTS:
+                        if consecutive_failures >= _UPLOAD_FRAGMENT_MAX_ATTEMPTS:
                             raise _UploadError(
                                 "Could not determine OneDrive upload-session progress"
                             ) from reconcile_error
@@ -859,7 +892,7 @@ def _upload_large_file_content(
                             consecutive_failures = 0
                         else:
                             consecutive_failures += 1
-                            if consecutive_failures >= _UPLOAD_CHUNK_MAX_ATTEMPTS:
+                            if consecutive_failures >= _UPLOAD_FRAGMENT_MAX_ATTEMPTS:
                                 raise _UploadError(
                                     "OneDrive upload fragment made no forward progress"
                                 ) from upload_error
@@ -879,7 +912,7 @@ def _upload_large_file_content(
                     logger.warning(
                         "Retrying OneDrive upload fragment after reconciliation "
                         "(recovery cycle %s/%s, delay %.1fs)",
-                        recovery_cycles + 1,
+                        recovery_cycles,
                         _UPLOAD_CHUNK_MAX_RECOVERY_CYCLES,
                         delay,
                     )
@@ -917,6 +950,19 @@ def _upload_large_file_content(
                     break
                 start = end
         except Exception as exc:
+            cause = _request_error_cause(exc)
+            if isinstance(exc, _UploadError) or isinstance(
+                cause, requests.RequestException
+            ):
+                logger.error(
+                    "OneDrive large-file upload failed: %s",
+                    _safe_upload_error_message(exc),
+                )
+            else:
+                logger.exception(
+                    "Unexpected OneDrive large-file upload failure (%s)",
+                    type(exc).__name__,
+                )
             # No cross-call resume state is persisted. Once bounded retries
             # are exhausted, cancel the unusable session instead of leaving
             # partial data until its provider-defined expiration time.
@@ -1007,7 +1053,7 @@ def onedrive_get_item(path: str | None = None, item_id: str | None = None) -> st
             result = _graph_request("GET", _item_path(path))
         else:
             raise ValueError("either path or item_id is required")
-        return _success(item=result)
+        return _success(item=_caller_safe_drive_item(result))
     except Exception as e:
         logger.error("Error getting OneDrive item: %s", e)
         return _error(str(e))
@@ -1064,7 +1110,7 @@ def onedrive_upload_text_file(
         )
         if not isinstance(result, dict) or not result.get("id"):
             raise RuntimeError("OneDrive did not confirm the upload completed")
-        return _success(item=result)
+        return _success(item=_caller_safe_drive_item(result))
     except Exception as e:
         logger.error("Error uploading OneDrive text file %s: %s", file_path, e)
         return _error(str(e))
@@ -1171,9 +1217,14 @@ def onedrive_upload_file(
         if not isinstance(result, dict) or not result.get("id"):
             raise RuntimeError("OneDrive did not confirm the upload completed")
 
-        return _success(item=result)
+        return _success(item=_caller_safe_drive_item(result))
     except Exception as e:
-        logger.error("Error uploading OneDrive file %s: %s", local_file_path, e)
+        if isinstance(e, (OSError, ValueError, RuntimeError)):
+            logger.error("Error uploading OneDrive file %s: %s", local_file_path, e)
+        else:
+            logger.exception(
+                "Unexpected error uploading OneDrive file %s", local_file_path
+            )
         return _error(str(e))
 
 

@@ -535,7 +535,7 @@ def test_upload_file_uses_upload_session_for_large_files(
 
     mock_put = Mock(
         side_effect=[
-            MockResponse({}, content=b""),
+            MockResponse({}, status_code=202, content=b""),
             MockResponse({"id": "item-1", "name": "big.bin"}),
         ]
     )
@@ -617,7 +617,9 @@ def test_upload_large_file_content_reads_bounded_chunks_from_disk(monkeypatch):
         put_calls.append(data)
         is_last = sum(len(d) for d in put_calls) >= total_size
         return MockResponse(
-            {"id": "item-1"} if is_last else {}, content=b"{}" if is_last else b""
+            {"id": "item-1"} if is_last else {},
+            status_code=201 if is_last else 202,
+            content=b"{}" if is_last else b"",
         )
 
     _patch_session(monkeypatch, _FakeSession(put=Mock(side_effect=_fake_put)))
@@ -659,6 +661,35 @@ def test_upload_large_file_content_handles_exact_chunk_multiple(monkeypatch):
     assert mock_put.call_args_list[-1].kwargs["headers"]["Content-Range"] == (
         f"bytes {chunk_size}-{total_size - 1}/{total_size}"
     )
+
+
+def test_upload_large_file_content_rejects_completion_before_final_fragment(
+    monkeypatch,
+):
+    chunk_size = onedrive._UPLOAD_SESSION_CHUNK_SIZE
+    total_size = chunk_size + 10
+    monkeypatch.setattr(
+        onedrive.requests,
+        "request",
+        Mock(return_value=MockResponse({"uploadUrl": "https://upload.example/s"})),
+    )
+    mock_put = Mock(return_value=MockResponse({"id": "premature"}, status_code=201))
+    mock_delete = Mock(return_value=MockResponse({}, status_code=204))
+    _patch_session(
+        monkeypatch,
+        _FakeSession(put=mock_put, delete=mock_delete),
+    )
+
+    with pytest.raises(RuntimeError, match="completion before the local final"):
+        onedrive._upload_large_file_content(
+            "big.bin",
+            io.BytesIO(b"\x00" * total_size),
+            total_size,
+            "application/octet-stream",
+        )
+
+    mock_put.assert_called_once()
+    mock_delete.assert_called_once()
 
 
 def test_upload_large_file_content_does_not_forward_chunk_error_body(
@@ -1616,7 +1647,10 @@ def test_upload_large_file_content_fails_on_a_non_first_chunk(monkeypatch):
         status_code=416,
         content=b'{"error": {"message": "range conflict"}}',
     )
-    mock_put = Mock(side_effect=[MockResponse({}, content=b"")] + [error_response] * 3)
+    mock_put = Mock(
+        side_effect=[MockResponse({}, status_code=202, content=b"")]
+        + [error_response] * 3
+    )
     mock_get = Mock(
         return_value=MockResponse({"nextExpectedRanges": [f"{chunk_size}-"]})
     )
@@ -1660,7 +1694,7 @@ def test_upload_large_file_content_recovers_when_final_response_is_202(
     )
     mock_put = Mock(
         side_effect=[
-            MockResponse({}, content=b""),
+            MockResponse({}, status_code=202, content=b""),
             MockResponse(
                 {"expirationDateTime": "2099-01-01T00:00:00Z"}, status_code=202
             ),
@@ -1709,7 +1743,9 @@ def test_upload_large_file_content_recovers_from_missing_or_unparsable_final_res
     final_response = MockResponse({}, status_code=201, content=final_content)
     if final_content:
         final_response.json = Mock(side_effect=ValueError("Expecting value"))
-    mock_put = Mock(side_effect=[MockResponse({}, content=b""), final_response])
+    mock_put = Mock(
+        side_effect=[MockResponse({}, status_code=202, content=b""), final_response]
+    )
     mock_delete = Mock(return_value=MockResponse({}))
     _patch_session(monkeypatch, _FakeSession(put=mock_put, delete=mock_delete))
 
@@ -1859,7 +1895,7 @@ def test_upload_large_file_content_rejects_short_chunk_read(monkeypatch):
         "request",
         Mock(return_value=MockResponse({"uploadUrl": "https://upload.example/s"})),
     )
-    mock_put = Mock(return_value=MockResponse({}, content=b""))
+    mock_put = Mock(return_value=MockResponse({}, status_code=202, content=b""))
     _patch_session(monkeypatch, _FakeSession(put=mock_put))
 
     with pytest.raises(RuntimeError, match="changed size during upload"):

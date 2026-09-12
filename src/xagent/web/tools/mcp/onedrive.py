@@ -807,7 +807,14 @@ def _upload_large_file_content(
                             timeout=_BINARY_UPLOAD_TIMEOUT_SECONDS,
                         )
                         _raise_upload_status(response)
-                        if end < total or response.status_code in (200, 201):
+                        if response.status_code in (200, 201):
+                            if end < total:
+                                raise _UploadError(
+                                    "OneDrive reported completion before the local "
+                                    "final fragment"
+                                )
+                            break
+                        if end < total and response.status_code == 202:
                             break
                     except Exception as exc:
                         status_code = _upload_status_code(exc)

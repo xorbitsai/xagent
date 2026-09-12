@@ -178,6 +178,7 @@ export default defineConfig({
       "src/hooks/use-websocket.test.ts",
       "src/lib/api-wrapper.test.ts",
       "src/lib/auth-cache.test.ts",
+      "src/lib/connector-runtime-api.test.ts",
       "src/lib/files-disabled-presentation.test.ts",
       "src/lib/remark-currency-safe-math.test.ts",
     ],

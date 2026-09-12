@@ -464,6 +464,56 @@ def _validated_recurrence_lines(value: Any) -> list[str]:
     return value
 
 
+def _validated_stored_boundary(
+    side: Any, field_name: str
+) -> tuple[str, bool, str | None]:
+    """Return a stored EventDateTime value, kind, and optional timezone."""
+    if not isinstance(side, dict):
+        raise ValueError(
+            f"the existing event must contain a valid {field_name} boundary "
+            "before its recurrence can be updated"
+        )
+    has_date = "date" in side
+    has_datetime = "dateTime" in side
+    if has_date == has_datetime:
+        raise ValueError(
+            f"the existing event {field_name} must contain exactly one of "
+            "date or dateTime before its recurrence can be updated"
+        )
+    key = "date" if has_date else "dateTime"
+    value = side.get(key)
+    if not isinstance(value, str):
+        raise ValueError(
+            f"the existing event must contain a valid {field_name} boundary "
+            "before its recurrence can be updated"
+        )
+    is_all_day = _classify_event_time(value, f"existing event {field_name}")
+    if is_all_day != has_date:
+        raise ValueError(
+            f"the existing event {field_name}.{key} has the wrong value kind"
+        )
+    timezone = side.get("timeZone")
+    if timezone is not None and not isinstance(timezone, str):
+        raise ValueError(f"the existing event {field_name}.timeZone must be a string")
+    return value, is_all_day, timezone
+
+
+def _require_datetime_matches_timezone(
+    value: str, timezone: str, field_name: str
+) -> None:
+    """Reject an explicit offset whose wall clock contradicts ``timezone``."""
+    parsed = _date_parser.isoparse(value)
+    if parsed.tzinfo is None:
+        return
+    zoned = parsed.astimezone(resolve_zoneinfo(timezone))
+    if zoned.replace(tzinfo=None) != parsed.replace(tzinfo=None):
+        raise ValueError(
+            f"the existing event {field_name} offset conflicts with timeZone "
+            f"{timezone!r}; use the recurring-event reschedule operation to "
+            "change its schedule explicitly"
+        )
+
+
 def _merge_recurrence(
     existing_recurrence: list[str] | None, new_rrule: str
 ) -> list[str]:
@@ -1025,9 +1075,10 @@ def google_calendar_update_events(
                 "recurrence cannot be combined with start_time or end_time yet; "
                 "update the recurrence rule separately"
             )
+        timezone_was_provided = timezone is not None
         if timezone is not None:
             timezone = timezone.strip() or None
-        if timezone is not None and recurrence is None:
+        if timezone_was_provided and recurrence is None:
             raise ValueError("timezone is only supported together with recurrence")
         if timezone:
             resolve_zoneinfo(timezone)
@@ -1035,6 +1086,12 @@ def google_calendar_update_events(
             _require_offset_datetime(start_time, "start_time")
         if end_time is not None:
             _require_offset_datetime(end_time, "end_time")
+        if recurrence is not None and not ignore_conflicts:
+            raise ValueError(
+                "A recurring series cannot be fully conflict-checked from its first "
+                "occurrence. Pass ignore_conflicts=True only after the user confirms "
+                "they have verified every occurrence in the resulting series."
+            )
         service = get_calendar_service()
 
         # Lazily fetched and cached - this
@@ -1052,12 +1109,6 @@ def google_calendar_update_events(
         event = service.events().get(calendarId="primary", eventId=event_id).execute()
 
         if recurrence is not None:
-            if not ignore_conflicts:
-                raise ValueError(
-                    "A recurring series cannot be fully conflict-checked from its first "
-                    "occurrence. Pass ignore_conflicts=True only after the user confirms "
-                    "they have verified every occurrence in the resulting series."
-                )
             if event.get("recurringEventId"):
                 raise ValueError(
                     f"event {event_id!r} is a single occurrence of a recurring "
@@ -1067,20 +1118,12 @@ def google_calendar_update_events(
                 )
             start_side = event.get("start")
             end_side = event.get("end")
-            if not isinstance(start_side, dict) or not isinstance(end_side, dict):
-                raise ValueError(
-                    "the existing event must contain valid start and end boundaries "
-                    "before its recurrence can be updated"
-                )
-            start_value = start_side.get("dateTime") or start_side.get("date")
-            end_value = end_side.get("dateTime") or end_side.get("date")
-            if not isinstance(start_value, str) or not isinstance(end_value, str):
-                raise ValueError(
-                    "the existing event must contain valid start and end boundaries "
-                    "before its recurrence can be updated"
-                )
-            start_is_all_day = is_bare_date(start_value)
-            end_is_all_day = is_bare_date(end_value)
+            start_value, start_is_all_day, start_timezone = _validated_stored_boundary(
+                start_side, "start"
+            )
+            end_value, end_is_all_day, end_timezone = _validated_stored_boundary(
+                end_side, "end"
+            )
             if start_is_all_day != end_is_all_day:
                 raise ValueError(
                     "the existing event start and end must both be dates or both "
@@ -1088,17 +1131,52 @@ def google_calendar_update_events(
                 )
             expansion_timezone = None
             if not start_is_all_day:
-                expansion_timezone = (
-                    timezone or start_side.get("timeZone") or end_side.get("timeZone")
-                )
+                stored_timezones = {
+                    stored_timezone
+                    for stored_timezone in (start_timezone, end_timezone)
+                    if stored_timezone
+                }
+                if len(stored_timezones) > 1:
+                    raise ValueError(
+                        "the existing event uses different start and end timeZones; "
+                        "a rule-only update cannot convert it to the single timezone "
+                        "required for recurrence"
+                    )
+                stored_timezone = next(iter(stored_timezones), None)
+                if timezone and stored_timezone and timezone != stored_timezone:
+                    raise ValueError(
+                        "a rule-only update cannot change the event's existing "
+                        "timeZone; use the recurring-event reschedule operation"
+                    )
+                expansion_timezone = timezone or stored_timezone
                 if not expansion_timezone:
                     raise ValueError(
                         "timezone is required when adding recurrence to a timed event "
                         "that has no existing timeZone"
                     )
                 resolve_zoneinfo(expansion_timezone)
+                _require_datetime_matches_timezone(
+                    start_value, expansion_timezone, "start"
+                )
+                _require_datetime_matches_timezone(end_value, expansion_timezone, "end")
                 start_side["timeZone"] = expansion_timezone
                 end_side["timeZone"] = expansion_timezone
+                comparable_start = (
+                    start_value
+                    if _has_own_utc_offset(start_value)
+                    else _offset_datetime_string(start_value, expansion_timezone)
+                )
+                comparable_end = (
+                    end_value
+                    if _has_own_utc_offset(end_value)
+                    else _offset_datetime_string(end_value, expansion_timezone)
+                )
+                _reject_reversed_window(comparable_start, comparable_end)
+            else:
+                if date.fromisoformat(end_value) <= date.fromisoformat(start_value):
+                    raise ValueError(
+                        "the existing all-day event end must be later than its start"
+                    )
             new_rrule = _normalize_rrule(
                 recurrence,
                 start_value,

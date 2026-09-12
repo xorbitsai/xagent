@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+from datetime import datetime
 from typing import Any
 from urllib.parse import quote
 
@@ -164,10 +165,40 @@ def _has_own_utc_offset(value: str) -> bool:
 
 def _is_midnight_in_timezone(value: str, timezone: str) -> bool:
     """Whether ``value`` represents midnight in the event timezone."""
-    parsed = _date_parser.isoparse(value)
+    parsed: datetime = _date_parser.isoparse(value)
     if parsed.tzinfo is not None:
         parsed = parsed.astimezone(_resolve_zoneinfo(timezone))
     return not (parsed.hour or parsed.minute or parsed.second or parsed.microsecond)
+
+
+def _naive_datetime_in_timezone(value: str, timezone: str) -> str:
+    """Return an Outlook dateTimeTimeZone clock value in ``timezone``.
+
+    Graph represents these values as a naive local datetime plus a separate
+    timeZone field. Preserve already-naive wall-clock input, but convert an
+    offset-bearing instant into the requested zone before removing its offset.
+    """
+    parsed: datetime = _date_parser.isoparse(value)
+    if parsed.tzinfo is None:
+        return value
+    return (
+        parsed.astimezone(_resolve_zoneinfo(timezone)).replace(tzinfo=None).isoformat()
+    )
+
+
+def _reject_invalid_create_window(
+    start_datetime: str, end_datetime: str, *, is_all_day: bool
+) -> None:
+    try:
+        _reject_reversed_window(start_datetime, end_datetime)
+    except ValueError as exc:
+        if is_all_day:
+            raise ValueError(
+                "end_datetime is exclusive for an all-day event and must "
+                "be after start_datetime; use the following day's midnight "
+                "as the end of a one-day event."
+            ) from exc
+        raise
 
 
 # Defensive cap on calendarView pages followed for one organizer-side
@@ -607,30 +638,38 @@ def outlook_create_event(
     following day's midnight as the end of a one-day event.
     """
     try:
-        # Both sides share the same `timezone`, so comparing them as naive
-        # values (no offset attached) is already a valid relative
-        # comparison - it doesn't matter which real zone that is.
-        try:
-            _reject_reversed_window(start_datetime, end_datetime)
-        except ValueError as exc:
-            if is_all_day:
-                raise ValueError(
-                    "end_datetime is exclusive for an all-day event and must "
-                    "be after start_datetime; use the following day's midnight "
-                    "as the end of a one-day event."
-                ) from exc
-            raise
         normalized_attendees = _normalize_addresses(attendees) if attendees else []
 
-        # Graph requires all-day event boundaries to be midnight in the
-        # same timezone. Normalize both the availability query and the
-        # eventual write, including when ignore_conflicts bypasses the query.
-        effective_start, effective_end = start_datetime, end_datetime
+        # Retain the caller-level ordering check before all-day normalization:
+        # two reversed times on the same date must not become a valid full-day
+        # window merely because both are widened to date boundaries.
+        _reject_invalid_create_window(
+            start_datetime, end_datetime, is_all_day=is_all_day
+        )
+
+        # Graph's dateTimeTimeZone shape carries a naive wall-clock value and
+        # its timezone separately. Convert offset-bearing inputs to that shape
+        # before comparing, querying, or writing them. This also makes a mixed
+        # aware/naive pair comparable instead of letting it bypass the ordering
+        # check when Python refuses to compare the two datetime kinds.
+        effective_start = _naive_datetime_in_timezone(start_datetime, timezone)
+        effective_end = _naive_datetime_in_timezone(end_datetime, timezone)
+
+        # Graph additionally requires all-day boundaries to be midnight in the
+        # same timezone. Normalize both the availability query and the eventual
+        # write, including when ignore_conflicts bypasses the query.
         if is_all_day:
             effective_start, _ = _naive_day_bounds(start_datetime, timezone)
             end_of_its_day, next_day_start = _naive_day_bounds(end_datetime, timezone)
             end_is_midnight = _is_midnight_in_timezone(end_datetime, timezone)
             effective_end = end_of_its_day if end_is_midnight else next_day_start
+
+        # The raw comparison is deliberately unable to compare a mixed
+        # aware/naive pair. Recheck after normalization so that case cannot
+        # bypass the invariant.
+        _reject_invalid_create_window(
+            effective_start, effective_end, is_all_day=is_all_day
+        )
 
         unchecked_attendees: list[str] = []
         check_error: str | None = None

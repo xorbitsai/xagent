@@ -347,6 +347,25 @@ def test_create_event_rejects_a_reversed_window(monkeypatch):
     graph_request.assert_not_called()
 
 
+def test_create_event_rejects_a_reversed_mixed_offset_window(monkeypatch):
+    graph_request = Mock()
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_create_event(
+            subject="Kickoff",
+            start_datetime="2026-08-27T10:30:00Z",
+            end_datetime="2026-08-27T10:00:00",
+            timezone="UTC",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "must be after" in result["message"]
+    graph_request.assert_not_called()
+
+
 def test_create_event_explains_exclusive_all_day_end(monkeypatch):
     graph_request = Mock()
     monkeypatch.setattr(outlook, "_graph_request", graph_request)
@@ -457,6 +476,28 @@ def test_create_event_converts_offset_all_day_boundaries_to_event_timezone(
     # The supplied end instant is 04:00 on Aug 29 in Singapore, so the
     # exclusive all-day boundary is the following midnight.
     assert payload["end"]["dateTime"] == "2026-08-30T00:00:00"
+
+
+def test_create_event_rejects_reversed_all_day_window_after_timezone_conversion(
+    monkeypatch,
+):
+    graph_request = Mock()
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_create_event(
+            subject="Company holiday",
+            start_datetime="2026-08-27T20:00:00Z",
+            end_datetime="2026-08-27T00:00:00",
+            timezone="Asia/Singapore",
+            is_all_day=True,
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "exclusive" in result["message"]
+    graph_request.assert_not_called()
 
 
 def test_create_event_normalizes_all_day_payload_when_conflicts_are_ignored(
@@ -758,8 +799,23 @@ def test_create_event_calendarview_query_carries_an_explicit_offset(monkeypatch)
     )
 
 
-def test_create_event_calendarview_accepts_offset_bearing_boundaries(monkeypatch):
-    graph_request = Mock(side_effect=[{"value": []}, {"id": "created"}])
+def test_create_event_converts_offset_boundaries_to_datetime_timezone_shape(
+    monkeypatch,
+):
+    graph_request = Mock(
+        side_effect=[
+            {"value": []},
+            {
+                "value": [
+                    {
+                        "scheduleId": "chelsea@example.com",
+                        "scheduleItems": [],
+                    }
+                ]
+            },
+            {"id": "created"},
+        ]
+    )
     monkeypatch.setattr(outlook, "_graph_request", graph_request)
 
     result = json.loads(
@@ -767,14 +823,33 @@ def test_create_event_calendarview_accepts_offset_bearing_boundaries(monkeypatch
             subject="Kickoff",
             start_datetime="2026-08-27T10:00:00Z",
             end_datetime="2026-08-27T10:30:00Z",
-            timezone="UTC",
+            timezone="Asia/Singapore",
+            attendees=["chelsea@example.com"],
         )
     )
 
     assert result["status"] == "success"
     params = graph_request.call_args_list[0].kwargs["params"]
-    assert params["startDateTime"] == "2026-08-27T10:00:00Z"
-    assert params["endDateTime"] == "2026-08-27T10:30:00Z"
+    assert params["startDateTime"] == "2026-08-27T18:00:00+08:00"
+    assert params["endDateTime"] == "2026-08-27T18:30:00+08:00"
+    schedule_body = graph_request.call_args_list[1].kwargs["body"]
+    assert schedule_body["startTime"] == {
+        "dateTime": "2026-08-27T18:00:00",
+        "timeZone": "Asia/Singapore",
+    }
+    assert schedule_body["endTime"] == {
+        "dateTime": "2026-08-27T18:30:00",
+        "timeZone": "Asia/Singapore",
+    }
+    payload = graph_request.call_args_list[2].kwargs["body"]
+    assert payload["start"] == {
+        "dateTime": "2026-08-27T18:00:00",
+        "timeZone": "Asia/Singapore",
+    }
+    assert payload["end"] == {
+        "dateTime": "2026-08-27T18:30:00",
+        "timeZone": "Asia/Singapore",
+    }
 
 
 def test_create_event_accepts_windows_timezone_names(monkeypatch):

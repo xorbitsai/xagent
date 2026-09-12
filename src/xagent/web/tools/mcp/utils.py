@@ -847,13 +847,18 @@ def _validate_rrule_constraints(
         )
 
 
+def is_rrule_line(value: str) -> bool:
+    """Return whether ``value`` is an RRULE property line."""
+    return value.strip().upper().startswith("RRULE:")
+
+
 def _strip_rrule_prefix(rrule_text: str) -> str:
     """Return `rrule_text` with any leading "RRULE:" (case-insensitive)
     removed and outer whitespace trimmed - the one place this stripping
     happens, so `ensure_rrule_prefix` and `parse_rrule` can't drift apart
     on what counts as "the prefix"."""
     body = rrule_text.strip()
-    if body.upper().startswith("RRULE:"):
+    if is_rrule_line(body):
         body = body[len("RRULE:") :]
     return body.strip()
 

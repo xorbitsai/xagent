@@ -430,6 +430,52 @@ def _classify_event_time(value: str, field_name: str) -> bool:
     return False
 
 
+def _property_header(line: str) -> str:
+    """Return the RFC 5545 property header before the first unquoted colon."""
+    quoted = False
+    for index, character in enumerate(line):
+        if character == '"':
+            quoted = not quoted
+        elif character == ":" and not quoted:
+            return line[:index]
+    return line
+
+
+def _recurrence_property_name(line: str) -> str:
+    header = _property_header(line)
+    if header == line:
+        return ""
+    return header.split(";", 1)[0].strip().upper()
+
+
+def _validated_recurrence_lines(value: Any) -> list[str]:
+    """Validate recurrence data fetched from Google before forwarding it."""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError("the existing event recurrence must be a list")
+    allowed = {"RRULE", "EXRULE", "RDATE", "EXDATE"}
+    for line in value:
+        if not isinstance(line, str) or _recurrence_property_name(line) not in allowed:
+            raise ValueError(
+                "the existing event recurrence contains an unsupported property; "
+                "only RRULE, EXRULE, RDATE, and EXDATE are supported"
+            )
+    return value
+
+
+def _merge_recurrence(
+    existing_recurrence: list[str] | None, new_rrule: str
+) -> list[str]:
+    """Replace RRULE properties while preserving recurrence exceptions."""
+    preserved = [
+        line
+        for line in existing_recurrence or []
+        if _recurrence_property_name(line) != "RRULE"
+    ]
+    return [new_rrule, *preserved]
+
+
 def _has_own_utc_offset(dt_string: str) -> bool:
     """Whether an RFC3339 dateTime string carries its own explicit UTC
     offset or "Z" suffix, as opposed to a naive local time meant to be
@@ -923,11 +969,20 @@ def google_calendar_update_events(
     attendees: list[str] | str | None = None,
     notify_attendees: bool = False,
     add_google_meet: bool = False,
+    timezone: str | None = None,
+    recurrence: str | None = None,
     ignore_conflicts: bool = False,
 ) -> str:
     """
     Update an existing event in Google Calendar.
     start_time and end_time must be RFC3339 formatted if provided.
+    recurrence replaces the event's RFC 5545 RRULE while preserving its
+    EXDATE/RDATE/EXRULE exception lines. This PR intentionally handles rule
+    updates only: do not combine recurrence with start_time or end_time.
+    A timed series uses one IANA timezone on both boundaries; pass timezone
+    when the existing event does not already store one. Updating a rule cannot
+    be fully conflict-checked, so it requires ignore_conflicts=True after the
+    user confirms the resulting series is safe.
     If the update moves the event to a new time, or adds attendees, that change is checked for
     conflicts the same way google_calendar_create_events is; pass ignore_conflicts=True to skip the
     check once the user has explicitly confirmed a conflict is fine. If an individual required
@@ -962,6 +1017,19 @@ def google_calendar_update_events(
     """
     requested_conference = False
     try:
+        if recurrence is not None and not recurrence.strip():
+            raise ValueError("recurrence rule must not be empty")
+        if recurrence is not None and (start_time is not None or end_time is not None):
+            raise ValueError(
+                "recurrence cannot be combined with start_time or end_time yet; "
+                "update the recurrence rule separately"
+            )
+        if timezone is not None:
+            timezone = timezone.strip() or None
+        if timezone is not None and recurrence is None:
+            raise ValueError("timezone is only supported together with recurrence")
+        if timezone:
+            resolve_zoneinfo(timezone)
         if start_time is not None:
             _require_offset_datetime(start_time, "start_time")
         if end_time is not None:
@@ -981,6 +1049,62 @@ def google_calendar_update_events(
 
         # First get the existing event
         event = service.events().get(calendarId="primary", eventId=event_id).execute()
+
+        if recurrence is not None:
+            if not ignore_conflicts:
+                raise ValueError(
+                    "A recurring series cannot be fully conflict-checked from its first "
+                    "occurrence. Pass ignore_conflicts=True only after the user confirms "
+                    "they have verified every occurrence in the resulting series."
+                )
+            if event.get("recurringEventId"):
+                raise ValueError(
+                    f"event {event_id!r} is a single occurrence of a recurring "
+                    f"series (recurringEventId={event['recurringEventId']!r}), not "
+                    "the series itself - call this on the series' master event id "
+                    "to change its recurrence"
+                )
+            start_side = event.get("start")
+            end_side = event.get("end")
+            if not isinstance(start_side, dict) or not isinstance(end_side, dict):
+                raise ValueError(
+                    "the existing event must contain valid start and end boundaries "
+                    "before its recurrence can be updated"
+                )
+            start_value = start_side.get("dateTime") or start_side.get("date")
+            end_value = end_side.get("dateTime") or end_side.get("date")
+            if not isinstance(start_value, str) or not isinstance(end_value, str):
+                raise ValueError(
+                    "the existing event must contain valid start and end boundaries "
+                    "before its recurrence can be updated"
+                )
+            start_is_all_day = is_bare_date(start_value)
+            end_is_all_day = is_bare_date(end_value)
+            if start_is_all_day != end_is_all_day:
+                raise ValueError(
+                    "the existing event start and end must both be dates or both "
+                    "be dateTimes before its recurrence can be updated"
+                )
+            expansion_timezone = None
+            if not start_is_all_day:
+                expansion_timezone = (
+                    timezone or start_side.get("timeZone") or end_side.get("timeZone")
+                )
+                if not expansion_timezone:
+                    raise ValueError(
+                        "timezone is required when adding recurrence to a timed event "
+                        "that has no existing timeZone"
+                    )
+                resolve_zoneinfo(expansion_timezone)
+                start_side["timeZone"] = expansion_timezone
+                end_side["timeZone"] = expansion_timezone
+            new_rrule = _normalize_rrule(
+                recurrence,
+                start_value,
+                expansion_timezone,
+            )
+            existing_recurrence = _validated_recurrence_lines(event.get("recurrence"))
+            event["recurrence"] = _merge_recurrence(existing_recurrence, new_rrule)
 
         existing_attendees_raw = [
             a["email"]

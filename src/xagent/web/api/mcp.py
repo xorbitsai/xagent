@@ -23,7 +23,7 @@ from uuid import UUID
 
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
-from fastapi.responses import JSONResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
@@ -5469,7 +5469,7 @@ async def get_mcp_server_tools(
 async def mcp_oauth_callback(
     request: Request,
     db: Session = Depends(get_db),
-) -> RedirectResponse:
+) -> Response:
     """Complete MCP OAuth Authorization Code + PKCE and store an encrypted grant."""
     code = request.query_params.get("code")
     state_value = request.query_params.get("state")
@@ -5492,6 +5492,13 @@ async def mcp_oauth_callback(
     callback_redirect_after = (
         str(flow_state.redirect_after) if flow_state.redirect_after else None
     )
+    # Snapshot before claim/commit expires the flow. Actor browsers need not
+    # have an Xagent login, so they cannot reach the authenticated tools page.
+    close_actor_popup = str(
+        flow_state.resource_owner_key
+    ) != _default_resource_owner_key(
+        int(flow_state.user_id)
+    ) and callback_redirect_after in (None, "/tools")
     try:
         _validate_mcp_oauth_state_cookie(request, state_value)
     except HTTPException as exc:
@@ -5655,18 +5662,31 @@ async def mcp_oauth_callback(
             message="MCP OAuth authorization failed",
         )
 
-    # Positive success signal: the connect popup's self-close logic keys on
-    # this param instead of inferring success from "no error params", so a
-    # future error param added to the error redirect can't be mistaken for
-    # success by an out-of-date guard.
-    response = RedirectResponse(
-        _mcp_oauth_redirect_after_url(
-            _redirect_after_with_params(
-                callback_redirect_after,
-                (("mcp_oauth_success", "1"),),
+    response: Response
+    if close_actor_popup:
+        response = HTMLResponse(
+            '<!doctype html><html lang="en"><head><meta charset="utf-8">'
+            "<title>Connected</title></head><body><h1>Connected</h1>"
+            "<p>You can close this window now.</p>"
+            "<script>window.close();</script></body></html>",
+            headers={
+                "Cache-Control": "no-store",
+                "Referrer-Policy": "no-referrer",
+                "Content-Security-Policy": (
+                    "default-src 'none'; script-src 'unsafe-inline'; frame-ancestors 'none'"
+                ),
+            },
+        )
+    else:
+        # Preserve ordinary-user and explicit custom redirects.
+        response = RedirectResponse(
+            _mcp_oauth_redirect_after_url(
+                _redirect_after_with_params(
+                    callback_redirect_after,
+                    (("mcp_oauth_success", "1"),),
+                )
             )
         )
-    )
     _clear_mcp_oauth_state_cookie(response)
     return response
 

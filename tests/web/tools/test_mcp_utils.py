@@ -946,6 +946,15 @@ def test_require_offset_datetime_is_permissive_on_unparseable_input():
     utils.require_offset_datetime("not-a-date", "start_time")
 
 
+@pytest.mark.parametrize("value", ["RRULE:FREQ=DAILY", " rrule:freq=weekly "])
+def test_is_rrule_line_accepts_case_and_surrounding_whitespace(value):
+    assert utils.is_rrule_line(value)
+
+
+def test_is_rrule_line_rejects_other_recurrence_properties():
+    assert not utils.is_rrule_line("EXDATE:20260902T090000Z")
+
+
 def test_calendar_day_bounds_spans_a_short_day_across_a_dst_spring_forward():
     """2026-03-08 is when America/New_York springs forward (clocks skip
     02:00-03:00), so the calendar day is only 23 hours long. The end

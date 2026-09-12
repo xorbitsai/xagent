@@ -3,6 +3,7 @@ import os
 import re
 import urllib.request
 from datetime import date, datetime, time, timedelta
+from datetime import timezone as dt_timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -1328,3 +1329,31 @@ def naive_day_bounds(
     start = datetime.combine(day, time.min)
     end = start + timedelta(days=days)
     return start.isoformat(), end.isoformat()
+
+
+def timezones_could_differ(a: str, b: str) -> bool:
+    """True only when two Graph timeZone values can be POSITIVELY
+    confirmed to denote different zones (compared by current UTC offset,
+    not just the zone key, so e.g. a Windows name and the IANA name Graph
+    also accepts for the same real zone compare equal).
+
+    False whenever that can't be confirmed - including when either name
+    fails to resolve (an unmappable legacy Windows zone) - because "can't
+    tell" must never read as "these are different": the only use of this
+    function is deciding whether to reject a caller-supplied timezone as
+    ambiguous, and the actual write always uses Graph's own already-valid
+    timeZone string regardless of this check's answer. Wrongly rejecting
+    a same-zone resubmission (written in a different but equally valid
+    form) is the real failure mode to avoid; wrongly allowing a genuinely
+    different but unresolvable zone through is never worse than what
+    happens when the caller omits the argument entirely.
+    """
+    if a == b:
+        return False
+    try:
+        zone_a = resolve_zoneinfo(a)
+        zone_b = resolve_zoneinfo(b)
+    except ValueError:
+        return False
+    now = datetime.now(dt_timezone.utc)
+    return now.astimezone(zone_a).utcoffset() != now.astimezone(zone_b).utcoffset()

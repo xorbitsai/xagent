@@ -29,7 +29,6 @@ from ...core.runtime_performance import (
 from ...core.runtime_performance import (
     observe_duration,
     observe_value,
-    run_in_thread_with_telemetry,
 )
 from ...core.tools.adapters.vibe.connector_runtime import (
     redact_runtime_sensitive_payload,
@@ -58,6 +57,7 @@ from ...web.services.task_lease_service import (
     lock_task_lease_no_commit,
     task_lease_attempt_predicate,
 )
+from ...web.services.trace_database import get_trace_database_runtime
 from ...web.services.trace_event_staging import (
     checkpoint_run_partition_filter,
     failed_checkpoint_row_conditions,
@@ -230,10 +230,9 @@ class DatabaseTraceHandler(BaseTraceHandler):
             # A cancelled caller must wait for the instrumented worker to
             # release its transaction before task settlement can begin.
             worker = asyncio.create_task(
-                run_in_thread_with_telemetry(
-                    "trace_database_write",
-                    self._sync_save_to_database,
-                    event,
+                get_trace_database_runtime().run(
+                    lambda: self._sync_save_to_database(event),
+                    lambda db: self._save_trace_event(db, event),
                 )
             )
             await drain_async_task_cancellation_safe(worker)

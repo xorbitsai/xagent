@@ -141,6 +141,8 @@ TASK_RUNTIME_HOOK_QUEUE_TIMEOUT_SECONDS = (
 )
 CHECKPOINT_ENCODING_V2 = "XAGENT_CHECKPOINT_ENCODING_V2"
 CHECKPOINT_HISTORY_LIMIT = "XAGENT_CHECKPOINT_HISTORY_LIMIT"
+ASYNC_TRACE_DB_ENABLED = "XAGENT_ASYNC_TRACE_DB_ENABLED"
+TRACE_DB_MAX_INFLIGHT = "XAGENT_TRACE_DB_MAX_INFLIGHT"
 COMPACT_THRESHOLD_RATIO = "XAGENT_COMPACT_THRESHOLD_RATIO"
 COMPACT_THRESHOLD_DEFAULT = "XAGENT_COMPACT_THRESHOLD_DEFAULT"
 REDIS_URL = "XAGENT_REDIS_URL"
@@ -2639,6 +2641,21 @@ def get_db_pool_size() -> int:
         Number of persistent connections kept in the pool per process.
     """
     return _get_positive_int_env(DB_POOL_SIZE, 10)
+
+
+def get_async_trace_db_enabled() -> bool:
+    """Opt into native PostgreSQL trace writes; restart to change the backend."""
+    return _get_bool_env(ASYNC_TRACE_DB_ENABLED, False)
+
+
+def get_trace_db_max_inflight() -> int:
+    """Bound trace writes before thread/connection acquisition, per event loop.
+
+    Defaults to a conservative four, not the throughput benchmark's optimum.
+    The async trace pool has this same cap and no overflow. Sync writes also
+    clamp to leave one shared pooled connection where pool size permits.
+    """
+    return _get_positive_int_env(TRACE_DB_MAX_INFLIGHT, 4)
 
 
 def get_db_max_overflow() -> int:

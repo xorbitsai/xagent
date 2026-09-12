@@ -1306,6 +1306,11 @@ async def _initialize_database_and_admit_runtime(app_instance: FastAPI) -> None:
     with _startup_phase("host admission"):
         await run_host_startup_admissions(app_instance)
 
+    # Validate the opt-in backend before opening task ingress.
+    from .services.trace_database import get_trace_database_runtime
+
+    get_trace_database_runtime()
+
     # Keep built-in task-runtime providers scoped to the application lifespan.
     # Register even when disabled so task creation receives a precise 403
     # instead of an ambiguous "unknown extension" error.
@@ -1938,6 +1943,10 @@ async def shutdown_event() -> None:
 
     await background_task_manager.shutdown()
     await wait_for_heartbeat_manager_idle()
+
+    from .services.trace_database import close_trace_database_runtime
+
+    await close_trace_database_runtime()
 
     # Export task-finalization metrics and post-drain gauges before stopping
     # telemetry. Exporter shutdown must not delay cancellation of live tasks.

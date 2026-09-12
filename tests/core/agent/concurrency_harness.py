@@ -170,6 +170,8 @@ class RecordingContext:
         tool_name: str,
         result: Any,
         tool_call_id: str | None = None,
+        *,
+        insert_before_last_user: bool = False,
     ) -> _RecordedMessage:
         self.tool_results.append(
             {
@@ -179,7 +181,18 @@ class RecordingContext:
             }
         )
         message = _RecordedMessage("tool", result, tool_call_id=tool_call_id)
-        self.messages.append(message)
+        if insert_before_last_user:
+            # Mirrors ExecutionContext.add_tool_result's placement contract
+            # (xorbitsai/xagent#2223); the harness tracks ordering in
+            # self.tool_results so callers observe the same adjacency.
+            position = len(self.messages)
+            for index in range(len(self.messages) - 1, -1, -1):
+                if self.messages[index].role == "user":
+                    position = index
+                    break
+            self.messages.insert(position, message)
+        else:
+            self.messages.append(message)
         return message
 
     def add_assistant_message(self, content: str, **kwargs: Any) -> _RecordedMessage:

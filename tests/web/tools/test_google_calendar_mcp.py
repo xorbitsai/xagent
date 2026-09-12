@@ -167,6 +167,136 @@ def test_update_event_rule_only_rejects_existing_exception_lines(monkeypatch):
     service.events.return_value.update.assert_not_called()
 
 
+@pytest.mark.parametrize("missing_side", ["start", "end"])
+def test_update_event_recurrence_rejects_one_offsetless_boundary_without_timezone(
+    monkeypatch, missing_side
+):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "UTC"},
+        "end": {"dateTime": "2026-08-26T08:00:00", "timeZone": "UTC"},
+    }
+    existing_event[missing_side].pop("timeZone")
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=WEEKLY;COUNT=2",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "timeZone on only one offsetless boundary" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_event_recurrence_rejects_an_exception_on_a_later_list_page(
+    monkeypatch,
+):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "UTC"},
+        "end": {"dateTime": "2026-08-26T08:00:00", "timeZone": "UTC"},
+        "recurrence": ["RRULE:FREQ=DAILY;COUNT=5"],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    service.events.return_value.list.side_effect = [
+        Mock(
+            execute=Mock(
+                return_value={
+                    "items": [{"id": "other", "recurringEventId": "other-series"}],
+                    "nextPageToken": "page-2",
+                }
+            )
+        ),
+        Mock(
+            execute=Mock(
+                return_value={
+                    "items": [
+                        {
+                            "id": "exception-1",
+                            "recurringEventId": "existing-1",
+                            "originalStartTime": {"dateTime": "2026-08-27T07:00:00Z"},
+                        }
+                    ]
+                }
+            )
+        ),
+    ]
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=WEEKLY;COUNT=2",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "edited or cancelled instances" in result["message"]
+    list_calls = service.events.return_value.list.call_args_list
+    assert len(list_calls) == 2
+    assert list_calls[0].kwargs["singleEvents"] is False
+    assert list_calls[0].kwargs["showDeleted"] is True
+    assert "pageToken" not in list_calls[0].kwargs
+    assert list_calls[1].kwargs["pageToken"] == "page-2"
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_event_adding_first_recurrence_does_not_scan_for_exceptions(
+    monkeypatch,
+):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "UTC"},
+        "end": {"dateTime": "2026-08-26T08:00:00", "timeZone": "UTC"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=WEEKLY;COUNT=2",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    service.events.return_value.list.assert_not_called()
+
+
+def test_update_event_recurrence_with_attendees_uses_confirmed_conflict_bypass(
+    monkeypatch,
+):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "UTC"},
+        "end": {"dateTime": "2026-08-26T08:00:00", "timeZone": "UTC"},
+        "recurrence": ["RRULE:FREQ=DAILY;COUNT=5"],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            attendees=["new@example.com"],
+            recurrence="FREQ=WEEKLY;COUNT=2",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    body = service.events.return_value.update.call_args.kwargs["body"]
+    assert body["attendees"] == [{"email": "new@example.com"}]
+    service.freebusy.return_value.query.assert_not_called()
+
+
 def test_update_event_adds_recurrence_to_all_day_event(monkeypatch):
     existing_event = {
         "id": "existing-1",
@@ -180,6 +310,7 @@ def test_update_event_adds_recurrence_to_all_day_event(monkeypatch):
         calendar.google_calendar_update_events(
             event_id="existing-1",
             recurrence="FREQ=DAILY;COUNT=2",
+            timezone="Asia/Shanghai",
             ignore_conflicts=True,
         )
     )
@@ -189,6 +320,86 @@ def test_update_event_adds_recurrence_to_all_day_event(monkeypatch):
     assert body["recurrence"] == ["RRULE:FREQ=DAILY;COUNT=2"]
     assert body["start"] == {"date": "2026-08-26"}
     assert body["end"] == {"date": "2026-08-27"}
+
+
+@pytest.mark.parametrize(
+    ("timezone", "expected_status"),
+    [("UTC", "success"), ("Asia/Shanghai", "error")],
+)
+def test_update_event_offsetless_boundaries_require_the_calendar_timezone(
+    monkeypatch, timezone, expected_status
+):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00"},
+        "end": {"dateTime": "2026-08-26T08:00:00"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=DAILY;COUNT=2",
+            timezone=timezone,
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == expected_status
+    if expected_status == "error":
+        assert "must match the primary calendar timezone" in result["message"]
+        service.events.return_value.update.assert_not_called()
+
+
+def test_update_event_one_offsetless_boundary_requires_the_calendar_timezone(
+    monkeypatch,
+):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00Z"},
+        "end": {"dateTime": "2026-08-26T08:00:00"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=DAILY;COUNT=2",
+            timezone="Asia/Shanghai",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "must match the primary calendar timezone" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_event_recurrence_reports_a_colonless_stored_line_as_malformed(
+    monkeypatch,
+):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "UTC"},
+        "end": {"dateTime": "2026-08-26T08:00:00", "timeZone": "UTC"},
+        "recurrence": ["RRULE"],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=DAILY;COUNT=2",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "malformed property" in result["message"]
+    service.events.return_value.update.assert_not_called()
 
 
 @pytest.mark.parametrize(

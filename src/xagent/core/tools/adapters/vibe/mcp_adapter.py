@@ -28,6 +28,7 @@ from typing import (
     Union,
     cast,
 )
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from mcp.types import Tool as MCPTool
@@ -35,6 +36,7 @@ from pydantic import BaseModel, Field, create_model
 
 from ..... import config as _root_config
 from .....sandbox.base import Sandbox
+from ....utils.security import redact_sensitive_text
 from ...core.mcp.sessions import Connection, create_session
 from ...core.mcp.tools import load_mcp_tools, raw_annotations_for
 from .base import AbstractBaseTool, ToolVisibility
@@ -227,7 +229,36 @@ class EmptyArgsModel(BaseModel):
 logger = logging.getLogger(__name__)
 _RUNTIME_CONNECTION_REFRESH_KEY = "_connector_runtime_refresh"
 _OAUTH_TOKEN_RESOLVER_REFRESH_KEY = "_oauth_token_resolver_refresh"
-_RESOLVER_HTTP_401_NODE_LIMIT = 64
+# Hard ceiling on how many exception nodes either walk over a failed call
+# visits, so a wide or cyclic __cause__/__context__ graph cannot spin.
+# Two consumers read it: _bounded_exception_nodes (the 401 resolver's
+# challenge lookup) and _level_order_exception_nodes (failure logging).
+_EXCEPTION_WALK_NODE_LIMIT = 64
+# Caps each exception message logged when an MCP tool call fails, so a server
+# that echoes a large payload back in its error (or an SDK that dumps a full
+# request) can't blow up log volume. The cap is per line, not per failure: a
+# plain failure logs one capped line, and an exception-group failure logs one
+# for the group plus up to _MCP_TOOL_ERROR_LOG_MAX_SUB_EXCEPTIONS more, each
+# capped on its own. No traceback is attached to any of them. The message
+# returned to the caller ("Error executing MCP tool.") never carries it.
+_MCP_TOOL_ERROR_LOG_MAX_CHARS = 500
+# Caps str(exc) before either redaction pass in _truncated_error_message runs.
+# str(exc) comes from a remote MCP server (or an SDK relaying its response)
+# and has no length limit of its own, while both redaction passes cost time
+# proportional to their input, so an unbounded message is a CPU-cost lever a
+# hostile or compromised server can pull regardless of how cheap either pass
+# is made per character. This bound only needs to keep the redaction passes
+# themselves cheap -- _MCP_TOOL_ERROR_LOG_MAX_CHARS is still what bounds the
+# final logged size.
+_MCP_TOOL_ERROR_RAW_MAX_CHARS = 4096
+# Caps how many related exceptions of a failed call get their own log line:
+# the leaves of a (possibly nested) BaseExceptionGroup and the exceptions on
+# their __cause__/__context__ chains. A fan-out call (e.g. concurrent
+# sub-requests) can otherwise raise a group with dozens of members.
+# Members at the same nesting depth are visited before any of their own
+# chains, so a fan-out failure logs one line per leg before spending
+# budget on a leg's causes.
+_MCP_TOOL_ERROR_LOG_MAX_SUB_EXCEPTIONS = 5
 _HTTP_401_TEXT_RE = re.compile(
     r"\b(?:http(?:\s+status)?|status(?:\s+code)?|response|code)\s*[:=]?\s*401\b|"
     r"\b401\s+unauthorized\b",
@@ -621,7 +652,7 @@ def _bounded_exception_nodes(
     pending = [(exc, True)]
     visited: set[int] = set()
     visited_count = 0
-    while pending and visited_count < _RESOLVER_HTTP_401_NODE_LIMIT:
+    while pending and visited_count < _EXCEPTION_WALK_NODE_LIMIT:
         current, is_root = pending.pop()
         current_id = id(current)
         if current_id in visited or (
@@ -642,6 +673,170 @@ def _bounded_exception_nodes(
         if isinstance(current.__context__, BaseException):
             linked.append(current.__context__)
         pending.extend((node, False) for node in reversed(linked))
+
+
+def _level_order_exception_nodes(exc: BaseException) -> Iterator[BaseException]:
+    """Yield ``exc`` and the exceptions linked to it in level order: the
+    members of an exception group at one nesting depth are reached before
+    any of those members' own ``__cause__``/``__context__`` chains.
+
+    ``_bounded_exception_nodes`` walks the same edges depth-first, which is
+    what the 401 resolver wants -- it only needs one matching response from
+    anywhere in the graph. A capped log wants the opposite: a fan-out call
+    fails as a group with one member per failed leg, and depth-first order
+    lets the first leg's own cause chain spend the whole per-call budget,
+    so the other legs never get a line at all.
+    """
+    pending: list[BaseException] = [exc]
+    visited: set[int] = set()
+    index = 0
+    while index < len(pending) and len(visited) < _EXCEPTION_WALK_NODE_LIMIT:
+        current = pending[index]
+        index += 1
+        current_id = id(current)
+        if current_id in visited:
+            continue
+        visited.add(current_id)
+        yield current
+
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(current.exceptions)
+        if isinstance(current.__cause__, BaseException):
+            pending.append(current.__cause__)
+        if isinstance(current.__context__, BaseException):
+            pending.append(current.__context__)
+
+
+_URL_TOKEN_RE = re.compile(r"(?:https?|wss?)://[^\s'\"<>]+", re.IGNORECASE)
+# Punctuation that ends the sentence rather than the URL. Closing brackets
+# are only dropped when the token holds no matching opener, so an IPv6
+# authority ("https://[::1]") and a parenthesised path segment survive.
+_URL_TRAILING_PUNCTUATION = ",.;:"
+_URL_TRAILING_BRACKETS = {")": "(", "]": "[", "}": "{"}
+
+
+def _split_url_token(token: str) -> tuple[str, str]:
+    """Split a matched URL token into ``(clean, trailing)``.
+
+    ``trailing`` is sentence punctuation immediately following the URL (a
+    closing paren, a period, ...) that should survive redaction even
+    though the URL itself does not; ``clean`` is the token with that
+    punctuation removed, ready to hand to ``urlsplit``.
+
+    The boundary between the two is found by scanning backward from the
+    end of the *scheme+authority+path* portion of the token only -- never
+    past the first ``?`` or ``#`` -- dropping characters that are either
+    in ``_URL_TRAILING_PUNCTUATION`` or a closing bracket with no
+    matching opener earlier in that same portion, until neither applies.
+    Stopping at the query/fragment boundary is deliberate: those parts are
+    dropped wholesale by the caller, so a credential value ending in one
+    of these characters (``...api_key=S)))``) must not have that tail
+    split off, survive the drop, and be reattached to the redacted URL as
+    if it were sentence punctuation -- nothing at or after the boundary is
+    ever part of either return value. Bracket counts for the scanned
+    portion are computed once up front and decremented as brackets are
+    consumed, rather than re-scanned on every character, so the scan is
+    linear in the token length instead of quadratic.
+    """
+    boundary = len(token)
+    for sep in ("?", "#"):
+        idx = token.find(sep)
+        if idx != -1 and idx < boundary:
+            boundary = idx
+    scanned = token[:boundary]
+    remaining = {c: scanned.count(c) for c in _URL_TRAILING_BRACKETS}
+    openers = {c: scanned.count(o) for c, o in _URL_TRAILING_BRACKETS.items()}
+    end = boundary
+    while end > 0:
+        last = token[end - 1]
+        if last in _URL_TRAILING_PUNCTUATION:
+            end -= 1
+            continue
+        if last in _URL_TRAILING_BRACKETS and openers[last] < remaining[last]:
+            remaining[last] -= 1
+            end -= 1
+            continue
+        break
+    return token[:end], token[end:boundary]
+
+
+def redact_urls_in_text(text: str) -> str:
+    """Return ``text`` with every ``scheme://...`` URL replaced by a copy
+    that has its query string and userinfo stripped.
+
+    Exception messages that legitimately need to name the server sometimes
+    embed the full request URL -- e.g. ``httpx.HTTPStatusError``'s message
+    is "... for url '<url>'" and an unfollowed redirect's message names the
+    ``Location`` response header. Connector URLs commonly carry secrets
+    (API keys, tokens) in the query string or in ``user:pass@host``
+    userinfo, so those parts are dropped before the message is logged, and
+    so is the fragment (it never reaches a server and carries no diagnostic
+    value). The scheme, host, port, and path are kept so the log line still
+    says which server failed. A token that fails to parse as a URL is
+    replaced wholesale with ``<url redacted>`` rather than risking a partial
+    leak. ``ws://``/``wss://`` tokens are covered the same way as
+    ``http``/``https``, because a websocket transport cannot send headers,
+    so a websocket connector has nowhere but the URL to put its credential.
+    Sentence punctuation that trails the token (a closing paren, a period,
+    ...) is split off before parsing and re-appended to the result
+    afterwards, so redaction does not eat the punctuation that follows a
+    URL -- but only punctuation trailing the scheme/authority/path:
+    nothing at or after the first ``?``/``#`` is ever treated as trailing,
+    since that is where the query string / fragment begins and both are
+    dropped wholesale (see ``_split_url_token``). Text separated from the
+    URL only by a character that is legal inside a query string (a comma,
+    say) is still part of the token and is dropped with the query; see
+    the ``comma-inside-query`` test case.
+    """
+
+    def _redact(match: "re.Match[str]") -> str:
+        token = match.group(0)
+        clean, trailing = _split_url_token(token)
+        try:
+            parts = urlsplit(clean)
+            # Keep the authority verbatim minus userinfo: re-assembling it
+            # from ``hostname``/``port`` would drop IPv6 brackets and lower
+            # the case, and reading ``port`` raises on out-of-range values.
+            netloc = parts.netloc.rsplit("@", 1)[-1]
+            return urlunsplit((parts.scheme, netloc, parts.path, "", "")) + trailing
+        except ValueError:
+            # UnicodeError is a ValueError subclass, so this also covers a
+            # token that fails to decode as IDNA.
+            return "<url redacted>" + trailing
+
+    return _URL_TOKEN_RE.sub(_redact, text)
+
+
+def _truncated_error_message(exc: BaseException) -> str:
+    """Return ``str(exc)`` made safe to log: URLs lose their query string,
+    userinfo and fragment (``redact_urls_in_text``), header- and
+    assignment-shaped secrets are masked (``redact_sensitive_text``), and
+    the result is bounded to ``_MCP_TOOL_ERROR_LOG_MAX_CHARS``. It is
+    otherwise just the exception's own message (e.g. a JSON-RPC error
+    string or an HTTP status line) -- it must never be additionally handed
+    tool_args, tool_meta, or connection headers, none of which are
+    exception messages to begin with. Some shapes are recognised by neither
+    helper -- a secret in a URL path segment (#2272) and some of the shapes
+    listed in #2356 -- and for those the cap is what bounds the exposure.
+    ``str(exc)`` is also bounded to ``_MCP_TOOL_ERROR_RAW_MAX_CHARS`` before
+    either redaction pass runs, since it is remote-controlled and unbounded
+    while both passes cost time proportional to their input.
+    """
+    try:
+        raw = str(exc)
+        if len(raw) > _MCP_TOOL_ERROR_RAW_MAX_CHARS:
+            raw = raw[:_MCP_TOOL_ERROR_RAW_MAX_CHARS]
+        text = redact_sensitive_text(redact_urls_in_text(raw))
+    except BaseException:
+        # Every caller is an ``except`` handler whose contract is to return
+        # a result dict, so a custom ``__str__`` that raises must not escape
+        # here. ``BaseException`` is deliberate: nothing in the guarded block
+        # awaits, so no cancellation can originate in it, and a ``__str__``
+        # is free to raise a BaseException subclass.
+        return type(exc).__name__
+    if len(text) <= _MCP_TOOL_ERROR_LOG_MAX_CHARS:
+        return text
+    return text[: _MCP_TOOL_ERROR_LOG_MAX_CHARS - 1].rstrip() + "…"
 
 
 def _strict_http_401_responses(
@@ -1414,12 +1609,34 @@ class MCPToolAdapter(AbstractBaseTool):
                         return retry_result
                     raise
 
+        # The tool-loading handlers (_load_direct_mcp_tools,
+        # load_mcp_tools_as_agent_tools) log only the class name above DEBUG
+        # and keep the raw traceback (exc_info) for DEBUG, because a traceback
+        # is unredacted and unbounded. These two handlers log at ERROR, but
+        # only _truncated_error_message() output -- passed through
+        # redact_urls_in_text and redact_sensitive_text and capped per line --
+        # and never a traceback, so do not add exc_info here. Shapes neither
+        # helper recognises: #2272 and some of those listed in #2356.
         except BaseExceptionGroup as e:
             logger.error(
-                "MCP tool %s execution failed with exception group %s",
+                "MCP tool %s execution failed with exception group %s: %s",
                 self.mcp_tool.name,
                 type(e).__name__,
+                _truncated_error_message(e),
             )
+            leaf_count = 0
+            for node in _level_order_exception_nodes(e):
+                if node is e or isinstance(node, BaseExceptionGroup):
+                    continue
+                if leaf_count >= _MCP_TOOL_ERROR_LOG_MAX_SUB_EXCEPTIONS:
+                    break
+                leaf_count += 1
+                logger.error(
+                    "MCP tool %s execution failed with related exception %s: %s",
+                    self.mcp_tool.name,
+                    type(node).__name__,
+                    _truncated_error_message(node),
+                )
             return {
                 "content": [{"text": "Error executing MCP tool."}],
                 "is_error": True,
@@ -1427,9 +1644,10 @@ class MCPToolAdapter(AbstractBaseTool):
 
         except Exception as e:
             logger.error(
-                "MCP tool %s execution failed with %s",
+                "MCP tool %s execution failed with %s: %s",
                 self.mcp_tool.name,
                 type(e).__name__,
+                _truncated_error_message(e),
             )
             return {
                 "content": [{"text": "Error executing MCP tool."}],
@@ -1623,7 +1841,16 @@ class MCPToolAdapter(AbstractBaseTool):
             if target.get("target_type") != TARGET_TOOL_ARGUMENTS:
                 continue
             target_key = target.get("key")
-            if not isinstance(target_key, str) or target_key not in properties:
+            if not isinstance(target_key, str):
+                continue
+            if target_key not in properties:
+                logger.warning(
+                    "Skipping runtime MCP tool argument binding for %s on "
+                    "tool %s: the tool's input schema does not declare "
+                    "this argument",
+                    target_key,
+                    self.mcp_tool.name,
+                )
                 continue
             value = binding_source_value(
                 binding,

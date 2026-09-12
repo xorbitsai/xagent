@@ -63,6 +63,7 @@ from ...core.tools.adapters.vibe.connector_runtime import (
     runtime_bindings_from_config,
 )
 from ...core.tools.adapters.vibe.db_session import tool_session_scope
+from ...core.tools.adapters.vibe.mcp_adapter import redact_urls_in_text
 from ..services.actor_mcp_runtime import (
     ActorMCPStdioSessionIdentity,
     resolve_actor_mcp_stdio_configs,
@@ -475,6 +476,21 @@ def _bounded_oauth_metadata(value: Any, *, max_length: int = 128) -> str:
     if len(text) <= max_length:
         return text
     return f"{text[: max_length - 3]}..."
+
+
+def _redacted_bounded_resource(resource: str | None) -> str | None:
+    """Redact and bound an OAuth resource URL for a diagnostic, or ``None``
+    if there is none. Every producer of ``resource`` (``mcp_runtime.py``'s
+    ``effective_mcp_oauth_resource`` and this module's
+    ``_oauth_token_configured_resource``) excludes the empty string, so a
+    truthy guard and an ``is not None`` guard are equivalent in practice;
+    this uses the truthy form so ``""`` -- if a producer's contract ever
+    changes -- is treated the same as ``None`` rather than redacted and
+    bounded into a diagnostic-empty string.
+    """
+    if not resource:
+        return None
+    return _bounded_oauth_metadata(redact_urls_in_text(resource))
 
 
 def _extract_oauth_token_resolver_diagnostic_actor_id(exc: Exception) -> str | None:
@@ -3603,9 +3619,7 @@ class WebToolConfig(BaseToolConfig):
             server,
             code=OAUTH_TOKEN_RESOLVER_FAILURE_CODE,
             message=OAUTH_TOKEN_RESOLVER_FAILURE_MESSAGE,
-            resource=_bounded_oauth_metadata(error.resource)
-            if error.resource is not None
-            else None,
+            resource=_redacted_bounded_resource(error.resource),
         )
         diagnostic["providers"] = [
             _bounded_oauth_metadata(provider) for provider in error.providers[:2]
@@ -3628,9 +3642,12 @@ class WebToolConfig(BaseToolConfig):
         )
         self._mcp_oauth_diagnostics.append(diagnostic)
         logger.warning(
-            "OAuth token resolver failed for MCP server '%s' with %s",
+            "OAuth token resolver failed for MCP server '%s' with %s "
+            "(failure_code=%s, resource=%s)",
             getattr(server, "name", "<unknown>"),
             error.exception_type,
+            error.failure_code,
+            _redacted_bounded_resource(error.resource),
         )
         return self._build_unavailable_mcp_config(
             server=server,

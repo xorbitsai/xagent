@@ -3,6 +3,7 @@ import logging
 import re
 import subprocess
 import sys
+import time
 from contextlib import asynccontextmanager
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
@@ -19,6 +20,8 @@ from xagent.core.model.chat.basic.claude import _fix_pydantic_schema_for_claude
 from xagent.core.tools.adapters.vibe import mcp_adapter as mcp_adapter_module
 from xagent.core.tools.adapters.vibe.mcp_adapter import (
     _FIELD_TEXT_MAX_CHARS,
+    _MCP_TOOL_ERROR_LOG_MAX_CHARS,
+    _MCP_TOOL_ERROR_RAW_MAX_CHARS,
     EmptyArgsModel,
     MCPFailurePhase,
     MCPServerLoadFailure,
@@ -28,9 +31,12 @@ from xagent.core.tools.adapters.vibe.mcp_adapter import (
     _compact_json,
     _exception_indicates_http_401,
     _mcp_return_value_as_string,
+    _split_url_token,
+    _truncated_error_message,
     classify_non_idempotent_write,
     classify_write_hint,
     load_mcp_tools_as_agent_tools,
+    redact_urls_in_text,
 )
 from xagent.core.tools.adapters.vibe.tool_naming_limits import (
     MAX_AGENT_TOOL_NAME_LENGTH,
@@ -509,7 +515,7 @@ def test_resolver_challenge_traversal_stops_at_named_node_budget():
     current: BaseException = _http_status_error(
         authenticate=['Bearer error="invalid_token"']
     )
-    for index in range(mcp_adapter_module._RESOLVER_HTTP_401_NODE_LIMIT):
+    for index in range(mcp_adapter_module._EXCEPTION_WALK_NODE_LIMIT):
         wrapper = RuntimeError(f"wrapper-{index}")
         wrapper.__cause__ = current
         current = wrapper
@@ -1255,6 +1261,150 @@ def test_mcp_runtime_tool_argument_missing_source_warns(caplog):
     assert "list_clients" in caplog.text
 
 
+def test_mcp_runtime_tool_argument_undeclared_target_warns_and_is_skipped(caplog):
+    """A runtime binding can name a tool argument the connector author
+    thinks exists. If the tool's actual input schema (from tools/list)
+    doesn't declare that argument, the binding must be dropped loudly, not
+    silently -- the previous silent `continue` gave no signal that the
+    connector's runtime_bindings and the tool's real schema had drifted
+    apart."""
+    mcp_tool = SimpleNamespace(
+        name="list_clients",
+        description="List clients",
+        inputSchema={
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+        },
+    )
+    adapter = MCPToolAdapter(
+        mcp_tool=mcp_tool,
+        connection={
+            "transport": "stdio",
+            "command": "python",
+            "args": [],
+            "runtime_bindings": [
+                {
+                    "source": {"input_type": "context", "key": "account_id"},
+                    "target": {
+                        "target_type": "tool_arguments",
+                        "key": "account_id",
+                    },
+                },
+            ],
+            "connector_runtime": {
+                "context": {"account_id": "6185"},
+                "secrets": {},
+                "auth_selector": {},
+            },
+        },
+    )
+
+    caplog.set_level("WARNING")
+    assert adapter._runtime_tool_arguments() == {}
+    assert [(record.levelname, record.getMessage()) for record in caplog.records] == [
+        (
+            "WARNING",
+            "Skipping runtime MCP tool argument binding for account_id on tool "
+            "list_clients: the tool's input schema does not declare this argument",
+        )
+    ]
+
+
+@pytest.mark.parametrize("target_key", [123, None])
+def test_mcp_runtime_tool_argument_non_string_target_key_is_skipped_silently(
+    caplog, target_key
+):
+    """A binding whose target key is not a string is dropped without any log
+    line, unlike a string key the tool's schema does not declare, which warns."""
+    adapter = MCPToolAdapter(
+        mcp_tool=_mcp_tool("list_clients"),
+        connection={
+            "transport": "stdio",
+            "command": "python",
+            "args": [],
+            "runtime_bindings": [
+                {
+                    "source": {"input_type": "context", "key": "account_id"},
+                    "target": {"target_type": "tool_arguments", "key": target_key},
+                },
+            ],
+            "connector_runtime": {
+                "context": {"account_id": "6185"},
+                "secrets": {},
+                "auth_selector": {},
+            },
+        },
+    )
+
+    caplog.set_level("DEBUG")
+    assert adapter._runtime_tool_arguments() == {}
+    assert caplog.records == []
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_call_proceeds_when_runtime_binding_target_is_undeclared(
+    monkeypatch,
+):
+    """Even though the runtime binding above can't be applied, the tool call
+    itself must still go through -- an undeclared binding target degrades to
+    'this one argument isn't injected', not 'the tool call fails'."""
+    mcp_tool = SimpleNamespace(
+        name="list_clients",
+        description="List clients",
+        inputSchema={
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+        },
+    )
+    adapter = MCPToolAdapter(
+        mcp_tool=mcp_tool,
+        connection={
+            "transport": "stdio",
+            "command": "python",
+            "args": [],
+            "runtime_bindings": [
+                {
+                    "source": {"input_type": "context", "key": "account_id"},
+                    "target": {
+                        "target_type": "tool_arguments",
+                        "key": "account_id",
+                    },
+                },
+            ],
+            "connector_runtime": {
+                "context": {"account_id": "6185"},
+                "secrets": {},
+                "auth_selector": {},
+            },
+        },
+    )
+
+    captured: dict[str, Any] = {}
+
+    class _FakeSession:
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, name, arguments, **kwargs):
+            captured["name"] = name
+            captured["arguments"] = arguments
+            return CallToolResult(content=[], isError=False)
+
+    @asynccontextmanager
+    async def _fake_create_session(_connection):
+        yield _FakeSession()
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.mcp_adapter.create_session",
+        _fake_create_session,
+    )
+
+    result = await adapter.run_json_async({"query": "active"})
+
+    assert result["is_error"] is False
+    assert captured["arguments"] == {"query": "active"}
+
+
 def _resolver_retry_adapter(connection):
     return MCPToolAdapter(
         mcp_tool=SimpleNamespace(
@@ -1869,7 +2019,7 @@ async def test_resolver_retry_prunes_over_budget_initial_exception_subtree(
     deep_original: BaseException = _http_status_error(
         authenticate=['Bearer error="invalid_token"']
     )
-    for index in range(mcp_adapter_module._RESOLVER_HTTP_401_NODE_LIMIT + 1):
+    for index in range(mcp_adapter_module._EXCEPTION_WALK_NODE_LIMIT + 1):
         wrapper = RuntimeError(f"initial-wrapper-{index}")
         wrapper.__cause__ = deep_original
         deep_original = wrapper
@@ -2208,6 +2358,333 @@ async def test_mcp_tool_execution_error_does_not_echo_raw_exception(monkeypatch)
     assert result["is_error"] is True
     assert result["content"][0]["text"] == "Error executing MCP tool."
     assert "runtime-token" not in repr(result)
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_execution_error_logs_truncated_message(monkeypatch, caplog):
+    """The generic-exception handler must log the server's actual error
+    message (bounded), not just the exception's class name, so an on-call
+    engineer reading the log can see what the server actually said."""
+    mcp_tool = SimpleNamespace(
+        name="list_clients",
+        description="List clients",
+        inputSchema={"type": "object", "properties": {}},
+    )
+    adapter = MCPToolAdapter(
+        mcp_tool=mcp_tool,
+        connection={"transport": "streamable_http", "url": "https://mcp.example.test"},
+    )
+    overlong_detail = "server-said-this-and-nothing-else-" + "z" * 600
+
+    class _FakeSession:
+        async def initialize(self):
+            raise RuntimeError(overlong_detail)
+
+    @asynccontextmanager
+    async def _fake_create_session(connection):
+        yield _FakeSession()
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.mcp_adapter.create_session",
+        _fake_create_session,
+    )
+    caplog.set_level("ERROR")
+
+    result = await adapter.run_json_async({})
+
+    assert result == {
+        "content": [{"text": "Error executing MCP tool."}],
+        "is_error": True,
+    }
+    # No traceback is attached to this log record: attaching one would print
+    # the exception's raw, unbounded message a second time (Python's own
+    # traceback formatting bypasses the truncation below), defeating the
+    # bound. So the untruncated payload must not appear anywhere in the
+    # emitted log, not just outside the formatted message field.
+    assert "RuntimeError" in caplog.text
+    assert "server-said-this-and-nothing-else-" in caplog.text
+    assert overlong_detail not in caplog.text
+    assert caplog.records[-1].exc_info is None
+    truncated = caplog.records[-1].args[-1]
+    assert len(truncated) == _MCP_TOOL_ERROR_LOG_MAX_CHARS
+    assert truncated.endswith("…")
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_execution_error_redacts_prefixed_credential_assignments(
+    monkeypatch, caplog
+):
+    """A server error that echoes a prefixed credential assignment such as
+    ``MCP_API_KEY=...`` must not leave the raw value in any emitted log
+    record: the shared sanitizer masks the value while keeping the key name
+    so the log still says which setting the server complained about."""
+    mcp_tool = SimpleNamespace(
+        name="list_clients",
+        description="List clients",
+        inputSchema={"type": "object", "properties": {}},
+    )
+    adapter = MCPToolAdapter(
+        mcp_tool=mcp_tool,
+        connection={"transport": "streamable_http", "url": "https://mcp.example.test"},
+    )
+
+    class _FakeSession:
+        async def initialize(self):
+            raise RuntimeError(
+                "MCP_API_KEY=SECRET-abc123 rejected; "
+                "SERVICE_ACCESS_TOKEN=tok-987654 expired"
+            )
+
+    @asynccontextmanager
+    async def _fake_create_session(connection):
+        yield _FakeSession()
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.mcp_adapter.create_session",
+        _fake_create_session,
+    )
+    # Capture every level, not just ERROR: the guarantee is that the raw
+    # value is absent from every record this call emits.
+    caplog.set_level("DEBUG")
+
+    result = await adapter.run_json_async({})
+
+    assert result == {
+        "content": [{"text": "Error executing MCP tool."}],
+        "is_error": True,
+    }
+    assert "SECRET-abc123" not in caplog.text
+    assert "tok-987654" not in caplog.text
+    assert "MCP_API_KEY=***c123 rejected" in caplog.text
+    assert "SERVICE_ACCESS_TOKEN=***7654 expired" in caplog.text
+    assert caplog.records[-1].exc_info is None
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_execution_error_redacts_url_query_and_userinfo(
+    monkeypatch, caplog
+):
+    """httpx.HTTPStatusError formats its own message as "... for url
+    '<url>'". Connector URLs commonly carry secrets (API keys, tokens) in
+    the query string, so the logged message must have the query string
+    dropped while still naming the host and status so the log stays
+    useful."""
+    mcp_tool = SimpleNamespace(
+        name="list_clients",
+        description="List clients",
+        inputSchema={"type": "object", "properties": {}},
+    )
+    adapter = MCPToolAdapter(
+        mcp_tool=mcp_tool,
+        connection={"transport": "streamable_http", "url": "https://mcp.example.test"},
+    )
+    request = httpx.Request(
+        "POST",
+        "https://mcp.example.test/mcp?api_key=SECRET-abc123&tenant=acme",
+    )
+    response = httpx.Response(403, request=request)
+    with pytest.raises(httpx.HTTPStatusError) as exc_info:
+        response.raise_for_status()
+    status_error = exc_info.value
+
+    class _FakeSession:
+        async def initialize(self):
+            raise status_error
+
+    @asynccontextmanager
+    async def _fake_create_session(connection):
+        yield _FakeSession()
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.mcp_adapter.create_session",
+        _fake_create_session,
+    )
+    caplog.set_level("ERROR")
+
+    result = await adapter.run_json_async({})
+
+    assert result == {
+        "content": [{"text": "Error executing MCP tool."}],
+        "is_error": True,
+    }
+    assert "SECRET-abc123" not in caplog.text
+    assert "tenant=acme" not in caplog.text
+    assert "403" in caplog.text
+    assert "mcp.example.test" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_execution_error_redacts_url_userinfo(monkeypatch, caplog):
+    """A message that embeds a URL with userinfo (``user:pass@host``) must
+    have both the credentials and the query string stripped before
+    logging."""
+    mcp_tool = SimpleNamespace(
+        name="list_clients",
+        description="List clients",
+        inputSchema={"type": "object", "properties": {}},
+    )
+    adapter = MCPToolAdapter(
+        mcp_tool=mcp_tool,
+        connection={"transport": "streamable_http", "url": "https://mcp.example.test"},
+    )
+
+    class _FakeSession:
+        async def initialize(self):
+            raise RuntimeError(
+                "upstream refused connection to https://user:pw@host/path?x=1"
+            )
+
+    @asynccontextmanager
+    async def _fake_create_session(connection):
+        yield _FakeSession()
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.mcp_adapter.create_session",
+        _fake_create_session,
+    )
+    caplog.set_level("ERROR")
+
+    result = await adapter.run_json_async({})
+
+    assert result == {
+        "content": [{"text": "Error executing MCP tool."}],
+        "is_error": True,
+    }
+    assert caplog.records[-1].args[-1] == (
+        "upstream refused connection to https://host/path"
+    )
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_execution_error_group_logs_each_sub_exception(
+    monkeypatch, caplog
+):
+    """The exception-group handler must log each leaf exception's own class
+    and message (bounded), not just the group's class name -- a fan-out MCP
+    call raises one group per failed leg (and the MCP client's own two
+    nested task groups can wrap that again), and a group itself carries no
+    detail about which leg failed or why. Nested groups must be expanded to
+    their leaves rather than logged as an opaque inner ExceptionGroup."""
+    mcp_tool = SimpleNamespace(
+        name="list_clients",
+        description="List clients",
+        inputSchema={"type": "object", "properties": {}},
+    )
+    adapter = MCPToolAdapter(
+        mcp_tool=mcp_tool,
+        connection={"transport": "streamable_http", "url": "https://mcp.example.test"},
+    )
+
+    class _FakeSession:
+        async def initialize(self):
+            raise BaseExceptionGroup(
+                "outer",
+                [
+                    BaseExceptionGroup("inner", [RuntimeError("first-leg-failed")]),
+                    ValueError("second-leg"),
+                ],
+            )
+
+    @asynccontextmanager
+    async def _fake_create_session(connection):
+        yield _FakeSession()
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.mcp_adapter.create_session",
+        _fake_create_session,
+    )
+    caplog.set_level("ERROR")
+
+    result = await adapter.run_json_async({})
+
+    assert result == {
+        "content": [{"text": "Error executing MCP tool."}],
+        "is_error": True,
+    }
+    assert "RuntimeError" in caplog.text
+    assert "first-leg-failed" in caplog.text
+    assert "ValueError" in caplog.text
+    assert "second-leg" in caplog.text
+    assert "related exception ExceptionGroup" not in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
+
+
+async def _run_json_with_failure(monkeypatch, exc: BaseException) -> dict[str, Any]:
+    """Run an adapter whose session raises ``exc`` and return its result."""
+    adapter = MCPToolAdapter(
+        mcp_tool=_mcp_tool("list_clients"),
+        connection={"transport": "streamable_http", "url": "https://mcp.example.test"},
+    )
+
+    class _FakeSession:
+        async def initialize(self):
+            raise exc
+
+    @asynccontextmanager
+    async def _fake_create_session(_connection):
+        yield _FakeSession()
+
+    monkeypatch.setattr(mcp_adapter_module, "create_session", _fake_create_session)
+    return await adapter.run_json_async({})
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_execution_error_group_logs_every_member_before_chains(
+    monkeypatch, caplog
+):
+    """A fan-out call raises one group member per failed leg. If one leg's
+    own __cause__/__context__ chain runs deep, a depth-first walk spends the
+    whole per-call log budget on that one leg's chain and the other legs
+    never get a line. Every member must get a line before any single
+    member's chain is followed further."""
+    member_a: BaseException = RuntimeError("member-a-root")
+    for level in range(1, 8):
+        wrapper = RuntimeError(f"member-a-chain-{level}")
+        wrapper.__context__ = member_a
+        member_a = wrapper
+
+    exc_group = BaseExceptionGroup(
+        "fan-out",
+        [member_a, ValueError("second-leg"), ValueError("third-leg")],
+    )
+    caplog.set_level("ERROR")
+
+    result = await _run_json_with_failure(monkeypatch, exc_group)
+
+    assert result == {
+        "content": [{"text": "Error executing MCP tool."}],
+        "is_error": True,
+    }
+    assert "second-leg" in caplog.text
+    assert "third-leg" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_execution_error_group_survives_exploding_context_str(
+    monkeypatch, caplog
+):
+    """A group member's __context__ can itself be an exception whose
+    __str__ raises. ``_exception_indicates_http_401`` only recurses into a
+    group's own members, not its __cause__/__context__ chain, so that
+    incidental protection does not cover this shape: the logging path
+    itself must not let a misbehaving __str__ escape ``run_json_async``."""
+
+    class _ExplodingStr(Exception):
+        def __str__(self):
+            raise ValueError("__str__ exploded")
+
+    member = RuntimeError("member-ok")
+    member.__context__ = _ExplodingStr()
+    exc_group = BaseExceptionGroup("fan-out", [member])
+    caplog.set_level("ERROR")
+
+    result = await _run_json_with_failure(monkeypatch, exc_group)
+
+    assert result == {
+        "content": [{"text": "Error executing MCP tool."}],
+        "is_error": True,
+    }
+    assert "_ExplodingStr" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -3104,6 +3581,25 @@ def test_description_length_boundary(length, truncated):
         assert description == raw
 
 
+@pytest.mark.parametrize(
+    "length,truncated",
+    [
+        (_MCP_TOOL_ERROR_LOG_MAX_CHARS - 1, False),
+        (_MCP_TOOL_ERROR_LOG_MAX_CHARS, False),
+        (_MCP_TOOL_ERROR_LOG_MAX_CHARS + 1, True),
+    ],
+)
+def test_truncated_error_message_length_boundary(length, truncated):
+    """The cap is inclusive: exactly the cap is kept, one over is shortened."""
+    message = _truncated_error_message(RuntimeError("a" * length))
+
+    assert len(message) <= _MCP_TOOL_ERROR_LOG_MAX_CHARS
+    if truncated:
+        assert message == "a" * (_MCP_TOOL_ERROR_LOG_MAX_CHARS - 1) + "…"
+    else:
+        assert message == "a" * length
+
+
 def _listing(*annotations: object) -> dict[str, Any]:
     """A ``tools/list`` payload whose tools carry the given raw annotations."""
     tools = []
@@ -3332,3 +3828,198 @@ def test_only_read_only_is_a_safe_reading():
         MCPWriteHint.DESTRUCTIVE,
         MCPWriteHint.UNDECLARED,
     }
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        (
+            "wss://mcp.example.test/ws?api_key=SECRET-abc123 rejected",
+            "wss://mcp.example.test/ws rejected",
+        ),
+        (
+            "Authorization: Bearer ey.SECRETJWT.sig",
+            "Authorization: Bearer ***.sig",
+        ),
+        ("x-api-key: SECRET-abc123", "x-api-key: ***c123"),
+        (
+            "config error: api_key=SECRET-abc123",
+            "config error: api_key=***c123",
+        ),
+        (
+            "MCP_API_KEY=SECRET-abc123 rejected",
+            "MCP_API_KEY=***c123 rejected",
+        ),
+        (
+            "SERVICE_ACCESS_TOKEN=tok-987654 expired",
+            "SERVICE_ACCESS_TOKEN=***7654 expired",
+        ),
+    ],
+)
+def test_truncated_error_message_redacts_non_url_secret_shapes(message, expected):
+    """``_truncated_error_message`` must also mask header- and
+    assignment-shaped secrets that never sit inside a URL token, on top of
+    the URL redaction ``redact_urls_in_text`` already does."""
+    assert _truncated_error_message(RuntimeError(message)) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("HTTPS://H.EXAMPLE/P?K=SECRET", "https://H.EXAMPLE/P"),
+        ("https://cb.example/done#access_token=TOKEN&t=b", "https://cb.example/done"),
+        ("https://[::1]:8080/x?y=1 done", "https://[::1]:8080/x done"),
+        ("https://user:pw@Host.Example:8443/p?x=1", "https://Host.Example:8443/p"),
+        ("https://[::1/x?y=1 done", "<url redacted> done"),
+        ("wss://h/ws?api_key=SECRET rejected", "wss://h/ws rejected"),
+        ("ws://h/p?tok=SECRET redirect", "ws://h/p redirect"),
+        ("see (https://h/p) ok", "see (https://h/p) ok"),
+        ("msg: https://h/p.", "msg: https://h/p."),
+        ("see (https://h/p?k=s) ok", "see (https://h/p ok"),
+        ("msg: https://h/p?k=s.", "msg: https://h/p"),
+        ("see https://[::1]", "see https://[::1]"),
+        (
+            "https://en.example/wiki/Foo_(bar)",
+            "https://en.example/wiki/Foo_(bar)",
+        ),
+        ("url=https://h/p?k=s,next", "url=https://h/p"),
+    ],
+    ids=[
+        "uppercase-scheme",
+        "fragment-dropped",
+        "ipv6-brackets-kept",
+        "userinfo-and-case",
+        "unparsable",
+        "wss-query-dropped",
+        "ws-query-dropped",
+        "trailing-paren-no-query",
+        "trailing-period-no-query",
+        "trailing-paren-in-dropped-query",
+        "trailing-period-in-dropped-query",
+        "bare-ipv6-authority",
+        "balanced-paren-in-path",
+        "comma-inside-query-is-part-of-the-url",
+    ],
+)
+def test_redact_urls_in_text_edge_shapes(text, expected):
+    """``comma-inside-query-is-part-of-the-url`` documents a known gap: the
+    comma sits inside the query string, not at the end of the token, so the
+    trailing-punctuation strip (which only looks at the token's own last
+    character) does not reach it. The only way to also recover the ``next``
+    that follows it would be excluding ``,`` from the URL token's character
+    class, but a comma is a legal query-string character -- doing that
+    would split a secret that happens to contain a comma into two pieces
+    and leave the second piece in the log. This case pins the current,
+    deliberate trade-off; it must turn red if that trade-off is reversed.
+
+    ``trailing-paren-in-dropped-query`` and ``trailing-period-in-dropped-query``
+    pin the fix for the mirror-image bug: the token's own trailing ``)``/
+    ``.`` sits right after a query string (``?k=s)`` / ``?k=s.``), so
+    stripping it as sentence punctuation *before* the query is located
+    would split a credential value ending in one of those characters off
+    its query, survive the query's removal, and get reattached to the
+    redacted URL. ``_split_url_token`` never looks past the query/fragment
+    boundary, so that trailing text is dropped with the rest of the query
+    instead -- these two cases have no trailing punctuation reattached,
+    unlike their no-query counterparts just above them.
+    """
+    assert redact_urls_in_text(text) == expected
+
+
+@pytest.mark.parametrize(
+    ("token", "expected_clean", "expected_trailing"),
+    [
+        ("https://h/p)))", "https://h/p", ")))"),
+        ("https://h/a(b)c", "https://h/a(b)c", ""),
+        ("https://[::1]", "https://[::1]", ""),
+        ("https://h/p,.;:", "https://h/p", ",.;:"),
+        ("https://h/p", "https://h/p", ""),
+    ],
+    ids=[
+        "unmatched-closing-bracket",
+        "matched-brackets-in-path",
+        "ipv6-authority-brackets",
+        "trailing-punctuation-run",
+        "no-trailing-punctuation",
+    ],
+)
+def test_split_url_token(token, expected_clean, expected_trailing):
+    """``_split_url_token`` is the boundary scan ``redact_urls_in_text`` uses
+    to separate a URL from sentence punctuation trailing it, extracted out
+    of ``_redact`` so it can be tested on its own. ``matched-brackets-in-path``
+    and ``ipv6-authority-brackets`` pin that a *balanced* bracket is never
+    treated as trailing punctuation, only an unmatched one is.
+    """
+    assert _split_url_token(token) == (expected_clean, expected_trailing)
+
+
+def test_split_url_token_stops_at_query_boundary():
+    """A trailing character that is actually the tail of a query value (a
+    credential ending in ``)``) must never be classified as sentence
+    punctuation: the scan stops at the first ``?``/``#`` in the token, so
+    nothing at or after that point can appear in either half of the
+    result. See ``test_redact_urls_in_text_does_not_reattach_query_tail``
+    for the same fix exercised through ``redact_urls_in_text``.
+    """
+    assert _split_url_token("https://h/p?api_key=S)))") == ("https://h/p", "")
+
+
+def test_redact_urls_in_text_is_linear_on_unmatched_closing_brackets():
+    """Before this fix, ``_redact``'s trailing-punctuation strip re-scanned
+    the whole token on every character it stripped (``token.count(...)``
+    plus ``token = token[:-1]``, both full-length operations run once per
+    stripped character), making it quadratic in the length of a run of
+    unmatched closing brackets -- measured at roughly 24s for a
+    300,000-character run before this fix. The budget below is loose on
+    purpose so a slow CI worker cannot trip it, while a quadratic
+    regression (tens of seconds here) still does.
+    """
+    text = "see https://mcp.example.com/x" + ")" * 300_000
+
+    start = time.perf_counter()
+    redact_urls_in_text(text)
+    elapsed = time.perf_counter() - start
+
+    assert elapsed < 1.0
+
+
+def test_redact_urls_in_text_does_not_reattach_query_tail_as_trailing_punctuation():
+    """The trailing-punctuation strip used to run on the raw token before
+    the query string was located, so a credential value ending in a
+    character ``_split_url_token`` treats as sentence punctuation (a
+    closing paren, a period, or an unmatched bracket) had that tail split
+    off, survived the query being dropped, and was reattached to the
+    redacted URL -- leaking a few trailing characters of the credential.
+    The fix stops the boundary scan at the query separator, so the whole
+    query -- tail included -- is dropped together and nothing survives to
+    be reattached.
+    """
+    text = "connect failed for url 'https://mcp.example.com/p?api_key=S)))'"
+
+    result = redact_urls_in_text(text)
+
+    assert not result.endswith(")))'")
+    assert result == "connect failed for url 'https://mcp.example.com/p'"
+
+
+def test_truncated_error_message_bounds_raw_text_before_redaction(monkeypatch):
+    """``str(exc)`` is remote-controlled and has no length limit of its
+    own, while both redaction passes cost time proportional to their
+    input, so it must be capped to ``_MCP_TOOL_ERROR_RAW_MAX_CHARS``
+    before either one runs -- not just truncated to
+    ``_MCP_TOOL_ERROR_LOG_MAX_CHARS`` afterwards, which would leave both
+    passes running on the full, unbounded message.
+    """
+    seen_lengths = []
+    original_redact_urls = mcp_adapter_module.redact_urls_in_text
+
+    def spy(text):
+        seen_lengths.append(len(text))
+        return original_redact_urls(text)
+
+    monkeypatch.setattr(mcp_adapter_module, "redact_urls_in_text", spy)
+
+    message = _truncated_error_message(RuntimeError("x" * 100_000))
+
+    assert seen_lengths == [_MCP_TOOL_ERROR_RAW_MAX_CHARS]
+    assert len(message) <= _MCP_TOOL_ERROR_LOG_MAX_CHARS

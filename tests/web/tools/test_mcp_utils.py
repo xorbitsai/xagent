@@ -16,6 +16,13 @@ def test_naive_day_bounds_accepts_a_z_suffixed_datetime():
     )
 
 
+def test_naive_day_bounds_converts_an_instant_before_selecting_the_day():
+    assert utils.naive_day_bounds("2026-08-27T20:00:00Z", "Asia/Singapore") == (
+        "2026-08-28T00:00:00",
+        "2026-08-29T00:00:00",
+    )
+
+
 def test_require_clean_identifier_rejects_empty_and_whitespace():
     with pytest.raises(ValueError, match="record_id"):
         utils.require_clean_identifier("", "record_id")
@@ -549,6 +556,12 @@ def test_resolve_zoneinfo_returns_zoneinfo_for_valid_iana_name():
     from zoneinfo import ZoneInfo
 
     assert utils.resolve_zoneinfo("Asia/Shanghai") == ZoneInfo("Asia/Shanghai")
+
+
+def test_resolve_zoneinfo_accepts_a_windows_timezone_name():
+    from zoneinfo import ZoneInfo
+
+    assert utils.resolve_zoneinfo("China Standard Time") == ZoneInfo("Asia/Shanghai")
 
 
 def test_resolve_zoneinfo_rejects_unknown_timezone():

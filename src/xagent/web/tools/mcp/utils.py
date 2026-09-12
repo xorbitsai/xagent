@@ -603,9 +603,119 @@ def require_offset_datetime(value: str, field_name: str) -> None:
         )
 
 
+_WINDOWS_TO_IANA: dict[str, str] = {
+    "UTC": "UTC",
+    "GMT Standard Time": "Europe/London",
+    "Greenwich Standard Time": "Atlantic/Reykjavik",
+    "W. Europe Standard Time": "Europe/Berlin",
+    "Central Europe Standard Time": "Europe/Budapest",
+    "Central European Standard Time": "Europe/Warsaw",
+    "Romance Standard Time": "Europe/Paris",
+    "E. Europe Standard Time": "Europe/Bucharest",
+    "GTB Standard Time": "Europe/Bucharest",
+    "".join(("F", "LE Standard Time")): "Europe/Kyiv",
+    "Turkey Standard Time": "Europe/Istanbul",
+    "Russian Standard Time": "Europe/Moscow",
+    "Kaliningrad Standard Time": "Europe/Kaliningrad",
+    "Arabic Standard Time": "Asia/Baghdad",
+    "Syria Standard Time": "Asia/Damascus",
+    "Arab Standard Time": "Asia/Riyadh",
+    "Israel Standard Time": "Asia/Jerusalem",
+    "Jordan Standard Time": "Asia/Amman",
+    "Middle East Standard Time": "Asia/Beirut",
+    "Egypt Standard Time": "Africa/Cairo",
+    "South Africa Standard Time": "Africa/Johannesburg",
+    "E. Africa Standard Time": "Africa/Nairobi",
+    "Mauritius Standard Time": "Indian/Mauritius",
+    "Iran Standard Time": "Asia/Tehran",
+    "Arabian Standard Time": "Asia/Dubai",
+    "Azerbaijan Standard Time": "Asia/Baku",
+    "Georgian Standard Time": "Asia/Tbilisi",
+    "Caucasus Standard Time": "Asia/Yerevan",
+    "Afghanistan Standard Time": "Asia/Kabul",
+    "Pakistan Standard Time": "Asia/Karachi",
+    "West Asia Standard Time": "Asia/Tashkent",
+    "India Standard Time": "Asia/Kolkata",
+    "Sri Lanka Standard Time": "Asia/Colombo",
+    "Nepal Standard Time": "Asia/Kathmandu",
+    "Central Asia Standard Time": "Asia/Almaty",
+    "Bangladesh Standard Time": "Asia/Dhaka",
+    "Ekaterinburg Standard Time": "Asia/Yekaterinburg",
+    "Myanmar Standard Time": "Asia/Yangon",
+    "SE Asia Standard Time": "Asia/Bangkok",
+    "Novosibirsk Standard Time": "Asia/Novosibirsk",
+    "China Standard Time": "Asia/Shanghai",
+    "North Asia Standard Time": "Asia/Krasnoyarsk",
+    "Singapore Standard Time": "Asia/Singapore",
+    "Taipei Standard Time": "Asia/Taipei",
+    "Ulaanbaatar Standard Time": "Asia/Ulaanbaatar",
+    "North Asia East Standard Time": "Asia/Irkutsk",
+    "W. Australia Standard Time": "Australia/Perth",
+    "Tokyo Standard Time": "Asia/Tokyo",
+    "Korea Standard Time": "Asia/Seoul",
+    "Cen. Australia Standard Time": "Australia/Adelaide",
+    "AUS Central Standard Time": "Australia/Darwin",
+    "E. Australia Standard Time": "Australia/Brisbane",
+    "AUS Eastern Standard Time": "Australia/Sydney",
+    "West Pacific Standard Time": "Pacific/Port_Moresby",
+    "Tasmania Standard Time": "Australia/Hobart",
+    "Yakutsk Standard Time": "Asia/Yakutsk",
+    "Central Pacific Standard Time": "Pacific/Guadalcanal",
+    "Vladivostok Standard Time": "Asia/Vladivostok",
+    "New Zealand Standard Time": "Pacific/Auckland",
+    "Fiji Standard Time": "Pacific/Fiji",
+    "Magadan Standard Time": "Asia/Magadan",
+    "Tonga Standard Time": "Pacific/Tongatapu",
+    "Samoa Standard Time": "Pacific/Apia",
+    "Line Islands Standard Time": "Pacific/Kiritimati",
+    "Dateline Standard Time": "Etc/GMT+12",
+    "Hawaiian Standard Time": "Pacific/Honolulu",
+    "Alaskan Standard Time": "America/Anchorage",
+    "Pacific Standard Time (Mexico)": "America/Santa_Isabel",
+    "Pacific Standard Time": "America/Los_Angeles",
+    "US Mountain Standard Time": "America/Phoenix",
+    "Mountain Standard Time (Mexico)": "America/Chihuahua",
+    "Mountain Standard Time": "America/Denver",
+    "Central America Standard Time": "America/Guatemala",
+    "Central Standard Time": "America/Chicago",
+    "Central Standard Time (Mexico)": "America/Mexico_City",
+    "Canada Central Standard Time": "America/Regina",
+    "SA Pacific Standard Time": "America/Bogota",
+    "Eastern Standard Time": "America/New_York",
+    "US Eastern Standard Time": "America/Indiana/Indianapolis",
+    "Venezuela Standard Time": "America/Caracas",
+    "Paraguay Standard Time": "America/Asuncion",
+    "Atlantic Standard Time": "America/Halifax",
+    "Central Brazilian Standard Time": "America/Cuiaba",
+    "SA Western Standard Time": "America/La_Paz",
+    "Pacific SA Standard Time": "America/Santiago",
+    "Newfoundland Standard Time": "America/St_Johns",
+    "E. South America Standard Time": "America/Sao_Paulo",
+    "Argentina Standard Time": "America/Argentina/Buenos_Aires",
+    "SA Eastern Standard Time": "America/Cayenne",
+    "Greenland Standard Time": "America/Godthab",
+    "Montevideo Standard Time": "America/Montevideo",
+    "Bahia Standard Time": "America/Bahia",
+    "Azores Standard Time": "Atlantic/Azores",
+    "Cape Verde Standard Time": "Atlantic/Cape_Verde",
+    "Morocco Standard Time": "Africa/Casablanca",
+    "Namibia Standard Time": "Africa/Windhoek",
+    "W. Central Africa Standard Time": "Africa/Lagos",
+}
+
+
+def resolve_zone_name(name: str) -> str:
+    """Map a Graph timeZone value to a name zoneinfo can load.
+
+    Returns the input unchanged when it isn't a recognized legacy Windows
+    zone name - it's then assumed to already be IANA-shaped, which
+    zoneinfo can load directly.
+    """
+    return _WINDOWS_TO_IANA.get(name, name)
+
+
 def resolve_zoneinfo(name: str) -> ZoneInfo:
-    """Resolve a Google Calendar timeZone value (an IANA Time Zone
-    Database name, per Google's own EventDateTime docs) to a real
+    """Resolve an IANA or supported Windows time zone to a real
     ``ZoneInfo``, for use anywhere a working zone is required (not just a
     best-effort comparison) - e.g. attaching a real UTC offset to a naive
     datetime string.
@@ -616,10 +726,10 @@ def resolve_zoneinfo(name: str) -> ZoneInfo:
     helper exists to prevent.
     """
     try:
-        return ZoneInfo(name)
+        return ZoneInfo(resolve_zone_name(name))
     except (ZoneInfoNotFoundError, TypeError, ValueError) as exc:
         raise ValueError(
-            f"Timezone {name!r} isn't a recognized IANA zone name."
+            f"Timezone {name!r} isn't a recognized IANA zone name or Windows zone name."
         ) from exc
 
 
@@ -1158,21 +1268,24 @@ def unchecked_extra(unchecked_attendees: list[str]) -> dict[str, Any]:
     return {"unchecked_attendees": unchecked_attendees}
 
 
-def naive_day_bounds(date_value: str, *, days: int = 1) -> tuple[str, str]:
+def naive_day_bounds(
+    date_value: str, tz_name: str | None = None, *, days: int = 1
+) -> tuple[str, str]:
     """Return (start, end) NAIVE ISO datetime strings spanning ``days``
-    full calendar day(s) starting at ``date_value``'s date - the
-    zone-agnostic counterpart to ``calendar_day_bounds``, for an API like
-    Outlook's dateTimeTimeZone that wants a naive clock value paired with
-    a separate timeZone field rather than an embedded offset (attaching a
-    zone here and stripping it back off would just be lossy round-tripping
-    for no benefit, since no zone conversion is actually needed - "midnight
-    of this date" is the same clock reading regardless of which zone it's
-    later paired with).
+    full calendar day(s) starting at ``date_value``'s effective date, for
+    an API like Outlook's dateTimeTimeZone that wants a naive clock value
+    paired with a separate timeZone field rather than an embedded offset.
 
-    ``date_value`` may be a bare "YYYY-MM-DD" or a full datetime string
-    (only its date component is used).
+    ``date_value`` may be a bare "YYYY-MM-DD" or a full datetime string.
+    If it carries an offset and ``tz_name`` is supplied, the represented
+    instant is converted into that zone before its calendar date is taken.
+    Naive values are already wall-clock readings in ``tz_name`` and keep
+    their own date.
     """
-    day: date = _date_parser.isoparse(date_value).date()
+    parsed = _date_parser.isoparse(date_value)
+    if parsed.tzinfo is not None and tz_name is not None:
+        parsed = parsed.astimezone(resolve_zoneinfo(tz_name))
+    day: date = parsed.date()
     start = datetime.combine(day, time.min)
     end = start + timedelta(days=days)
     return start.isoformat(), end.isoformat()

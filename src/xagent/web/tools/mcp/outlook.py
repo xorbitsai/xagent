@@ -10,13 +10,14 @@ from mcp.server.fastmcp import FastMCP
 
 from .utils import InsufficientScopeError
 from .utils import conflict_response as _conflict_response
+from .utils import incomplete_check_response as _incomplete_check_response
 from .utils import merge_scope_error as _merge_scope_error
 from .utils import naive_day_bounds as _naive_day_bounds
 from .utils import normalize_addresses as _normalize_addresses
 from .utils import offset_datetime_string as _offset_datetime_string
 from .utils import reject_reversed_window as _reject_reversed_window
+from .utils import resolve_zoneinfo as _resolve_zoneinfo
 from .utils import setup_proxy_env
-from .utils import unchecked_extra as _unchecked_extra
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("outlook-mcp")
@@ -46,6 +47,20 @@ class _GraphRequestError(RuntimeError):
     def __init__(self, message: str, *, status_code: int) -> None:
         super().__init__(message)
         self.status_code = status_code
+
+
+class _ConflictCheckIncompleteError(RuntimeError):
+    """An availability scan that stopped after finding partial results."""
+
+    def __init__(
+        self,
+        message: str,
+        conflicts: list[dict[str, Any]],
+        unchecked_attendees: list[str],
+    ) -> None:
+        super().__init__(message)
+        self.conflicts = conflicts
+        self.unchecked_attendees = unchecked_attendees
 
 
 def _success(**payload: Any) -> str:
@@ -128,15 +143,31 @@ def _message_body(content: str, content_type: str) -> dict[str, str]:
     return {"contentType": normalized, "content": content}
 
 
-def _next_link_path(next_link: str) -> str:
+def _next_link_path(next_link: Any) -> str:
     """Strip GRAPH_BASE_URL from an @odata.nextLink so it can be re-issued
     through `_graph_request` as a plain path+query (the link is always an
     absolute URL; `_graph_request` builds its own URL as
     ``f"{GRAPH_BASE_URL}{path}"``, so passing the absolute link verbatim as
     `path` would double up the host instead of following it)."""
-    if next_link.startswith(GRAPH_BASE_URL):
-        return next_link[len(GRAPH_BASE_URL) :]
-    return next_link
+    if not isinstance(next_link, str) or not next_link.startswith(f"{GRAPH_BASE_URL}/"):
+        raise ValueError("Outlook returned an invalid calendarView next link.")
+    return next_link[len(GRAPH_BASE_URL) :]
+
+
+def _has_own_utc_offset(value: str) -> bool:
+    """Whether an ISO datetime already identifies an absolute instant."""
+    try:
+        return _date_parser.isoparse(value).tzinfo is not None
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_midnight_in_timezone(value: str, timezone: str) -> bool:
+    """Whether ``value`` represents midnight in the event timezone."""
+    parsed = _date_parser.isoparse(value)
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(_resolve_zoneinfo(timezone))
+    return not (parsed.hour or parsed.minute or parsed.second or parsed.microsecond)
 
 
 # Defensive cap on calendarView pages followed for one organizer-side
@@ -169,6 +200,12 @@ def _find_conflicts(
     - a naive value there is silently read as UTC. So only the calendarView
     call needs an explicit offset attached before it's sent.
 
+    The organizer results are accepted as Graph's own overlap decision for
+    this half-open window; this connector does not apply a second local
+    overlap calculation at the exact start/end edges. Each returned
+    boundary retains its response timezone below so organizer-local and
+    getSchedule UTC values cannot be mistaken for the same clock basis.
+
     getSchedule has no concept of "exclude this event": it only returns raw
     busy blocks, so a query against a window an attendee is *already* busy
     for (because that's the very event being updated) can't be told apart
@@ -192,8 +229,16 @@ def _find_conflicts(
     unchecked_attendees: list[str] = []
 
     if check_organizer:
-        offset_start = _offset_datetime_string(start_datetime, timezone)
-        offset_end = _offset_datetime_string(end_datetime, timezone)
+        offset_start = (
+            start_datetime
+            if _has_own_utc_offset(start_datetime)
+            else _offset_datetime_string(start_datetime, timezone)
+        )
+        offset_end = (
+            end_datetime
+            if _has_own_utc_offset(end_datetime)
+            else _offset_datetime_string(end_datetime, timezone)
+        )
         params: dict[str, Any] | None = {
             "startDateTime": offset_start,
             "endDateTime": offset_end,
@@ -202,12 +247,24 @@ def _find_conflicts(
         }
         next_path: str | None = None
         for _ in range(_MAX_CALENDAR_VIEW_PAGES):
-            calendar_view = _graph_request(
-                "GET",
-                next_path if next_path is not None else "/me/calendarView",
-                params=params if next_path is None else None,
-                extra_headers={"Prefer": f'outlook.timezone="{timezone}"'},
-            )
+            try:
+                calendar_view = _graph_request(
+                    "GET",
+                    next_path if next_path is not None else "/me/calendarView",
+                    params=params if next_path is None else None,
+                    extra_headers={"Prefer": f'outlook.timezone="{timezone}"'},
+                )
+            except _GraphRequestError as exc:
+                if exc.status_code == 403:
+                    raise InsufficientScopeError(
+                        "Missing the calendars.read permission needed to check "
+                        "organizer availability - reconnecting the Outlook "
+                        "connector may grant it. This is a missing permission "
+                        "on our own credential, not a scheduling conflict.",
+                        conflicts,
+                        unchecked_attendees + attendees,
+                    ) from exc
+                raise
             for item in calendar_view.get("value") or []:
                 if item.get("isCancelled"):
                     continue
@@ -242,17 +299,25 @@ def _find_conflicts(
                         "summary": item.get("subject") or "(no subject)",
                         "start": start.get("dateTime"),
                         "end": end.get("dateTime"),
+                        "start_timezone": start.get("timeZone") or timezone,
+                        "end_timezone": end.get("timeZone") or timezone,
                     }
                 )
             next_link = calendar_view.get("@odata.nextLink")
-            if not next_link:
+            if next_link is None:
                 break
-            next_path = _next_link_path(next_link)
+            try:
+                next_path = _next_link_path(next_link)
+            except ValueError as exc:
+                raise _ConflictCheckIncompleteError(
+                    str(exc), conflicts, unchecked_attendees + attendees
+                ) from exc
         else:
-            raise RuntimeError(
+            raise _ConflictCheckIncompleteError(
                 "Outlook calendar conflict check exceeded the pagination limit; "
-                "the event was not created because availability could not be "
-                "verified completely."
+                "availability could not be verified completely.",
+                conflicts,
+                unchecked_attendees + attendees,
             )
 
     # getSchedule accepts at most _MAX_ATTENDEES_PER_SCHEDULE_QUERY
@@ -272,6 +337,7 @@ def _find_conflicts(
                     "endTime": {"dateTime": end_datetime, "timeZone": timezone},
                     "availabilityViewInterval": 30,
                 },
+                extra_headers={"Prefer": f'outlook.timezone="{timezone}"'},
             )
         except _GraphRequestError as exc:
             if exc.status_code == 403:
@@ -345,6 +411,8 @@ def _find_conflicts(
                             "summary": None,
                             "start": start.get("dateTime"),
                             "end": end.get("dateTime"),
+                            "start_timezone": start.get("timeZone") or timezone,
+                            "end_timezone": end.get("timeZone") or timezone,
                         }
                     )
 
@@ -535,12 +603,23 @@ def outlook_create_event(
     own calendar; a conflict returns status="conflict" instead of creating
     the event. Pass ignore_conflicts=True to create it anyway once the user
     has explicitly confirmed a conflict is fine.
+    For an all-day event, end_datetime is an exclusive boundary: use the
+    following day's midnight as the end of a one-day event.
     """
     try:
         # Both sides share the same `timezone`, so comparing them as naive
         # values (no offset attached) is already a valid relative
         # comparison - it doesn't matter which real zone that is.
-        _reject_reversed_window(start_datetime, end_datetime)
+        try:
+            _reject_reversed_window(start_datetime, end_datetime)
+        except ValueError as exc:
+            if is_all_day:
+                raise ValueError(
+                    "end_datetime is exclusive for an all-day event and must "
+                    "be after start_datetime; use the following day's midnight "
+                    "as the end of a one-day event."
+                ) from exc
+            raise
         normalized_attendees = _normalize_addresses(attendees) if attendees else []
 
         # Graph requires all-day event boundaries to be midnight in the
@@ -548,31 +627,39 @@ def outlook_create_event(
         # eventual write, including when ignore_conflicts bypasses the query.
         effective_start, effective_end = start_datetime, end_datetime
         if is_all_day:
-            effective_start, _ = _naive_day_bounds(start_datetime)
-            end_of_its_day, next_day_start = _naive_day_bounds(end_datetime)
-            parsed_end = _date_parser.isoparse(end_datetime)
-            end_is_midnight = (
-                parsed_end.hour == 0
-                and parsed_end.minute == 0
-                and parsed_end.second == 0
-                and parsed_end.microsecond == 0
-            )
+            effective_start, _ = _naive_day_bounds(start_datetime, timezone)
+            end_of_its_day, next_day_start = _naive_day_bounds(end_datetime, timezone)
+            end_is_midnight = _is_midnight_in_timezone(end_datetime, timezone)
             effective_end = end_of_its_day if end_is_midnight else next_day_start
 
         unchecked_attendees: list[str] = []
+        check_error: str | None = None
         if not ignore_conflicts:
             try:
                 conflicts, unchecked_attendees = _find_conflicts(
                     effective_start, effective_end, timezone, normalized_attendees
                 )
             except InsufficientScopeError as exc:
+                check_error = str(exc)
                 conflicts, unchecked_attendees = _merge_scope_error(exc, [], [])
+            except _ConflictCheckIncompleteError as exc:
+                check_error = str(exc)
+                conflicts = exc.conflicts
+                unchecked_attendees = exc.unchecked_attendees
             if conflicts:
                 return _conflict_response(
                     conflicts,
                     unchecked_attendees,
                     effective_start,
                     effective_end,
+                    check_error=check_error,
+                )
+            if check_error or unchecked_attendees:
+                return _incomplete_check_response(
+                    unchecked_attendees,
+                    effective_start,
+                    effective_end,
+                    message=check_error,
                 )
 
         payload: dict[str, Any] = {
@@ -589,7 +676,7 @@ def outlook_create_event(
             payload["attendees"] = _attendee_list(normalized_attendees)
 
         result = _graph_request("POST", "/me/events", body=payload)
-        return _success(event=result, **_unchecked_extra(unchecked_attendees))
+        return _success(event=result)
     except Exception as e:
         logger.error("Error creating Outlook event: %s", e)
         return _error(str(e))

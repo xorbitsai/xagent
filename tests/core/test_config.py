@@ -2861,7 +2861,7 @@ def test_toby_personal_stdio_is_disabled_by_default(monkeypatch):
 def test_trace_database_defaults_and_opt_in(monkeypatch):
     monkeypatch.delenv(config.ASYNC_TRACE_DB_ENABLED, raising=False)
     monkeypatch.delenv(config.TRACE_DB_MAX_INFLIGHT, raising=False)
-    assert config.get_async_trace_db_enabled() is False
+    assert config.get_async_trace_db_enabled() is True
     assert config.get_trace_db_max_inflight() == 4
     monkeypatch.setenv(config.ASYNC_TRACE_DB_ENABLED, "true")
     monkeypatch.setenv(config.TRACE_DB_MAX_INFLIGHT, "8")

@@ -2644,15 +2644,20 @@ def get_db_pool_size() -> int:
 
 
 def get_async_trace_db_enabled() -> bool:
-    """Opt into native PostgreSQL trace writes; restart to change the backend."""
-    return _get_bool_env(ASYNC_TRACE_DB_ENABLED, False)
+    """Async PostgreSQL/file-SQLite trace writes; restart to change backend.
+
+    Private memory databases and custom session-only hosts retain bounded sync
+    writes so a second engine cannot change database identity.
+    """
+    return _get_bool_env(ASYNC_TRACE_DB_ENABLED, True)
 
 
 def get_trace_db_max_inflight() -> int:
     """Bound trace writes before thread/connection acquisition, per event loop.
 
     Defaults to a conservative four, not the throughput benchmark's optimum.
-    The async trace pool has this same cap and no overflow. Sync writes also
+    The PostgreSQL async trace pool has this cap and no overflow; SQLite uses
+    one trace writer per loop in either mode. Sync PostgreSQL writes also
     clamp to leave one shared pooled connection where pool size permits.
     """
     return _get_positive_int_env(TRACE_DB_MAX_INFLIGHT, 4)

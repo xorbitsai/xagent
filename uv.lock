@@ -261,6 +261,15 @@ wheels = [
 ]
 
 [[package]]
+name = "aiosqlite"
+version = "0.22.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/4e/8a/64761f4005f17809769d23e518d915db74e6310474e733e3593cfc854ef1/aiosqlite-0.22.1.tar.gz", hash = "sha256:043e0bd78d32888c0a9ca90fc788b38796843360c855a7262a532813133a0650", size = 14821, upload-time = "2025-12-23T19:25:43.997Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/00/b7/e3bf5133d697a08128598c8d0abc5e16377b51465a33756de24fa7dee953/aiosqlite-0.22.1-py3-none-any.whl", hash = "sha256:21c002eb13823fad740196c5a2e9d8e62f6243bd9e7e4a1f87fb5e44ecb4fceb", size = 17405, upload-time = "2025-12-23T19:25:42.139Z" },
+]
+
+[[package]]
 name = "alembic"
 version = "1.18.4"
 source = { registry = "https://pypi.org/simple" }
@@ -7842,6 +7851,7 @@ dependencies = [
     { name = "aiogram" },
     { name = "aiohttp" },
     { name = "aiohttp-socks" },
+    { name = "aiosqlite" },
     { name = "alembic" },
     { name = "anthropic" },
     { name = "asyncssh" },
@@ -7868,6 +7878,7 @@ dependencies = [
     { name = "google-auth-oauthlib" },
     { name = "google-cloud-pubsub" },
     { name = "google-genai" },
+    { name = "greenlet" },
     { name = "html2text" },
     { name = "httpx", extra = ["socks"] },
     { name = "idna" },
@@ -7968,6 +7979,7 @@ milvus = [
     { name = "pymilvus" },
 ]
 postgresql = [
+    { name = "psycopg", extra = ["binary"] },
     { name = "psycopg2-binary" },
 ]
 postgresql-async = [
@@ -8083,6 +8095,7 @@ requires-dist = [
     { name = "aiogram", specifier = ">=3.4.1" },
     { name = "aiohttp", specifier = ">=3.12.14" },
     { name = "aiohttp-socks", specifier = ">=0.8.4" },
+    { name = "aiosqlite", specifier = ">=0.20.0" },
     { name = "alembic", specifier = ">=1.13.0" },
     { name = "anthropic", specifier = ">=0.84.0" },
     { name = "asyncssh", specifier = ">=2.14.0" },
@@ -8120,6 +8133,7 @@ requires-dist = [
     { name = "google-auth-oauthlib", specifier = ">=1.2.0" },
     { name = "google-cloud-pubsub", specifier = ">=2.21.0" },
     { name = "google-genai", specifier = ">=1.65.0" },
+    { name = "greenlet", specifier = ">=3.0" },
     { name = "greenlet", marker = "extra == 'all'", specifier = ">=3.0" },
     { name = "greenlet", marker = "extra == 'postgresql-async'", specifier = ">=3.0" },
     { name = "html2text", specifier = ">=2025.4.15" },
@@ -8153,6 +8167,7 @@ requires-dist = [
     { name = "playwright", marker = "extra == 'browser'", specifier = ">=1.40.0" },
     { name = "prompt-toolkit", specifier = ">=3.0.0" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'all'", specifier = ">=3.2.0" },
+    { name = "psycopg", extras = ["binary"], marker = "extra == 'postgresql'", specifier = ">=3.2.0" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'postgresql-async'", specifier = ">=3.2.0" },
     { name = "psycopg2-binary", marker = "extra == 'all'", specifier = ">=2.9.0" },
     { name = "psycopg2-binary", marker = "extra == 'postgresql'", specifier = ">=2.9.0" },

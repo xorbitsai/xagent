@@ -135,9 +135,10 @@ async def test_failed_write_returns_permit():
 def test_sync_shared_pool_headroom_and_async_backend_validation():
     engine = create_engine("sqlite://", poolclass=QueuePool, pool_size=3)
     try:
-        assert TraceDatabaseRuntime(engine, use_async=False, limit=8).limit == 2
-        with pytest.raises(ValueError, match="PostgreSQL"):
-            TraceDatabaseRuntime(engine, use_async=True, limit=2)
+        assert TraceDatabaseRuntime(engine, use_async=False, limit=8).limit == 1
+        memory_runtime = TraceDatabaseRuntime(engine, use_async=True, limit=2)
+        assert memory_runtime.engine is None
+        assert memory_runtime.limit == 1
         with pytest.raises(ValueError, match="positive"):
             TraceDatabaseRuntime(None, use_async=False, limit=0)
     finally:
@@ -194,5 +195,5 @@ def test_missing_async_driver_fails_explicitly(monkeypatch):
         "create_async_engine",
         Mock(side_effect=ModuleNotFoundError("psycopg")),
     )
-    with pytest.raises(RuntimeError, match="postgresql-async extra"):
+    with pytest.raises(RuntimeError, match="postgresql extra"):
         TraceDatabaseRuntime(source, use_async=True, limit=4)

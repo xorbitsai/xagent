@@ -4,7 +4,8 @@ Admission precedes worker submission and connection checkout. Required events
 wait; they are not dropped. The handler owns cancellation-safe draining through
 session close and retention cleanup, so a permit cannot be reused while an
 abandoned worker still owns a transaction. AsyncSession.run_sync bridges the
-existing ORM transaction to native async I/O, not a thread pool. Its Python
+existing ORM transaction to async driver I/O, not the default thread pool.
+SQLite's aiosqlite driver uses a dedicated thread per connection. Python
 encoding/ORM work still runs on the loop; this is not CPU isolation.
 """
 
@@ -14,7 +15,7 @@ from collections.abc import Callable
 from sqlalchemy import Engine
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 from sqlalchemy.orm import Session
-from sqlalchemy.pool import QueuePool
+from sqlalchemy.pool import AsyncAdaptedQueuePool, QueuePool
 
 from ...config import (
     get_async_trace_db_enabled,
@@ -22,6 +23,7 @@ from ...config import (
     get_trace_db_max_inflight,
 )
 from ...core.runtime_performance import observe_duration, run_in_thread_with_telemetry
+from ...db.sqlite import apply_sqlite_concurrency_pragmas
 from ..models.database import get_engine
 from .db_runtime import drain_async_task_cancellation_safe
 
@@ -33,22 +35,53 @@ class TraceDatabaseRuntime:
         if limit < 1:
             raise ValueError("Trace database concurrency must be positive")
         self.engine: AsyncEngine | None = None
+        # A second engine cannot see a private in-memory SQLite database.
+        # Keep the supplied session factory for memory/custom hosts rather than
+        # silently writing to an empty database. File databases use aiosqlite.
+        sqlite = source is not None and source.dialect.name == "sqlite"
+        memory = (
+            source is not None
+            and sqlite
+            and (
+                not source.url.database
+                or source.url.database == ":memory:"
+                or source.url.database.startswith("file:")
+                and (
+                    "mode=memory" in source.url.database
+                    or source.url.query.get("mode") == "memory"
+                    or source.url.database.startswith("file::memory:")
+                )
+            )
+        )
+        if source is None or memory:
+            use_async = False
+        if sqlite:
+            limit = 1
         if use_async:
-            if source is None or source.dialect.name != "postgresql":
-                raise ValueError("Async trace persistence requires PostgreSQL")
+            if source is None or source.dialect.name not in {"postgresql", "sqlite"}:
+                raise ValueError(
+                    "Async trace persistence requires PostgreSQL or SQLite"
+                )
             # Psycopg preserves existing libpq URL options (SSL/search_path/etc.).
             # This is a SEPARATE bounded pool; include it in the process budget.
             try:
                 self.engine = create_async_engine(
-                    source.url.set(drivername="postgresql+psycopg"),
+                    source.url.set(
+                        drivername="sqlite+aiosqlite"
+                        if sqlite
+                        else "postgresql+psycopg"
+                    ),
                     **{**get_db_pool_kwargs(), "pool_size": limit, "max_overflow": 0},
+                    poolclass=AsyncAdaptedQueuePool,
                     hide_parameters=True,
                     execution_options=source.get_execution_options(),
                 )
             except ModuleNotFoundError as exc:
                 raise RuntimeError(
-                    "Async trace persistence requires the postgresql-async extra"
+                    "Async trace persistence requires aiosqlite or the postgresql extra"
                 ) from exc
+            if sqlite:
+                apply_sqlite_concurrency_pragmas(self.engine.sync_engine)
         elif source is not None and isinstance(source.pool, QueuePool):
             # Do not rely on overflow for API headroom. A size-one pool cannot
             # reserve a connection; deployments needing isolation must enlarge

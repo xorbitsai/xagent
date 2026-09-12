@@ -158,7 +158,14 @@ class TraceCheckpointStore:
         execution_id = self._execution_id(payload)
         event_payload = self._event_payload(payload, execution_id=execution_id)
 
-        event_id = await self._call_checkpoint_writer(payload, event_payload)
+        try:
+            event_id = await self._call_checkpoint_writer(payload, event_payload)
+        except CheckpointPersistenceError:
+            raise
+        except Exception as exc:
+            raise CheckpointPersistenceError(
+                "Checkpoint writer failed before persistence was confirmed."
+            ) from exc
         if event_id is None:
             raise CheckpointPersistenceError(
                 "Tracer does not expose a durable checkpoint write API."

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import sqlite3
 from typing import Any
 
 import pytest
@@ -83,6 +85,14 @@ class NoneReturningTraceEventBackend:
     ) -> None:
         del event_type, task_id, data, require_persisted
         return None
+
+
+class RaisingCheckpointBackend:
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+
+    async def checkpoint(self, **_: Any) -> None:
+        raise self.error
 
 
 class LegacyCheckpointBackend:
@@ -237,6 +247,41 @@ async def test_trace_checkpoint_store_rejects_none_trace_event_writer() -> None:
             label="before_llm",
             execution_id="exec-none-trace-event",
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [RuntimeError, sqlite3.OperationalError])
+async def test_trace_checkpoint_store_normalizes_writer_failures(
+    error_type: type[Exception],
+) -> None:
+    failure = error_type("checkpoint unavailable")
+    store = TraceCheckpointStore(RaisingCheckpointBackend(failure))
+
+    with pytest.raises(CheckpointPersistenceError) as exc_info:
+        await store.checkpoint(
+            type="checkpoint",
+            label="before_llm",
+            execution_id="exec-failed-writer",
+        )
+
+    assert exc_info.value.__cause__ is failure
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [asyncio.CancelledError(), SystemExit()])
+async def test_trace_checkpoint_store_preserves_base_exception_semantics(
+    failure: BaseException,
+) -> None:
+    store = TraceCheckpointStore(RaisingCheckpointBackend(failure))
+
+    with pytest.raises(type(failure)) as exc_info:
+        await store.checkpoint(
+            type="checkpoint",
+            label="before_llm",
+            execution_id="exec-interrupted-writer",
+        )
+
+    assert exc_info.value is failure
 
 
 @pytest.mark.asyncio

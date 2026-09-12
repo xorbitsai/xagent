@@ -7,14 +7,13 @@ structured envelope carrying the prior result instead.
 
 Scope is deliberately narrow:
 
-* Same turn only, enforced by turn_id equality on the ledger records. The
-  runner stamps a fresh turn_id on every user message (initial and
-  injected), and the pattern re-reads it at each pattern start, so a resume
-  that continues the execution — and its checkpointed ledger — under a new
-  user message compares unequal and executes, while an intra-turn resume
-  keeps suppressing the replay. A call with no turn_id (an embedding that
-  drives the pattern directly without stamping turns) is never guarded:
-  suppression must not outlive a turn, so an unknowable turn fails open.
+* Same turn only, enforced by the ledger record's guard turn identity. An
+  ordinary completion uses its original turn id. A resumed success uses the
+  settlement turn that received the result, so a model cannot immediately
+  repeat the approved write after resume. A later user turn remains a new
+  authorization boundary and may issue the same arguments again. A call with
+  no guard turn id is never guarded: suppression must not outlive a turn, so
+  an unknowable turn fails open.
 * Identical execution arguments only, compared via the ledger's canonical
   args hash.
 * Only tools that *explicitly* declare a non-idempotent write:
@@ -80,22 +79,24 @@ def build_suppression_envelope(
     tool_name: str,
     prior_tool_call_id: str,
     prior_result: Any,
+    prior_succeeded: bool = True,
 ) -> dict[str, Any]:
     """Build the model-facing envelope for a suppressed duplicate write.
 
-    ``success: True`` deliberately: the requested effect exists — it was
-    produced by the earlier call — so the loop's success accounting should
-    treat this observation like the write it stands in for.
+    A successful prior call produces a successful envelope because the effect
+    already exists. A denied or dispatch-unknown settlement stays unsuccessful
+    while still preventing the write from being executed again.
     """
+    outcome = "already succeeded" if prior_succeeded else "was denied or is uncertain"
     return {
-        "success": True,
+        "success": prior_succeeded,
         DUPLICATE_WRITE_SUPPRESSED_KEY: True,
         "tool_name": tool_name,
         "suppressed_duplicate_of": prior_tool_call_id,
         "result": prior_result,
         "message": (
             f"Duplicate write suppressed: this exact {tool_name} call "
-            "already succeeded earlier in this turn "
+            f"{outcome} earlier in this turn "
             f"(tool call {prior_tool_call_id}); it was not executed again. "
             "The previous call's result is attached under 'result' — use it "
             "instead of retrying. Repeating this write with identical "

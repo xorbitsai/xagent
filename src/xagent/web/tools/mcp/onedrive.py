@@ -4,6 +4,7 @@ import logging
 import mimetypes
 import os
 import time
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -70,7 +71,10 @@ class _QuickXorHash:
     """Streaming implementation of OneDrive's 160-bit QuickXorHash."""
 
     _WIDTH_BITS = 160
-    _WIDTH_BYTES = _WIDTH_BITS // 8
+    _DIGEST_BYTES = _WIDTH_BITS // 8
+    # rotate(byte, index * 11) repeats after 160 input bytes because 11
+    # and 160 are coprime. This is distinct from the 20-byte digest width.
+    _INPUT_PERIOD_BYTES = _WIDTH_BITS
     _MASK = (1 << _WIDTH_BITS) - 1
 
     def __init__(self) -> None:
@@ -82,7 +86,7 @@ class _QuickXorHash:
         """Add bytes while reducing full 160-byte periods in C-sized blocks."""
         self._length += len(data)
         if self._tail:
-            needed = self._WIDTH_BYTES - len(self._tail)
+            needed = self._INPUT_PERIOD_BYTES - len(self._tail)
             if len(data) < needed:
                 self._tail += data
                 return
@@ -90,11 +94,11 @@ class _QuickXorHash:
             data = data[needed:]
             self._tail = b""
 
-        full_length = len(data) - (len(data) % self._WIDTH_BYTES)
+        full_length = len(data) - (len(data) % self._INPUT_PERIOD_BYTES)
         view = memoryview(data)
-        for offset in range(0, full_length, self._WIDTH_BYTES):
+        for offset in range(0, full_length, self._INPUT_PERIOD_BYTES):
             self._column_xor ^= int.from_bytes(
-                view[offset : offset + self._WIDTH_BYTES], "little"
+                view[offset : offset + self._INPUT_PERIOD_BYTES], "little"
             )
         self._tail = bytes(view[full_length:])
 
@@ -105,7 +109,9 @@ class _QuickXorHash:
             columns ^= int.from_bytes(self._tail, "little")
 
         value = 0
-        for index, byte in enumerate(columns.to_bytes(self._WIDTH_BYTES, "little")):
+        for index, byte in enumerate(
+            columns.to_bytes(self._INPUT_PERIOD_BYTES, "little")
+        ):
             shift = (index * 11) % self._WIDTH_BITS
             rotated = (
                 byte
@@ -114,9 +120,9 @@ class _QuickXorHash:
             )
             value ^= rotated & self._MASK
 
-        digest = bytearray(value.to_bytes(self._WIDTH_BYTES, "little"))
+        digest = bytearray(value.to_bytes(self._DIGEST_BYTES, "little"))
         for index, byte in enumerate(self._length.to_bytes(8, "little")):
-            digest[self._WIDTH_BYTES - 8 + index] ^= byte
+            digest[self._DIGEST_BYTES - 8 + index] ^= byte
         return base64.b64encode(digest).decode("ascii")
 
 
@@ -305,26 +311,35 @@ def _is_retriable_upload_error(exc: BaseException) -> bool:
     documented retriable statuses (429 and any 5xx) are retriable. The
     HTTPError behind an _UploadError is recovered through ``__cause__``.
     """
-    cause = _request_error_cause(exc)
-    status_code = getattr(getattr(cause, "response", None), "status_code", None)
-    if isinstance(status_code, int):
+    status_code = _upload_status_code(exc)
+    if status_code is not None:
         return status_code == 429 or 500 <= status_code < 600
+    cause = _request_error_cause(exc)
     return isinstance(cause, (requests.ConnectionError, requests.Timeout))
 
 
-def _upload_retry_delay(exc: BaseException, retry_number: int) -> float:
-    """Return a bounded Retry-After or exponential-backoff delay."""
-    cause = _request_error_cause(exc)
-    response = getattr(cause, "response", None)
-    headers = getattr(response, "headers", {}) or {}
+def _retry_delay(headers: Any, retry_number: int) -> float:
+    """Return a bounded seconds/HTTP-date Retry-After or exponential delay."""
+    headers = headers or {}
     retry_after = headers.get("Retry-After")
     if retry_after is not None:
         try:
             return min(max(float(retry_after), 0.0), _UPLOAD_RETRY_MAX_SECONDS)
         except (TypeError, ValueError):
-            pass
+            try:
+                retry_at = parsedate_to_datetime(str(retry_after)).timestamp()
+                return min(max(retry_at - time.time(), 0.0), _UPLOAD_RETRY_MAX_SECONDS)
+            except (TypeError, ValueError, OverflowError):
+                pass
     exponential_delay = _UPLOAD_RETRY_BASE_SECONDS * (2.0 ** (retry_number - 1))
     return min(exponential_delay, _UPLOAD_RETRY_MAX_SECONDS)
+
+
+def _upload_retry_delay(exc: BaseException, retry_number: int) -> float:
+    """Return a retry delay from an upload exception."""
+    cause = _request_error_cause(exc)
+    response = getattr(cause, "response", None)
+    return _retry_delay(getattr(response, "headers", None), retry_number)
 
 
 def _upload_status_code(exc: BaseException) -> int | None:
@@ -334,15 +349,19 @@ def _upload_status_code(exc: BaseException) -> int | None:
     return status_code if isinstance(status_code, int) else None
 
 
-def _next_expected_upload_offset(response: Any) -> int:
+def _next_expected_upload_offset(response: Any, total: int) -> int:
     """Parse the first missing offset from an upload-session status response."""
     try:
         payload = response.json()
         ranges = payload["nextExpectedRanges"]
+        if not isinstance(ranges, list):
+            raise TypeError("nextExpectedRanges must be a list")
         offsets = [int(value.split("-", 1)[0]) for value in ranges]
     except (KeyError, TypeError, ValueError, AttributeError) as exc:
         raise _UploadError("OneDrive returned invalid upload-session progress") from exc
-    if not offsets or any(offset < 0 for offset in offsets):
+    if not offsets:
+        return total
+    if any(offset < 0 or offset > total for offset in offsets):
         raise _UploadError("OneDrive returned invalid upload-session progress")
     return min(offsets)
 
@@ -373,10 +392,10 @@ def _completed_upload_item(
     for attempt in range(1, _UPLOAD_CHUNK_MAX_ATTEMPTS + 1):
         try:
             item = _current_upload_item(remote_path)
+            file_facet = item.get("file") if isinstance(item, dict) else None
+            hashes = file_facet.get("hashes") if isinstance(file_facet, dict) else None
             remote_hash = (
-                item.get("file", {}).get("hashes", {}).get("quickXorHash")
-                if isinstance(item, dict)
-                else None
+                hashes.get("quickXorHash") if isinstance(hashes, dict) else None
             )
             if (
                 isinstance(item, dict)
@@ -393,8 +412,7 @@ def _completed_upload_item(
             if not _is_retriable_upload_error(exc):
                 break
         if attempt < _UPLOAD_CHUNK_MAX_ATTEMPTS:
-            delay_source = last_error or _UploadError("confirmation pending")
-            time.sleep(_upload_retry_delay(delay_source, attempt))
+            time.sleep(_upload_retry_delay(last_error, attempt))
     raise _UploadError(
         "OneDrive upload completed ambiguously and could not be confirmed"
     ) from last_error
@@ -408,8 +426,8 @@ def _reconcile_upload_progress(
     end: int,
     total: int,
     expected_quickxor_hash: str,
-) -> tuple[bool, dict[str, Any] | None]:
-    """Return whether an ambiguous fragment was accepted, plus a final item."""
+) -> tuple[int, dict[str, Any] | None]:
+    """Return the first missing byte offset, plus a confirmed final item."""
     last_error: BaseException | None = None
     completed = False
     for attempt in range(1, _UPLOAD_CHUNK_MAX_ATTEMPTS + 1):
@@ -423,15 +441,22 @@ def _reconcile_upload_progress(
                     "OneDrive upload session disappeared before completion"
                 )
             _raise_upload_status(response)
-            next_offset = _next_expected_upload_offset(response)
-            if next_offset == start:
-                return False, None
+            next_offset = _next_expected_upload_offset(response, total)
+            if next_offset < start:
+                raise _UploadError(
+                    "OneDrive returned inconsistent upload-session progress"
+                )
+            if next_offset == total and end < total:
+                raise _UploadError(
+                    "OneDrive reported completion before the local final fragment"
+                )
+            if next_offset < end:
+                return next_offset, None
             if next_offset >= end:
                 if end == total:
                     completed = True
                     break
-                return True, None
-            raise _UploadError("OneDrive returned inconsistent upload-session progress")
+                return next_offset, None
         except Exception as exc:
             last_error = exc
             if not _is_retriable_upload_error(exc):
@@ -439,14 +464,11 @@ def _reconcile_upload_progress(
             if attempt == _UPLOAD_CHUNK_MAX_ATTEMPTS:
                 break
             time.sleep(_upload_retry_delay(exc, attempt))
-    else:
-        raise _UploadError(
-            "Could not determine OneDrive upload-session progress"
-        ) from last_error
-
     if completed:
-        return True, _completed_upload_item(remote_path, total, expected_quickxor_hash)
-    raise _UploadError("Could not determine OneDrive upload-session progress")
+        return total, _completed_upload_item(remote_path, total, expected_quickxor_hash)
+    raise _UploadError(
+        "Could not determine OneDrive upload-session progress"
+    ) from last_error
 
 
 def _graph_request(
@@ -639,11 +661,14 @@ def _upload_large_file_content(
         # function initializes below, bypassing the "did OneDrive actually
         # confirm this" check that only runs inside the loop.
         raise ValueError(f"total must be positive, got {total}")
-    session = _graph_request(
-        "POST",
-        f"{_item_path(remote_path)}/createUploadSession",
-        body={"item": {"@microsoft.graph.conflictBehavior": "replace"}},
-    )
+    try:
+        session = _graph_request(
+            "POST",
+            f"{_item_path(remote_path)}/createUploadSession",
+            body={"item": {"@microsoft.graph.conflictBehavior": "replace"}},
+        )
+    except (RuntimeError, requests.RequestException) as exc:
+        raise _UploadError("Could not create OneDrive upload session") from exc
     upload_url = session.get("uploadUrl")
     if not upload_url:
         raise RuntimeError("OneDrive did not return an upload session URL")
@@ -683,6 +708,7 @@ def _upload_large_file_content(
                     raise _UploadError(
                         "the local file may have changed size during upload"
                     )
+                fragment_start = start
                 # The upload session URL is itself pre-authenticated (a
                 # token in its query string) -- Microsoft's own docs for
                 # createUploadSession confirm this explicitly: "If you
@@ -700,53 +726,63 @@ def _upload_large_file_content(
                     try:
                         response = http.put(
                             upload_url,
-                            data=chunk,
+                            data=(
+                                chunk
+                                if fragment_start == start
+                                else memoryview(chunk)[fragment_start - start :]
+                            ),
                             headers={
-                                "Content-Length": str(end - start),
-                                "Content-Range": f"bytes {start}-{end - 1}/{total}",
+                                "Content-Length": str(end - fragment_start),
+                                "Content-Range": (
+                                    f"bytes {fragment_start}-{end - 1}/{total}"
+                                ),
                                 "Content-Type": mime_type,
                             },
                             timeout=_BINARY_UPLOAD_TIMEOUT_SECONDS,
                         )
                         _raise_upload_status(response)
                         if end == total and response.status_code not in (200, 201):
-                            accepted, completed_item = _reconcile_upload_progress(
+                            next_offset, completed_item = _reconcile_upload_progress(
                                 http,
                                 upload_url,
                                 remote_path,
-                                start,
+                                fragment_start,
                                 end,
                                 total,
                                 quickxor_hash.base64_digest(),
                             )
-                            if accepted:
-                                if completed_item is not None:
-                                    result = completed_item
+                            if completed_item is not None:
+                                result = completed_item
                                 break
+                            if next_offset >= end:
+                                break
+                            fragment_start = next_offset
                             if attempt == _UPLOAD_CHUNK_MAX_ATTEMPTS:
                                 raise _UploadError(
                                     "OneDrive did not confirm the upload completed"
                                 )
-                            time.sleep(_UPLOAD_RETRY_BASE_SECONDS)
+                            time.sleep(_retry_delay(response.headers, attempt))
                             continue
                         break
                     except Exception as exc:
                         status_code = _upload_status_code(exc)
                         if not (_is_retriable_upload_error(exc) or status_code == 416):
                             raise
-                        accepted, completed_item = _reconcile_upload_progress(
+                        next_offset, completed_item = _reconcile_upload_progress(
                             http,
                             upload_url,
                             remote_path,
-                            start,
+                            fragment_start,
                             end,
                             total,
                             quickxor_hash.base64_digest(),
                         )
-                        if accepted:
-                            if completed_item is not None:
-                                result = completed_item
+                        if completed_item is not None:
+                            result = completed_item
                             break
+                        if next_offset >= end:
+                            break
+                        fragment_start = next_offset
                         if attempt == _UPLOAD_CHUNK_MAX_ATTEMPTS:
                             raise
                         delay = _upload_retry_delay(exc, attempt)

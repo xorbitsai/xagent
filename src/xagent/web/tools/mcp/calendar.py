@@ -976,9 +976,10 @@ def google_calendar_update_events(
     """
     Update an existing event in Google Calendar.
     start_time and end_time must be RFC3339 formatted if provided.
-    recurrence replaces the event's RFC 5545 RRULE while preserving its
-    EXDATE/RDATE/EXRULE exception lines. This PR intentionally handles rule
-    updates only: do not combine recurrence with start_time or end_time.
+    recurrence replaces the event's RFC 5545 RRULE. This rule-only operation
+    rejects a series that already has EXDATE/RDATE/EXRULE lines because their
+    meaning cannot be safely inferred after a rule change. This PR intentionally
+    handles rule updates only: do not combine recurrence with start_time or end_time.
     A timed series uses one IANA timezone on both boundaries; pass timezone
     when the existing event does not already store one. Updating a rule cannot
     be fully conflict-checked, so it requires ignore_conflicts=True after the
@@ -1104,6 +1105,16 @@ def google_calendar_update_events(
                 expansion_timezone,
             )
             existing_recurrence = _validated_recurrence_lines(event.get("recurrence"))
+            auxiliary_lines = [
+                line
+                for line in existing_recurrence
+                if _recurrence_property_name(line) != "RRULE"
+            ]
+            if auxiliary_lines:
+                raise ValueError(
+                    "the existing series has EXDATE, RDATE, or EXRULE lines whose "
+                    "meaning cannot be safely inferred after a rule-only update"
+                )
             event["recurrence"] = _merge_recurrence(existing_recurrence, new_rrule)
 
         existing_attendees_raw = [

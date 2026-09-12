@@ -96,15 +96,12 @@ def test_update_event_adds_recurrence_using_one_existing_timezone(monkeypatch):
     assert body["end"]["timeZone"] == "Asia/Shanghai"
 
 
-def test_update_event_replaces_parameterized_rrule_and_keeps_exceptions(monkeypatch):
+def test_update_event_replaces_a_parameterized_rrule(monkeypatch):
     existing_event = {
         "id": "existing-1",
         "start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "UTC"},
         "end": {"dateTime": "2026-08-26T08:00:00", "timeZone": "UTC"},
-        "recurrence": [
-            "RRULE;X-CUSTOM=provider:FREQ=DAILY;COUNT=3",
-            "EXDATE:20260827T070000Z",
-        ],
+        "recurrence": ["RRULE;X-CUSTOM=provider:FREQ=DAILY;COUNT=3"],
     }
     service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
     monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
@@ -119,10 +116,33 @@ def test_update_event_replaces_parameterized_rrule_and_keeps_exceptions(monkeypa
 
     assert result["status"] == "success"
     body = service.events.return_value.update.call_args.kwargs["body"]
-    assert body["recurrence"] == [
-        "RRULE:FREQ=WEEKLY;COUNT=2",
-        "EXDATE:20260827T070000Z",
-    ]
+    assert body["recurrence"] == ["RRULE:FREQ=WEEKLY;COUNT=2"]
+
+
+def test_update_event_rule_only_rejects_existing_exception_lines(monkeypatch):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "UTC"},
+        "end": {"dateTime": "2026-08-26T08:00:00", "timeZone": "UTC"},
+        "recurrence": [
+            "RRULE:FREQ=DAILY;COUNT=3",
+            "EXDATE:20260827T070000Z",
+        ],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=WEEKLY;COUNT=2",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "cannot be safely inferred" in result["message"]
+    service.events.return_value.update.assert_not_called()
 
 
 def test_update_event_adds_recurrence_to_all_day_event(monkeypatch):

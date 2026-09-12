@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
@@ -28,7 +29,6 @@ from ...core.runtime_performance import (
 from ...core.runtime_performance import (
     observe_duration,
     observe_value,
-    run_in_thread_with_telemetry,
 )
 from ...core.tools.adapters.vibe.connector_runtime import (
     redact_runtime_sensitive_payload,
@@ -57,6 +57,7 @@ from ...web.services.task_lease_service import (
     lock_task_lease_no_commit,
     task_lease_attempt_predicate,
 )
+from ...web.services.trace_database import get_trace_database_runtime
 from ...web.services.trace_event_staging import (
     checkpoint_run_partition_filter,
     failed_checkpoint_row_conditions,
@@ -70,6 +71,11 @@ from ...web.services.trace_message_storage import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Preserve the existing control-character policy without a Python iteration
+# for every character in LLM/tool output. JSONB-specific normalization still
+# belongs to stage_trace_event_row, after this serializer.
+_TRACE_CONTROL_CHARACTERS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
 # Page size for one batch of the checkpoint read scan. A read does not stop
 # at the first page: it keeps paging through the matching set (see
@@ -224,10 +230,9 @@ class DatabaseTraceHandler(BaseTraceHandler):
             # A cancelled caller must wait for the instrumented worker to
             # release its transaction before task settlement can begin.
             worker = asyncio.create_task(
-                run_in_thread_with_telemetry(
-                    "trace_database_write",
-                    self._sync_save_to_database,
-                    event,
+                get_trace_database_runtime().run(
+                    lambda: self._sync_save_to_database(event),
+                    lambda db: self._save_trace_event(db, event),
                 )
             )
             await drain_async_task_cancellation_safe(worker)
@@ -1403,14 +1408,7 @@ class DatabaseTraceHandler(BaseTraceHandler):
             if not isinstance(value, str):
                 return value
 
-            # Remove NULL characters and other problematic control characters
-            cleaned = value.replace("\x00", "")  # Remove NULL character
-            cleaned = cleaned.replace("\u0000", "")  # Remove Unicode NULL
-            # Remove other control characters that might cause issues
-            cleaned = "".join(
-                char for char in cleaned if ord(char) >= 32 or char in "\n\r\t"
-            )
-            return cleaned
+            return _TRACE_CONTROL_CHARACTERS.sub("", value)
 
         def serialize_value(value: Any) -> Any:
             # Handle Pydantic models (BaseModel)

@@ -61,6 +61,8 @@ dependencies = [
   "tiktoken>=0.8.0",
   # Database ORM and migrations (core for web interface)
   "sqlalchemy>=2.0.0",
+  "aiosqlite>=0.20.0",
+  "greenlet>=3.0",
   "alembic>=1.13.0",
   "python-jose[cryptography]>=3.3.0",
   "cryptography>=3.0.0",
@@ -137,7 +139,8 @@ ai-document = ["docling>=2.68.0"]
 
 # PostgreSQL driver (uses psycopg2-binary for convenience)
 # Note: For production, consider installing psycopg2 from source instead
-postgresql = ["psycopg2-binary>=2.9.0"]
+postgresql = ["psycopg2-binary>=2.9.0", "psycopg[binary]>=3.2.0"]
+postgresql-async = ["psycopg2-binary>=2.9.0", "psycopg[binary]>=3.2.0", "greenlet>=3.0"]
 
 duckdb = ["duckdb>=1.0.0,<2.0", "duckdb-engine>=0.10.0,<1.0"]
 
@@ -165,6 +168,8 @@ all = [
   "pypdf2>=3.0.1",
   "docling>=2.68.0",
   "psycopg2-binary>=2.9.0",
+  "psycopg[binary]>=3.2.0",
+  "greenlet>=3.0",
   "playwright>=1.40.0",
   "curl_cffi>=0.14.0",
   "chromadb",

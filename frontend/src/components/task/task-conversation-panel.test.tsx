@@ -26,12 +26,15 @@ const openFilePreviewMock = vi.hoisted(() => vi.fn())
 const sendMessageMock = vi.hoisted(() => vi.fn())
 const pauseTaskMock = vi.hoisted(() => vi.fn())
 const resumeTaskMock = vi.hoisted(() => vi.fn())
+const stopTaskMock = vi.hoisted(() => vi.fn())
 const getFileDownloadUrlMock = vi.hoisted(() => vi.fn())
 const fileAccessRequestMock = vi.hoisted(() => vi.fn())
 const appControls = vi.hoisted(() => ({
   filesDisabled: false,
   voiceInputEnabled: true,
   taskControlsEnabled: true,
+  canStopTask: false,
+  stopState: "idle" as const,
   isConversationResetPending: false,
   isMessageDeliveryPending: false,
   isSessionInteractionLocked: false,
@@ -47,6 +50,8 @@ const chatInputProps = vi.hoisted(() => ({
     onFilesChange?: (files: File[]) => void
     onPause?: () => void
     onResume?: () => void
+    onStop?: () => void
+    stopState?: string
     onSend: (message: string, config?: unknown, files?: File[]) => Promise<void> | void
   },
 }))
@@ -60,6 +65,9 @@ vi.mock("@/contexts/app-context-chat", () => ({
     sendMessage: sendMessageMock,
     pauseTask: pauseTaskMock,
     resumeTask: resumeTaskMock,
+    canStopTask: appControls.canStopTask,
+    stopTask: stopTaskMock,
+    stopState: appControls.stopState,
     openFilePreview: openFilePreviewMock,
     closeFilePreview: vi.fn(),
     requestStatus: vi.fn(),
@@ -252,6 +260,7 @@ describe("TaskConversationPanel", () => {
     sendMessageMock.mockResolvedValue(undefined)
     pauseTaskMock.mockReset()
     resumeTaskMock.mockReset()
+    stopTaskMock.mockReset()
     getFileDownloadUrlMock.mockReset()
     fileAccessRequestMock.mockReset()
     chatInputProps.current = null
@@ -261,6 +270,8 @@ describe("TaskConversationPanel", () => {
     appControls.filesDisabled = false
     appControls.voiceInputEnabled = true
     appControls.taskControlsEnabled = true
+    appControls.canStopTask = false
+    appControls.stopState = "idle"
   })
 
   afterEach(() => {
@@ -489,6 +500,30 @@ describe("TaskConversationPanel", () => {
 
     expect(chatInputProps.current?.onPause).toBe(pauseTaskMock)
     expect(chatInputProps.current?.onResume).toBe(resumeTaskMock)
+  })
+
+  it("keeps pause and resume closed while task stop is open", () => {
+    appControls.canStopTask = true
+    appControls.taskControlsEnabled = false
+
+    render(<TaskConversationPanel mode="page" />)
+
+    expect(chatInputProps.current?.onPause).toBeUndefined()
+    expect(chatInputProps.current?.onResume).toBeUndefined()
+    expect(chatInputProps.current?.onStop).toBe(stopTaskMock)
+  })
+
+  it("passes the stop callback when task stop is available", () => {
+    appControls.canStopTask = true
+
+    const { rerender } = render(<TaskConversationPanel mode="page" />)
+
+    expect(chatInputProps.current?.onStop).toBe(stopTaskMock)
+
+    appControls.canStopTask = false
+    rerender(<TaskConversationPanel mode="page" />)
+
+    expect(chatInputProps.current?.onStop).toBeUndefined()
   })
 
   it("does not offer a retained waiting request identity from a different task", () => {

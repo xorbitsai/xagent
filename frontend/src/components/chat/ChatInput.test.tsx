@@ -1877,4 +1877,139 @@ describe("ChatInput", () => {
     })
     expect(container.querySelector('button[type="submit"]')).toBeDisabled()
   })
+
+  it("disables the stop square while a stop is in flight", () => {
+    const onStop = vi.fn()
+    const { unmount } = render(
+      <ChatInput
+        compact
+        hideConfig
+        hideFileUpload
+        inputValue=""
+        isLoading
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        onStop={onStop}
+        stopState="stopping"
+        taskStatus="running"
+      />
+    )
+    expect(
+      screen.getByRole("button", { name: "widgetSession.stoppingResponse" })
+    ).toBeDisabled()
+    unmount()
+
+    const secondRender = render(
+      <ChatInput
+        compact
+        hideConfig
+        hideFileUpload
+        inputValue=""
+        isLoading
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        onStop={onStop}
+        stopState="timed_out"
+        taskStatus="running"
+      />
+    )
+    const stopButton = screen.getByRole("button", { name: "widgetSession.stopResponse" })
+    expect(stopButton).not.toBeDisabled()
+    expect(stopButton).toHaveAttribute("type", "button")
+    const hint = screen.getByText("widgetSession.stopTimedOut")
+    expect(hint).toBeInTheDocument()
+    expect(stopButton).toHaveAttribute("aria-describedby", hint.id)
+    expect(screen.getByRole("textbox")).not.toHaveAttribute("aria-describedby")
+    fireEvent.click(stopButton)
+    expect(onStop).toHaveBeenCalledTimes(1)
+    secondRender.unmount()
+
+    const thirdRender = render(
+      <ChatInput
+        compact
+        hideConfig
+        hideFileUpload
+        inputValue=""
+        isLoading
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        onStop={onStop}
+        stopState="not_sent"
+        taskStatus="running"
+      />
+    )
+    // A refusal and a timeout are different outcomes, so they get different
+    // sentences; the timed-out copy must not leak through for a refusal.
+    expect(screen.getByText("widgetSession.stopNotSent")).toBeInTheDocument()
+    expect(screen.queryByText("widgetSession.stopTimedOut")).not.toBeInTheDocument()
+    expect(
+      screen.getByRole("button", { name: "widgetSession.stopResponse" })
+    ).not.toBeDisabled()
+    thirdRender.unmount()
+
+    render(
+      <ChatInput
+        compact
+        hideConfig
+        hideFileUpload
+        inputValue="draft"
+        isLoading
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        onStop={onStop}
+        stopState="timed_out"
+        taskStatus="running"
+      />
+    )
+    expect(screen.queryByText("widgetSession.stopTimedOut")).not.toBeInTheDocument()
+  })
+
+  it("swaps the compact submit control for a stop square", () => {
+    const cases: Array<[string, string]> = [
+      ["", "widgetSession.stopResponse"],
+      ["draft", "common.send"],
+    ]
+
+    for (const [inputValue, expectedName] of cases) {
+      const otherName = expectedName === "common.send"
+        ? "widgetSession.stopResponse"
+        : "common.send"
+      const { unmount } = render(
+        <ChatInput
+          compact
+          hideConfig
+          hideFileUpload
+          inputValue={inputValue}
+          isLoading
+          onInputChange={vi.fn()}
+          onSend={vi.fn()}
+          onStop={vi.fn()}
+          stopState="idle"
+          taskStatus="running"
+        />
+      )
+      expect(screen.getByRole("button", { name: expectedName })).toBeInTheDocument()
+      expect(screen.queryByRole("button", { name: otherName })).not.toBeInTheDocument()
+      unmount()
+    }
+  })
+
+  it("renders no stop control without an onStop callback", () => {
+    render(
+      <ChatInput
+        compact
+        hideConfig
+        hideFileUpload
+        inputValue=""
+        isLoading
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        taskStatus="running"
+      />
+    )
+    expect(
+      screen.queryByRole("button", { name: "widgetSession.stopResponse" })
+    ).not.toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "common.send" })).toBeInTheDocument()
+  })
 })

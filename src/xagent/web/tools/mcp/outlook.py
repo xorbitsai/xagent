@@ -3,7 +3,7 @@ import logging
 import os
 from datetime import datetime
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlsplit
 
 import requests
 from dateutil import parser as _date_parser
@@ -152,15 +152,12 @@ def _next_link_path(next_link: Any) -> str:
     `path` would double up the host instead of following it)."""
     if not isinstance(next_link, str) or not next_link.startswith(f"{GRAPH_BASE_URL}/"):
         raise ValueError("Outlook returned an invalid calendarView next link.")
+    if any(
+        unquote(segment) in {".", ".."}
+        for segment in urlsplit(next_link).path.split("/")
+    ):
+        raise ValueError("Outlook returned an invalid calendarView next link.")
     return next_link[len(GRAPH_BASE_URL) :]
-
-
-def _has_own_utc_offset(value: str) -> bool:
-    """Whether an ISO datetime already identifies an absolute instant."""
-    try:
-        return _date_parser.isoparse(value).tzinfo is not None
-    except (TypeError, ValueError):
-        return False
 
 
 def _is_midnight_in_timezone(value: str, timezone: str) -> bool:
@@ -178,9 +175,30 @@ def _naive_datetime_in_timezone(value: str, timezone: str) -> str:
     timeZone field. Preserve already-naive wall-clock input, but convert an
     offset-bearing instant into the requested zone before removing its offset.
     """
-    parsed: datetime = _date_parser.isoparse(value)
+    normalized = value.strip()
+    if (
+        len(normalized) < 19
+        or normalized[4] != "-"
+        or normalized[7] != "-"
+        or normalized[10] not in {"T", "t"}
+        or normalized[13] != ":"
+        or normalized[16] != ":"
+    ):
+        raise ValueError(
+            "Outlook event datetimes must use the extended ISO format "
+            "YYYY-MM-DDTHH:MM:SS, optionally followed by fractional seconds "
+            "and a UTC offset or Z suffix."
+        )
+    try:
+        parsed: datetime = _date_parser.isoparse(normalized)
+    except ValueError as exc:
+        raise ValueError(
+            "Outlook event datetimes must use the extended ISO format "
+            "YYYY-MM-DDTHH:MM:SS, optionally followed by fractional seconds "
+            "and a UTC offset or Z suffix."
+        ) from exc
     if parsed.tzinfo is None:
-        return value
+        return normalized
     return (
         parsed.astimezone(_resolve_zoneinfo(timezone)).replace(tzinfo=None).isoformat()
     )
@@ -260,16 +278,8 @@ def _find_conflicts(
     unchecked_attendees: list[str] = []
 
     if check_organizer:
-        offset_start = (
-            start_datetime
-            if _has_own_utc_offset(start_datetime)
-            else _offset_datetime_string(start_datetime, timezone)
-        )
-        offset_end = (
-            end_datetime
-            if _has_own_utc_offset(end_datetime)
-            else _offset_datetime_string(end_datetime, timezone)
-        )
+        offset_start = _offset_datetime_string(start_datetime, timezone)
+        offset_end = _offset_datetime_string(end_datetime, timezone)
         params: dict[str, Any] | None = {
             "startDateTime": offset_start,
             "endDateTime": offset_end,
@@ -290,8 +300,10 @@ def _find_conflicts(
                     raise InsufficientScopeError(
                         "Missing the calendars.read permission needed to check "
                         "organizer availability - reconnecting the Outlook "
-                        "connector may grant it. This is a missing permission "
-                        "on our own credential, not a scheduling conflict.",
+                        "connector may grant it; if it already has calendar "
+                        "access, an org-level policy may be blocking the call. "
+                        "This is a credential or policy error, not a scheduling "
+                        "conflict.",
                         conflicts,
                         unchecked_attendees + attendees,
                     ) from exc
@@ -426,7 +438,9 @@ def _find_conflicts(
             if entry.get("error"):
                 unchecked_attendees.append(email)
                 continue
-            for item in entry.get("scheduleItems") or []:
+            schedule_items = entry.get("scheduleItems") or []
+            found_busy_item = False
+            for item in schedule_items:
                 # See the matching comment on the organizer-side loop
                 # above: "unknown" is unclassified, not confirmed-free,
                 # so it's treated the same way here for consistency -
@@ -434,6 +448,7 @@ def _find_conflicts(
                 # over-flagging one the caller can dismiss with
                 # ignore_conflicts.
                 if item.get("status") in ("busy", "tentative", "oof", "unknown"):
+                    found_busy_item = True
                     start = item.get("start") or {}
                     end = item.get("end") or {}
                     conflicts.append(
@@ -446,6 +461,17 @@ def _find_conflicts(
                             "end_timezone": end.get("timeZone") or timezone,
                         }
                     )
+            availability_view = entry.get("availabilityView")
+            if not found_busy_item and (
+                not isinstance(availability_view, str)
+                or not availability_view
+                or any(slot != "0" for slot in availability_view)
+            ):
+                # scheduleItems can be withheld even though availabilityView
+                # still reports a busy slot. Without item boundaries there is
+                # not enough detail to construct a normal conflict entry, but
+                # treating the attendee as free would permit a double booking.
+                unchecked_attendees.append(email)
 
     return conflicts, unchecked_attendees
 
@@ -629,15 +655,18 @@ def outlook_create_event(
     ignore_conflicts: bool = False,
 ) -> str:
     """Create an Outlook calendar event.
+    The organizer's calendar is always checked for scheduling conflicts.
     attendees, if given, are invited by email (Graph emails them the invite)
-    and are checked for scheduling conflicts together with the organizer's
-    own calendar; a conflict returns status="conflict" instead of creating
-    the event. Pass ignore_conflicts=True to create it anyway once the user
-    has explicitly confirmed a conflict is fine.
+    and their schedules are checked too; a conflict returns status="conflict"
+    instead of creating the event. Pass ignore_conflicts=True to create it
+    anyway once the user has explicitly confirmed a conflict is fine.
     For an all-day event, end_datetime is an exclusive boundary: use the
     following day's midnight as the end of a one-day event.
     """
     try:
+        # Timezone validity is part of the write contract, independent of
+        # whether the caller explicitly bypasses availability checks.
+        _resolve_zoneinfo(timezone)
         normalized_attendees = _normalize_addresses(attendees) if attendees else []
 
         # Retain the caller-level ordering check before all-day normalization:
@@ -662,7 +691,14 @@ def outlook_create_event(
             effective_start, _ = _naive_day_bounds(start_datetime, timezone)
             end_of_its_day, next_day_start = _naive_day_bounds(end_datetime, timezone)
             end_is_midnight = _is_midnight_in_timezone(end_datetime, timezone)
-            effective_end = end_of_its_day if end_is_midnight else next_day_start
+            # end_datetime is an exclusive date boundary. A same-day time
+            # range still denotes one all-day event, while a later date is
+            # already the exclusive boundary even if its clock is non-midnight.
+            effective_end = (
+                end_of_its_day
+                if end_is_midnight or end_of_its_day != effective_start
+                else next_day_start
+            )
 
         # The raw comparison is deliberately unable to compare a mixed
         # aware/naive pair. Recheck after normalization so that case cannot

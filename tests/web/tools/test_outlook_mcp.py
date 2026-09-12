@@ -18,6 +18,7 @@ def _busy_event(
     show_as="busy",
     is_cancelled=False,
     response=None,
+    timezone=None,
 ):
     event = {
         "id": event_id,
@@ -27,9 +28,54 @@ def _busy_event(
         "start": {"dateTime": "2026-08-27T10:00:00"},
         "end": {"dateTime": "2026-08-27T10:30:00"},
     }
+    if timezone is not None:
+        event["start"]["timeZone"] = timezone
+        event["end"]["timeZone"] = timezone
     if response is not None:
         event["responseStatus"] = {"response": response}
     return event
+
+
+def test_graph_request_preserves_http_status(monkeypatch):
+    response = Mock(status_code=429, content=b"rate limited", text="rate limited")
+    response.raise_for_status.side_effect = outlook.requests.HTTPError(
+        "429 Too Many Requests"
+    )
+    monkeypatch.setattr(outlook.requests, "request", Mock(return_value=response))
+
+    with pytest.raises(outlook._GraphRequestError) as exc_info:
+        outlook._graph_request("GET", "/me/calendarView")
+
+    assert exc_info.value.status_code == 429
+    assert "rate limited" in str(exc_info.value)
+
+
+def test_find_conflicts_can_skip_the_organizer_calendar(monkeypatch):
+    graph_request = Mock(
+        return_value={
+            "value": [
+                {
+                    "scheduleId": "chelsea@example.com",
+                    "availabilityView": "0",
+                    "scheduleItems": [],
+                }
+            ]
+        }
+    )
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    conflicts, unchecked = outlook._find_conflicts(
+        "2026-08-27T10:00:00",
+        "2026-08-27T10:30:00",
+        "UTC",
+        ["chelsea@example.com"],
+        check_organizer=False,
+    )
+
+    assert conflicts == []
+    assert unchecked == []
+    graph_request.assert_called_once()
+    assert graph_request.call_args.args[:2] == ("POST", "/me/calendar/getSchedule")
 
 
 def test_create_event_detects_organizer_conflict_same_timezone(monkeypatch):
@@ -167,7 +213,7 @@ def test_create_event_detects_attendee_schedule_conflict(monkeypatch):
 def test_create_event_reports_all_conflicts_in_the_requested_timezone(monkeypatch):
     graph_request = Mock(
         side_effect=[
-            {"value": [_busy_event()]},
+            {"value": [_busy_event(timezone="Singapore Standard Time")]},
             {
                 "value": [
                     {
@@ -175,8 +221,14 @@ def test_create_event_reports_all_conflicts_in_the_requested_timezone(monkeypatc
                         "scheduleItems": [
                             {
                                 "status": "busy",
-                                "start": {"dateTime": "2026-08-27T10:00:00"},
-                                "end": {"dateTime": "2026-08-27T10:30:00"},
+                                "start": {
+                                    "dateTime": "2026-08-27T10:00:00",
+                                    "timeZone": "Singapore Standard Time",
+                                },
+                                "end": {
+                                    "dateTime": "2026-08-27T10:30:00",
+                                    "timeZone": "Singapore Standard Time",
+                                },
                             }
                         ],
                     }
@@ -198,7 +250,7 @@ def test_create_event_reports_all_conflicts_in_the_requested_timezone(monkeypatc
 
     assert result["status"] == "conflict"
     assert {item["start_timezone"] for item in result["conflicts"]} == {
-        "Asia/Singapore"
+        "Singapore Standard Time"
     }
     assert graph_request.call_args_list[1].kwargs["extra_headers"] == {
         "Prefer": 'outlook.timezone="Asia/Singapore"'
@@ -214,8 +266,16 @@ def test_create_event_accepts_attendees_as_a_comma_separated_string(monkeypatch)
             {"value": []},
             {
                 "value": [
-                    {"scheduleId": "chelsea@example.com", "scheduleItems": []},
-                    {"scheduleId": "dana@example.com", "scheduleItems": []},
+                    {
+                        "scheduleId": "chelsea@example.com",
+                        "availabilityView": "0",
+                        "scheduleItems": [],
+                    },
+                    {
+                        "scheduleId": "dana@example.com",
+                        "availabilityView": "0",
+                        "scheduleItems": [],
+                    },
                 ]
             },
             {"id": "created"},
@@ -312,6 +372,39 @@ def test_create_event_unchecked_attendee_blocks_creation(monkeypatch):
     assert graph_request.call_count == 2
 
 
+def test_create_event_uses_availability_view_when_schedule_items_are_hidden(
+    monkeypatch,
+):
+    graph_request = Mock(
+        side_effect=[
+            {"value": []},
+            {
+                "value": [
+                    {
+                        "scheduleId": "chelsea@example.com",
+                        "availabilityView": "2",
+                        "scheduleItems": [],
+                    }
+                ]
+            },
+        ]
+    )
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_create_event(
+            subject="Kickoff",
+            start_datetime="2026-08-27T10:00:00",
+            end_datetime="2026-08-27T10:30:00",
+            attendees=["chelsea@example.com"],
+        )
+    )
+
+    assert result["status"] == "conflict_check_incomplete"
+    assert result["unchecked_attendees"] == ["chelsea@example.com"]
+    assert graph_request.call_count == 2
+
+
 def test_create_event_ignore_conflicts_skips_the_check_entirely(monkeypatch):
     graph_request = Mock(return_value={"id": "created"})
     monkeypatch.setattr(outlook, "_graph_request", graph_request)
@@ -363,6 +456,46 @@ def test_create_event_rejects_a_reversed_mixed_offset_window(monkeypatch):
 
     assert result["status"] == "error"
     assert "must be after" in result["message"]
+    graph_request.assert_not_called()
+
+
+def test_create_event_rejects_an_invalid_timezone_even_when_checks_are_bypassed(
+    monkeypatch,
+):
+    graph_request = Mock()
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_create_event(
+            subject="Kickoff",
+            start_datetime="2026-08-27T10:00:00",
+            end_datetime="2026-08-27T10:30:00",
+            timezone="Not/ARealZone",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "recognized" in result["message"]
+    graph_request.assert_not_called()
+
+
+@pytest.mark.parametrize("value", ["2026-08-27", "20260827T100000"])
+def test_create_event_rejects_non_graph_datetime_shapes(monkeypatch, value):
+    graph_request = Mock()
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_create_event(
+            subject="Kickoff",
+            start_datetime=value,
+            end_datetime="2026-08-27T10:30:00",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "extended ISO format" in result["message"]
     graph_request.assert_not_called()
 
 
@@ -473,9 +606,9 @@ def test_create_event_converts_offset_all_day_boundaries_to_event_timezone(
     assert result["status"] == "success"
     payload = graph_request.call_args_list[1].kwargs["body"]
     assert payload["start"]["dateTime"] == "2026-08-28T00:00:00"
-    # The supplied end instant is 04:00 on Aug 29 in Singapore, so the
-    # exclusive all-day boundary is the following midnight.
-    assert payload["end"]["dateTime"] == "2026-08-30T00:00:00"
+    # The supplied end falls on Aug 29 in Singapore, which is already the
+    # exclusive date boundary for the Aug 28 all-day event.
+    assert payload["end"]["dateTime"] == "2026-08-29T00:00:00"
 
 
 def test_create_event_rejects_reversed_all_day_window_after_timezone_conversion(
@@ -521,6 +654,27 @@ def test_create_event_normalizes_all_day_payload_when_conflicts_are_ignored(
     assert create_call.args[:2] == ("POST", "/me/events")
     assert create_call.kwargs["body"]["start"]["dateTime"] == "2026-08-27T00:00:00"
     assert create_call.kwargs["body"]["end"]["dateTime"] == "2026-08-28T00:00:00"
+    assert create_call.kwargs["body"]["isAllDay"] is True
+
+
+def test_create_event_all_day_bounds_follow_dst_offsets(monkeypatch):
+    graph_request = Mock(side_effect=[{"value": []}, {"id": "created"}])
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_create_event(
+            subject="DST day",
+            start_datetime="2026-11-01T09:00:00",
+            end_datetime="2026-11-01T17:00:00",
+            timezone="America/New_York",
+            is_all_day=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    params = graph_request.call_args_list[0].kwargs["params"]
+    assert params["startDateTime"] == "2026-11-01T00:00:00-04:00"
+    assert params["endDateTime"] == "2026-11-02T00:00:00-05:00"
 
 
 def test_create_event_batch_over_limit_is_chunked_into_multiple_calls(
@@ -536,6 +690,9 @@ def test_create_event_batch_over_limit_is_chunked_into_multiple_calls(
             "value": [
                 {
                     "scheduleId": email,
+                    "availabilityView": (
+                        "2" if email == "person0@example.com" else "0"
+                    ),
                     "scheduleItems": (
                         [{"status": "busy", "start": {}, "end": {}}]
                         if email == "person0@example.com"
@@ -809,6 +966,7 @@ def test_create_event_converts_offset_boundaries_to_datetime_timezone_shape(
                 "value": [
                     {
                         "scheduleId": "chelsea@example.com",
+                        "availabilityView": "0",
                         "scheduleItems": [],
                     }
                 ]
@@ -951,7 +1109,15 @@ def test_create_event_pagination_failure_preserves_found_conflicts(monkeypatch):
 
 @pytest.mark.parametrize(
     "next_link",
-    [0, 123, "", "https://example.com/wrong-host", f"{outlook.GRAPH_BASE_URL}evil"],
+    [
+        0,
+        123,
+        "",
+        "https://example.com/wrong-host",
+        f"{outlook.GRAPH_BASE_URL}evil",
+        f"{outlook.GRAPH_BASE_URL}/me/../users/calendarView",
+        f"{outlook.GRAPH_BASE_URL}/me/%2e%2e/users/calendarView",
+    ],
 )
 def test_create_event_rejects_invalid_calendarview_next_link(monkeypatch, next_link):
     graph_request = Mock(return_value={"value": [], "@odata.nextLink": next_link})

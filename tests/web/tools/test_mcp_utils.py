@@ -558,10 +558,19 @@ def test_resolve_zoneinfo_returns_zoneinfo_for_valid_iana_name():
     assert utils.resolve_zoneinfo("Asia/Shanghai") == ZoneInfo("Asia/Shanghai")
 
 
-def test_resolve_zoneinfo_accepts_a_windows_timezone_name():
+@pytest.mark.parametrize(
+    ("windows_name", "iana_name"),
+    [
+        ("China Standard Time", "Asia/Shanghai"),
+        ("Aleutian Standard Time", "America/Adak"),
+        ("UTC-11", "Etc/GMT+11"),
+        ("Yukon Standard Time", "America/Whitehorse"),
+    ],
+)
+def test_resolve_zoneinfo_accepts_windows_timezone_names(windows_name, iana_name):
     from zoneinfo import ZoneInfo
 
-    assert utils.resolve_zoneinfo("China Standard Time") == ZoneInfo("Asia/Shanghai")
+    assert utils.resolve_zoneinfo(windows_name) == ZoneInfo(iana_name)
 
 
 def test_resolve_zoneinfo_rejects_unknown_timezone():

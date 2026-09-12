@@ -603,6 +603,8 @@ def require_offset_datetime(value: str, field_name: str) -> None:
         )
 
 
+# Global (territory="001") mappings from Unicode CLDR windowsZones.xml,
+# plus legacy Windows IDs already accepted by this connector.
 _WINDOWS_TO_IANA: dict[str, str] = {
     "UTC": "UTC",
     "GMT Standard Time": "Europe/London",
@@ -613,6 +615,8 @@ _WINDOWS_TO_IANA: dict[str, str] = {
     "Romance Standard Time": "Europe/Paris",
     "E. Europe Standard Time": "Europe/Bucharest",
     "GTB Standard Time": "Europe/Bucharest",
+    # Split this Windows ID only to avoid codespell treating its three-letter
+    # abbreviation as a misspelling; joining the parts restores the real key.
     "".join(("F", "LE Standard Time")): "Europe/Kyiv",
     "Turkey Standard Time": "Europe/Istanbul",
     "Russian Standard Time": "Europe/Moscow",
@@ -701,6 +705,49 @@ _WINDOWS_TO_IANA: dict[str, str] = {
     "Morocco Standard Time": "Africa/Casablanca",
     "Namibia Standard Time": "Africa/Windhoek",
     "W. Central Africa Standard Time": "Africa/Lagos",
+    "Aleutian Standard Time": "America/Adak",
+    "Altai Standard Time": "Asia/Barnaul",
+    "Astrakhan Standard Time": "Europe/Astrakhan",
+    "Aus Central W. Standard Time": "Australia/Eucla",
+    "Belarus Standard Time": "Europe/Minsk",
+    "Bougainville Standard Time": "Pacific/Bougainville",
+    "Chatham Islands Standard Time": "Pacific/Chatham",
+    "Cuba Standard Time": "America/Havana",
+    "Easter Island Standard Time": "Pacific/Easter",
+    "Eastern Standard Time (Mexico)": "America/Cancun",
+    "Haiti Standard Time": "America/Port-au-Prince",
+    "Libya Standard Time": "Africa/Tripoli",
+    "Lord Howe Standard Time": "Australia/Lord_Howe",
+    "Magallanes Standard Time": "America/Punta_Arenas",
+    "Marquesas Standard Time": "Pacific/Marquesas",
+    "N. Central Asia Standard Time": "Asia/Novosibirsk",
+    "Norfolk Standard Time": "Pacific/Norfolk",
+    "North Korea Standard Time": "Asia/Pyongyang",
+    "Omsk Standard Time": "Asia/Omsk",
+    "Qyzylorda Standard Time": "Asia/Qyzylorda",
+    "Russia Time Zone 10": "Asia/Srednekolymsk",
+    "Russia Time Zone 11": "Asia/Kamchatka",
+    "Russia Time Zone 3": "Europe/Samara",
+    "Saint Pierre Standard Time": "America/Miquelon",
+    "Sakhalin Standard Time": "Asia/Sakhalin",
+    "Sao Tome Standard Time": "Africa/Sao_Tome",
+    "Saratov Standard Time": "Europe/Saratov",
+    "South Sudan Standard Time": "Africa/Juba",
+    "Sudan Standard Time": "Africa/Khartoum",
+    "Tocantins Standard Time": "America/Araguaina",
+    "Tomsk Standard Time": "Asia/Tomsk",
+    "Transbaikal Standard Time": "Asia/Chita",
+    "Turks And Caicos Standard Time": "America/Grand_Turk",
+    "UTC+12": "Etc/GMT-12",
+    "UTC+13": "Etc/GMT-13",
+    "UTC-02": "Etc/GMT+2",
+    "UTC-08": "Etc/GMT+8",
+    "UTC-09": "Etc/GMT+9",
+    "UTC-11": "Etc/GMT+11",
+    "Volgograd Standard Time": "Europe/Volgograd",
+    "W. Mongolia Standard Time": "Asia/Hovd",
+    "West Bank Standard Time": "Asia/Hebron",
+    "Yukon Standard Time": "America/Whitehorse",
 }
 
 

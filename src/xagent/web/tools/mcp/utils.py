@@ -604,7 +604,8 @@ def require_offset_datetime(value: str, field_name: str) -> None:
 
 
 # Global (territory="001") mappings from Unicode CLDR windowsZones.xml,
-# plus legacy Windows IDs already accepted by this connector.
+# using modern equivalent IANA aliases where appropriate, plus legacy Windows
+# IDs already accepted by this connector.
 _WINDOWS_TO_IANA: dict[str, str] = {
     "UTC": "UTC",
     "GMT Standard Time": "Europe/London",
@@ -613,7 +614,7 @@ _WINDOWS_TO_IANA: dict[str, str] = {
     "Central Europe Standard Time": "Europe/Budapest",
     "Central European Standard Time": "Europe/Warsaw",
     "Romance Standard Time": "Europe/Paris",
-    "E. Europe Standard Time": "Europe/Bucharest",
+    "E. Europe Standard Time": "Europe/Chisinau",
     "GTB Standard Time": "Europe/Bucharest",
     # Split this Windows ID only to avoid codespell treating its three-letter
     # abbreviation as a misspelling; joining the parts restores the real key.
@@ -642,7 +643,7 @@ _WINDOWS_TO_IANA: dict[str, str] = {
     "India Standard Time": "Asia/Kolkata",
     "Sri Lanka Standard Time": "Asia/Colombo",
     "Nepal Standard Time": "Asia/Kathmandu",
-    "Central Asia Standard Time": "Asia/Almaty",
+    "Central Asia Standard Time": "Asia/Bishkek",
     "Bangladesh Standard Time": "Asia/Dhaka",
     "Ekaterinburg Standard Time": "Asia/Yekaterinburg",
     "Myanmar Standard Time": "Asia/Yangon",
@@ -678,7 +679,7 @@ _WINDOWS_TO_IANA: dict[str, str] = {
     "Pacific Standard Time (Mexico)": "America/Santa_Isabel",
     "Pacific Standard Time": "America/Los_Angeles",
     "US Mountain Standard Time": "America/Phoenix",
-    "Mountain Standard Time (Mexico)": "America/Chihuahua",
+    "Mountain Standard Time (Mexico)": "America/Mazatlan",
     "Mountain Standard Time": "America/Denver",
     "Central America Standard Time": "America/Guatemala",
     "Central Standard Time": "America/Chicago",
@@ -1304,15 +1305,6 @@ def setup_proxy_env() -> None:
     # If ALL_PROXY is set, ensure HTTPS_PROXY is also set
     if "ALL_PROXY" in os.environ and "HTTPS_PROXY" not in os.environ:
         os.environ["HTTPS_PROXY"] = os.environ["ALL_PROXY"]
-
-
-def unchecked_extra(unchecked_attendees: list[str]) -> dict[str, Any]:
-    """Extra fields for a status="success" envelope when some attendees
-    ended up unchecked - empty (nothing to add) when there's nothing to
-    report."""
-    if not unchecked_attendees:
-        return {}
-    return {"unchecked_attendees": unchecked_attendees}
 
 
 def naive_day_bounds(

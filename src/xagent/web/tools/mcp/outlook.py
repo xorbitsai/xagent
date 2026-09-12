@@ -152,9 +152,11 @@ def _next_link_path(next_link: Any) -> str:
     `path` would double up the host instead of following it)."""
     if not isinstance(next_link, str) or not next_link.startswith(f"{GRAPH_BASE_URL}/"):
         raise ValueError("Outlook returned an invalid calendarView next link.")
+    # Decode before splitting so an encoded slash cannot hide a dot segment
+    # inside one raw segment (for example ``%2e%2e%2fusers``).
     if any(
-        unquote(segment) in {".", ".."}
-        for segment in urlsplit(next_link).path.split("/")
+        segment in {".", ".."}
+        for segment in unquote(urlsplit(next_link).path).split("/")
     ):
         raise ValueError("Outlook returned an invalid calendarView next link.")
     return next_link[len(GRAPH_BASE_URL) :]
@@ -465,10 +467,13 @@ def _find_conflicts(
             if not found_busy_item and (
                 not isinstance(availability_view, str)
                 or not availability_view
-                or any(slot != "0" for slot in availability_view)
+                or any(slot not in {"0", "4"} for slot in availability_view)
             ):
                 # scheduleItems can be withheld even though availabilityView
-                # still reports a busy slot. Without item boundaries there is
+                # still reports a busy slot. Graph uses "4" for
+                # workingElsewhere, which follows the same non-blocking policy
+                # as detailed schedule items above. Without item boundaries for
+                # any other non-free state there is
                 # not enough detail to construct a normal conflict entry, but
                 # treating the attendee as free would permit a double booking.
                 unchecked_attendees.append(email)

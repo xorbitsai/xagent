@@ -562,6 +562,9 @@ def test_resolve_zoneinfo_returns_zoneinfo_for_valid_iana_name():
     ("windows_name", "iana_name"),
     [
         ("China Standard Time", "Asia/Shanghai"),
+        ("Central Asia Standard Time", "Asia/Bishkek"),
+        ("E. Europe Standard Time", "Europe/Chisinau"),
+        ("Mountain Standard Time (Mexico)", "America/Mazatlan"),
         ("Aleutian Standard Time", "America/Adak"),
         ("UTC-11", "Etc/GMT+11"),
         ("Yukon Standard Time", "America/Whitehorse"),

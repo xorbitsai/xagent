@@ -405,6 +405,39 @@ def test_create_event_uses_availability_view_when_schedule_items_are_hidden(
     assert graph_request.call_count == 2
 
 
+def test_create_event_treats_working_elsewhere_availability_as_non_blocking(
+    monkeypatch,
+):
+    graph_request = Mock(
+        side_effect=[
+            {"value": []},
+            {
+                "value": [
+                    {
+                        "scheduleId": "chelsea@example.com",
+                        "availabilityView": "4",
+                        "scheduleItems": [],
+                    }
+                ]
+            },
+            {"id": "created"},
+        ]
+    )
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_create_event(
+            subject="Kickoff",
+            start_datetime="2026-08-27T10:00:00",
+            end_datetime="2026-08-27T10:30:00",
+            attendees=["chelsea@example.com"],
+        )
+    )
+
+    assert result["status"] == "success"
+    assert graph_request.call_count == 3
+
+
 def test_create_event_ignore_conflicts_skips_the_check_entirely(monkeypatch):
     graph_request = Mock(return_value={"id": "created"})
     monkeypatch.setattr(outlook, "_graph_request", graph_request)
@@ -1117,6 +1150,7 @@ def test_create_event_pagination_failure_preserves_found_conflicts(monkeypatch):
         f"{outlook.GRAPH_BASE_URL}evil",
         f"{outlook.GRAPH_BASE_URL}/me/../users/calendarView",
         f"{outlook.GRAPH_BASE_URL}/me/%2e%2e/users/calendarView",
+        f"{outlook.GRAPH_BASE_URL}/me/%2e%2e%2fusers/calendarView",
     ],
 )
 def test_create_event_rejects_invalid_calendarview_next_link(monkeypatch, next_link):

@@ -9,6 +9,13 @@ import requests
 from xagent.web.tools.mcp import utils
 
 
+def test_naive_day_bounds_accepts_a_z_suffixed_datetime():
+    assert utils.naive_day_bounds("2026-08-27T23:30:00Z") == (
+        "2026-08-27T00:00:00",
+        "2026-08-28T00:00:00",
+    )
+
+
 def test_require_clean_identifier_rejects_empty_and_whitespace():
     with pytest.raises(ValueError, match="record_id"):
         utils.require_clean_identifier("", "record_id")

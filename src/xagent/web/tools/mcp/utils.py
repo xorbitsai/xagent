@@ -1172,7 +1172,7 @@ def naive_day_bounds(date_value: str, *, days: int = 1) -> tuple[str, str]:
     ``date_value`` may be a bare "YYYY-MM-DD" or a full datetime string
     (only its date component is used).
     """
-    day: date = datetime.fromisoformat(date_value).date()
+    day: date = _date_parser.isoparse(date_value).date()
     start = datetime.combine(day, time.min)
     end = start + timedelta(days=days)
     return start.isoformat(), end.isoformat()

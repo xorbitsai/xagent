@@ -1,11 +1,11 @@
 import json
 import logging
 import os
-from datetime import datetime
 from typing import Any
 from urllib.parse import quote
 
 import requests
+from dateutil import parser as _date_parser
 from mcp.server.fastmcp import FastMCP
 
 from .utils import InsufficientScopeError
@@ -556,12 +556,14 @@ def outlook_create_event(
                 # midnight, next midnight), so applying it unconditionally
                 # would push an already-correct boundary one whole day
                 # too far.
-                query_end = (
-                    end_datetime
-                    if datetime.fromisoformat(end_datetime)
-                    == datetime.fromisoformat(end_of_its_day)
-                    else next_day_start
+                parsed_end = _date_parser.isoparse(end_datetime)
+                end_is_midnight = (
+                    parsed_end.hour == 0
+                    and parsed_end.minute == 0
+                    and parsed_end.second == 0
+                    and parsed_end.microsecond == 0
                 )
+                query_end = end_of_its_day if end_is_midnight else next_day_start
             try:
                 conflicts, unchecked_attendees = _find_conflicts(
                     query_start, query_end, timezone, normalized_attendees

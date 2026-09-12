@@ -352,6 +352,29 @@ def test_create_event_widens_all_day_conflict_check_to_the_full_day(monkeypatch)
     )
 
 
+def test_create_event_preserves_an_exclusive_z_suffixed_all_day_end(monkeypatch):
+    graph_request = Mock(side_effect=[{"value": []}, {"id": "created"}])
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_create_event(
+            subject="Company holiday",
+            start_datetime="2026-08-27T00:00:00Z",
+            end_datetime="2026-08-28T00:00:00Z",
+            is_all_day=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    calendar_view_call = graph_request.call_args_list[0]
+    assert calendar_view_call.kwargs["params"]["startDateTime"] == (
+        "2026-08-27T00:00:00+00:00"
+    )
+    assert calendar_view_call.kwargs["params"]["endDateTime"] == (
+        "2026-08-28T00:00:00+00:00"
+    )
+
+
 def test_create_event_batch_over_limit_is_chunked_into_multiple_calls(
     monkeypatch,
 ):

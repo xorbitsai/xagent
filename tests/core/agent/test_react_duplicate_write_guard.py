@@ -692,3 +692,100 @@ def test_suppression_envelope_shape() -> None:
     assert envelope["suppressed_duplicate_of"] == "call_1"
     assert envelope["result"] == {"success": True, "record_id": "rec-1"}
     assert "already succeeded earlier in this turn" in envelope["message"]
+
+
+# ---------------------------------------------------------------------------
+# Metering: a suppressed duplicate must not be billed
+# ---------------------------------------------------------------------------
+
+
+async def _metered_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[list[int], list[dict[str, Any]]]:
+    """Run a duplicate-write scenario and return (metered_counts, tool_calls)."""
+    metered: list[int] = []
+    monkeypatch.setattr(
+        "xagent.core.model.chat.token_context.add_tool_call_usage",
+        lambda count=1: metered.append(count),
+    )
+    args = {"title": "invoice", "amount": 7}
+    llm = _run_twice_llm("create_record", args, dict(args))
+    tool = FakeWriteTool()
+    context = _turn_context("Create the invoice record")
+    await _pattern().run(context=context, tools=[tool], llm=llm)
+    return metered, tool.calls
+
+
+@pytest.mark.asyncio
+async def test_suppressed_duplicate_write_is_not_metered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The suppression path keeps trace visibility but skips billing.
+
+    Regression for xorbitsai/xagent#2231: before the fix, the suppressed
+    repeat still consumed one billable action even though the tool never
+    ran — only the genuine first call consumes an execution round.
+    """
+    metered, calls = await _metered_run(monkeypatch)
+
+    assert calls == [{"title": "invoice", "amount": 7}]
+    # Exactly one metered invocation: the genuine execution. The suppressed
+    # duplicate must not add a second billable action.
+    assert metered == [1]
+
+
+@pytest.mark.asyncio
+async def test_metered_default_still_bills_each_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two distinct executions in one turn still bill two actions."""
+    metered: list[int] = []
+    monkeypatch.setattr(
+        "xagent.core.model.chat.token_context.add_tool_call_usage",
+        lambda count=1: metered.append(count),
+    )
+    llm = _run_twice_llm(
+        "create_record",
+        {"title": "invoice", "amount": 7},
+        {"title": "invoice", "amount": 8},
+    )
+    tool = FakeWriteTool()
+    context = _turn_context("Create both records")
+
+    await _pattern().run(context=context, tools=[tool], llm=llm)
+
+    assert len(tool.calls) == 2
+    assert metered == [1, 1]
+
+
+@pytest.mark.asyncio
+async def test_metered_flag_is_a_call_site_contract_not_payload_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tool-controlled payload cannot dodge metering.
+
+    The exemption is an explicit call-site parameter on
+    PatternRuntime.on_tool_start; a tool_call dict carrying a
+    duplicate_write_suppressed marker (as a hostile model or tool wrapper
+    might inject) must still be billed.
+    """
+    metered: list[int] = []
+    monkeypatch.setattr(
+        "xagent.core.model.chat.token_context.add_tool_call_usage",
+        lambda count=1: metered.append(count),
+    )
+    pattern = _pattern()
+    tool_call = {
+        "id": "call_h",
+        "name": "create_record",
+        "args": {"title": "spoofed"},
+        "duplicate_write_suppressed": True,
+    }
+    # The runtime would normally be PatternRuntime; exercising the hook with
+    # a forged payload must not exempt it from metering.
+    from xagent.core.agent import PatternRuntime
+
+    runtime = PatternRuntime(execution_id="test")
+    await runtime.on_tool_start(tool_call=tool_call)
+
+    assert metered == [1]

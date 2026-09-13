@@ -458,6 +458,10 @@ def _validated_recurrence_lines(value: Any) -> list[str]:
     for line in value:
         if not isinstance(line, str):
             raise ValueError("the existing event recurrence must contain only strings")
+        if "\r" in line or "\n" in line:
+            raise ValueError(
+                "the existing event recurrence contains an embedded line break"
+            )
         property_name = _recurrence_property_name(line)
         if not property_name:
             raise ValueError(
@@ -467,7 +471,7 @@ def _validated_recurrence_lines(value: Any) -> list[str]:
         if property_name not in allowed:
             raise ValueError(
                 "the existing event recurrence contains an unsupported property; "
-                "only RRULE, EXRULE, RDATE, and EXDATE are supported"
+                "expected RRULE, EXRULE, RDATE, or EXDATE"
             )
     return value
 
@@ -1073,11 +1077,13 @@ def google_calendar_update_events(
     rejects a series that already has EXDATE/RDATE/EXRULE lines because their
     meaning cannot be safely inferred after a rule change. This operation handles
     rule updates only: do not combine recurrence with start_time or end_time.
-    A timed series uses one IANA timezone on both boundaries; pass timezone
-    when the existing event does not already store one. An offset-only boundary
-    is checked against that zone at the first occurrence; the caller must ensure
-    the zone also represents the intended wall-clock behavior across future DST
-    transitions. timezone is validated but not written for all-day events.
+    A timed series uses one IANA timezone on both boundaries. For offsetless
+    boundaries without a stored timezone, the primary calendar's timezone is
+    used; pass timezone for explicit-offset boundaries that do not store one.
+    When recurrence is first added, an offset-only boundary is checked against
+    that zone at the first occurrence; the caller must ensure the zone also
+    represents the intended wall-clock behavior across future DST transitions.
+    timezone is validated but not written for all-day events.
     Updating a rule cannot be fully conflict-checked, so it requires
     ignore_conflicts=True after the user confirms the resulting series is safe.
     That flag also skips attendee
@@ -1116,6 +1122,8 @@ def google_calendar_update_events(
     """
     requested_conference = False
     try:
+        if timezone is not None:
+            timezone = timezone.strip() or None
         if recurrence is not None and not recurrence.strip():
             raise ValueError("recurrence rule must not be empty")
         if recurrence is not None and (start_time is not None or end_time is not None):
@@ -1125,8 +1133,6 @@ def google_calendar_update_events(
             )
         if timezone is not None and recurrence is None:
             raise ValueError("timezone is only supported together with recurrence")
-        if timezone is not None:
-            timezone = timezone.strip() or None
         if timezone:
             resolve_zoneinfo(timezone)
         if start_time is not None:
@@ -1154,6 +1160,7 @@ def google_calendar_update_events(
 
         # First get the existing event
         event = service.events().get(calendarId="primary", eventId=event_id).execute()
+        replacement_recurrence: list[str] | None = None
 
         if recurrence is not None:
             if event.get("recurringEventId"):
@@ -1163,6 +1170,18 @@ def google_calendar_update_events(
                     "the series itself - call this on the series' master event id "
                     "to change its recurrence"
                 )
+            existing_recurrence = _validated_recurrence_lines(event.get("recurrence"))
+            existing_rrules = [
+                line
+                for line in existing_recurrence
+                if _recurrence_property_name(line) == "RRULE"
+            ]
+            if len(existing_rrules) > 1:
+                raise ValueError(
+                    "the existing series has multiple RRULE lines that cannot be "
+                    "safely collapsed by a rule-only update"
+                )
+            replacing_existing_rule = bool(existing_rrules)
             start_side = event.get("start")
             end_side = event.get("end")
             start_value, start_is_all_day, start_timezone = _validated_stored_boundary(
@@ -1186,32 +1205,32 @@ def google_calendar_update_events(
                             "offsetless boundary; a rule-only update cannot infer "
                             "the missing boundary's timezone safely"
                         )
-                stored_timezones = {
-                    stored_timezone
-                    for stored_timezone in (start_timezone, end_timezone)
-                    if stored_timezone
-                }
-                if len(stored_timezones) > 1:
+                if start_timezone and end_timezone and start_timezone != end_timezone:
                     raise ValueError(
                         "the existing event uses different start and end timeZones; "
                         "a rule-only update cannot convert it to the single timezone "
                         "required for recurrence"
                     )
-                stored_timezone = next(iter(stored_timezones), None)
+                stored_timezone = start_timezone or end_timezone
                 if timezone and stored_timezone and timezone != stored_timezone:
                     raise ValueError(
                         "a rule-only update cannot change the event's existing timeZone"
                     )
                 expansion_timezone = timezone or stored_timezone
+                has_offsetless_boundary = not _has_own_utc_offset(
+                    start_value
+                ) or not _has_own_utc_offset(end_value)
+                if not expansion_timezone and has_offsetless_boundary:
+                    # Google interprets a dateTime without an offset or sibling
+                    # timeZone in the primary calendar's zone. Use that same zone
+                    # when converting the event into a recurring series.
+                    expansion_timezone = primary_calendar_info()[1]
                 if not expansion_timezone:
                     raise ValueError(
                         "timezone is required when adding recurrence to a timed event "
                         "that has no existing timeZone"
                     )
-                if not stored_timezone and (
-                    not _has_own_utc_offset(start_value)
-                    or not _has_own_utc_offset(end_value)
-                ):
+                if not stored_timezone and has_offsetless_boundary:
                     calendar_timezone = primary_calendar_info()[1]
                     if expansion_timezone != calendar_timezone:
                         raise ValueError(
@@ -1221,14 +1240,15 @@ def google_calendar_update_events(
                             "its schedule"
                         )
                 resolve_zoneinfo(expansion_timezone)
-                _require_datetime_matches_timezone(
-                    start_value, expansion_timezone, "the existing event start"
-                )
-                _require_datetime_matches_timezone(
-                    end_value, expansion_timezone, "the existing event end"
-                )
-                start_side["timeZone"] = expansion_timezone
-                end_side["timeZone"] = expansion_timezone
+                if not replacing_existing_rule:
+                    _require_datetime_matches_timezone(
+                        start_value, expansion_timezone, "the existing event start"
+                    )
+                    _require_datetime_matches_timezone(
+                        end_value, expansion_timezone, "the existing event end"
+                    )
+                    start_side["timeZone"] = expansion_timezone
+                    end_side["timeZone"] = expansion_timezone
                 comparable_start = (
                     start_value
                     if _has_own_utc_offset(start_value)
@@ -1250,7 +1270,6 @@ def google_calendar_update_events(
                 start_value,
                 expansion_timezone,
             )
-            existing_recurrence = _validated_recurrence_lines(event.get("recurrence"))
             auxiliary_lines = [
                 line
                 for line in existing_recurrence
@@ -1261,10 +1280,7 @@ def google_calendar_update_events(
                     "the existing series has EXDATE, RDATE, or EXRULE lines whose "
                     "meaning cannot be safely inferred after a rule-only update"
                 )
-            if any(
-                _recurrence_property_name(line) == "RRULE"
-                for line in existing_recurrence
-            ) and _series_has_exceptions(
+            if replacing_existing_rule and _series_has_exceptions(
                 service,
                 event_id,
                 event.get("iCalUID") if isinstance(event.get("iCalUID"), str) else None,
@@ -1274,7 +1290,7 @@ def google_calendar_update_events(
                     "instances whose meaning cannot be safely preserved after a "
                     "rule-only update"
                 )
-            event["recurrence"] = [new_rrule]
+            replacement_recurrence = [new_rrule]
 
         existing_attendees_raw = [
             a["email"]
@@ -1793,6 +1809,8 @@ def google_calendar_update_events(
                     unchecked_attendees, effective_start, effective_end
                 )
 
+        if replacement_recurrence is not None:
+            event["recurrence"] = replacement_recurrence
         if summary:
             event["summary"] = summary
         if start_time:

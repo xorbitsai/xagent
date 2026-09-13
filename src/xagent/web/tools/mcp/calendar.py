@@ -537,36 +537,67 @@ def _series_has_exceptions(
     inspect every page client-side and include cancelled resources explicitly.
     """
     page_token: str | None = None
+    seen_page_tokens: set[str] = set()
+    saw_master = False
+    use_ical_uid = (
+        ical_uid
+        if ical_uid
+        and ical_uid.strip()
+        and "\r" not in ical_uid
+        and "\n" not in ical_uid
+        else None
+    )
     while True:
         kwargs: dict[str, Any] = {
             "calendarId": "primary",
             "singleEvents": False,
             "showDeleted": True,
+            "showHiddenInvitations": True,
             "maxResults": 2500,
-            "fields": "items(recurringEventId),nextPageToken",
+            "fields": "items(id,recurringEventId),nextPageToken",
         }
-        if ical_uid:
+        if use_ical_uid:
             # Every occurrence in one recurring series shares its iCalUID,
             # while each has a distinct Event id. This supported server-side
             # filter avoids walking an unrelated large calendar merely to find
             # the exception resources belonging to this master.
-            kwargs["iCalUID"] = ical_uid
+            kwargs["iCalUID"] = use_ical_uid
         if page_token:
             kwargs["pageToken"] = page_token
         page = service.events().list(**kwargs).execute()
         if not isinstance(page, dict):
             raise ValueError("Google Calendar returned an invalid event list")
-        items = page.get("items") or []
+        items = page.get("items", [])
         if not isinstance(items, list):
             raise ValueError("Google Calendar returned an invalid event list")
-        if any(
-            isinstance(item, dict) and item.get("recurringEventId") == event_id
-            for item in items
-        ):
-            return True
-        page_token = page.get("nextPageToken")
-        if not page_token:
+        for item in items:
+            if not isinstance(item, dict):
+                raise ValueError("Google Calendar returned an invalid event list")
+            recurring_event_id = item.get("recurringEventId")
+            if recurring_event_id is not None and not isinstance(
+                recurring_event_id, str
+            ):
+                raise ValueError("Google Calendar returned an invalid event list")
+            if item.get("id") == event_id:
+                saw_master = True
+            if recurring_event_id == event_id:
+                return True
+        next_page_token = page.get("nextPageToken")
+        if next_page_token is None or next_page_token == "":
+            if not saw_master:
+                raise ValueError(
+                    "Google Calendar's exception scan did not return the recurring "
+                    "master event; refusing to replace its rule"
+                )
             return False
+        if not isinstance(next_page_token, str):
+            raise ValueError("Google Calendar returned an invalid event list")
+        if next_page_token in seen_page_tokens:
+            raise ValueError(
+                "Google Calendar returned a repeated event-list page token"
+            )
+        seen_page_tokens.add(next_page_token)
+        page_token = next_page_token
 
 
 def _has_own_utc_offset(dt_string: str) -> bool:
@@ -1077,12 +1108,13 @@ def google_calendar_update_events(
     rejects a series that already has EXDATE/RDATE/EXRULE lines because their
     meaning cannot be safely inferred after a rule change. This operation handles
     rule updates only: do not combine recurrence with start_time or end_time.
-    A timed series uses one IANA timezone on both boundaries. For offsetless
-    boundaries without a stored timezone, the primary calendar's timezone is
-    used; pass timezone for explicit-offset boundaries that do not store one.
-    When recurrence is first added, an offset-only boundary is checked against
-    that zone at the first occurrence; the caller must ensure the zone also
-    represents the intended wall-clock behavior across future DST transitions.
+    When recurrence is first added, a timed series is normalized to one IANA
+    timezone on both boundaries. For offsetless boundaries without a stored
+    timezone, the primary calendar's timezone is used; pass timezone for
+    explicit-offset boundaries that do not store one. An offset-only boundary
+    is checked against that zone at the first occurrence; the caller must ensure
+    the zone also represents the intended wall-clock behavior across future DST
+    transitions. Replacing an existing rule preserves both boundaries exactly.
     timezone is validated but not written for all-day events.
     Updating a rule cannot be fully conflict-checked, so it requires
     ignore_conflicts=True after the user confirms the resulting series is safe.
@@ -1197,7 +1229,9 @@ def google_calendar_update_events(
                 )
             expansion_timezone = None
             if not start_is_all_day:
-                if bool(start_timezone) != bool(end_timezone):
+                if not replacing_existing_rule and bool(start_timezone) != bool(
+                    end_timezone
+                ):
                     missing_value = end_value if start_timezone else start_value
                     if not _has_own_utc_offset(missing_value):
                         raise ValueError(
@@ -1205,7 +1239,12 @@ def google_calendar_update_events(
                             "offsetless boundary; a rule-only update cannot infer "
                             "the missing boundary's timezone safely"
                         )
-                if start_timezone and end_timezone and start_timezone != end_timezone:
+                if (
+                    not replacing_existing_rule
+                    and start_timezone
+                    and end_timezone
+                    and start_timezone != end_timezone
+                ):
                     raise ValueError(
                         "the existing event uses different start and end timeZones; "
                         "a rule-only update cannot convert it to the single timezone "
@@ -1252,12 +1291,16 @@ def google_calendar_update_events(
                 comparable_start = (
                     start_value
                     if _has_own_utc_offset(start_value)
-                    else _offset_datetime_string(start_value, expansion_timezone)
+                    else _offset_datetime_string(
+                        start_value, start_timezone or expansion_timezone
+                    )
                 )
                 comparable_end = (
                     end_value
                     if _has_own_utc_offset(end_value)
-                    else _offset_datetime_string(end_value, expansion_timezone)
+                    else _offset_datetime_string(
+                        end_value, end_timezone or expansion_timezone
+                    )
                 )
                 _reject_reversed_window(comparable_start, comparable_end)
             else:

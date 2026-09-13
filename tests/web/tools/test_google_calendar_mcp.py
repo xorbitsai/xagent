@@ -38,7 +38,6 @@ def _fake_service(execute_result: dict, existing_event: dict | None = None):
     events.update = Mock(return_value=request)
     # These Meet-focused tests do not exercise scheduling-conflict discovery.
     # Return empty availability data so they continue to isolate event writes.
-    events.list = Mock(return_value=Mock(execute=Mock(return_value={"items": []})))
     fetched_event = {
         "id": "evt1",
         "start": {"dateTime": "2026-09-07T15:00:00+08:00"},
@@ -46,6 +45,7 @@ def _fake_service(execute_result: dict, existing_event: dict | None = None):
     }
     if existing_event:
         fetched_event.update(copy.deepcopy(existing_event))
+    events.list = Mock(return_value=Mock(execute=Mock(return_value={"items": []})))
     events.get = Mock(return_value=Mock(execute=Mock(return_value=fetched_event)))
     service = Mock()
     service.events.return_value = events
@@ -67,6 +67,12 @@ def _fake_service(execute_result: dict, existing_event: dict | None = None):
         )
     )
     return service
+
+
+def _complete_exception_scan(service: Mock, event_id: str) -> None:
+    service.events.return_value.list.return_value.execute.return_value = {
+        "items": [{"id": event_id}]
+    }
 
 
 def test_update_event_rejects_different_stored_timezones(monkeypatch):
@@ -126,6 +132,7 @@ def test_update_event_replaces_a_parameterized_rrule(monkeypatch):
         "recurrence": ["RRULE;X-CUSTOM=provider:FREQ=DAILY;COUNT=3"],
     }
     service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    _complete_exception_scan(service, "existing-1")
     monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
 
     result = json.loads(
@@ -157,6 +164,7 @@ def test_update_event_replaces_rrule_without_revalidating_unchanged_timezone(
         "recurrence": ["RRULE:FREQ=DAILY;COUNT=3"],
     }
     service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    _complete_exception_scan(service, "existing-1")
     monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
 
     result = json.loads(
@@ -172,6 +180,39 @@ def test_update_event_replaces_rrule_without_revalidating_unchanged_timezone(
     assert body["start"] == existing_event["start"]
     assert body["end"] == existing_event["end"]
     assert body["recurrence"] == ["RRULE:FREQ=WEEKLY;COUNT=2"]
+
+
+def test_update_event_replaces_rrule_without_rejecting_unchanged_two_zone_event(
+    monkeypatch,
+):
+    existing_event = {
+        "id": "existing-1",
+        "start": {
+            "dateTime": "2026-08-26T09:00:00",
+            "timeZone": "Asia/Shanghai",
+        },
+        "end": {
+            "dateTime": "2026-08-26T08:00:00",
+            "timeZone": "America/Los_Angeles",
+        },
+        "recurrence": ["RRULE:FREQ=DAILY;COUNT=3"],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    _complete_exception_scan(service, "existing-1")
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=WEEKLY;COUNT=2",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    body = service.events.return_value.update.call_args.kwargs["body"]
+    assert body["start"] == existing_event["start"]
+    assert body["end"] == existing_event["end"]
 
 
 def test_update_event_rule_only_rejects_existing_exception_lines(monkeypatch):
@@ -314,10 +355,36 @@ def test_update_event_recurrence_rejects_an_exception_on_a_later_list_page(
     assert len(list_calls) == 2
     assert list_calls[0].kwargs["singleEvents"] is False
     assert list_calls[0].kwargs["showDeleted"] is True
+    assert list_calls[0].kwargs["showHiddenInvitations"] is True
+    assert list_calls[0].kwargs["fields"] == "items(id,recurringEventId),nextPageToken"
     assert list_calls[0].kwargs["iCalUID"] == "series@example.com"
     assert "pageToken" not in list_calls[0].kwargs
     assert list_calls[1].kwargs["pageToken"] == "page-2"
     service.events.return_value.update.assert_not_called()
+
+
+def test_update_event_recurrence_scans_without_a_malformed_ical_uid(monkeypatch):
+    existing_event = {
+        "id": "existing-1",
+        "iCalUID": "  ",
+        "start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "UTC"},
+        "end": {"dateTime": "2026-08-26T08:00:00", "timeZone": "UTC"},
+        "recurrence": ["RRULE:FREQ=DAILY;COUNT=5"],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    _complete_exception_scan(service, "existing-1")
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=WEEKLY;COUNT=2",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    assert "iCalUID" not in service.events.return_value.list.call_args.kwargs
 
 
 def test_update_event_adding_first_recurrence_does_not_scan_for_exceptions(
@@ -343,6 +410,69 @@ def test_update_event_adding_first_recurrence_does_not_scan_for_exceptions(
     service.events.return_value.list.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "event_list",
+    [
+        {"items": []},
+        {"items": None},
+        {"items": [None]},
+        {"items": [{"id": "existing-1", "recurringEventId": 123}]},
+        {"items": [{"id": "existing-1"}], "nextPageToken": 123},
+    ],
+)
+def test_update_event_recurrence_fails_closed_on_inconclusive_exception_scan(
+    monkeypatch, event_list
+):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "UTC"},
+        "end": {"dateTime": "2026-08-26T08:00:00", "timeZone": "UTC"},
+        "recurrence": ["RRULE:FREQ=DAILY;COUNT=5"],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    service.events.return_value.list.return_value.execute.return_value = event_list
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=WEEKLY;COUNT=2",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_event_recurrence_rejects_a_repeated_exception_page_token(monkeypatch):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "UTC"},
+        "end": {"dateTime": "2026-08-26T08:00:00", "timeZone": "UTC"},
+        "recurrence": ["RRULE:FREQ=DAILY;COUNT=5"],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    service.events.return_value.list.return_value.execute.return_value = {
+        "items": [{"id": "existing-1"}],
+        "nextPageToken": "same-page",
+    }
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=WEEKLY;COUNT=2",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "repeated event-list page token" in result["message"]
+    assert service.events.return_value.list.call_count == 2
+    service.events.return_value.update.assert_not_called()
+
+
 def test_update_event_recurrence_with_attendees_uses_confirmed_conflict_bypass(
     monkeypatch,
 ):
@@ -353,6 +483,7 @@ def test_update_event_recurrence_with_attendees_uses_confirmed_conflict_bypass(
         "recurrence": ["RRULE:FREQ=DAILY;COUNT=5"],
     }
     service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    _complete_exception_scan(service, "existing-1")
     monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
 
     result = json.loads(
@@ -378,6 +509,7 @@ def test_update_event_recurrence_can_add_google_meet(monkeypatch):
         "recurrence": ["RRULE:FREQ=DAILY;COUNT=5"],
     }
     service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    _complete_exception_scan(service, "existing-1")
     monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
 
     result = json.loads(

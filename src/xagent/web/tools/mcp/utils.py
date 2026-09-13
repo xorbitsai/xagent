@@ -762,8 +762,8 @@ def resolve_zone_name(name: str) -> str:
     return _WINDOWS_TO_IANA.get(name, name)
 
 
-def resolve_zoneinfo(name: str) -> ZoneInfo:
-    """Resolve an IANA or supported Windows time zone to a real
+def resolve_zoneinfo(name: str, *, allow_windows_names: bool = False) -> ZoneInfo:
+    """Resolve an IANA time zone, optionally accepting Windows names, to a real
     ``ZoneInfo``, for use anywhere a working zone is required (not just a
     best-effort comparison) - e.g. attaching a real UTC offset to a naive
     datetime string.
@@ -774,14 +774,18 @@ def resolve_zoneinfo(name: str) -> ZoneInfo:
     helper exists to prevent.
     """
     try:
-        return ZoneInfo(resolve_zone_name(name))
+        resolved_name = resolve_zone_name(name) if allow_windows_names else name
+        return ZoneInfo(resolved_name)
     except (ZoneInfoNotFoundError, TypeError, ValueError) as exc:
         raise ValueError(
-            f"Timezone {name!r} isn't a recognized IANA zone name or Windows zone name."
+            f"Timezone {name!r} isn't a recognized IANA zone name"
+            + (" or Windows zone name." if allow_windows_names else ".")
         ) from exc
 
 
-def offset_datetime_string(value: str, tz_name: str) -> str:
+def offset_datetime_string(
+    value: str, tz_name: str, *, allow_windows_names: bool = False
+) -> str:
     """Combine a naive datetime string (no embedded UTC offset - Outlook's
     dateTimeTimeZone.dateTime is always this shape, paired with a separate
     timeZone field) with its zone name into an offset-bearing ISO 8601
@@ -816,7 +820,9 @@ def offset_datetime_string(value: str, tz_name: str) -> str:
             "datetime string (no trailing 'Z' or +HH:MM) together with "
             "its timezone name instead of embedding an offset in both."
         )
-    return parsed.replace(tzinfo=resolve_zoneinfo(tz_name)).isoformat()
+    return parsed.replace(
+        tzinfo=resolve_zoneinfo(tz_name, allow_windows_names=allow_windows_names)
+    ).isoformat()
 
 
 def calendar_day_bounds(
@@ -1308,7 +1314,11 @@ def setup_proxy_env() -> None:
 
 
 def naive_day_bounds(
-    date_value: str, tz_name: str | None = None, *, days: int = 1
+    date_value: str,
+    tz_name: str | None = None,
+    *,
+    days: int = 1,
+    allow_windows_names: bool = False,
 ) -> tuple[str, str]:
     """Return (start, end) NAIVE ISO datetime strings spanning ``days``
     full calendar day(s) starting at ``date_value``'s effective date, for
@@ -1321,9 +1331,13 @@ def naive_day_bounds(
     Naive values are already wall-clock readings in ``tz_name`` and keep
     their own date.
     """
+    if days <= 0:
+        raise ValueError("days must be a positive integer")
     parsed = _date_parser.isoparse(date_value)
     if parsed.tzinfo is not None and tz_name is not None:
-        parsed = parsed.astimezone(resolve_zoneinfo(tz_name))
+        parsed = parsed.astimezone(
+            resolve_zoneinfo(tz_name, allow_windows_names=allow_windows_names)
+        )
     day: date = parsed.date()
     start = datetime.combine(day, time.min)
     end = start + timedelta(days=days)

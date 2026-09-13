@@ -166,7 +166,9 @@ def _is_midnight_in_timezone(value: str, timezone: str) -> bool:
     """Whether ``value`` represents midnight in the event timezone."""
     parsed: datetime = _date_parser.isoparse(value)
     if parsed.tzinfo is not None:
-        parsed = parsed.astimezone(_resolve_zoneinfo(timezone))
+        parsed = parsed.astimezone(
+            _resolve_zoneinfo(timezone, allow_windows_names=True)
+        )
     return not (parsed.hour or parsed.minute or parsed.second or parsed.microsecond)
 
 
@@ -202,7 +204,9 @@ def _naive_datetime_in_timezone(value: str, timezone: str) -> str:
     if parsed.tzinfo is None:
         return normalized
     return (
-        parsed.astimezone(_resolve_zoneinfo(timezone)).replace(tzinfo=None).isoformat()
+        parsed.astimezone(_resolve_zoneinfo(timezone, allow_windows_names=True))
+        .replace(tzinfo=None)
+        .isoformat()
     )
 
 
@@ -280,8 +284,12 @@ def _find_conflicts(
     unchecked_attendees: list[str] = []
 
     if check_organizer:
-        offset_start = _offset_datetime_string(start_datetime, timezone)
-        offset_end = _offset_datetime_string(end_datetime, timezone)
+        offset_start = _offset_datetime_string(
+            start_datetime, timezone, allow_windows_names=True
+        )
+        offset_end = _offset_datetime_string(
+            end_datetime, timezone, allow_windows_names=True
+        )
         params: dict[str, Any] | None = {
             "startDateTime": offset_start,
             "endDateTime": offset_end,
@@ -305,7 +313,8 @@ def _find_conflicts(
                         "connector may grant it; if it already has calendar "
                         "access, an org-level policy may be blocking the call. "
                         "This is a credential or policy error, not a scheduling "
-                        "conflict.",
+                        "conflict. Pass ignore_conflicts=true if the user has "
+                        "confirmed they want to proceed without this check.",
                         conflicts,
                         unchecked_attendees + attendees,
                     ) from exc
@@ -456,7 +465,7 @@ def _find_conflicts(
                     conflicts.append(
                         {
                             "calendar": email,
-                            "summary": None,
+                            "summary": item.get("subject"),
                             "start": start.get("dateTime"),
                             "end": end.get("dateTime"),
                             "start_timezone": start.get("timeZone") or timezone,
@@ -467,13 +476,12 @@ def _find_conflicts(
             if not found_busy_item and (
                 not isinstance(availability_view, str)
                 or not availability_view
-                or any(slot not in {"0", "4"} for slot in availability_view)
+                or any(slot != "0" for slot in availability_view)
             ):
                 # scheduleItems can be withheld even though availabilityView
-                # still reports a busy slot. Graph uses "4" for
-                # workingElsewhere, which follows the same non-blocking policy
-                # as detailed schedule items above. Without item boundaries for
-                # any other non-free state there is
+                # still reports a busy slot. Graph folds workingElsewhere into
+                # the documented "0" (free) availability code. Without item
+                # boundaries for any non-free state there is
                 # not enough detail to construct a normal conflict entry, but
                 # treating the attendee as free would permit a double booking.
                 unchecked_attendees.append(email)
@@ -660,18 +668,21 @@ def outlook_create_event(
     ignore_conflicts: bool = False,
 ) -> str:
     """Create an Outlook calendar event.
-    The organizer's calendar is always checked for scheduling conflicts.
+    The organizer's primary/default calendar is always checked for scheduling
+    conflicts, matching Outlook's free/busy availability semantics.
     attendees, if given, are invited by email (Graph emails them the invite)
     and their schedules are checked too; a conflict returns status="conflict"
     instead of creating the event. Pass ignore_conflicts=True to create it
     anyway once the user has explicitly confirmed a conflict is fine.
-    For an all-day event, end_datetime is an exclusive boundary: use the
-    following day's midnight as the end of a one-day event.
+    Timed values use extended ISO format (YYYY-MM-DDTHH:MM:SS with an optional
+    offset). For an all-day event, bare YYYY-MM-DD dates are also accepted and
+    end_datetime is an exclusive boundary: use the following date as the end
+    of a one-day event.
     """
     try:
         # Timezone validity is part of the write contract, independent of
         # whether the caller explicitly bypasses availability checks.
-        _resolve_zoneinfo(timezone)
+        _resolve_zoneinfo(timezone, allow_windows_names=True)
         normalized_attendees = _normalize_addresses(attendees) if attendees else []
 
         # Retain the caller-level ordering check before all-day normalization:
@@ -686,15 +697,16 @@ def outlook_create_event(
         # before comparing, querying, or writing them. This also makes a mixed
         # aware/naive pair comparable instead of letting it bypass the ordering
         # check when Python refuses to compare the two datetime kinds.
-        effective_start = _naive_datetime_in_timezone(start_datetime, timezone)
-        effective_end = _naive_datetime_in_timezone(end_datetime, timezone)
-
         # Graph additionally requires all-day boundaries to be midnight in the
         # same timezone. Normalize both the availability query and the eventual
         # write, including when ignore_conflicts bypasses the query.
         if is_all_day:
-            effective_start, _ = _naive_day_bounds(start_datetime, timezone)
-            end_of_its_day, next_day_start = _naive_day_bounds(end_datetime, timezone)
+            effective_start, _ = _naive_day_bounds(
+                start_datetime, timezone, allow_windows_names=True
+            )
+            end_of_its_day, next_day_start = _naive_day_bounds(
+                end_datetime, timezone, allow_windows_names=True
+            )
             end_is_midnight = _is_midnight_in_timezone(end_datetime, timezone)
             # end_datetime is an exclusive date boundary. A same-day time
             # range still denotes one all-day event, while a later date is
@@ -704,6 +716,9 @@ def outlook_create_event(
                 if end_is_midnight or end_of_its_day != effective_start
                 else next_day_start
             )
+        else:
+            effective_start = _naive_datetime_in_timezone(start_datetime, timezone)
+            effective_end = _naive_datetime_in_timezone(end_datetime, timezone)
 
         # The raw comparison is deliberately unable to compare a mixed
         # aware/naive pair. Recheck after normalization so that case cannot

@@ -261,6 +261,24 @@ def test_create_events_rejects_an_invalid_timezone_even_without_recurrence(
     service.events.return_value.insert.assert_not_called()
 
 
+def test_create_events_still_rejects_windows_timezone_names(monkeypatch):
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Standup",
+            start_time="2026-08-26T09:00:00",
+            end_time="2026-08-26T09:15:00",
+            timezone="Eastern Standard Time",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "recognized IANA zone name" in result["message"]
+    service.events.return_value.insert.assert_not_called()
+
+
 def test_create_events_accepts_recurrence_with_explicit_prefix(monkeypatch):
     service = _fake_service({"id": "created"})
     monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)

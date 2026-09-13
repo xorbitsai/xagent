@@ -99,6 +99,15 @@ def test_create_event_detects_organizer_conflict_same_timezone(monkeypatch):
     assert result["conflicts"][0]["start_timezone"] == "Asia/Singapore"
     graph_request.assert_called_once()
     assert graph_request.call_args.args[:2] == ("GET", "/me/calendarView")
+    assert graph_request.call_args.kwargs["params"] == {
+        "startDateTime": "2026-08-27T10:00:00+08:00",
+        "endDateTime": "2026-08-27T10:30:00+08:00",
+        "$top": 250,
+        "$select": "id,subject,start,end,isCancelled,showAs,responseStatus",
+    }
+    assert graph_request.call_args.kwargs["extra_headers"] == {
+        "Prefer": 'outlook.timezone="Asia/Singapore"'
+    }
 
 
 def test_create_event_ignores_free_and_cancelled_events(monkeypatch):
@@ -125,7 +134,10 @@ def test_create_event_ignores_free_and_cancelled_events(monkeypatch):
 
     assert result["status"] == "success"
     assert graph_request.call_count == 2
-    assert graph_request.call_args.args[:2] == ("POST", "/me/events")
+    assert [call.args[:2] for call in graph_request.call_args_list] == [
+        ("GET", "/me/calendarView"),
+        ("POST", "/me/events"),
+    ]
 
 
 def test_create_event_declined_but_busy_event_is_still_a_conflict(monkeypatch):
@@ -173,7 +185,8 @@ def test_create_event_ignores_organizers_own_declined_and_free_event(monkeypatch
     assert graph_request.call_count == 2
 
 
-def test_create_event_detects_attendee_schedule_conflict(monkeypatch):
+@pytest.mark.parametrize("status", ["busy", "tentative", "oof", "unknown"])
+def test_create_event_detects_attendee_schedule_conflict(monkeypatch, status):
     graph_request = Mock(
         side_effect=[
             {"value": []},
@@ -183,7 +196,8 @@ def test_create_event_detects_attendee_schedule_conflict(monkeypatch):
                         "scheduleId": "chelsea@example.com",
                         "scheduleItems": [
                             {
-                                "status": "busy",
+                                "status": status,
+                                "subject": "Private focus time",
                                 "start": {"dateTime": "2026-08-27T10:00:00"},
                                 "end": {"dateTime": "2026-08-27T10:30:00"},
                             }
@@ -206,6 +220,7 @@ def test_create_event_detects_attendee_schedule_conflict(monkeypatch):
 
     assert result["status"] == "conflict"
     assert result["conflicts"][0]["calendar"] == "chelsea@example.com"
+    assert result["conflicts"][0]["summary"] == "Private focus time"
     assert result["conflicts"][0]["start_timezone"] == "UTC"
     assert graph_request.call_count == 2
 
@@ -405,7 +420,7 @@ def test_create_event_uses_availability_view_when_schedule_items_are_hidden(
     assert graph_request.call_count == 2
 
 
-def test_create_event_treats_working_elsewhere_availability_as_non_blocking(
+def test_create_event_treats_working_elsewhere_schedule_as_non_blocking(
     monkeypatch,
 ):
     graph_request = Mock(
@@ -415,8 +430,11 @@ def test_create_event_treats_working_elsewhere_availability_as_non_blocking(
                 "value": [
                     {
                         "scheduleId": "chelsea@example.com",
-                        "availabilityView": "4",
-                        "scheduleItems": [],
+                        # availabilityView folds workingElsewhere into the
+                        # documented free code even though scheduleItems keeps
+                        # the more specific status.
+                        "availabilityView": "0",
+                        "scheduleItems": [{"status": "workingElsewhere"}],
                     }
                 ]
             },
@@ -436,6 +454,36 @@ def test_create_event_treats_working_elsewhere_availability_as_non_blocking(
 
     assert result["status"] == "success"
     assert graph_request.call_count == 3
+
+
+def test_create_event_rejects_undocumented_availability_view_code(monkeypatch):
+    graph_request = Mock(
+        side_effect=[
+            {"value": []},
+            {
+                "value": [
+                    {
+                        "scheduleId": "chelsea@example.com",
+                        "availabilityView": "4",
+                        "scheduleItems": [],
+                    }
+                ]
+            },
+        ]
+    )
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_create_event(
+            subject="Kickoff",
+            start_datetime="2026-08-27T10:00:00",
+            end_datetime="2026-08-27T10:30:00",
+            attendees=["chelsea@example.com"],
+        )
+    )
+
+    assert result["status"] == "conflict_check_incomplete"
+    assert result["unchecked_attendees"] == ["chelsea@example.com"]
 
 
 def test_create_event_ignore_conflicts_skips_the_check_entirely(monkeypatch):
@@ -530,6 +578,32 @@ def test_create_event_rejects_non_graph_datetime_shapes(monkeypatch, value):
     assert result["status"] == "error"
     assert "extended ISO format" in result["message"]
     graph_request.assert_not_called()
+
+
+def test_create_event_accepts_bare_dates_for_all_day_event(monkeypatch):
+    graph_request = Mock(side_effect=[{"value": []}, {"id": "created"}])
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_create_event(
+            subject="Company holiday",
+            start_datetime="2026-08-27",
+            end_datetime="2026-08-28",
+            timezone="Singapore Standard Time",
+            is_all_day=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    payload = graph_request.call_args_list[-1].kwargs["body"]
+    assert payload["start"] == {
+        "dateTime": "2026-08-27T00:00:00",
+        "timeZone": "Singapore Standard Time",
+    }
+    assert payload["end"] == {
+        "dateTime": "2026-08-28T00:00:00",
+        "timeZone": "Singapore Standard Time",
+    }
 
 
 def test_create_event_explains_exclusive_all_day_end(monkeypatch):
@@ -761,7 +835,7 @@ def test_create_event_batch_over_limit_is_chunked_into_multiple_calls(
 
     assert result["status"] == "conflict"
     assert result["conflicts"][0]["calendar"] == "person0@example.com"
-    assert sorted(len(batch) for batch in calls) == [1, 20]
+    assert calls == [attendees[:20], attendees[20:]]
 
 
 def test_create_event_missing_schedule_scope_rejects_the_write(monkeypatch):
@@ -791,6 +865,43 @@ def test_create_event_missing_schedule_scope_rejects_the_write(monkeypatch):
     # The message must give an LLM caller something actionable -
     # reconnecting the connector - rather than a bare error string.
     assert "reconnect" in result["message"].lower()
+
+
+def test_create_event_second_schedule_batch_scope_error_rejects_the_write(
+    monkeypatch,
+):
+    attendees = [f"person{i}@example.com" for i in range(21)]
+    first_batch = {
+        "value": [
+            {
+                "scheduleId": email,
+                "availabilityView": "0",
+                "scheduleItems": [],
+            }
+            for email in attendees[:20]
+        ]
+    }
+    graph_request = Mock(
+        side_effect=[
+            {"value": []},
+            first_batch,
+            outlook._GraphRequestError("403 Forbidden", status_code=403),
+        ]
+    )
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_create_event(
+            subject="All hands",
+            start_datetime="2026-08-27T10:00:00",
+            end_datetime="2026-08-27T10:30:00",
+            attendees=attendees,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "reconnect" in result["message"].lower()
+    assert graph_request.call_count == 3
 
 
 def test_create_event_organizer_scope_error_is_actionable(monkeypatch):

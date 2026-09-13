@@ -570,10 +570,19 @@ def test_resolve_zoneinfo_returns_zoneinfo_for_valid_iana_name():
         ("Yukon Standard Time", "America/Whitehorse"),
     ],
 )
-def test_resolve_zoneinfo_accepts_windows_timezone_names(windows_name, iana_name):
+def test_resolve_zoneinfo_accepts_windows_timezone_names_when_enabled(
+    windows_name, iana_name
+):
     from zoneinfo import ZoneInfo
 
-    assert utils.resolve_zoneinfo(windows_name) == ZoneInfo(iana_name)
+    assert utils.resolve_zoneinfo(windows_name, allow_windows_names=True) == ZoneInfo(
+        iana_name
+    )
+
+
+def test_resolve_zoneinfo_rejects_windows_timezone_names_by_default():
+    with pytest.raises(ValueError, match="recognized IANA zone name"):
+        utils.resolve_zoneinfo("Eastern Standard Time")
 
 
 def test_resolve_zoneinfo_rejects_unknown_timezone():
@@ -999,6 +1008,12 @@ def test_calendar_day_bounds_spans_a_long_day_across_a_dst_fall_back():
 def test_calendar_day_bounds_rejects_non_positive_days(days):
     with pytest.raises(ValueError, match="positive"):
         utils.calendar_day_bounds("2026-08-27", "UTC", days=days)
+
+
+@pytest.mark.parametrize("days", [0, -1])
+def test_naive_day_bounds_rejects_non_positive_days(days):
+    with pytest.raises(ValueError, match="positive"):
+        utils.naive_day_bounds("2026-08-27", "UTC", days=days)
 
 
 def test_resolve_zoneinfo_reports_missing_name_as_value_error():

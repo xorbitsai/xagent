@@ -95,8 +95,8 @@ def _microsoft_app_rows() -> list[dict[str, object]]:
             ],
             "is_visible_in_connector": True,
             "launch_config": {
-                "command": "uv",
-                "args": ["run", "python", "-m", "xagent.web.tools.mcp.teams"],
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.teams"],
                 "env_mapping": {"AUTH_TOKEN": "access_token"},
             },
         },
@@ -116,8 +116,8 @@ def _microsoft_app_rows() -> list[dict[str, object]]:
             ],
             "is_visible_in_connector": True,
             "launch_config": {
-                "command": "uv",
-                "args": ["run", "python", "-m", "xagent.web.tools.mcp.outlook"],
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.outlook"],
                 "env_mapping": {"AUTH_TOKEN": "access_token"},
             },
         },
@@ -132,8 +132,8 @@ def _microsoft_app_rows() -> list[dict[str, object]]:
             "oauth_scopes": ["Files.ReadWrite"],
             "is_visible_in_connector": True,
             "launch_config": {
-                "command": "uv",
-                "args": ["run", "python", "-m", "xagent.web.tools.mcp.onedrive"],
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.onedrive"],
                 "env_mapping": {"AUTH_TOKEN": "access_token"},
             },
         },

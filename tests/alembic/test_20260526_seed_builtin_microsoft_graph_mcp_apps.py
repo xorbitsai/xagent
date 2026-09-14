@@ -23,6 +23,20 @@ def _load_migration_module():
     return module
 
 
+def _load_normalize_migration_module():
+    migration_file = (
+        Path(__file__).parent.parent.parent
+        / "src/xagent/migrations/versions/20260715_normalize_builtin_mcp_launch.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "normalize_builtin_mcp_launch_migration", migration_file
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
 def _operations(connection):
     return Operations(MigrationContext.configure(connection))
 
@@ -119,6 +133,57 @@ def test_upgrade_is_idempotent(tmp_path):
             text("SELECT COUNT(*) FROM oauth_providers WHERE provider_name='microsoft'")
         ).scalar()
         assert provider_count == 1
+
+
+def test_seed_rows_match_registry(tmp_path):
+    """The migration snapshot and the runtime registry must define the same
+    rows. Drift here (e.g. a later normalization migration rewriting these
+    apps' launch_config) means a downgrade chain that passes through the
+    normalization migration would see the seeded rows as "modified" and
+    incorrectly preserve them -- see
+    test_downgrade_cleans_up_after_descendant_normalization_migration."""
+    from xagent.web.builtin_mcp_registry import (
+        get_builtin_oauth_provider_rows,
+        get_builtin_public_mcp_app_rows,
+    )
+
+    migration = _load_migration_module()
+
+    registry_apps = {
+        row["app_id"]: row
+        for row in get_builtin_public_mcp_app_rows()
+        if row["app_id"] in {"teams", "outlook", "onedrive"}
+    }
+    migration_apps = {row["app_id"]: row for row in migration._microsoft_app_rows()}
+    assert migration_apps == registry_apps
+
+    registry_provider = next(
+        row
+        for row in get_builtin_oauth_provider_rows()
+        if row["provider_name"] == "microsoft"
+    )
+    assert migration._microsoft_provider_row() == registry_provider
+
+
+def test_downgrade_cleans_up_after_descendant_normalization_migration(tmp_path):
+    """20260715_normalize_builtin_mcp_launch runs after this migration and
+    unconditionally rewrites teams/outlook/onedrive's launch_config (its own
+    downgrade is a deliberate no-op). A downgrade chain that passes through
+    it and then back through this migration must still remove the seeded
+    apps and provider, not preserve them as if an operator had edited them."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    normalize_migration = _load_normalize_migration_module()
+    with engine.begin() as connection:
+        _create_tables(connection)
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+        with patch.object(normalize_migration, "op", _operations(connection)):
+            normalize_migration.upgrade()
+        with patch.object(migration, "op", _operations(connection)):
+            migration.downgrade()
+        assert not {"teams", "outlook", "onedrive"} & _app_ids(connection)
+        assert "microsoft" not in _provider_names(connection)
 
 
 def test_downgrade_removes_provider_and_apps(tmp_path):

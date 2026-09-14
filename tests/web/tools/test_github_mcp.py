@@ -3543,7 +3543,7 @@ def test_create_or_update_file_reports_updated_with_sha_and_branch(monkeypatch):
             "Production Ready",
             "chore: mark ready",
             branch="release/v1",
-            sha=" " + "9" * 40 + " ",
+            sha="9" * 40,
         )
     )
 
@@ -3554,6 +3554,39 @@ def test_create_or_update_file_reports_updated_with_sha_and_branch(monkeypatch):
     assert sent["branch"] == "release/v1"
     assert sent["sha"] == "9" * 40
     assert sent["content"] == base64.b64encode(b"Production Ready").decode("ascii")
+
+
+@pytest.mark.parametrize(
+    "sha",
+    [
+        "   ",
+        " " + "9" * 40,
+        "9" * 40 + " ",
+        "9" * 39,
+        "9" * 41,
+        "g" * 40,
+        "9" * 40 + "\n",
+        "ABCDEF1234567890ABCDEF1234567890ABCDEF12",
+    ],
+)
+def test_create_or_update_file_rejects_malformed_sha(monkeypatch, sha):
+    """A malformed sha is rejected outright rather than silently stripped
+    or truncated into something that happens to look valid -- a caller bug
+    that produces a padded/truncated/wrong-case sha should surface here,
+    not be coerced into either a request GitHub 409s on, or (pre-fix) a
+    silently-stripped whitespace-only sha treated as "no sha" at all."""
+    mock_request = Mock()
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    result = json.loads(
+        github.github_create_or_update_file(
+            "octocat/Hello-World", "test.txt", "x", "msg", sha=sha
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "sha" in result["message"]
+    mock_request.assert_not_called()
 
 
 def test_create_or_update_file_allows_empty_content(monkeypatch):

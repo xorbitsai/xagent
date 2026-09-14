@@ -1374,6 +1374,11 @@ def github_get_file_contents(repo: str, path: str, ref: str = "") -> str:
 
 
 _CONTENT_ENCODINGS = frozenset({"utf-8", "base64"})
+# GitHub.com hosts SHA-1 repositories only (SHA-256 is git-upstream
+# experimental, not offered by any major host, GitHub included) -- every
+# blob/commit sha this connector's own tools return (github_get_file_contents,
+# github_list_commits, github_create_branch) is exactly this shape.
+_COMMIT_SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
 
 
 @mcp.tool()
@@ -1393,9 +1398,10 @@ def github_create_or_update_file(
     content: the complete new file body (not a diff).
     message: the commit message.
     branch: branch to commit to (defaults to the repo's default branch).
-    sha: required when the file already exists -- the `sha` returned by
-    github_get_file_contents for the version being replaced. GitHub rejects
-    the write if the file changed since that read, so this also guards
+    sha: required when the file already exists -- the exact 40-character
+    hex `sha` returned by github_get_file_contents for the version being
+    replaced, unmodified. GitHub rejects the write if the file changed
+    since that read, so this also guards
     against overwriting someone else's commit.
     content_encoding: "utf-8" (default) for text, or "base64" when
     `content` is already base64-encoded binary (the form
@@ -1429,8 +1435,17 @@ def github_create_or_update_file(
         json_data: dict[str, Any] = {"message": message}
         if branch.strip():
             json_data["branch"] = _validate_branch_name(branch, field="branch")
-        if sha.strip():
-            json_data["sha"] = sha.strip()
+        if sha:
+            # Reject a malformed sha outright rather than silently
+            # stripping it into shape (this module's "reject rather than
+            # repair" convention, see _encode_path_component) -- a caller
+            # bug that produces e.g. a whitespace-padded or truncated sha
+            # should surface here, not be silently coerced into either a
+            # request GitHub then 409s on, or a "no sha" write that
+            # skips the conflict check the caller thought they had.
+            if not _COMMIT_SHA_PATTERN.fullmatch(sha):
+                raise ValueError(f"sha must be a 40-character hex string, got: {sha!r}")
+            json_data["sha"] = sha
         if content_encoding == "base64":
             # Round-trip through the strict decoder so malformed input fails
             # here rather than as an opaque 422 from GitHub, and so

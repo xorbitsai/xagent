@@ -305,6 +305,27 @@ def isolate_proxy_env(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(name, raising=False)
 
 
+@pytest.fixture(autouse=True, scope="function")
+def isolate_meta_config_id_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Clear ambient Meta Login Configuration env vars for the same reason as
+    isolate_proxy_env above: a developer's real .env can carry META_CONFIG_ID
+    or one of the per-app overrides (META_FACEBOOK_CONFIG_ID /
+    META_INSTAGRAM_CONFIG_ID / META_ADS_CONFIG_ID -- exactly what
+    example.env now documents setting), and without this an otherwise
+    unrelated test exercising the Meta OAuth authorize flow would silently
+    pick up that ambient value instead of the one it explicitly sets/expects.
+    Tests exercising config_id behavior already opt in with
+    ``monkeypatch.setenv(...)`` for the exact var(s) they need.
+    """
+    for name in (
+        "META_CONFIG_ID",
+        "META_FACEBOOK_CONFIG_ID",
+        "META_INSTAGRAM_CONFIG_ID",
+        "META_ADS_CONFIG_ID",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
 @pytest.fixture
 def temp_tool_dir():
     """Create a temporary directory with a single sample tool file.

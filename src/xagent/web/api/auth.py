@@ -413,7 +413,22 @@ _META_APP_CONFIG_ID_ENV_VARS = {
 
 def _meta_login_config_id(app_id: str | None = None) -> str:
     if app_id:
-        app_env_var = _META_APP_CONFIG_ID_ENV_VARS.get(app_id.lower())
+        # Normalized the same way requires_app_scoped_oauth_grant resolves
+        # app_id (mcp_apps._normalize_oauth_grant_key), not a bare .lower() --
+        # an admin-created app_id like "Meta Ads" normalizes to "meta-ads"
+        # there but not here, which would silently miss this override and
+        # fall back to the shared META_CONFIG_ID for that app, reintroducing
+        # the exact cross-app capability sharing this override exists to
+        # avoid. Imported locally to match this module's existing lazy-import
+        # convention for mcp_apps (see requires_app_scoped_oauth_grant above).
+        from ..mcp_apps import _normalize_oauth_grant_key
+
+        normalized_app_id = _normalize_oauth_grant_key(app_id)
+        app_env_var = (
+            _META_APP_CONFIG_ID_ENV_VARS.get(normalized_app_id)
+            if normalized_app_id
+            else None
+        )
         if app_env_var:
             app_config_id = os.environ.get(app_env_var)
             if app_config_id:

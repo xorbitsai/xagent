@@ -137,6 +137,24 @@ def _next_link(result: dict[str, Any]) -> str | None:
     return (result.get("paging") or {}).get("next")
 
 
+_MAX_LOGGED_ID_LENGTH = 200
+
+
+def _safe_log_id(value: object) -> str:
+    """Sanitize a caller-supplied id before it's interpolated into a log
+    message. This is independent of (and in addition to) the token
+    redaction _log_error applies to the composed message: an id can be
+    unvalidated at the point an error is logged (e.g. it's the raw
+    argument that just failed validation), so it could otherwise contain
+    newlines that forge additional log lines, or be arbitrarily long and
+    bloat logs.
+    """
+    text = "".join(ch for ch in str(value) if ch.isprintable())
+    if len(text) > _MAX_LOGGED_ID_LENGTH:
+        text = text[:_MAX_LOGGED_ID_LENGTH] + "...[truncated]"
+    return text
+
+
 def _log_error(message: str, error: Exception) -> None:
     """Log an exception with token redaction applied to both ``message`` and
     ``error`` -- not just str(error) -- instead of writing the access token
@@ -218,10 +236,10 @@ def meta_ads_get_ad_account(ad_account_id: str) -> str:
         )
         return _success(ad_account=result)
     except GraphAPIError as e:
-        _log_error(f"Error getting Meta ad account {ad_account_id}", e)
+        _log_error(f"Error getting Meta ad account {_safe_log_id(ad_account_id)}", e)
         return _graph_error(e)
     except Exception as e:
-        _log_error(f"Error getting Meta ad account {ad_account_id}", e)
+        _log_error(f"Error getting Meta ad account {_safe_log_id(ad_account_id)}", e)
         return _error(str(e))
 
 
@@ -240,10 +258,10 @@ def meta_ads_list_campaigns(ad_account_id: str, limit: int = 25) -> str:
             next_link=_next_link(result),
         )
     except GraphAPIError as e:
-        _log_error(f"Error listing campaigns for {ad_account_id}", e)
+        _log_error(f"Error listing campaigns for {_safe_log_id(ad_account_id)}", e)
         return _graph_error(e)
     except Exception as e:
-        _log_error(f"Error listing campaigns for {ad_account_id}", e)
+        _log_error(f"Error listing campaigns for {_safe_log_id(ad_account_id)}", e)
         return _error(str(e))
 
 
@@ -269,10 +287,10 @@ def meta_ads_list_ad_sets(
             next_link=_next_link(result),
         )
     except GraphAPIError as e:
-        _log_error(f"Error listing ad sets for {ad_account_id}", e)
+        _log_error(f"Error listing ad sets for {_safe_log_id(ad_account_id)}", e)
         return _graph_error(e)
     except Exception as e:
-        _log_error(f"Error listing ad sets for {ad_account_id}", e)
+        _log_error(f"Error listing ad sets for {_safe_log_id(ad_account_id)}", e)
         return _error(str(e))
 
 
@@ -305,10 +323,10 @@ def meta_ads_list_ads(
             next_link=_next_link(result),
         )
     except GraphAPIError as e:
-        _log_error(f"Error listing ads for {ad_account_id}", e)
+        _log_error(f"Error listing ads for {_safe_log_id(ad_account_id)}", e)
         return _graph_error(e)
     except Exception as e:
-        _log_error(f"Error listing ads for {ad_account_id}", e)
+        _log_error(f"Error listing ads for {_safe_log_id(ad_account_id)}", e)
         return _error(str(e))
 
 
@@ -363,10 +381,10 @@ def meta_ads_get_insights(
             next_link=_next_link(result),
         )
     except GraphAPIError as e:
-        _log_error(f"Error getting Meta Ads insights for {object_id}", e)
+        _log_error(f"Error getting Meta Ads insights for {_safe_log_id(object_id)}", e)
         return _graph_error(e)
     except Exception as e:
-        _log_error(f"Error getting Meta Ads insights for {object_id}", e)
+        _log_error(f"Error getting Meta Ads insights for {_safe_log_id(object_id)}", e)
         return _error(str(e))
 
 

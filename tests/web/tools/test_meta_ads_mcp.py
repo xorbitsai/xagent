@@ -440,3 +440,27 @@ def test_caller_supplied_id_in_log_message_is_also_redacted(monkeypatch, caplog)
     mock_request.assert_not_called()
     assert "user-token" not in caplog.text
     assert "[redacted]" in caplog.text
+
+
+def test_safe_log_id_strips_control_characters_and_truncates():
+    assert meta_ads._safe_log_id("abc\ndef\r\tghi") == "abcdefghi"
+    long_value = "9" * (meta_ads._MAX_LOGGED_ID_LENGTH + 50)
+    result = meta_ads._safe_log_id(long_value)
+    assert len(result) < len(long_value)
+    assert result.endswith("...[truncated]")
+
+
+def test_caller_supplied_id_with_newline_cannot_forge_log_lines(monkeypatch, caplog):
+    """A raw, not-yet-validated id can contain newlines before validation
+    rejects it -- these must not reach the log verbatim and forge what looks
+    like a second, fabricated log line."""
+    monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
+    mock_request = Mock()
+    monkeypatch.setattr(meta_ads.requests, "request", mock_request)
+
+    with caplog.at_level("ERROR", logger="meta-ads-mcp"):
+        meta_ads.meta_ads_get_ad_account("123\nERROR forged log line")
+
+    mock_request.assert_not_called()
+    assert "123\nERROR forged log line" not in caplog.text
+    assert "123ERROR forged log line" in caplog.text

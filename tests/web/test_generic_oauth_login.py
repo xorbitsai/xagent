@@ -573,6 +573,48 @@ def test_meta_login_uses_comma_separated_canonical_scopes_for_builtin_app(
     ]
 
 
+def test_meta_ads_login_requests_ads_read_scope_without_config_id(
+    db_session, monkeypatch
+):
+    db, user = db_session
+    token = _token_for(user)
+    monkeypatch.delenv("META_CONFIG_ID", raising=False)
+    monkeypatch.delenv("META_ADS_CONFIG_ID", raising=False)
+    db.add(
+        PublicMCPApp(
+            app_id="meta-ads",
+            name="Meta Ads",
+            description="Meta Ads connector",
+            transport="oauth",
+            provider_name="meta",
+            category="Marketing",
+            oauth_scopes=["ads_read"],
+            is_visible_in_connector=True,
+            launch_config={},
+        )
+    )
+    db.commit()
+
+    provider = _provider(
+        auth_url="https://www.facebook.com/v25.0/dialog/oauth",
+        default_scopes=["public_profile"],
+        redirect_uri="https://app.example.com/api/auth/meta/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="meta",
+        token=token,
+        app_id="meta-ads",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert qs["scope"] == ["public_profile,ads_read"]
+    assert "config_id" not in qs
+
+
 def test_github_login_requests_exact_canonical_scope(db_session):
     """The requested scope must be exactly the provider's default_scopes
     ("read:user") merged with the github app row's canonical oauth_scopes
@@ -1025,6 +1067,88 @@ def test_meta_login_uses_config_id_without_scope_for_facebook(db_session, monkey
     assert "optional_scope" not in qs
 
 
+def test_facebook_login_uses_its_own_config_id_override(db_session, monkeypatch):
+    """Mirrors the meta-ads override test below for META_FACEBOOK_CONFIG_ID,
+    which had no dedicated coverage of its own."""
+    db, user = db_session
+    token = _token_for(user)
+    monkeypatch.setenv("META_CONFIG_ID", "shared-config-id")
+    monkeypatch.setenv("META_FACEBOOK_CONFIG_ID", "facebook-only-config-id")
+    db.add(
+        PublicMCPApp(
+            app_id="facebook",
+            name="Facebook Pages",
+            description="Facebook connector",
+            transport="oauth",
+            provider_name="meta",
+            category="Marketing",
+            oauth_scopes=["pages_show_list"],
+            is_visible_in_connector=True,
+            launch_config={},
+        )
+    )
+    db.commit()
+
+    provider = _provider(
+        auth_url="https://www.facebook.com/v25.0/dialog/oauth",
+        default_scopes=["public_profile"],
+        redirect_uri="https://app.example.com/api/auth/meta/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="meta",
+        token=token,
+        app_id="facebook",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert qs["config_id"] == ["facebook-only-config-id"]
+
+
+def test_instagram_login_uses_its_own_config_id_override(db_session, monkeypatch):
+    """Mirrors the meta-ads override test below for META_INSTAGRAM_CONFIG_ID,
+    which had no dedicated coverage of its own."""
+    db, user = db_session
+    token = _token_for(user)
+    monkeypatch.setenv("META_CONFIG_ID", "shared-config-id")
+    monkeypatch.setenv("META_INSTAGRAM_CONFIG_ID", "instagram-only-config-id")
+    db.add(
+        PublicMCPApp(
+            app_id="instagram",
+            name="Instagram",
+            description="Instagram connector",
+            transport="oauth",
+            provider_name="meta",
+            category="Marketing",
+            oauth_scopes=["instagram_basic"],
+            is_visible_in_connector=True,
+            launch_config={},
+        )
+    )
+    db.commit()
+
+    provider = _provider(
+        auth_url="https://www.facebook.com/v25.0/dialog/oauth",
+        default_scopes=["public_profile"],
+        redirect_uri="https://app.example.com/api/auth/meta/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="meta",
+        token=token,
+        app_id="instagram",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert qs["config_id"] == ["instagram-only-config-id"]
+
+
 def test_meta_ads_login_uses_its_own_config_id_override(db_session, monkeypatch):
     """A dedicated META_ADS_CONFIG_ID must take precedence over the shared
     META_CONFIG_ID for the meta-ads app -- otherwise widening the one shared
@@ -1111,6 +1235,54 @@ def test_meta_ads_login_falls_back_to_shared_config_id_when_unset(
     qs = parse_qs(urlparse(_location(resp)).query)
 
     assert qs["config_id"] == ["shared-config-id"]
+
+
+def test_meta_ads_login_config_id_override_survives_admin_app_id_casing(
+    db_session, monkeypatch
+):
+    """An admin-created app row's app_id is free-form (e.g. "Meta Ads" with
+    a space/capitals, still normalizing to "meta-ads" for the app-scoped
+    OAuth grant policy in mcp_apps.py). The config_id override lookup must
+    normalize the same way, or a differently-cased app_id would silently
+    miss META_ADS_CONFIG_ID and fall back to the shared META_CONFIG_ID --
+    reintroducing exactly the cross-app capability sharing the per-app
+    override exists to prevent."""
+    db, user = db_session
+    token = _token_for(user)
+    monkeypatch.setenv("META_CONFIG_ID", "shared-config-id")
+    monkeypatch.setenv("META_ADS_CONFIG_ID", "ads-only-config-id")
+    db.add(
+        PublicMCPApp(
+            app_id="Meta Ads",
+            name="Meta Ads",
+            description="Meta Ads connector",
+            transport="oauth",
+            provider_name="meta",
+            category="Marketing",
+            oauth_scopes=["ads_read"],
+            is_visible_in_connector=True,
+            launch_config={},
+        )
+    )
+    db.commit()
+
+    provider = _provider(
+        auth_url="https://www.facebook.com/v25.0/dialog/oauth",
+        default_scopes=["public_profile"],
+        redirect_uri="https://app.example.com/api/auth/meta/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="meta",
+        token=token,
+        app_id="Meta Ads",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert qs["config_id"] == ["ads-only-config-id"]
 
 
 def test_meta_login_ignores_undocumented_legacy_config_id_alias(

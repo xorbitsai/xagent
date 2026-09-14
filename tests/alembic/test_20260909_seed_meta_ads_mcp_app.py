@@ -109,3 +109,35 @@ def test_downgrade_removes_meta_ads(tmp_path):
             migration.upgrade()
             migration.downgrade()
         assert "meta-ads" not in _app_ids(connection)
+
+
+def test_downgrade_preserves_preexisting_custom_row_with_same_app_id(tmp_path):
+    """An administrator could have hand-created a custom public app under the
+    same free-form app_id before this migration ever ran; upgrade() correctly
+    no-ops on that collision (see test below), but downgrade() must not then
+    delete that unrelated row just because the app_id matches."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection)
+        connection.execute(
+            text(
+                "INSERT INTO public_mcp_apps "
+                "(app_id, name, description, transport) "
+                "VALUES ('meta-ads', 'Internal Meta Ads Proxy', "
+                "'Hand-rolled admin connector', 'stdio')"
+            )
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()  # no-ops: app_id already exists
+            migration.downgrade()
+        row = connection.execute(
+            text(
+                "SELECT name, description, transport FROM public_mcp_apps "
+                "WHERE app_id='meta-ads'"
+            )
+        ).first()
+        assert row is not None, "downgrade must not delete an unowned custom row"
+        assert row[0] == "Internal Meta Ads Proxy"
+        assert row[1] == "Hand-rolled admin connector"
+        assert row[2] == "stdio"

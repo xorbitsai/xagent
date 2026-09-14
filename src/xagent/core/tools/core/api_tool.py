@@ -73,17 +73,28 @@ def _match_known_connector_domain(hostname: str) -> Optional[str]:
 # their own credential - not just the standard "Authorization" header, since
 # several of the services in _KNOWN_CONNECTOR_DOMAINS use a service-specific
 # one instead (e.g. Shopify's "X-Shopify-Access-Token").
-_AUTH_HEADER_NAME_MARKERS = ("authorization", "token", "api-key", "apikey", "auth", "signature")
+_AUTH_HEADER_NAME_MARKERS = (
+    "authorization",
+    "token",
+    "api-key",
+    "apikey",
+    "auth",
+    "signature",
+)
 
 # Query parameter names (case-insensitive) commonly used to carry an API key
 # instead of a header - e.g. Google APIs' "key" parameter.
-_AUTH_QUERY_PARAM_NAMES = frozenset({"key", "api_key", "apikey", "token", "access_token"})
+_AUTH_QUERY_PARAM_NAMES = frozenset(
+    {"key", "api_key", "apikey", "token", "access_token"}
+)
 
 
 def _has_auth_header(headers: Optional[Mapping[str, str]]) -> bool:
     if not headers:
         return False
-    return any(marker in key.lower() for key in headers for marker in _AUTH_HEADER_NAME_MARKERS)
+    return any(
+        marker in key.lower() for key in headers for marker in _AUTH_HEADER_NAME_MARKERS
+    )
 
 
 def _has_auth_query_param(url: str, params: Optional[Mapping[str, Any]]) -> bool:
@@ -102,7 +113,9 @@ def _has_auth_credentials(
     this call, by any of the mechanisms api_call or a typical direct REST
     call supports: the auth_token argument, an auth-looking header, or an
     auth-looking query parameter (in either `params` or the URL itself)."""
-    return bool(auth_token or _has_auth_header(headers) or _has_auth_query_param(url, params))
+    return bool(
+        auth_token or _has_auth_header(headers) or _has_auth_query_param(url, params)
+    )
 
 
 class APIClientCore:
@@ -159,7 +172,10 @@ class APIClientCore:
         Returns:
             Dictionary with success status, status_code, headers, body, and error
         """
-        logger.info(f"🌐 API Call: {method} {url}" + (f" (auth: {auth_type})" if auth_type else ""))
+        logger.info(
+            f"🌐 API Call: {method} {url}"
+            + (f" (auth: {auth_type})" if auth_type else "")
+        )
 
         # Validate URL
         if not self._is_valid_url(url):
@@ -180,7 +196,9 @@ class APIClientCore:
         # auth-looking query parameter (e.g. Google's "key") - genuinely
         # intends a direct call, so that combination is let through untouched.
         connector_label = _match_known_connector_domain(urlparse(url).hostname or "")
-        if connector_label and not _has_auth_credentials(url, headers, params, auth_token):
+        if connector_label and not _has_auth_credentials(
+            url, headers, params, auth_token
+        ):
             message = (
                 f"{url} is a {connector_label} API endpoint. This generic api_call "
                 f"tool has no stored credential for {connector_label} and this "
@@ -203,7 +221,9 @@ class APIClientCore:
         # Prepare request
         method = method.upper()
         timeout = timeout or self.default_timeout
-        retry_count = retry_count if retry_count is not None else self.default_retry_count
+        retry_count = (
+            retry_count if retry_count is not None else self.default_retry_count
+        )
         # Ensure retry_count is non-negative to avoid empty range
         retry_count = max(0, retry_count)
 
@@ -246,7 +266,9 @@ class APIClientCore:
                     proxy_url=proxy_url,
                     allow_redirects=allow_redirects,
                 )
-                logger.info(f"✅ API Call successful: {method} {url} -> {result['status_code']}")
+                logger.info(
+                    f"✅ API Call successful: {method} {url} -> {result['status_code']}"
+                )
                 return result
 
             except Exception as e:
@@ -256,7 +278,9 @@ class APIClientCore:
                         f"⚠️ API Call failed (attempt {attempt + 1}/{retry_count + 1}): {str(e)}"
                     )
                 else:
-                    logger.error(f"❌ API Call failed after {retry_count + 1} attempts: {str(e)}")
+                    logger.error(
+                        f"❌ API Call failed after {retry_count + 1} attempts: {str(e)}"
+                    )
 
         # All retries failed
         return {
@@ -408,7 +432,9 @@ class APIClientCore:
         else:
             return str(body)
 
-    def _parse_response_body_from_content(self, content: bytes, headers: Dict[str, str]) -> Any:
+    def _parse_response_body_from_content(
+        self, content: bytes, headers: Dict[str, str]
+    ) -> Any:
         """Parse response body from raw content based on content type"""
         if not content:
             return None

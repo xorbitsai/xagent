@@ -51,7 +51,10 @@ class TestMatchKnownConnectorDomain:
         """A hostname that merely contains the target domain as a substring
         elsewhere (not as its own suffix) must not match."""
         assert (
-            _hostname_matches_connector_domain("zendesk.com.evil.example", "zendesk.com") is False
+            _hostname_matches_connector_domain(
+                "zendesk.com.evil.example", "zendesk.com"
+            )
+            is False
         )
 
 
@@ -81,11 +84,16 @@ class TestHasAuthCredentials:
         )
 
     def test_true_for_auth_query_param_in_url_itself(self):
-        assert _has_auth_credentials("https://maps.googleapis.com/x?key=AIza123", None, None, None)
+        assert _has_auth_credentials(
+            "https://maps.googleapis.com/x?key=AIza123", None, None, None
+        )
 
     def test_false_when_nothing_looks_like_a_credential(self):
         assert not _has_auth_credentials(
-            "https://api.hubapi.com/x?limit=10", {"Content-Type": "application/json"}, None, None
+            "https://api.hubapi.com/x?limit=10",
+            {"Content-Type": "application/json"},
+            None,
+            None,
         )
 
     def test_false_for_no_arguments_at_all(self):
@@ -114,7 +122,9 @@ def mock_httpbin(monkeypatch: pytest.MonkeyPatch) -> None:
         if path == "/get":
             body = {"args": _single_value_query_args(url)}
         elif path == "/post":
-            parsed_data = json.loads(data.decode() if isinstance(data, bytes) else data or "{}")
+            parsed_data = json.loads(
+                data.decode() if isinstance(data, bytes) else data or "{}"
+            )
             body = {"json": parsed_data}
         elif path == "/bearer":
             token = headers.get("Authorization", "").removeprefix("Bearer ")
@@ -270,7 +280,9 @@ class TestAPIClientCore:
         assert "Zendesk" in result["error"]
 
     @pytest.mark.asyncio
-    async def test_allows_known_connector_domain_with_explicit_auth_token(self, mock_httpbin: None):
+    async def test_allows_known_connector_domain_with_explicit_auth_token(
+        self, mock_httpbin: None
+    ):
         """An explicit auth_token means the caller has their own credential
         and genuinely intends a direct call - the guard must not block it."""
         client = APIClientCore()
@@ -310,7 +322,9 @@ class TestAPIClientCore:
         assert "error" not in result or result.get("status_code") != 0
 
     @pytest.mark.asyncio
-    async def test_allows_known_connector_domain_with_query_param_in_url(self, mock_httpbin: None):
+    async def test_allows_known_connector_domain_with_query_param_in_url(
+        self, mock_httpbin: None
+    ):
         """Google APIs commonly carry the API key as a "key" query
         parameter directly in the URL rather than a header."""
         client = APIClientCore()

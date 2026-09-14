@@ -277,6 +277,53 @@ def test_get_contact_deals_empty_returns_no_more(monkeypatch):
     assert result == {"status": "success", "deals": [], "has_more": False}
 
 
+def test_get_company_deals_single_page_has_no_more(monkeypatch):
+    def fake_request(method, url, headers, params, json, timeout):
+        if "/associations/deals" in url:
+            assert "/crm/v3/objects/companies/co1/associations/deals" in url
+            return MockResponse(json_data={"results": [{"id": "d1"}, {"id": "d2"}]})
+        assert url.endswith("/crm/v3/objects/deals/batch/read")
+        return MockResponse(
+            json_data={
+                "results": [
+                    {"id": item["id"], "properties": {"dealname": "Deal"}}
+                    for item in json["inputs"]
+                ]
+            }
+        )
+
+    monkeypatch.setattr(hubspot.requests, "request", Mock(side_effect=fake_request))
+
+    result = json.loads(hubspot.hubspot_get_company_deals("co1"))
+
+    assert result["status"] == "success"
+    assert [deal["id"] for deal in result["deals"]] == ["d1", "d2"]
+    assert result["has_more"] is False
+
+
+def test_get_company_deals_empty_returns_no_more(monkeypatch):
+    monkeypatch.setattr(
+        hubspot.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data={"results": []})),
+    )
+
+    result = json.loads(hubspot.hubspot_get_company_deals("co1"))
+
+    assert result == {"status": "success", "deals": [], "has_more": False}
+
+
+def test_get_company_deals_rejects_whitespace_padded_company_id(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(hubspot.hubspot_get_company_deals(" co1 "))
+
+    assert result["status"] == "error"
+    assert "company_id" in result["message"]
+    mock_request.assert_not_called()
+
+
 def test_create_deal_without_contact_id_sends_no_associations(monkeypatch):
     mock_request = Mock(return_value=MockResponse(json_data={"id": "d1"}))
     monkeypatch.setattr(hubspot.requests, "request", mock_request)

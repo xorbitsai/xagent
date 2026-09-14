@@ -465,39 +465,83 @@ def hubspot_update_company(company_id: str, properties_json: str) -> str:
         return _error(str(e))
 
 
+def _get_associated_deals(
+    object_type: str, object_id: str, limit: int
+) -> dict[str, Any]:
+    """Fetch the deals associated with a HubSpot contact or company record.
+
+    Shared by ``hubspot_get_contact_deals`` and ``hubspot_get_company_deals``:
+    both associations follow the same shape (list ids, then batch-read the
+    deal properties), and keeping one implementation means a fix to the
+    pagination or batch-read logic does not need to be made twice.
+    """
+    deal_ids, has_more = _list_association_ids(
+        f"/crm/v3/objects/{object_type}/{object_id}/associations/deals",
+        max(1, min(limit, 100)),
+    )
+    if not deal_ids:
+        return {"deals": [], "has_more": has_more}
+
+    deals = _request(
+        "POST",
+        "/crm/v3/objects/deals/batch/read",
+        body={
+            "properties": DEFAULT_DEAL_PROPERTIES,
+            "inputs": [{"id": deal_id} for deal_id in deal_ids],
+        },
+    )
+    return {
+        "deals": [
+            {"id": item.get("id"), "properties": item.get("properties", {})}
+            for item in deals.get("results", [])
+        ],
+        "has_more": has_more,
+    }
+
+
 @mcp.tool()
 def hubspot_get_contact_deals(contact_id: str, limit: int = 100) -> str:
     """
     List the deals associated with a HubSpot contact, including deal stage,
     pipeline, amount, and close date. Returns at most `limit` deals (max 100);
     `has_more` is true when the contact has additional deals beyond the result.
+
+    A contact's deals are not necessarily the same as its company's deals: two
+    contacts can share a name (e.g. the same person with a role at two
+    different companies) while belonging to different HubSpot companies. When
+    the question is about a company's open deals rather than one specific
+    contact's, use `hubspot_get_company_deals` instead of guessing which
+    contact to look up by name - it associates deals with the company record
+    directly instead of relying on a contact match.
     """
     try:
         contact_id = _url_path_id(contact_id, "contact_id")
-        deal_ids, has_more = _list_association_ids(
-            f"/crm/v3/objects/contacts/{contact_id}/associations/deals",
-            max(1, min(limit, 100)),
-        )
-        if not deal_ids:
-            return _success(deals=[], has_more=has_more)
-
-        deals = _request(
-            "POST",
-            "/crm/v3/objects/deals/batch/read",
-            body={
-                "properties": DEFAULT_DEAL_PROPERTIES,
-                "inputs": [{"id": deal_id} for deal_id in deal_ids],
-            },
-        )
-        return _success(
-            deals=[
-                {"id": item.get("id"), "properties": item.get("properties", {})}
-                for item in deals.get("results", [])
-            ],
-            has_more=has_more,
-        )
+        return _success(**_get_associated_deals("contacts", contact_id, limit))
     except Exception as e:
         logger.error(f"Error getting contact deals: {e}")
+        return _error(str(e))
+
+
+@mcp.tool()
+def hubspot_get_company_deals(company_id: str, limit: int = 100) -> str:
+    """
+    List the deals associated with a HubSpot company, including deal stage,
+    pipeline, amount, and close date. Returns at most `limit` deals (max 100);
+    `has_more` is true when the company has additional deals beyond the result.
+
+    Use this to answer "what are this company's open deals" - it reads the
+    company-to-deal association directly. Do not substitute a contact lookup
+    for this (e.g. searching for a person's name and calling
+    `hubspot_get_contact_deals` on the match): a contact match found by name
+    is not proof that contact belongs to the company being asked about, and a
+    deal returned that way must not be reported as the company's unless a
+    call scoped to this company's id actually returned it.
+    """
+    try:
+        company_id = _url_path_id(company_id, "company_id")
+        return _success(**_get_associated_deals("companies", company_id, limit))
+    except Exception as e:
+        logger.error(f"Error getting company deals: {e}")
         return _error(str(e))
 
 

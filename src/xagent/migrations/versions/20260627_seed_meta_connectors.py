@@ -92,8 +92,8 @@ def _meta_app_rows() -> list[dict[str, object]]:
             ],
             "is_visible_in_connector": True,
             "launch_config": {
-                "command": "uv",
-                "args": ["run", "python", "-m", "xagent.web.tools.mcp.facebook"],
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.facebook"],
                 "env_mapping": {"META_ACCESS_TOKEN": "access_token"},
             },
         },
@@ -113,8 +113,8 @@ def _meta_app_rows() -> list[dict[str, object]]:
             ],
             "is_visible_in_connector": True,
             "launch_config": {
-                "command": "uv",
-                "args": ["run", "python", "-m", "xagent.web.tools.mcp.instagram"],
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.instagram"],
                 "env_mapping": {"META_ACCESS_TOKEN": "access_token"},
             },
         },

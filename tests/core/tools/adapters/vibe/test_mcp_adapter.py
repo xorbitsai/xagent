@@ -4416,3 +4416,102 @@ async def test_workspace_upload_settles_detached_resolution_before_cancellation(
     with pytest.raises(asyncio.CancelledError):
         await call
     create_session_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_preview_producer_and_mcp_adapter_share_ephemeral_workspace(
+    monkeypatch,
+    tmp_path,
+):
+    from xagent.core.agent.service import AgentService
+    from xagent.core.tools.adapters.vibe.browser_tools import create_browser_tools
+    from xagent.core.tools.adapters.vibe.config import ToolConfig
+    from xagent.core.tools.adapters.vibe.factory import ToolFactory
+    from xagent.core.tools.adapters.vibe.mcp_tools import create_mcp_tools
+
+    preview_id = "preview_deadbeef"
+    config = ToolConfig(
+        {
+            "task_id": preview_id,
+            "workspace": {
+                "base_dir": str(tmp_path),
+                "task_id": preview_id,
+            },
+            "mcp_servers": [
+                {
+                    "name": "google_drive",
+                    "transport": "stdio",
+                    "config": {"command": "python", "args": []},
+                }
+            ],
+        }
+    )
+    service = AgentService(
+        name="preview",
+        id=preview_id,
+        tool_config=config,
+        enable_workspace=True,
+        workspace_base_dir=str(tmp_path),
+    )
+    browser_tools = await create_browser_tools(config)
+    screenshot_tool = next(
+        tool for tool in browser_tools if tool.name == "browser_screenshot"
+    )
+    producer_workspace = screenshot_tool._workspace
+    assert producer_workspace is service.workspace
+
+    png_bytes = b"\x89PNG\r\n\x1a\npreview screenshot"
+
+    async def fake_browser_screenshot(**kwargs):
+        import base64
+
+        return {
+            "success": True,
+            "session_id": kwargs["session_id"],
+            "screenshot": "data:image/png;base64,"
+            + base64.b64encode(png_bytes).decode("ascii"),
+            "format": "png",
+            "full_page": False,
+            "wait_for_lazy_load": False,
+            "message": "ok",
+            "error": "",
+        }
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.browser_use.browser_screenshot",
+        fake_browser_screenshot,
+    )
+    produced = await screenshot_tool.run_json_async({"output_filename": "preview.png"})
+
+    captured = {}
+
+    class _FakeSession:
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, name, arguments, **kwargs):
+            return CallToolResult(content=[], isError=False)
+
+    @asynccontextmanager
+    async def fake_create_session(connection):
+        captured["connection"] = connection
+        yield _FakeSession()
+
+    async def fake_create_mcp_tools(mcp_configs, **kwargs):
+        assert mcp_configs
+        assert kwargs["workspace"] is producer_workspace
+        return [_workspace_upload_adapter(kwargs["workspace"])]
+
+    monkeypatch.setattr(
+        ToolFactory,
+        "_create_mcp_tools_from_configs",
+        staticmethod(fake_create_mcp_tools),
+    )
+    monkeypatch.setattr(mcp_adapter_module, "create_session", fake_create_session)
+    mcp_tools = await create_mcp_tools(config)
+    result = await mcp_tools[0].run_json_async({"file_id": produced["file_id"]})
+
+    assert result["is_error"] is False
+    env = captured["connection"]["env"]
+    assert env["XAGENT_GOOGLE_DRIVE_UPLOAD_FILE_ID"] == produced["file_id"]
+    assert env["XAGENT_GOOGLE_DRIVE_UPLOAD_FILE_MIME"] == "image/png"

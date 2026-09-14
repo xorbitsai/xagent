@@ -775,13 +775,7 @@ class ToolFactory:
             release = getattr(config, "release_db_connection", None)
             if callable(release):
                 release()
-            workspace = (
-                config.get_task_runtime_workspace()
-                if isinstance(config, BaseToolConfig)
-                else None
-            )
-            if workspace is None:
-                workspace = ToolFactory.create_workspace(config.get_workspace_config())
+            workspace = ToolFactory.get_or_create_runtime_workspace(config)
             if workspace is not None:
                 directories = workspace.get_allowed_dirs()
                 # Mount coverage is sufficient only when the backend-side
@@ -956,6 +950,19 @@ class ToolFactory:
         except Exception as e:
             logger.warning(f"Failed to create workspace: {e}")
             return None
+
+    @staticmethod
+    def get_or_create_runtime_workspace(
+        config: BaseToolConfig,
+    ) -> TaskWorkspace | None:
+        """Return the one workspace shared by every creator in a factory run."""
+
+        workspace = config.get_task_runtime_workspace()
+        if workspace is None:
+            workspace = ToolFactory.create_workspace(config.get_workspace_config())
+            if workspace is not None:
+                config.set_task_runtime_workspace(workspace)
+        return workspace
 
     @staticmethod
     def _create_workspace(

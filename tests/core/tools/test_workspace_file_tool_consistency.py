@@ -374,7 +374,13 @@ class TestWorkspaceFileToolConsistency:
                     file_id="foreign-file",
                     user_id=2,
                     task_id=None,
+                    filename="other-user.txt",
+                    mime_type="text/plain",
+                    file_size=len("private"),
                     storage_path=str(external_file),
+                    storage_key=None,
+                    storage_status="legacy",
+                    checksum=None,
                 )
 
         class FakeSession:
@@ -415,6 +421,9 @@ class TestWorkspaceFileToolConsistency:
                     filename="Original Name.txt",
                     mime_type="text/custom",
                     file_size=len("content"),
+                    storage_key=None,
+                    storage_status="legacy",
+                    checksum=None,
                 )
 
         class WorkerSession:

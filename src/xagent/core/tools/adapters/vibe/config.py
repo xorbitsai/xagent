@@ -225,10 +225,12 @@ class BaseToolConfig(ABC):
     def set_task_runtime_workspace(self, workspace: Any) -> None:
         """Retain a workspace shared by task-runtime and sandbox setup."""
 
+        self._task_runtime_workspace = workspace
+
     def get_task_runtime_workspace(self) -> Any:
         """Return a workspace prepared by the task runtime, when present."""
 
-        return None
+        return getattr(self, "_task_runtime_workspace", None)
 
     @abstractmethod
     def get_workspace_config(self) -> Optional[Dict[str, Any]]:

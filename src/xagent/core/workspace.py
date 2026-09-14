@@ -22,6 +22,7 @@ from typing import (
     Dict,
     Iterator,
     List,
+    Mapping,
     Optional,
     Sequence,
     Tuple,
@@ -119,6 +120,7 @@ class WorkspaceFileRegistration:
     relative_path: str
     category: str
     is_workspace_file: bool
+    mime_type: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -145,6 +147,22 @@ class WorkspaceUploadBinding:
     size: int
     device: int
     inode: int
+
+
+@dataclass(frozen=True)
+class WorkspaceUploadedFileResolutionSnapshot:
+    """Detached record fields needed to authorize and materialize a FileRef."""
+
+    file_id: str
+    user_id: int
+    task_id: Optional[int]
+    filename: str
+    mime_type: Optional[str]
+    file_size: int
+    storage_path: str
+    storage_key: Optional[str]
+    storage_status: str
+    checksum: Optional[str]
 
 
 @dataclass(frozen=True)
@@ -396,11 +414,16 @@ class TaskWorkspace:
                 )
 
     def register_file(
-        self, file_path: str, file_id: Optional[str] = None, db_session: Any = None
+        self,
+        file_path: str,
+        file_id: Optional[str] = None,
+        db_session: Any = None,
+        mime_type: Optional[str] = None,
     ) -> str:
         registered = self.register_files(
             ((file_path, file_id),),
             db_session=db_session,
+            mime_types={file_path: mime_type} if mime_type else None,
         )
         return registered[0]
 
@@ -418,6 +441,7 @@ class TaskWorkspace:
         files: Sequence[tuple[str, Optional[str]]],
         *,
         db_session: Any = None,
+        mime_types: Optional[Mapping[str, str]] = None,
     ) -> tuple[str, ...]:
         """Serialize one workspace's registration read/stage/commit sequence."""
 
@@ -429,7 +453,11 @@ class TaskWorkspace:
                 for path, file_id in files
             )
         with self._registration_lock:
-            return self._register_files_locked(files, db_session=db_session)
+            return self._register_files_locked(
+                files,
+                db_session=db_session,
+                mime_types=mime_types,
+            )
 
     def _register_files_locked(
         self,
@@ -437,6 +465,7 @@ class TaskWorkspace:
         *,
         db_session: Any,
         require_persistence: bool = False,
+        mime_types: Optional[Mapping[str, str]] = None,
     ) -> tuple[str, ...]:
         """Register files through detached read, storage, and metadata phases.
 
@@ -453,7 +482,10 @@ class TaskWorkspace:
 
         # Path resolution, validation, and stat-like filesystem work happen
         # only after any clean caller transaction has returned its connection.
-        registrations, result_indexes = self._normalize_file_registrations(files)
+        registrations, result_indexes = self._normalize_file_registrations(
+            files,
+            mime_types=mime_types,
+        )
         plans = self._load_file_registration_plans(
             registrations,
             db_session=resolved_db_session,
@@ -505,6 +537,8 @@ class TaskWorkspace:
     def _normalize_file_registrations(
         self,
         files: Sequence[tuple[str, Optional[str]]],
+        *,
+        mime_types: Optional[Mapping[str, str]] = None,
     ) -> tuple[
         tuple[tuple[WorkspaceFileRegistration, Optional[str]], ...],
         tuple[int, ...],
@@ -517,7 +551,14 @@ class TaskWorkspace:
         result_indexes: list[int] = []
 
         for file_path, file_id in files:
-            registration = self.describe_file_registration(file_path)
+            explicit_mime_type = (mime_types or {}).get(file_path)
+            if explicit_mime_type is None:
+                registration = self.describe_file_registration(file_path)
+            else:
+                registration = self.describe_file_registration(
+                    file_path,
+                    mime_type=explicit_mime_type,
+                )
             path_key = str(registration.path)
             requested_file_id = str(file_id).strip() if file_id is not None else None
             if not requested_file_id:
@@ -539,6 +580,23 @@ class TaskWorkspace:
                     unique[existing_index] = (
                         existing_registration,
                         requested_file_id,
+                    )
+                if (
+                    registration.mime_type is not None
+                    and existing_registration.mime_type is not None
+                    and registration.mime_type != existing_registration.mime_type
+                ):
+                    raise ValueError(
+                        "One workspace path cannot be registered with multiple "
+                        "MIME types in the same batch"
+                    )
+                if (
+                    existing_registration.mime_type is None
+                    and registration.mime_type is not None
+                ):
+                    unique[existing_index] = (
+                        registration,
+                        unique[existing_index][1],
                     )
                 if requested_file_id is not None:
                     existing_path = path_by_requested_file_id.get(requested_file_id)
@@ -774,7 +832,9 @@ class TaskWorkspace:
             )
             category = "output"
 
-        mime_type = plan.existing.mime_type if plan.existing is not None else None
+        mime_type = plan.registration.mime_type
+        if not mime_type and plan.existing is not None:
+            mime_type = plan.existing.mime_type
         if not mime_type:
             mime_type, _ = mimetypes.guess_type(local_path.name)
         mime_type = mime_type or "application/octet-stream"
@@ -970,7 +1030,12 @@ class TaskWorkspace:
             self._remember_file_registration(normalized_file_id, registration.path)
         return normalized_file_id
 
-    def describe_file_registration(self, file_path: str) -> WorkspaceFileRegistration:
+    def describe_file_registration(
+        self,
+        file_path: str,
+        *,
+        mime_type: Optional[str] = None,
+    ) -> WorkspaceFileRegistration:
         """Return validated, persistence-ready metadata without side effects."""
 
         resolved_path = self._resolve_file_for_registration(file_path)
@@ -988,6 +1053,7 @@ class TaskWorkspace:
             relative_path=relative_path,
             category=category,
             is_workspace_file=is_workspace_file,
+            mime_type=mime_type,
         )
 
     def _resolve_file_for_registration(self, file_path: str) -> Path:
@@ -1294,9 +1360,18 @@ class TaskWorkspace:
         if not canonical_id:
             return None
 
-        record_metadata: Optional[tuple[str, Optional[str], int]] = None
+        record_snapshot: Optional[WorkspaceUploadedFileResolutionSnapshot] = None
         path: Optional[Path] = None
-        if not canonical_id.startswith("internal-"):
+        # Non-persistent executions (for example REST preview) have no Task or
+        # UploadedFile row. Their opaque IDs are authoritative only in this
+        # exact shared workspace instance, so consult that cache before any DB
+        # access. Persisted tasks still load registered metadata from the DB.
+        if self.current_task_id is None:
+            path = self._resolve_file_id(
+                canonical_id,
+                use_bound_db_session=False,
+            )
+        if path is None and not canonical_id.startswith("internal-"):
             from ..web.models.uploaded_file import UploadedFile
             from .storage.manager import create_db_session
 
@@ -1308,32 +1383,54 @@ class TaskWorkspace:
                     .first()
                 )
                 if record is not None:
-                    storage_path = Path(record.storage_path)
-                    if storage_path.exists() and storage_path.is_file():
-                        if not self._file_record_allowed_for_workspace(
-                            record, storage_path
-                        ):
-                            return None
-                        path = storage_path
-                    elif (
-                        getattr(record, "storage_key", None)
-                        and getattr(record, "storage_status", None) == "available"
-                    ):
-                        if not self._file_record_allowed_for_workspace(record):
-                            return None
-                        from ..web.services.managed_file_ref import ManagedFileRef
-
-                        path = ManagedFileRef(record).materialize()
                     record_mime = getattr(record, "mime_type", None)
-                    record_metadata = (
-                        str(record.filename),
-                        None if record_mime is None else str(record_mime),
-                        int(record.file_size),
+                    record_storage_key = getattr(record, "storage_key", None)
+                    record_checksum = getattr(record, "checksum", None)
+                    record_snapshot = WorkspaceUploadedFileResolutionSnapshot(
+                        file_id=str(record.file_id),
+                        user_id=int(record.user_id),
+                        task_id=(
+                            int(record.task_id) if record.task_id is not None else None
+                        ),
+                        filename=str(record.filename),
+                        mime_type=(None if record_mime is None else str(record_mime)),
+                        file_size=int(record.file_size),
+                        storage_path=str(record.storage_path),
+                        storage_key=(
+                            None
+                            if record_storage_key is None
+                            else str(record_storage_key)
+                        ),
+                        storage_status=str(record.storage_status),
+                        checksum=(
+                            None if record_checksum is None else str(record_checksum)
+                        ),
                     )
             finally:
                 db.close()
 
-        if path is None and record_metadata is None:
+        # The ORM Session and its checked-out connection are gone before any
+        # filesystem stat, checksum, or durable-storage materialization. The
+        # detached snapshot is the only record state allowed past this point.
+        if record_snapshot is not None:
+            storage_path = Path(record_snapshot.storage_path)
+            if storage_path.exists() and storage_path.is_file():
+                if not self._file_record_allowed_for_workspace(
+                    record_snapshot, storage_path
+                ):
+                    return None
+                path = storage_path
+            elif (
+                record_snapshot.storage_key
+                and record_snapshot.storage_status == "available"
+            ):
+                if not self._file_record_allowed_for_workspace(record_snapshot):
+                    return None
+                from ..web.services.managed_file_ref import ManagedFileRef
+
+                path = ManagedFileRef(record_snapshot).materialize()
+
+        if path is None and record_snapshot is None:
             path = self._resolve_file_id(canonical_id, use_bound_db_session=False)
         if path is None:
             return None
@@ -1345,15 +1442,15 @@ class TaskWorkspace:
 
         filename = resolved.name
         mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
-        if record_metadata is not None:
-            filename, registered_mime, registered_size = record_metadata
-            if registered_size != stat.st_size:
+        if record_snapshot is not None:
+            filename = record_snapshot.filename
+            if record_snapshot.file_size != stat.st_size:
                 logger.warning(
                     "Rejected workspace FileRef with changed size: %s",
                     canonical_id,
                 )
                 return None
-            mime_type = str(registered_mime or mime_type)
+            mime_type = str(record_snapshot.mime_type or mime_type)
 
         return WorkspaceUploadBinding(
             file_id=canonical_id,
@@ -2093,7 +2190,11 @@ class TaskWorkspace:
         return target_path
 
     @contextmanager
-    def auto_register_files(self) -> "Iterator[TaskWorkspace]":
+    def auto_register_files(
+        self,
+        *,
+        mime_type: Optional[str] = None,
+    ) -> "Iterator[TaskWorkspace]":
         """
         Context manager to automatically register files created during execution.
 
@@ -2134,6 +2235,7 @@ class TaskWorkspace:
                         file_id = self.register_file(
                             str(file_path),
                             db_session=self.db_session,
+                            mime_type=mime_type,
                         )
                         logger.debug(
                             "Auto-registered file: %s -> %s", file_path, file_id
@@ -2655,7 +2757,12 @@ class MockWorkspace:
         else:
             return self.workspace_dir / file_path
 
-    def register_file(self, file_path: str, file_id: Optional[str] = None) -> str:
+    def register_file(
+        self,
+        file_path: str,
+        file_id: Optional[str] = None,
+        mime_type: Optional[str] = None,
+    ) -> str:
         """
         Mock register_file - returns a UUID without creating database record.
 

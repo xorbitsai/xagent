@@ -222,7 +222,10 @@ def build_workspace_file_ref(
     else:
         final_file_id = file_id or workspace.get_file_id_from_path(str(resolved_path))
         if not final_file_id:
-            final_file_id = workspace.register_file(str(resolved_path))
+            final_file_id = workspace.register_file(
+                str(resolved_path),
+                mime_type=mime_type,
+            )
 
     workspace_root = workspace.workspace_dir.resolve()
     file_ref = build_file_ref(

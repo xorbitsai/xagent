@@ -281,11 +281,7 @@ async def create_mcp_tools(config: "BaseToolConfig") -> List[Any]:
                 actor_stdio_session_identities=session_identities,
                 actor_stdio_session_consumer=session_consumer,
             )
-        workspace_getter = getattr(config, "get_task_runtime_workspace", None)
-        workspace = workspace_getter() if callable(workspace_getter) else None
-        workspace_config_getter = getattr(config, "get_workspace_config", None)
-        if workspace is None and callable(workspace_config_getter):
-            workspace = ToolFactory.create_workspace(workspace_config_getter())
+        workspace = ToolFactory.get_or_create_runtime_workspace(config)
         if workspace is not None:
             create_kwargs["workspace"] = workspace
         tools = await ToolFactory._create_mcp_tools_from_configs(

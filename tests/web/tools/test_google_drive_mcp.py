@@ -5,7 +5,19 @@ from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
+from xagent.core.file_storage.factory import (
+    get_unscoped_file_storage,
+)
+from xagent.core.tools.adapters.vibe.browser_use import BrowserScreenshotTool
+from xagent.core.workspace import TaskWorkspace
+from xagent.web.models import Base
+from xagent.web.models.task import Task
+from xagent.web.models.uploaded_file import UploadedFile
+from xagent.web.models.user import User
 from xagent.web.tools.mcp import google_drive
 
 
@@ -2736,6 +2748,119 @@ def test_upload_file_preserves_exact_binary_bytes_and_authoritative_metadata(
         "mime_type": expected_mime,
         "size": len(content),
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("output_filename", ["capture", "capture.jpg"])
+async def test_browser_png_mime_survives_registration_binding_and_drive(
+    monkeypatch,
+    tmp_path,
+    bind_workspace_upload,
+    output_filename,
+):
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    Base.metadata.create_all(bind=engine)
+    db = SessionLocal()
+    try:
+        user = User(username=f"drive-mime-{output_filename}", password_hash="hash")
+        db.add(user)
+        db.flush()
+        db.add(Task(id=9232, user_id=user.id, title="Drive MIME task"))
+        db.commit()
+
+        monkeypatch.setenv(
+            "XAGENT_FILE_STORAGE_URI",
+            (tmp_path / "objects").as_uri(),
+        )
+        get_unscoped_file_storage.cache_clear()
+        monkeypatch.setattr(
+            "xagent.web.models.database.get_session_local",
+            lambda: SessionLocal,
+        )
+        monkeypatch.setattr(
+            "xagent.core.storage.manager.create_db_session",
+            SessionLocal,
+        )
+        workspace = TaskWorkspace(
+            id="web_task_9232",
+            base_dir=str(tmp_path / "workspaces"),
+            db_task_id=9232,
+        )
+        workspace.owner_user_id = int(user.id)
+        workspace.db_session = db
+        png_bytes = b"\x89PNG\r\n\x1a\nexact screenshot bytes"
+
+        async def fake_browser_screenshot(**kwargs):
+            return {
+                "success": True,
+                "session_id": kwargs["session_id"],
+                "screenshot": "data:image/png;base64,"
+                + base64.b64encode(png_bytes).decode("ascii"),
+                "format": "png",
+                "full_page": False,
+                "wait_for_lazy_load": False,
+                "message": "ok",
+                "error": "",
+            }
+
+        monkeypatch.setattr(
+            "xagent.core.tools.adapters.vibe.browser_use.browser_screenshot",
+            fake_browser_screenshot,
+        )
+        produced = await BrowserScreenshotTool(
+            task_id="web_task_9232",
+            workspace=workspace,
+        ).run_json_async({"output_filename": output_filename})
+        record = (
+            db.query(UploadedFile)
+            .filter(UploadedFile.file_id == produced["file_id"])
+            .one()
+        )
+        assert record.mime_type == "image/png"
+
+        binding = workspace.resolve_file_binding_detached(produced["file_id"])
+        assert binding is not None
+        assert binding.filename == output_filename
+        assert binding.mime_type == "image/png"
+        file_id = bind_workspace_upload(
+            binding.path,
+            file_id=binding.file_id,
+            name=binding.filename,
+            mime_type=binding.mime_type,
+        )
+        captured = {}
+
+        class _CapturingUpload:
+            def __init__(self, fh, *, mimetype, resumable):
+                captured["bytes"] = fh.read()
+                captured["mime_type"] = mimetype
+
+        monkeypatch.setattr(google_drive, "MediaIoBaseUpload", _CapturingUpload)
+        files = Mock()
+        files.create.return_value.execute.return_value = {
+            "id": "drive-screenshot-id",
+            "name": output_filename,
+            "mimeType": "image/png",
+        }
+        _mock_drive_service_with_files(monkeypatch, files)
+
+        result = json.loads(google_drive.google_drive_upload_file(file_id))
+
+        assert result["status"] == "success"
+        assert captured == {"bytes": png_bytes, "mime_type": "image/png"}
+        assert files.create.call_args.kwargs["body"] == {
+            "name": output_filename,
+            "mimeType": "image/png",
+        }
+    finally:
+        db.close()
+        engine.dispose()
+        get_unscoped_file_storage.cache_clear()
 
 
 def test_upload_file_includes_parent_id_when_given(

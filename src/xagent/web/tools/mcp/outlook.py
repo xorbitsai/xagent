@@ -288,7 +288,7 @@ def _normalize_all_day_window(
     return effective_start, effective_end
 
 
-# Defensive cap on calendarView pages followed for one organizer-side
+# Defensive cap on calendarView pages followed for one signed-in-calendar
 # conflict check - comfortably more than any single-window query should
 # ever need, just bounding the loop against an unexpected/pathological
 # amount of paging rather than looping forever.
@@ -303,8 +303,9 @@ def _find_conflicts(
     *,
     exclude_event_id: str | None = None,
     check_organizer: bool = True,
+    organizer_calendar_label: str = "organizer",
 ) -> tuple[list[dict[str, Any]], list[str]]:
-    """Check the organizer's own calendar (when check_organizer) plus each
+    """Check the signed-in calendar (when check_organizer) plus each
     attendee's schedule for anything overlapping [start_datetime,
     end_datetime) in the given timezone.
 
@@ -318,7 +319,12 @@ def _find_conflicts(
     - a naive value there is silently read as UTC. So only the calendarView
     call needs an explicit offset attached before it's sent.
 
-    The organizer results are accepted as Graph's own overlap decision for
+    `organizer_calendar_label` controls how the `/me/calendarView` source is
+    identified in conflicts. Create uses the default because the signed-in
+    user is creating the event; update uses `signed_in_calendar` because an
+    event in `/me/events` may have been organized by someone else.
+
+    The signed-in calendar results are accepted as Graph's overlap decision for
     this half-open window; this connector does not apply a second local
     overlap calculation at the exact start/end edges. Each returned
     boundary retains its response timezone below so organizer-local and
@@ -372,7 +378,7 @@ def _find_conflicts(
                 if exc.status_code == 403:
                     raise InsufficientScopeError(
                         "Missing the calendars.read permission needed to check "
-                        "organizer availability - reconnecting the Outlook "
+                        "signed-in calendar availability - reconnecting the Outlook "
                         "connector may grant it; if it already has calendar "
                         "access, an org-level policy may be blocking the call. "
                         "This is a credential or policy error, not a scheduling "
@@ -412,7 +418,7 @@ def _find_conflicts(
                 end = item.get("end") or {}
                 conflicts.append(
                     {
-                        "calendar": "organizer",
+                        "calendar": organizer_calendar_label,
                         "summary": item.get("subject") or "(no subject)",
                         "start": start.get("dateTime"),
                         "end": end.get("dateTime"),
@@ -470,7 +476,7 @@ def _find_conflicts(
                 # never actually checked would defeat the entire point
                 # of this feature, so reject instead of silently booking
                 # over a possible conflict. Carrying `conflicts` (e.g. an
-                # organizer conflict already found above, before this
+                # signed-in-calendar conflict already found above, before this
                 # batch ever ran) lets a caller still report it rather
                 # than silently discarding a known problem just because
                 # this later, unrelated check also failed.
@@ -856,6 +862,13 @@ def outlook_update_event(
     the event's own existing timezone is reused automatically. Passing
     both together fully replaces the window, and timezone then describes
     both new values (defaulting to UTC if also left unset).
+    This update path checks the signed-in calendar when the event window
+    changes; attendee availability is not checked yet. A detected conflict
+    returns status="conflict" without updating the event. An incomplete
+    availability check returns status="conflict_check_incomplete", or
+    status="error" for a missing OAuth scope, and also skips the update.
+    The check and PATCH are separate Graph calls, so availability can still
+    change between them.
     """
     try:
         touches_schedule = (
@@ -863,6 +876,10 @@ def outlook_update_event(
             or end_datetime is not None
             or is_all_day is not None
         )
+        if timezone is not None:
+            # Validate every explicit value, including flag-only all-day
+            # updates that reuse the existing zone for stored boundaries.
+            _resolve_zoneinfo(timezone, allow_windows_names=True)
 
         # A single boundary changing without the other means the untouched
         # one keeps its existing clock value - but Graph needs ONE timeZone
@@ -953,19 +970,14 @@ def outlook_update_event(
                     "single-boundary update; pass both start_datetime and "
                     "end_datetime together with an explicit timezone."
                 )
-            if timezone is not None:
-                try:
-                    _resolve_zoneinfo(timezone, allow_windows_names=True)
-                except ValueError as exc:
-                    # `timezones_could_differ` treats "can't resolve" as
-                    # "benefit of the doubt, not confirmed different" -
-                    # right for a name Graph itself reported (it's always
-                    # written verbatim from `existing_timezone`, never from
-                    # this value), but wrong for the caller's OWN value: an
-                    # unresolvable `timezone` here is a bad argument, not an
-                    # ambiguous-but-plausible one, and must not be silently
-                    # discarded in favor of the existing zone.
-                    raise ValueError(f"Unknown timezone {timezone!r}.") from exc
+            try:
+                _resolve_zoneinfo(existing_timezone, allow_windows_names=True)
+            except ValueError as exc:
+                raise ValueError(
+                    "Existing event uses an unrecognized timezone "
+                    f"({existing_timezone!r}); pass both start_datetime and "
+                    "end_datetime together with an explicit timezone."
+                ) from exc
             if timezone is not None and _timezones_could_differ(
                 timezone,
                 existing_timezone,
@@ -990,20 +1002,18 @@ def outlook_update_event(
                     "timezone to reuse the existing one."
                 )
             resolved_timezone = existing_timezone
-            # The first GET (no Prefer header) returned start/end in UTC,
-            # not `resolved_timezone` - re-query specifically in that zone
-            # so the untouched boundary's clock value is expressed the
-            # same way the PATCH itself is about to write it, rather than
-            # this code guessing at a UTC<->zone conversion Graph already
-            # knows how to do correctly.
-            existing_zoned = _graph_request(
-                "GET",
-                f"/me/events/{quote(event_id, safe='')}",
-                params={"$select": "start,end"},
-                extra_headers={"Prefer": f'outlook.timezone="{resolved_timezone}"'},
-            )
-            existing_start_field = existing_zoned.get("start") or {}
-            existing_end_field = existing_zoned.get("end") or {}
+            existing_start_field = existing.get("start") or {}
+            existing_end_field = existing.get("end") or {}
+            if not existing.get("isAllDay"):
+                # A plain GET reports timed boundaries in UTC. Re-express
+                # those instants as the event's wall-clock values locally so
+                # the untouched boundary and PATCH share one timezone.
+                existing_start_field = _utc_field_in_zone(
+                    existing_start_field, resolved_timezone
+                )
+                existing_end_field = _utc_field_in_zone(
+                    existing_end_field, resolved_timezone
+                )
             existing_zone = resolved_timezone
         else:
             resolved_timezone = timezone or "UTC"
@@ -1049,12 +1059,16 @@ def outlook_update_event(
                 # is_all_day toggle to the wrong calendar day whenever the
                 # real zone's offset pushes the instant across a day
                 # boundary from its UTC date.
-                existing_start_field = _utc_field_in_zone(
-                    existing_start_field, existing_timezone
-                )
-                existing_end_field = _utc_field_in_zone(
-                    existing_end_field, existing_timezone
-                )
+                # Graph's UTC-labelled midnight values for an all-day event
+                # are date boundaries, not instants. Converting them by the
+                # zone offset can roll a negative-offset event back one day.
+                if not existing.get("isAllDay"):
+                    existing_start_field = _utc_field_in_zone(
+                        existing_start_field, existing_timezone
+                    )
+                    existing_end_field = _utc_field_in_zone(
+                        existing_end_field, existing_timezone
+                    )
             else:
                 existing_zone = existing_start_field.get("timeZone")
 
@@ -1178,14 +1192,14 @@ def outlook_update_event(
             existing_end_key = _key(existing_end, existing_zone or "UTC")
             effective_start_key = _key(effective_start, query_timezone)
             effective_end_key = _key(effective_end, query_timezone)
-            check_organizer = (effective_start_key, effective_end_key) != (
+            window_changed = (effective_start_key, effective_end_key) != (
                 existing_start_key,
                 existing_end_key,
             ) or effective_is_all_day != existing_is_all_day
 
             query_start, query_end = effective_start, effective_end
 
-            if check_organizer:
+            if window_changed:
                 if not query_start or not query_end:
                     raise ValueError(
                         "Existing event has no complete time window; cannot safely "
@@ -1209,6 +1223,7 @@ def outlook_update_event(
                         [],
                         exclude_event_id=event_id,
                         check_organizer=True,
+                        organizer_calendar_label="signed_in_calendar",
                     )
                 except InsufficientScopeError as exc:
                     check_error = str(exc)

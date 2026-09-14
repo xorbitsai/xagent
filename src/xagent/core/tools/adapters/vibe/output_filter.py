@@ -251,14 +251,16 @@ class OutputValueFilter:
     def _try_json_truncate(self, value: str, tool_name: str) -> str | None:
         """
         Truncate an oversized JSON string by dropping trailing items from its
-        largest list, keeping the result valid JSON instead of slicing raw
-        characters (which would corrupt the JSON syntax mid-token).
+        largest list, keeping the result valid JSON in the common case
+        instead of slicing raw characters (which would corrupt the JSON
+        syntax mid-token).
 
         Returns None (falling back to raw character slicing) when the value
-        isn't parseable JSON, contains no list to trim, can't be brought under
-        max_chars by trimming alone, or is nested deep enough that walking or
-        re-serializing it risks a RecursionError - this is a best-effort
-        improvement over raw slicing, never a required step.
+        isn't parseable JSON, contains no list worth trimming, can't be
+        brought under max_chars by trimming alone (e.g. a large non-list
+        field dominates the payload), or is nested deep enough that walking
+        or re-serializing it risks a RecursionError - this is a best-effort
+        improvement over raw slicing, never a guaranteed one.
         """
         try:
             parsed = json.loads(value)
@@ -271,14 +273,12 @@ class OutputValueFilter:
 
             original_items = list(target_list)
             total = len(original_items)
-            if total == 0:
-                return None
 
             # A compact re-serialization (no pretty-print whitespace) of the
             # untouched list may already fit, even though the original
             # (possibly indented) string didn't - check that before dropping
             # anything.
-            full_serialized = json.dumps(parsed, ensure_ascii=False)
+            full_serialized = json.dumps(parsed, ensure_ascii=False, allow_nan=False)
             if len(full_serialized) <= self.max_chars:
                 logger.info(
                     f"Tool '{tool_name}' output JSON-compacted (no items "
@@ -307,7 +307,7 @@ class OutputValueFilter:
                         TRUNCATED_ITEMS_TEMPLATE.format(count=remaining)
                     ]
                     target_list[:] = candidate
-                    serialized = json.dumps(parsed, ensure_ascii=False)
+                    serialized = json.dumps(parsed, ensure_ascii=False, allow_nan=False)
                     if len(serialized) <= self.max_chars:
                         best_serialized = serialized
                         best_kept = mid
@@ -317,7 +317,11 @@ class OutputValueFilter:
             finally:
                 target_list[:] = original_items
 
-            if best_serialized is None:
+            # Keeping zero real items (marker only) discards every real
+            # element of the chosen list - strictly less real content than
+            # the old raw-slice fallback would keep, so it isn't a useful
+            # trim; fall back instead of returning an effectively-empty list.
+            if best_serialized is None or best_kept == 0:
                 return None
 
             logger.info(
@@ -326,22 +330,39 @@ class OutputValueFilter:
                 f"{len(best_serialized)} characters)"
             )
             return best_serialized
-        except (json.JSONDecodeError, TypeError, ValueError, RecursionError) as e:
-            logger.info(
-                f"Tool '{tool_name}' JSON-aware truncation failed ({e!r}); "
+        except json.JSONDecodeError:
+            # The routine, expected case: a large non-JSON string (markdown,
+            # HTML, logs, ...). Not worth INFO-level noise on top of the
+            # truncation log already emitted by the raw-slice fallback.
+            logger.debug(
+                f"Tool '{tool_name}' output is not JSON; "
                 f"falling back to raw character slicing."
+            )
+            return None
+        except (TypeError, ValueError, RecursionError) as e:
+            logger.warning(
+                f"Tool '{tool_name}' JSON-aware truncation failed unexpectedly "
+                f"({e!r}); falling back to raw character slicing."
             )
             return None
 
     @staticmethod
     def _find_largest_list(obj: Any) -> list | None:
         """Find the largest (by estimated serialized size) list nested
-        anywhere in obj, in a single bottom-up pass.
+        anywhere in obj that has at least 2 items, in a single bottom-up pass.
 
-        This estimates size instead of calling json.dumps on every candidate
+        Size is estimated instead of calling json.dumps on every candidate
         list, which would make the walk quadratic (or worse) for structures
         with several nesting levels, since each level would re-serialize
         everything below it.
+
+        The >= 2 items requirement matters because this is a bottom-up sum:
+        an ancestor list's estimated size always exceeds any list nested
+        inside it (it's that list's size plus more), so without a floor, a
+        one-item envelope wrapper (e.g. {"results": [{"items": [...100
+        rows...]}]}) would always "win" over the real data list nested
+        inside it - trimming it away would silently discard the entire
+        payload instead of the intended rows.
         """
         best: list | None = None
         best_size = -1
@@ -352,7 +373,7 @@ class OutputValueFilter:
                 size = 2 + max(0, len(node) - 1)  # brackets + separators
                 for item in node:
                     size += estimate_size(item)
-                if size > best_size:
+                if len(node) >= 2 and size > best_size:
                     best_size = size
                     best = node
                 return size

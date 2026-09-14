@@ -555,3 +555,116 @@ def test_find_largest_list_does_not_reserialize_subtrees():
 
     mocked_dumps.assert_not_called()
     assert result == list(range(50))
+
+
+def test_json_truncation_ignores_single_item_envelope_wrapper():
+    """A one-item envelope wrapper around the real data list must not be
+    picked as the trim target - by bottom-up size it always looks "largest"
+    since its estimated size is the wrapped list's size plus more, so without
+    a >= 2 items floor the whole real payload gets discarded instead of the
+    wrapper. Reproduces the exact shape called out in review: a single-page
+    "results" wrapper around a real "items" array."""
+    data = {
+        "results": [{"items": [{"id": i, "name": f"row-{i}"} for i in range(100)]}],
+        "status": "ok",
+    }
+    payload = json.dumps(data)
+    filter = _create_filter(max_chars=300)
+
+    result = filter.filter(payload, "test_tool")
+    parsed = json.loads(result)
+
+    assert parsed["status"] == "ok"
+    kept = parsed["results"][0]["items"]
+    assert len(kept) > 0, "wrapper should not swallow all real data"
+    assert kept[0] == {"id": 0, "name": "row-0"}
+
+
+def test_json_truncation_falls_back_when_only_marker_would_fit():
+    """If the chosen list's items are individually too large for even one to
+    fit, dropping all of them (keeping only the truncation marker) discards
+    100% of the real content - strictly less real information than the old
+    raw-slice fallback would keep. Must fall back instead of returning a
+    valid-but-empty JSON envelope."""
+    data = {"data": ["x" * 2000, "y" * 2000, "z" * 2000]}
+    payload = json.dumps(data)
+    filter = _create_filter(max_chars=100)
+
+    result = filter.filter(payload, "test_tool")
+
+    # Falls back to the raw-slice path (real, if malformed, content) rather
+    # than a marker-only, content-free JSON list.
+    assert result.endswith(DEFAULT_TRUNCATION_MESSAGE)
+    assert "xxx" in result
+
+
+def test_json_truncation_falls_back_when_non_list_field_dominates():
+    """When a huge non-list field (not the list itself) is what pushes the
+    payload over budget, trimming the list to zero items still won't fit -
+    must fall back to raw slicing (this specific "best_serialized stays None"
+    branch had no direct test coverage before)."""
+    data = {"message": "x" * 5000, "data": [1, 2, 3]}
+    payload = json.dumps(data)
+    filter = _create_filter(max_chars=300)
+
+    result = filter.filter(payload, "test_tool")
+
+    assert result.endswith(DEFAULT_TRUNCATION_MESSAGE)
+    assert result.startswith('{"message"')
+
+
+def test_json_truncation_single_item_list_is_never_the_trim_target():
+    """A list with exactly one item can never usefully be trimmed (it would
+    have to go straight to marker-only), so it must never be selected as the
+    largest list - even when it's the only list in the payload."""
+    data = {"data": ["x" * 5000]}
+    payload = json.dumps(data)
+    filter = _create_filter(max_chars=200)
+
+    result = filter.filter(payload, "test_tool")
+
+    # No list qualifies as a trim target, so this falls back to raw slicing.
+    assert result.endswith(DEFAULT_TRUNCATION_MESSAGE)
+
+
+def test_json_truncation_preserves_non_ascii_content():
+    """ensure_ascii=False must be honored end to end: non-ASCII characters in
+    kept items stay as literal UTF-8 text, not \\uXXXX escapes."""
+    data = {"data": [{"name": f"名前-{i}", "note": "説明" * 5} for i in range(200)]}
+    payload = json.dumps(data, ensure_ascii=False)
+    filter = _create_filter(max_chars=2000)
+
+    result = filter.filter(payload, "test_tool")
+    parsed = json.loads(result)
+
+    assert len(parsed["data"]) < 200
+    assert parsed["data"][0]["name"] == "名前-0"
+    assert "\\u" not in result
+
+
+def test_json_truncation_exact_boundary_is_not_truncated():
+    """A JSON string whose length is exactly max_chars must be returned as-is
+    (no truncation, no marker) - the filter.filter entry point already
+    guards `len(value) <= self.max_chars`, but pin it through the JSON path
+    too since it re-serializes rather than returning the input verbatim."""
+    payload = json.dumps({"data": [1, 2, 3]})
+    filter = _create_filter(max_chars=len(payload))
+
+    result = filter.filter(payload, "test_tool")
+
+    assert result == payload
+
+
+def test_json_truncation_falls_back_on_out_of_range_float():
+    """A payload containing an out-of-range number (json.loads happily parses
+    `1e400` to float('inf')) must not be re-serialized with the non-RFC8259
+    `Infinity` token; allow_nan=False turns that into a ValueError that's
+    caught, falling back to raw slicing instead."""
+    data = {"data": [1e400, 2, 3]}
+    payload = json.dumps(data)
+    filter = _create_filter(max_chars=10)
+
+    result = filter.filter(payload, "test_tool")
+
+    assert "Infinity" not in result
+    assert result.endswith(DEFAULT_TRUNCATION_MESSAGE)

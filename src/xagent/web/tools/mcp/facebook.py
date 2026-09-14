@@ -24,6 +24,13 @@ setup_proxy_env()
 mcp = FastMCP("facebook-mcp")
 requests = meta_graph.requests  # exposed for test monkeypatching
 
+# Keep in sync with the "facebook" app's oauth_scopes in builtin_mcp_registry.py.
+REQUIRED_PERMISSIONS = (
+    "pages_show_list",
+    "pages_read_engagement",
+    "pages_manage_posts",
+)
+
 
 def _graph_path(value: Any, name: str, suffix: str) -> str:
     if not value or not str(value).strip():
@@ -89,9 +96,12 @@ def _page_access_token(page_id: str) -> str:
 
 @mcp.tool()
 def facebook_auth_status() -> str:
-    """Check whether the injected Meta access token is usable."""
+    """Check whether the injected Meta access token is usable and carries the
+    permissions the Facebook Page tools need."""
     try:
         me = _graph_request("GET", "/me", params={"fields": "id,name,email"})
+        granted = meta_graph.get_permissions()
+        missing = meta_graph.missing_permissions(REQUIRED_PERMISSIONS, granted)
         return _success(
             authenticated=True,
             user={
@@ -99,6 +109,9 @@ def facebook_auth_status() -> str:
                 "name": me.get("name"),
                 "email": me.get("email"),
             },
+            required_permissions=list(REQUIRED_PERMISSIONS),
+            missing_permissions=missing,
+            permissions_ok=not missing,
         )
     except GraphAPIError as e:
         logger.error("Error checking Facebook auth status: %s", e)

@@ -29,9 +29,21 @@ def _payload(result: str):
 
 def test_auth_status_uses_injected_meta_token(monkeypatch):
     monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
-    mock_request = Mock(
-        return_value=MockResponse({"id": "user-1", "name": "Alice Meta"})
-    )
+
+    def request(method, url, **kwargs):
+        if url.endswith("/me/permissions"):
+            return MockResponse(
+                {
+                    "data": [
+                        {"permission": name, "status": "granted"}
+                        for name in instagram.REQUIRED_PERMISSIONS
+                    ]
+                }
+            )
+        assert url == "https://graph.facebook.com/v25.0/me"
+        return MockResponse({"id": "user-1", "name": "Alice Meta"})
+
+    mock_request = Mock(side_effect=request)
     monkeypatch.setattr(instagram.requests, "request", mock_request)
 
     result = _payload(instagram.instagram_auth_status())
@@ -40,18 +52,43 @@ def test_auth_status_uses_injected_meta_token(monkeypatch):
         "status": "success",
         "authenticated": True,
         "user": {"id": "user-1", "name": "Alice Meta", "email": None},
+        "required_permissions": list(instagram.REQUIRED_PERMISSIONS),
+        "missing_permissions": [],
+        "permissions_ok": True,
     }
-    mock_request.assert_called_once_with(
-        method="GET",
-        url="https://graph.facebook.com/v25.0/me",
-        headers={
-            "Authorization": "Bearer user-token",
-            "Accept": "application/json",
-        },
-        params={"fields": "id,name,email"},
-        data=None,
-        timeout=30,
-    )
+
+
+def test_auth_status_reports_missing_permissions(monkeypatch):
+    monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
+
+    def request(method, url, **kwargs):
+        if url.endswith("/me/permissions"):
+            # instagram_content_publish was declined in the consent screen
+            # (or omitted by a configured META_CONFIG_ID Login Configuration).
+            return MockResponse(
+                {
+                    "data": [
+                        {"permission": "pages_show_list", "status": "granted"},
+                        {"permission": "pages_read_engagement", "status": "granted"},
+                        {"permission": "instagram_basic", "status": "granted"},
+                        {
+                            "permission": "instagram_content_publish",
+                            "status": "declined",
+                        },
+                    ]
+                }
+            )
+        assert url == "https://graph.facebook.com/v25.0/me"
+        return MockResponse({"id": "user-1", "name": "Alice Meta"})
+
+    monkeypatch.setattr(instagram.requests, "request", Mock(side_effect=request))
+
+    result = _payload(instagram.instagram_auth_status())
+
+    assert result["status"] == "success"
+    assert result["authenticated"] is True
+    assert result["permissions_ok"] is False
+    assert result["missing_permissions"] == ["instagram_content_publish"]
 
 
 def test_list_linked_accounts_returns_pages_with_instagram_accounts(monkeypatch):

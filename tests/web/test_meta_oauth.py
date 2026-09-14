@@ -685,6 +685,18 @@ def test_meta_callback_exchanges_short_lived_token_and_connects_selected_app(
                 }
             )
 
+        if url == "https://graph.facebook.com/v25.0/me/permissions":
+            assert kwargs["headers"] == {"Authorization": "Bearer long-token"}
+            return MockResponse(
+                {
+                    "data": [
+                        {"permission": "pages_show_list", "status": "granted"},
+                        {"permission": "pages_read_engagement", "status": "granted"},
+                        {"permission": "pages_manage_posts", "status": "granted"},
+                    ]
+                }
+            )
+
         assert url == "https://graph.facebook.com/v25.0/me?fields=id,email"
         assert kwargs["headers"] == {"Authorization": "Bearer long-token"}
         return MockResponse({"id": "meta-user-1", "email": "alice@example.com"})
@@ -752,6 +764,18 @@ def test_meta_callback_uses_short_lived_token_when_long_lived_exchange_is_not_js
         if url.endswith("/oauth/access_token"):
             return NonJsonResponse(status_code=502, text="<html>bad gateway</html>")
 
+        if url == "https://graph.facebook.com/v25.0/me/permissions":
+            assert kwargs["headers"] == {"Authorization": "Bearer short-token"}
+            return MockResponse(
+                {
+                    "data": [
+                        {"permission": "pages_show_list", "status": "granted"},
+                        {"permission": "pages_read_engagement", "status": "granted"},
+                        {"permission": "pages_manage_posts", "status": "granted"},
+                    ]
+                }
+            )
+
         assert url == "https://graph.facebook.com/v25.0/me?fields=id,email"
         assert kwargs["headers"] == {"Authorization": "Bearer short-token"}
         return MockResponse({"id": "meta-user-1", "email": "alice@example.com"})
@@ -805,6 +829,18 @@ def test_meta_callback_uses_short_lived_token_when_long_lived_exchange_fails(
     def get(url, **kwargs):
         if url.endswith("/oauth/access_token"):
             raise auth_api.requests.RequestException("meta token exchange timed out")
+
+        if url == "https://graph.facebook.com/v25.0/me/permissions":
+            assert kwargs["headers"] == {"Authorization": "Bearer short-token"}
+            return MockResponse(
+                {
+                    "data": [
+                        {"permission": "pages_show_list", "status": "granted"},
+                        {"permission": "pages_read_engagement", "status": "granted"},
+                        {"permission": "pages_manage_posts", "status": "granted"},
+                    ]
+                }
+            )
 
         assert url == "https://graph.facebook.com/v25.0/me?fields=id,email"
         assert kwargs["headers"] == {"Authorization": "Bearer short-token"}
@@ -1470,3 +1506,195 @@ def test_generic_oauth_single_app_rejects_non_oauth_app_cleanly(
 
     assert response.status_code == 400
     assert "GMaps" not in {s.name for s in db.query(MCPServer).all()}
+
+
+def test_meta_callback_rejects_reconnect_missing_required_permission(
+    db_session, monkeypatch
+):
+    """A Meta token that Meta issues without one of the app's required
+    permissions (declined in consent, or a META_CONFIG_ID Login Configuration
+    that omits it) must not be accepted as "connected" -- token presence
+    alone proved nothing about pages_manage_posts. The callback must fail
+    closed with an actionable error and must not touch any existing
+    credential (New Finding: meta_ads_auth_status / mcp_apps.py:55)."""
+    db, user = db_session
+    existing = UserOAuth(
+        user_id=user.id,
+        provider="facebook",
+        access_token="existing-valid-token",
+        provider_user_id="meta-user-0",
+    )
+    db.add(existing)
+    db.commit()
+
+    state = create_access_token(
+        data={
+            "type": "oauth_state",
+            "user_id": user.id,
+            "provider": "meta",
+            "app_id": "facebook",
+        },
+        expires_delta=timedelta(minutes=10),
+    )
+    request = SimpleNamespace(query_params={"code": "short-code", "state": state})
+
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {
+                    "access_token": "short-token",
+                    "token_type": "bearer",
+                    "expires_in": 3600,
+                }
+            )
+        ),
+    )
+
+    def get(url, **kwargs):
+        if url.endswith("/oauth/access_token"):
+            raise auth_api.requests.RequestException("skip long-lived exchange")
+        if url == "https://graph.facebook.com/v25.0/me/permissions":
+            assert kwargs["headers"] == {"Authorization": "Bearer short-token"}
+            # pages_manage_posts (required by the "facebook" app fixture) was
+            # declined -- only pages_show_list came back granted.
+            return MockResponse(
+                {"data": [{"permission": "pages_show_list", "status": "granted"}]}
+            )
+        assert url == "https://graph.facebook.com/v25.0/me?fields=id,email"
+        return MockResponse({"id": "meta-user-1", "email": "alice@example.com"})
+
+    monkeypatch.setattr(auth_api.requests, "get", Mock(side_effect=get))
+
+    response = generic_oauth_callback("meta", request, db, _meta_provider())
+
+    assert response.status_code == 400
+    assert "pages_manage_posts" in response.body.decode()
+    assert not db.query(MCPServer).filter(MCPServer.name == "Facebook Pages").all()
+    preserved = (
+        db.query(UserOAuth)
+        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "facebook")
+        .one()
+    )
+    assert preserved.access_token == "existing-valid-token"
+
+
+def test_meta_callback_fails_closed_when_permissions_check_errors(
+    db_session, monkeypatch, caplog
+):
+    """If /me/permissions itself cannot be verified (network error), the
+    connector must not be marked connected on an unverifiable claim."""
+    db, user = db_session
+    state = create_access_token(
+        data={
+            "type": "oauth_state",
+            "user_id": user.id,
+            "provider": "meta",
+            "app_id": "facebook",
+        },
+        expires_delta=timedelta(minutes=10),
+    )
+    request = SimpleNamespace(query_params={"code": "short-code", "state": state})
+
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {
+                    "access_token": "short-token",
+                    "token_type": "bearer",
+                    "expires_in": 3600,
+                }
+            )
+        ),
+    )
+
+    def get(url, **kwargs):
+        if url.endswith("/oauth/access_token"):
+            raise auth_api.requests.RequestException("skip long-lived exchange")
+        if url == "https://graph.facebook.com/v25.0/me/permissions":
+            raise auth_api.requests.RequestException("permissions check timed out")
+        assert url == "https://graph.facebook.com/v25.0/me?fields=id,email"
+        return MockResponse({"id": "meta-user-1", "email": "alice@example.com"})
+
+    monkeypatch.setattr(auth_api.requests, "get", Mock(side_effect=get))
+    caplog.set_level(logging.WARNING, logger=auth_api.__name__)
+
+    response = generic_oauth_callback("meta", request, db, _meta_provider())
+
+    assert response.status_code == 400
+    assert "Meta permissions check failed" in caplog.text
+    assert not db.query(UserOAuth).filter(UserOAuth.provider == "facebook").all()
+
+
+def test_generic_oauth_batch_skips_meta_app_missing_permission(db_session, monkeypatch):
+    """Bare "meta" connect (no app_id) can satisfy some apps under the
+    provider but not others whose oauth_scopes it doesn't carry -- the app
+    missing a permission must be skipped rather than marked connected,
+    without aborting the rest of the batch."""
+    db, user = db_session
+    db.add(
+        PublicMCPApp(
+            app_id="instagram",
+            name="Instagram",
+            transport="oauth",
+            provider_name="meta",
+            oauth_scopes=["instagram_content_publish"],
+            is_visible_in_connector=True,
+            launch_config={
+                "command": "uv",
+                "args": ["run", "python", "-m", "xagent.web.tools.mcp.instagram"],
+                "env_mapping": {"META_ACCESS_TOKEN": "access_token"},
+            },
+        )
+    )
+    db.commit()
+
+    state = create_access_token(
+        data={"type": "oauth_state", "user_id": user.id, "provider": "meta"},
+        expires_delta=timedelta(minutes=10),
+    )
+    request = SimpleNamespace(query_params={"code": "short-code", "state": state})
+
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {
+                    "access_token": "short-token",
+                    "token_type": "bearer",
+                    "expires_in": 3600,
+                }
+            )
+        ),
+    )
+
+    def get(url, **kwargs):
+        if url.endswith("/oauth/access_token"):
+            raise auth_api.requests.RequestException("skip long-lived exchange")
+        if url == "https://graph.facebook.com/v25.0/me/permissions":
+            # facebook's pages_show_list/pages_manage_posts are granted, but
+            # instagram's instagram_content_publish was declined.
+            return MockResponse(
+                {
+                    "data": [
+                        {"permission": "pages_show_list", "status": "granted"},
+                        {"permission": "pages_read_engagement", "status": "granted"},
+                        {"permission": "pages_manage_posts", "status": "granted"},
+                    ]
+                }
+            )
+        assert url == "https://graph.facebook.com/v25.0/me?fields=id,email"
+        return MockResponse({"id": "meta-user-1", "email": "alice@example.com"})
+
+    monkeypatch.setattr(auth_api.requests, "get", Mock(side_effect=get))
+
+    response = generic_oauth_callback("meta", request, db, _meta_provider())
+
+    assert response.status_code == 200
+    server_names = {s.name for s in db.query(MCPServer).all()}
+    assert "Facebook Pages" in server_names
+    assert "Instagram" not in server_names

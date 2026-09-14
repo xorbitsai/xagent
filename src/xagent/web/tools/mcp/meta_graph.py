@@ -1,5 +1,6 @@
 import json
 import os
+from collections.abc import Iterable, Mapping
 from typing import Any
 from urllib.parse import urlparse
 
@@ -137,6 +138,35 @@ def response_json(response: Any) -> Any:
 
 def bounded_limit(limit: int, maximum: int = 100) -> int:
     return max(1, min(int(limit), maximum))
+
+
+def get_permissions(token: str | None = None) -> dict[str, str]:
+    """Fetch this token's /me/permissions edge as {permission: status}.
+
+    A user can decline an individual permission on Meta's consent screen (or
+    a configured Login Configuration can simply omit one an app normally
+    requests), and the token is still issued either way -- unlike /me, which
+    only proves the token identifies *some* user, this is what actually
+    proves whether a specific permission was granted.
+    """
+    result = graph_request("GET", "/me/permissions", token=token)
+    entries = result.get("data") if isinstance(result, dict) else None
+    if not isinstance(entries, list):
+        return {}
+    return {
+        str(entry["permission"]): str(entry.get("status", ""))
+        for entry in entries
+        if isinstance(entry, dict) and entry.get("permission")
+    }
+
+
+def missing_permissions(
+    required: Iterable[str], granted: Mapping[str, str]
+) -> list[str]:
+    """Required permissions that are not in a "granted" state."""
+    return [
+        permission for permission in required if granted.get(permission) != "granted"
+    ]
 
 
 def is_public_image_url(image_url: str) -> bool:

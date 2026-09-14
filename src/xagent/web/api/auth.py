@@ -454,6 +454,41 @@ def _exchange_meta_long_lived_token(
     return {**token_data, **long_lived_token_data}
 
 
+META_GRAPH_PERMISSIONS_URL = "https://graph.facebook.com/v25.0/me/permissions"
+
+
+def _meta_granted_permissions(access_token: str) -> set[str]:
+    """Permissions actually granted on a Meta access token.
+
+    A user can decline an individual permission on Meta's consent screen, or
+    a configured META_CONFIG_ID Login Configuration can simply omit one an
+    app normally requests -- the token exchange succeeds either way, so only
+    this edge (not token presence, and not the token response's own "scope"
+    field, which Meta does not reliably populate) proves what the token can
+    actually do.
+    """
+    response = requests.get(
+        META_GRAPH_PERMISSIONS_URL,
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=10.0,
+    )
+    if response.status_code != 200:
+        raise ValueError(
+            f"Meta permissions check returned status={response.status_code}"
+        )
+    payload = response.json()
+    entries = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(entries, list):
+        return set()
+    return {
+        str(entry["permission"])
+        for entry in entries
+        if isinstance(entry, dict)
+        and entry.get("status") == "granted"
+        and entry.get("permission")
+    }
+
+
 def _normalize_intercom_token_response(
     provider: str, token_data: dict[str, Any]
 ) -> dict[str, Any]:
@@ -3235,6 +3270,55 @@ def generic_oauth_callback(
                 status_code=400,
             )
 
+        # Only a granted-permissions check (not token presence) proves what a
+        # Meta token can actually do -- see _meta_granted_permissions. Fetched
+        # once up front and reused below for both the single-app and batch
+        # connect paths, rather than per app. A failed check fails closed
+        # (treated as no permissions granted) so an app is never marked
+        # connected on the strength of an unverifiable claim.
+        meta_granted_permissions: set[str] | None = None
+        if provider.lower() == "meta":
+            try:
+                meta_granted_permissions = _meta_granted_permissions(access_token)
+            except (requests.RequestException, ValueError) as exc:
+                logger.warning(
+                    "Meta permissions check failed; treating scopes as ungranted: %s",
+                    exc,
+                )
+                meta_granted_permissions = set()
+
+        def _meta_missing_scopes(required_scopes: Any) -> list[str]:
+            if meta_granted_permissions is None:
+                return []
+            required = [scope for scope in (required_scopes or []) if scope]
+            return [
+                scope for scope in required if scope not in meta_granted_permissions
+            ]
+
+        if app_id:
+            # target_app_info is the same lookup already performed above (for
+            # the hidden-app gate) when app_id is present -- reused rather
+            # than re-fetched. Checked before the delete-then-recreate below,
+            # not after: that block unconditionally drops any existing
+            # UserOAuth row for this user+provider first, so a missing
+            # permission here must fail before that happens, preserving any
+            # prior *working* grant instead of replacing it with an
+            # under-scoped one.
+            missing_scopes = _meta_missing_scopes(
+                (target_app_info or {}).get("oauth_scopes")
+            )
+            if missing_scopes:
+                return HTMLResponse(
+                    content=(
+                        "<h1>Missing Permissions</h1>"
+                        "<p>Meta did not grant the following required "
+                        f"permission(s): {html.escape(', '.join(missing_scopes))}.</p>"
+                        "<p>Please reconnect and approve all requested "
+                        "permissions when prompted by Meta.</p>"
+                    ),
+                    status_code=400,
+                )
+
         provider_user_id = None
         email = None
 
@@ -3708,6 +3792,21 @@ def generic_oauth_callback(
                             "OAuth batch connect",
                             app_info.get("id"),
                             provider,
+                        )
+                        continue
+                    # A bare provider-level grant may satisfy some apps under
+                    # this provider but not others whose oauth_scopes it
+                    # doesn't actually carry (see meta_granted_permissions
+                    # above) -- skip only that app rather than the whole
+                    # batch, symmetric with the other skips in this loop.
+                    missing_scopes = _meta_missing_scopes(app_info.get("oauth_scopes"))
+                    if missing_scopes:
+                        logger.warning(
+                            "Skipping app %s during %s OAuth batch connect; "
+                            "missing permission(s): %s",
+                            app_info.get("id"),
+                            provider,
+                            ", ".join(missing_scopes),
                         )
                         continue
                     # A mis-tagged non-oauth app sharing this provider must not

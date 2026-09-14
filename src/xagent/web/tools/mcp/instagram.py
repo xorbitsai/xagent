@@ -24,6 +24,14 @@ setup_proxy_env()
 mcp = FastMCP("instagram-mcp")
 requests = meta_graph.requests  # exposed for test monkeypatching
 
+# Keep in sync with the "instagram" app's oauth_scopes in builtin_mcp_registry.py.
+REQUIRED_PERMISSIONS = (
+    "pages_show_list",
+    "pages_read_engagement",
+    "instagram_basic",
+    "instagram_content_publish",
+)
+
 LINKED_ACCOUNT_FIELDS = (
     "id,name,category,tasks,access_token,"
     "instagram_business_account{id,username,name,profile_picture_url}"
@@ -92,9 +100,12 @@ def _list_pages_with_instagram_accounts() -> list[dict[str, Any]]:
 
 @mcp.tool()
 def instagram_auth_status() -> str:
-    """Check whether the injected Meta access token is usable."""
+    """Check whether the injected Meta access token is usable and carries the
+    permissions the Instagram tools need."""
     try:
         me = _graph_request("GET", "/me", params={"fields": "id,name,email"})
+        granted = meta_graph.get_permissions()
+        missing = meta_graph.missing_permissions(REQUIRED_PERMISSIONS, granted)
         return _success(
             authenticated=True,
             user={
@@ -102,6 +113,9 @@ def instagram_auth_status() -> str:
                 "name": me.get("name"),
                 "email": me.get("email"),
             },
+            required_permissions=list(REQUIRED_PERMISSIONS),
+            missing_permissions=missing,
+            permissions_ok=not missing,
         )
     except GraphAPIError as e:
         logger.error("Error checking Instagram auth status: %s", e)

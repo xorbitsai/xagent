@@ -1,7 +1,7 @@
 """update GitHub connector description for the new write tools
 
 Revision ID: 20260914_update_github_description
-Revises: 20260914_add_hubspot_deals_write_scope
+Revises: 20260914_durable_sandbox_lifecycles
 Create Date: 2026-09-14
 
 """
@@ -12,7 +12,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "20260914_update_github_description"
-down_revision: Union[str, None] = "20260914_add_hubspot_deals_write_scope"
+down_revision: Union[str, None] = "20260914_durable_sandbox_lifecycles"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

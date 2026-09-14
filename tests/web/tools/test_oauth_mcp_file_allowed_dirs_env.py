@@ -14,7 +14,6 @@ _READ_ALLOWLIST_ENV_VARS = (
     "XAGENT_LINKEDIN_IMAGE_ALLOWED_DIRS",
     "XAGENT_GMAIL_FILE_ALLOWED_DIRS",
     "XAGENT_ONEDRIVE_FILE_ALLOWED_DIRS",
-    "XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS",
 )
 
 
@@ -67,7 +66,6 @@ def test_transport_config_omits_allowlist_vars_without_a_task_id() -> None:
     assert "XAGENT_LINKEDIN_IMAGE_ALLOWED_DIRS" not in transport_config["env"]
     assert "XAGENT_GMAIL_FILE_ALLOWED_DIRS" not in transport_config["env"]
     assert "XAGENT_ONEDRIVE_FILE_ALLOWED_DIRS" not in transport_config["env"]
-    assert "XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS" not in transport_config["env"]
     assert "workspace_file_ref_env" not in transport_config
     assert "XAGENT_GOOGLE_DRIVE_OUTPUT_DIR" not in transport_config["env"]
 

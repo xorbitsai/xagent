@@ -1125,13 +1125,6 @@ class ToolFactory:
                             "transport": transport,
                             **inner_config,
                         }
-                        if workspace is not None and inner_config.get(
-                            "workspace_file_ref_env"
-                        ):
-                            # create_session filters private connection keys;
-                            # the MCP adapter consumes this object locally to
-                            # resolve opaque workspace FileRefs before launch.
-                            connection_config["_workspace"] = workspace
                         for runtime_key in (
                             "runtime_bindings",
                             "runtime_input_schema",
@@ -1181,6 +1174,17 @@ class ToolFactory:
                                 (server_name, connection_config, session_identity)
                             )
                             continue
+                        if workspace is not None and inner_config.get(
+                            "workspace_file_ref_env"
+                        ):
+                            from .sandboxed_tool.sandboxed_mcp_tool_helper import (
+                                should_sandbox_mcp_connection,
+                            )
+
+                            if not should_sandbox_mcp_connection(connection_config):
+                                # Host-only capability for a trusted direct
+                                # connector; never serialize it into a sandbox.
+                                connection_config["_workspace"] = workspace
                         connections[server_name] = connection_config
 
                     for server_name, connection, identity in session_requests:

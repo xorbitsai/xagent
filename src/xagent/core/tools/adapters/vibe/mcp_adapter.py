@@ -15,7 +15,6 @@ import weakref
 from collections.abc import Coroutine, Iterator
 from dataclasses import dataclass
 from enum import Enum
-from pathlib import Path
 from typing import (
     Annotated,
     Any,
@@ -1809,26 +1808,28 @@ class MCPToolAdapter(AbstractBaseTool):
         tool_args: Mapping[str, Any],
         tool_meta: Mapping[str, Any],
     ) -> dict[str, Any]:
-        scoped_connection = self._connection_with_workspace_file(connection, tool_args)
+        scoped_connection, scoped_args = await self._connection_with_workspace_file(
+            connection, tool_args
+        )
         async with create_session(scoped_connection) as session:
             await session.initialize()
             result = await session.call_tool(
                 self.mcp_tool.name,
-                dict(tool_args),
+                scoped_args,
                 meta=dict(tool_meta) or None,
             )
 
             return _normalized_mcp_call_result(result)
 
-    def _connection_with_workspace_file(
+    async def _connection_with_workspace_file(
         self,
         connection: Connection,
         tool_args: Mapping[str, Any],
-    ) -> Connection:
+    ) -> tuple[Connection, dict[str, Any]]:
         """Inject one task-scoped FileRef resolution into a new stdio process."""
         env_name = self._workspace_file_ref_env.get(self.mcp_tool.name)
         if not isinstance(env_name, str):
-            return connection
+            return connection, dict(tool_args)
         if connection.get("transport") != "stdio" or not env_name:
             raise _WorkspaceFileRefUnavailable(
                 "Workspace file upload is unavailable for this connector."
@@ -1836,13 +1837,15 @@ class MCPToolAdapter(AbstractBaseTool):
 
         raw_file_id = tool_args.get("file_id")
         file_id = str(raw_file_id).strip() if isinstance(raw_file_id, str) else ""
-        resolver = getattr(self._workspace, "resolve_file_id", None)
+        resolver = getattr(self._workspace, "resolve_file_binding_detached", None)
         if not file_id or not callable(resolver):
             raise _WorkspaceFileRefUnavailable(
                 "Workspace file is unavailable for this task."
             )
         try:
-            resolved = resolver(file_id)
+            from .....web.services.db_runtime import run_db_io_cancellation_safe
+
+            binding = await run_db_io_cancellation_safe(lambda: resolver(file_id))
         except Exception as exc:
             logger.warning(
                 "Workspace FileRef resolution failed for MCP tool %s (%s)",
@@ -1852,20 +1855,32 @@ class MCPToolAdapter(AbstractBaseTool):
             raise _WorkspaceFileRefUnavailable(
                 "Workspace file is unavailable for this task."
             ) from exc
-        if resolved is None:
+        if binding is None:
             raise _WorkspaceFileRefUnavailable(
                 "Workspace file is unavailable for this task."
             )
 
-        resolved_path = Path(resolved).resolve()
-        workspace_root_value = getattr(self._workspace, "workspace_dir", None)
-        workspace_root = (
-            Path(workspace_root_value).resolve() if workspace_root_value else None
-        )
+        try:
+            bound_id = binding.file_id
+            bound_path = binding.path
+            bound_name = binding.filename
+            bound_mime = binding.mime_type
+            bound_size = int(binding.size)
+            bound_device = int(binding.device)
+            bound_inode = int(binding.inode)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise _WorkspaceFileRefUnavailable(
+                "Workspace file is unavailable for this task."
+            ) from exc
         if (
-            workspace_root is None
-            or not resolved_path.is_relative_to(workspace_root)
-            or not resolved_path.is_file()
+            not isinstance(bound_id, str)
+            or not isinstance(bound_name, str)
+            or not isinstance(bound_mime, str)
+            or not bound_id
+            or not bound_name
+            or not bound_mime
+            or bound_size < 0
+            or any(char in bound_name + bound_mime for char in "\x00\r\n")
         ):
             raise _WorkspaceFileRefUnavailable(
                 "Workspace file is unavailable for this task."
@@ -1874,11 +1889,17 @@ class MCPToolAdapter(AbstractBaseTool):
         scoped = dict(connection)
         raw_env = connection.get("env")
         env = dict(raw_env) if isinstance(raw_env, Mapping) else {}
-        env[env_name] = str(resolved_path)
-        env[f"{env_name}_ID"] = file_id
-        env[f"{env_name}_ROOT"] = str(workspace_root)
+        env[env_name] = str(bound_path)
+        env[f"{env_name}_ID"] = bound_id
+        env[f"{env_name}_NAME"] = bound_name
+        env[f"{env_name}_MIME"] = bound_mime
+        env[f"{env_name}_SIZE"] = str(bound_size)
+        env[f"{env_name}_DEVICE"] = str(bound_device)
+        env[f"{env_name}_INODE"] = str(bound_inode)
         scoped["env"] = env
-        return cast(Connection, scoped)
+        scoped_args = dict(tool_args)
+        scoped_args["file_id"] = bound_id
+        return cast(Connection, scoped), scoped_args
 
     async def _retry_after_authorization_failure(
         self,

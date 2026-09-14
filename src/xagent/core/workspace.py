@@ -135,6 +135,19 @@ class WorkspaceUploadedFileSnapshot:
 
 
 @dataclass(frozen=True)
+class WorkspaceUploadBinding:
+    """Immutable host-only binding for one authorized workspace FileRef."""
+
+    file_id: str
+    path: Path
+    filename: str
+    mime_type: str
+    size: int
+    device: int
+    inode: int
+
+
+@dataclass(frozen=True)
 class WorkspaceFileRegistrationPlan:
     """Read-phase result for one workspace registration."""
 
@@ -1271,6 +1284,86 @@ class TaskWorkspace:
         needed.
         """
         return self._resolve_file_id(file_id, use_bound_db_session=False)
+
+    def resolve_file_binding_detached(
+        self, file_id: str
+    ) -> Optional[WorkspaceUploadBinding]:
+        """Resolve an opaque FileRef and detach its trusted upload metadata."""
+        raw_file_id = str(file_id).strip()
+        canonical_id = parse_file_id_ref(raw_file_id) or raw_file_id
+        if not canonical_id:
+            return None
+
+        record_metadata: Optional[tuple[str, Optional[str], int]] = None
+        path: Optional[Path] = None
+        if not canonical_id.startswith("internal-"):
+            from ..web.models.uploaded_file import UploadedFile
+            from .storage.manager import create_db_session
+
+            db = create_db_session()
+            try:
+                record = (
+                    db.query(UploadedFile)
+                    .filter(UploadedFile.file_id == canonical_id)
+                    .first()
+                )
+                if record is not None:
+                    storage_path = Path(record.storage_path)
+                    if storage_path.exists() and storage_path.is_file():
+                        if not self._file_record_allowed_for_workspace(
+                            record, storage_path
+                        ):
+                            return None
+                        path = storage_path
+                    elif (
+                        getattr(record, "storage_key", None)
+                        and getattr(record, "storage_status", None) == "available"
+                    ):
+                        if not self._file_record_allowed_for_workspace(record):
+                            return None
+                        from ..web.services.managed_file_ref import ManagedFileRef
+
+                        path = ManagedFileRef(record).materialize()
+                    record_mime = getattr(record, "mime_type", None)
+                    record_metadata = (
+                        str(record.filename),
+                        None if record_mime is None else str(record_mime),
+                        int(record.file_size),
+                    )
+            finally:
+                db.close()
+
+        if path is None and record_metadata is None:
+            path = self._resolve_file_id(canonical_id, use_bound_db_session=False)
+        if path is None:
+            return None
+        try:
+            resolved = path.resolve(strict=True)
+            stat = resolved.stat()
+        except OSError:
+            return None
+
+        filename = resolved.name
+        mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        if record_metadata is not None:
+            filename, registered_mime, registered_size = record_metadata
+            if registered_size != stat.st_size:
+                logger.warning(
+                    "Rejected workspace FileRef with changed size: %s",
+                    canonical_id,
+                )
+                return None
+            mime_type = str(registered_mime or mime_type)
+
+        return WorkspaceUploadBinding(
+            file_id=canonical_id,
+            path=resolved,
+            filename=filename,
+            mime_type=mime_type,
+            size=stat.st_size,
+            device=stat.st_dev,
+            inode=stat.st_ino,
+        )
 
     def _resolve_file_id(
         self,

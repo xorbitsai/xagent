@@ -2,6 +2,8 @@
 agent setup (or pin resources) indefinitely."""
 
 import asyncio
+import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -277,3 +279,33 @@ async def test_create_mcp_tools_releases_db_before_network_init(monkeypatch):
     await create_mcp_tools(FakeConfig())
 
     assert calls == ["load_configs", "release_db", "network_init"]
+
+
+@pytest.mark.asyncio
+async def test_generic_stdio_connection_never_serializes_live_workspace(monkeypatch):
+    from xagent.core.tools.adapters.vibe.factory import ToolFactory
+
+    serialized = []
+
+    async def fake_load(connections, **_kwargs):
+        json.dumps(connections)
+        assert "_workspace" not in connections["custom"]
+        serialized.append(True)
+        return SimpleNamespace(tools=(), failures=())
+
+    monkeypatch.setattr(mcp_adapter_module, "load_mcp_tools_as_agent_tools", fake_load)
+    await ToolFactory._create_mcp_tools_from_configs(
+        [
+            {
+                "name": "custom",
+                "transport": "stdio",
+                "config": {
+                    "command": "npx",
+                    "args": ["-y", "custom-mcp"],
+                    "workspace_file_ref_env": {"upload": "PRIVATE_BINDING"},
+                },
+            }
+        ],
+        workspace=object(),
+    )
+    assert serialized == [True]

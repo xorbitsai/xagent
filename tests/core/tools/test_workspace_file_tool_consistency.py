@@ -390,6 +390,7 @@ class TestWorkspaceFileToolConsistency:
         )
 
         assert workspace.resolve_file_id("foreign-file") is None
+        assert workspace.resolve_file_binding_detached("foreign-file") is None
 
     def test_resolve_file_id_detached_uses_worker_owned_session(self, tmp_path, mocker):
         """Detached resolution must not reuse the caller's SQLAlchemy session."""
@@ -411,6 +412,9 @@ class TestWorkspaceFileToolConsistency:
                     user_id=1,
                     task_id=None,
                     storage_path=str(registered_file),
+                    filename="Original Name.txt",
+                    mime_type="text/custom",
+                    file_size=len("content"),
                 )
 
         class WorkerSession:
@@ -430,6 +434,15 @@ class TestWorkspaceFileToolConsistency:
         )
 
         assert workspace.resolve_file_id_detached("registered-file") == registered_file
+        binding = workspace.resolve_file_binding_detached("registered-file")
+        assert binding is not None
+        assert (binding.filename, binding.mime_type, binding.size) == (
+            "Original Name.txt",
+            "text/custom",
+            len("content"),
+        )
+        registered_file.write_text("changed content")
+        assert workspace.resolve_file_binding_detached("registered-file") is None
         assert worker_session.closed is True
 
     def test_resolve_file_id_rejects_durable_only_other_user_records(

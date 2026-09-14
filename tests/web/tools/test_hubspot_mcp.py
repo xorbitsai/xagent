@@ -324,6 +324,31 @@ def test_get_company_deals_rejects_whitespace_padded_company_id(monkeypatch):
     mock_request.assert_not_called()
 
 
+def test_get_associated_deals_requests_authoritative_closed_state_flags(monkeypatch):
+    """dealstage/pipeline are opaque IDs and closedate is set on open deals
+    too, so a caller needs hs_is_closed(_won|_lost) to tell open from closed
+    without guessing at stage semantics.
+    """
+
+    def fake_request(method, url, headers, params, json, timeout):
+        if "/associations/deals" in url:
+            return MockResponse(json_data={"results": [{"id": "d1"}]})
+        assert url.endswith("/crm/v3/objects/deals/batch/read")
+        requested_properties.append(json["properties"])
+        return MockResponse(json_data={"results": [{"id": "d1", "properties": {}}]})
+
+    requested_properties = []
+    monkeypatch.setattr(hubspot.requests, "request", Mock(side_effect=fake_request))
+
+    json.loads(hubspot.hubspot_get_contact_deals("c1"))
+    json.loads(hubspot.hubspot_get_company_deals("co1"))
+
+    for properties in requested_properties:
+        assert "hs_is_closed" in properties
+        assert "hs_is_closed_won" in properties
+        assert "hs_is_closed_lost" in properties
+
+
 def test_create_deal_without_contact_id_sends_no_associations(monkeypatch):
     mock_request = Mock(return_value=MockResponse(json_data={"id": "d1"}))
     monkeypatch.setattr(hubspot.requests, "request", mock_request)

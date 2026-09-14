@@ -59,6 +59,13 @@ DEFAULT_DEAL_PROPERTIES = [
     "amount",
     "closedate",
     "hs_lastmodifieddate",
+    # dealstage/pipeline are opaque IDs on a custom pipeline, and closedate
+    # is set on open deals too (and isn't cleared on reopen) - these three
+    # are HubSpot's own authoritative closed-state flags, so a caller can
+    # tell open from closed without guessing at stage semantics.
+    "hs_is_closed",
+    "hs_is_closed_won",
+    "hs_is_closed_lost",
 ]
 DEFAULT_CAMPAIGN_PROPERTIES = [
     "hs_name",
@@ -502,14 +509,19 @@ def _get_associated_deals(
 @mcp.tool()
 def hubspot_get_contact_deals(contact_id: str, limit: int = 100) -> str:
     """
-    List the deals associated with a HubSpot contact, including deal stage,
-    pipeline, amount, and close date. Returns at most `limit` deals (max 100);
-    `has_more` is true when the contact has additional deals beyond the result.
+    List every deal associated with a HubSpot contact - open and closed alike
+    - including deal stage, pipeline, amount, close date, and the closed-state
+    flags hs_is_closed/hs_is_closed_won/hs_is_closed_lost. Use those flags to
+    tell open from closed: dealstage and pipeline are opaque IDs on a custom
+    pipeline, and closedate is set on open deals too (and typically isn't
+    cleared when a deal is reopened), so neither reliably signals closed on
+    its own. Returns at most `limit` deals (max 100); `has_more` is true when
+    the contact has additional deals beyond the result.
 
     A contact's deals are not necessarily the same as its company's deals: two
     contacts can share a name (e.g. the same person with a role at two
     different companies) while belonging to different HubSpot companies. When
-    the question is about a company's open deals rather than one specific
+    the question is about a company's deals rather than one specific
     contact's, use `hubspot_get_company_deals` instead of guessing which
     contact to look up by name - it associates deals with the company record
     directly instead of relying on a contact match.
@@ -525,13 +537,17 @@ def hubspot_get_contact_deals(contact_id: str, limit: int = 100) -> str:
 @mcp.tool()
 def hubspot_get_company_deals(company_id: str, limit: int = 100) -> str:
     """
-    List the deals associated with a HubSpot company, including deal stage,
-    pipeline, amount, and close date. Returns at most `limit` deals (max 100);
-    `has_more` is true when the company has additional deals beyond the result.
+    List every deal associated with a HubSpot company - open and closed alike
+    - including deal stage, pipeline, amount, close date, and the closed-state
+    flags hs_is_closed/hs_is_closed_won/hs_is_closed_lost. Use those flags to
+    tell open from closed: dealstage and pipeline are opaque IDs on a custom
+    pipeline, and closedate is set on open deals too (and typically isn't
+    cleared when a deal is reopened), so neither reliably signals closed on
+    its own. Returns at most `limit` deals (max 100); `has_more` is true when
+    the company has additional deals beyond the result.
 
-    Use this to answer "what are this company's open deals" - it reads the
-    company-to-deal association directly. Do not substitute a contact lookup
-    for this (e.g. searching for a person's name and calling
+    This reads the company-to-deal association directly. Do not substitute a
+    contact lookup for this (e.g. searching for a person's name and calling
     `hubspot_get_contact_deals` on the match): a contact match found by name
     is not proof that contact belongs to the company being asked about, and a
     deal returned that way must not be reported as the company's unless a

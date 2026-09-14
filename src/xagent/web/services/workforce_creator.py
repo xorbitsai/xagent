@@ -60,7 +60,7 @@ async def generate_workforce_creation_plan(
     # persisted into the conversation (see build_workforce_prompt_plan's
     # builder_response), the same "every agent this user talks to" shape
     # that Builder chat and task chat already apply this to.
-    from ..api.agents import voice_from_runtime_user
+    from .agent_prompt import voice_from_runtime_user
 
     voice = voice_from_runtime_user(user)
 

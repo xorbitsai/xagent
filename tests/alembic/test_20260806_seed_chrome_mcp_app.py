@@ -135,7 +135,13 @@ def test_seed_row_matches_registry():
     registry_row = next(
         r for r in get_builtin_public_mcp_app_rows() if r["app_id"] == "chrome-devtools"
     )
-    assert migration.ROW == registry_row
+    assert registry_row["stdio_session_scope"] == "execution"
+    persisted_registry_row = {
+        key: value
+        for key, value in registry_row.items()
+        if key != "stdio_session_scope"
+    }
+    assert migration.ROW == persisted_registry_row
 
 
 def test_seed_row_classifies_keyless():

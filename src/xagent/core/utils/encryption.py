@@ -7,6 +7,8 @@ from functools import lru_cache
 
 from cryptography.fernet import Fernet, InvalidToken
 
+from ...config import DEV_FALLBACK_ENCRYPTION_KEY
+
 logger = logging.getLogger(__name__)
 
 
@@ -19,7 +21,7 @@ def _get_encryption_key() -> str:
                 "ENCRYPTION_KEY environment variable is not set in non-development environment"
             )
         # FIXME: For dev only, same as in db_models.py
-        return "RQMpe38gK3m0szjpSmTNw_sP3Y54r6hDc6JewBoPKXc="
+        return DEV_FALLBACK_ENCRYPTION_KEY
     return encryption_key
 
 

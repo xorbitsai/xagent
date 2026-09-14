@@ -13,7 +13,10 @@ from sqlalchemy.orm import sessionmaker
 
 from xagent.core.agent.runtime import PatternRuntime
 from xagent.core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
-from xagent.core.tools.adapters.vibe.mcp_adapter import MCPToolAdapter
+from xagent.core.tools.adapters.vibe.mcp_adapter import (
+    MCPToolAdapter,
+    redact_urls_in_text,
+)
 from xagent.core.utils.encryption import encrypt_value
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer, UserMCPServer
@@ -1653,6 +1656,197 @@ async def test_hook_failure_does_not_fallback_and_later_servers_still_build(
 
 
 @pytest.mark.asyncio
+async def test_hook_failure_warning_includes_failure_code(
+    db_session,
+    caplog,
+):
+    """The warning logged for a resolver failure must carry the classified
+    failure code (e.g. 'oauth_token_required'), not just the exception's
+    class name -- the class name alone tells an on-call engineer nothing
+    about whether this is a routine reconnect-required case versus an
+    unexpected resolver bug."""
+    db, user = db_session
+    caplog.set_level(logging.WARNING)
+    _add_oauth_server(db, user, launch_config=_launch_config())
+    _add_user_oauth(db, user, provider="google", access_token="user-token")
+
+    class ReauthorizationRequired(RuntimeError):
+        oauth_token_resolver_failure_code = "oauth_token_required"
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        raise ReauthorizationRequired("secret-reauth-detail")
+
+    set_oauth_token_resolver_hook(resolver)
+
+    cfg = _tool_config(db, user)
+    configs = await cfg.get_mcp_server_configs()
+
+    assert configs[0]["config"]["failure_code"] == "oauth_token_required"
+    assert "oauth_token_required" in caplog.text
+    assert "secret-reauth-detail" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_hook_failure_warning_redacts_and_bounds_resource(
+    db_session,
+    caplog,
+):
+    """The resource logged on a resolver failure can fall back to a
+    self-hosted MCP server's own URL, and custom connectors commonly carry
+    an API key or other secret in that URL's query string or userinfo. The
+    warning must strip those before logging, and it must still bound the
+    result the way every other field logged here already is."""
+    db, user = db_session
+    caplog.set_level(logging.WARNING)
+    resource = (
+        "https://user:pw@mcp.example.com/oauth/"
+        + "r" * 160
+        + "?api_key=SECRET-abc123&tenant=acme"
+    )
+    _add_oauth_server(db, user, launch_config=_launch_config(resource=resource))
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        raise RuntimeError("resolver failed")
+
+    set_oauth_token_resolver_hook(resolver)
+
+    cfg = _tool_config(db, user)
+    configs = await cfg.get_mcp_server_configs()
+
+    assert configs[0]["transport"] == "unavailable"
+    expected = web_tools_config._bounded_oauth_metadata(redact_urls_in_text(resource))
+    assert "SECRET-abc123" not in caplog.text
+    assert "tenant=acme" not in caplog.text
+    assert "user:pw@" not in caplog.text
+    assert "mcp.example.com" in caplog.text
+    assert f"resource={expected}" in caplog.text
+    assert expected.endswith("...")
+    assert len(expected) == 128
+    assert cfg.get_mcp_oauth_diagnostics()[0]["resource"] == expected
+    assert configs[0]["config"]["diagnostic"]["resource"] == expected
+
+
+@pytest.mark.asyncio
+async def test_hook_failure_warning_redacts_short_resource_query_string(
+    db_session,
+    caplog,
+):
+    """A resource short enough to survive the 128-character bound intact must
+    still lose its query string. Without this case the bound alone satisfies
+    the secret-absence assertions on the long resource above, so redaction
+    could regress without turning any test red."""
+    db, user = db_session
+    caplog.set_level(logging.WARNING)
+    resource = "https://mcp.example.test/oauth?api_key=SECRET-abc123&tenant=acme"
+    assert len(resource) < 128
+    _add_oauth_server(db, user, launch_config=_launch_config(resource=resource))
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        raise RuntimeError("resolver failed")
+
+    set_oauth_token_resolver_hook(resolver)
+
+    cfg = _tool_config(db, user)
+    configs = await cfg.get_mcp_server_configs()
+
+    assert configs[0]["transport"] == "unavailable"
+    assert "SECRET-abc123" not in caplog.text
+    assert "tenant=acme" not in caplog.text
+    assert "mcp.example.test" in caplog.text
+    assert "resource=https://mcp.example.test/oauth" in caplog.text
+    assert cfg.get_mcp_oauth_diagnostics()[0]["resource"] == (
+        "https://mcp.example.test/oauth"
+    )
+    assert configs[0]["config"]["diagnostic"]["resource"] == (
+        "https://mcp.example.test/oauth"
+    )
+
+
+@pytest.mark.asyncio
+async def test_hook_failure_warning_redacts_resource_userinfo_pushed_out_by_query(
+    db_session,
+    caplog,
+):
+    """The resource logged here is the connector URL the user typed
+    verbatim -- it never passes through an HTTP client and is never
+    truncated -- so the userinfo-provenance rule that rejects a token
+    still carrying an ``@`` its parsed authority does not must be
+    provided by the shared ``redact_urls_in_text`` helper itself, not
+    duplicated by this call site.
+    """
+    db, user = db_session
+    caplog.set_level(logging.WARNING)
+    resource = "https://SECRET_API_KEY?x@mcp.example.test/oauth"
+    _add_oauth_server(db, user, launch_config=_launch_config(resource=resource))
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        raise RuntimeError("resolver failed")
+
+    set_oauth_token_resolver_hook(resolver)
+
+    cfg = _tool_config(db, user)
+    configs = await cfg.get_mcp_server_configs()
+
+    assert configs[0]["transport"] == "unavailable"
+    assert "SECRET_API_KEY" not in caplog.text
+    assert cfg.get_mcp_oauth_diagnostics()[0]["resource"] == "<url redacted>"
+    assert configs[0]["config"]["diagnostic"]["resource"] == "<url redacted>"
+
+
+@pytest.mark.asyncio
+async def test_hook_failure_warning_redacts_resource_query_value_containing_quote(
+    db_session,
+    caplog,
+):
+    """Same call site as the test above, for the token-boundary
+    correction rather than the userinfo-provenance rule: a query value
+    containing a single quote must not end the URL token early and leave
+    the ``api_key=`` key name -- and the secret after it -- outside the
+    token entirely.
+    """
+    db, user = db_session
+    caplog.set_level(logging.WARNING)
+    resource = "https://mcp.example.test/oauth?api_key='SECRET-abc123'"
+    _add_oauth_server(db, user, launch_config=_launch_config(resource=resource))
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        raise RuntimeError("resolver failed")
+
+    set_oauth_token_resolver_hook(resolver)
+
+    cfg = _tool_config(db, user)
+    configs = await cfg.get_mcp_server_configs()
+
+    assert configs[0]["transport"] == "unavailable"
+    assert "SECRET-abc123" not in caplog.text
+    assert cfg.get_mcp_oauth_diagnostics()[0]["resource"] == (
+        "https://mcp.example.test/oauth"
+    )
+    assert configs[0]["config"]["diagnostic"]["resource"] == (
+        "https://mcp.example.test/oauth"
+    )
+
+
+def test_redacted_bounded_resource_treats_none_and_empty_string_alike():
+    """``_build_oauth_token_resolver_diagnostic`` and
+    ``_resolver_failure_config`` used to guard the same expression with
+    ``is not None`` and truthiness respectively, so the two calls would
+    have disagreed on a ``""`` resource (kept as ``""`` vs. treated as
+    absent) had one ever reached them -- neither of this value's two
+    producers (``mcp_runtime.py``'s resource selection and this module's
+    ``_oauth_token_configured_resource``) emits ``""``, so this was never
+    reachable, but the shared helper now makes the two call sites agree by
+    construction rather than by their producers' contract.
+    """
+    assert web_tools_config._redacted_bounded_resource(None) is None
+    assert web_tools_config._redacted_bounded_resource("") is None
+    resource = "https://mcp.example.com/oauth?api_key=SECRET-abc123"
+    assert web_tools_config._redacted_bounded_resource(
+        resource
+    ) == web_tools_config._bounded_oauth_metadata(redact_urls_in_text(resource))
+
+
+@pytest.mark.asyncio
 async def test_hook_connector_runtime_error_propagates(db_session):
     db, user = db_session
     _add_oauth_server(db, user, launch_config=_launch_config())
@@ -3183,3 +3377,42 @@ async def test_remote_hook_refresh_classification_reaches_tool_failure_trace(
     public_output = repr(result) + repr(tracer.events) + caplog.text
     assert private_exception_text not in public_output
     assert "http-private-exception-secret" not in public_output
+
+
+@pytest.mark.asyncio
+async def test_hook_failure_warning_reads_the_resource_from_the_diagnostic(
+    db_session,
+    caplog,
+    monkeypatch,
+):
+    """The resource in the log line and the resource in the diagnostic dict
+    must come from the same computation rather than each being computed
+    separately from ``error.resource``. Both paths return the same value
+    today, so asserting on the value cannot tell them apart; this asserts
+    on how many times the redacting helper was called instead.
+    """
+    db, user = db_session
+    caplog.set_level(logging.WARNING)
+    resource = "https://mcp.example.test/oauth?api_key=SECRET-abc123"
+    _add_oauth_server(db, user, launch_config=_launch_config(resource=resource))
+
+    calls: list[Any] = []
+    original = web_tools_config._redacted_bounded_resource
+
+    def _counting(value):
+        calls.append(value)
+        return original(value)
+
+    monkeypatch.setattr(web_tools_config, "_redacted_bounded_resource", _counting)
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        raise RuntimeError("resolver failed")
+
+    set_oauth_token_resolver_hook(resolver)
+
+    cfg = _tool_config(db, user)
+    configs = await cfg.get_mcp_server_configs()
+
+    assert configs[0]["transport"] == "unavailable"
+    assert calls == [resource]
+    assert f"resource={configs[0]['config']['diagnostic']['resource']}" in caplog.text

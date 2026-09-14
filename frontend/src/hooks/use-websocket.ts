@@ -42,6 +42,8 @@ interface WebSocketMessage {
   delta?: string
   content?: string
   run_id?: string | null
+  stream_run_id?: string | null
+  stream_attempt_id?: string | null
   state_version?: number
   control_state?: "idle" | "running" | "pause_requested" | "paused" | "resume_requested" | "waiting_for_user" | "completed" | "failed"
   status?: unknown
@@ -731,6 +733,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       const socket = protocols
         ? new WebSocket(connection.url, protocols)
         : new WebSocket(connection.url)
+      let sharedTaskId: number | undefined
       const owner: SocketOwner = {
         callbacks: callbacksRef.current,
         connection,
@@ -795,6 +798,12 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
 
       socket.onclose = (event) => {
         if (!isCurrentOwner(owner)) return
+        if (sharedTaskId !== undefined) {
+          owner.callbacks.onMessage?.({
+            type: "stream_unavailable", task_id: sharedTaskId,
+            data: {}, timestamp: new Date().toISOString(),
+          })
+        }
 
         const wasCurrent = retireOwnerCore(owner, {
           pendingError: deliveryError("Connection closed before the message was accepted.", "outcome_unknown"),
@@ -931,6 +940,9 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         if (!isCurrentOwner(owner)) return
         try {
           const data = JSON.parse(event.data)
+          if (data.type === "task_stream_snapshot" || data.stream_run_id !== undefined) {
+            sharedTaskId = data.task_id
+          }
 
           if (data.type === 'message_accepted' || data.type === 'message_rejected') {
             const clientMessageId = data.client_message_id
@@ -1126,6 +1138,8 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
           // Preserve the canonical task-control envelope even when a message
           // type normalizes its payload into ``data`` above.
           message.run_id = data.run_id
+          message.stream_run_id = data.stream_run_id
+          message.stream_attempt_id = data.stream_attempt_id
           message.state_version = data.state_version
           message.control_state = data.control_state
           message.status = data.status

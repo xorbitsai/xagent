@@ -2,7 +2,6 @@ from types import SimpleNamespace
 
 import pytest
 
-import xagent.web.api.chat as chat_module
 from xagent.core.task_runtime import (
     TaskRuntimeContext,
     TaskRuntimeContribution,
@@ -12,7 +11,8 @@ from xagent.core.tools.adapters.vibe import browser_tools as browser_tools_modul
 from xagent.core.tools.adapters.vibe.base import ToolCategory
 from xagent.core.tools.adapters.vibe.config import ToolConfig
 from xagent.core.tools.adapters.vibe.factory import ToolFactory, ToolRegistry
-from xagent.web.api.chat import create_default_tools
+from xagent.web.services import agent_service_manager as agent_runtime_service
+from xagent.web.services.agent_service_manager import create_default_tools
 
 
 @pytest.mark.asyncio
@@ -86,9 +86,9 @@ async def test_create_default_tools_prefers_out_of_tree_computer_runtime(
         "create_workspace",
         lambda _config: SimpleNamespace(id="workspace"),
     )
-    monkeypatch.setattr(chat_module, "build_task_runtime", build_runtime)
+    monkeypatch.setattr(agent_runtime_service, "build_task_runtime", build_runtime)
     monkeypatch.setattr(
-        chat_module,
+        agent_runtime_service,
         "registered_task_extensions",
         lambda: ("out_of_tree_browser",),
     )

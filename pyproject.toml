@@ -38,11 +38,15 @@ dependencies = [
   "rich >= 14.0.0",
   "prompt_toolkit >= 3.0.0",
   "langfuse >= 4.0.6, < 5.0.0",    # Tracing implementation targets the v4 SDK API
+  "opentelemetry-api >= 1.39.0, < 2.0.0",
+  "opentelemetry-sdk >= 1.39.0, < 2.0.0",
+  "opentelemetry-exporter-otlp-proto-http >= 1.39.0, < 2.0.0",
   "python-dotenv >= 1.0.1",
   "mcp>=1.12.4,<2",  # streamablehttp_client (sessions.py) was removed/renamed in mcp 2.0
   "asyncssh>=2.14.0",  # SSH MCP runner (production runtime, not just tests)
   "requests >= 2.32.0",
   "idna >= 3.7",  # magento.py's non-ASCII MAGENTO_BASE_URL handling; currently only pulled in transitively via requests
+  "python-dateutil >= 2.8.2",  # calendar.py's RRULE validation (utils.parse_rrule); currently only pulled in transitively
   "boto3 >= 1.34.0",  # AWS built-in MCP connector (CloudWatch/DynamoDB/SQS, read-only)
   "celery[redis]>=5.4.0,<6.0.0",
   "redis>=5.0.0",
@@ -73,6 +77,11 @@ dependencies = [
   "matplotlib>=3.5.0",
   "google-auth-oauthlib>=1.2.0",
   "google-api-python-client>=2.145.0",
+  # zoneinfo's IANA timezone database - stdlib zoneinfo relies on the OS's
+  # tz data, which minimal container images may not ship; this guarantees
+  # it's present regardless of platform (calendar/outlook conflict-check
+  # timezone math needs real zone offsets, not just zone names).
+  "tzdata>=2024.1",
   "boxlite>=0.6.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
   "boxlite>=0.6.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
   "filelock>=3.0.0",
@@ -240,6 +249,7 @@ static-type-check = [
   "types-openpyxl>=3.1.5",
   "types-setuptools>=69.0.0",
   "types-docker>=7.1.0.20251009",
+  "types-python-dateutil>=2.8.19",
 ]
 
 [project.scripts]

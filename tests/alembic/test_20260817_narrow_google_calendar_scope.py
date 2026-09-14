@@ -306,22 +306,20 @@ def test_offline_sqlite_downgrade_round_trips_json_scope_value() -> None:
     assert json.loads(stored[0]) == OLD_SCOPES
 
 
-def test_migration_fields_match_registry() -> None:
-    from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
-
+def test_migration_fields_match_this_files_expectations() -> None:
+    # This migration has since been superseded by
+    # 20260907_add_calendar_freebusy_scope, which adds calendar.freebusy on
+    # top of what this one set - so migration.NEW_SCOPES is no longer
+    # expected to equal the live registry value; that comparison now lives
+    # in the newer migration's own test instead.
+    #
+    # This file's own OLD_SCOPES/NEW_SCOPES (used throughout the tests
+    # above) are a separate copy of the migration's constants, not a
+    # reference to them -- if the migration's values ever changed without
+    # this file's copy following, every test above would keep passing
+    # against a stale expectation instead of failing loudly.
     migration = _load_migration_module()
-    registry_row = next(
-        row
-        for row in get_builtin_public_mcp_app_rows()
-        if row["app_id"] == "google-calendar"
-    )
 
-    assert list(migration.NEW_SCOPES) == registry_row["oauth_scopes"]
-    # This file's own OLD_SCOPES/NEW_SCOPES (used throughout the tests above)
-    # are a separate copy of the migration's constants, not a reference to
-    # them -- if the migration's values ever changed without this file's
-    # copy following, every test above would keep passing against a stale
-    # expectation instead of failing loudly.
     assert list(migration.OLD_SCOPES) == OLD_SCOPES
     assert list(migration.NEW_SCOPES) == NEW_SCOPES
 

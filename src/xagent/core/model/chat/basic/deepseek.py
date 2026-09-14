@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 DEEPSEEK_DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEEPSEEK_SUPPORTED_MODELS = (
+    "deepseek-flash",
     "deepseek-v4-flash",
     "deepseek-v4-pro",
 )
@@ -272,6 +273,12 @@ class DeepSeekLLM(OpenAICompatibleLLM):
     ) -> List[Dict[str, Any]]:
         _ = api_key, base_url
         return [
+            {
+                "id": "deepseek-flash",
+                "created": 0,
+                "owned_by": "deepseek",
+                "abilities": ["chat", "tool_calling", "thinking_mode"],
+            },
             {
                 "id": "deepseek-v4-flash",
                 "created": 0,

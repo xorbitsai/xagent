@@ -13,7 +13,7 @@ import logging
 import os
 import time
 from pathlib import Path
-from threading import RLock
+from threading import Lock, RLock
 from typing import Any, ClassVar, Dict, List, Optional, Tuple
 
 import lancedb
@@ -29,6 +29,7 @@ __all__ = [
     "LanceDBConnectionManager",
     "LanceDBVectorStore",
     "clear_connection_cache",
+    "get_async_connection_from_env",
     "get_connection",
     "get_connection_from_env",
 ]
@@ -37,18 +38,64 @@ __all__ = [
 _connection_cache: Dict[str, Tuple[DBConnection, float]] = {}
 _cache_lock = RLock()
 
+# Async connections are cached separately and carry no TTL. A cached connection
+# works from any event loop because AsyncConnection binds no loop of its own;
+# the lock guarding this dict is a threading one so that the pool code is safe
+# across loops too. An asyncio.Lock here could bind to whichever loop first
+# contended it and strand the others.
+_async_connection_cache: Dict[str, Any] = {}
+_async_cache_lock = Lock()
+
 # Connection TTL (seconds), default 5 minutes
 CONNECTION_TTL = int(os.getenv("LANCEDB_CONNECTION_TTL", "300"))
 
 
 def clear_connection_cache() -> None:
-    """Clear the global LanceDB connection cache.
+    """Clear the global LanceDB connection caches, sync and async.
 
     This is primarily intended for test isolation to avoid reusing cached
     connections across different `LANCEDB_DIR` values.
+
+    Both halves only drop their entries. Closing a pooled async connection here
+    would break any coroutine still holding one -- the stores keep theirs across
+    awaits -- and dropping the entry is already enough to force a fresh connect.
     """
     with _cache_lock:
         _connection_cache.clear()
+    with _async_cache_lock:
+        _async_connection_cache.clear()
+
+
+async def get_async_connection_from_env(env_var: str = "LANCEDB_DIR") -> Any:
+    """Get a process-wide async LanceDB connection for the env-configured dir.
+
+    Both planes resolve the directory through ``resolve_dir_from_env``, so they
+    always agree on it without this having to open a sync connection first.
+    """
+    uri = LanceDBConnectionManager().resolve_dir_from_env(env_var)
+
+    with _async_cache_lock:
+        cached = _async_connection_cache.get(uri)
+    if cached is not None:
+        return cached
+    LanceDBConnectionManager._ensure_dir(uri)
+
+    # connect_async is awaited outside the lock; a concurrent opener may win the
+    # insert below, in which case this connection is closed.
+    conn = await lancedb.connect_async(uri)  # type: ignore[attr-defined]
+    discarded = None
+    with _async_cache_lock:
+        existing = _async_connection_cache.get(uri)
+        if existing is not None:
+            discarded, conn = conn, existing
+        else:
+            _async_connection_cache[uri] = conn
+    if discarded is not None:
+        try:
+            discarded.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Error closing superseded async connection: %s", exc)
+    return conn
 
 
 class LanceDBConnectionManager:
@@ -199,20 +246,38 @@ class LanceDBConnectionManager:
             ValueError: If environment variable is empty
             KeyError: If environment variable (other than LANCEDB_DIR) is not set
         """
+        return self.get_connection(self.resolve_dir_from_env(env_var))
+
+    def resolve_dir_from_env(self, env_var: str = "LANCEDB_DIR") -> str:
+        """Resolve the configured directory without opening a connection.
+
+        Args:
+            env_var: Environment variable name containing database directory
+
+        Returns:
+            Normalized directory path
+
+        Raises:
+            ValueError: If environment variable is empty
+            KeyError: If environment variable (other than LANCEDB_DIR) is not set
+        """
         db_dir = os.getenv(env_var)
 
         if db_dir is None:
             if env_var == "LANCEDB_DIR":
                 # Use default path only for the standard LANCEDB_DIR environment variable
                 db_dir = self.get_default_lancedb_dir()
-                logger.info(f"Using default LanceDB directory: {db_dir}")
+                # Reached on every connection request now that the KB stores
+                # no longer memoise one (LanceDBVectorStore still does), so
+                # this must be neither INFO nor an eager f-string.
+                logger.debug("Using default LanceDB directory: %s", db_dir)
             else:
                 # For other environment variables, raise KeyError as before
                 raise KeyError(f"Environment variable {env_var} is not set")
         elif db_dir.strip() == "":
             raise ValueError(f"Environment variable {env_var} is empty")
 
-        return self.get_connection(db_dir)
+        return self._normalize_dirpath(db_dir)
 
 
 class LanceDBVectorStore(VectorStore):

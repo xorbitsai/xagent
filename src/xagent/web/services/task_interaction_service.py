@@ -120,7 +120,10 @@ from ...core.agent.checkpoint import (
 )
 from ...core.agent.pattern.react.react import _normalize_interaction_text
 from ...core.tools.adapters.vibe.ask_user_tool import AskUserQuestionArgs
-from ...core.tools.adapters.vibe.interaction_types import INTERACTION_TYPES
+from ...core.tools.adapters.vibe.interaction_types import (
+    INTERACTION_TYPES,
+    TYPES_REQUIRING_OPTIONS,
+)
 from ..models.task import Task, TaskStatus, TaskStatusPredicate, TraceEvent
 from ..models.task_command import TaskExecutionCommand
 from ..models.task_interaction import (
@@ -1080,19 +1083,6 @@ def build_v1_request_payload(parsed: AskUserQuestionArgs) -> dict[str, Any]:
 # is what keeps either surface from having to.
 _V1_INTERACTION_TYPES = frozenset(INTERACTION_TYPES)
 
-# The types whose whole purpose is picking from a supplied list -- one set,
-# per #1314 item 2 ("key rules by interaction type, rather than one flat
-# list"), read below as a total function of membership rather than the two
-# independent flat sets this replaces. The split is the render surface's,
-# not this module's: ``select_one``, ``select_multiple``, and
-# ``action_cards`` iterate ``interaction.options``
-# (``frontend/src/components/chat/clarification-form.tsx``), while
-# ``confirm`` renders a switch, ``text_input`` a field, ``number_input`` a
-# spinner, and ``file_upload`` a picker -- none of which read ``options``.
-_V1_TYPES_REQUIRING_OPTIONS = frozenset(
-    {"select_one", "select_multiple", "action_cards"}
-)
-
 
 @dataclass(frozen=True)
 class InteractionWriteRefusal:
@@ -1192,7 +1182,7 @@ def validate_v1_write_payload(parsed: AskUserQuestionArgs) -> None:
     identifier and the position it fired at, never producer-supplied text
     (``#1314`` item 3) -- describing the first violation found; returns
     ``None`` when the payload may be written. Each rule below is scoped by
-    ``interaction.type`` through ``_V1_TYPES_REQUIRING_OPTIONS`` where a
+    ``interaction.type`` through ``TYPES_REQUIRING_OPTIONS`` where a
     rule is type-specific at all (``#1314`` item 2); the rules that apply
     to every
     type (blank/duplicate field, blank/duplicate option) are not, because
@@ -1216,12 +1206,12 @@ def validate_v1_write_payload(parsed: AskUserQuestionArgs) -> None:
     ``build_clarification_payload`` (``task_clarification_draft.py``) is a
     second producer of this same shape and its output has to keep passing
     here, pinned by a test that feeds this function that builder's real
-    output. Two of that builder's shapes are the reason for the boundaries
-    drawn below. An empty ``interactions`` list is accepted: a
-    ``send_message``-sourced draft never carries interactions, and an
-    over-size form is deliberately dropped to ``[]`` rather than truncated
-    to half a form -- both are questions with prose and no form, which the
-    read surface renders. A blank ``message`` is rejected, and that costs
+    output. An empty ``interactions`` list is accepted: an over-size form is
+    deliberately dropped to ``[]`` rather than truncated to half a form, and
+    that is a question with prose and no form, which the read surface
+    renders. (A ``send_message``-sourced draft used to be the other such
+    shape; it now carries the engine's appended free-text field, so its list
+    is never empty.) A blank ``message`` is rejected, and that costs
     the builder nothing: ``resolve_publishable_clarification`` already
     classifies a payload whose message is blank after filtering as
     ``NotApplicable("empty_question")`` and never offers it for writing.
@@ -1334,7 +1324,7 @@ def validate_v1_write_payload(parsed: AskUserQuestionArgs) -> None:
         # rule cannot drift from itself. interaction.type is provably in
         # _V1_INTERACTION_TYPES by here -- the unsupported_type check
         # above rejects anything else.
-        requires_options = interaction.type in _V1_TYPES_REQUIRING_OPTIONS
+        requires_options = interaction.type in TYPES_REQUIRING_OPTIONS
         if requires_options and not interaction.options:
             raise InteractionWritePayloadRejected(
                 InteractionWriteRefusal(

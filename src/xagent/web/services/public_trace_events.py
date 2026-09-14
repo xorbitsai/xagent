@@ -9,8 +9,8 @@ from sqlalchemy import or_
 from ...core.tools.adapters.vibe.connector_runtime import (
     redact_runtime_sensitive_payload,
 )
-from ..services.client_error_messages import CLIENT_SAFE_TASK_FAILURE
-from ..services.trace_event_types import GENERAL_ERROR_EVENT_TYPES
+from .client_error_messages import CLIENT_SAFE_TASK_FAILURE
+from .trace_event_types import GENERAL_ERROR_EVENT_TYPES
 
 TOOL_EVENT_TYPES = frozenset(
     {

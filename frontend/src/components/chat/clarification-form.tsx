@@ -14,12 +14,15 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 import { ChevronDown, ChevronRight, MessageSquare, Upload, File as FileIcon, X, Globe } from "lucide-react"
 import { ConnectAppsField } from "./connect-apps-field"
 import type { MessageDeliveryDisposition } from "@/hooks/use-websocket"
-import type { TranslationKey } from "@/i18n/translations"
+import { clientErrorTranslationKey, type ClientErrorCode } from "@/lib/client-errors"
 import {
-  clientErrorTranslationKey,
-  readClientErrorCode,
-  type ClientErrorCode,
-} from "@/lib/client-errors"
+  readSendDisposition,
+  readSendErrorCode,
+  readSendReason,
+  sendHintKey,
+  type ClarificationOnSend,
+  type ClarificationSendMetadata,
+} from "./clarification-delivery"
 
 interface ClarificationFormProps {
   message?: string
@@ -28,7 +31,12 @@ interface ClarificationFormProps {
   requestId?: string
   active?: boolean
   filesDisabled?: boolean
-  onSend?: (message: string, files?: File[], metadata?: any) => Promise<void> | void
+  /**
+   * Injected send path (e.g. the agent builder chat). Held to the delivery
+   * contract in clarification-delivery.ts: it rejects with the same
+   * discriminated failure shape as the internal path (#1485).
+   */
+  onSend?: ClarificationOnSend
 }
 
 const FILE_ACTION_VALUE_RE = /(^|[-_\s])(upload|file)(?=$|[-_\s])/i
@@ -52,67 +60,6 @@ const isFileActionSelection = (
 ): boolean => option
   ? isFileActionOption(option)
   : isFileActionValue(value)
-
-/**
- * Delivery failures carry whether the turn definitely never reached the agent.
- * Plain errors (local validation, unexpected throws) carry nothing, and are
- * left unqualified rather than guessed at: telling a visitor to resubmit a
- * turn that may have landed is worse than saying nothing. Errors are probed
- * structurally rather than by `instanceof`, because the `onSend` branch's
- * failures come from arbitrary builder callbacks (see #1485).
- */
-const readSendDisposition = (error: unknown): MessageDeliveryDisposition | null => {
-  if (typeof error !== "object" || error === null || !("disposition" in error)) {
-    return null
-  }
-  const disposition = (error as { disposition: unknown }).disposition
-  return disposition === "not_sent"
-    || disposition === "rejected"
-    || disposition === "outcome_unknown"
-    ? disposition
-    : null
-}
-
-/**
- * Only the reasons the sender can act on — the backend's rejection text — are
- * shown as-is. Connection plumbing messages stay behind the localized string:
- * they are English diagnostics, and a widget visitor is not the audience for
- * them.
- *
- * The message is probed structurally for the same reason the disposition is:
- * an `onSend` callback's rejection need not be an `Error` instance. Nothing
- * new becomes displayable either way — `userFacing` still has to be set.
- */
-const readSendReason = (error: unknown): string => {
-  if (
-    typeof error !== "object"
-    || error === null
-    || (error as { userFacing?: unknown }).userFacing !== true
-  ) {
-    return ""
-  }
-  const message = (error as { message?: unknown }).message
-  return typeof message === "string" ? message.trim() : ""
-}
-
-const readSendErrorCode = (error: unknown): ClientErrorCode | null => {
-  if (typeof error !== "object" || error === null) return null
-  return readClientErrorCode((error as { errorCode?: unknown }).errorCode)
-}
-
-/**
- * The hint that belongs with a disposition, as a key rather than a translated
- * string: the toast needs it once at failure time, while the persistent alert
- * has to re-resolve it on every render so a locale switch is not stuck behind
- * whatever language was active when the send failed.
- */
-const sendHintKey = (
-  disposition: MessageDeliveryDisposition | null,
-): TranslationKey | null => disposition === "outcome_unknown"
-  ? "chatPage.clarification.sendOutcomeUnknown"
-  : disposition === "not_sent" || disposition === "rejected"
-    ? "chatPage.clarification.sendNotSent"
-    : null
 
 // Interaction types that are "live widgets" reflecting external state (e.g.
 // useMcpApps()'s connection state), not a question with an answer to submit
@@ -291,7 +238,7 @@ export function ClarificationForm({
   const handleSubmit = async () => {
     const submittedRequestId = requestId
     // Construct the message
-    const metadata: any = requestId ? { request_id: requestId } : {}
+    const metadata: ClarificationSendMetadata = requestId ? { request_id: requestId } : {}
     const lines = normalizedInteractions.flatMap(interaction => {
       const value = formState[interaction.field]
 

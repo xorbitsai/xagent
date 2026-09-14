@@ -4,7 +4,7 @@ Four production sites inject a WebSocket, A2A, or v1 SDK user message
 straight into a checkpoint instead of going through the native interaction
 protocol's answer path: the online WebSocket injection, the deferred
 WebSocket injection (``execute_resume_background``), the A2A resume-input
-path, and the v1 ``POST .../reply`` resume-input path (``task_reply.py``).
+path, and the v1 ``POST .../reply`` resume-input path (``task_resume.py``).
 Each of those sites, once its own message write has succeeded, must retire
 the run's active ``task_interaction_requests`` row (if any) as
 ``terminated`` / ``answered_via_legacy_resume`` and clear
@@ -52,11 +52,11 @@ close call (``mark_user_message_delivery_sync``) the identical log-only
 way, for the identical reason; see the inline comments beside each pair.
 The A2A and v1 reply sites are different: each close call runs inside its
 own resume-input fence transaction (``_update_a2a_resume_input_sync`` in
-``a2a.py``, ``_update_reply_input_sync`` in ``task_reply.py``), committed
+``task_resume.py``, ``_update_reply_input_sync`` in the same module), committed
 together with the ownership fence UPDATE that precedes it -- that is what
 makes those two sites stronger than the WebSocket sites, not a claim that
 the close is atomic with the message injection itself. The message
-injection (``post_user_message`` at ``a2a.py:464`` / ``task_reply.py:512``)
+injection (``post_user_message`` in ``task_resume.py``)
 commits on its own, earlier, in ``AgentRunner._persist_injected_context``;
 only after that commit has already landed does the caller open the fence
 transaction that writes the resumed input and closes the interaction row
@@ -94,7 +94,7 @@ site cannot quietly become dangerous if it is ever changed to derive its
 own key.
 
 The fourth production caller, the v1 ``POST .../reply`` resume-input
-path (``task_reply.py``), carries no guard at all and needs none: it
+path (``task_resume.py``), carries no guard at all and needs none: it
 builds its turn id as ``f"v1:reply:{task_id}:{uuid4()}"``, a value that
 is fresh on every single call, so it can never present a repeated turn
 id and can never reach the short circuit that produces a replay.
@@ -139,6 +139,7 @@ schema corruption after the fact.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import sqlalchemy as sa
@@ -233,16 +234,94 @@ def _classify_close_rowcount(
         )
 
 
-def active_interaction_id_sync(task_id: int) -> int | None:
-    """The id of this task's active native interaction row, or ``None``.
+@dataclass(frozen=True)
+class ActiveInteractionFound:
+    """A live native interaction row exists for this task, keyed by its
+    primary key. Callers pass ``interaction_id`` straight to
+    ``close_legacy_resume_interaction`` / ``close_legacy_resume_interaction_sync``
+    and, at the resume command seam, compare it against the client's
+    receipt.
+    """
 
-    Read this *before* injecting the user message, and pass what it
-    returns to ``close_legacy_resume_interaction`` -- see this module's
-    docstring for why that ordering is the whole point.
+    interaction_id: int
+
+
+@dataclass(frozen=True)
+class ActiveInteractionAbsent:
+    """No live native interaction row exists for this task. Reached from
+    four situations: no database configured, a NULL protocol marker, no
+    interaction table yet, or an empty row lookup. The first two answer
+    without querying the interaction table at all -- they are not a
+    lookup that came back empty, they are a state in which no row can be
+    staged -- and the last two are that lookup coming back empty. All
+    four mean the same thing to a caller, and none of them is a failed
+    read: there is nothing to close and nothing being hidden.
+    """
+
+
+@dataclass(frozen=True)
+class ActiveInteractionUnavailable:
+    """The read could not be made at all. ``reason`` carries which of the
+    two words in ``ACTIVE_INTERACTION_UNAVAILABLE_REASONS`` applies --
+    provisionally two, because ``"lookup_failed"`` currently covers both a
+    transient query failure and the structural case of a deployment whose
+    ``tasks`` table has no ``interaction_protocol_version`` column yet
+    (#1314). Splitting that word belongs with the change that gives a
+    caller a reason to act on the two differently, not with this one.
+    This is not ``ActiveInteractionAbsent``: the row may or may not
+    exist, the read just could not tell. Kept distinct from
+    ``ActiveInteractionAbsent`` at the type level even where a caller's
+    action for the two is the same today: collapsing them into one
+    member, or into one branch, is what makes the distinction
+    unrecoverable for the caller that has to act on it differently later.
+    """
+
+    reason: str
+
+
+# The three-state result of reading a task's active native interaction
+# row. A union of three frozen dataclasses, not an enum with an optional
+# id and not a single dataclass with two optional fields: either of those
+# shapes lets a caller collapse ActiveInteractionUnavailable into
+# ActiveInteractionAbsent with one truthy check on the id (`if
+# x.interaction_id is not None`), and mypy would have nothing to say about
+# it. A tagged union of distinct types is what makes an exhaustiveness
+# check possible at all, but it does not by itself produce one: mypy only
+# reports a missing arm when the branch chain ends in `assert_never`, so
+# every caller in this repo ends its chain that way and the union is the
+# thing that makes those calls type-check. ClarificationResolution in
+# task_clarification_draft.py has the same shape: a union of frozen
+# dataclasses, one member per outcome, with a reason word on the members
+# that need to say why.
+ActiveInteractionRead = (
+    ActiveInteractionFound | ActiveInteractionAbsent | ActiveInteractionUnavailable
+)
+
+# Every ActiveInteractionUnavailable.reason value this module produces
+# today. Each corresponds to one of the two logger.warning call sites
+# inside active_interaction_id_sync below, which already carry distinct
+# message text -- this constant is what keeps a future change from
+# quietly merging the two log messages (and the two reasons they
+# describe) into one. It is also what the tests parametrize and assert
+# over, so a word added here gains its coverage cells without anyone
+# remembering to add them; that is the reason it is a runtime constant
+# and not only a type.
+ACTIVE_INTERACTION_UNAVAILABLE_REASONS: frozenset[str] = frozenset(
+    {"session_unavailable", "lookup_failed"}
+)
+
+
+def active_interaction_id_sync(task_id: int) -> ActiveInteractionRead:
+    """This task's active native interaction row: found, absent, or
+    unavailable (the read itself could not be made).
+
+    Read this *before* injecting the user message, and translate the
+    result before passing it to ``close_legacy_resume_interaction`` -- see
+    this module's docstring for why that ordering is the whole point.
 
     Opens and closes its own short session. Three legacy-resume injection
     paths call it from a point where they hold no session of their own: the
-    two fence-transaction paths (``a2a.py``, ``v1/task_reply.py``) open
+    two fence-transaction paths (both in ``task_resume.py``) open
     their fence only after the injection has already committed, and the
     WebSocket online chat injection holds none at all. The fourth
     legacy-resume path -- the WebSocket deferred injection reached through
@@ -260,24 +339,49 @@ def active_interaction_id_sync(task_id: int) -> int | None:
     predicate of its own -- the close this feeds and the readers that show
     the question must not disagree about which row is live.
 
-    Returns ``None`` when the read cannot be made at all -- no table yet,
-    no session, a failing query. ``None`` closes nothing: the close
-    statement matches zero rows and the active row survives -- and so
-    does the marker, because the clear beside the close is conditioned on
-    no active row remaining for this ``(task_id, run_id)`` pair (see
-    ``close_legacy_resume_interaction``). A reader keeps seeing the live
-    native question the read could not see, instead of falling back to
-    the legacy transcript question. The alternative -- closing on the old
-    unbound predicate when the read fails -- is the retire-the-wrong-row
-    bug this function exists to prevent, so an unreadable id must never
-    widen what the close matches.
+    Returns ``ActiveInteractionUnavailable`` when the read cannot be made
+    at all -- no session, a failing query -- and ``ActiveInteractionAbsent``
+    when the read completes but finds nothing to close -- no table yet, a
+    NULL marker, no active row. At the three legacy-resume close sites,
+    both translate to "close nothing": the close statement is bound to no
+    primary key, so it matches zero rows and retires no question in
+    either case.
 
-    Two branches decide "no id" before the row lookup runs, and both mean
-    the same thing as an empty lookup, not a failure:
-    ``get_optional_session_local()`` returning ``None`` (no database
-    configured in this process -- expected in tests, never in production),
-    and ``tasks.interaction_protocol_version`` being ``NULL``. The marker
-    gate is the write side of the same first step
+    What happens to the task's marker is where the two part ways, and no
+    caller decides it: the clear beside the close is conditioned on no
+    active row remaining for this ``(task_id, run_id)`` pair (see
+    ``close_legacy_resume_interaction``). Under
+    ``ActiveInteractionAbsent`` nothing is there to hold that condition
+    back, so the marker clears. Under ``ActiveInteractionUnavailable``
+    the condition is evaluated against whatever is really in the table,
+    which is the case this state exists for: a live row the read could
+    not see holds the clear back, so the marker survives with the row and
+    a reader keeps seeing that live native question instead of falling
+    back to the legacy transcript question. The alternative -- closing on
+    the old unbound predicate when the read fails -- is the
+    retire-the-wrong-row bug this function exists to prevent, so an
+    unreadable id must never widen what the close matches.
+
+    At the resume command seam's refusal gate (``websocket.py``), all three
+    states are handled on their own branch, and today
+    ``ActiveInteractionUnavailable`` takes the same action as
+    ``ActiveInteractionAbsent``: the resume proceeds. That is not the two
+    being interchangeable -- it is what the marker gate makes true right
+    now. Nothing in ``src/`` writes ``tasks.interaction_protocol_version``
+    to anything but ``NULL``, so a read that could not be made cannot be
+    hiding a live native interaction row, and refusing on it would cost a
+    refused resume on tasks that provably carry no question. The change
+    that first writes that marker to ``1`` is the one that turns this
+    gate's ``ActiveInteractionUnavailable`` branch into a refusal; the
+    branch is already separate so that change edits one branch's action
+    and touches neither of the other two.
+
+    Two branches resolve to ``ActiveInteractionAbsent`` before the row
+    lookup ever runs, and both mean the same thing as an empty lookup, not
+    a failure: ``get_optional_session_local()`` returning ``None`` (no
+    database configured in this process -- expected in tests, never in
+    production), and ``tasks.interaction_protocol_version`` being ``NULL``.
+    The marker gate is the write side of the same first step
     ``get_pending_interaction_question`` (``task_interaction_read.py``)
     takes on the read side: a NULL marker means no native row was ever
     staged for this task's current wait, so the interaction table goes
@@ -291,7 +395,7 @@ def active_interaction_id_sync(task_id: int) -> int | None:
     That gate decides every call today: the only statements in ``src/``
     that write the column are this module's two clears, and both of them
     write ``NULL``, so the marker is NULL for every task and this branch
-    returns ``None`` before anything below it runs.
+    returns ``ActiveInteractionAbsent()`` before anything below it runs.
 
     This is also the resume command seam's reader (``websocket.py``'s
     refusal gate for a resume whose payload cannot prove it answered the
@@ -304,7 +408,7 @@ def active_interaction_id_sync(task_id: int) -> int | None:
 
     SessionLocal = get_optional_session_local()
     if SessionLocal is None:
-        return None
+        return ActiveInteractionAbsent()
     try:
         db = SessionLocal()
     except Exception:
@@ -314,7 +418,7 @@ def active_interaction_id_sync(task_id: int) -> int | None:
             task_id,
             exc_info=True,
         )
-        return None
+        return ActiveInteractionUnavailable("session_unavailable")
     try:
         marker = (
             db.query(Task.interaction_protocol_version)
@@ -322,9 +426,9 @@ def active_interaction_id_sync(task_id: int) -> int | None:
             .scalar()
         )
         if marker is None:
-            return None
+            return ActiveInteractionAbsent()
         if not interaction_requests_table_exists(db):
-            return None
+            return ActiveInteractionAbsent()
         row = (
             db.query(TaskInteractionRequest.id)
             .join(Task, Task.id == TaskInteractionRequest.task_id)
@@ -334,7 +438,9 @@ def active_interaction_id_sync(task_id: int) -> int | None:
             )
             .first()
         )
-        return int(row[0]) if row is not None else None
+        if row is None:
+            return ActiveInteractionAbsent()
+        return ActiveInteractionFound(int(row[0]))
     except Exception:
         logger.warning(
             "the active interaction row lookup failed for task_id=%s; "
@@ -342,7 +448,7 @@ def active_interaction_id_sync(task_id: int) -> int | None:
             task_id,
             exc_info=True,
         )
-        return None
+        return ActiveInteractionUnavailable("lookup_failed")
     finally:
         db.close()
 

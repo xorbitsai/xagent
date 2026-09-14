@@ -10,11 +10,12 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from sqlalchemy import event
 
-from xagent.web.api import chat as chat_api
 from xagent.web.api import websocket as websocket_api
 from xagent.web.models.database import get_engine
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
+from xagent.web.services import agent_service_manager as agent_runtime_service
+from xagent.web.services import task_command_execution as command_execution_service
 from xagent.web.services import task_orchestrator as orchestrator_module
 from xagent.web.services.task_orchestrator import (
     TaskTurnOrchestrator,
@@ -65,7 +66,9 @@ async def test_legacy_execute_uses_worker_snapshot_and_primitive_scheduler_bound
     agent_manager.execute_task = AsyncMock(
         return_value={"success": True, "output": "done", "file_outputs": []}
     )
-    monkeypatch.setattr(chat_api, "get_agent_manager", lambda: agent_manager)
+    monkeypatch.setattr(
+        agent_runtime_service, "get_agent_manager", lambda: agent_manager
+    )
 
     connection_manager = MagicMock()
     connection_manager.send_personal_message = AsyncMock()
@@ -171,7 +174,9 @@ def test_websocket_task_info_exposes_persisted_runtime_extension_bindings(
         db.commit()
         db.refresh(task)
 
-        routing, _ = websocket_api._load_websocket_task_routing_snapshot(db, task)
+        routing, _ = command_execution_service._load_task_command_routing_snapshot(
+            db, task
+        )
 
         assert routing.task_info["runtime_extension_bindings"] == ["local_browser"]
     finally:

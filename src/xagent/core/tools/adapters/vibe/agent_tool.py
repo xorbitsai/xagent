@@ -59,7 +59,7 @@ class _DelegatedAgentDatabaseTraceHandler:
         build_id: str,
         metadata: Mapping[str, Any],
     ) -> None:
-        from .....web.api.trace_handlers import DatabaseTraceHandler
+        from .....web.services.trace_handlers import DatabaseTraceHandler
 
         self.task_id = task_id
         self.build_id = build_id
@@ -81,7 +81,7 @@ class _DelegatedAgentDatabaseTraceHandler:
         return await self._handler.load_latest_checkpoint(execution_id)
 
 
-class _DelegatedAgentWebSocketTraceHandler:
+class _DelegatedAgentTaskEventTraceHandler:
     """Broadcast safe child-agent traces on the parent task stream."""
 
     def __init__(
@@ -90,11 +90,11 @@ class _DelegatedAgentWebSocketTraceHandler:
         task_id: int,
         metadata: Mapping[str, Any],
     ) -> None:
-        from .....web.api.ws_trace_handlers import WebSocketTraceHandler
+        from .....web.services.task_event_trace_handler import TaskEventTraceHandler
 
         self.task_id = task_id
         self.metadata = dict(metadata)
-        self._handler = WebSocketTraceHandler(task_id)
+        self._handler = TaskEventTraceHandler(task_id)
 
     async def handle_event(self, event: Any) -> None:
         original_data = event.data
@@ -1965,7 +1965,7 @@ class AgentTool(AbstractBaseTool):
                 )
             )
             handlers.append(
-                _DelegatedAgentWebSocketTraceHandler(
+                _DelegatedAgentTaskEventTraceHandler(
                     task_id=parent_db_task_id,
                     metadata=metadata,
                 )
@@ -2175,14 +2175,45 @@ class AgentTool(AbstractBaseTool):
                 # Resolve models
                 storage = UserAwareModelStorage(db)
 
-                if agent_models:
-                    from .agent_model_resolution import resolve_agent_model_llms
+                from .agent_model_resolution import resolve_agent_model_llms
 
-                    default_llm, fast_llm, vision_llm, compact_llm = (
-                        resolve_agent_model_llms(
-                            db, storage, agent_models, self._user_id
+                default_llm, fast_llm, vision_llm, compact_llm = (
+                    resolve_agent_model_llms(db, storage, agent_models, self._user_id)
+                )
+                # Keyed on the general slot, not on the whole mapping: an
+                # agent carrying only e.g. {"compact": id} has an unset general
+                # slot too. Anything else keeps failing closed when it will not
+                # resolve -- a model *name* forwarded from template YAML (which
+                # resolves by id only), or a payload that is not even a mapping,
+                # which is a stated-but-corrupt config rather than an unset one.
+                general_unset = agent_models is None or (
+                    isinstance(agent_models, Mapping)
+                    and not agent_models.get("general")
+                )
+                if general_unset and not default_llm:
+                    from .....web.services.llm_utils import AutoModelUnavailableError
+
+                    try:
+                        default_llm, _, _, _ = storage.get_configured_defaults(
+                            self._user_id, config_types=("general",)
                         )
-                    )
+                    except AutoModelUnavailableError:
+                        logger.warning(
+                            "Agent %s has no general model and no default is "
+                            "configured for user %s; failing the delegation",
+                            self._agent_id,
+                            self._user_id,
+                        )
+                        default_llm = None
+                    if default_llm is not None:
+                        logger.info(
+                            "Agent %s has no general model set; delegating on "
+                            "the resolved default %s",
+                            self._agent_id,
+                            getattr(
+                                default_llm, "model_name", type(default_llm).__name__
+                            ),
+                        )
             # ---- Phase 1 session closed here. ----
 
             if not default_llm:

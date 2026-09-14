@@ -17,7 +17,6 @@ from xagent.core.file_storage.factory import get_unscoped_file_storage
 from xagent.core.file_storage.storage import FsspecFileStorage
 from xagent.core.workspace import TaskWorkspace
 from xagent.web.api import files as files_api
-from xagent.web.api import websocket as websocket_api
 from xagent.web.api.public_chat_access import (
     PublicChatAccessContext,
     ShareChatAccessContext,
@@ -26,6 +25,7 @@ from xagent.web.api.public_chat_access import (
 )
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
+from xagent.web.services import task_execution as task_execution_service
 from xagent.web.services.managed_file_ref import (
     DURABLE_FAULT_LOG_PREFIX,
     DurableStorageOperationError,
@@ -1001,7 +1001,7 @@ def test_http_durable_upload_is_bound_to_agent_workspace_without_second_put(
         base_dir=str(tmp_path := upload_root / "agent-workspaces"),
         allowed_external_dirs=[str(Path(storage_path).parent)],
     )
-    websocket_api._register_uploaded_files_for_agent(
+    task_execution_service._register_uploaded_files_for_agent(
         type("AgentService", (), {"workspace": workspace})(),
         [file_info],
     )

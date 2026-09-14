@@ -61,6 +61,7 @@ _CURATED_MODELS_BY_PROVIDER: dict[str, tuple[str, ...]] = {
     # OpenRouter directly. Users may also type any OpenRouter slug.
     "openrouter": (AUTO_MODEL_NAME,),
     "deepseek": (
+        "deepseek-flash",
         "deepseek-v4-flash",
         "deepseek-v4-pro",
     ),

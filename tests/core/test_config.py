@@ -2783,3 +2783,125 @@ def test_inline_file_delivery_budget(monkeypatch, caplog):
         caplog.clear()
         assert config.get_inline_file_delivery_max_bytes() == 0
         assert "Invalid XAGENT_INLINE_FILE_DELIVERY_MAX_BYTES" in caplog.text
+
+
+_OTEL_ENV_VARS = (
+    "XAGENT_RUNTIME_TELEMETRY_ENABLED",
+    "XAGENT_OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+    "XAGENT_OTEL_EXPORT_INTERVAL_MILLISECONDS",
+    "XAGENT_OTEL_SERVICE_NAME",
+    "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "OTEL_METRIC_EXPORT_INTERVAL",
+    "OTEL_SERVICE_NAME",
+)
+
+
+def _clear_otel_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for env_var in _OTEL_ENV_VARS:
+        monkeypatch.delenv(env_var, raising=False)
+
+
+def test_runtime_telemetry_defaults_to_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_otel_env(monkeypatch)
+
+    assert config.get_otel_metrics_endpoint() is None
+    assert config.get_runtime_telemetry_enabled() is False
+    assert config.get_otel_export_interval_milliseconds() == 10_000
+    assert config.get_otel_service_name() == "xagent"
+
+
+def test_xagent_otel_endpoint_enables_export_and_explicit_false_disables_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_otel_env(monkeypatch)
+    monkeypatch.setenv(
+        "XAGENT_OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+        " http://collector:4318/v1/metrics/ ",
+    )
+
+    assert config.get_otel_metrics_endpoint() == "http://collector:4318/v1/metrics"
+    assert config.get_runtime_telemetry_enabled() is True
+
+    monkeypatch.setenv("XAGENT_RUNTIME_TELEMETRY_ENABLED", "false")
+    assert config.get_runtime_telemetry_enabled() is False
+
+
+def test_standard_otel_fallbacks_and_xagent_precedence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_otel_env(monkeypatch)
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://standard:4318/")
+    monkeypatch.setenv("OTEL_METRIC_EXPORT_INTERVAL", "30000")
+    monkeypatch.setenv("OTEL_SERVICE_NAME", "standard-xagent")
+
+    assert config.get_otel_metrics_endpoint() == "http://standard:4318/v1/metrics"
+    assert config.get_otel_export_interval_milliseconds() == 30_000
+    assert config.get_otel_service_name() == "standard-xagent"
+
+    monkeypatch.setenv(
+        "XAGENT_OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+        "http://xagent:4318/v1/metrics",
+    )
+    monkeypatch.setenv("XAGENT_OTEL_EXPORT_INTERVAL_MILLISECONDS", "5000")
+    monkeypatch.setenv("XAGENT_OTEL_SERVICE_NAME", "xagent-override")
+    assert config.get_otel_metrics_endpoint() == "http://xagent:4318/v1/metrics"
+    assert config.get_otel_export_interval_milliseconds() == 5_000
+    assert config.get_otel_service_name() == "xagent-override"
+
+
+def test_toby_personal_stdio_is_disabled_by_default(monkeypatch):
+    monkeypatch.delenv(config.TOBY_PERSONAL_STDIO_ENABLED, raising=False)
+
+    assert config.get_toby_personal_stdio_enabled() is False
+
+
+@pytest.mark.parametrize("value", ["1", "true", "YES", "on"])
+def test_toby_personal_stdio_explicit_opt_in(monkeypatch, value):
+    monkeypatch.setenv(config.TOBY_PERSONAL_STDIO_ENABLED, value)
+
+    assert config.get_toby_personal_stdio_enabled() is True
+
+
+@pytest.mark.parametrize(
+    "value,expected", [(None, False), ("true", True), ("false", False)]
+)
+def test_shared_task_execution_is_dormant_by_default(monkeypatch, value, expected):
+    monkeypatch.delenv(config.SHARED_TASK_EXECUTION_ENABLED, raising=False)
+    if value is not None:
+        monkeypatch.setenv(config.SHARED_TASK_EXECUTION_ENABLED, value)
+    assert config.get_shared_task_execution_enabled() is expected
+
+
+@pytest.mark.parametrize("value", ["", " ", "deployment/channel"])
+def test_task_event_channel_prefix_rejects_invalid_namespace(monkeypatch, value):
+    monkeypatch.setenv(config.TASK_EVENT_CHANNEL_PREFIX, value)
+    with pytest.raises(ValueError, match="channel prefix"):
+        config.get_task_event_channel_prefix()
+
+
+def test_task_event_channel_prefix_default_and_override(monkeypatch):
+    monkeypatch.delenv(config.TASK_EVENT_CHANNEL_PREFIX, raising=False)
+    assert config.get_task_event_channel_prefix() == "xagent:task-events:v1"
+    monkeypatch.setenv(config.TASK_EVENT_CHANNEL_PREFIX, "xagent:staging:v1")
+    assert config.get_task_event_channel_prefix() == "xagent:staging:v1"
+
+
+@pytest.mark.parametrize(
+    "key", [None, "", "RQMpe38gK3m0szjpSmTNw_sP3Y54r6hDc6JewBoPKXc="]
+)
+def test_task_runtime_secrets_reject_unconfigured_or_public_key(monkeypatch, key):
+    monkeypatch.delenv(config.ENCRYPTION_KEY, raising=False)
+    if key is not None:
+        monkeypatch.setenv(config.ENCRYPTION_KEY, key)
+    assert config.get_task_runtime_secrets_encryption_key() is None
+
+
+def test_task_runtime_secrets_use_explicit_key(monkeypatch):
+    from cryptography.fernet import Fernet
+
+    key = Fernet.generate_key().decode()
+    monkeypatch.setenv(config.ENCRYPTION_KEY, key)
+    assert config.get_task_runtime_secrets_encryption_key() == key

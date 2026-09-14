@@ -41,6 +41,7 @@ from ..auth_dependencies import get_current_user, is_admin_user
 from ..mcp_apps import (
     get_all_mcp_apps,
     get_app_for_mcp_server,
+    normalize_catalog_key,
     restrict_to_app_scoped_oauth_grant,
 )
 from ..models.custom_api import CustomApi, UserCustomApi
@@ -2156,17 +2157,10 @@ def _enrich_oauth_server_info(
     return app_id, provider, connected_account
 
 
-def _normalize_app_key(value: object) -> Optional[str]:
-    if value is None:
-        return None
-    normalized = "-".join(str(value).strip().lower().split())
-    return normalized or None
-
-
 def _app_lookup_keys(*values: object) -> list[str]:
     keys = []
     for value in values:
-        key = _normalize_app_key(value)
+        key = normalize_catalog_key(value)
         if key and key not in keys:
             keys.append(key)
     return keys
@@ -2212,7 +2206,7 @@ def _server_catalog_keys(server: MCPServer) -> list[str]:
     — a key this misses is a #1346 duplicate, while a key it over-matches only
     moves a legacy row to the Remote tab, still editable via /api/mcp/servers.
     """
-    if _normalize_app_key(server.transport) != "oauth":
+    if normalize_catalog_key(server.transport) != "oauth":
         return _app_lookup_keys(server.name)
     return _app_lookup_keys(server.name, *_oauth_server_lookup_keys(server))
 
@@ -2224,7 +2218,7 @@ def _is_reserved_catalog_name(db: Session, name: object) -> bool:
     by normalized id/name, so a squatter would shadow the official shared row (or
     at least DoS legitimate connects). Enforced on both create and rename.
     """
-    key = _normalize_app_key(name)
+    key = normalize_catalog_key(name)
     if not key:
         return False
     return any(key in _catalog_app_keys(app) for app in get_all_mcp_apps(db))
@@ -2259,14 +2253,14 @@ def _is_oauth_server_for_app(server: MCPServer, app: dict) -> bool:
     if server.transport != "oauth":
         return False
 
-    app_id = _normalize_app_key(app.get("id"))
-    provider = _normalize_app_key(app.get("provider"))
-    server_name = _normalize_app_key(server.name)
+    app_id = normalize_catalog_key(app.get("id"))
+    provider = normalize_catalog_key(app.get("provider"))
+    server_name = normalize_catalog_key(server.name)
 
     auth = getattr(server, "auth", None)
     if isinstance(auth, dict):
-        auth_app_id = _normalize_app_key(auth.get("app_id"))
-        auth_provider = _normalize_app_key(auth.get("provider"))
+        auth_app_id = normalize_catalog_key(auth.get("app_id"))
+        auth_provider = normalize_catalog_key(auth.get("provider"))
 
         if auth_app_id and auth_app_id != app_id:
             return False
@@ -2307,7 +2301,7 @@ def _connected_oauth_server_for_app(
 def _build_oauth_account_lookup(oauth_accounts: list[object]) -> dict[str, object]:
     lookup: dict[str, object] = {}
     for account in oauth_accounts:
-        key = _normalize_app_key(getattr(account, "provider", None))
+        key = normalize_catalog_key(getattr(account, "provider", None))
         if key and key not in lookup and _oauth_account_can_connect(account):
             lookup[key] = account
     return lookup
@@ -2316,11 +2310,11 @@ def _build_oauth_account_lookup(oauth_accounts: list[object]) -> dict[str, objec
 def _oauth_server_lookup_keys(server: MCPServer) -> list[str]:
     auth = getattr(server, "auth", None)
     if isinstance(auth, dict):
-        auth_app_id = _normalize_app_key(auth.get("app_id"))
+        auth_app_id = normalize_catalog_key(auth.get("app_id"))
         if auth_app_id:
             return [auth_app_id]
 
-        auth_provider = _normalize_app_key(auth.get("provider"))
+        auth_provider = normalize_catalog_key(auth.get("provider"))
         if auth_provider:
             return [auth_provider]
 
@@ -2332,7 +2326,7 @@ def _build_active_oauth_server_lookup(
 ) -> dict[str, list[MCPServer]]:
     lookup: dict[str, list[MCPServer]] = {}
     for server, user_mcp in user_mcps:
-        if not user_mcp.is_active or _normalize_app_key(server.transport) != "oauth":
+        if not user_mcp.is_active or normalize_catalog_key(server.transport) != "oauth":
             continue
         for key in _oauth_server_lookup_keys(server):
             lookup.setdefault(key, []).append(server)
@@ -2359,8 +2353,8 @@ def _build_active_non_oauth_server_lookup(
 ) -> dict[tuple[str, str], MCPServer]:
     lookup: dict[tuple[str, str], MCPServer] = {}
     for server, user_mcp in user_mcps:
-        transport = _normalize_app_key(server.transport)
-        server_name = _normalize_app_key(server.name)
+        transport = normalize_catalog_key(server.transport)
+        server_name = normalize_catalog_key(server.name)
         if (
             not user_mcp.is_active
             or not transport
@@ -2476,7 +2470,7 @@ def _app_user_env_configured(configured_keys: list[str], required: list[str]) ->
 def _connected_non_oauth_server_for_app(
     app: dict, non_oauth_server_lookup: dict[tuple[str, str], MCPServer]
 ) -> Optional[int]:
-    app_transport = _normalize_app_key(app.get("transport"))
+    app_transport = normalize_catalog_key(app.get("transport"))
     if not app_transport or app_transport == "oauth":
         return None
 
@@ -2710,7 +2704,7 @@ def list_mcp_apps(
         for srv in (
             db.query(MCPServer).filter(MCPServer.name.in_(non_oauth_names)).all()
         ):
-            norm = _normalize_app_key(srv.name)
+            norm = normalize_catalog_key(srv.name)
             if norm:
                 server_by_key.setdefault(norm, srv)
     user_mcp_by_server_id = {cast(int, srv.id): um for srv, um in user_mcps}
@@ -3370,6 +3364,64 @@ def _reject_hidden_catalog_app(app_info: dict) -> None:
         )
 
 
+def _catalog_server_provenance_auth(app_info: dict) -> dict[str, Any] | None:
+    launch = app_info.get("launch_config")
+    marker = launch.get("builtin_provenance") if isinstance(launch, dict) else None
+    if not isinstance(marker, dict):
+        return None
+    return {"builtin_provenance": marker}
+
+
+def _reject_provenance_catalog_collisions(
+    db: Session, app_info: dict, expected_auth: dict[str, Any]
+) -> MCPServer | None:
+    """Return the exact stamped server, rejecting every normalized collision."""
+    from xagent.builtin_identity import canonicalize_builtin_identity
+
+    identity_keys = {
+        canonicalize_builtin_identity(app_info.get("id")),
+        canonicalize_builtin_identity(app_info.get("name")),
+    } - {None}
+    catalog_collisions = [
+        app
+        for app in db.query(PublicMCPApp).all()
+        if {
+            canonicalize_builtin_identity(app.app_id),
+            canonicalize_builtin_identity(app.name),
+        }
+        & identity_keys
+    ]
+    if len(catalog_collisions) != 1 or (
+        str(catalog_collisions[0].app_id) != str(app_info["id"])
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The built-in catalog identity conflicts with a custom app",
+        )
+
+    server_collisions = [
+        server
+        for server in db.query(MCPServer).all()
+        if canonicalize_builtin_identity(server.name) in identity_keys
+    ]
+    if not server_collisions:
+        return None
+    exact_server = next(
+        (
+            server
+            for server in server_collisions
+            if server.name == str(app_info["id"]) and server.auth == expected_auth
+        ),
+        None,
+    )
+    if len(server_collisions) != 1 or exact_server is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The built-in catalog identity conflicts with a custom server",
+        )
+    return exact_server
+
+
 def _ensure_catalog_app_server(db: Session, app_id: str) -> tuple[MCPServer, dict]:
     """Idempotently ensure the shared server row for a key-based or keyless
     catalog app exists, without creating any per-user association. Returns
@@ -3403,7 +3455,12 @@ def _ensure_catalog_app_server(db: Session, app_id: str) -> tuple[MCPServer, dic
     # is what the connector uses to detect an app as connected.
     server_name = str(app_info["id"])
 
-    server = db.query(MCPServer).filter(MCPServer.name == server_name).first()
+    expected_provenance_auth = _catalog_server_provenance_auth(app_info)
+    server = (
+        _reject_provenance_catalog_collisions(db, app_info, expected_provenance_auth)
+        if expected_provenance_auth is not None
+        else db.query(MCPServer).filter(MCPServer.name == server_name).first()
+    )
     # Server names are a single global namespace. A row under this catalog id may
     # be a hijack — a custom server someone created with their own command — so
     # only reuse it if the command/transport match the official launch config.
@@ -3449,7 +3506,10 @@ def _ensure_catalog_app_server(db: Session, app_id: str) -> tuple[MCPServer, dic
             # transport/args; otherwise fall through to the same 409 every
             # such row already got before this change, leaving it and
             # whatever it holds untouched for an operator to resolve.
-            if _server_has_policy_beyond_catalog_identity(server):
+            if (
+                expected_provenance_auth is None
+                and _server_has_policy_beyond_catalog_identity(server)
+            ):
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail="A server with this name already exists with a different configuration",
@@ -3481,7 +3541,15 @@ def _ensure_catalog_app_server(db: Session, app_id: str) -> tuple[MCPServer, dic
                     name=server_name,
                     transport="stdio",
                     description=app_info.get("description"),
-                    config={"command": command, "args": launch.get("args") or []},
+                    config={
+                        "command": command,
+                        "args": launch.get("args") or [],
+                        **(
+                            {"auth": expected_provenance_auth}
+                            if expected_provenance_auth is not None
+                            else {}
+                        ),
+                    },
                 )
             )
         except ValueError as e:
@@ -3490,6 +3558,14 @@ def _ensure_catalog_app_server(db: Session, app_id: str) -> tuple[MCPServer, dic
                 detail=f"Invalid app configuration: {str(e)}",
             )
         server = _add_catalog_server_with_race_recovery(db, config, server_name)
+        if (
+            expected_provenance_auth is not None
+            and server.auth != expected_provenance_auth
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="The built-in catalog identity conflicts with a custom server",
+            )
     return server, app_info
 
 
@@ -4394,7 +4470,7 @@ def _catalog_server_has_platform_key(db: Session, server: MCPServer) -> bool:
         return False
     from ..mcp_apps import get_all_mcp_apps
 
-    key = _normalize_app_key(getattr(server, "name", None))
+    key = normalize_catalog_key(getattr(server, "name", None))
     if not key:
         return False
     for app in get_all_mcp_apps(db):
@@ -4615,10 +4691,10 @@ def _teardown_mcp_app_server_locally(
                     )
                     .all()
                 )
-                normalized_provider = _normalize_app_key(provider)
+                normalized_provider = normalize_catalog_key(provider)
                 sibling_still_connected = any(
                     (sibling_app := get_app_for_mcp_server(db, other_server))
-                    and _normalize_app_key(sibling_app.get("provider"))
+                    and normalize_catalog_key(sibling_app.get("provider"))
                     == normalized_provider
                     for other_server in other_servers
                 )
@@ -4921,10 +4997,10 @@ async def delete_mcp_server(
                         )
                         .all()
                     )
-                    normalized_provider = _normalize_app_key(provider)
+                    normalized_provider = normalize_catalog_key(provider)
                     sibling_still_connected = any(
                         (sibling_app := get_app_for_mcp_server(db, other_server))
-                        and _normalize_app_key(sibling_app.get("provider"))
+                        and normalize_catalog_key(sibling_app.get("provider"))
                         == normalized_provider
                         for other_server in other_servers
                     )

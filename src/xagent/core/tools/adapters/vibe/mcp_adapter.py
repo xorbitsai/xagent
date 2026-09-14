@@ -28,13 +28,16 @@ from typing import (
     Union,
     cast,
 )
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
+from mcp.types import CallToolResult
 from mcp.types import Tool as MCPTool
-from pydantic import BaseModel, Field, create_model
+from pydantic import BaseModel, Field, ValidationError, create_model
 
 from ..... import config as _root_config
 from .....sandbox.base import Sandbox
+from ....utils.security import redact_sensitive_text
 from ...core.mcp.sessions import Connection, create_session
 from ...core.mcp.tools import load_mcp_tools, raw_annotations_for
 from .base import AbstractBaseTool, ToolVisibility
@@ -49,7 +52,16 @@ from .connector_runtime import (
     connector_runtime_from_config,
     runtime_bindings_from_config,
 )
+from .sandboxed_tool.chrome_session import (
+    ChromeDaemonLaunchSpec,
+    ChromeExecutionScope,
+    ChromeExecutionSessionPool,
+    ChromeSessionContractError,
+    chrome_metadata_connection,
+)
 from .sandboxed_tool.sandboxed_mcp_tool_helper import (
+    SandboxedMCPLoadResult,
+    list_tools_in_sandbox,
     load_sandboxed_mcp_tools,
     should_sandbox_mcp_connection,
 )
@@ -227,7 +239,36 @@ class EmptyArgsModel(BaseModel):
 logger = logging.getLogger(__name__)
 _RUNTIME_CONNECTION_REFRESH_KEY = "_connector_runtime_refresh"
 _OAUTH_TOKEN_RESOLVER_REFRESH_KEY = "_oauth_token_resolver_refresh"
-_RESOLVER_HTTP_401_NODE_LIMIT = 64
+# Hard ceiling on how many exception nodes either walk over a failed call
+# visits, so a wide or cyclic __cause__/__context__ graph cannot spin.
+# Two consumers read it: _bounded_exception_nodes (the 401 resolver's
+# challenge lookup) and _level_order_exception_nodes (failure logging).
+_EXCEPTION_WALK_NODE_LIMIT = 64
+# Caps each exception message logged when an MCP tool call fails, so a server
+# that echoes a large payload back in its error (or an SDK that dumps a full
+# request) can't blow up log volume. The cap is per line, not per failure: a
+# plain failure logs one capped line, and an exception-group failure logs one
+# for the group plus up to _MCP_TOOL_ERROR_LOG_MAX_SUB_EXCEPTIONS more, each
+# capped on its own. No traceback is attached to any of them. The message
+# returned to the caller ("Error executing MCP tool.") never carries it.
+_MCP_TOOL_ERROR_LOG_MAX_CHARS = 500
+# Caps str(exc) before either redaction pass in _truncated_error_message runs.
+# str(exc) comes from a remote MCP server (or an SDK relaying its response)
+# and has no length limit of its own, while both redaction passes cost time
+# proportional to their input, so an unbounded message is a CPU-cost lever a
+# hostile or compromised server can pull regardless of how cheap either pass
+# is made per character. This bound only needs to keep the redaction passes
+# themselves cheap -- _MCP_TOOL_ERROR_LOG_MAX_CHARS is still what bounds the
+# final logged size.
+_MCP_TOOL_ERROR_RAW_MAX_CHARS = 4096
+# Caps how many related exceptions of a failed call get their own log line:
+# the leaves of a (possibly nested) BaseExceptionGroup and the exceptions on
+# their __cause__/__context__ chains. A fan-out call (e.g. concurrent
+# sub-requests) can otherwise raise a group with dozens of members.
+# Members at the same nesting depth are visited before any of their own
+# chains, so a fan-out failure logs one line per leg before spending
+# budget on a leg's causes.
+_MCP_TOOL_ERROR_LOG_MAX_SUB_EXCEPTIONS = 5
 _HTTP_401_TEXT_RE = re.compile(
     r"\b(?:http(?:\s+status)?|status(?:\s+code)?|response|code)\s*[:=]?\s*401\b|"
     r"\b401\s+unauthorized\b",
@@ -621,7 +662,7 @@ def _bounded_exception_nodes(
     pending = [(exc, True)]
     visited: set[int] = set()
     visited_count = 0
-    while pending and visited_count < _RESOLVER_HTTP_401_NODE_LIMIT:
+    while pending and visited_count < _EXCEPTION_WALK_NODE_LIMIT:
         current, is_root = pending.pop()
         current_id = id(current)
         if current_id in visited or (
@@ -642,6 +683,254 @@ def _bounded_exception_nodes(
         if isinstance(current.__context__, BaseException):
             linked.append(current.__context__)
         pending.extend((node, False) for node in reversed(linked))
+
+
+def _level_order_exception_nodes(exc: BaseException) -> Iterator[BaseException]:
+    """Yield ``exc`` and the exceptions linked to it in level order: the
+    members of an exception group at one nesting depth are reached before
+    any of those members' own ``__cause__``/``__context__`` chains.
+
+    ``_bounded_exception_nodes`` walks the same edges depth-first, which is
+    what the 401 resolver wants -- it only needs one matching response from
+    anywhere in the graph. A capped log wants the opposite: a fan-out call
+    fails as a group with one member per failed leg, and depth-first order
+    lets the first leg's own cause chain spend the whole per-call budget,
+    so the other legs never get a line at all.
+    """
+    pending: list[BaseException] = [exc]
+    visited: set[int] = set()
+    index = 0
+    while index < len(pending) and len(visited) < _EXCEPTION_WALK_NODE_LIMIT:
+        current = pending[index]
+        index += 1
+        current_id = id(current)
+        if current_id in visited:
+            continue
+        visited.add(current_id)
+        yield current
+
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(current.exceptions)
+        if isinstance(current.__cause__, BaseException):
+            pending.append(current.__cause__)
+        if isinstance(current.__context__, BaseException):
+            pending.append(current.__context__)
+
+
+# A URL token ends only at whitespace or an angle bracket. A quote is NOT a
+# boundary: quotes are legal query-string content, and HTTPX puts the request
+# URL inside single quotes in its own error messages, so stopping at the first
+# quote would end the token in the middle of a query value -- dropping the
+# ``key=`` half with the query while the value stayed outside the token, where
+# the assignment-shaped pass that masks by key name can no longer see it. The
+# cost of consuming the quote instead is one trailing quote missing from the
+# logged sentence. Whitespace and the two angle brackets stay boundaries
+# because they are structural, not typographic: RFC 3986 excludes all three
+# from the URI character set, and HTTPX -- the only producer this has been
+# measured against -- percent-encodes a literal space, ``<``, or ``>`` in a
+# query value before it ever reaches a token here. A producer that does not
+# percent-encode them (this also consumes the ``str()`` of arbitrary
+# non-HTTPX exceptions, e.g. a JSON-RPC error or an echoed server message)
+# can still end a token at a raw ``<``/``>`` the same way a quote used to,
+# splitting a ``key=`` off with the query while its value stays outside the
+# token; ``_MCP_TOOL_ERROR_LOG_MAX_CHARS`` is what bounds that residual.
+_URL_TOKEN_RE = re.compile(r"(?:https?|wss?)://[^\s<>]+", re.IGNORECASE)
+# Punctuation that ends the sentence rather than the URL. Closing brackets
+# are only dropped when the token holds no matching opener, so an IPv6
+# authority ("https://[::1]") and a parenthesised path segment survive.
+_URL_TRAILING_PUNCTUATION = ",.;:"
+_URL_TRAILING_BRACKETS = {")": "(", "]": "[", "}": "{"}
+# Appended by a caller that truncates the text it hands to
+# ``redact_urls_in_text`` (``_truncated_error_message`` is the only producer).
+# A URL token carrying it was cut at an unknown offset, so its remaining
+# authority may be the front half of a ``user:pass`` whose ``@`` was cut away.
+# U+FFFE is a Unicode noncharacter, permanently reserved and never assigned a
+# meaning in interchange text, so in practice its presence comes from that
+# append; nothing stops a remote message from carrying one on its own; if
+# that happens, the only effect is that the token carrying it is redacted
+# too. ``_truncated_error_message``, the only caller that appends it, also
+# strips it unconditionally before anything is logged -- a guarantee scoped
+# to that call site, not to every consumer of ``redact_urls_in_text``.
+_TEXT_TRUNCATION_MARK = "\ufffe"
+
+
+def _split_url_token(token: str) -> tuple[str, str]:
+    """Split a matched URL token into ``(clean, trailing)``.
+
+    ``trailing`` is sentence punctuation immediately following the URL (a
+    closing paren, a period, ...) that should survive redaction even
+    though the URL itself does not; ``clean`` is the token with that
+    punctuation removed, ready to hand to ``urlsplit``.
+
+    The boundary between the two is found by scanning backward from the
+    end of the *scheme+authority+path* portion of the token only -- never
+    past the first ``?`` or ``#`` -- dropping characters that are either
+    in ``_URL_TRAILING_PUNCTUATION`` or a closing bracket with no
+    matching opener earlier in that same portion, until neither applies.
+    Stopping at the query/fragment boundary is deliberate: those parts are
+    dropped wholesale by the caller, so a credential value ending in one
+    of these characters (``...api_key=S)))``) must not have that tail
+    split off, survive the drop, and be reattached to the redacted URL as
+    if it were sentence punctuation -- nothing at or after the boundary is
+    ever part of either return value. Bracket counts for the scanned
+    portion are computed once up front and decremented as brackets are
+    consumed, rather than re-scanned on every character, so the scan is
+    linear in the token length instead of quadratic.
+    """
+    boundary = len(token)
+    for sep in ("?", "#"):
+        idx = token.find(sep)
+        if idx != -1 and idx < boundary:
+            boundary = idx
+    scanned = token[:boundary]
+    remaining = {c: scanned.count(c) for c in _URL_TRAILING_BRACKETS}
+    openers = {c: scanned.count(o) for c, o in _URL_TRAILING_BRACKETS.items()}
+    end = boundary
+    while end > 0:
+        last = token[end - 1]
+        if last in _URL_TRAILING_PUNCTUATION:
+            end -= 1
+            continue
+        if last in _URL_TRAILING_BRACKETS and openers[last] < remaining[last]:
+            remaining[last] -= 1
+            end -= 1
+            continue
+        break
+    return token[:end], token[end:boundary]
+
+
+def redact_urls_in_text(text: str) -> str:
+    """Return ``text`` with every ``scheme://...`` URL replaced by a copy
+    that has its query string and userinfo stripped.
+
+    Exception messages that legitimately need to name the server sometimes
+    embed the full request URL -- e.g. ``httpx.HTTPStatusError``'s message
+    is "... for url '<url>'" and an unfollowed redirect's message names the
+    ``Location`` response header. Connector URLs commonly carry secrets
+    (API keys, tokens) in the query string or in ``user:pass@host``
+    userinfo, so those parts are dropped before the message is logged, and
+    so is the fragment (it never reaches a server and carries no diagnostic
+    value). The scheme, host, port, and path are kept so the log line still
+    says which server failed. A token that fails to parse as a URL, or
+    whose authority does not parse as ``host[:port]``, is replaced
+    wholesale with ``<url redacted>`` rather than risking a partial leak.
+    Two further rules cover userinfo that lost its ``@``, which no
+    authority parse can recognise on its own because ``user:pass`` is
+    byte-for-byte a legal ``host:port``. First, a token that still carries
+    an ``@`` the parsed authority does not -- a password containing ``?``
+    or ``#`` pushes the separator into the query string -- is replaced
+    wholesale: the stray ``@`` is the only evidence left that the
+    authority is a remnant. Second, a caller that truncates the text it
+    passes here must append ``_TEXT_TRUNCATION_MARK``, because a cut can
+    remove the ``@`` outright and leave no evidence at all inside the
+    token; a token carrying the mark was cut at an unknown offset and is
+    likewise replaced wholesale. What is still kept is an authority with
+    no such evidence against it: ``https://alice:12345`` standing alone in
+    an untruncated message is indistinguishable from a host named
+    ``alice`` on port 12345, and rejecting it would reject every legal
+    ``host:port``. ``ws://``/``wss://`` tokens are covered the same way as
+    ``http``/``https``, because a websocket transport cannot send headers,
+    so a websocket connector has nowhere but the URL to put its credential.
+    Sentence punctuation that trails the token (a closing paren, a period,
+    ...) is split off before parsing and re-appended to the result
+    afterwards, so redaction does not eat the punctuation that follows a
+    URL -- but only punctuation trailing the scheme/authority/path:
+    nothing at or after the first ``?``/``#`` is ever treated as trailing,
+    since that is where the query string / fragment begins and both are
+    dropped wholesale (see ``_split_url_token``). Text separated from the
+    URL only by a character that is legal inside a query string (a comma,
+    say) is still part of the token and is dropped with the query; see
+    the ``comma-inside-query`` test case.
+    """
+
+    def _redact(match: "re.Match[str]") -> str:
+        token = match.group(0)
+        clean, trailing = _split_url_token(token)
+        try:
+            if _TEXT_TRUNCATION_MARK in token:
+                # The text was cut inside this token, so its real extent is
+                # unknown: what is left of the authority can be the front half
+                # of a ``user:pass`` whose ``@`` was cut away, which is
+                # byte-for-byte a legal ``host:port``. Only the caller that
+                # cut the text knows that happened, which is what the mark
+                # carries.
+                raise ValueError("truncated URL token")
+            parts = urlsplit(clean)
+            # Fail closed unless the authority parses as ``host[:port]``.
+            # ``SplitResult.port`` is the standard library's own reading of
+            # that field and raises ``ValueError`` on anything that is not a
+            # port number, so the ``except`` below turns the whole URL into
+            # ``<url redacted>``. Reading it IS the check: deleting this line
+            # as an unused assignment removes the guard. It covers userinfo
+            # left where an authority belongs with no ``@`` in the token at
+            # all -- ``https://alice:PASSWORDabcd`` -- which the ``@`` check
+            # below cannot see.
+            _port = parts.port
+            authority = parts.netloc
+            if "@" in token and "@" not in authority:
+                # The token carries a userinfo separator that the parsed
+                # authority does not: ``urlsplit`` ends the authority at the
+                # first ``?``/``#``, so a password holding one of those pushes
+                # the ``@`` into the query string and leaves ``user:pass``
+                # sitting where ``host:port`` belongs -- and that remnant can
+                # itself be a legal authority (``https://alice:123``,
+                # ``https://SECRET_API_KEY``), which no parse can reject. The
+                # original ``@`` is the only evidence that it is a remnant, so
+                # the whole token goes.
+                raise ValueError("userinfo separator outside the authority")
+            # Keep the authority verbatim minus userinfo: re-assembling it
+            # from ``hostname``/``port`` would drop IPv6 brackets and lower
+            # the case.
+            netloc = authority.rsplit("@", 1)[-1]
+            return urlunsplit((parts.scheme, netloc, parts.path, "", "")) + trailing
+        except ValueError:
+            # UnicodeError is a ValueError subclass, so this also covers a
+            # token that fails to decode as IDNA.
+            return "<url redacted>" + trailing
+
+    return _URL_TOKEN_RE.sub(_redact, text)
+
+
+def _truncated_error_message(exc: BaseException) -> str:
+    """Return ``str(exc)`` made safe to log: URLs lose their query string,
+    userinfo and fragment (``redact_urls_in_text``), header- and
+    assignment-shaped secrets are masked (``redact_sensitive_text``), and
+    the result is bounded to ``_MCP_TOOL_ERROR_LOG_MAX_CHARS``. It is
+    otherwise just the exception's own message (e.g. a JSON-RPC error
+    string or an HTTP status line) -- it must never be additionally handed
+    tool_args, tool_meta, or connection headers, none of which are
+    exception messages to begin with. Some shapes are recognised by neither
+    helper -- a secret in a URL path segment (#2272), some of the shapes
+    listed in #2356, and a query value containing a raw ``<`` or ``>`` from
+    a non-HTTPX producer (HTTPX itself percent-encodes both) -- and for
+    those the cap is what bounds the exposure.
+    ``str(exc)`` is also bounded to ``_MCP_TOOL_ERROR_RAW_MAX_CHARS`` before
+    either redaction pass runs, since it is remote-controlled and unbounded
+    while both passes cost time proportional to their input. Cutting the
+    raw text can land between a URL's password and its ``@``, leaving a
+    remnant that is byte-for-byte a legal ``host:port``. The cut therefore
+    appends ``_TEXT_TRUNCATION_MARK`` so ``redact_urls_in_text`` can
+    replace that whole token instead of keeping its visible half; the mark
+    is removed again from the redacted text, so it never reaches a log
+    line.
+    """
+    try:
+        raw = str(exc)
+        if len(raw) > _MCP_TOOL_ERROR_RAW_MAX_CHARS:
+            raw = raw[:_MCP_TOOL_ERROR_RAW_MAX_CHARS] + _TEXT_TRUNCATION_MARK
+        text = redact_sensitive_text(redact_urls_in_text(raw)).replace(
+            _TEXT_TRUNCATION_MARK, ""
+        )
+    except BaseException:
+        # Every caller is an ``except`` handler whose contract is to return
+        # a result dict, so a custom ``__str__`` that raises must not escape
+        # here. ``BaseException`` is deliberate: nothing in the guarded block
+        # awaits, so no cancellation can originate in it, and a ``__str__``
+        # is free to raise a BaseException subclass.
+        return type(exc).__name__
+    if len(text) <= _MCP_TOOL_ERROR_LOG_MAX_CHARS:
+        return text
+    return text[: _MCP_TOOL_ERROR_LOG_MAX_CHARS - 1].rstrip() + "…"
 
 
 def _strict_http_401_responses(
@@ -859,6 +1148,43 @@ def _mcp_return_value_as_string(value: Any) -> str:
     except Exception as e:
         logger.warning(f"Failed to convert return value to string: {e}")
         return str(value)
+
+
+def _normalized_mcp_call_result(
+    value: Any, *, validate_wire: bool = False
+) -> dict[str, Any]:
+    """Validate a wire result and render the stable agent-facing shape."""
+
+    if validate_wire:
+        if (
+            not isinstance(value, Mapping)
+            or type(value.get("isError", False)) is not bool
+        ):
+            raise ChromeSessionContractError("Chrome daemon returned invalid result")
+        try:
+            result = CallToolResult.model_validate(value)
+        except ValidationError as exc:
+            raise ChromeSessionContractError(
+                "Chrome daemon returned invalid result"
+            ) from exc
+    else:
+        result = value
+    content = []
+    if result.content:
+        for content_item in result.content:
+            if hasattr(content_item, "model_dump"):
+                content.append(content_item.model_dump())
+            else:
+                content.append({"text": str(content_item)})
+    # MCP SDK 1.x and 2.x expose different Python attribute spellings, while
+    # the wire aliases remain stable. Keep aliases here and handle content
+    # separately so nested content metadata is not renamed unexpectedly.
+    other_fields = result.model_dump(by_alias=True, exclude={"content"})
+    return {
+        "content": content,
+        "structured_content": other_fields.get("structuredContent"),
+        "is_error": bool(other_fields.get("isError")),
+    }
 
 
 def _format_unavailable_mcp_tool_name(server_name: str, server_id: Any | None) -> str:
@@ -1414,12 +1740,34 @@ class MCPToolAdapter(AbstractBaseTool):
                         return retry_result
                     raise
 
+        # The tool-loading handlers (_load_direct_mcp_tools,
+        # load_mcp_tools_as_agent_tools) log only the class name above DEBUG
+        # and keep the raw traceback (exc_info) for DEBUG, because a traceback
+        # is unredacted and unbounded. These two handlers log at ERROR, but
+        # only _truncated_error_message() output -- passed through
+        # redact_urls_in_text and redact_sensitive_text and capped per line --
+        # and never a traceback, so do not add exc_info here. Shapes neither
+        # helper recognises: #2272 and some of those listed in #2356.
         except BaseExceptionGroup as e:
             logger.error(
-                "MCP tool %s execution failed with exception group %s",
+                "MCP tool %s execution failed with exception group %s: %s",
                 self.mcp_tool.name,
                 type(e).__name__,
+                _truncated_error_message(e),
             )
+            leaf_count = 0
+            for node in _level_order_exception_nodes(e):
+                if node is e or isinstance(node, BaseExceptionGroup):
+                    continue
+                if leaf_count >= _MCP_TOOL_ERROR_LOG_MAX_SUB_EXCEPTIONS:
+                    break
+                leaf_count += 1
+                logger.error(
+                    "MCP tool %s execution failed with related exception %s: %s",
+                    self.mcp_tool.name,
+                    type(node).__name__,
+                    _truncated_error_message(node),
+                )
             return {
                 "content": [{"text": "Error executing MCP tool."}],
                 "is_error": True,
@@ -1427,9 +1775,10 @@ class MCPToolAdapter(AbstractBaseTool):
 
         except Exception as e:
             logger.error(
-                "MCP tool %s execution failed with %s",
+                "MCP tool %s execution failed with %s: %s",
                 self.mcp_tool.name,
                 type(e).__name__,
+                _truncated_error_message(e),
             )
             return {
                 "content": [{"text": "Error executing MCP tool."}],
@@ -1450,29 +1799,7 @@ class MCPToolAdapter(AbstractBaseTool):
                 meta=dict(tool_meta) or None,
             )
 
-            content = []
-            if result.content:
-                for content_item in result.content:
-                    if hasattr(content_item, "model_dump"):
-                        content.append(content_item.model_dump())
-                    else:
-                        content.append({"text": str(content_item)})
-
-            # Read by wire name (by_alias=True), not by Python attribute name:
-            # the mcp SDK's CallToolResult field naming has changed across
-            # major versions (1.x uses plain camelCase attributes, 2.x uses
-            # snake_case attributes with a camelCase alias), but the MCP
-            # wire/JSON field names ("structuredContent", "isError") are
-            # spec-fixed and stable across both. `content` is excluded and
-            # handled by the loop above instead, since by_alias=True would
-            # also rename each content item's `meta` field to `_meta`.
-            other_fields = result.model_dump(by_alias=True, exclude={"content"})
-
-            return {
-                "content": content,
-                "structured_content": other_fields.get("structuredContent"),
-                "is_error": bool(other_fields.get("isError")),
-            }
+            return _normalized_mcp_call_result(result)
 
     async def _retry_after_authorization_failure(
         self,
@@ -1623,7 +1950,16 @@ class MCPToolAdapter(AbstractBaseTool):
             if target.get("target_type") != TARGET_TOOL_ARGUMENTS:
                 continue
             target_key = target.get("key")
-            if not isinstance(target_key, str) or target_key not in properties:
+            if not isinstance(target_key, str):
+                continue
+            if target_key not in properties:
+                logger.warning(
+                    "Skipping runtime MCP tool argument binding for %s on "
+                    "tool %s: the tool's input schema does not declare "
+                    "this argument",
+                    target_key,
+                    self.mcp_tool.name,
+                )
                 continue
             value = binding_source_value(
                 binding,
@@ -1680,6 +2016,53 @@ class MCPToolAdapter(AbstractBaseTool):
     def return_value_as_string(self, value: Any) -> str:
         """Convert return value to string representation."""
         return _mcp_return_value_as_string(value)
+
+
+class ChromeExecutionMCPToolAdapter(MCPToolAdapter):
+    """MCP adapter whose calls share one sandbox-owned Chrome daemon."""
+
+    def __init__(
+        self,
+        *args: Any,
+        chrome_pool: ChromeExecutionSessionPool,
+        chrome_scope: ChromeExecutionScope,
+        chrome_launch: ChromeDaemonLaunchSpec,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._chrome_pool = chrome_pool
+        self._chrome_scope = chrome_scope
+        self._chrome_launch = chrome_launch
+
+    async def _execute_mcp_call(
+        self,
+        connection: Connection,
+        tool_args: Mapping[str, Any],
+        tool_meta: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        if connection is not self.connection or tool_meta:
+            raise ChromeSessionContractError(
+                "Chrome execution connection changed after identity binding"
+            )
+        result = await self._chrome_pool.invoke_tool(
+            self._chrome_scope,
+            self._chrome_launch,
+            self.mcp_tool.name,
+            tool_args,
+        )
+        try:
+            return _normalized_mcp_call_result(result, validate_wire=True)
+        except ChromeSessionContractError:
+            await self._chrome_pool.close_shielded(self._chrome_scope)
+            raise
+
+    async def teardown(self, task_id: Optional[str] = None) -> None:
+        try:
+            await self._chrome_pool.close_shielded(self._chrome_scope)
+        except asyncio.CancelledError:
+            # The pool-owned cleanup task remains alive. Do not abort Runner's
+            # reverse teardown pass before the remaining tools are visited.
+            return
 
 
 class _UnavailableMCPToolResult(BaseModel):
@@ -1842,6 +2225,96 @@ def _build_mcp_tool_adapter(
         # sandboxed loader attach it, so one builder serves both paths and
         # neither can quietly lose the evidence the other keeps.
         raw_annotations=raw_annotations_for(mcp_tool),
+    )
+
+
+def _build_execution_scoped_chrome_tool_adapter(
+    server_name: str,
+    connection: Connection,
+    mcp_tool: MCPTool,
+    *,
+    pool: ChromeExecutionSessionPool,
+    scope: ChromeExecutionScope,
+    launch: ChromeDaemonLaunchSpec,
+    name_prefix: str,
+    visibility: Optional[ToolVisibility],
+    allow_users: Optional[List[str]],
+    concurrency_safe: bool,
+    concurrent_tools: list[str],
+) -> ChromeExecutionMCPToolAdapter:
+    tool_prefix = f"{name_prefix}{server_name}_" if name_prefix else f"{server_name}_"
+    from .selection_spec import normalize_mcp_server_name
+
+    return ChromeExecutionMCPToolAdapter(
+        mcp_tool=mcp_tool,
+        connection=connection,
+        name_prefix=tool_prefix,
+        visibility=visibility,
+        allow_users=allow_users,
+        source_server=normalize_mcp_server_name(server_name),
+        concurrency_safe=concurrency_safe,
+        concurrent_tools=concurrent_tools,
+        raw_annotations=raw_annotations_for(mcp_tool),
+        chrome_pool=pool,
+        chrome_scope=scope,
+        chrome_launch=launch,
+    )
+
+
+async def load_execution_scoped_chrome_tools(
+    server_name: str,
+    connection: Connection,
+    *,
+    scope: ChromeExecutionScope,
+    name_prefix: str = "mcp_",
+    visibility: Optional[ToolVisibility] = None,
+    allow_users: Optional[List[str]] = None,
+) -> SandboxedMCPLoadResult:
+    # Lazy web import preserves the existing core-only MCP adapter import path.
+    from .....web.services.chrome_mcp_runtime import (
+        get_chrome_execution_session_pool,
+    )
+
+    launch = ChromeDaemonLaunchSpec.from_connection(connection)
+    pool = get_chrome_execution_session_pool()
+    session = await pool.get_or_create(scope, launch)
+    try:
+        mcp_tools = await list_tools_in_sandbox(
+            session.sandbox,
+            chrome_metadata_connection(connection),
+        )
+    except BaseException:
+        await pool.close_shielded(scope)
+        raise
+
+    concurrency_safe, concurrent_tools = _connection_concurrency_config(connection)
+    tools: list[AbstractBaseTool] = []
+    adapter_errors: list[str] = []
+    for mcp_tool in mcp_tools:
+        try:
+            tools.append(
+                _build_execution_scoped_chrome_tool_adapter(
+                    server_name,
+                    connection,
+                    mcp_tool,
+                    pool=pool,
+                    scope=scope,
+                    launch=launch,
+                    name_prefix=name_prefix,
+                    visibility=visibility,
+                    allow_users=allow_users,
+                    concurrency_safe=concurrency_safe,
+                    concurrent_tools=concurrent_tools,
+                )
+            )
+        except Exception as exc:
+            adapter_errors.append(type(exc).__name__)
+    if not tools:
+        await pool.close_shielded(scope)
+    return SandboxedMCPLoadResult(
+        tools=tuple(tools),
+        adapter_error_types=tuple(adapter_errors),
+        wrap_error_types=(),
     )
 
 

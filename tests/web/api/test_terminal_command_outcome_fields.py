@@ -19,12 +19,13 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from xagent.web.api import websocket as websocket_api
-from xagent.web.api.websocket import (
-    ClientVisibleTaskCommandDeferred,
-    execute_durable_task_command,
-)
+from xagent.web.services import task_command_execution as command_execution_service
 from xagent.web.services.external_task_input import (
     EXTERNAL_INPUT_NOT_APPLIED_MESSAGE,
+)
+from xagent.web.services.task_command_execution import (
+    ClientVisibleTaskCommandDeferred,
+    execute_durable_task_command,
 )
 from xagent.web.services.task_command_terminal_events import (
     FIRST_PARTY_MESSAGE_NOT_APPLIED_MESSAGE,
@@ -69,7 +70,7 @@ async def _run_terminal(command: ClaimedTaskCommand, error: BaseException) -> di
 
     with (
         patch.object(
-            websocket_api,
+            command_execution_service,
             "_execute_durable_task_command",
             new=AsyncMock(side_effect=error),
         ),
@@ -254,7 +255,7 @@ async def test_one_step_below_the_terminal_boundary_broadcasts_nothing(
 
     with (
         patch.object(
-            websocket_api,
+            command_execution_service,
             "_execute_durable_task_command",
             new=AsyncMock(side_effect=error),
         ),
@@ -295,7 +296,9 @@ async def test_broadcast_reads_the_bound_draft_not_the_exception() -> None:
         "broadcast_to_task",
         new=AsyncMock(),
     ) as broadcast:
-        await websocket_api._broadcast_terminal_command_error(command, error)
+        await command_execution_service._broadcast_terminal_command_error(
+            command, error
+        )
 
     frame, task_id = broadcast.await_args.args
     assert task_id == command.task_id

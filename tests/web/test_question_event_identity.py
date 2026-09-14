@@ -5,7 +5,10 @@ from typing import Any
 import pytest
 
 from xagent.core.agent import PatternRuntime
-from xagent.web.api.websocket import create_stream_event, make_agent_outbound_handler
+from xagent.web.services.task_execution import (
+    create_stream_event,
+    make_agent_outbound_handler,
+)
 
 
 @pytest.mark.asyncio
@@ -22,7 +25,7 @@ async def test_question_identity_is_shared_by_runtime_persistence_and_broadcast(
         broadcast.append(dict(event))
 
     monkeypatch.setattr(
-        "xagent.web.api.websocket._persist_agent_outbound_event",
+        "xagent.web.services.task_execution._persist_agent_outbound_event",
         fake_persist,
     )
     monkeypatch.setattr(

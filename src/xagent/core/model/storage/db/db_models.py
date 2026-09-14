@@ -7,6 +7,8 @@ from cryptography.fernet import Fernet
 from sqlalchemy import JSON, Boolean, Column, DateTime, Float, Integer, String, Text
 from sqlalchemy.sql import func
 
+from .....config import DEV_FALLBACK_ENCRYPTION_KEY
+
 
 def create_model_table(Base: Type[Any]) -> Type[Any]:
     """
@@ -68,7 +70,7 @@ def create_model_table(Base: Type[Any]) -> Type[Any]:
             encryption_key = os.getenv("ENCRYPTION_KEY")
             if not encryption_key:
                 # FIXME: For dev only
-                return "RQMpe38gK3m0szjpSmTNw_sP3Y54r6hDc6JewBoPKXc="
+                return DEV_FALLBACK_ENCRYPTION_KEY
             return encryption_key
 
         @property

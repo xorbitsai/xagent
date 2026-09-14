@@ -13,13 +13,13 @@ it two different ways (see task_interaction_close.py's module docstring,
 _update_a2a_resume_input_sync's inline comment, and
 _update_reply_input_sync's inline comment):
 
-* The two WebSocket injection sites (websocket.py) share one
+* The online and deferred injection sites (task_command_execution.py and
+  task_execution.py) share one
   short-transaction helper, close_legacy_resume_interaction_sync, which
   takes one explicit FOR NO KEY UPDATE / key_share=True lock read before
   calling into the close-and-clear function -- one lock read, not two,
   because the obligation moved into the shared helper.
-* The A2A resume-input site (a2a.py) and the v1 reply resume-input site
-  (task_reply.py) each take no lock read of their own: the resume-input
+* The A2A and v1 reply resume-input sites (task_resume.py) each take no lock read of their own: the resume-input
   fence UPDATE each already issues, ahead of its close call, is the first
   statement that transaction directs at tasks or task_interaction_requests,
   and (being a non-key-column UPDATE) already carries the ordering and
@@ -60,9 +60,12 @@ import ast
 from pathlib import Path
 
 import xagent
-from xagent.web.api import a2a, websocket
-from xagent.web.api.v1 import task_reply
-from xagent.web.services import task_interaction_close
+from xagent.web.services import (
+    task_command_execution,
+    task_execution,
+    task_interaction_close,
+    task_resume,
+)
 
 CLOSE_MODULE_NAME = "task_interaction_close"
 UNLOCKED_CLOSE_FUNCTION = "close_legacy_resume_interaction"
@@ -73,7 +76,7 @@ UNLOCKED_CLOSE_FUNCTION = "close_legacy_resume_interaction"
 # statement the transaction directs at tasks or task_interaction_requests.
 # Any other name added here must carry the same kind of argument, not just
 # a passing test.
-APPROVED_UNLOCKED_CALLERS = frozenset({"a2a", "task_reply"})
+APPROVED_UNLOCKED_CALLERS = frozenset({"task_resume"})
 
 POST_USER_MESSAGE_CALL_NAME = "post_user_message"
 CLOSE_FAMILY_CALL_NAMES = frozenset(
@@ -85,9 +88,9 @@ CLOSE_FAMILY_CALL_NAMES = frozenset(
 )
 # web/ modules that call post_user_message but are exempt from the
 # close-family wiring obligation checked below. Empty by construction:
-# every known post_user_message call site today (a2a.py, websocket.py,
-# task_reply.py) wires in a close-family call. A new call site should wire
-# one in too, not be added here as an exception.
+# every known post_user_message call site today (task_resume.py,
+# task_command_execution.py, task_execution.py) wires in a close-family call. A new call
+# site should wire one in too, not be added here as an exception.
 APPROVED_UNWIRED_POST_USER_MESSAGE_CALLERS: frozenset[str] = frozenset()
 
 
@@ -185,11 +188,12 @@ def test_close_sync_takes_the_lock_read_before_the_close_call() -> None:
 
 def test_both_websocket_injection_sites_call_the_shared_close_helper() -> None:
     """The online and deferred injection handlers each call the shared
-    helper exactly once, and it is called from nowhere else in the
+    helper exactly once, and it is called from nowhere else in either
     module."""
-    tree = ast.parse(_source(websocket))
-    online = _find_function(tree, "_handle_chat_message_unserialized")
-    deferred = _find_function(tree, "execute_resume_background")
+    command_tree = ast.parse(_source(task_command_execution))
+    execution_tree = ast.parse(_source(task_execution))
+    online = _find_function(command_tree, "handle_task_message")
+    deferred = _find_function(execution_tree, "execute_resume_background")
     online_calls = _call_lines(online, attr="close_legacy_resume_interaction_sync")
     deferred_calls = _call_lines(deferred, attr="close_legacy_resume_interaction_sync")
     assert len(online_calls) == 1, (
@@ -200,11 +204,13 @@ def test_both_websocket_injection_sites_call_the_shared_close_helper() -> None:
         "expected exactly one close_legacy_resume_interaction_sync call in "
         f"the deferred injection handler, found {len(deferred_calls)}"
     )
-    all_calls = _call_lines(tree, attr="close_legacy_resume_interaction_sync")
+    all_calls = _call_lines(
+        command_tree, attr="close_legacy_resume_interaction_sync"
+    ) + _call_lines(execution_tree, attr="close_legacy_resume_interaction_sync")
     assert len(all_calls) == 2, (
         "close_legacy_resume_interaction_sync must be called from exactly "
         f"the two websocket injection sites, found {len(all_calls)} call(s) "
-        "across the module"
+        "across the command and execution services"
     )
 
 
@@ -221,7 +227,9 @@ def test_a2a_resume_input_fence_precedes_the_close_call() -> None:
 
     Moving the fence UPDATE after the close call turns this red.
     """
-    fn = _find_function(ast.parse(_source(a2a)), "_update_a2a_resume_input_sync")
+    fn = _find_function(
+        ast.parse(_source(task_resume)), "_update_a2a_resume_input_sync"
+    )
     fence_update_lines = [
         node.lineno
         for node in ast.walk(fn)
@@ -293,7 +301,9 @@ def test_a2a_resume_input_close_is_gated_by_table_exists_check() -> None:
     Deleting the ``if interaction_requests_table_exists(db):`` guard, or
     moving the close call outside its body, turns this red.
     """
-    fn = _find_function(ast.parse(_source(a2a)), "_update_a2a_resume_input_sync")
+    fn = _find_function(
+        ast.parse(_source(task_resume)), "_update_a2a_resume_input_sync"
+    )
     guard_line = _table_exists_guard_line_for_close_call(
         fn, close_call_attr="close_legacy_resume_interaction"
     )
@@ -305,13 +315,13 @@ def test_a2a_resume_input_close_is_gated_by_table_exists_check() -> None:
 
 
 def test_reply_resume_input_close_is_gated_by_table_exists_check() -> None:
-    """Same obligation as the A2A site, above, for task_reply.py's
+    """Same obligation as the A2A site, above, for task_resume.py's
     fence-and-close pair.
 
     Deleting the ``if interaction_requests_table_exists(db):`` guard, or
     moving the close call outside its body, turns this red.
     """
-    fn = _find_function(ast.parse(_source(task_reply)), "_update_reply_input_sync")
+    fn = _find_function(ast.parse(_source(task_resume)), "_update_reply_input_sync")
     guard_line = _table_exists_guard_line_for_close_call(
         fn, close_call_attr="close_legacy_resume_interaction"
     )
@@ -344,20 +354,24 @@ def test_a2a_resume_input_fence_writes_exactly_the_approved_columns() -> None:
     column it writes is a non-key column. Adding a key column -- or any
     column covered by a unique index -- to the UPDATE's values without
     re-justifying that argument and widening
-    a2a.RESUME_INPUT_FENCE_UPDATE_COLUMNS to match must turn this red.
+    task_resume.RESUME_INPUT_FENCE_UPDATE_COLUMNS to match must turn this red.
     """
-    fn = _find_function(ast.parse(_source(a2a)), "_update_a2a_resume_input_sync")
-    assert _fence_update_value_columns(fn) == set(a2a.RESUME_INPUT_FENCE_UPDATE_COLUMNS)
+    fn = _find_function(
+        ast.parse(_source(task_resume)), "_update_a2a_resume_input_sync"
+    )
+    assert _fence_update_value_columns(fn) == set(
+        task_resume.RESUME_INPUT_FENCE_UPDATE_COLUMNS
+    )
 
 
 def test_reply_resume_input_fence_precedes_the_close_call() -> None:
     """The v1 reply resume-input fence UPDATE must precede the close call it
     satisfies the lock obligation for -- the same argument as the A2A site,
-    applied to task_reply.py's own fence-and-close pair.
+    applied to task_resume.py's own fence-and-close pair.
 
     Moving the fence UPDATE after the close call turns this red.
     """
-    fn = _find_function(ast.parse(_source(task_reply)), "_update_reply_input_sync")
+    fn = _find_function(ast.parse(_source(task_resume)), "_update_reply_input_sync")
     fence_update_lines = [
         node.lineno
         for node in ast.walk(fn)
@@ -386,11 +400,11 @@ def test_reply_resume_input_fence_writes_exactly_the_approved_columns() -> None:
     column it writes is a non-key column, the same argument the A2A site
     makes. Adding a key column -- or any column covered by a unique index --
     to the UPDATE's values without re-justifying that argument and widening
-    task_reply.RESUME_INPUT_FENCE_UPDATE_COLUMNS to match must turn this red.
+    task_resume.RESUME_INPUT_FENCE_UPDATE_COLUMNS to match must turn this red.
     """
-    fn = _find_function(ast.parse(_source(task_reply)), "_update_reply_input_sync")
+    fn = _find_function(ast.parse(_source(task_resume)), "_update_reply_input_sync")
     assert _fence_update_value_columns(fn) == set(
-        task_reply.RESUME_INPUT_FENCE_UPDATE_COLUMNS
+        task_resume.RESUME_INPUT_FENCE_UPDATE_COLUMNS
     )
 
 
@@ -437,7 +451,7 @@ def test_unlocked_close_is_only_called_from_the_approved_sites() -> None:
     (see the module docstring above). Scans every source file under the
     installed xagent package, so a new caller added anywhere without
     updating APPROVED_UNLOCKED_CALLERS is caught regardless of which
-    package it lands in, not only websocket.py, a2a.py, and task_reply.py.
+    package it lands in, not only task_resume.py and the execution modules.
 
     Known blind spot, not fixed here: this matches the call as written
     (``close_legacy_resume_interaction(...)`` or
@@ -472,7 +486,8 @@ def test_every_post_user_message_caller_wires_the_close_family() -> None:
     This is a module-level check, not a call-site-level one: it proves a
     close-family call exists somewhere in the module, not that it runs on
     every code path that reaches post_user_message. Today's four call
-    sites across three modules (a2a.py, websocket.py x2, task_reply.py)
+    sites across three modules (task_resume.py, task_command_execution.py,
+    task_execution.py)
     each carry their own per-site argument for why their wiring is
     complete; see the tests
     above and task_interaction_close.py's module docstring.

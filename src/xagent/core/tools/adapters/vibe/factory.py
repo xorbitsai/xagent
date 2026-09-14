@@ -25,6 +25,7 @@ from .....core.workspace import TaskWorkspace
 from ...core.knowledge_base_scope import KnowledgeBaseScopeError
 from .base import BINDING_AUTHORIZED_CATEGORIES, AbstractBaseTool, Tool
 from .config import (
+    ACTOR_STDIO_SESSION_RUNTIME_UNAVAILABLE_REASON,
     BaseToolConfig,
     MCPFailurePolicy,
     MCPUnavailableSummary,
@@ -39,7 +40,13 @@ from .selection_spec import ToolSelectionSpec
 
 if TYPE_CHECKING:
     from .....sandbox.base import Sandbox
+    from .....web.services.actor_mcp_runtime import ActorMCPStdioSessionIdentity
     from .mcp_adapter import MCPServerLoadFailure
+
+    ActorMCPStdioSessionConsumer = Callable[
+        ...,
+        Any,
+    ]
 
 logger = logging.getLogger(__name__)
 
@@ -1032,8 +1039,10 @@ class ToolFactory:
     async def _create_mcp_tools_from_configs(
         mcp_configs: list[dict[str, Any]],
         sandbox: Optional["Sandbox"] = None,
+        actor_stdio_session_identities: "Mapping[str, ActorMCPStdioSessionIdentity] | None" = None,
+        actor_stdio_session_consumer: "ActorMCPStdioSessionConsumer | None" = None,
     ) -> list[Tool]:
-        """Create MCP tools from configurations."""
+        """Create MCP tools while keeping actor session identity host-only."""
         try:
             from .mcp_adapter import load_mcp_tools_as_agent_tools
 
@@ -1067,6 +1076,8 @@ class ToolFactory:
             if normal_configs:
                 connections: dict[str, Any] = {}
                 configs_by_name: dict[str, dict[str, Any]] = {}
+                session_requests: list[tuple[str, dict[str, Any], Any]] = []
+                session_identities = actor_stdio_session_identities or {}
                 try:
                     # Convert configs to connection format
                     for config in normal_configs:
@@ -1143,8 +1154,55 @@ class ToolFactory:
                                     "args"
                                 ].split()
 
-                        connections[server_name] = connection_config
                         configs_by_name[server_name] = config
+                        session_identity = session_identities.get(server_name)
+                        if session_identity is not None:
+                            if actor_stdio_session_consumer is None:
+                                unavailable_tools.append(
+                                    ToolFactory._create_unavailable_mcp_tool(
+                                        server_name=server_name,
+                                        server_id=config.get("id"),
+                                        reason=ACTOR_STDIO_SESSION_RUNTIME_UNAVAILABLE_REASON,
+                                        message=(
+                                            "MCP server session runtime is unavailable."
+                                        ),
+                                    )
+                                )
+                                continue
+                            session_requests.append(
+                                (server_name, connection_config, session_identity)
+                            )
+                            continue
+                        connections[server_name] = connection_config
+
+                    for server_name, connection, identity in session_requests:
+                        try:
+                            consumed_tools = await actor_stdio_session_consumer(
+                                server_name=server_name,
+                                connection=connection,
+                                session_identity=identity,
+                                sandbox=sandbox,
+                            )
+                            normal_tools.extend(consumed_tools)
+                        except ConnectorRuntimeError:
+                            raise
+                        except Exception as exc:
+                            logger.warning(
+                                "Actor stdio session consumer failed for server "
+                                "'%s' (%s)",
+                                server_name,
+                                type(exc).__name__,
+                            )
+                            unavailable_tools.append(
+                                ToolFactory._create_unavailable_mcp_tool(
+                                    server_name=server_name,
+                                    server_id=configs_by_name[server_name].get("id"),
+                                    reason=ACTOR_STDIO_SESSION_RUNTIME_UNAVAILABLE_REASON,
+                                    message=(
+                                        "MCP server session runtime is unavailable."
+                                    ),
+                                )
+                            )
 
                     # Load MCP tools
                     if connections:
@@ -1152,7 +1210,7 @@ class ToolFactory:
                             connections,
                             sandbox=sandbox,
                         )  # type: ignore[arg-type]
-                        normal_tools = list(load_result.tools)
+                        normal_tools.extend(load_result.tools)
                         unavailable_tools.extend(
                             ToolFactory._unavailable_mcp_tools_from_load_failures(
                                 load_result.failures,

@@ -10,10 +10,10 @@ from __future__ import annotations
 
 import pytest
 
-from xagent.web.api.chat import AgentServiceManager
 from xagent.web.models.database import Base, get_db, get_engine, init_db
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
+from xagent.web.services.agent_service_manager import AgentServiceManager
 from xagent.web.services.share_rate_limit import reset_share_rate_limiter
 
 
@@ -430,7 +430,7 @@ def test_coerce_optional_entity_id_rejects_non_positive_int_inputs() -> None:
     inf (whose int() raises OverflowError, escaping the narrow except), and
     junk all degrade to None ("unkeyable → admit") rather than keying a wrong
     bucket or crashing. Genuine positive ints and digit strings pass through."""
-    from xagent.web.api.chat import _coerce_optional_entity_id
+    from xagent.web.services.agent_service_manager import _coerce_optional_entity_id
 
     assert _coerce_optional_entity_id(42) == 42
     assert _coerce_optional_entity_id("42") == 42

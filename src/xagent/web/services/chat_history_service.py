@@ -660,6 +660,7 @@ def persist_assistant_message(
     interactions: Optional[List[Dict[str, Any]]] = None,
     turn_id: Optional[str] = None,
     content_is_reconciled: bool = False,
+    source_event_id: Optional[str] = None,
 ) -> Optional[TaskChatMessage]:
     reconciled_content = (
         content
@@ -683,6 +684,7 @@ def persist_assistant_message(
         message_type=message_type,
         interactions=interactions,
         turn_id=turn_id,
+        source_event_id=source_event_id,
     )
 
 
@@ -1043,6 +1045,7 @@ def _persist_message(
     attachments: Optional[List[Dict[str, Any]]] = None,
     turn_id: Optional[str] = None,
     delivery_status: Optional[str] = None,
+    source_event_id: Optional[str] = None,
 ) -> Optional[TaskChatMessage]:
     normalized_content = content.strip()
     if not normalized_content and not attachments:
@@ -1057,6 +1060,7 @@ def _persist_message(
         interactions=interactions,
         turn_id=turn_id,
         delivery_status=delivery_status,
+        source_event_id=source_event_id,
         # Pass through ``attachments`` directly so an explicit empty list
         # round-trips as ``[]`` rather than being coerced to ``NULL``.
         attachments=attachments,

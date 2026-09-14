@@ -8,6 +8,7 @@ from xagent.web.api import websocket as websocket_api
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.user import User
+from xagent.web.services import task_execution as task_execution_service
 from xagent.web.services.assistant_history_safety import (
     CLIENT_SAFE_FAILURE_MESSAGE_TYPE,
 )
@@ -162,7 +163,7 @@ def _history_cache_entry(task_id: int, events: list[dict]) -> dict[str, object]:
             or 0
         )
         return {
-            "trace_scope": "public-v1",
+            "trace_scope": "public-v2",
             "updated_at": cache_version_token(task.updated_at),
             "max_trace_event_id": 0,
             "max_chat_message_id": int(max_chat_message_id),
@@ -532,7 +533,7 @@ async def test_new_plain_assistant_response_replays_unchanged(
         title="Normal response history",
     )
 
-    finalized = websocket_api._finalize_task_execution_result_isolated(
+    finalized = task_execution_service._finalize_task_execution_result_isolated(
         task_id=task_id,
         task_user_id=user_id,
         pre_run_status=TaskStatus.RUNNING,
@@ -544,7 +545,7 @@ async def test_new_plain_assistant_response_replays_unchanged(
         expected_run_id=None,
         task_lease=None,
         resolved_scope_segments=(),
-        prepared_outputs=websocket_api._PreparedTaskFileOutputs((), (), ()),
+        prepared_outputs=task_execution_service._PreparedTaskFileOutputs((), (), ()),
     )
     assert not finalized.late_result
 
@@ -570,7 +571,7 @@ def test_failed_websocket_result_with_null_diagnostics_uses_safe_fallback(
         title="Failed WebSocket null diagnostics",
     )
 
-    finalized = websocket_api._finalize_task_execution_result_isolated(
+    finalized = task_execution_service._finalize_task_execution_result_isolated(
         task_id=task_id,
         task_user_id=user_id,
         pre_run_status=TaskStatus.RUNNING,
@@ -583,7 +584,7 @@ def test_failed_websocket_result_with_null_diagnostics_uses_safe_fallback(
         expected_run_id=None,
         task_lease=None,
         resolved_scope_segments=(),
-        prepared_outputs=websocket_api._PreparedTaskFileOutputs((), (), ()),
+        prepared_outputs=task_execution_service._PreparedTaskFileOutputs((), (), ()),
     )
 
     assert not finalized.late_result
@@ -604,7 +605,7 @@ def test_successful_websocket_result_with_null_output_skips_empty_history(
         title="Successful WebSocket null output",
     )
 
-    finalized = websocket_api._finalize_task_execution_result_isolated(
+    finalized = task_execution_service._finalize_task_execution_result_isolated(
         task_id=task_id,
         task_user_id=user_id,
         pre_run_status=TaskStatus.RUNNING,
@@ -612,7 +613,7 @@ def test_successful_websocket_result_with_null_output_skips_empty_history(
         expected_run_id=None,
         task_lease=None,
         resolved_scope_segments=(),
-        prepared_outputs=websocket_api._PreparedTaskFileOutputs((), (), ()),
+        prepared_outputs=task_execution_service._PreparedTaskFileOutputs((), (), ()),
     )
 
     assert not finalized.late_result
@@ -643,7 +644,7 @@ async def test_failed_websocket_result_replays_only_safe_history(
         title="Failed WebSocket result",
     )
 
-    finalized = websocket_api._finalize_task_execution_result_isolated(
+    finalized = task_execution_service._finalize_task_execution_result_isolated(
         task_id=task_id,
         task_user_id=user_id,
         pre_run_status=TaskStatus.RUNNING,
@@ -659,7 +660,7 @@ async def test_failed_websocket_result_replays_only_safe_history(
         expected_run_id=None,
         task_lease=None,
         resolved_scope_segments=(),
-        prepared_outputs=websocket_api._PreparedTaskFileOutputs((), (), ()),
+        prepared_outputs=task_execution_service._PreparedTaskFileOutputs((), (), ()),
     )
     assert not finalized.late_result
 
@@ -691,7 +692,7 @@ async def test_failed_websocket_result_prefers_diagnostic_error_over_display_tex
         title="Failed WebSocket diagnostic",
     )
 
-    finalized = websocket_api._finalize_task_execution_result_isolated(
+    finalized = task_execution_service._finalize_task_execution_result_isolated(
         task_id=task_id,
         task_user_id=user_id,
         pre_run_status=TaskStatus.RUNNING,
@@ -704,7 +705,7 @@ async def test_failed_websocket_result_prefers_diagnostic_error_over_display_tex
         expected_run_id=None,
         task_lease=None,
         resolved_scope_segments=(),
-        prepared_outputs=websocket_api._PreparedTaskFileOutputs((), (), ()),
+        prepared_outputs=task_execution_service._PreparedTaskFileOutputs((), (), ()),
     )
 
     assert not finalized.late_result
@@ -723,7 +724,7 @@ def test_failed_resumed_websocket_result_prefers_diagnostic_error_over_display_t
         run_id="resume-run-1730",
     )
 
-    finalized = websocket_api._finalize_resumed_task(
+    finalized = task_execution_service._finalize_resumed_task(
         task_id,
         status="error",
         success=False,
@@ -741,7 +742,7 @@ def test_failed_resumed_websocket_result_prefers_diagnostic_error_over_display_t
             runner_id="resume-runner-1730",
             run_id="resume-run-1730",
         ),
-        prepared_outputs=websocket_api._PreparedTaskFileOutputs((), (), ()),
+        prepared_outputs=task_execution_service._PreparedTaskFileOutputs((), (), ()),
     )
 
     assert not finalized["late_result"]
@@ -755,7 +756,7 @@ def test_terminal_failure_writer_persists_safe_provenance(_test_db) -> None:
         title="Terminal failure provenance",
     )
 
-    websocket_api._terminal_task_error_payload(task_id, raw_error)
+    task_execution_service._terminal_task_error_payload(task_id, raw_error)
 
     _assert_safe_failure_persisted(task_id, raw_error)
 

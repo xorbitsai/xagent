@@ -61,7 +61,7 @@ def test_publishes_with_docker_chosen_loopback_ports() -> None:
 
     returned, host_ports = run_container_with_dynamic_ports(
         client,
-        "minio/minio",
+        "quay.io/minio/minio",
         "server /data",
         name="fixture-container",
         container_ports=("9000/tcp", "9001/tcp"),

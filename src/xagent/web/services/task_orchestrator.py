@@ -111,7 +111,7 @@ from .task_lease_service import (
     acquire_task_lease_no_commit,
     fail_and_release_task_lease_no_commit,
     get_runner_id,
-    lock_task_lease_no_commit,
+    lock_task_lease_for_settlement_no_commit,
     release_task_lease,
     run_task_lease_heartbeat,
     run_while_task_lease_owned,
@@ -697,12 +697,7 @@ class TaskTurnOrchestrator:
 
 
 @dataclass(frozen=True)
-class _ClaimedTurn:
-    """Snapshot returned by ``_begin_turn_atomic_sync`` after the claim
-    commits, so ``begin_turn`` can build :class:`TurnStarted` without the
-    caller re-reading the ORM."""
-
-    task_lease: TaskLease
+class _AcceptedTurn:
     status: TaskStatus
     updated_at: Optional[datetime]
     before_message_id: Optional[int]
@@ -711,6 +706,11 @@ class _ClaimedTurn:
     state_version: int = 0
     control_state: str = TaskControlState.RUNNING.value
     agent_config: Optional[dict[str, Any]] = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class _ClaimedTurn(_AcceptedTurn):
+    task_lease: TaskLease
 
 
 async def _schedule_committed_turn(
@@ -966,15 +966,14 @@ def _turn_started_snapshot(
     )
 
 
-def _persist_claimed_turn_no_commit(
+def _persist_accepted_turn_no_commit(
     db: Session,
     *,
     task_id: int,
     task_owner_user_id: int,
     payload: TaskTurnPayload,
-    task_lease: TaskLease,
-) -> _ClaimedTurn:
-    """Persist the first message and snapshot one already-claimed turn."""
+) -> _AcceptedTurn:
+    """Persist the first message and snapshot one accepted turn."""
 
     from .chat_history_service import persist_user_message_no_commit
 
@@ -1014,8 +1013,7 @@ def _persist_claimed_turn_no_commit(
         .filter(Task.id == task_id)
         .one()
     )
-    return _ClaimedTurn(
-        task_lease=task_lease,
+    return _AcceptedTurn(
         status=status,
         updated_at=updated_at,
         before_message_id=before_message_id,
@@ -1064,15 +1062,15 @@ def _task_requires_actor_policy_sync(
         return _task_requires_actor_policy(db, task_id, task_owner_user_id)
 
 
-def _claim_turn_no_commit(
+def _accept_turn_no_commit(
     db: Session,
     task_id: int,
     task_owner_user_id: int,
     *,
     payload: TaskTurnPayload,
     kind: TurnKind,
-) -> _ClaimedTurn:
-    """Stage one atomic turn claim; the caller owns commit and rollback."""
+) -> _AcceptedTurn:
+    """Stage turn acceptance without a lease; the caller owns the transaction."""
 
     if kind == TurnKind.APPEND and _task_requires_actor_policy(
         db,
@@ -1125,22 +1123,11 @@ def _claim_turn_no_commit(
             raise TaskTurnError("interaction_response_required")
         raise TaskTurnError("busy")
 
-    task_lease = acquire_task_lease_no_commit(
-        db,
-        task_id,
-        expected_run_id=run_id,
-    )
-    if task_lease is None:
-        raise RuntimeError(
-            f"task {task_id} claim could not stage its exact execution lease"
-        )
-
-    result = _persist_claimed_turn_no_commit(
+    result = _persist_accepted_turn_no_commit(
         db,
         task_id=task_id,
         task_owner_user_id=task_owner_user_id,
         payload=payload,
-        task_lease=task_lease,
     )
     missing_bindings = bind_turn_files_no_commit(
         file_ids=list(payload.file_ids),
@@ -1172,7 +1159,7 @@ def _claim_turn_no_commit(
         except WorkforceTurnRejectedError as exc:
             raise TaskTurnError(exc.reason) from exc
         # Keep the WorkforceRun projection in the same transaction as the
-        # Task RUNNING claim and exact prelease. A later best-effort worker can
+        # Task RUNNING acceptance. A later best-effort worker can
         # otherwise arrive after completion and resurrect the projection.
         from .workforce_runtime import sync_workforce_run_status
 
@@ -1181,14 +1168,29 @@ def _claim_turn_no_commit(
             .filter(
                 Task.id == task_id,
                 Task.status == TaskStatus.RUNNING,
-                Task.runner_id == task_lease.runner_id,
-                task_lease_attempt_predicate(task_lease),
-                Task.run_id == task_lease.run_id,
+                Task.run_id == run_id,
             )
             .one()
         )
         sync_workforce_run_status(db, claimed_task, TaskStatus.RUNNING)
     return result
+
+
+def _claim_turn_no_commit(
+    db: Session,
+    task_id: int,
+    task_owner_user_id: int,
+    *,
+    payload: TaskTurnPayload,
+    kind: TurnKind,
+) -> _ClaimedTurn:
+    accepted = _accept_turn_no_commit(
+        db, task_id, task_owner_user_id, payload=payload, kind=kind
+    )
+    lease = acquire_task_lease_no_commit(db, task_id, expected_run_id=accepted.run_id)
+    if lease is None:
+        raise RuntimeError(f"task {task_id} could not stage its exact execution lease")
+    return _ClaimedTurn(**vars(accepted), task_lease=lease)
 
 
 def _begin_turn_atomic_sync(
@@ -1418,7 +1420,7 @@ def _refuse_if_bg_inflight(task_id: int) -> None:
     works fine for the legitimate "previous task naturally completed"
     case).
     """
-    from ..api.websocket import background_task_manager
+    from .task_execution import background_task_manager
 
     existing = background_task_manager.running_tasks.get(task_id)
     if existing is not None and not existing.done():
@@ -1428,10 +1430,10 @@ def _refuse_if_bg_inflight(task_id: int) -> None:
 def _get_agent_manager() -> Any:
     """Resolve the global ``AgentServiceManager`` singleton.
 
-    Local import keeps the services -> api boundary one-way at module
-    load time.
+    Resolve lazily so importing turn lifecycle helpers does not construct
+    the process-local runtime manager.
     """
-    from ..api.chat import get_agent_manager
+    from .agent_service_manager import get_agent_manager
 
     return get_agent_manager()
 
@@ -1565,7 +1567,7 @@ def finish_turn(
                 task_id,
             )
             return False
-        lock_task_lease_no_commit(bg_db, task_lease)
+        lock_task_lease_for_settlement_no_commit(bg_db, task_lease)
         query = query.filter(
             Task.runner_id == task_lease.runner_id,
             task_lease_attempt_predicate(task_lease),
@@ -1790,12 +1792,12 @@ def _schedule_bg(
     bg run loads its own snapshot and opens its own sessions, so no
     caller-bound ORM object crosses into the coroutine.
     """
-    from ..api.websocket import (
+    from .task_events import publish_task_event
+    from .task_execution import (
         background_task_manager,
         create_terminal_task_error_event,
         execute_task_background,
     )
-    from ..api.websocket import manager as websocket_manager
 
     execution_failed = False
 
@@ -2090,7 +2092,7 @@ def _schedule_bg(
                         lease_settled = bool(settled)
                         if settled and broadcast_error_message is not None:
                             try:
-                                await websocket_manager.broadcast_to_task(
+                                await publish_task_event(
                                     create_terminal_task_error_event(
                                         task_id,
                                         broadcast_error_message,

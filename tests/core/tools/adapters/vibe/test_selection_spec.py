@@ -40,6 +40,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from xagent.core.tools.adapters.vibe.config import (
+    ACTOR_STDIO_SESSION_RUNTIME_UNAVAILABLE_REASON,
+    ACTOR_STDIO_SHADOWED_REASON,
     BaseToolConfig,
     MCPConfigLoadError,
     MCPFailurePolicy,
@@ -452,6 +454,17 @@ def test_required_mcp_error_message_does_not_expose_summary_values() -> None:
     assert error.summaries[0].reason == "mcp_server_unavailable"
     assert error.summaries[1].server_name == "MCP server"
     assert error.summaries[1].reason == "mcp_server_unavailable"
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        ACTOR_STDIO_SHADOWED_REASON,
+        ACTOR_STDIO_SESSION_RUNTIME_UNAVAILABLE_REASON,
+    ],
+)
+def test_actor_stdio_unavailable_reasons_are_public_safe(reason: str) -> None:
+    assert MCPUnavailableSummary.from_values("PostHog", reason).reason == reason
 
 
 async def test_registry_preserves_required_mcp_errors(isolated_registry):
@@ -2337,7 +2350,7 @@ def test_spec_wants_mcp_only_for_explicit_mcp_selection():
         _SpecNone,
         should_load_mcp_server_configs,
     )
-    from xagent.web.api.chat import _spec_wants_mcp
+    from xagent.web.services.agent_service_manager import _spec_wants_mcp
 
     specs = [
         (None, False),

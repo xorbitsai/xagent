@@ -18,7 +18,7 @@ from xagent.core.execution_scope import (
     ExecutionScope,
     set_execution_scope_snapshot_loader,
 )
-from xagent.web.api.chat import AgentServiceManager
+from xagent.web.services.agent_service_manager import AgentServiceManager
 
 OWNER_ID = 7
 TASK_ID = 42

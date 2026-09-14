@@ -20,7 +20,7 @@ from xagent.core.tools.adapters.vibe.agent_tool import (
     PublishedAgentToolRecord,
     UpdateAgentTool,
     _coerce_db_task_id,
-    _DelegatedAgentWebSocketTraceHandler,
+    _DelegatedAgentTaskEventTraceHandler,
     build_published_agent_tools_from_records,
     gen_agent_tool_name,
     get_published_agents_tools,
@@ -64,10 +64,10 @@ async def test_delegated_agent_websocket_handler_adds_worker_metadata() -> None:
             forwarded_data.append(dict(event.data))
 
     with patch(
-        "xagent.web.api.ws_trace_handlers.WebSocketTraceHandler",
+        "xagent.web.services.task_event_trace_handler.TaskEventTraceHandler",
         return_value=CaptureHandler(),
     ):
-        handler = _DelegatedAgentWebSocketTraceHandler(
+        handler = _DelegatedAgentTaskEventTraceHandler(
             task_id=77,
             metadata={
                 "source": "xagent-agent-tool-child",
@@ -116,7 +116,7 @@ def test_agent_tool_child_tracer_persists_and_broadcasts() -> None:
     handlers = create_tracer.call_args.kwargs["handlers"]
     assert [handler.__class__.__name__ for handler in handlers] == [
         "_DelegatedAgentDatabaseTraceHandler",
-        "_DelegatedAgentWebSocketTraceHandler",
+        "_DelegatedAgentTaskEventTraceHandler",
     ]
     assert all(handler.task_id == 77 for handler in handlers)
     assert all(

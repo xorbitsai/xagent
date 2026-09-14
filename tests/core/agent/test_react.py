@@ -4625,7 +4625,8 @@ async def test_react_pattern_ask_user_question_pauses_with_structured_payload() 
                             "name": "ask_user_question",
                             "arguments": (
                                 '{"message":"Pick one","interactions":'
-                                '[{"type":"select_one","field":"choice","label":"Choice"}]}'
+                                '[{"type":"select_one","field":"choice","label":"Choice",'
+                                '"options":[{"label":"A","value":"a"}]}]}'
                             ),
                         },
                     }
@@ -4652,11 +4653,14 @@ async def test_react_pattern_ask_user_question_pauses_with_structured_payload() 
     assert outbound_message["expect_response"] is True
     assert outbound_message["visible"] is True
     assert outbound_message["step_id"] == outbound_message["metadata"]["step_id"]
+    # Carries real options: a picker with nothing to select gets the engine's
+    # free-text field appended, which would make this a test of that instead.
     assert outbound_message["metadata"]["interactions"] == [
         {
             "type": "select_one",
             "field": "choice",
             "label": "Choice",
+            "options": [{"label": "A", "value": "a"}],
         }
     ]
     assert pattern.tool_ledger["call_question_form"].status == "completed"
@@ -5189,13 +5193,27 @@ async def test_pause_for_tool_results_deduplicates_normalized_fields() -> None:
         "status": "waiting_for_user",
         "message": "Pick one",
         "message_type": "question",
-        "interactions": [{"type": "select_one", "field": "\ufeffchoice"}],
+        # Options are what keep these answerable, so the published list is the
+        # deduplicated one with no free-text field appended.
+        "interactions": [
+            {
+                "type": "select_one",
+                "field": "\ufeffchoice",
+                "options": [{"label": "A", "value": "a"}],
+            }
+        ],
     }
     result_b = {
         "status": "waiting_for_user",
         "message": "Pick another",
         "message_type": "question",
-        "interactions": [{"type": "select_one", "field": "choice"}],
+        "interactions": [
+            {
+                "type": "select_one",
+                "field": "choice",
+                "options": [{"label": "B", "value": "b"}],
+            }
+        ],
     }
 
     outcome = await pattern._pause_for_tool_results(
@@ -6051,6 +6069,8 @@ async def test_react_pattern_traces_context_compaction() -> None:
     context.compact_config.threshold = 1
     for index in range(3):
         context.add_user_message(f"message {index}")
+    llm = FakeLLM([{"content": "summary"}, {"content": "done"}])
+    llm.context_window = 32_000
 
     result = await ReActPattern(max_iterations=1).run(
         context=context,
@@ -6058,7 +6078,7 @@ async def test_react_pattern_traces_context_compaction() -> None:
         # Two responses: compaction now summarizes with the main model when no
         # compact model is configured, so it consumes one before the turn's
         # own call.
-        llm=FakeLLM([{"content": "summary"}, {"content": "done"}]),
+        llm=llm,
         runtime=runtime,
     )
 
@@ -6098,6 +6118,7 @@ async def test_react_pattern_uses_compact_llm_for_context_compaction() -> None:
             }
         ]
     )
+    compact_llm.context_window = 32_000
 
     result = await ReActPattern(max_iterations=1).run(
         context=context,
@@ -9059,15 +9080,15 @@ class RoutedDownstreamLLM:
 
 
 def _routing_router(
-    downstream: Any, route_prompts: list[str], *, context_window: int = 4
+    downstream: Any, route_prompts: list[str], *, context_window: int = 32_000
 ) -> RouterLLM:
     """A real ``RouterLLM`` whose selection is stubbed to record its prompt.
 
     ``context_window`` is deliberately set, matching production: ``adapter.py``
     always stamps it from the model row, and ``prepare_llm_for_context``
     recomputes the compaction threshold from it. Leaving it unset would put the
-    fixture in a state a real router never reaches. A window of 4 yields a
-    threshold of 3, small enough that any context compacts.
+    fixture in a state a real router never reaches. The fixture uses a realistic
+    32k window and enough history below to trigger compaction.
     """
     router = RouterLLM(downstream_resolver=lambda _model_id: downstream)
     router.context_window = context_window
@@ -9086,10 +9107,19 @@ def _react_context_with_tool_history(execution_id: str) -> ExecutionContext:
     context.add_assistant_message(
         "",
         tool_calls=[
-            {"id": "call-1", "type": "function", "function": {"name": "read_file"}},
+            {
+                "id": "call-1",
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "arguments": '{"path":"large.txt"}',
+                },
+            },
         ],
     )
-    context.add_tool_result("read_file", {"output": "x" * 200}, tool_call_id="call-1")
+    context.add_tool_result(
+        "read_file", {"output": "x" * 120_000}, tool_call_id="call-1"
+    )
     return context
 
 

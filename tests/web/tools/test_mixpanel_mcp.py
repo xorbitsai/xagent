@@ -870,18 +870,14 @@ def test_list_tools_never_exceed_the_output_limit_at_the_unsatisfiable_boundary(
     [(*case, limit) for case, limit in zip(_LIST_TOOL_CASES, [65, 60, 65])],
     ids=["event_names", "funnels", "annotations"],
 )
-def test_list_tools_still_raise_keyerror_in_the_unsatisfiable_window(
+def test_list_tools_do_not_raise_keyerror_in_the_unsatisfiable_window(
     monkeypatch, call, key, json_data, window_limit
 ):
     # window_limit sits strictly between the two fixed floors: too small
     # for {key: {key: []}} but large enough for {key: {}} to fit. No
-    # representation of the required shape fits there, and this PR
-    # deliberately keeps the length budget as the hard constraint (see
-    # test_list_tools_never_exceed_the_output_limit_at_the_unsatisfiable_boundary),
-    # so result[key][key] still raises here -- a pre-existing gap in the
-    # shared success_with_capped_dict, not something a Mixpanel-local
-    # wrapper can close. Pinned explicitly so this stays a documented,
-    # known limitation rather than a silent gap in test coverage.
+    # representation of the required shape fits there, so the length budget
+    # wins. The local wrapper must still return valid JSON instead of indexing
+    # a field that the shared capper was allowed to omit.
     _patch_max_output_length(monkeypatch, window_limit)
     monkeypatch.setattr(
         mixpanel.requests,
@@ -889,11 +885,11 @@ def test_list_tools_still_raise_keyerror_in_the_unsatisfiable_window(
         Mock(return_value=MockResponse(json_data=json_data)),
     )
 
-    result = json.loads(call())
+    raw = call()
+    result = json.loads(raw)
 
     assert result["status"] == "success"
-    with pytest.raises(KeyError):
-        result[key][key]
+    assert len(raw) <= window_limit
 
 
 def test_create_annotation_sends_json_body_to_app_api(monkeypatch):

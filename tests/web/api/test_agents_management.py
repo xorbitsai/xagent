@@ -33,6 +33,7 @@ from xagent.web.models.template_stats import TemplateStats
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 from xagent.web.models.workforce import Workforce, WorkforceAgent, WorkforceRun
+from xagent.web.services import agent_prompt as _agent_prompt_services
 from xagent.web.services.agent_management import (
     AgentManagementService,
     AgentWorkforceConflictError,
@@ -3748,32 +3749,41 @@ class TestApplyUserVoice:
     preference's system-prompt injection, alongside enhance_system_prompt_with_kb."""
 
     def test_no_voice_returns_prompt_unchanged(self):
-        assert agents_api.apply_user_voice("Be helpful.", None) == "Be helpful."
+        assert (
+            _agent_prompt_services.apply_user_voice("Be helpful.", None)
+            == "Be helpful."
+        )
 
     def test_unrecognized_voice_value_returns_prompt_unchanged(self):
-        assert agents_api.apply_user_voice("Be helpful.", "sarcastic") == "Be helpful."
+        assert (
+            _agent_prompt_services.apply_user_voice("Be helpful.", "sarcastic")
+            == "Be helpful."
+        )
 
     def test_list_voice_value_does_not_raise_and_returns_prompt_unchanged(self):
         # The JSON `preferences` column has no nested-type constraint, so a
         # corrupted/hand-edited row could hold a list here. A list is truthy
         # but unhashable - `dict.get` on it would raise TypeError instead of
         # degrading to plain output.
-        assert agents_api.apply_user_voice("Be helpful.", ["concise"]) == "Be helpful."
+        assert (
+            _agent_prompt_services.apply_user_voice("Be helpful.", ["concise"])
+            == "Be helpful."
+        )
 
     def test_dict_voice_value_does_not_raise_and_returns_prompt_unchanged(self):
         assert (
-            agents_api.apply_user_voice("Be helpful.", {"voice": "concise"})
+            _agent_prompt_services.apply_user_voice("Be helpful.", {"voice": "concise"})
             == "Be helpful."
         )
 
     def test_known_voice_appends_output_voice_section(self):
-        result = agents_api.apply_user_voice("Be helpful.", "concise")
+        result = _agent_prompt_services.apply_user_voice("Be helpful.", "concise")
 
         assert result.startswith("Be helpful.\n\n## OUTPUT VOICE\n")
         assert "As short as possible" in result
 
     def test_none_system_prompt_with_voice_omits_leading_blank_lines(self):
-        result = agents_api.apply_user_voice(None, "warm")
+        result = _agent_prompt_services.apply_user_voice(None, "warm")
 
         assert result.startswith("## OUTPUT VOICE\n")
 
@@ -3791,15 +3801,17 @@ class TestVoiceFromRuntimeUser:
     for why a fresh query is deliberately avoided here)."""
 
     def test_none_runtime_user_returns_none(self):
-        assert agents_api.voice_from_runtime_user(None) is None
+        assert _agent_prompt_services.voice_from_runtime_user(None) is None
 
     def test_runtime_user_fields_with_voice_set(self):
         runtime_user = RuntimeUserFields(id=1, is_admin=False, voice="friendly")
-        assert agents_api.voice_from_runtime_user(runtime_user) == "friendly"
+        assert (
+            _agent_prompt_services.voice_from_runtime_user(runtime_user) == "friendly"
+        )
 
     def test_runtime_user_fields_with_no_voice(self):
         runtime_user = RuntimeUserFields(id=1, is_admin=False)
-        assert agents_api.voice_from_runtime_user(runtime_user) is None
+        assert _agent_prompt_services.voice_from_runtime_user(runtime_user) is None
 
     def test_full_user_orm_row_reads_from_preferences(self):
         _admin_headers()
@@ -3809,7 +3821,7 @@ class TestVoiceFromRuntimeUser:
         db = _direct_db_session()
         try:
             user = db.get(User, user_id)
-            assert agents_api.voice_from_runtime_user(user) == "playful"
+            assert _agent_prompt_services.voice_from_runtime_user(user) == "playful"
         finally:
             db.close()
 
@@ -3821,7 +3833,7 @@ class TestVoiceFromRuntimeUser:
         db = _direct_db_session()
         try:
             user = db.get(User, user_id)
-            assert agents_api.voice_from_runtime_user(user) is None
+            assert _agent_prompt_services.voice_from_runtime_user(user) is None
         finally:
             db.close()
 
@@ -3835,4 +3847,4 @@ class TestVoiceFromRuntimeUser:
         class _NotAUser:
             pass
 
-        assert agents_api.voice_from_runtime_user(_NotAUser()) is None
+        assert _agent_prompt_services.voice_from_runtime_user(_NotAUser()) is None

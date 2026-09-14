@@ -20,11 +20,9 @@ from xagent.core.execution_scope import (
     ExecutionScopeAuthorityError,
     set_execution_scope_snapshot_loader,
 )
-from xagent.web.api.chat import _build_allowed_external_dirs
-from xagent.web.api.websocket import (
-    _output_path_in_current_task_scope,
-    _scope_segments_for_task,
-)
+from xagent.web.api.websocket import _scope_segments_for_task
+from xagent.web.services.agent_service_manager import _build_allowed_external_dirs
+from xagent.web.services.task_execution import _output_path_in_current_task_scope
 from xagent.web.services.workspace_binding import _build_external_allowlist
 
 

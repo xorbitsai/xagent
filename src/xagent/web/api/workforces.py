@@ -41,6 +41,11 @@ from ..services.deployments import (
     new_widget_key,
 )
 from ..services.llm_utils import AutoModelUnavailableError
+from ..services.public_trace_events import (
+    DELEGATED_AGENT_TRACE_SOURCE,
+    is_audit_only_trace_data,
+    normalize_public_trace_event,
+)
 from ..services.trace_event_types import GENERAL_ERROR_EVENT_TYPES
 from ..services.trace_message_storage import decode_trace_events_data
 from ..services.triggers import unregister_deleted_trigger_bindings
@@ -74,11 +79,6 @@ from ..services.workforce_snapshot import (
     validate_workforce_for_run,
 )
 from ..services.workforce_workers import create_workforce_worker
-from .public_trace_events import (
-    DELEGATED_AGENT_TRACE_SOURCE,
-    is_audit_only_trace_data,
-    normalize_public_trace_event,
-)
 
 router = APIRouter(prefix="/api/workforces", tags=["workforces"])
 logger = logging.getLogger(__name__)

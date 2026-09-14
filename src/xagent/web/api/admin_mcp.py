@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from ...core.utils.encryption import encrypt_value
 from ..auth_dependencies import get_current_user
 from ..builtin_mcp_registry import (
+    _persisted_builtin_provenance_matches,
     get_builtin_execution_fields,
     get_builtin_public_mcp_app,
     is_builtin_public_mcp_app,
@@ -216,6 +217,10 @@ def _commit_public_mcp_app_write(
 def _public_mcp_app_response(app: PublicMCPApp) -> Dict[str, Any]:
     values = _public_mcp_app_values(app)
     execution_fields = get_builtin_execution_fields(app.app_id)
+    if execution_fields is not None and not _persisted_builtin_provenance_matches(
+        app.app_id, app.launch_config
+    ):
+        execution_fields = None
     if execution_fields is not None:
         values.update(execution_fields)
     return {
@@ -248,6 +253,10 @@ def _validate_public_mcp_app_values(
 
 def _apply_public_mcp_app_update(db_app: PublicMCPApp, changes: Dict[str, Any]) -> None:
     canonical = get_builtin_public_mcp_app(db_app.app_id)
+    if canonical is not None and not _persisted_builtin_provenance_matches(
+        db_app.app_id, db_app.launch_config
+    ):
+        canonical = None
     persisted = _public_mcp_app_values(db_app)
     enforce_connect_shape = bool({"transport", "launch_config"} & changes.keys())
 
@@ -553,7 +562,9 @@ async def delete_app(
     db_app = db.query(PublicMCPApp).filter(PublicMCPApp.id == app_id).first()
     if not db_app:
         raise HTTPException(status_code=404, detail="App not found")
-    if is_builtin_public_mcp_app(db_app.app_id):
+    if is_builtin_public_mcp_app(
+        db_app.app_id
+    ) and _persisted_builtin_provenance_matches(db_app.app_id, db_app.launch_config):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Built-in MCP apps are managed by code",

@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Callable, Coroutine, Iterator, Sequence, TypeVar, cast
 
-from sqlalchemy import and_, case, false, func, or_, update
+from sqlalchemy import and_, case, false, func, or_, select, text, update
 from sqlalchemy.exc import MultipleResultsFound
 from sqlalchemy.orm import Query, Session
 from sqlalchemy.sql.elements import ColumnElement
@@ -152,6 +152,32 @@ def lock_task_lease_no_commit(db: Session, lease: TaskLease) -> bool:
     return _rowcount(result) == 1
 
 
+def lock_task_lease_for_settlement_no_commit(db: Session, lease: TaskLease) -> bool:
+    """Take the finalizer's full row lock before any weaker task write lock.
+
+    On PostgreSQL, upgrading a no-op UPDATE's lock to FOR UPDATE can deadlock
+    with a checkpoint that holds the task FK's KEY SHARE lock and then updates
+    its checkpoint pointer. Acquire FOR UPDATE directly, preserving its
+    exclusion of concurrent FK inserts as well as task updates. SQLite needs
+    the existing conditional UPDATE because it ignores FOR UPDATE.
+    """
+    if db.get_bind().dialect.name != "postgresql":
+        return lock_task_lease_no_commit(db, lease)
+    return (
+        db.execute(
+            select(Task.id)
+            .where(
+                Task.id == lease.task_id,
+                Task.runner_id == lease.runner_id,
+                Task.run_id == lease.run_id,
+                task_lease_attempt_predicate(lease),
+            )
+            .with_for_update()
+        ).scalar_one_or_none()
+        is not None
+    )
+
+
 _CURRENT_TASK_LEASE: ContextVar[TaskLease | None] = ContextVar(
     "xagent_current_task_lease",
     default=None,
@@ -223,6 +249,7 @@ class TaskLeaseRefreshState(str, Enum):
     REFRESHED = "refreshed"
     SETTLEMENT_READY = "settlement_ready"
     LOST = "lost"
+    DEFERRED = "deferred"
 
 
 TaskLeaseKey = tuple[int, str, str | None, str | None]
@@ -1000,6 +1027,97 @@ def refresh_task_lease(db: Session, lease: TaskLease) -> TaskLeaseRefreshState:
     return state
 
 
+def _refresh_task_leases_postgresql_no_commit(
+    db: Session, leases: tuple[TaskLease, ...]
+) -> dict[TaskLeaseKey, TaskLeaseRefreshState]:
+    """Renew available rows without making healthy leases wait for busy ones."""
+    # Bound exceptional SQL waits without tying the budget to retry cadence.
+    statement_ms = max(1, int(min(5, get_task_lease_ttl_seconds() / 4) * 1000))
+    db.execute(
+        text(
+            "SELECT set_config('statement_timeout', :statement, true), "
+            "set_config('lock_timeout', :lock, true)"
+        ),
+        {"statement": f"{statement_ms}ms", "lock": f"{min(1000, statement_ms)}ms"},
+    )
+    owned = or_(
+        *(
+            and_(
+                Task.id == lease.task_id,
+                Task.runner_id == lease.runner_id,
+                Task.run_id == lease.run_id,
+                task_lease_attempt_predicate(lease),
+            )
+            for lease in leases
+        )
+    )
+    available = list(
+        db.scalars(
+            select(Task.id)
+            .where(owned, task_status_predicate.eq(TaskStatus.RUNNING))
+            # SQLAlchemy's key_share=True (without read=True) means NO KEY
+            # UPDATE, compatible with checkpoint foreign-key KEY SHARE locks.
+            .with_for_update(of=Task, key_share=True, skip_locked=True)
+        )
+    )
+    refreshed: set[TaskLeaseKey] = set()
+    if available:
+        now = utc_now()
+        rows = db.execute(
+            update(Task)
+            .where(
+                Task.id.in_(available),
+                owned,
+                task_status_predicate.eq(TaskStatus.RUNNING),
+            )
+            .values(last_heartbeat_at=now, lease_expires_at=task_lease_expires_at(now))
+            .returning(Task.id, Task.runner_id, Task.run_id, Task.lease_attempt_id)
+            .execution_options(synchronize_session=False)
+        )
+        refreshed = {
+            (row.id, row.runner_id, row.run_id, row.lease_attempt_id) for row in rows
+        }
+    remaining = [lease for lease in leases if _task_lease_key(lease) not in refreshed]
+    # A skipped row is not evidence of lost ownership. Read committed state
+    # without acquiring more row locks; uncommitted takeovers stay deferred.
+    visible = (
+        {
+            row.id: row
+            for row in db.execute(
+                select(
+                    Task.id,
+                    Task.runner_id,
+                    Task.run_id,
+                    Task.lease_attempt_id,
+                    Task.status,
+                ).where(Task.id.in_([lease.task_id for lease in remaining]))
+            )
+        }
+        if remaining
+        else {}
+    )
+    states = {}
+    for lease in leases:
+        key = _task_lease_key(lease)
+        if key in refreshed:
+            states[key] = TaskLeaseRefreshState.REFRESHED
+            continue
+        row = visible.get(lease.task_id)
+        if (
+            lease.run_id is None
+            or lease.attempt_id is None
+            or row is None
+            or (row.runner_id, row.run_id, row.lease_attempt_id)
+            != (lease.runner_id, lease.run_id, lease.attempt_id)
+        ):
+            states[key] = TaskLeaseRefreshState.LOST
+        elif row.status != TaskStatus.RUNNING:
+            states[key] = TaskLeaseRefreshState.SETTLEMENT_READY
+        else:
+            states[key] = TaskLeaseRefreshState.DEFERRED
+    return states
+
+
 def refresh_task_leases_isolated(
     leases: tuple[TaskLease, ...],
 ) -> dict[TaskLeaseKey, TaskLeaseRefreshState]:
@@ -1020,15 +1138,19 @@ def refresh_task_leases_isolated(
     expires_at = task_lease_expires_at(now)
     with SessionLocal() as db:
         try:
-            states = {
-                _task_lease_key(lease): _refresh_task_lease_no_commit(
-                    db,
-                    lease,
-                    now=now,
-                    expires_at=expires_at,
-                )
-                for lease in leases
-            }
+            states = (
+                _refresh_task_leases_postgresql_no_commit(db, leases)
+                if (db.get_bind().dialect.name == "postgresql")
+                else {
+                    _task_lease_key(lease): _refresh_task_lease_no_commit(
+                        db,
+                        lease,
+                        now=now,
+                        expires_at=expires_at,
+                    )
+                    for lease in leases
+                }
+            )
             db.commit()
             return states
         except Exception:
@@ -1041,8 +1163,12 @@ def validate_preacquired_task_lease_isolated(
 ) -> TaskLeaseRefreshState:
     """Refresh and validate an exact lease committed before local scheduling."""
 
-    states = refresh_task_leases_isolated((lease,))
-    return states.get(_task_lease_key(lease), TaskLeaseRefreshState.LOST)
+    from ..models.database import get_session_local
+
+    # Execution admission needs a definitive refresh, not a heartbeat's
+    # DEFERRED result while another transaction holds the task row.
+    with get_session_local()() as db:
+        return refresh_task_lease(db, lease)
 
 
 _NON_TERMINAL_RELEASE_STATUSES = frozenset(
@@ -1202,6 +1328,8 @@ class _TaskLeaseHeartbeatEntry:
     )
     terminal_event: asyncio.Event = field(default_factory=asyncio.Event)
     refresh_waiter: asyncio.Future[TaskLeaseHeartbeatOutcome] | None = None
+    retry_at: float | None = None
+    deferred_since: float | None = None
 
 
 class _TaskLeaseHeartbeatRegistration:
@@ -1304,7 +1432,16 @@ class _TaskLeaseHeartbeatManager:
         try:
             next_refresh_at = self._loop.time() + get_task_lease_heartbeat_seconds()
             while self._entries:
-                delay = max(0.0, next_refresh_at - self._loop.time())
+                next_attempt_at = min(
+                    (
+                        entry.retry_at
+                        for entry in self._entries.values()
+                        if entry.retry_at is not None
+                    ),
+                    default=next_refresh_at,
+                )
+                next_attempt_at = min(next_refresh_at, next_attempt_at)
+                delay = max(0.0, next_attempt_at - self._loop.time())
                 if delay > 0:
                     self._wake_event.clear()
                     try:
@@ -1316,10 +1453,17 @@ class _TaskLeaseHeartbeatManager:
                         pass
                     if not self._entries:
                         return
-                    if self._loop.time() < next_refresh_at:
+                    if self._loop.time() < next_attempt_at:
                         continue
 
-                snapshot_entries = tuple(self._entries.items())
+                now = self._loop.time()
+                regular_refresh = now >= next_refresh_at
+                snapshot_entries = tuple(
+                    (key, entry)
+                    for key, entry in self._entries.items()
+                    if regular_refresh
+                    or (entry.retry_at is not None and entry.retry_at <= now)
+                )
                 snapshot = tuple(entry.lease for _, entry in snapshot_entries)
                 refresh_waiters = tuple(
                     (key, entry, self._loop.create_future())
@@ -1328,6 +1472,9 @@ class _TaskLeaseHeartbeatManager:
                 active_refresh_waiters = refresh_waiters
                 for _, entry, waiter in refresh_waiters:
                     entry.refresh_waiter = waiter
+                    # A database error waits for the next normal tick instead
+                    # of retrying the same failed statement in a tight loop.
+                    entry.retry_at = None
                 try:
                     states = await run_db_io_cancellation_safe(
                         lambda: refresh_task_leases_isolated(snapshot)
@@ -1368,6 +1515,18 @@ class _TaskLeaseHeartbeatManager:
                 else:
                     for key, entry, waiter in refresh_waiters:
                         state = states.get(key, TaskLeaseRefreshState.LOST)
+                        if state == TaskLeaseRefreshState.DEFERRED:
+                            now = self._loop.time()
+                            if entry.deferred_since is None:
+                                entry.deferred_since = now
+                            entry.retry_at = now + min(
+                                1.0, get_task_lease_heartbeat_seconds() / 4
+                            )
+                            # Skipping a locked row neither proves ownership
+                            # loss nor clears a preceding pool checkout error.
+                            self._settle_refresh_waiter(entry, waiter, entry.outcome)
+                            continue
+                        entry.deferred_since = None
                         if state == TaskLeaseRefreshState.LOST:
                             self._settle_refresh_waiter(
                                 entry,
@@ -1388,12 +1547,29 @@ class _TaskLeaseHeartbeatManager:
                                 waiter,
                                 TaskLeaseHeartbeatOutcome(),
                             )
+                    deferred = [
+                        entry
+                        for _, entry, _ in refresh_waiters
+                        if entry.deferred_since is not None
+                    ]
+                    if deferred:
+                        logger.debug(
+                            "component=lease-heartbeat deferred_count=%s "
+                            "oldest_deferred_seconds=%.3f",
+                            len(deferred),
+                            max(
+                                self._loop.time() - cast(float, entry.deferred_since)
+                                for entry in deferred
+                            ),
+                        )
                 active_refresh_waiters = ()
                 interval = get_task_lease_heartbeat_seconds()
-                next_refresh_at += interval
                 now = self._loop.time()
-                while next_refresh_at <= now:
-                    next_refresh_at += interval
+                # A slow subset retry must not consume a normal tick owed to
+                # the other leases. Run that overdue batch on the next loop.
+                if regular_refresh:
+                    while next_refresh_at <= now:
+                        next_refresh_at += interval
         finally:
             for _, entry, waiter in active_refresh_waiters:
                 self._settle_refresh_waiter(

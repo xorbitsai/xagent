@@ -14,6 +14,8 @@ type TestWebSocketMessage = {
   task?: Record<string, unknown>
   status?: string
   run_id?: string | null
+  stream_run_id?: string | null
+  stream_attempt_id?: string | null
   state_version?: number
   control_state?: string
   request_id?: string
@@ -188,6 +190,7 @@ function StateProbe() {
           })
         )}
       </div>
+      <div data-testid="last-task-update">{state.lastTaskUpdate}</div>
       <div data-testid="task-status">{state.currentTask?.status || ""}</div>
       <div data-testid="waiting-request-id">{state.currentTask?.waitingRequestId || ""}</div>
       <div data-testid="waiting-interactions">{JSON.stringify(state.currentTask?.waitingInteractions || [])}</div>
@@ -214,6 +217,7 @@ function StateProbe() {
       <div data-testid="history-loading">{String(state.isHistoryLoading)}</div>
       <div data-testid="preview-open">{String(state.filePreview.isOpen)}</div>
       <div data-testid="processing">{String(state.isProcessing)}</div>
+      <div data-testid="stream-recovery">{state.streamRecoveryTaskId ?? ""}</div>
     </>
   )
 }
@@ -488,19 +492,25 @@ function SeedExistingTask() {
   return null
 }
 
-function SendMessageProbe() {
+function SendMessageProbe({
+  label = "Send message",
+  message = "Optimistic round trip",
+  clientMessageId = "turn-optimistic",
+}: {
+  label?: string
+  message?: string
+  clientMessageId?: string
+}) {
   const { sendMessage } = useApp()
 
   return (
     <button
       type="button"
       onClick={() => {
-        void sendMessage("Optimistic round trip", {
-          clientMessageId: "turn-optimistic",
-        })
+        void sendMessage(message, { clientMessageId })
       }}
     >
-      Send message
+      {label}
     </button>
   )
 }
@@ -562,6 +572,161 @@ describe("AppProvider websocket message routing", () => {
   afterEach(() => {
     cleanup()
     localStorage.clear()
+  })
+
+  it.each([false, true])("rejects an initial shared delta and accepts a complete replacement (wrapped=%s)", (wrapped) => {
+    render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
+    const send = (eventType: string, data: Record<string, unknown>) => act(() => {
+      webSocketOptions.current?.onMessage?.({
+        task_id: 1, timestamp: "2026-05-27T05:00:00Z",
+        stream_run_id: "run-1", stream_attempt_id: "attempt-1",
+        ...(wrapped ? { type: "trace_event", event_type: eventType, data: { data } } : { type: eventType, data }),
+      })
+    })
+    act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type: "task_started", task_id: 1, run_id: "run-1", state_version: 1,
+        status: "running", control_state: "running", timestamp: "2026-05-27T05:00:00Z",
+      })
+    })
+    // Joining a known active run can deliver a delta before either start or snapshot.
+    send("final_answer_delta", { message_id: "final_answer_1", delta: "WRONG SUFFIX" })
+    expect(screen.getByTestId("messages").textContent).not.toContain("WRONG SUFFIX")
+    expect(screen.getByTestId("stream-recovery").textContent).toBe("1")
+    send("final_answer_delta", { message_id: "final_answer_1", delta: "MORE SUFFIX" })
+    expect(screen.getByTestId("messages").textContent).not.toContain("MORE SUFFIX")
+    send("final_answer_end", { message_id: "final_answer_1", content: "complete answer" })
+    expect(screen.getByTestId("messages").textContent).toContain("complete answer")
+    expect(screen.getByTestId("stream-recovery").textContent).toBe("")
+    send("final_answer_delta", { message_id: "final_answer_1", delta: "LATE SUFFIX" })
+    expect(screen.getByTestId("messages").textContent).not.toContain("LATE SUFFIX")
+  })
+
+  it.each([false, true])("handles task completion after a shared answer ends (wrapped=%s)", (wrapped) => {
+    render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
+    const send = (message: Partial<TestWebSocketMessage> & Record<string, unknown>) => act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type: "task_started", task_id: 1, timestamp: "2026-05-27T05:00:02Z",
+        stream_run_id: "run-1", stream_attempt_id: "attempt-1", ...message,
+      })
+    })
+    send({ run_id: "run-1", state_version: 1, status: "running", control_state: "running" })
+    send({ type: "trace_event", data: {
+      event_id: "dag-before-answer", event_type: "dag_execution",
+      data: { phase: "executing", turn_id: "run-1" },
+    } })
+    expect(screen.getByTestId("dag-phase").textContent).toBe("executing")
+    const answerFrame = (eventType: string, data: Record<string, unknown>) => send(
+      wrapped ? { type: "trace_event", event_type: eventType, data: { data } } : { type: eventType, data },
+    )
+    answerFrame("final_answer_start", { message_id: "final_answer_1" })
+    answerFrame("final_answer_end", { message_id: "final_answer_1", content: "complete answer" })
+    const previousUpdate = screen.getByTestId("last-task-update").textContent
+    send({ type: "task_completed", run_id: "run-1", state_version: 2,
+      control_state: "completed", task: { id: 1, status: "completed" }, success: true,
+    })
+    expect(screen.getByTestId("task-status").textContent).toBe("completed")
+    expect(screen.getByTestId("processing").textContent).toBe("false")
+    expect(screen.getByTestId("dag-phase").textContent).toBe("completed")
+    expect(screen.getByTestId("task-dag-terminated-at").textContent).not.toBe("")
+    expect(screen.getByTestId("last-task-update").textContent).not.toBe(previousUpdate)
+    answerFrame("final_answer_delta", { message_id: "final_answer_1", delta: "LATE SUFFIX" })
+    expect(screen.getByTestId("messages").textContent).toContain("complete answer")
+    expect(screen.getByTestId("messages").textContent).not.toContain("LATE SUFFIX")
+    expect(screen.getByTestId("stream-recovery").textContent).toBe("")
+  })
+
+  it.each([false, true])("keeps recovery after a completed answer receives a late start (wrapped=%s)", (wrapped) => {
+    render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
+    const send = (message: Partial<TestWebSocketMessage> & Record<string, unknown>) => act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type: "task_started", task_id: 1, timestamp: "2026-05-27T05:00:02Z", ...message,
+      })
+    })
+    const answerFrame = (type: string, data: Record<string, unknown>) => send({
+      stream_run_id: "run-1", stream_attempt_id: "attempt-1",
+      ...(wrapped ? { type: "trace_event", event_type: type, data: { data } } : { type, data }),
+    })
+    send({ run_id: "run-1", state_version: 1, status: "running", control_state: "running" })
+    answerFrame("final_answer_start", { message_id: "final_answer_1" })
+    answerFrame("final_answer_end", { message_id: "final_answer_1", content: "richer live answer" })
+    const snapshot = {
+      type: "task_stream_snapshot", run_id: "run-1", state_version: 2,
+      status: "completed", control_state: "completed",
+      data: { output: "durable answer", lease_attempt_id: "attempt-1" },
+    }
+    // Healthy completed output keeps its richer live presentation.
+    send(snapshot)
+    expect(screen.getByTestId("messages").textContent).toContain("richer live answer")
+    send({ type: "stream_unavailable" })
+    expect(screen.getByTestId("stream-recovery").textContent).toBe("1")
+    answerFrame("final_answer_start", { message_id: "final_answer_1" })
+    expect(screen.getByTestId("stream-recovery").textContent).toBe("1")
+    answerFrame("final_answer_delta", { message_id: "final_answer_1", delta: "LATE SUFFIX" })
+    expect(screen.getByTestId("messages").textContent).not.toContain("LATE SUFFIX")
+    // An interruption lets durable output replace even an already-complete result.
+    send(snapshot)
+    expect(screen.getByTestId("messages").textContent).toContain("durable answer")
+    expect(screen.getByTestId("messages").textContent).not.toContain("richer live answer")
+    expect(screen.getByTestId("stream-recovery").textContent).toBe("")
+  })
+
+  it("resumes shared deltas when a start establishes the missing prefix", () => {
+    render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
+    const send = (type: string, data: Record<string, unknown>) => act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type, task_id: 1, timestamp: "2026-05-27T05:00:00Z",
+        stream_run_id: "run-1", stream_attempt_id: "attempt-1", data,
+      })
+    })
+    send("final_answer_delta", { message_id: "final_answer_1", delta: "WRONG SUFFIX" })
+    send("final_answer_start", { message_id: "final_answer_1" })
+    send("final_answer_delta", { message_id: "final_answer_1", delta: "answer from its beginning" })
+    expect(screen.getByTestId("messages").textContent).toContain("answer from its beginning")
+    expect(screen.getByTestId("messages").textContent).not.toContain("WRONG SUFFIX")
+    expect(screen.getByTestId("stream-recovery").textContent).toBe("")
+  })
+
+  it("streams a new answer whose prefix arrives after an active snapshot", () => {
+    render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
+    const send = (message: Partial<TestWebSocketMessage>) => act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type: "task_stream_snapshot", task_id: 1,
+        timestamp: "2026-05-27T05:00:00Z", ...message,
+      })
+    })
+    send({ run_id: "run-1", state_version: 1, control_state: "running", status: "running", data: {} })
+    send({ type: "final_answer_start", stream_run_id: "run-1", data: { message_id: "final_answer_1" } })
+    send({ type: "final_answer_delta", stream_run_id: "run-1", data: { message_id: "final_answer_1", delta: "first visible answer" } })
+    expect(screen.getByTestId("messages").textContent).toContain("first visible answer")
+    send({ type: "task_started", stream_run_id: "run-2", run_id: "run-2", state_version: 2, status: "running", control_state: "running" })
+    send({ type: "final_answer_start", stream_run_id: "run-2", data: { message_id: "final_answer_2" } })
+    send({ type: "final_answer_delta", stream_run_id: "run-2", data: { message_id: "final_answer_2", delta: "second visible answer" } })
+    expect(screen.getByTestId("messages").textContent).toContain("second visible answer")
+  })
+
+  it("reconciles a gapped shared stream without appending later deltas or accepting an old run", () => {
+    render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
+    const send = (message: Partial<TestWebSocketMessage>) => act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type: "task_stream_snapshot", task_id: 1,
+        timestamp: "2026-05-27T05:00:00Z", ...message,
+      })
+    })
+    send({ type: "task_started", run_id: "run-2", state_version: 2, control_state: "running", status: "running" })
+    send({ type: "final_answer_start", stream_run_id: "run-2", data: { message_id: "final_answer_2" } })
+    send({ type: "final_answer_delta", stream_run_id: "run-2", data: { message_id: "final_answer_2", delta: "prefix" } })
+    expect(screen.getByTestId("messages").textContent).toContain("prefix")
+    send({ type: "stream_unavailable" })
+    send({ type: "final_answer_delta", stream_run_id: "run-2", data: { message_id: "final_answer_2", delta: "WRONG SUFFIX" } })
+    expect(screen.getByTestId("messages").textContent).not.toContain("WRONG SUFFIX")
+    send({ run_id: "run-1", state_version: 1, status: "completed", control_state: "completed", data: { output: "OLD RESULT" } })
+    expect(screen.getByTestId("messages").textContent).not.toContain("OLD RESULT")
+    send({ run_id: "run-2", state_version: 3, status: "completed", control_state: "completed", data: { output: "complete persisted result" } })
+    expect(screen.getByTestId("messages").textContent).toContain("complete persisted result")
+    expect(screen.getByTestId("messages").textContent).not.toContain("prefix")
+    send({ type: "final_answer_delta", stream_run_id: "run-2", data: { message_id: "final_answer_2", delta: "LATE" } })
+    expect(screen.getByTestId("messages").textContent).not.toContain("LATE")
   })
 
   it("routes historical assistant transcript rows to chat and progress events to trace", async () => {
@@ -751,6 +916,207 @@ describe("AppProvider websocket message routing", () => {
     })
   })
 
+  it("collapses one assistant question replayed after a reconnect", async () => {
+    render(
+      <AppProvider token="token">
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+    const interactions = [{ type: "confirm", label: "Proceed?" }]
+
+    // Live delivery: the raw prompt, carrying the form.
+    act(() => {
+      onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:00Z",
+        data: {
+          event_id: "question-1",
+          event_type: "agent_message",
+          data: {
+            message: "Round 1: please confirm",
+            expect_response: true,
+            request_id: "req-1",
+            metadata: { interactions },
+          },
+        },
+      })
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "Round 1: please confirm"
+      )
+    })
+
+    // Reconnect replay: same question, same event identity, but the
+    // transcript copy has the rendered interaction list appended, so no
+    // content comparison could pair the two.
+    act(() => {
+      onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:05Z",
+        data: {
+          event_id: "question-1",
+          event_type: "agent_message",
+          data: {
+            message:
+              "Round 1: please confirm\n\nPlease answer the following questions:\n- Proceed?",
+            role: "assistant",
+            source: "chat_history",
+            display: "chat",
+            expect_response: false,
+            visible: true,
+            metadata: { interactions },
+          },
+        },
+      })
+    })
+
+    // A second reconnect replays it again. The issue reported three copies on
+    // screen at this point; the widget session page never clears messages on
+    // reconnect, so nothing but identity stops them accumulating.
+    act(() => {
+      ;(window as typeof window & { clearDuplicateMessageCache?: () => void })
+        .clearDuplicateMessageCache?.()
+      onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:09Z",
+        data: {
+          event_id: "question-1",
+          event_type: "agent_message",
+          data: {
+            message:
+              "Round 1: please confirm\n\nPlease answer the following questions:\n- Proceed?",
+            role: "assistant",
+            source: "chat_history",
+            display: "chat",
+            expect_response: false,
+            visible: true,
+            metadata: { interactions },
+          },
+        },
+      })
+    })
+
+    await waitFor(() => {
+      const messages = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]"
+      ) as Array<{ id: string; role: string; content: string }>
+      const assistant = messages.filter(message => message.role === "assistant")
+      expect(assistant).toHaveLength(1)
+      expect(assistant[0].id).toBe("msg-agent-event-question-1")
+      expect(assistant[0].content).toBe("Round 1: please confirm")
+    })
+  })
+
+  it("does not re-print the question when replay is followed by the waiting re-assert", async () => {
+    // After the snapshot, the server re-asserts WAITING_FOR_USER with the
+    // question text read straight off the transcript row
+    // (get_latest_waiting_question returns TaskChatMessage.content), so it is
+    // byte-identical to the replayed row event. Suppressing the trace twin
+    // must not leave that frame as a fresh third bubble.
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("running")
+    })
+    const interactions = [{ type: "confirm", label: "Proceed?" }]
+    const transcriptText =
+      "Round 1: please confirm\n\nPlease answer the following questions:\n- Proceed?"
+
+    act(() => {
+      onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:00Z",
+        data: {
+          event_id: "question-1",
+          event_type: "agent_message",
+          data: {
+            message: transcriptText,
+            role: "assistant",
+            source: "chat_history",
+            display: "chat",
+            expect_response: false,
+            visible: true,
+            metadata: { interactions },
+          },
+        },
+      })
+      onMessage?.({
+        type: "task_waiting_for_user",
+        timestamp: "2026-05-27T05:00:01Z",
+        question: transcriptText,
+        message: transcriptText,
+        interactions,
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("waiting_for_user")
+    })
+    const messages = JSON.parse(
+      screen.getByTestId("messages").textContent || "[]"
+    ) as Array<{ role: string; content: string }>
+    expect(messages.filter(message => message.role === "assistant")).toHaveLength(1)
+  })
+
+  it("keeps two rounds that ask the same question verbatim", async () => {
+    render(
+      <AppProvider token="token">
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:00Z",
+        data: {
+          event_id: "question-1",
+          event_type: "agent_message",
+          data: {
+            message: "Please confirm",
+            expect_response: true,
+            request_id: "req-1",
+          },
+        },
+      })
+      onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:01Z",
+        data: {
+          event_id: "question-2",
+          event_type: "agent_message",
+          data: {
+            message: "Please confirm",
+            expect_response: true,
+            request_id: "req-2",
+          },
+        },
+      })
+    })
+
+    await waitFor(() => {
+      const messages = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]"
+      ) as Array<{ id: string; role: string; content: string }>
+      expect(messages.filter(message => message.content === "Please confirm"))
+        .toHaveLength(2)
+    })
+  })
+
   it("keeps identical text from distinct user turns", async () => {
     render(
       <AppProvider token="token">
@@ -844,6 +1210,365 @@ describe("AppProvider websocket message routing", () => {
           content: "Optimistic round trip",
           isOptimistic: false,
         }),
+      ])
+    })
+  })
+
+  it("keeps a second user turn whose text repeats an unreconciled optimistic turn", async () => {
+    // Two replies to the same fixed-string form: same text, different turns.
+    render(
+      <AppProvider token="token">
+        <SeedExistingTask />
+        <SendMessageProbe
+          label="Send repeated turn"
+          message="Confirmed"
+          clientMessageId="turn-first"
+        />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("running")
+    })
+
+    // The first turn's live user_message never arrives - a run refused before
+    // it starts emits none (see sendMessage's own note on the quota gate) -
+    // so its bubble stays optimistic and remains a merge candidate.
+    fireEvent.click(screen.getByRole("button", { name: "Send repeated turn" }))
+
+    await waitFor(() => {
+      const messages = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]"
+      ) as Array<{ content: string; isOptimistic?: boolean }>
+      expect(messages).toEqual([
+        expect.objectContaining({ content: "Confirmed", isOptimistic: true }),
+      ])
+    })
+
+    // Inside USER_MESSAGE_REPLACE_WINDOW_MS of the optimistic bubble, which
+    // is what makes the two turns candidates for a content merge at all.
+    act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type: "trace_event",
+        timestamp: new Date().toISOString(),
+        data: {
+          event_id: "user-event-second",
+          event_type: "user_message",
+          data: { message: "Confirmed", turn_id: "turn-second" },
+        },
+      })
+    })
+
+    await waitFor(() => {
+      const messages = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]"
+      ) as Array<{ id: string; content: string; isOptimistic?: boolean }>
+      expect(messages).toEqual([
+        expect.objectContaining({
+          id: "msg-user-turn-turn-first",
+          content: "Confirmed",
+          isOptimistic: true,
+        }),
+        expect.objectContaining({
+          id: "msg-user-turn-turn-second",
+          content: "Confirmed",
+          isOptimistic: false,
+        }),
+      ])
+    })
+  })
+
+  it("keeps two optimistic sends that repeat the same text", async () => {
+    // Both ids come from a client_message_id, so neither has been near the wire.
+    render(
+      <AppProvider token="token">
+        <SeedExistingTask />
+        <SendMessageProbe
+          label="Send first"
+          message="Confirmed"
+          clientMessageId="turn-first"
+        />
+        <SendMessageProbe
+          label="Send second"
+          message="Confirmed"
+          clientMessageId="turn-second"
+        />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("running")
+    })
+
+    fireEvent.click(screen.getByRole("button", { name: "Send first" }))
+    await waitFor(() => {
+      const messages = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]"
+      ) as Array<unknown>
+      expect(messages).toHaveLength(1)
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Send second" }))
+
+    await waitFor(() => {
+      const messages = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]"
+      ) as Array<{ id: string; isOptimistic?: boolean }>
+      expect(messages).toEqual([
+        expect.objectContaining({
+          id: "msg-user-turn-turn-first",
+          content: "Confirmed",
+          isOptimistic: true,
+        }),
+        expect.objectContaining({
+          id: "msg-user-turn-turn-second",
+          content: "Confirmed",
+          isOptimistic: true,
+        }),
+      ])
+    })
+  })
+
+  it("renders both repeated clarification replies on a Session transport", async () => {
+    // The incident surface: history is "none", so a collapsed turn never returns.
+    const transport = makeSessionTransport()
+    render(
+      <AppProvider token="token" transport={transport}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    act(() => webSocketOptions.current?.onConnect?.())
+    act(() => {
+      webSocketOptions.current?.onMessage?.(taskInfoMessage(1))
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("task-id").textContent).toBe("1")
+    })
+
+    // First reply: its live user_message never arrives, so the bubble stays
+    // optimistic and remains a merge candidate.
+    await act(async () => {
+      await getSessionControls().sendMessage("Confirmed", {
+        clientMessageId: "session-turn-1",
+      })
+    })
+
+    act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type: "trace_event",
+        timestamp: new Date().toISOString(),
+        task_id: 1,
+        data: {
+          event_id: "session-user-event-2",
+          event_type: "user_message",
+          data: { message: "Confirmed", turn_id: "session-turn-2" },
+        },
+      })
+    })
+
+    await waitFor(() => {
+      const messages = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]"
+      ) as Array<{ id: string; content: string; isOptimistic?: boolean }>
+      expect(messages).toEqual([
+        expect.objectContaining({
+          id: "msg-user-turn-session-turn-1",
+          content: "Confirmed",
+          isOptimistic: true,
+        }),
+        expect.objectContaining({
+          id: "msg-user-turn-session-turn-2",
+          content: "Confirmed",
+          isOptimistic: false,
+        }),
+      ])
+    })
+  })
+
+  it("shows one turn twice when its persisted id disagrees with the sender's", async () => {
+    // The accepted cost of reconciling by identity alone; see the commit.
+    render(
+      <AppProvider token="token">
+        <SeedExistingTask />
+        <SendMessageProbe
+          label="Send repeated turn"
+          message="Confirmed"
+          clientMessageId="turn-first"
+        />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("running")
+    })
+
+    fireEvent.click(screen.getByRole("button", { name: "Send repeated turn" }))
+    await waitFor(() => {
+      const messages = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]"
+      ) as Array<unknown>
+      expect(messages).toHaveLength(1)
+    })
+
+    // Same turn, server-minted id.
+    act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type: "trace_event",
+        timestamp: new Date().toISOString(),
+        data: {
+          event_id: "user-event-server-minted",
+          event_type: "user_message",
+          data: { message: "Confirmed", turn_id: "server-minted-uuid" },
+        },
+      })
+    })
+
+    await waitFor(() => {
+      const messages = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]"
+      ) as Array<{ id: string }>
+      expect(messages).toEqual([
+        expect.objectContaining({ id: "msg-user-turn-turn-first" }),
+        expect.objectContaining({ id: "msg-user-turn-server-minted-uuid" }),
+      ])
+    })
+  })
+
+  it("keeps a repeated turn identified only by event_id", async () => {
+    // The msg-user-event- half of the identity test: a row whose turn_id is
+    // NULL replays carrying only an event_id, and is still its own turn.
+    render(
+      <AppProvider token="token">
+        <SeedExistingTask />
+        <SendMessageProbe
+          label="Send repeated turn"
+          message="Confirmed"
+          clientMessageId="turn-first"
+        />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("running")
+    })
+
+    fireEvent.click(screen.getByRole("button", { name: "Send repeated turn" }))
+    await waitFor(() => {
+      const messages = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]"
+      ) as Array<unknown>
+      expect(messages).toHaveLength(1)
+    })
+
+    act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type: "trace_event",
+        timestamp: new Date().toISOString(),
+        data: {
+          event_id: "user-event-no-turn",
+          event_type: "user_message",
+          data: { message: "Confirmed" },
+        },
+      })
+    })
+
+    await waitFor(() => {
+      const messages = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]"
+      ) as Array<{ id: string; isOptimistic?: boolean }>
+      expect(messages).toEqual([
+        expect.objectContaining({
+          id: "msg-user-turn-turn-first",
+          isOptimistic: true,
+        }),
+        expect.objectContaining({
+          id: "msg-user-event-user-event-no-turn",
+          isOptimistic: false,
+        }),
+      ])
+    })
+  })
+
+  it("does not let blank client message ids collide into one bubble", async () => {
+    // `config` is untyped, so a blank id would otherwise mint a bare
+    // `msg-user-turn-` that every other blank-id turn reconciles onto.
+    render(
+      <AppProvider token="token">
+        <SeedExistingTask />
+        <SendMessageProbe label="Send blank one" message="First" clientMessageId="  " />
+        <SendMessageProbe label="Send blank two" message="Second" clientMessageId="  " />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("running")
+    })
+
+    fireEvent.click(screen.getByRole("button", { name: "Send blank one" }))
+    fireEvent.click(screen.getByRole("button", { name: "Send blank two" }))
+
+    await waitFor(() => {
+      const messages = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]"
+      ) as Array<{ id: string; content: string }>
+      expect(messages.map((message) => message.content)).toEqual(["First", "Second"])
+      expect(messages[0].id).not.toBe(messages[1].id)
+      expect(messages.some((message) => message.id === "msg-user-turn-")).toBe(false)
+    })
+  })
+
+  it("still reconciles a repeated user turn that carries no stable identity", async () => {
+    // No turn_id and no event_id: text is the only reconciliation available.
+    render(
+      <AppProvider token="token">
+        <SeedExistingTask />
+        <SendMessageProbe
+          label="Send repeated turn"
+          message="Confirmed"
+          clientMessageId="turn-first"
+        />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("running")
+    })
+
+    fireEvent.click(screen.getByRole("button", { name: "Send repeated turn" }))
+
+    await waitFor(() => {
+      const messages = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]"
+      ) as Array<{ content: string; isOptimistic?: boolean }>
+      expect(messages).toEqual([
+        expect.objectContaining({ content: "Confirmed", isOptimistic: true }),
+      ])
+    })
+
+    act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type: "trace_event",
+        timestamp: new Date().toISOString(),
+        data: {
+          event_type: "user_message",
+          data: { message: "Confirmed" },
+        },
+      })
+    })
+
+    await waitFor(() => {
+      const messages = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]"
+      ) as Array<{ content: string; isOptimistic?: boolean }>
+      expect(messages).toEqual([
+        expect.objectContaining({ content: "Confirmed", isOptimistic: false }),
       ])
     })
   })

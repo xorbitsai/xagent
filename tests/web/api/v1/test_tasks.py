@@ -48,6 +48,7 @@ from xagent.web.models.task import (
     TraceEvent,
 )
 from xagent.web.models.user import User
+from xagent.web.services import task_start
 from xagent.web.services.connector_runtime import (
     ConnectorRuntimeValues,
     drop_ephemeral_runtime_values_for_testing,
@@ -697,7 +698,7 @@ async def test_cancelled_upload_cleans_partial_local_file_and_metadata(
         with open(target_path, "xb") as buffer:
             buffer.write(b"partial")
         write_started.set()
-        assert allow_write.wait(timeout=2)
+        assert allow_write.wait(timeout=GUARD_TIMEOUT)
         return target_path
 
     monkeypatch.setattr(files_api, "_reserve_and_copy_upload", delayed_copy)
@@ -716,11 +717,18 @@ async def test_cancelled_upload_cleans_partial_local_file_and_metadata(
             user_id=user_id,
         )
     )
-    assert await asyncio.to_thread(write_started.wait, 2)
-    upload_task.cancel()
-    allow_write.set()
-    with pytest.raises(asyncio.CancelledError):
-        await upload_task
+    try:
+        assert await asyncio.to_thread(write_started.wait, GUARD_TIMEOUT)
+        upload_task.cancel()
+        allow_write.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(upload_task, timeout=GUARD_TIMEOUT)
+    finally:
+        allow_write.set()
+        upload_task.cancel()
+        await asyncio.wait_for(
+            asyncio.gather(upload_task, return_exceptions=True), timeout=GUARD_TIMEOUT
+        )
 
     assert written_path is not None
     assert not written_path.exists()
@@ -1197,7 +1205,7 @@ def test_create_task_maps_runtime_plan_identity_mismatch_to_domain_error(
     mock_start_task,
 ) -> None:
     agent_id, full_key = _create_agent_with_key()
-    prepare_runtime_plan = v1_tasks.prepare_create_connector_runtime
+    prepare_runtime_plan = task_start.prepare_create_connector_runtime
 
     def prepare_mismatched_identity(**kwargs):
         plan = prepare_runtime_plan(**kwargs)
@@ -1207,7 +1215,7 @@ def test_create_task_maps_runtime_plan_identity_mismatch_to_domain_error(
         )
 
     monkeypatch.setattr(
-        v1_tasks,
+        task_start,
         "prepare_create_connector_runtime",
         prepare_mismatched_identity,
     )
@@ -1490,7 +1498,7 @@ def test_create_task_rolls_back_when_runtime_secret_store_fails(mock_start_task)
     )
 
     with patch(
-        "xagent.web.api.v1.tasks.store_ephemeral_runtime_values",
+        "xagent.web.services.task_start.store_ephemeral_runtime_values",
         side_effect=RuntimeError("store failed for Bearer tenant-token"),
     ):
         resp = client.post(
@@ -1548,7 +1556,7 @@ def test_create_task_cleans_runtime_secret_when_schedule_fails(mock_start_task):
 
     with (
         patch(
-            "xagent.web.api.v1.tasks.store_ephemeral_runtime_values",
+            "xagent.web.services.task_start.store_ephemeral_runtime_values",
             new=recording_store,
         ),
         patch(
@@ -2165,9 +2173,9 @@ def test_append_message_uses_persisted_task_owner_after_agent_owner_changes(
     mock_start_task.reset_mock()
 
     with patch.object(
-        v1_tasks.TaskTurnOrchestrator,
+        task_start.TaskTurnOrchestrator,
         "schedule_claimed_turn",
-        wraps=v1_tasks.TaskTurnOrchestrator.schedule_claimed_turn,
+        wraps=task_start.TaskTurnOrchestrator.schedule_claimed_turn,
     ) as schedule_claimed_turn:
         response = client.post(
             f"/v1/chat/tasks/{task_id}/messages",
@@ -2705,7 +2713,7 @@ def test_append_message_keeps_task_state_when_runtime_secret_store_fails(
     mock_start_task.reset_mock()
 
     with patch(
-        "xagent.web.api.v1.tasks.store_ephemeral_runtime_values",
+        "xagent.web.services.task_start.store_ephemeral_runtime_values",
         side_effect=RuntimeError("store failed for Bearer append-token"),
     ):
         resp = client.post(
@@ -2780,7 +2788,7 @@ def test_append_message_does_not_store_runtime_secret_when_task_is_busy(
         store_ephemeral_runtime_values(turn_id, values_by_ref)
 
     with patch(
-        "xagent.web.api.v1.tasks.store_ephemeral_runtime_values",
+        "xagent.web.services.task_start.store_ephemeral_runtime_values",
         new=recording_store,
     ):
         resp = client.post(
@@ -3034,7 +3042,7 @@ def test_append_message_bg_inflight_does_not_corrupt_task_state(mock_start_task)
     """
     import asyncio
 
-    from xagent.web.api.websocket import background_task_manager
+    from xagent.web.services.task_execution import background_task_manager
 
     agent_id, full_key = _create_agent_with_key()
     task_id = _create_task(full_key, agent_id, content="first turn")

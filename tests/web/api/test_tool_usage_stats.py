@@ -13,10 +13,10 @@ from tests.web.services.test_task_execution_event_store import (
 from xagent.core.agent.trace import ACTION_END_TOOL
 from xagent.core.agent.trace import TraceEvent as CoreTraceEvent
 from xagent.web.api.tools import _tool_usage_query, get_tool_usage
-from xagent.web.api.trace_handlers import DatabaseTraceHandler
 from xagent.web.models.task import Task, TraceEvent
 from xagent.web.models.tool_config import ToolUsage
 from xagent.web.services import task_lease_service
+from xagent.web.services.trace_handlers import DatabaseTraceHandler
 
 engine = engine_fixture
 task_id = task_id_fixture

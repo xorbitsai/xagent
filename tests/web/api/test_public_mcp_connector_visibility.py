@@ -12,6 +12,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 import xagent.web.api.mcp as mcp_api
+from tests.shared.auth_database import auth_db_override
 from xagent.web.api.admin_mcp import (
     PublicMCPAppCreate,
     PublicMCPAppUpdate,
@@ -24,6 +25,7 @@ from xagent.web.api.auth import (
     auth_router,
 )
 from xagent.web.api.mcp import mcp_router
+from xagent.web.models.auth_database import get_auth_db
 from xagent.web.models.database import Base, get_db, get_engine
 from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.oauth_provider import OAuthProvider
@@ -47,6 +49,7 @@ app_for_tests.include_router(auth_router)
 app_for_tests.include_router(mcp_router)
 app_for_tests.include_router(admin_mcp_router)
 app_for_tests.dependency_overrides[get_db] = override_get_db
+app_for_tests.dependency_overrides[get_auth_db] = auth_db_override(override_get_db)
 client = TestClient(app_for_tests)
 
 
@@ -1106,6 +1109,89 @@ def test_builtin_registry_drift_validation_accepts_canonical_rows() -> None:
         with get_engine().begin() as connection:
             assert validate_builtin_public_mcp_apps(connection) == []
     finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_shopify_provenance_version_drift_keeps_ownership_and_is_reported() -> None:
+    from xagent.web.builtin_mcp_registry import (
+        _persisted_builtin_provenance_matches,
+        is_builtin_public_mcp_app,
+        validate_builtin_public_mcp_apps,
+    )
+    from xagent.web.mcp_apps import _app_to_dict
+
+    temp_dir = _setup_test_db()
+    db = next(get_db())
+    try:
+        shopify_app = (
+            db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "shopify").one()
+        )
+        launch_config = dict(shopify_app.launch_config)
+        marker = dict(launch_config["builtin_provenance"])
+        marker["version"] = 999
+        launch_config["builtin_provenance"] = marker
+        shopify_app.launch_config = launch_config
+        db.commit()
+
+        assert _persisted_builtin_provenance_matches("shopify", launch_config) is True
+        assert is_builtin_public_mcp_app("shopify") is True
+        assert (
+            _app_to_dict(shopify_app)["launch_config"]["builtin_provenance"]["version"]
+            == 1
+        )
+        with get_engine().begin() as connection:
+            mismatches = validate_builtin_public_mcp_apps(connection)
+
+        shopify_mismatch = next(
+            mismatch for mismatch in mismatches if mismatch["app_id"] == "shopify"
+        )
+        assert shopify_mismatch["mismatched_fields"] == ["launch_config"]
+    finally:
+        db.close()
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_shopify_foreign_provenance_is_not_owned_but_is_reported() -> None:
+    from xagent.web.builtin_mcp_registry import (
+        _persisted_builtin_provenance_matches,
+        validate_builtin_public_mcp_apps,
+    )
+
+    temp_dir = _setup_test_db()
+    db = next(get_db())
+    try:
+        shopify_app = (
+            db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "shopify").one()
+        )
+        launch_config = dict(shopify_app.launch_config)
+        marker = dict(launch_config["builtin_provenance"])
+        marker["registry"] = "custom"
+        launch_config["builtin_provenance"] = marker
+        shopify_app.launch_config = launch_config
+        db.commit()
+
+        assert _persisted_builtin_provenance_matches("shopify", launch_config) is False
+        with get_engine().begin() as connection:
+            mismatches = validate_builtin_public_mcp_apps(connection)
+
+        shopify_mismatch = next(
+            mismatch for mismatch in mismatches if mismatch["app_id"] == "shopify"
+        )
+        assert shopify_mismatch["mismatched_fields"] == ["builtin_provenance"]
+    finally:
+        db.close()
         Base.metadata.drop_all(bind=get_engine())
         try:
             import shutil

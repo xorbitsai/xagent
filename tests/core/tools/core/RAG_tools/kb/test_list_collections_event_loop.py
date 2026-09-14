@@ -244,7 +244,7 @@ class _FakeConnection:
 
 def _store_with(connection: _FakeConnection) -> LanceDBMetadataStore:
     store = LanceDBMetadataStore()
-    store._conn = connection
+    store.get_raw_connection = lambda: connection  # type: ignore[method-assign]
     return store
 
 

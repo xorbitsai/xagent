@@ -268,6 +268,10 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   // Set once loadAgent decides to load an owner-scoped MCP list for an admin
   // cross-user view, so the mount-time self-scoped fetch won't clobber it.
   const ownerScopedMcpRef = useRef(false)
+  // The CURRENT user's general default (not necessarily the agent owner's),
+  // kept so the edit-mode seed below can run whichever mount fetch lands last.
+  const userDefaultGeneralRef = useRef<number | null>(null)
+  const seededGeneralRef = useRef<number | null>(null)
   const router = useRouter()
   const searchParams = useSearchParams()
   const templateId = searchParams.get("template")
@@ -788,22 +792,29 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         if (userDefaultsRes.ok) {
           const userDefaults = await userDefaultsRes.json()
 
-          // Set model config based on user defaults (only for new agent)
+          // One pass: the general-default ref is needed in edit mode too (the
+          // seed effect above reads it), the rest only seeds a new agent.
+          // The shape guards are defensive -- fetchData's catch already
+          // swallows a malformed response, so no test can tell them apart.
+          const config: AgentModelConfig = {
+            general: null,
+            small_fast: null,
+            visual: null,
+            compact: null,
+          }
+          for (const m of Array.isArray(userDefaults) ? userDefaults : []) {
+            const id = m?.model?.id
+            if (!id) continue
+            if (m.config_type === 'general') {
+              config.general = id
+              userDefaultGeneralRef.current = id
+            }
+            else if (m.config_type === 'small_fast') config.small_fast = id
+            else if (m.config_type === 'visual') config.visual = id
+            else if (m.config_type === 'compact') config.compact = id
+          }
+
           if (!isEditMode) {
-            const config: AgentModelConfig = {
-              general: null,
-              small_fast: null,
-              visual: null,
-              compact: null,
-            }
-
-            for (const m of userDefaults) {
-              if (m.config_type === 'general') config.general = m.model.id
-              else if (m.config_type === 'small_fast') config.small_fast = m.model.id
-              else if (m.config_type === 'visual') config.visual = m.model.id
-              else if (m.config_type === 'compact') config.compact = m.model.id
-            }
-
             // Fallback: If no general model set, pick first available LLM
             if (!config.general && availableModels.length > 0) {
               // models endpoint was called with ?category=llm so these should be LLMs
@@ -838,6 +849,22 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     }
   }
 
+  // Server-side creation paths persisted no model config, which rendered "--"
+  // and tripped the required-model guard on save. Both mount fetches must have
+  // landed before we can tell an unset slot from one still loading.
+  useEffect(() => {
+    // Not in a read-only cross-user view: the default below is the viewer's,
+    // so seeding there would render someone else's model as this agent's.
+    if (!isEditMode || readOnly || !isInitialDataLoaded || !originalData) return
+    if (seededGeneralRef.current !== null || modelConfig.general) return
+    const seeded = userDefaultGeneralRef.current
+    // Only an id the dropdown can actually show: seeding one that is missing
+    // from the fetched list renders an empty Select while counting as dirty.
+    if (!seeded || !models.some(m => m.id === seeded)) return
+    seededGeneralRef.current = seeded
+    setModelConfig(prev => ({ ...prev, general: seeded }))
+  }, [isEditMode, readOnly, isInitialDataLoaded, originalData, modelConfig.general, models])
+
   // Load agent data in edit mode
   useEffect(() => {
     if (!isEditMode || !localAgentId) return
@@ -857,6 +884,18 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           if (!active) return
           setOriginalData(agent)
           setReadOnly(agent.can_edit === false)
+          // Same synchronous block as originalData: React 18 does not batch
+          // across the await below, so leaving this after it lets the seed
+          // effect run against a committed originalData and then be clobbered
+          // -- with the ref already stamped, it would never seed again.
+          if (agent.models) {
+            setModelConfig({
+              general: agent.models.general || null,
+              small_fast: agent.models.small_fast || null,
+              visual: agent.models.visual || null,
+              compact: agent.models.compact || null,
+            })
+          }
           setName(agent.name || "")
           setDescription(agent.description || "")
           setInstructions(agent.instructions || "")
@@ -901,16 +940,6 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
 
           setLogoUrl(agent.logo_url || null)
           setLogoRemoved(false)
-
-          // Load models
-          if (agent.models) {
-            setModelConfig({
-              general: agent.models.general || null,
-              small_fast: agent.models.small_fast || null,
-              visual: agent.models.visual || null,
-              compact: agent.models.compact || null,
-            })
-          }
         } else if (response.status === 404) {
           setNotFound(true)
         }
@@ -1269,7 +1298,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     })
   }
 
-  const isDirty = useMemo(() => {
+  const isDirtyBeyondGeneralModel = useMemo(() => {
     if (!originalData) return false
 
     // Helper to normalize arrays for comparison
@@ -1309,15 +1338,33 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     const originalNonMcpCategories = (originalData.tool_categories || []).filter((c: string) => !c.startsWith('mcp:'))
     if (normalize(nonMcpCategories) !== normalize(originalNonMcpCategories)) return true
 
-    // Compare models
+    // Compare models. The general slot is compared outside this memo: the
+    // seed has to leave Update enabled (that is the only flow that persists
+    // it) while not blocking Publish.
     const origModels = originalData.models || {}
-    if ((modelConfig.general || null) !== (origModels.general || null)) return true
     if ((modelConfig.small_fast || null) !== (origModels.small_fast || null)) return true
     if ((modelConfig.visual || null) !== (origModels.visual || null)) return true
     if ((modelConfig.compact || null) !== (origModels.compact || null)) return true
 
     return false
   }, [name, description, instructions, executionMode, ownership, visibility, logoFile, logoRemoved, suggestedPrompts, selectedKbs, selectedSkills, selectedToolCategories, selectedMcpServers, modelConfig, originalData])
+
+  const generalModelDiffers =
+    (modelConfig.general || null) !== ((originalData?.models || {}).general || null)
+  // Enables Update, so the seeded value has a way into the database: Publish
+  // posts no body and never persists models.
+  const isDirty = isDirtyBeyondGeneralModel || generalModelDiffers
+  // ...but a slot holding the seeded value is not an edit worth blocking
+  // Publish over, for the very agents the seed exists to unblock. Picking the
+  // seeded model by hand is indistinguishable from the seed itself, which is
+  // harmless: either way the delegation resolves the same default. The
+  // stored-slot test retires the exemption once an Update has persisted a
+  // model, so re-picking the seeded one is then an ordinary unsaved edit.
+  const seedStillUnsaved = !(originalData?.models || {}).general
+  const publishBlockedByEdits =
+    isDirtyBeyondGeneralModel ||
+    (generalModelDiffers &&
+      !(seedStillUnsaved && modelConfig.general === seededGeneralRef.current))
 
   // After a successful save, align server-side ownership with the chosen control:
   // promote a personal agent to team (with visibility) or demote a team agent back
@@ -2005,7 +2052,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
                   <Button
                     variant="secondary"
                     onClick={handlePublish}
-                    disabled={isCreating || loadingAgent || isDirty}
+                    disabled={isCreating || loadingAgent || publishBlockedByEdits}
                   >
                     {t("builds.editor.header.publish")}
                   </Button>

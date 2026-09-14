@@ -29,6 +29,11 @@ from xagent.web.models.database import Base
 from xagent.web.models.user import User
 from xagent.web.tools.config import WebToolConfig
 
+# Every no-valid-model assertion in this module depends on the fallback
+# resolving to nothing; see the fixture for why that cannot be left to the
+# machine's environment.
+pytestmark = pytest.mark.usefixtures("no_resolvable_default_llm")
+
 
 def _create_session() -> tuple[Session, str, sessionmaker]:
     temp_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)

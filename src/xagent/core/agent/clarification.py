@@ -37,7 +37,7 @@ CLARIFICATION_SOURCES = frozenset({"send_message", "ask_user_question", "tool_wa
 
 # Marker composition constants. ``_MARKER_KEEP`` must stay character-for-
 # character identical to the whitelist in
-# ``src/xagent/web/api/trace_handlers.py``'s ``clean_string`` (see
+# ``src/xagent/web/services/trace_handlers.py``'s ``clean_string`` (see
 # ``_marker_clean`` below for the full cross-layer contract note).
 _MARKER_KEEP = "\n\r\t"
 _MARKER_SEP = "|"
@@ -124,8 +124,8 @@ class ClarificationDraft:
         ``ClarificationDraft`` (under ``result["clarification_draft"]``) is
         serialized into trace events by handlers that use the ``to_dict``
         protocol -- ``DatabaseTraceHandler._serialize_data_for_json`` and its
-        WebSocket twins, ``WebSocketTraceHandler._serialize_data`` in
-        ``ws_trace_handlers.py`` and ``SharedWebSocketTracer._serialize_data``
+        WebSocket twins, ``TaskEventTraceHandler._serialize_data`` in
+        ``task_event_trace_handler.py`` and ``SharedWebSocketTracer._serialize_data``
         in ``websocket.py``, call ``value.to_dict()`` whenever it is
         callable, and then recursively re-serialize whatever that call
         returns. So this
@@ -163,9 +163,9 @@ def _marker_clean(value: str) -> str:
     Five independent copies of this control-character filter exist in the
     codebase, and all five must stay in the same domain: this function,
     three web-layer closures that the core layer cannot import and so
-    cannot share code with -- ``src/xagent/web/api/trace_handlers.py``'s
+    cannot share code with -- ``src/xagent/web/services/trace_handlers.py``'s
     ``DatabaseTraceHandler._serialize_data_for_json`` (``clean_string``),
-    ``src/xagent/web/api/ws_trace_handlers.py``'s
+    ``src/xagent/web/services/task_event_trace_handler.py``'s
     ``serialize_trace_data`` (``clean_string``), and
     ``src/xagent/web/api/websocket.py``'s
     ``SharedWebSocketTracer._serialize_data`` (``clean_string``) -- and
@@ -234,9 +234,14 @@ def draft_from_waiting_request(
 
     - ``request["kind"] == "tool_waiting_for_user"`` -> ``"tool_waiting"``,
       one :class:`ClarificationRequestItem` per entry in ``request["requests"]``.
-    - otherwise ``request["message_type"] == "question"`` *and* ``request``
-      has an ``"interactions"`` key (key presence, not truthiness -- an
-      empty-form ``ask_user_question`` still has the key) -> ``"ask_user_question"``.
+    - otherwise ``request["tool_name"] == "ask_user_question"`` ->
+      ``"ask_user_question"``. Keyed on the tool name rather than on the
+      presence of an ``"interactions"`` key, because every waiting path now
+      carries that key: the engine appends a default free-text field
+      whenever nothing the model supplied is answerable, so key presence no
+      longer tells the two control tools apart. ``tool_name`` has always
+      been written here, so checkpoints written before that classify the same
+      way.
     - otherwise -> ``"send_message"``.
 
     Returns ``None`` in two cases, both meaning "no typed draft could be
@@ -245,14 +250,11 @@ def draft_from_waiting_request(
     - ``request`` is not a dict (``None``, a stray ``str``, a ``list``,
       ...) -- a type mismatch from the caller.
     - ``request`` is a dict but carries neither a non-empty message nor an
-      ``"interactions"`` key nor a non-empty ``"requests"`` list. This is
-      reachable in production today: a ``send_message`` call with an empty
-      ``message`` and ``expect_response=True`` reaches ``waiting_for_user``
-      with no message, no ``"interactions"`` key, and no ``"requests"``
-      list (see the ``send_message`` branch of
-      ``ReActPattern._handle_control_tool`` in ``react.py``). It also
-      covers resuming a checkpoint written by an older schema, which
-      degrades to "no draft" instead of raising and blocking resume.
+      ``"interactions"`` key nor a non-empty ``"requests"`` list. No ReAct
+      waiting path produces that shape any more -- every one of them now
+      writes an ``"interactions"`` key. What remains is resuming a checkpoint
+      written by an older schema, which degrades to "no draft" instead of
+      raising and blocking resume.
     """
 
     if not isinstance(request, dict):
@@ -300,7 +302,7 @@ def draft_from_waiting_request(
                     )
                 )
         requests = tuple(items)
-    elif request.get("message_type") == "question" and has_interactions_key:
+    elif request.get("tool_name") == "ask_user_question":
         source = "ask_user_question"
         tool_call_id = str(request.get("tool_call_id") or "")
         requests = (

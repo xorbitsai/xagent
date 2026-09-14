@@ -15,11 +15,13 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from tests.shared.auth_database import auth_db_override
 from xagent.core.model.embedding.base import BaseEmbedding
 from xagent.core.model.model import EmbeddingModelConfig
 from xagent.core.tools.core.RAG_tools.core.schemas import CollectionInfo
 from xagent.web.api.auth import hash_password
 from xagent.web.api.kb import kb_router
+from xagent.web.models.auth_database import get_auth_db
 from xagent.web.models.database import Base, get_db
 from xagent.web.models.user import User
 
@@ -177,6 +179,7 @@ def test_env(monkeypatch: pytest.MonkeyPatch):
 
     app.include_router(auth_router)
     app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides[get_auth_db] = auth_db_override(override_get_db)
 
     Base.metadata.create_all(bind=test_engine)
 

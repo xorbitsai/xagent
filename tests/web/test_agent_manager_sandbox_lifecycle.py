@@ -16,8 +16,8 @@ from xagent.sandbox.base import (
     SandboxRecoveryRequiredError,
     SandboxRuntimeConflictError,
 )
-from xagent.web.api.chat import AgentServiceManager
 from xagent.web.sandbox_manager import SandboxCapacityError, SandboxManager
+from xagent.web.services.agent_service_manager import AgentServiceManager
 
 
 class _FakeAgentService:

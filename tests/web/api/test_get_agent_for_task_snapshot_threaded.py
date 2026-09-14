@@ -36,15 +36,15 @@ from sqlalchemy.pool import QueuePool
 from xagent.core.file_storage.factory import get_unscoped_file_storage
 from xagent.core.tools.adapters.vibe.config import MCPFailurePolicy
 from xagent.core.workspace import TaskWorkspace
-from xagent.web.api import chat as chat_module
-from xagent.web.api.chat import AgentServiceManager
 from xagent.web.models import Base, Task
 from xagent.web.models import database as database_module
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.task import TaskStatus
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
+from xagent.web.services import agent_service_manager as agent_runtime_service
 from xagent.web.services import uploaded_file_store as uploaded_file_store_module
+from xagent.web.services.agent_service_manager import AgentServiceManager
 from xagent.web.services.managed_file_ref import ensure_uploaded_file_local_path
 from xagent.web.services.task_setup_snapshot import (
     RuntimeUserFields,
@@ -131,7 +131,7 @@ async def test_live_request_session_releases_clean_read_before_snapshot_worker(
     request_user = request_db.get(User, user_id)
     assert request_user is not None
     loaded_snapshots: list[TaskSetupSnapshot] = []
-    real_loader = chat_module.load_task_setup_snapshot_sync
+    real_loader = agent_runtime_service.load_task_setup_snapshot_sync
 
     def tracking_loader(
         loaded_task_id: int,
@@ -157,18 +157,24 @@ async def test_live_request_session_releases_clean_read_before_snapshot_worker(
     manager = AgentServiceManager()
     with (
         patch(
-            "xagent.web.api.chat.load_task_setup_snapshot_sync",
+            "xagent.web.services.agent_service_manager.load_task_setup_snapshot_sync",
             side_effect=tracking_loader,
         ),
         patch.object(manager, "_load_persisted_conversation_history"),
         patch.object(manager, "_load_persisted_execution_context", new=AsyncMock()),
-        patch("xagent.web.api.chat.create_task_tracer", return_value=MagicMock()),
         patch(
-            "xagent.web.api.chat.create_default_tools",
+            "xagent.web.services.agent_service_manager.create_task_tracer",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "xagent.web.services.agent_service_manager.create_default_tools",
             new=observed_create_default_tools,
         ),
         patch("xagent.web.sandbox_manager.get_sandbox_manager", return_value=None),
-        patch("xagent.web.api.chat.AgentService", return_value=MagicMock()),
+        patch(
+            "xagent.web.services.agent_service_manager.AgentService",
+            return_value=MagicMock(),
+        ),
     ):
         await manager.get_agent_for_task(task_id, request_db, user=request_user)
 
@@ -250,7 +256,7 @@ def test_selected_file_registration_materializes_after_read_session_closes(
         return ensure_uploaded_file_local_path(record)
 
     monkeypatch.setattr(
-        chat_module,
+        agent_runtime_service,
         "ensure_uploaded_file_local_path",
         observed_materialization,
     )
@@ -260,7 +266,7 @@ def test_selected_file_registration_materializes_after_read_session_closes(
         allowed_external_dirs=[str(source_dir)],
     )
 
-    chat_module._register_selected_task_files_isolated(
+    agent_runtime_service._register_selected_task_files_isolated(
         workspace,
         task_id=task_id,
         task_owner_id=user_id,
@@ -292,16 +298,18 @@ async def test_snapshot_worker_rejects_caller_session_with_pending_writes() -> N
     worker = AsyncMock()
     with (
         patch(
-            "xagent.web.api.chat.release_db_connection_if_clean",
+            "xagent.web.services.agent_service_manager.release_db_connection_if_clean",
             return_value=False,
         ),
         patch(
-            "xagent.web.api.chat.run_db_io_cancellation_safe",
+            "xagent.web.services.agent_service_manager.run_db_io_cancellation_safe",
             new=worker,
         ),
         pytest.raises(RuntimeError, match="pending writes"),
     ):
-        await chat_module._load_task_setup_snapshot_for_agent(42, 1, caller_db)
+        await agent_runtime_service._load_task_setup_snapshot_for_agent(
+            42, 1, caller_db
+        )
 
     worker.assert_not_awaited()
 
@@ -339,13 +347,19 @@ async def test_snapshot_pool_timeout_is_not_replaced_by_default_runtime(
     with (
         patch.object(manager, "_load_persisted_conversation_history"),
         patch.object(manager, "_load_persisted_execution_context", new=AsyncMock()),
-        patch("xagent.web.api.chat.create_task_tracer", return_value=MagicMock()),
         patch(
-            "xagent.web.api.chat.create_default_tools",
+            "xagent.web.services.agent_service_manager.create_task_tracer",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "xagent.web.services.agent_service_manager.create_default_tools",
             new=AsyncMock(return_value=([], MagicMock())),
         ),
         patch("xagent.web.sandbox_manager.get_sandbox_manager", return_value=None),
-        patch("xagent.web.api.chat.AgentService", new=agent_constructor),
+        patch(
+            "xagent.web.services.agent_service_manager.AgentService",
+            new=agent_constructor,
+        ),
         pytest.raises(SQLAlchemyTimeoutError),
     ):
         await manager.get_agent_for_task(42, caller_db, user=_make_user())
@@ -382,24 +396,24 @@ async def test_snapshot_runs_off_loop_thread() -> None:
 
     with (
         patch(
-            "xagent.web.api.chat.load_task_setup_snapshot_sync",
+            "xagent.web.services.agent_service_manager.load_task_setup_snapshot_sync",
             side_effect=fake_loader,
         ),
         patch.object(manager, "_load_persisted_conversation_history"),
         patch.object(manager, "_load_persisted_execution_context", new=AsyncMock()),
         patch(
-            "xagent.web.api.chat.create_task_tracer",
+            "xagent.web.services.agent_service_manager.create_task_tracer",
             return_value=MagicMock(),
         ),
         patch(
-            "xagent.web.api.chat.create_default_tools",
+            "xagent.web.services.agent_service_manager.create_default_tools",
             new=AsyncMock(return_value=([], MagicMock())),
         ),
         patch(
             "xagent.web.sandbox_manager.get_sandbox_manager",
             return_value=None,
         ),
-        patch("xagent.web.api.chat.AgentService"),
+        patch("xagent.web.services.agent_service_manager.AgentService"),
     ):
         try:
             await manager.get_agent_for_task(task_id=42, db=db, user=user)
@@ -445,23 +459,23 @@ async def test_event_loop_stays_responsive_during_snapshot_load() -> None:
     async def driver() -> None:
         with (
             patch(
-                "xagent.web.api.chat.load_task_setup_snapshot_sync",
+                "xagent.web.services.agent_service_manager.load_task_setup_snapshot_sync",
                 side_effect=slow_loader,
             ),
             patch.object(manager, "_load_persisted_conversation_history"),
             patch(
-                "xagent.web.api.chat.create_task_tracer",
+                "xagent.web.services.agent_service_manager.create_task_tracer",
                 return_value=MagicMock(),
             ),
             patch(
-                "xagent.web.api.chat.create_default_tools",
+                "xagent.web.services.agent_service_manager.create_default_tools",
                 new=AsyncMock(return_value=([], MagicMock())),
             ),
             patch(
                 "xagent.web.sandbox_manager.get_sandbox_manager",
                 return_value=None,
             ),
-            patch("xagent.web.api.chat.AgentService"),
+            patch("xagent.web.services.agent_service_manager.AgentService"),
         ):
             try:
                 await manager.get_agent_for_task(task_id=42, db=db, user=user)
@@ -520,24 +534,27 @@ async def test_loop_consumes_snapshot_after_session_close() -> None:
 
     with (
         patch(
-            "xagent.web.api.chat.load_task_setup_snapshot_sync",
+            "xagent.web.services.agent_service_manager.load_task_setup_snapshot_sync",
             return_value=snapshot,
         ),
         patch.object(manager, "_load_persisted_conversation_history"),
         patch.object(manager, "_load_persisted_execution_context", new=AsyncMock()),
         patch(
-            "xagent.web.api.chat.create_task_tracer",
+            "xagent.web.services.agent_service_manager.create_task_tracer",
             return_value=MagicMock(),
         ),
         patch(
-            "xagent.web.api.chat.create_default_tools",
+            "xagent.web.services.agent_service_manager.create_default_tools",
             new=AsyncMock(return_value=([], MagicMock())),
         ),
         patch(
             "xagent.web.sandbox_manager.get_sandbox_manager",
             return_value=None,
         ),
-        patch("xagent.web.api.chat.AgentService", new=_FakeAgentService),
+        patch(
+            "xagent.web.services.agent_service_manager.AgentService",
+            new=_FakeAgentService,
+        ),
     ):
         await manager.get_agent_for_task(task_id=42, db=db, user=user)
 
@@ -637,10 +654,19 @@ async def test_get_agent_for_task_snapshot_reader_uses_persisted_task_owner(
         with (
             patch.object(manager, "_load_persisted_conversation_history"),
             patch.object(manager, "_load_persisted_execution_context", new=AsyncMock()),
-            patch("xagent.web.api.chat.create_task_tracer", return_value=MagicMock()),
-            patch("xagent.web.api.chat.create_default_tools", new=capture_tools),
+            patch(
+                "xagent.web.services.agent_service_manager.create_task_tracer",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "xagent.web.services.agent_service_manager.create_default_tools",
+                new=capture_tools,
+            ),
             patch("xagent.web.sandbox_manager.get_sandbox_manager", return_value=None),
-            patch("xagent.web.api.chat.AgentService", return_value=agent_service),
+            patch(
+                "xagent.web.services.agent_service_manager.AgentService",
+                return_value=agent_service,
+            ),
         ):
             await manager.get_agent_for_task(task_id, request_db, user=actor_user)
     finally:
@@ -677,15 +703,21 @@ async def test_snapshot_source_controls_mcp_failure_policy(
     tracer = MagicMock()
     with (
         patch(
-            "xagent.web.api.chat.load_task_setup_snapshot_sync",
+            "xagent.web.services.agent_service_manager.load_task_setup_snapshot_sync",
             return_value=snapshot,
         ),
         patch.object(manager, "_load_persisted_conversation_history"),
         patch.object(manager, "_load_persisted_execution_context", new=AsyncMock()),
-        patch("xagent.web.api.chat.create_task_tracer", return_value=tracer),
-        patch("xagent.web.api.chat.create_default_tools", new=create_tools),
+        patch(
+            "xagent.web.services.agent_service_manager.create_task_tracer",
+            return_value=tracer,
+        ),
+        patch(
+            "xagent.web.services.agent_service_manager.create_default_tools",
+            new=create_tools,
+        ),
         patch("xagent.web.sandbox_manager.get_sandbox_manager", return_value=None),
-        patch("xagent.web.api.chat.AgentService"),
+        patch("xagent.web.services.agent_service_manager.AgentService"),
     ):
         await manager.get_agent_for_task(task_id=42, db=db, user=user)
 
@@ -712,15 +744,21 @@ async def test_fresh_public_snapshot_forwards_file_operation_policy() -> None:
 
     with (
         patch(
-            "xagent.web.api.chat.load_task_setup_snapshot_sync",
+            "xagent.web.services.agent_service_manager.load_task_setup_snapshot_sync",
             return_value=snapshot,
         ),
         patch.object(manager, "_load_persisted_conversation_history"),
         patch.object(manager, "_load_persisted_execution_context", new=AsyncMock()),
-        patch("xagent.web.api.chat.create_task_tracer", return_value=MagicMock()),
-        patch("xagent.web.api.chat.create_default_tools", new=create_tools),
+        patch(
+            "xagent.web.services.agent_service_manager.create_task_tracer",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "xagent.web.services.agent_service_manager.create_default_tools",
+            new=create_tools,
+        ),
         patch("xagent.web.sandbox_manager.get_sandbox_manager", return_value=None),
-        patch("xagent.web.api.chat.AgentService"),
+        patch("xagent.web.services.agent_service_manager.AgentService"),
     ):
         await manager.get_agent_for_task(task_id=42, db=db, user=_make_user())
 
@@ -805,24 +843,24 @@ async def test_snapshot_fallback_raises_on_no_default_llm_with_agent_builder() -
 
     with (
         patch(
-            "xagent.web.api.chat.load_task_setup_snapshot_sync",
+            "xagent.web.services.agent_service_manager.load_task_setup_snapshot_sync",
             return_value=agent_builder_snapshot,
         ),
         patch.object(manager, "_load_persisted_conversation_history"),
         patch.object(manager, "_load_persisted_execution_context", new=AsyncMock()),
         patch(
-            "xagent.web.api.chat.create_task_tracer",
+            "xagent.web.services.agent_service_manager.create_task_tracer",
             return_value=MagicMock(),
         ),
         patch(
-            "xagent.web.api.chat.create_default_tools",
+            "xagent.web.services.agent_service_manager.create_default_tools",
             new=AsyncMock(return_value=([], MagicMock())),
         ),
         patch(
             "xagent.web.sandbox_manager.get_sandbox_manager",
             return_value=None,
         ),
-        patch("xagent.web.api.chat.AgentService"),
+        patch("xagent.web.services.agent_service_manager.AgentService"),
     ):
         with pytest.raises(HTTPException) as exc_info:
             await manager.get_agent_for_task(task_id=42, db=db, user=user)

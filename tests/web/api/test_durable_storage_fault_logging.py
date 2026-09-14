@@ -24,7 +24,7 @@ import errno
 import io
 import logging
 from pathlib import Path
-from typing import Any, Iterator, cast
+from typing import Any, Iterator
 
 import pytest
 from fastapi import HTTPException
@@ -33,9 +33,10 @@ from fastapi.datastructures import UploadFile
 from xagent.core.file_storage.factory import get_unscoped_file_storage
 from xagent.web.api import files as files_api
 from xagent.web.api import websocket as websocket_api
-from xagent.web.api.v1 import tasks as v1_tasks
-from xagent.web.api.v1.errors import V1ApiError
+from xagent.web.models.agent import Agent
+from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
+from xagent.web.services import task_command_execution, task_start
 from xagent.web.services.managed_file_ref import (
     _MAX_LOG_VALUE_LENGTH,
     DURABLE_FAULT_LOG_PREFIX,
@@ -44,9 +45,9 @@ from xagent.web.services.managed_file_ref import (
     log_durable_storage_fault,
 )
 
-from .conftest import _direct_db_session, _setup_admin
+from .conftest import _admin_headers, _direct_db_session, _setup_admin, client
 
-# Not module-wide: only the end-to-end upload test touches the database. The
+# Not module-wide: only the upload and SDK endpoint tests need the database. The
 # other tests drive the helper directly and would pay a schema create/drop for
 # nothing.
 
@@ -362,7 +363,45 @@ async def test_upload_durable_write_failure_logs_the_provider_cause(
     _assert_cause_chain_recorded(rendered)
 
 
+@pytest.fixture(params=["create", "append"])
+def sdk_attachment_request(request: pytest.FixtureRequest, _test_db: None):
+    headers = _admin_headers()
+    response = client.post(
+        "/api/agents",
+        headers=headers,
+        json={"name": "attachment-fault-agent", "execution_mode": "balanced"},
+    )
+    assert response.status_code == 200, response.text
+    agent_id = response.json()["id"]
+    response = client.post(f"/api/agents/{agent_id}/api-key", headers=headers)
+    assert response.status_code == 200, response.text
+    headers = {"Authorization": f"Bearer {response.json()['full_key']}"}
+    task_id = None
+    with _direct_db_session() as db:
+        owner_id = int(db.get(Agent, agent_id).user_id)
+        if request.param == "append":
+            task = Task(
+                user_id=owner_id,
+                agent_id=agent_id,
+                title="completed SDK task",
+                source="sdk",
+                status=TaskStatus.COMPLETED,
+            )
+            db.add(task)
+            db.commit()
+            task_id = int(task.id)
+    url = "/v1/chat/tasks"
+    if task_id is not None:
+        url += f"/{task_id}/messages"
+    body = {
+        "agent_id": agent_id,
+        "message": {"content": "use the attachment", "files": ["8ac1f2"]},
+    }
+    return url, headers, body, owner_id, task_id
+
+
 def test_v1_turn_attachment_durable_fault_logs_the_provider_cause(
+    sdk_attachment_request,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -371,32 +410,34 @@ def test_v1_turn_attachment_durable_fault_logs_the_provider_cause(
     def fail_resolve(**_kwargs: Any) -> None:
         raise _wrapped_fault()
 
-    monkeypatch.setattr(v1_tasks, "resolve_turn_file_infos", fail_resolve)
+    monkeypatch.setattr(task_start, "resolve_turn_file_infos", fail_resolve)
 
-    with caplog.at_level(logging.WARNING, logger=v1_tasks.logger.name):
-        with pytest.raises(V1ApiError) as raised:
-            v1_tasks._resolve_turn_files_or_400(
-                file_ids=["8ac1f2"],
-                owner_user_id=7,
-                db=cast(Any, None),
-                task_id=42,
-            )
+    url, headers, body, owner_id, task_id = sdk_attachment_request
+    with caplog.at_level(logging.WARNING, logger=task_start.logger.name):
+        response = client.post(url, headers=headers, json=body)
 
-    assert raised.value.http_status == 503
-    assert _STORAGE_KEY not in raised.value.message
-    assert _PROVIDER_MESSAGE not in raised.value.message
+    assert response.status_code == 503, response.text
+    assert response.json()["error"]["code"] == "internal_error"
+    assert (
+        response.json()["error"]["message"]
+        == "File storage is temporarily unavailable."
+    )
+    assert _STORAGE_KEY not in response.text
+    assert _PROVIDER_MESSAGE not in response.text
 
     rendered = _warning_matching(
-        caplog, v1_tasks.logger.name, "during turn attachment resolution"
+        caplog, task_start.logger.name, "during turn attachment resolution"
     )
-    assert "task_id=42" in rendered
+    if task_id is not None:
+        assert f"task_id={task_id}" in rendered
     # The create path has task_id=None, so these carry identification there.
-    assert "owner_user_id=7" in rendered
+    assert f"owner_user_id={owner_id}" in rendered
     assert "file_ids=8ac1f2" in rendered
     _assert_cause_chain_recorded(rendered)
 
 
 def test_v1_turn_attachment_integrity_fault_is_not_reported_as_an_outage(
+    sdk_attachment_request,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -419,23 +460,23 @@ def test_v1_turn_attachment_integrity_fault_is_not_reported_as_an_outage(
             storage_key="users/7/uploads/8ac1f2/corrupt.txt",
         )
 
-    monkeypatch.setattr(v1_tasks, "resolve_turn_file_infos", fail_resolve)
+    monkeypatch.setattr(task_start, "resolve_turn_file_infos", fail_resolve)
 
-    with caplog.at_level(logging.WARNING, logger=v1_tasks.logger.name):
-        with pytest.raises(V1ApiError) as raised:
-            v1_tasks._resolve_turn_files_or_400(
-                file_ids=["8ac1f2"],
-                owner_user_id=7,
-                db=cast(Any, None),
-                task_id=42,
-            )
+    url, headers, body, _owner_id, _task_id = sdk_attachment_request
+    with caplog.at_level(logging.WARNING, logger=task_start.logger.name):
+        response = client.post(url, headers=headers, json=body)
 
-    assert raised.value.http_status == 503
+    assert response.status_code == 503, response.text
+    assert response.json()["error"]["code"] == "internal_error"
+    assert (
+        response.json()["error"]["message"]
+        == "File storage is temporarily unavailable."
+    )
     # The envelope is deliberately unchanged; what must not happen is a second,
     # contradicting record calling permanent corruption a transient outage.
     assert not [
         line
-        for line in _warnings(caplog, v1_tasks.logger.name)
+        for line in _warnings(caplog, task_start.logger.name)
         if DURABLE_FAULT_LOG_PREFIX in line
     ], "an integrity fault emitted an outage warning -- the arms are misordered"
 
@@ -851,7 +892,7 @@ def test_chat_is_unlabelled_only_because_its_arms_report_first() -> None:
     """The omission above must stay true of the handler, not just of a comment.
 
     Leaving ``chat`` out of the label map is only correct while every
-    ``DurableStorageOperationError`` arm in ``_handle_chat_message_unserialized``
+    ``DurableStorageOperationError`` arm in ``handle_task_message``
     that re-raises calls ``log_durable_storage_fault`` first: the logger marks
     the instance, so the endpoint-level call stays a no-op. If an arm stops
     logging before its bare ``raise``, the fault reaches the endpoint arm
@@ -865,12 +906,10 @@ def test_chat_is_unlabelled_only_because_its_arms_report_first() -> None:
     test proves that every statement of the handler sits inside a durable
     ``try``.
     """
-    func = _function_named(
-        _module_ast(websocket_api), "_handle_chat_message_unserialized"
-    )
+    func = _function_named(_module_ast(task_command_execution), "handle_task_message")
     durable_arms = _arms_catching(func, "DurableStorageOperationError")
     assert durable_arms, (
-        "_handle_chat_message_unserialized no longer has a "
+        "handle_task_message no longer has a "
         "DurableStorageOperationError arm, so a chat fault reaches the endpoint "
         "arm unreported and 'chat' needs a label in _DISPATCH_OPERATIONS again"
     )
@@ -955,8 +994,9 @@ def test_a_type_is_unlabelled_only_because_its_handler_swallows(
 # not derived.)
 _MODULES_WITH_DURABLE_ARM_PAIRS = (
     ("web/api/files.py", 7, lambda: files_api),
-    ("web/api/websocket.py", 3, lambda: websocket_api),
-    ("web/api/v1/tasks.py", 1, lambda: v1_tasks),
+    ("web/api/websocket.py", 1, lambda: websocket_api),
+    ("web/services/task_command_execution.py", 2, lambda: task_command_execution),
+    ("web/services/task_start.py", 1, lambda: task_start),
     (
         "core/tools/adapters/vibe/file_ingestion_tool.py",
         1,
@@ -989,16 +1029,20 @@ _DIRECT_HELPER_SITES = frozenset(
             ("file_id", "storage_key"),
         ),
         (
-            "web/api/v1/tasks.py",
+            "web/services/task_start.py",
             "turn attachment resolution",
             ("task_id", "owner_user_id", "file_ids"),
         ),
         (
-            "web/api/websocket.py",
+            "web/services/task_command_execution.py",
             "websocket chat turn preparation",
             ("task_id",),
         ),
-        ("web/api/websocket.py", "websocket agent execution", ("task_id",)),
+        (
+            "web/services/task_command_execution.py",
+            "websocket agent execution",
+            ("task_id",),
+        ),
         (
             "core/tools/adapters/vibe/file_ingestion_tool.py",
             "knowledge-base file restore",
@@ -1125,9 +1169,7 @@ def test_the_inner_durable_arms_still_notify_the_task() -> None:
     #1522 covers), so this pins the routing rather than the frames. It fails
     if an arm reverts to calling ``finish_delivery_failure`` directly.
     """
-    func = _function_named(
-        _module_ast(websocket_api), "_handle_chat_message_unserialized"
-    )
+    func = _function_named(_module_ast(task_command_execution), "handle_task_message")
     inner_arms = [
         arm
         for arm in _arms_catching(func, "DurableStorageOperationError")
@@ -1201,14 +1243,16 @@ def test_the_integrity_arm_precedes_its_parent_at_every_site(
     ``preview_file`` and the first ``public_preview_file`` pair (by the five
     ``*_checksum_mismatch_asks_user_to_reupload`` tests), ``v1/tasks.py`` and
     ``file_ingestion_tool`` (by the real-path injections in this file and
-    ``test_kb_creation_tools``), and the outer ``websocket.py`` pair (by
+    ``test_kb_creation_tools``), and the outer ``task_command_execution.py``
+    pair (by
     ``test_a_durable_integrity_fault_is_answered_as_corruption_not_an_outage``).
 
     The five where a swapped or deleted arm changes behaviour with no
     behavioural test failing are ``preview_pptx_as_pdf``,
     ``public_download_file``, the second ``public_preview_file`` pair (the
-    task-asset one), and the two remaining ``websocket.py`` pairs -- the inner
-    agent-execution one and the endpoint-level one. Those are what this check
+    task-asset one), and the two remaining pairs -- the inner agent-execution
+    one in ``task_command_execution.py`` and the endpoint-level one in
+    ``websocket.py``. Those are what this check
     is load-bearing for; giving them real end-to-end coverage is #1522.
 
     This does not replace the behavioural tests: it proves ordering, not that

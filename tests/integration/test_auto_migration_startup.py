@@ -756,9 +756,11 @@ async def test_startup_event_skips_when_auto_migrate_disabled(
 
     monkeypatch.setenv("LANCEDB_AUTO_MIGRATE", "false")
     monkeypatch.setattr(web_app_module, "init_db", lambda: None)
-    websocket_module = importlib.import_module("xagent.web.api.websocket")
+    task_execution_module = importlib.import_module(
+        "xagent.web.services.task_execution"
+    )
     monkeypatch.setattr(
-        websocket_module.background_task_manager,
+        task_execution_module.background_task_manager,
         "start_accepting",
         lambda: runtime_start_order.append("admission"),
     )
@@ -1139,7 +1141,7 @@ async def test_shutdown_event_stops_temp_file_cleanup_without_cancel(
             return None
 
     monkeypatch.setattr(
-        "xagent.web.api.websocket.background_task_manager",
+        "xagent.web.services.task_execution.background_task_manager",
         _FakeBackgroundTaskManager(),
     )
     monkeypatch.setattr(

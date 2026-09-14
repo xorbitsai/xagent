@@ -24,6 +24,7 @@ from .task_command import TaskExecutionCommand
 from .task_command_terminal_event import TaskCommandTerminalEvent
 from .task_execution_event import TaskExecutionEvent
 from .task_interaction import TaskInteractionRequest
+from .task_runtime_secret import TaskRuntimeSecret
 from .template_stats import TemplateStats, UserTemplateRelation
 from .tool_config import ToolConfig, ToolUsage
 from .trigger import (
@@ -73,6 +74,7 @@ __all__ = [
     "TaskCommandTerminalEvent",
     "TaskExecutionEvent",
     "TaskInteractionRequest",
+    "TaskRuntimeSecret",
     "TaskConnectorRuntimeContext",
     "DAGExecution",
     "TemplateStats",

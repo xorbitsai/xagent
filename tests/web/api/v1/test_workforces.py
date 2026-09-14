@@ -18,6 +18,7 @@ from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
 from xagent.web.models.workforce import Workforce
+from xagent.web.services import task_start
 
 from ..conftest import (
     _admin_headers,
@@ -657,7 +658,6 @@ def test_idempotency_conflict_when_original_task_deleted():
 def test_append_workforce_turn_rejection_maps_to_stable_codes(monkeypatch):
     """A non-transient workforce turn rejection on append maps to its own
     stable v1 code (not the misleading retryable task_busy)."""
-    from xagent.web.api.v1 import tasks as v1_tasks
     from xagent.web.services.task_orchestrator import TaskTurnError
 
     headers = _admin_headers()
@@ -691,7 +691,7 @@ def test_append_workforce_turn_rejection_maps_to_stable_codes(monkeypatch):
             raise TaskTurnError(reason)
 
         monkeypatch.setattr(
-            v1_tasks.TaskTurnOrchestrator,
+            task_start.TaskTurnOrchestrator,
             "claim_append_turn_no_commit",
             _reject,
         )

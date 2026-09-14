@@ -205,12 +205,11 @@ async def test_dedup_cell_7_deduplicated_output_passes_the_write_side_validator(
 
 
 @pytest.mark.asyncio
-async def test_dedup_cell_8_an_empty_interactions_list_survives_untouched() -> None:
-    """The degenerate input. The dedup loop must be a no-op on an empty
-    list, not a short-circuit that skips the surrounding waiting path:
-    ``_run_ask_user_question`` already asserts status == "waiting_for_user"
-    internally, so reaching its return at all proves that; this test
-    additionally pins the empty interactions list itself.
+async def test_dedup_cell_8_an_empty_interactions_list_gets_the_default_field() -> None:
+    """The degenerate input. The dedup loop is a no-op on an empty list,
+    and ``_send_waiting_message`` then appends the default free-text
+    field so the suspended run still renders a control. The default's base
+    name is not suffixed, because the dedup loop claimed nothing.
 
     Mutation (measured): an early `if not interactions: ...` short-circuit
     before the waiting path turns this red -- not on the status assertion
@@ -219,7 +218,7 @@ async def test_dedup_cell_8_an_empty_interactions_list_survives_untouched() -> N
     given, an IndexError on the test double's own canned-response list."""
 
     out = await _run_ask_user_question([])
-    assert out == []
+    assert [item["field"] for item in out] == ["response"]
 
 
 # ---------------------------------------------------------------------------

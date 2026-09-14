@@ -8,6 +8,7 @@ and other web-specific sources.
 import asyncio
 import copy
 import inspect
+import json
 import logging
 import os
 import random
@@ -42,6 +43,7 @@ from ...core.agent.result import (
     normalize_tool_failure_code,
 )
 from ...core.tools.adapters.vibe.config import (
+    ACTOR_STDIO_SHADOWED_REASON,
     BaseToolConfig,
     MCPConfigLoadError,
     MCPFailurePolicy,
@@ -61,7 +63,15 @@ from ...core.tools.adapters.vibe.connector_runtime import (
     runtime_bindings_from_config,
 )
 from ...core.tools.adapters.vibe.db_session import tool_session_scope
-from ..services.mcp_runtime import MCPBuiltinOAuthActorPolicy
+from ...core.tools.adapters.vibe.mcp_adapter import redact_urls_in_text
+from ..services.actor_mcp_runtime import (
+    ActorMCPStdioSessionIdentity,
+    resolve_actor_mcp_stdio_configs,
+)
+from ..services.mcp_runtime import (
+    MCPActorExecutionIdentity,
+    MCPBuiltinOAuthActorPolicy,
+)
 from ..services.tool_credentials import (
     TOOL_CREDENTIAL_SPECS,
     get_sql_connection_map,
@@ -96,6 +106,7 @@ _ACTOR_OAUTH_REFRESH_LOCKS: WeakValueDictionary[
 MCP_UNAVAILABLE_REASONS = frozenset(
     {
         "authorization_required",
+        ACTOR_STDIO_SHADOWED_REASON,
         "catalog_app_not_found",
         "config_load_failed",
         "insufficient_scope",
@@ -465,6 +476,21 @@ def _bounded_oauth_metadata(value: Any, *, max_length: int = 128) -> str:
     if len(text) <= max_length:
         return text
     return f"{text[: max_length - 3]}..."
+
+
+def _redacted_bounded_resource(resource: str | None) -> str | None:
+    """Redact and bound an OAuth resource URL for a diagnostic, or ``None``
+    if there is none. Every producer of ``resource`` (``mcp_runtime.py``'s
+    ``effective_mcp_oauth_resource`` and this module's
+    ``_oauth_token_configured_resource``) excludes the empty string, so a
+    truthy guard and an ``is not None`` guard are equivalent in practice;
+    this uses the truthy form so ``""`` -- if a producer's contract ever
+    changes -- is treated the same as ``None`` rather than redacted and
+    bounded into a diagnostic-empty string.
+    """
+    if not resource:
+        return None
+    return _bounded_oauth_metadata(redact_urls_in_text(resource))
 
 
 def _extract_oauth_token_resolver_diagnostic_actor_id(exc: Exception) -> str | None:
@@ -1687,6 +1713,8 @@ class WebToolConfig(BaseToolConfig):
         # positional arguments for anything after agent_call_stack keeps
         # binding the same values it always did.
         voice: Optional[str] = None,
+        mcp_actor_stdio_connection_adapter: Any = None,
+        mcp_actor_execution_identity: MCPActorExecutionIdentity | None = None,
     ):
         # ``tool_selection_spec`` accepts :class:`ToolSelectionSpec` from
         # the tools adapter package; typed as ``Any`` here to avoid an
@@ -1714,6 +1742,14 @@ class WebToolConfig(BaseToolConfig):
         # object can be overwritten by the model, and this value must not
         # be confusable with that one at the resolution point.
         self._declared_knowledge_bases = declared_knowledge_bases
+        # Internal storage boundary for actor-scoped stdio. It is deliberately
+        # separate from ordinary MCP env/auth hooks and receives the exact
+        # actor and lifecycle identity on every secret read.
+        self._mcp_actor_stdio_connection_adapter = mcp_actor_stdio_connection_adapter
+        self._mcp_actor_execution_identity = mcp_actor_execution_identity
+        self._mcp_actor_stdio_session_identities: dict[
+            str, ActorMCPStdioSessionIdentity
+        ] = {}
         self._task_runtime_contribution: Any = None
         self._task_runtime_workspace: Any = None
         self._live_db = db
@@ -1844,8 +1880,8 @@ class WebToolConfig(BaseToolConfig):
         self._browser_locale_resolved = False
         self._cached_browser_locale: Optional[str] = None
 
-    def _build_mcp_file_allowed_dirs(self) -> str:
-        """Build comma-separated file roots that local MCP tools may read."""
+    def _mcp_file_allowed_dir_paths(self) -> list[str]:
+        """Build unique, resolved file roots for local MCP read tools."""
         dirs: list[str] = []
         base_dir = Path(str(self._workspace_config.get("base_dir", get_uploads_dir())))
         task_id = self._workspace_config.get("task_id")
@@ -1861,14 +1897,14 @@ class WebToolConfig(BaseToolConfig):
             if dir_path not in seen:
                 unique_dirs.append(dir_path)
                 seen.add(dir_path)
-        return ",".join(unique_dirs)
+        return unique_dirs
 
     def _build_mcp_task_output_dir(self) -> str:
         """Single write-target root for connectors that create new files in
         the task workspace (currently just Google Drive's download tool).
 
-        Deliberately distinct from _build_mcp_file_allowed_dirs() above:
-        that one is a read allowlist that may reasonably include
+        Deliberately distinct from _mcp_file_allowed_dir_paths() above:
+        that method builds a read allowlist that may reasonably include
         allowed_external_dirs (e.g. read-only KB folders) alongside the
         task dir, and multiple consumers of it pick whichever entry a
         requested path happens to fall under. A write target has no such
@@ -2054,6 +2090,25 @@ class WebToolConfig(BaseToolConfig):
         self._store_mcp_config_cache_if_cacheable(configs)
         return configs
 
+    def get_actor_mcp_stdio_session_identities(
+        self,
+    ) -> Dict[str, ActorMCPStdioSessionIdentity]:
+        """Return host-only identities that must never enter MCP configs."""
+
+        return dict(self._mcp_actor_stdio_session_identities)
+
+    def get_actor_mcp_stdio_session_consumer(self) -> Any:
+        """Return the sandbox-only Chrome consumer for host-side identities."""
+
+        if not self._mcp_actor_stdio_session_identities:
+            return None
+
+        from ..services.chrome_mcp_runtime import (
+            consume_chrome_actor_stdio_session,
+        )
+
+        return consume_chrome_actor_stdio_session
+
     def _serialize_mcp_user_id(self) -> str:
         """Return the explicit identity used to isolate an MCP config."""
         if self._user_id is None:
@@ -2150,6 +2205,19 @@ class WebToolConfig(BaseToolConfig):
             return False
         self._connector_runtime_turn_id = normalized_turn_id
         self._connector_runtime_view = None
+        self._cached_mcp_configs = None
+        self._factory_runtime_snapshot = None
+        self._pending_runtime_policy = None
+        return True
+
+    def set_mcp_actor_execution_identity(
+        self, identity: MCPActorExecutionIdentity | None
+    ) -> bool:
+        """Advance the exact actor execution fence on a reused tool config."""
+
+        if self._mcp_actor_execution_identity == identity:
+            return False
+        self._mcp_actor_execution_identity = identity
         self._cached_mcp_configs = None
         self._factory_runtime_snapshot = None
         self._pending_runtime_policy = None
@@ -3563,9 +3631,7 @@ class WebToolConfig(BaseToolConfig):
             server,
             code=OAUTH_TOKEN_RESOLVER_FAILURE_CODE,
             message=OAUTH_TOKEN_RESOLVER_FAILURE_MESSAGE,
-            resource=_bounded_oauth_metadata(error.resource)
-            if error.resource is not None
-            else None,
+            resource=_redacted_bounded_resource(error.resource),
         )
         diagnostic["providers"] = [
             _bounded_oauth_metadata(provider) for provider in error.providers[:2]
@@ -3588,9 +3654,12 @@ class WebToolConfig(BaseToolConfig):
         )
         self._mcp_oauth_diagnostics.append(diagnostic)
         logger.warning(
-            "OAuth token resolver failed for MCP server '%s' with %s",
+            "OAuth token resolver failed for MCP server '%s' with %s "
+            "(failure_code=%s, resource=%s)",
             getattr(server, "name", "<unknown>"),
             error.exception_type,
+            error.failure_code,
+            diagnostic["resource"],
         )
         return self._build_unavailable_mcp_config(
             server=server,
@@ -3694,17 +3763,25 @@ class WebToolConfig(BaseToolConfig):
                     "http_proxy": os.environ.get("http_proxy", ""),
                 }
             )
-            allowed_file_dirs = self._build_mcp_file_allowed_dirs()
-            if allowed_file_dirs:
+            allowed_file_dir_paths = self._mcp_file_allowed_dir_paths()
+            if allowed_file_dir_paths:
+                # JSON preserves commas inside directory names. The shared
+                # parser also accepts the legacy comma-delimited form for
+                # manually configured standalone deployments.
+                allowed_file_dirs = json.dumps(allowed_file_dir_paths)
                 env["XAGENT_LINKEDIN_IMAGE_ALLOWED_DIRS"] = allowed_file_dirs
                 env["XAGENT_SLACK_FILE_ALLOWED_DIRS"] = allowed_file_dirs
                 env["XAGENT_GMAIL_FILE_ALLOWED_DIRS"] = allowed_file_dirs
-            # Distinct from the three read allowlists above: Google Drive's
+                env["XAGENT_ONEDRIVE_FILE_ALLOWED_DIRS"] = allowed_file_dirs
+                env["XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS"] = allowed_file_dirs
+            # Distinct from the five read allowlists above: Google Drive's
             # download tool writes NEW files into the task workspace, so it
             # gets its own single-value, task-dir-only var rather than
             # reusing the read-allowlist shape (see
             # _build_mcp_task_output_dir's docstring for why that would be
-            # wrong, not just differently-shaped).
+            # wrong, not just differently-shaped). google_drive_upload_file
+            # reads from XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS above instead,
+            # like the other four read allowlists.
             task_output_dir = self._build_mcp_task_output_dir()
             if task_output_dir:
                 env["XAGENT_GOOGLE_DRIVE_OUTPUT_DIR"] = task_output_dir
@@ -4020,6 +4097,7 @@ class WebToolConfig(BaseToolConfig):
         env_source_by_id: Mapping[int, Any],
         actor_catalog_app_info: Mapping[str, Any] | None = None,
         actor_builtin_invalid: bool = False,
+        actor_builtin_invalid_reason: str = "config_load_failed",
     ) -> Dict[str, Any]:
         """Build one MCP server config, preserving explicit unavailable outcomes."""
         actor_builtin = bool(
@@ -4028,7 +4106,7 @@ class WebToolConfig(BaseToolConfig):
         )
         if actor_builtin_invalid:
             policy_diagnostic = {
-                "code": "config_load_failed",
+                "code": actor_builtin_invalid_reason,
                 "message": "MCP server configuration is unavailable",
                 "server_id": int(server.id),
                 "server_name": server.name,
@@ -4036,7 +4114,7 @@ class WebToolConfig(BaseToolConfig):
             self._mcp_oauth_diagnostics.append(policy_diagnostic)
             return self._build_unavailable_mcp_config(
                 server=server,
-                reason="config_load_failed",
+                reason=actor_builtin_invalid_reason,
                 diagnostic=policy_diagnostic,
             )
 
@@ -4500,6 +4578,7 @@ class WebToolConfig(BaseToolConfig):
         env_source_by_id: Mapping[int, Any],
         actor_catalog_app_info: Mapping[str, Any] | None = None,
         actor_builtin_invalid: bool = False,
+        actor_builtin_invalid_reason: str = "config_load_failed",
     ) -> Dict[str, Any]:
         """Isolate unexpected failures while loading one MCP server config."""
         try:
@@ -4510,6 +4589,7 @@ class WebToolConfig(BaseToolConfig):
                 env_source_by_id=env_source_by_id,
                 actor_catalog_app_info=actor_catalog_app_info,
                 actor_builtin_invalid=actor_builtin_invalid,
+                actor_builtin_invalid_reason=actor_builtin_invalid_reason,
             )
         except ConnectorRuntimeError:
             raise
@@ -4551,6 +4631,7 @@ class WebToolConfig(BaseToolConfig):
         of leaving the shared layer keyed on the run owner's personal
         shared-env hook answer."""
         self._mcp_oauth_diagnostics = []
+        self._mcp_actor_stdio_session_identities = {}
         self._reset_mcp_config_load_cache_state()
 
         # Resolved before the guarded region below: that region reports
@@ -4628,11 +4709,36 @@ class WebToolConfig(BaseToolConfig):
                     ):
                         actor_classifications[int(visible_server.id)] = (None, True)
 
+            actor_stdio_resolution = resolve_actor_mcp_stdio_configs(
+                self.db,
+                user_id=(int(self._user_id) if isinstance(self._user_id, int) else 0),
+                policy=self._mcp_runtime_authorization_policy,
+                adapter=self._mcp_actor_stdio_connection_adapter,
+                visible_servers=servers,
+                execution_identity=self._mcp_actor_execution_identity,
+            )
+            for blocked_server_id in actor_stdio_resolution.blocked_server_ids:
+                actor_classifications[blocked_server_id] = (None, True)
+            actor_stdio_block_reasons = dict(
+                actor_stdio_resolution.blocked_server_reasons
+            )
+            self._mcp_actor_stdio_session_identities = dict(
+                actor_stdio_resolution.session_identities
+            )
+
             # Prefetch shared runtime state once before entering the isolated
             # per-server formatter.
-            user_env_by_id = load_user_env_overrides(self.db, self._user_id)
-            shared_env_by_id = load_shared_env_overrides(self.db, self._user_id)
-            env_source_by_id = load_user_env_sources(self.db, self._user_id)
+            if servers:
+                user_env_by_id = load_user_env_overrides(self.db, self._user_id)
+                shared_env_by_id = load_shared_env_overrides(self.db, self._user_id)
+                env_source_by_id = load_user_env_sources(self.db, self._user_id)
+            else:
+                # Synthetic actor stdio is intentionally independent from
+                # every ordinary MCP credential source. Avoid even querying
+                # those stores when there are no ordinary server rows.
+                user_env_by_id = {}
+                shared_env_by_id = {}
+                env_source_by_id = {}
 
             # Re-key the shared env layer, for team-owned ids only, onto the
             # governing team's own row -- never the run owner's team, and
@@ -4643,7 +4749,7 @@ class WebToolConfig(BaseToolConfig):
             # the credential-side hook was never installed -- the shared
             # layer stays user-keyed in that state, which is exactly the
             # cross-team influence this block exists to remove.
-            if self._connector_team_id is not None and team_mcp_ids:
+            if servers and self._connector_team_id is not None and team_mcp_ids:
                 if not team_env_hook_installed():
                     warn_team_env_hook_missing_once(
                         team_id=self._connector_team_id,
@@ -4708,9 +4814,13 @@ class WebToolConfig(BaseToolConfig):
                 actor_builtin_invalid=actor_classifications.get(
                     int(server.id), (None, False)
                 )[1],
+                actor_builtin_invalid_reason=actor_stdio_block_reasons.get(
+                    int(server.id), "config_load_failed"
+                ),
             )
             for server in servers
         ]
+        configs.extend(actor_stdio_resolution.configs)
         logger.info("Loaded %s MCP server configurations", len(configs))
         return configs
 

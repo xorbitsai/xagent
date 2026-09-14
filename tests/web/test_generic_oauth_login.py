@@ -26,10 +26,28 @@ from xagent.web.api.auth import (
     generic_oauth_login,
     verify_token,
 )
+from xagent.web.builtin_mcp_registry import (
+    get_builtin_oauth_provider_rows,
+    get_builtin_public_mcp_app,
+)
 from xagent.web.models.database import Base
+from xagent.web.models.oauth_provider import OAuthProvider
 from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
 from xagent.web.oauth_provider_quirks import requires_pkce
+
+XERO_APP_SCOPES = [
+    "openid",
+    "profile",
+    "email",
+    "accounting.contacts",
+    "accounting.settings",
+    "accounting.invoices",
+    "accounting.payments",
+    "accounting.banktransactions",
+    "accounting.manualjournals",
+    "offline_access",
+]
 
 # ---------- helpers ---------------------------------------------------------
 
@@ -83,6 +101,91 @@ def _location(response) -> str:
 
 
 # ---------- the actual regression checks ------------------------------------
+
+
+def test_xero_provider_defaults(monkeypatch):
+    monkeypatch.setenv("XERO_CLIENT_ID", "xero-test-client")
+    monkeypatch.setenv("XERO_CLIENT_SECRET", "xero-test-secret")
+    monkeypatch.setenv(
+        "XERO_REDIRECT_URI", "https://app.example/api/auth/xero/callback"
+    )
+
+    provider = next(
+        row
+        for row in get_builtin_oauth_provider_rows()
+        if row["provider_name"] == "xero"
+    )
+
+    assert provider == {
+        "provider_name": "xero",
+        "name": "Xero",
+        "client_id": "xero-test-client",
+        "client_secret": "xero-test-secret",
+        "auth_url": "https://login.xero.com/identity/connect/authorize",
+        "token_url": "https://identity.xero.com/connect/token",
+        "redirect_uri": "https://app.example/api/auth/xero/callback",
+        "userinfo_url": "https://identity.xero.com/connect/userinfo",
+        "user_id_path": "sub",
+        "email_path": "email",
+        "default_scopes": ["openid", "profile", "email"],
+    }
+
+
+def test_xero_catalog_contract():
+    app = get_builtin_public_mcp_app("xero")
+    assert app is not None
+    assert app["transport"] == "oauth"
+    assert app["provider_name"] == "xero"
+    assert app["category"] == "Operations"
+    assert app["is_visible_in_connector"] is True
+    assert app["oauth_scopes"] == XERO_APP_SCOPES
+    assert app["launch_config"] == {
+        "command": "npx",
+        "args": ["-y", "@xeroapi/xero-mcp-server@latest"],
+        "env_mapping": {"XERO_CLIENT_BEARER_TOKEN": "access_token"},
+    }
+
+
+def test_xero_catalog_login_scopes(db_session, monkeypatch):
+    db, user = db_session
+    monkeypatch.setenv("XERO_CLIENT_ID", "xero-test-client")
+    monkeypatch.setenv("XERO_CLIENT_SECRET", "xero-test-secret")
+    monkeypatch.setenv(
+        "XERO_REDIRECT_URI", "https://app.example/api/auth/xero/callback"
+    )
+    app = get_builtin_public_mcp_app("xero")
+    assert app is not None
+    db.add(PublicMCPApp(**app))
+    provider = OAuthProvider(
+        **next(
+            row
+            for row in get_builtin_oauth_provider_rows()
+            if row["provider_name"] == "xero"
+        )
+    )
+    db.add(provider)
+    db.commit()
+
+    response = generic_oauth_login(
+        provider="xero",
+        token=_token_for(user),
+        app_id="xero",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+
+    assert response.status_code == 307
+    url = urlparse(_location(response))
+    params = parse_qs(url.query)
+    assert f"{url.scheme}://{url.netloc}{url.path}" == provider.auth_url
+    assert params["client_id"] == ["xero-test-client"]
+    assert params["redirect_uri"] == [provider.redirect_uri]
+    assert params["response_type"] == ["code"]
+    scopes = params["scope"][0].split()
+    assert set(scopes) == set(XERO_APP_SCOPES)
+    assert len(scopes) == len(set(scopes))
+    assert verify_token(params["state"][0])["app_id"] == "xero"
 
 
 def test_auth_url_with_query_uses_ampersand_separator(db_session):

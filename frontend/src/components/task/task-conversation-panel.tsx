@@ -743,6 +743,11 @@ export function TaskConversationPanel({
         style={{ width: anyPreviewOpen ? `${leftWidth}%` : "100%" }}
         className={cn(anyPreviewOpen ? "" : "flex-1", "min-w-0 flex flex-col min-h-0 transition-[width] duration-0 relative")}
       >
+        {state.streamRecoveryTaskId === state.taskId && state.taskId !== null && (
+          <div role="status" className="mx-4 mt-3 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:bg-amber-950 dark:text-amber-100">
+            {t("sharedStream.interrupted")}
+          </div>
+        )}
         <div className="flex-1 overflow-y-auto">
           <main className={cn("mx-auto px-4 relative z-0 transition-all", mode === "page" ? "container max-w-4xl py-8" : "max-w-3xl py-4")}>
             <div className={cn(mode === "page" ? "space-y-6 pb-4" : "space-y-4 pb-4")}>

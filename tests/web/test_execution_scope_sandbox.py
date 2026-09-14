@@ -19,7 +19,6 @@ from xagent.core.execution_scope import (
     InvalidScopeComponentError,
 )
 from xagent.sandbox.base import SandboxMountIntent
-from xagent.web.api.chat import AgentServiceManager
 from xagent.web.sandbox_keys import (
     make_user_lifecycle_id,
     make_user_sandbox_key,
@@ -27,6 +26,7 @@ from xagent.web.sandbox_keys import (
     parse_user_sandbox_key,
 )
 from xagent.web.sandbox_manager import SandboxManager
+from xagent.web.services.agent_service_manager import AgentServiceManager
 
 
 class TestSandboxKeyHelpers:

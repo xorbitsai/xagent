@@ -7,26 +7,26 @@ from sqlalchemy import JSON, Boolean, Column, DateTime, ForeignKey, Integer, Str
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
+from ...config import DEV_FALLBACK_ENCRYPTION_KEY
 from .database import Base
 
 # Dev-only fallback so local setups work without configuration. Production
 # deployments must set ENCRYPTION_KEY; has_production_channel_encryption_key()
 # gates features (such as Slack workspace OAuth) that persist third-party
 # tokens on a real key being configured.
-_DEV_FALLBACK_ENCRYPTION_KEY = "RQMpe38gK3m0szjpSmTNw_sP3Y54r6hDc6JewBoPKXc="
 
 
 def has_production_channel_encryption_key() -> bool:
     """Report whether a non-default channel-config encryption key is set."""
     encryption_key = os.getenv("ENCRYPTION_KEY")
-    return bool(encryption_key) and encryption_key != _DEV_FALLBACK_ENCRYPTION_KEY
+    return bool(encryption_key) and encryption_key != DEV_FALLBACK_ENCRYPTION_KEY
 
 
 def _get_cipher() -> Fernet:
     encryption_key = os.getenv("ENCRYPTION_KEY")
     if not encryption_key:
         # FIXME: For dev only
-        encryption_key = _DEV_FALLBACK_ENCRYPTION_KEY
+        encryption_key = DEV_FALLBACK_ENCRYPTION_KEY
     return Fernet(
         encryption_key.encode() if isinstance(encryption_key, str) else encryption_key
     )

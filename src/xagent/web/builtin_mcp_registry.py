@@ -4,10 +4,15 @@ import hashlib
 import json
 import os
 from copy import deepcopy
-from typing import Any
+from typing import Any, Literal
 
 import sqlalchemy as sa
 from sqlalchemy.engine import Connection
+
+from ..builtin_identity import (
+    builtin_provenance_identity,
+    canonicalize_builtin_identity,
+)
 
 OAUTH_PROVIDERS_TABLE = sa.table(
     "oauth_providers",
@@ -36,6 +41,12 @@ PUBLIC_MCP_APPS_TABLE = sa.table(
     sa.column("oauth_scopes", sa.JSON),
     sa.column("is_visible_in_connector", sa.Boolean),
     sa.column("launch_config", sa.JSON),
+)
+
+MCP_SERVERS_IDENTITY_TABLE = sa.table(
+    "mcp_servers",
+    sa.column("name", sa.String),
+    sa.column("auth", sa.JSON),
 )
 
 
@@ -347,6 +358,19 @@ def get_builtin_oauth_provider_rows() -> list[dict[str, Any]]:
             ],
         },
         {
+            "provider_name": "xero",
+            "name": "Xero",
+            "client_id": os.environ.get("XERO_CLIENT_ID", ""),
+            "client_secret": os.environ.get("XERO_CLIENT_SECRET", ""),
+            "auth_url": "https://login.xero.com/identity/connect/authorize",
+            "token_url": "https://identity.xero.com/connect/token",
+            "redirect_uri": os.environ.get("XERO_REDIRECT_URI", ""),
+            "userinfo_url": "https://identity.xero.com/connect/userinfo",
+            "user_id_path": "sub",
+            "email_path": "email",
+            "default_scopes": ["openid", "profile", "email"],
+        },
+        {
             "provider_name": "myob",
             "name": "MYOB",
             "client_id": os.environ.get("MYOB_CLIENT_ID", ""),
@@ -446,7 +470,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
         {
             "app_id": "google-drive",
             "name": "Google Drive",
-            "description": "Access Google Drive to search for files, read documents, and manage your cloud storage.",
+            "description": "Access Google Drive to search for files, read documents, manage your cloud storage, and manage sharing on files or folders -- including granting access to someone new and revoking an existing collaborator's access.",
             "icon": "https://www.google.com/s2/favicons?domain=drive.google.com&sz=128",
             "transport": "oauth",
             "provider_name": "google",
@@ -467,7 +491,11 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "transport": "oauth",
             "provider_name": "google",
             "category": "Scheduling",
-            "oauth_scopes": ["https://www.googleapis.com/auth/calendar.events"],
+            "oauth_scopes": [
+                "https://www.googleapis.com/auth/calendar.events",
+                "https://www.googleapis.com/auth/calendar.freebusy",
+                "https://www.googleapis.com/auth/calendar.calendars.readonly",
+            ],
             "is_visible_in_connector": True,
             "launch_config": {
                 "command": "python",
@@ -688,7 +716,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
         {
             "app_id": "onedrive",
             "name": "OneDrive",
-            "description": "Connect to OneDrive to browse files, download content, and manage cloud storage.",
+            "description": "Connect to OneDrive to browse files, download content, upload files, and manage cloud storage.",
             "icon": "https://www.google.com/s2/favicons?domain=onedrive.live.com&sz=128",
             "transport": "oauth",
             "provider_name": "microsoft",
@@ -996,14 +1024,14 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "provider_name": None,
             "category": "Productivity",
             "oauth_scopes": None,
-            # Hidden until the runtime supports execution-scoped (persistent)
-            # stdio MCP sessions: today every tool call spawns a fresh
-            # chrome-devtools-mcp process (mcp_adapter._execute_mcp_call ->
-            # create_session), so browser/page state does not survive across
-            # calls and any multi-step flow (navigate -> click/fill) breaks.
-            # Once persistent sessions land, admins can re-enable via
-            # PATCH /api/admin/mcp/apps — is_visible_in_connector is not a
-            # builtin-protected field, so no redeploy is needed.
+            # Runtime-only metadata. This is intentionally outside
+            # launch_config so enabling execution-scoped session handling does
+            # not create persisted PublicMCPApp execution drift.
+            "stdio_session_scope": "execution",
+            # Hidden/default-off while execution-scoped sessions remain an
+            # enablement primitive. Durable cross-process ownership and crash
+            # reclaim tracked by xorbitsai/xagent#2281 must land before this is
+            # exposed in a multi-worker deployment.
             "is_visible_in_connector": False,
             # Keyless (non-oauth): no secrets to collect — connecting only
             # creates the per-user association via POST /api/mcp/apps/{id}/connect.
@@ -1017,21 +1045,18 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             # one is configured) independently pre-install this exact
             # version and warm an npx cache for it. That warm-up is
             # intended to make npx resolve locally instead of hitting the
-            # npm registry on every launch, but currently does not: the
-            # MCP stdio launcher this connector's process goes through
-            # only forwards a fixed env allowlist to the spawned npx
-            # child (no NPM_CONFIG_CACHE), so every launch still needs
-            # npm-registry access regardless of the warm-up -- tracked in
-            # xorbitsai/xagent#1869, not yet fixed here.
+            # npm registry on every launch. The execution-scoped controller
+            # explicitly passes NPM_CONFIG_CACHE and disables update checks.
             # No --executablePath/--channel: the default "stable" channel
             # resolution finds Chrome per-platform (/Applications/... on
             # macOS dev hosts, /opt/google/chrome/chrome in both the
             # backend and sandbox images, which each guarantee that path
             # exists) — a hardcoded path here would break every other
             # platform.
-            # --chrome-arg='--no-sandbox'/'--disable-setuid-sandbox': both
-            # the backend and sandbox containers run Chrome as root,
-            # needing the same root/no-sandbox exposure the existing
+            # --chrome-arg='--no-sandbox'/'--disable-setuid-sandbox': the
+            # Docker sandbox backend runs Chrome as root while Boxlite uses
+            # the image's uid 1100. This matches the root/no-sandbox exposure
+            # the existing
             # browser_use tool (core/tools/core/browser_use.py) already
             # carries in the backend image -- not identical flags
             # (browser_use passes only --no-sandbox, plus
@@ -1054,11 +1079,8 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                     # npm-exec flag, must precede the package spec: intended
                     # to let the exact-version cache warmed at image build
                     # time (both Dockerfile.backend and Dockerfile.sandbox)
-                    # skip the npm registry at launch, though that warm-up
-                    # currently doesn't reach this connector's actual npx
-                    # process (xorbitsai/xagent#1869) -- harmless either
-                    # way, since --prefer-offline still falls back to a
-                    # normal fetch on any cache miss.
+                    # skip the npm registry at launch. --prefer-offline still
+                    # falls back to a normal fetch on any cache miss.
                     "--prefer-offline",
                     "chrome-devtools-mcp@1.6.0",
                     "--headless",
@@ -1347,6 +1369,34 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             },
         },
         {
+            "app_id": "xero",
+            "name": "Xero",
+            "description": "Connect to Xero to manage contacts, invoices, payments, and accounting records.",
+            "icon": "https://www.google.com/s2/favicons?domain=xero.com&sz=128",
+            "transport": "oauth",
+            "provider_name": "xero",
+            "category": "Operations",
+            "oauth_scopes": [
+                "openid",
+                "profile",
+                "email",
+                "accounting.contacts",
+                "accounting.settings",
+                "accounting.invoices",
+                "accounting.payments",
+                "accounting.banktransactions",
+                "accounting.manualjournals",
+                "offline_access",
+            ],
+            "is_visible_in_connector": True,
+            # Match SG's database-configured launcher; inject only the actor's token.
+            "launch_config": {
+                "command": "npx",
+                "args": ["-y", "@xeroapi/xero-mcp-server@latest"],
+                "env_mapping": {"XERO_CLIENT_BEARER_TOKEN": "access_token"},
+            },
+        },
+        {
             "app_id": "myob",
             "name": "MYOB",
             "description": "Connect to MYOB AccountRight to look up and manage contacts, sales invoices, and purchase bills, and browse general ledger accounts and tax codes.",
@@ -1406,6 +1456,44 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                 # connector to work, even if client_id/client_secret are
                 # also configured via the admin UI.
                 "static_env": {"MYOB_API_KEY": "MYOB_CLIENT_ID"},
+            },
+        },
+        {
+            "app_id": "shopify",
+            "name": "Shopify",
+            "description": "Connect a Shopify custom app with a store label (for example, acme for acme.myshopify.com) and Admin API access token. Grant write_products, write_orders, and read_customers; read_all_orders is optional for orders older than 60 days.",
+            "icon": "https://www.google.com/s2/favicons?domain=shopify.com&sz=128",
+            "transport": "stdio",
+            "provider_name": None,
+            "category": "Commerce",
+            "oauth_scopes": None,
+            "is_visible_in_connector": True,
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.shopify"],
+                "required_env": [
+                    "SHOPIFY_STORE_DOMAIN",
+                    "SHOPIFY_ACCESS_TOKEN",
+                ],
+                "required_admin_scopes": [
+                    "write_products",
+                    "write_orders",
+                    "read_customers",
+                ],
+                "optional_admin_scopes": ["read_all_orders"],
+                # Compatibility metadata only. Current main ignores this
+                # field; a later actor-scoped stdio runtime can recognize
+                # that credentials are personal without this PR enabling
+                # delegated/Toby access or bypassing current isolation.
+                "credential_scope": "personal",
+                # Stable ownership marker used by the seed migration. It is
+                # intentionally inside launch_config because current main
+                # has no dedicated catalog-provenance column.
+                "builtin_provenance": {
+                    "registry": "xagent",
+                    "app_id": "shopify",
+                    "version": 1,
+                },
             },
         },
         {
@@ -1472,6 +1560,32 @@ _BUILTIN_EXECUTION_FIELD_NAMES = (
     "launch_config",
 )
 
+# Runtime policy must not become part of the persisted PublicMCPApp catalog
+# descriptor. Keeping this allowlist separate also preserves frozen migration
+# rows while making execution-scoped admission code-owned and fail-closed.
+_EXECUTION_SCOPED_STDIO_APP_IDS = frozenset({"chrome-devtools"})
+
+
+def _matches_builtin_provenance(
+    canonical_row: dict[str, Any], persisted_launch_config: Any
+) -> bool:
+    canonical_launch = canonical_row.get("launch_config")
+    marker = (
+        canonical_launch.get("builtin_provenance")
+        if isinstance(canonical_launch, dict)
+        else None
+    )
+    if marker is None:
+        return True
+    persisted_marker = (
+        persisted_launch_config.get("builtin_provenance")
+        if isinstance(persisted_launch_config, dict)
+        else None
+    )
+    return builtin_provenance_identity(persisted_marker) == builtin_provenance_identity(
+        marker
+    )
+
 
 def get_builtin_public_mcp_app(app_id: str) -> dict[str, Any] | None:
     for row in get_builtin_public_mcp_app_rows():
@@ -1480,8 +1594,20 @@ def get_builtin_public_mcp_app(app_id: str) -> dict[str, Any] | None:
     return None
 
 
+def _persisted_builtin_provenance_matches(
+    app_id: str, persisted_launch_config: Any
+) -> bool:
+    """Whether a persisted row carries any provenance required by its builtin.
+
+    An absent registry row has no provenance constraint. This keeps callers
+    composable with an injected registry while Shopify's real row is checked.
+    """
+    row = get_builtin_public_mcp_app(app_id)
+    return row is None or _matches_builtin_provenance(row, persisted_launch_config)
+
+
 def is_builtin_public_mcp_app(app_id: str) -> bool:
-    return any(row["app_id"] == app_id for row in get_builtin_public_mcp_app_rows())
+    return get_builtin_public_mcp_app(app_id) is not None
 
 
 def get_builtin_execution_fields(app_id: str) -> dict[str, Any] | None:
@@ -1491,6 +1617,17 @@ def get_builtin_execution_fields(app_id: str) -> dict[str, Any] | None:
     return deepcopy(
         {field_name: row[field_name] for field_name in _BUILTIN_EXECUTION_FIELD_NAMES}
     )
+
+
+def get_builtin_stdio_session_scope(
+    app_id: str,
+) -> Literal["per_call", "execution"]:
+    """Return code-owned stdio session scope; ordinary apps are per-call."""
+
+    row = get_builtin_public_mcp_app(app_id)
+    if row is not None and app_id in _EXECUTION_SCOPED_STDIO_APP_IDS:
+        return "execution"
+    return "per_call"
 
 
 def get_builtin_execution_fields_and_optional_scopes(
@@ -1558,6 +1695,31 @@ def validate_builtin_public_mcp_apps(bind: Connection) -> list[dict[str, Any]]:
         persisted_row = persisted_by_app_id.get(app_id)
         if persisted_row is None:
             continue
+        if not _matches_builtin_provenance(
+            canonical_row, persisted_row["launch_config"]
+        ):
+            canonical_marker = canonical_row.get("launch_config", {}).get(
+                "builtin_provenance"
+            )
+            persisted_launch = persisted_row["launch_config"]
+            persisted_marker = (
+                persisted_launch.get("builtin_provenance")
+                if isinstance(persisted_launch, dict)
+                else None
+            )
+            mismatches.append(
+                {
+                    "app_id": app_id,
+                    "mismatched_fields": ["builtin_provenance"],
+                    "canonical_hash": _safe_configuration_hash(
+                        {"builtin_provenance": canonical_marker}
+                    ),
+                    "persisted_hash": _safe_configuration_hash(
+                        {"builtin_provenance": persisted_marker}
+                    ),
+                }
+            )
+            continue
 
         mismatched_fields = [
             field_name
@@ -1587,6 +1749,50 @@ def validate_builtin_public_mcp_apps(bind: Connection) -> list[dict[str, Any]]:
 
 def _filter_row(row: dict[str, Any], allowed_columns: set[str]) -> dict[str, Any]:
     return {key: value for key, value in row.items() if key in allowed_columns}
+
+
+def _validate_shopify_seed_server_identity(
+    bind: Connection, existing_tables: set[str]
+) -> None:
+    """Reject a fresh-seed server collision unless it is provably official."""
+    if "mcp_servers" not in existing_tables:
+        return
+    inspector = sa.inspect(bind)
+    server_columns = {column["name"] for column in inspector.get_columns("mcp_servers")}
+    if "auth" not in server_columns:
+        raise RuntimeError(
+            "Cannot verify builtin Shopify server provenance: mcp_servers.auth "
+            "is required"
+        )
+    shopify_keys = {
+        canonicalize_builtin_identity("shopify"),
+        canonicalize_builtin_identity("Shopify"),
+    }
+    collisions = [
+        row
+        for row in bind.execute(
+            sa.select(
+                MCP_SERVERS_IDENTITY_TABLE.c.name,
+                MCP_SERVERS_IDENTITY_TABLE.c.auth,
+            )
+        ).mappings()
+        if canonicalize_builtin_identity(row["name"]) in shopify_keys
+    ]
+    official_identity = builtin_provenance_identity(
+        {"registry": "xagent", "app_id": "shopify"}
+    )
+    trusted = (
+        len(collisions) == 1
+        and collisions[0]["name"] == "shopify"
+        and isinstance(collisions[0]["auth"], dict)
+        and builtin_provenance_identity(collisions[0]["auth"].get("builtin_provenance"))
+        == official_identity
+    )
+    if collisions and not trusted:
+        raise RuntimeError(
+            "Cannot seed builtin Shopify connector: custom mcp_servers identity "
+            "collides with 'shopify'"
+        )
 
 
 def seed_builtin_oauth_and_public_mcp_apps(bind: Connection) -> None:
@@ -1629,9 +1835,14 @@ def seed_builtin_oauth_and_public_mcp_apps(bind: Connection) -> None:
         existing_app_ids = set(
             bind.execute(sa.select(PUBLIC_MCP_APPS_TABLE.c.app_id)).scalars()
         )
+        builtin_app_rows = get_builtin_public_mcp_app_rows()
+        if "shopify" not in existing_app_ids and any(
+            row["app_id"] == "shopify" for row in builtin_app_rows
+        ):
+            _validate_shopify_seed_server_identity(bind, existing_tables)
         app_rows_to_insert = [
             _filter_row(row, app_columns)
-            for row in get_builtin_public_mcp_app_rows()
+            for row in builtin_app_rows
             if row["app_id"] not in existing_app_ids
         ]
         if app_rows_to_insert:

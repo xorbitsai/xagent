@@ -36,7 +36,7 @@ USER_ROOT_ALLOWLIST = {
     "web/api/kb.py",
     # Compares the first component of a workspace-relative path;
     # comparison, not composition.
-    "web/api/websocket.py",
+    "web/services/task_execution.py",
 }
 
 # Same idea for the durable-storage key prefix (``users/{user_id}/...``).

@@ -90,6 +90,7 @@ DISPATCHER_CONCURRENCY = 4
 
 
 class TaskCommandKind(str, enum.Enum):
+    START = "start"  # Protocol only; the current dispatcher must not consume it.
     MESSAGE = "message"
     PAUSE = "pause"
     RESUME = "resume"
@@ -330,6 +331,8 @@ def stage_task_command(
     command_id: str,
     kind: TaskCommandKind,
     payload: dict[str, Any],
+    reply_host_id: str | None = None,
+    reply_origin: str | None = None,
 ) -> StagedTaskCommand:
     """Add an idempotent command row to the session without ending its transaction.
 
@@ -467,6 +470,8 @@ def stage_task_command(
         target_run_id=snapshot.run_id,
         target_state_version=int(snapshot.state_version or 0),
         target_runner_id=active_runner_id,
+        reply_host_id=reply_host_id,
+        reply_origin=reply_origin,
         status=COMMAND_PENDING,
     )
     db.add(command)
@@ -564,6 +569,8 @@ def enqueue_task_command(
     command_id: str,
     kind: TaskCommandKind,
     payload: dict[str, Any],
+    reply_host_id: str | None = None,
+    reply_origin: str | None = None,
 ) -> EnqueuedTaskCommand:
     """Commit an idempotent command and return only after it is durable.
 
@@ -582,6 +589,8 @@ def enqueue_task_command(
             command_id=command_id,
             kind=kind,
             payload=payload,
+            reply_host_id=reply_host_id,
+            reply_origin=reply_origin,
         )
         # Only a newly created row is worth committing, and the commit stays
         # inside this try so that a constraint failure surfacing there rather
@@ -671,6 +680,10 @@ def _claimable_query(
         db.query(TaskExecutionCommand)
         .join(Task, Task.id == TaskExecutionCommand.task_id)
         .filter(
+            # START remains dormant until runner consumption is implemented.
+            # Keep it in the earlier-command check: later commands must not
+            # overtake START. Without a consumer they remain blocked.
+            TaskExecutionCommand.kind != TaskCommandKind.START.value,
             _claim_availability_predicate(now),
             ~_unfinished_earlier_command(),
             _command_routing_predicate(runner_id, now),

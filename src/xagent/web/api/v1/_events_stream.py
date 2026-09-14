@@ -161,14 +161,14 @@ from ...models.database import get_session_local
 from ...models.task import TaskStatus
 from ...schemas.v1 import PublicStep
 from ...services.db_runtime import run_db_io_cancellation_safe
-from ...services.task_execution_controller import TaskControlState
-from ..public_trace_events import (
+from ...services.public_trace_events import (
     DELEGATED_AGENT_TRACE_SOURCE,
     is_audit_only_trace_data,
     normalize_public_trace_event,
 )
+from ...services.task_event_trace_handler import serialize_trace_data
+from ...services.task_execution_controller import TaskControlState
 from ..websocket import _is_versioned_task_event, manager
-from ..ws_trace_handlers import serialize_trace_data
 from ._step_mapping import PublicStepProjector
 from .deps import ApiKeyPrincipal, active_runtime_key_filters
 from .errors import V1ApiError, V1ErrorCode
@@ -1350,8 +1350,11 @@ def count_task_sinks(task_id: int) -> int:
 
 
 def _is_runtime_key_active(key_prefix: str) -> bool:
-    """One indexed lookup, no bcrypt (the handshake already verified the
-    secret; this only re-checks revoked/paused)."""
+    """One indexed lookup without secret verification.
+
+    The handshake already verified the secret; this only re-checks
+    revoked/paused state.
+    """
     SessionLocal = get_session_local()
     with SessionLocal() as db:
         return (

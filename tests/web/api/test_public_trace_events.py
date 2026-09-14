@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from xagent.core.tools.adapters.vibe.connector_runtime import REDACTED_RUNTIME_SECRET
-from xagent.web.api.public_trace_events import normalize_public_trace_event
+from xagent.web.services.public_trace_events import normalize_public_trace_event
 
 
 def test_normalize_public_trace_event_redacts_tool_runtime_secrets() -> None:
@@ -79,7 +79,7 @@ def test_live_general_failure_trace_uses_redacted_public_event(
     trace_event_type: str,
 ) -> None:
     from xagent.core.agent.trace import STEP_ERROR, TASK_ERROR, TraceEvent
-    from xagent.web.api.ws_trace_handlers import WebSocketTraceHandler
+    from xagent.web.services.task_event_trace_handler import TaskEventTraceHandler
 
     raw_error = "live provider token=secret"
     event = TraceEvent(
@@ -93,7 +93,7 @@ def test_live_general_failure_trace_uses_redacted_public_event(
         },
     )
 
-    stream_event = WebSocketTraceHandler(42)._convert_trace_event_to_stream_event(event)
+    stream_event = TaskEventTraceHandler(42)._convert_trace_event_to_stream_event(event)
 
     assert stream_event is not None
     assert stream_event["event_type"] == "trace_error"
@@ -172,7 +172,7 @@ def test_live_failed_pattern_end_redacts_nested_diagnostics(
     expected_event_type: str,
 ) -> None:
     from xagent.core.agent.trace import TASK_END_DAG, TASK_END_REACT, TraceEvent
-    from xagent.web.api.ws_trace_handlers import WebSocketTraceHandler
+    from xagent.web.services.task_event_trace_handler import TaskEventTraceHandler
 
     raw_error = "live pattern token=secret"
     event = TraceEvent(
@@ -184,7 +184,7 @@ def test_live_failed_pattern_end_redacts_nested_diagnostics(
         },
     )
 
-    stream_event = WebSocketTraceHandler(42)._convert_trace_event_to_stream_event(event)
+    stream_event = TaskEventTraceHandler(42)._convert_trace_event_to_stream_event(event)
 
     assert stream_event is not None
     assert stream_event["event_type"] == expected_event_type
@@ -197,7 +197,7 @@ def test_live_failed_pattern_end_redacts_nested_diagnostics(
 
 def test_mcp_load_summary_audit_event_is_not_fanned_out() -> None:
     from xagent.core.agent.trace import SYSTEM_INFO, TraceEvent
-    from xagent.web.api.ws_trace_handlers import WebSocketTraceHandler
+    from xagent.web.services.task_event_trace_handler import TaskEventTraceHandler
 
     event = TraceEvent(
         event_type=SYSTEM_INFO,
@@ -212,4 +212,4 @@ def test_mcp_load_summary_audit_event_is_not_fanned_out() -> None:
         },
     )
 
-    assert WebSocketTraceHandler(42)._convert_trace_event_to_stream_event(event) is None
+    assert TaskEventTraceHandler(42)._convert_trace_event_to_stream_event(event) is None

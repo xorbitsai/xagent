@@ -14,18 +14,16 @@ from tests.web.services.task_lease_shared import (
     live_task_lease as live_task_lease_fixture,
 )
 from xagent.core.agent.runner import UserMessageInjectionOutcome
-from xagent.web.api import websocket as websocket_api
-from xagent.web.api.websocket import (
-    ResumeReservationOutcome,
-    execute_durable_task_command,
-)
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import Base, get_db, get_engine, init_db
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.task_command_terminal_event import TaskCommandTerminalEvent
 from xagent.web.models.user import User
+from xagent.web.services import task_command_execution as command_execution_service
+from xagent.web.services import task_execution as task_execution_service
 from xagent.web.services.chat_history_service import DELIVERY_PENDING
+from xagent.web.services.task_command_execution import execute_durable_task_command
 from xagent.web.services.task_command_transport import (
     COMMAND_COMPLETED,
     COMMAND_FAILED,
@@ -39,6 +37,7 @@ from xagent.web.services.task_command_transport import (
     get_runner_id,
     max_command_defers,
 )
+from xagent.web.services.task_execution import ResumeReservationOutcome
 
 live_task_lease = live_task_lease_fixture
 
@@ -131,7 +130,7 @@ def _live_control_environment(
 
     with (
         patch(
-            "xagent.web.api.chat.get_agent_manager",
+            "xagent.web.services.agent_service_manager.get_agent_manager",
             return_value=MagicMock(get_agent_for_task=AsyncMock(return_value=agent)),
         ),
         patch(
@@ -141,9 +140,11 @@ def _live_control_environment(
                 send_personal_message=AsyncMock(),
             ),
         ),
-        patch("xagent.web.api.websocket.execute_resume_background", AsyncMock()),
         patch(
-            "xagent.web.api.websocket.background_task_manager",
+            "xagent.web.services.task_execution.execute_resume_background", AsyncMock()
+        ),
+        patch(
+            "xagent.web.services.task_execution.background_task_manager",
             background_manager,
         ),
     ):
@@ -152,7 +153,7 @@ def _live_control_environment(
 
 @pytest.mark.asyncio
 async def test_cancel_clears_pre_registration_resume_reservation() -> None:
-    background_manager = websocket_api.BackgroundTaskManager()
+    background_manager = task_execution_service.BackgroundTaskManager()
     assert (
         background_manager.try_reserve_resume(7, expected_run_id="live-run")
         is ResumeReservationOutcome.RESERVED
@@ -241,7 +242,7 @@ async def test_dispatcher_reclaims_and_applies_message_after_contention_clears(
     db_session,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    caplog.set_level("INFO", logger=websocket_api.__name__)
+    caplog.set_level("INFO", logger=command_execution_service.__name__)
     owner = _user(db_session, "eventual-delivery-owner")
     task = _live_task(db_session, int(owner.id))
     task.runner_id = get_runner_id()
@@ -264,7 +265,7 @@ async def test_dispatcher_reclaims_and_applies_message_after_contention_clears(
     )
     db_session.commit()
 
-    background_manager = websocket_api.BackgroundTaskManager()
+    background_manager = task_execution_service.BackgroundTaskManager()
     assert (
         background_manager.try_reserve_resume(
             int(task.id),
@@ -309,9 +310,9 @@ async def test_dispatcher_reclaims_and_applies_message_after_contention_clears(
         # real close still executes for its own side effects (the DB
         # write), keeping the rest of the test's assertions valid.
         with patch.object(
-            websocket_api,
+            command_execution_service,
             "close_legacy_resume_interaction_sync",
-            wraps=websocket_api.close_legacy_resume_interaction_sync,
+            wraps=command_execution_service.close_legacy_resume_interaction_sync,
         ) as close_spy:
             assert await dispatch_one_task_command(
                 execute_durable_task_command,

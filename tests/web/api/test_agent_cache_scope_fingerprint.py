@@ -31,10 +31,10 @@ from xagent.core.execution_scope import (
     scope_fingerprint,
     set_execution_scope_snapshot_loader,
 )
-from xagent.web.api.chat import AgentServiceManager
 from xagent.web.models.agent import AgentStatus
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
+from xagent.web.services.agent_service_manager import AgentServiceManager
 from xagent.web.services.llm_utils import AgentRuntimeFields
 from xagent.web.services.task_setup_snapshot import (
     RuntimeUserFields,
@@ -115,16 +115,19 @@ def _common_patches(
     return [
         patch.object(manager, "_load_persisted_conversation_history"),
         patch.object(manager, "_load_persisted_execution_context", new=AsyncMock()),
-        patch("xagent.web.api.chat.create_task_tracer", return_value=MagicMock()),
         patch(
-            "xagent.web.api.chat.create_default_tools",
+            "xagent.web.services.agent_service_manager.create_task_tracer",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "xagent.web.services.agent_service_manager.create_default_tools",
             new=AsyncMock(return_value=([], MagicMock())),
         ),
         patch(
             "xagent.web.sandbox_manager.get_sandbox_manager",
             return_value=sandbox_manager,
         ),
-        patch("xagent.web.api.chat.AgentService"),
+        patch("xagent.web.services.agent_service_manager.AgentService"),
     ]
 
 
@@ -457,7 +460,7 @@ async def test_resolver_scope_reaches_workspace_paths_on_build() -> None:
         for p in _common_patches(manager)[:-1]:
             stack.enter_context(p)
         agent_service_mock = stack.enter_context(
-            patch("xagent.web.api.chat.AgentService")
+            patch("xagent.web.services.agent_service_manager.AgentService")
         )
         await _call(
             manager,
@@ -489,7 +492,7 @@ async def test_unscoped_build_uses_legacy_workspace_base_dir() -> None:
         for p in _common_patches(manager)[:-1]:
             stack.enter_context(p)
         agent_service_mock = stack.enter_context(
-            patch("xagent.web.api.chat.AgentService")
+            patch("xagent.web.services.agent_service_manager.AgentService")
         )
         await _call(
             manager,

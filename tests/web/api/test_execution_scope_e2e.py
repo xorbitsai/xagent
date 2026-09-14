@@ -36,10 +36,13 @@ from xagent.core.execution_scope import (
 from xagent.core.tools.adapters.vibe.factory import ToolFactory
 from xagent.core.workspace import scoped_user_root
 from xagent.sandbox.base import SandboxMountIntent
-from xagent.web.api.chat import AgentServiceManager, create_default_tools
 from xagent.web.models.agent import AgentStatus
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
+from xagent.web.services.agent_service_manager import (
+    AgentServiceManager,
+    create_default_tools,
+)
 from xagent.web.services.llm_utils import AgentRuntimeFields
 from xagent.web.services.task_setup_snapshot import (
     RuntimeUserFields,
@@ -169,11 +172,14 @@ async def _run_build(manager: AgentServiceManager, task_id: int) -> _Build:
             patch.object(manager, "_load_persisted_execution_context", new=AsyncMock())
         )
         stack.enter_context(
-            patch("xagent.web.api.chat.create_task_tracer", return_value=MagicMock())
+            patch(
+                "xagent.web.services.agent_service_manager.create_task_tracer",
+                return_value=MagicMock(),
+            )
         )
         stack.enter_context(
             patch(
-                "xagent.web.api.chat.create_default_tools",
+                "xagent.web.services.agent_service_manager.create_default_tools",
                 new=AsyncMock(return_value=([], MagicMock())),
             )
         )
@@ -184,7 +190,7 @@ async def _run_build(manager: AgentServiceManager, task_id: int) -> _Build:
             )
         )
         agent_service_mock = stack.enter_context(
-            patch("xagent.web.api.chat.AgentService")
+            patch("xagent.web.services.agent_service_manager.AgentService")
         )
         try:
             await manager.get_agent_for_task(

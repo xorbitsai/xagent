@@ -72,7 +72,12 @@ from ....file_ref import (
 )
 from ....model.chat.exceptions import LLMToolProtocolError
 from ....model.chat.tool_protocol import get_tool_protocol_error
-from ....tools.adapters.vibe.interaction_types import INTERACTION_TYPES
+from ....tools.adapters.vibe.interaction_types import (
+    DEFAULT_WAITING_INTERACTION,
+    INTERACTION_TYPE_ALIASES,
+    INTERACTION_TYPES,
+    TYPES_REQUIRING_OPTIONS,
+)
 from ....tools.user_interaction import (
     tool_result_waits_for_user,
     user_interaction_resume_callable,
@@ -259,8 +264,10 @@ def _normalize_ask_user_interactions(interactions: Any) -> list[dict[str, Any]]:
     treated the same as missing: the option is dropped. A field name that is
     blank after normalization falls back to ``response_{index}``; a
     well-formed field name is normalized and written back so the frontend's
-    own ``trim()`` is a no-op on it. Survivors are otherwise kept verbatim --
-    only blankness is judged here, not content.
+    own ``trim()`` is a no-op on it. A ``type`` listed in
+    ``INTERACTION_TYPE_ALIASES`` is rewritten to the canonical name the
+    frontend maps it to; any other off-contract ``type`` is left verbatim.
+    Survivors are otherwise kept verbatim.
 
     The alias chain ``field or id or name`` intentionally keeps its raw
     truthiness check; it is not normalization-aware. The frontend's own
@@ -301,6 +308,9 @@ def _normalize_ask_user_interactions(interactions: Any) -> list[dict[str, Any]]:
             continue
 
         item = dict(interaction)
+        item_type = item.get("type")
+        if isinstance(item_type, str) and item_type in INTERACTION_TYPE_ALIASES:
+            item["type"] = INTERACTION_TYPE_ALIASES[item_type]
         field = item.get("field") or item.get("id") or item.get("name")
         normalized_field = (
             _normalize_interaction_text(field) if isinstance(field, str) else ""
@@ -409,6 +419,51 @@ def _normalize_ask_user_interactions(interactions: Any) -> list[dict[str, Any]]:
         )
 
     return normalized
+
+
+def _unique_field(base_field: str, used_fields: set[str]) -> str:
+    """Suffix ``_2``/``_3``... until unused, record it, and return it."""
+
+    field = base_field
+    suffix = 2
+    while field in used_fields:
+        field = f"{base_field}_{suffix}"
+        suffix += 1
+    used_fields.add(field)
+    return field
+
+
+def _is_answerable(interaction: Any) -> bool:
+    """Whether a user handed this control could produce an answer with it.
+
+    A type outside ``INTERACTION_TYPES`` is dropped by the frontend's
+    ``normalizeInteractions``; ``connect_apps`` is the one it keeps and still
+    cannot answer, because a form whose fields are all widgets renders no
+    Submit button (``isConnectAppsOnly``, clarification-form.tsx). A picker
+    with no options survives ``_normalize_ask_user_interactions`` (which drops
+    the blank options, not the interaction) as a control with nothing to pick.
+    Aliases are not a third case: normalization has already mapped them onto
+    these seven. Two gaps stay open, both under the embedded widget's default
+    ``filesDisabled``: a ``file_upload`` renders nothing, and an
+    ``action_cards`` whose options are all file actions renders no cards
+    (``visibleOptions``, clarification-form.tsx).
+    """
+
+    if not isinstance(interaction, dict):
+        return False
+    interaction_type = interaction.get("type")
+    # The model is free to send an unhashable ``type`` (a list). Refused here
+    # rather than left to the membership test, which only tolerates one
+    # because ``INTERACTION_TYPES`` is a tuple -- as a set it would raise
+    # ``TypeError`` and take the whole run down.
+    if not isinstance(interaction_type, str):
+        return False
+    if interaction_type not in INTERACTION_TYPES:
+        return False
+    if interaction_type in TYPES_REQUIRING_OPTIONS:
+        options = interaction.get("options")
+        return isinstance(options, list) and bool(options)
+    return True
 
 
 class ReActPattern(AgentPattern):
@@ -2414,24 +2469,37 @@ class ReActPattern(AgentPattern):
             expect_response = bool(args.get("expect_response", False))
             message_type = str(args.get("message_type", "info"))
             visible = bool(args.get("visible", True))
-            outbound_message = await runtime.send_message(
-                message=message,
-                message_type=message_type,
-                expect_response=expect_response,
-                visible=visible,
-                metadata=source,
-            )
-            self._record_tool_call(
-                tool_call,
-                status="completed",
-                result={
-                    "message": message,
-                    "expect_response": expect_response,
-                    "visible": visible,
-                },
-            )
+            interactions: list[dict[str, Any]] = []
+            if expect_response:
+                outbound_message, interactions = await self._send_waiting_message(
+                    runtime=runtime,
+                    message=message,
+                    message_type=message_type,
+                    interactions=[],
+                    metadata=source,
+                    visible=visible,
+                )
+            else:
+                outbound_message = await runtime.send_message(
+                    message=message,
+                    message_type=message_type,
+                    expect_response=False,
+                    visible=visible,
+                    metadata=source,
+                )
+            ledger_result: dict[str, Any] = {
+                "message": message,
+                "expect_response": expect_response,
+                "visible": visible,
+            }
+            if expect_response:
+                ledger_result["interactions"] = interactions
+            self._record_tool_call(tool_call, status="completed", result=ledger_result)
             if expect_response:
                 self.status = "waiting_for_user"
+                # No ``interactions`` in the tool result: the model called a
+                # tool that has no such parameter, and echoing a form back
+                # would read as one it produced.
                 context.add_tool_result(
                     tool_name=name,
                     result={
@@ -2447,6 +2515,7 @@ class ReActPattern(AgentPattern):
                     "tool_name": name,
                     "message": message,
                     "message_type": message_type,
+                    "interactions": interactions,
                     "task_text": self.task_text,
                     "message_count": len(getattr(context, "messages", [])),
                 }
@@ -2455,6 +2524,7 @@ class ReActPattern(AgentPattern):
                     "status": self.status,
                     "message": message,
                     "message_type": message_type,
+                    "interactions": interactions,
                     "context": context,
                     "clarification_draft": draft_from_waiting_request(
                         self.waiting_for_user_request,
@@ -2490,25 +2560,16 @@ class ReActPattern(AgentPattern):
             deduplicated_interactions: list[dict[str, Any]] = []
             for interaction in interactions:
                 item = dict(interaction)
-                base_field = str(item.get("field") or "response")
-                field = base_field
-                suffix = 2
-                while field in used_fields:
-                    field = f"{base_field}_{suffix}"
-                    suffix += 1
-                item["field"] = field
-                used_fields.add(field)
+                item["field"] = _unique_field(
+                    str(item.get("field") or "response"), used_fields
+                )
                 deduplicated_interactions.append(item)
-            interactions = deduplicated_interactions
-            outbound_message = await runtime.send_message(
+            outbound_message, interactions = await self._send_waiting_message(
+                runtime=runtime,
                 message=message,
                 message_type="question",
-                expect_response=True,
-                visible=True,
-                metadata={
-                    **source,
-                    "interactions": interactions,
-                },
+                interactions=deduplicated_interactions,
+                metadata=source,
             )
             self._record_tool_call(
                 tool_call,
@@ -2526,7 +2587,10 @@ class ReActPattern(AgentPattern):
                     "status": "waiting_for_user",
                     "message": message,
                     "message_type": "question",
-                    "interactions": interactions,
+                    # Pre-append copy: what the model supplied is its own output
+                    # and echoes back; an engine-appended field would read as
+                    # one it authored too.
+                    "interactions": deduplicated_interactions,
                 },
                 tool_call_id=tool_call.get("id"),
             )
@@ -2555,6 +2619,49 @@ class ReActPattern(AgentPattern):
             }
 
         return None
+
+    async def _send_waiting_message(
+        self,
+        *,
+        runtime: PatternRuntime,
+        message: str,
+        message_type: str,
+        interactions: list[dict[str, Any]],
+        metadata: dict[str, Any],
+        visible: bool = True,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        """Publish a message that suspends the run, and return what it carried.
+
+        The only ``expect_response=True`` producer, so the "at least one
+        answerable field" guarantee is made once. Not pushed into
+        ``runtime.send_message``, which also serves non-suspending messages
+        that must stay field-free, and whose callers need the published list
+        back to store on the waiting request.
+
+        Appended, never substituted for the list: an options-less picker's
+        ``label`` is the only copy of the question text the run has.
+        """
+
+        published = list(interactions)
+        if not any(_is_answerable(item) for item in published):
+            appended = dict(DEFAULT_WAITING_INTERACTION)
+            appended["field"] = _unique_field(
+                str(appended["field"]),
+                {
+                    str(item.get("field") or "")
+                    for item in published
+                    if isinstance(item, dict)
+                },
+            )
+            published.append(appended)
+        outbound_message = await runtime.send_message(
+            message=message,
+            message_type=message_type,
+            expect_response=True,
+            visible=visible,
+            metadata={**metadata, "interactions": published},
+        )
+        return outbound_message, published
 
     def _reject_empty_final_answer(
         self, tool_call: dict[str, Any], context: Any
@@ -2788,14 +2895,9 @@ class ReActPattern(AgentPattern):
             deduplicated_request_interactions: list[dict[str, Any]] = []
             for interaction in request_interactions:
                 item = dict(interaction)
-                base_field = str(item.get("field") or "response")
-                field = base_field
-                suffix = 2
-                while field in used_fields:
-                    field = f"{base_field}_{suffix}"
-                    suffix += 1
-                item["field"] = field
-                used_fields.add(field)
+                item["field"] = _unique_field(
+                    str(item.get("field") or "response"), used_fields
+                )
                 interactions.append(item)
                 deduplicated_request_interactions.append(item)
 
@@ -2827,13 +2929,12 @@ class ReActPattern(AgentPattern):
             )
             message_type = "question"
 
-        outbound_message = await runtime.send_message(
+        outbound_message, interactions = await self._send_waiting_message(
+            runtime=runtime,
             message=message,
             message_type=message_type,
-            expect_response=True,
-            visible=True,
+            interactions=interactions,
             metadata={
-                "interactions": interactions,
                 "tool_calls": [
                     self._tool_message_source(
                         self._with_runtime_turn_id(

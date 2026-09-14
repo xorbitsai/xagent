@@ -21,6 +21,7 @@ import { Button } from "@/components/ui/button";
 import { normalizeTimestampMs } from "@/lib/time-utils";
 import { FileChip } from "./FileChip";
 import { ClarificationForm } from "./clarification-form";
+import type { ClarificationOnSend } from "./clarification-delivery";
 import { isStoppedTraceProcessStatus, resolveTraceProcessStatus } from "@/lib/trace-process-status";
 import {
   TaskRuntimeMessageMetadataExtension,
@@ -94,7 +95,7 @@ export interface ChatMessageProps {
   showEmptyStatus?: boolean;
   onOpenExecutionPlan?: () => void;
   onAgentExecutionClick?: (execution: AgentExecutionSummary) => void;
-  onSendInteraction?: (message: string, files?: File[], metadata?: any) => Promise<void> | void;
+  onSendInteraction?: ClarificationOnSend;
   contextBadges?: Array<{
     kind: "computer_use";
     label: string;

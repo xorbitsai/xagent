@@ -28,6 +28,8 @@ interface WebSocketMessage {
   event_type?: string
   event_id?: string
   run_id?: string | null
+  stream_run_id?: string | null
+  stream_attempt_id?: string | null
   state_version?: number
   control_state?: TaskControlState
   status?: unknown
@@ -62,6 +64,7 @@ type TaskControlEnvelope = {
 }
 
 const VERSIONED_TASK_EVENT_TYPES = new Set([
+  "task_stream_snapshot",
   "agent_error",
   "error",
   "task_completed",
@@ -100,6 +103,8 @@ const TASK_SCOPED_ACTION_TYPES = new Set<AppAction["type"]>([
   "SET_HISTORY_LOADING",
   "ADD_MESSAGE",
   "UPSERT_STREAMING_FINAL_ANSWER",
+  "SET_STREAM_RECOVERY",
+  "RECONCILE_STREAM_OUTPUT",
   "ADD_TRACE_EVENT",
   "SET_CONTEXT_USAGE",
   "SET_PLAN_MEMORY_INFO",
@@ -374,6 +379,10 @@ import {
   shouldBufferMessageForHistoricalReplay,
 } from "@/lib/streaming-final-answer"
 import { extractSharedChatResponse } from "@/lib/chat-response"
+import {
+  isStableAssistantMessageId,
+  stableAssistantMessageId,
+} from "@/lib/assistant-message-identity"
 
 // Unique ID generator for messages
 let messageIdCounter = 0
@@ -440,7 +449,6 @@ const dispatchAutoOpenPreview = (
   })
 }
 
-const OPTIMISTIC_USER_MESSAGE_PREFIX = "msg-user-optimistic"
 const USER_TURN_MESSAGE_PREFIX = "msg-user-turn"
 const USER_EVENT_MESSAGE_PREFIX = "msg-user-event"
 const USER_MESSAGE_REPLACE_WINDOW_MS = 30000
@@ -487,11 +495,29 @@ const normalizeMessageContent = (content: string | React.ReactNode): string => {
   return ''
 }
 
+// A user message id minted from a stable per-turn identity: the wire's
+// `turn_id` / `event_id` (stableUserMessageId) or the sender's own
+// client_message_id (userTurnMessageId), which the backend echoes back as
+// that turn's id.
+const hasStableUserTurnIdentity = (id: string): boolean =>
+  id.startsWith(`${USER_TURN_MESSAGE_PREFIX}-`) ||
+  id.startsWith(`${USER_EVENT_MESSAGE_PREFIX}-`)
+
 const findOptimisticUserMessageIndex = (
   messages: Message[],
   incomingMessage: Message,
 ): number => {
   if (incomingMessage.role !== "user") {
+    return -1
+  }
+
+  // Identity beats text: a message carrying one is reconciled by
+  // ADD_MESSAGE's id branch alone. Merging by text instead can drop a turn
+  // from the transcript with no error, and repeated text is routine here -
+  // a clarification form with no free-text field serializes to a fixed
+  // string. Only identity-less legacy events still need text. See the commit
+  // for which same-turn pairs this gives up on, and why they are unreachable.
+  if (hasStableUserTurnIdentity(incomingMessage.id)) {
     return -1
   }
 
@@ -504,14 +530,7 @@ const findOptimisticUserMessageIndex = (
 
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const existingMessage = messages[index]
-    if (
-      existingMessage.role !== "user" ||
-      typeof existingMessage.id !== "string" ||
-      (
-        !existingMessage.isOptimistic &&
-        !existingMessage.id.startsWith(OPTIMISTIC_USER_MESSAGE_PREFIX)
-      )
-    ) {
+    if (existingMessage.role !== "user" || !existingMessage.isOptimistic) {
       continue
     }
 
@@ -1163,6 +1182,7 @@ const normalizeDagExecutionPayload = (raw: Record<string, unknown>): DAGExecutio
 }
 
 export interface AppState {
+  streamRecoveryTaskId?: number | null
   messages: Message[]
   currentTask: Task | null
   taskRuntimeExtensions: TaskRuntimeExtensions
@@ -1210,6 +1230,8 @@ export interface AppState {
 }
 
 type AppAction =
+  | { type: "SET_STREAM_RECOVERY"; payload: number | null }
+  | { type: "RECONCILE_STREAM_OUTPUT"; payload: { runId: string; output: string; timestamp: string; interrupted: boolean } }
   | { type: "SESSION_CONVERSATION"; payload: SessionConversationAction }
   | { type: "SET_TASK_ID"; payload: number | null }
   | { type: "ADOPT_SESSION_TASK"; payload: { taskId: number; task: Task } }
@@ -1406,6 +1428,39 @@ function projectAppState(state: AppState, action: AppAction): AppState {
         }
       }
 
+      // One assistant question can be delivered twice -- live, then replayed
+      // from the transcript after a reconnect -- under one event identity but
+      // with different text, because the replayed copy carries the rendered
+      // interaction list. Identity decides, never text: #2250 is the record
+      // of what text matching costs. The mounted bubble is kept rather than
+      // replaced so an open clarification form is not remounted under the
+      // visitor; the re-delivery only fills in what the bubble lacks. Content
+      // is deliberately not among those fields: one event id is one question,
+      // and the replayed copy differs only by the rendered interaction list
+      // the form already draws.
+      if (messageToAdd.role === "assistant" && isStableAssistantMessageId(messageToAdd.id)) {
+        const deliveredIndex = state.messages.findIndex(
+          message => message.role === "assistant" && message.id === messageToAdd.id,
+        )
+        if (deliveredIndex >= 0) {
+          const updatedMessages = state.messages.map((message, index) =>
+            index === deliveredIndex
+              ? {
+                ...message,
+                interactions: message.interactions ?? messageToAdd.interactions,
+                interactionRequestId:
+                  message.interactionRequestId ?? messageToAdd.interactionRequestId,
+                traceEvents: mergeTraceEventsById(
+                  message.traceEvents,
+                  messageToAdd.traceEvents,
+                ),
+              }
+              : message
+          )
+          return { ...state, messages: updatedMessages, traceEvents: newTraceEvents }
+        }
+      }
+
       const optimisticUserMessageIndex = findOptimisticUserMessageIndex(
         state.messages,
         messageToAdd,
@@ -1459,6 +1514,40 @@ function projectAppState(state: AppState, action: AppAction): AppState {
         return normalizeTimestampMs(a.timestamp) - normalizeTimestampMs(b.timestamp)
       })
       return { ...state, messages: updatedMessages, traceEvents: newTraceEvents }
+    }
+
+    case "SET_STREAM_RECOVERY":
+      return { ...state, streamRecoveryTaskId: action.payload }
+
+    case "RECONCILE_STREAM_OUTPUT": {
+      const { runId, output, timestamp, interrupted } = action.payload
+      let resultIndex = -1
+      for (let index = state.messages.length - 1; index >= 0; index--) {
+        const message = state.messages[index]
+        if (message.role === "user") break
+        if (message.role === "assistant" && message.isResult) {
+          resultIndex = index
+          break
+        }
+      }
+      const existing = state.messages[resultIndex]
+      // Preserve richer live formatting/files when a complete result already
+      // arrived. A partial stream, or a missed result, needs the durable text.
+      if (existing?.status === "completed" && !interrupted) return state
+      const restored: Message = {
+        ...existing,
+        id: existing?.id ?? `final_answer_recovered_${runId}`,
+        role: "assistant",
+        content: output,
+        rawContent: output,
+        timestamp: existing?.timestamp ?? timestamp,
+        status: "completed",
+        isResult: true,
+      }
+      const messages = [...state.messages]
+      if (resultIndex >= 0) messages[resultIndex] = restored
+      else messages.push(restored)
+      return { ...state, messages, streamRecoveryTaskId: null }
     }
 
     case "UPSERT_STREAMING_FINAL_ANSWER": {
@@ -2190,6 +2279,14 @@ export function AppProvider({
   const { t } = useI18n()
   const router = useRouter()
   const lastConnectedTaskId = useRef<number | null>(null)
+  const sharedStreamRef = useRef<{
+    taskId?: number
+    runId?: string | null
+    attemptId?: string | null
+    interrupted: boolean
+    prefixSeen: boolean
+    complete: boolean
+  }>({ interrupted: false, prefixSeen: false, complete: false })
   const taskStateVersionsRef = useRef(
     new Map<number, TaskStateVersionEntry>()
   )
@@ -2695,6 +2792,102 @@ export function AppProvider({
       }
       rawDispatch(action)
     }
+    if (!isMessageForOtherTask && typeof messageTaskId === "number") {
+      let stream = sharedStreamRef.current
+      if (stream.taskId !== messageTaskId) {
+        stream = { taskId: messageTaskId, interrupted: false, prefixSeen: false, complete: false }
+        sharedStreamRef.current = stream
+      }
+      if (message.type === "stream_unavailable" || message.type === "stream_resync_required") {
+        stream.interrupted = true
+        dispatch({ type: "SET_STREAM_RECOVERY", payload: messageTaskId })
+        return
+      }
+      if (message.type === "task_stream_snapshot") {
+        if (isHistoricalDataLoadingRef.current) return
+        const envelope = extractTaskControlEnvelope(message)
+        if (!acceptTaskControlVersion(message, envelope, taskStateVersionsRef.current)) return
+        const data = asMessageRecord(message.data)
+        if (stream.runId !== envelope.runId) {
+          stream.runId = envelope.runId
+          stream.prefixSeen = false
+          stream.complete = false
+        }
+        stream.attemptId = typeof data.lease_attempt_id === "string" ? data.lease_attempt_id : null
+        const active = envelope.status === "running"
+        stream.interrupted = stream.interrupted || (active && !stream.prefixSeen)
+        if (envelope.status) {
+          dispatch({ type: "UPDATE_TASK_STATUS", payload: {
+            status: envelope.status, runId: envelope.runId,
+            stateVersion: envelope.stateVersion, controlState: envelope.controlState,
+            ...(envelope.status === "waiting_for_user" ? {
+              waitingQuestion: typeof data.question === "string" ? data.question : undefined,
+              waitingInteractions: normalizeInteractions(data.interactions),
+            } : {}),
+          } })
+          dispatch({ type: "SET_PROCESSING", payload: active })
+        }
+        if (typeof data.output === "string" && typeof envelope.runId === "string") {
+          dispatch({ type: "RECONCILE_STREAM_OUTPUT", payload: {
+            runId: envelope.runId, output: data.output,
+            timestamp: message.timestamp, interrupted: stream.interrupted,
+          } })
+          stream.interrupted = false
+          stream.complete = true
+        } else if (envelope.status && envelope.status !== "running") {
+          stream.interrupted = false
+        }
+        dispatch({ type: "SET_STREAM_RECOVERY", payload: stream.interrupted ? messageTaskId : null })
+        return
+      }
+      if (message.stream_run_id !== undefined) {
+        const known = taskStateVersionsRef.current.get(messageTaskId)
+        if (known?.runId !== undefined && known.runId !== message.stream_run_id) {
+          const envelope = extractTaskControlEnvelope(message)
+          if (!envelope.isStateEvent || envelope.runId !== message.stream_run_id
+            || envelope.stateVersion === undefined || envelope.stateVersion <= known.version) return
+        }
+        if (stream.runId !== message.stream_run_id) {
+          stream.runId = message.stream_run_id
+          stream.attemptId = message.stream_attempt_id
+          stream.prefixSeen = false
+          stream.interrupted = false
+          stream.complete = false
+          dispatch({ type: "SET_STREAM_RECOVERY", payload: null })
+        }
+        if (stream.attemptId && message.stream_attempt_id !== stream.attemptId) return
+      }
+      const streamType = getWebSocketEventType(message)
+      if (stream.complete && isFinalAnswerStreamEventType(streamType)) return
+      if (streamType === "final_answer_start") {
+        stream.prefixSeen = true
+        stream.interrupted = false
+        dispatch({ type: "SET_STREAM_RECOVERY", payload: null })
+      }
+      if (isFinalAnswerStreamEventType(streamType)) {
+        const sharedFrame = message.stream_run_id !== undefined
+        const data = asMessageRecord(message.data)
+        const eventData = message.type === "trace_event"
+          ? asMessageRecord(data.data ?? data)
+          : { ...data, ...message }
+        const replacesContent = sharedFrame && (
+          (streamType === "final_answer_end" && typeof eventData.content === "string")
+          || (streamType === "final_answer_error" && typeof eventData.error === "string")
+        )
+        if (sharedFrame && streamType === "final_answer_delta" && !stream.prefixSeen) {
+          stream.interrupted = true
+          dispatch({ type: "SET_STREAM_RECOVERY", payload: messageTaskId })
+          return
+        }
+        if (replacesContent) {
+          stream.prefixSeen = true
+          stream.interrupted = false
+          dispatch({ type: "SET_STREAM_RECOVERY", payload: null })
+        }
+        if (stream.interrupted) return
+        if (replacesContent) stream.complete = true
+      }
+    }
     // The 30s dedup cache below is keyed on message content/type only, not
     // task id - several dedupKeys (e.g. dag-execute-end's "task end, this
     // iteration") are templated purely on generic fields like iteration
@@ -2909,23 +3102,6 @@ export function AppProvider({
     }
 
     switch (message.type) {
-      case "chat":
-        const chatData = message as any
-        const messageContent = chatData.message || ""
-
-        if (!isDuplicateMessageForViewedTask(messageContent, 'user-message')) {
-          dispatch({
-            type: "ADD_MESSAGE",
-            payload: {
-              id: generateMessageId("msg-user"),
-              role: "user",
-              content: messageContent,
-              timestamp: message.timestamp?.toString() || Date.now().toString(),
-            }
-          })
-        }
-        break
-
       case "trace_event":
         const traceEventData = (message.data ?? {}) as any
 
@@ -3256,7 +3432,12 @@ export function AppProvider({
             )) {
               return
             }
-            const msgId = generateMessageId("msg-agent")
+            const msgId =
+              (isAgentMessage
+                ? stableAssistantMessageId(
+                  message.event_id || traceEventData.event_id || eventData.event_id,
+                )
+                : null) ?? generateMessageId("msg-agent")
             dispatch({
               type: "ADD_MESSAGE",
               payload: {
@@ -5392,20 +5573,6 @@ export function AppProvider({
         }
         break
 
-      case "chat_message":
-        console.trace('Original message:', JSON.stringify(message), 'Handler: handleMessage (chat_message)')
-        const messageData = message.data as any
-        dispatch({
-          type: "ADD_MESSAGE",
-          payload: {
-            id: `msg-${messageData.id}`,
-            role: messageData.role,
-            content: messageData.content,
-            timestamp: messageData.timestamp,
-          },
-        })
-        break
-
       case "task_completed":
         const taskData = normalizeTaskCompletedMessage(message)
         dispatch({
@@ -6133,9 +6300,14 @@ export function AppProvider({
       )
     }
 
-    const clientMessageId = typeof config?.clientMessageId === 'string'
-      ? config.clientMessageId
-      : generateClientMessageId()
+    // Mirrors stableUserMessageId's trim guard. `config` is untyped, so a
+    // blank id would reach userTurnMessageId and mint a bare
+    // `msg-user-turn-` that every other blank-id turn collides on.
+    const requestedClientMessageId =
+      typeof config?.clientMessageId === 'string'
+        ? config.clientMessageId.trim()
+        : ''
+    const clientMessageId = requestedClientMessageId || generateClientMessageId()
     const requestId = typeof config?.metadata?.request_id === 'string'
       ? config.metadata.request_id
       : undefined

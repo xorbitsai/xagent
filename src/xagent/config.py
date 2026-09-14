@@ -40,6 +40,11 @@ EXTERNAL_SKILLS_LIBRARY_DIRS = "XAGENT_EXTERNAL_SKILLS_LIBRARY_DIRS"
 AGENT_RUNTIME = "XAGENT_AGENT_RUNTIME"
 INTERACTION_PROTOCOL_MODE = "XAGENT_INTERACTION_PROTOCOL_MODE"
 INTERACTION_NATIVE_SOURCES = "XAGENT_INTERACTION_NATIVE_SOURCES"
+SHARED_TASK_EXECUTION_ENABLED = "XAGENT_SHARED_TASK_EXECUTION_ENABLED"
+TASK_EVENT_CHANNEL_PREFIX = "XAGENT_TASK_EVENT_CHANNEL_PREFIX"
+ENCRYPTION_KEY = "ENCRYPTION_KEY"
+# Public development fallback; runtime credential storage must reject it.
+DEV_FALLBACK_ENCRYPTION_KEY = "RQMpe38gK3m0szjpSmTNw_sP3Y54r6hDc6JewBoPKXc="
 TASK_LEASE_TTL_SECONDS = "XAGENT_TASK_LEASE_TTL_SECONDS"
 TASK_LEASE_HEARTBEAT_SECONDS = "XAGENT_TASK_LEASE_HEARTBEAT_SECONDS"
 TASK_LEASE_RECOVERY_INTERVAL_SECONDS = "XAGENT_TASK_LEASE_RECOVERY_INTERVAL_SECONDS"
@@ -100,6 +105,14 @@ DATABASE_URL = "DATABASE_URL"
 DB_POOL_SIZE = "XAGENT_DB_POOL_SIZE"
 DB_MAX_OVERFLOW = "XAGENT_DB_MAX_OVERFLOW"
 DB_POOL_TIMEOUT_SECONDS = "XAGENT_DB_POOL_TIMEOUT_SECONDS"
+RUNTIME_TELEMETRY_ENABLED = "XAGENT_RUNTIME_TELEMETRY_ENABLED"
+OTEL_EXPORTER_OTLP_METRICS_ENDPOINT = "XAGENT_OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"
+OTEL_EXPORT_INTERVAL_MILLISECONDS = "XAGENT_OTEL_EXPORT_INTERVAL_MILLISECONDS"
+OTEL_SERVICE_NAME = "XAGENT_OTEL_SERVICE_NAME"
+_STANDARD_OTEL_EXPORTER_OTLP_METRICS_ENDPOINT = "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"
+_STANDARD_OTEL_EXPORTER_OTLP_ENDPOINT = "OTEL_EXPORTER_OTLP_ENDPOINT"
+_STANDARD_OTEL_METRIC_EXPORT_INTERVAL = "OTEL_METRIC_EXPORT_INTERVAL"
+_STANDARD_OTEL_SERVICE_NAME = "OTEL_SERVICE_NAME"
 MCP_TOOL_INIT_TIMEOUT_SECONDS = "XAGENT_MCP_TOOL_INIT_TIMEOUT_SECONDS"
 SANDBOX_CPUS = "SANDBOX_CPUS"
 SANDBOX_MEMORY = "SANDBOX_MEMORY"
@@ -215,6 +228,7 @@ OPENROUTER_OFFICIAL_PROVIDERS_ONLY = "XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY"
 XROUTER_EXCLUDED_MODELS = "XAGENT_XROUTER_EXCLUDED_MODELS"
 MCP_OAUTH_ALLOW_PRIVATE_HOSTS = "XAGENT_MCP_OAUTH_ALLOW_PRIVATE_HOSTS"
 MCP_OAUTH_PROXY_URL = "XAGENT_MCP_OAUTH_PROXY_URL"
+TOBY_PERSONAL_STDIO_ENABLED = "XAGENT_TOBY_PERSONAL_STDIO_ENABLED"
 TRUSTED_EGRESS_PROXY = "XAGENT_TRUSTED_EGRESS_PROXY"
 
 TOOL_MAX_OUTPUT_LENGTH = "XAGENT_TOOL_MAX_OUTPUT_LENGTH"
@@ -471,6 +485,57 @@ def _get_bool_env(env_var: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def get_otel_metrics_endpoint() -> str | None:
+    """Return the full OTLP/HTTP metrics endpoint.
+
+    XAgent's explicit setting wins. Standard OpenTelemetry variables remain a
+    fallback so an existing Collector deployment can configure this service
+    consistently with the rest of its fleet. ``OTEL_EXPORTER_OTLP_ENDPOINT``
+    is a base endpoint, so the HTTP metrics path is appended to it.
+    """
+
+    endpoint = _normalized_http_env_url(OTEL_EXPORTER_OTLP_METRICS_ENDPOINT)
+    if endpoint is not None:
+        return endpoint
+    endpoint = _normalized_http_env_url(_STANDARD_OTEL_EXPORTER_OTLP_METRICS_ENDPOINT)
+    if endpoint is not None:
+        return endpoint
+    base_endpoint = _normalized_http_env_url(_STANDARD_OTEL_EXPORTER_OTLP_ENDPOINT)
+    if base_endpoint is None:
+        return None
+    return f"{base_endpoint}/v1/metrics"
+
+
+def get_runtime_telemetry_enabled() -> bool:
+    """Whether runtime metrics should export through OpenTelemetry.
+
+    An explicit XAgent flag is authoritative. Otherwise, configuring any
+    supported OTLP endpoint enables export automatically.
+    """
+
+    if os.getenv(RUNTIME_TELEMETRY_ENABLED) is not None:
+        return _get_bool_env(RUNTIME_TELEMETRY_ENABLED, False)
+    return get_otel_metrics_endpoint() is not None
+
+
+def get_otel_export_interval_milliseconds() -> int:
+    """Return the periodic OTLP metrics export interval."""
+
+    if os.getenv(OTEL_EXPORT_INTERVAL_MILLISECONDS) is not None:
+        return _get_positive_int_env(OTEL_EXPORT_INTERVAL_MILLISECONDS, 10_000)
+    return _get_positive_int_env(_STANDARD_OTEL_METRIC_EXPORT_INTERVAL, 10_000)
+
+
+def get_otel_service_name() -> str:
+    """Return the OpenTelemetry service.name resource attribute."""
+
+    for env_var in (OTEL_SERVICE_NAME, _STANDARD_OTEL_SERVICE_NAME):
+        value = (os.getenv(env_var) or "").strip()
+        if value:
+            return value
+    return "xagent"
+
+
 def _normalized_env_url(env_var: str) -> str | None:
     """Return the env var's value normalized as a base URL.
 
@@ -631,6 +696,12 @@ def get_mcp_oauth_allow_private_hosts() -> bool:
     return _get_bool_env(MCP_OAUTH_ALLOW_PRIVATE_HOSTS, False)
 
 
+def get_toby_personal_stdio_enabled() -> bool:
+    """Return whether trusted Toby actor executions may use personal stdio."""
+
+    return _get_bool_env(TOBY_PERSONAL_STDIO_ENABLED, False)
+
+
 def get_trusted_egress_proxy_enabled() -> bool:
     """Return whether the ambient HTTP(S)_PROXY may be used for public fetches.
 
@@ -676,6 +747,33 @@ def get_redis_url() -> str | None:
         return None
     value = value.strip()
     return value or None
+
+
+def get_shared_task_execution_enabled() -> bool:
+    """Enable durable task handoff and the shared event bridge when explicitly configured."""
+    return _get_bool_env(SHARED_TASK_EXECUTION_ENABLED, False)
+
+
+def get_task_runtime_secrets_encryption_key() -> str | None:
+    """Return an explicitly configured, non-default ENCRYPTION_KEY.
+
+    Single-turn connector credentials must never use the published development
+    fallback. Invalid Fernet keys are rejected by the store before any write.
+    """
+    key = os.getenv(ENCRYPTION_KEY)
+    if not key or key == DEV_FALLBACK_ENCRYPTION_KEY:
+        return None
+    return key
+
+
+def get_task_event_channel_prefix() -> str:
+    """Redis Pub/Sub is not isolated by Redis DB number; namespace each deployment."""
+    prefix = os.getenv(TASK_EVENT_CHANNEL_PREFIX, "xagent:task-events:v1").strip()
+    if not prefix or not re.fullmatch(r"[A-Za-z0-9:._-]+", prefix):
+        raise ValueError(
+            f"{TASK_EVENT_CHANNEL_PREFIX} must be a nonempty channel prefix"
+        )
+    return prefix
 
 
 def get_hot_path_cache_enabled() -> bool:

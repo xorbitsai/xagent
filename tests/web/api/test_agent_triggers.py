@@ -422,7 +422,7 @@ def test_trigger_test_run_mcp_setup_failure_marks_run_failed() -> None:
             new=_real_schedule_bg,
         ),
         patch(
-            "xagent.web.api.chat.AgentServiceManager.get_agent_for_task",
+            "xagent.web.services.agent_service_manager.AgentServiceManager.get_agent_for_task",
             new=fail_required_mcp_setup,
         ),
         TestClient(app_for_tests, raise_server_exceptions=False) as live_client,

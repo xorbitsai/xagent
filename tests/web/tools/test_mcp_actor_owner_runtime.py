@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from xagent.core.utils.encryption import encrypt_value
 from xagent.web import mcp_apps
+from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.mcp_oauth import MCPOAuthClient, MCPOAuthGrant
@@ -19,7 +20,10 @@ from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth
 from xagent.web.services import connector_team_scope
-from xagent.web.services.mcp_runtime import MCPBuiltinOAuthActorPolicy
+from xagent.web.services.mcp_runtime import (
+    MCPActorAuthorizationPolicy,
+    MCPBuiltinOAuthActorPolicy,
+)
 from xagent.web.tools import config as web_tools_config
 from xagent.web.tools.config import (
     ResolvedToken,
@@ -245,14 +249,38 @@ def _token(config: dict) -> str:
     return config["config"]["env"]["ACTOR_ACCESS_TOKEN"]
 
 
-def test_actor_policy_is_frozen_normalized_and_owner_only() -> None:
+def test_actor_policy_is_frozen_normalized_and_stdio_disabled_by_default() -> None:
     policy = MCPBuiltinOAuthActorPolicy(resource_owner_key=f"  {OWNER_A}  ")
 
     assert policy.resource_owner_key == OWNER_A
-    assert [field.name for field in fields(policy)] == ["resource_owner_key"]
+    assert policy.allow_builtin_stdio is False
+    assert [field.name for field in fields(policy)] == [
+        "resource_owner_key",
+        "allow_builtin_stdio",
+    ]
     assert OWNER_A not in repr(policy)
     with pytest.raises(FrozenInstanceError):
         policy.resource_owner_key = OWNER_B  # type: ignore[misc]
+
+
+def test_general_actor_policy_keeps_legacy_type_identity() -> None:
+    policy = MCPActorAuthorizationPolicy(
+        resource_owner_key=OWNER_A,
+        allow_builtin_stdio=True,
+    )
+
+    assert MCPBuiltinOAuthActorPolicy is MCPActorAuthorizationPolicy
+    assert isinstance(policy, MCPBuiltinOAuthActorPolicy)
+    assert policy.allow_builtin_stdio is True
+
+
+@pytest.mark.parametrize("value", [None, 0, 1, "true"])
+def test_actor_policy_rejects_non_boolean_stdio_capability(value: object) -> None:
+    with pytest.raises(ValueError, match="allow_builtin_stdio must be a boolean"):
+        MCPActorAuthorizationPolicy(
+            resource_owner_key=OWNER_A,
+            allow_builtin_stdio=value,  # type: ignore[arg-type]
+        )
 
 
 @pytest.mark.parametrize("value", [None, 7, True, "", "   "])
@@ -924,6 +952,57 @@ async def test_actor_builtin_uses_only_exact_owner_namespace(db_session) -> None
     assert _token(configs[0]) == "actor-a-token"
     assert "ordinary-token" not in str(configs)
     assert "actor-b-token" not in str(configs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner", [OWNER_A, OWNER_B])
+async def test_xero_uses_exact_actor_token(db_session, owner) -> None:
+    db, user = db_session.db, db_session.user
+    app = get_builtin_public_mcp_app("xero")
+    assert app is not None
+    db.add(PublicMCPApp(**app))
+    server = MCPServer(
+        name="Xero",
+        managed="external",
+        transport="oauth",
+        auth={"app_id": "xero", "provider": "xero"},
+    )
+    db.add(server)
+    db.flush()
+    db.add(
+        UserMCPServer(
+            user_id=user.id,
+            mcpserver_id=server.id,
+            is_owner=False,
+            is_active=True,
+        )
+    )
+    for credential_owner, token in (
+        (None, "workspace-token"),
+        (OWNER_A, "alice-token"),
+        (OWNER_B, "bob-token"),
+    ):
+        db.add(
+            UserOAuth(
+                user_id=user.id,
+                provider="xero",
+                resource_owner_key=credential_owner,
+                provider_user_id="xero-user",
+                access_token=token,
+            )
+        )
+    db.commit()
+
+    configs = await _config(db_session, policy=_policy(owner)).get_mcp_server_configs()
+
+    expected_token = "alice-token" if owner == OWNER_A else "bob-token"
+    other_token = "bob-token" if owner == OWNER_A else "alice-token"
+    assert len(configs) == 1
+    assert configs[0]["config"]["command"] == "npx"
+    assert configs[0]["config"]["args"] == ["-y", "@xeroapi/xero-mcp-server@latest"]
+    assert configs[0]["config"]["env"]["XERO_CLIENT_BEARER_TOKEN"] == expected_token
+    assert "workspace-token" not in str(configs)
+    assert other_token not in str(configs)
 
 
 @pytest.mark.asyncio

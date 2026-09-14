@@ -87,10 +87,19 @@ def _success_with_capped_list(key: str, items: Any) -> str:
     max_output_length = get_tool_max_output_length()
     capped_response = success_with_capped_dict(key, {key: items})
     capped = json.loads(capped_response)
-    if key in capped[key]:
+    capped_payload = capped.get(key)
+    normalized_payload = capped_payload if isinstance(capped_payload, dict) else {}
+    if key in normalized_payload:
         return capped_response
     candidate_response = json.dumps(
-        {**capped, key: {**capped[key], key: []}}, ensure_ascii=False
+        {
+            **capped,
+            key: {
+                **normalized_payload,
+                key: [],
+            },
+        },
+        ensure_ascii=False,
     )
     if len(candidate_response) <= max_output_length:
         return candidate_response

@@ -19,6 +19,7 @@ from xagent.core.file_storage.factory import get_unscoped_file_storage
 from xagent.web.auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
 from xagent.web.models.database import get_engine, get_session_local, init_db
 from xagent.web.models.uploaded_file import UploadedFile
+from xagent.web.services import agent_service_manager as agent_runtime_service
 
 
 @dataclass(frozen=True)
@@ -117,9 +118,7 @@ def disable_external_app_services(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def reset_chat_agent_manager(monkeypatch: pytest.MonkeyPatch) -> None:
-    import xagent.web.api.chat as chat_api
-
-    monkeypatch.setattr(chat_api, "_global_agent_manager", None)
+    monkeypatch.setattr(agent_runtime_service, "_global_agent_manager", None)
 
 
 def init_e2e_db() -> Any:

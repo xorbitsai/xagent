@@ -50,6 +50,10 @@ class TaskExecutionCommand(Base):  # type: ignore
     kind = Column(String(32), nullable=False)
     payload = Column(JSON, nullable=False)
 
+    # Server-generated route, bound before the command becomes visible.
+    reply_host_id = Column(String(64), nullable=True)
+    reply_origin = Column(String(64), nullable=True)
+
     # The run/worker observed when the command was accepted. Commands aimed at
     # a live run stay with its lease owner; once that lease expires another
     # worker may recover them from the durable inbox.

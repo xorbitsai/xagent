@@ -37,7 +37,7 @@ from xagent.core.tools.adapters.vibe.factory import ToolFactory
 async def test_create_default_tools_forwards_creator_and_declaration_to_web_tool_config(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from xagent.web.api.chat import create_default_tools
+    from xagent.web.services.agent_service_manager import create_default_tools
 
     captured: dict[str, Any] = {}
 
@@ -77,7 +77,7 @@ async def test_create_default_tools_leaves_creator_and_declaration_unset_by_defa
 ) -> None:
     """Negative control: the common no-agent case must not accidentally
     populate either new value."""
-    from xagent.web.api.chat import create_default_tools
+    from xagent.web.services.agent_service_manager import create_default_tools
 
     captured: dict[str, Any] = {}
 

@@ -14,8 +14,8 @@ from lark_oapi.api.im.v1 import (
 )
 
 from ....core.file_ref import build_file_id_ref
-from ...api.chat import get_agent_manager
 from ...models.task import TaskStatus
+from ...services.agent_service_manager import get_agent_manager
 from ...services.channel_runtime import (
     ChannelAuthorizationError,
     ChannelConfigurationError,
@@ -526,7 +526,8 @@ class FeishuBotInstance:
             ext = ".jpg" if msg_type == "image" else ".bin"
             file_name = f"{file_key}{ext}"
 
-        from ...api.websocket import build_unique_target_path, normalize_filename
+        from ...api.websocket import build_unique_target_path
+        from ...services.task_execution import normalize_filename
 
         normalized_file_name = normalize_filename(file_name)
         target_path = build_unique_target_path(target_dir, normalized_file_name)

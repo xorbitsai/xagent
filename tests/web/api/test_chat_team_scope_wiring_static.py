@@ -33,7 +33,7 @@ from __future__ import annotations
 import ast
 import inspect
 
-import xagent.web.api.chat as chat_module
+import xagent.web.services.agent_service_manager as chat_module
 
 
 def _tree() -> ast.Module:

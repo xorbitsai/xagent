@@ -66,6 +66,7 @@ vi.mock("@/contexts/auth-context", () => ({
 }))
 
 import { ClarificationForm } from "./clarification-form"
+import { createClarificationSendFailure } from "./clarification-delivery"
 
 // Every describe in this file gets the identity translate back, so a locale
 // swapped by one test cannot leak into a suite added below it.
@@ -594,6 +595,26 @@ describe("ClarificationForm delivery failures", () => {
         { description: "chatPage.clarification.sendNotSent" },
       )
     })
+  })
+
+  it("never shows the builder's internal diagnostic to the visitor", async () => {
+    // agent-builder-chat.tsx's onSendInteraction throws this exact failure as
+    // a developer diagnostic (#1485) - it must never reach the visitor.
+    const onSend = vi.fn().mockRejectedValue(
+      createClarificationSendFailure("Failed to send interaction", "not_sent"),
+    )
+
+    await submitAnswer(onSend)
+
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalledWith(
+        "chatPage.clarification.sendError",
+        { description: "chatPage.clarification.sendNotSent" },
+      )
+    })
+    const alert = await screen.findByRole("alert")
+    expect(alert).toHaveTextContent("chatPage.clarification.sendError")
+    expect(alert).not.toHaveTextContent("Failed to send interaction")
   })
 
   it("re-renders the visible failure in the new locale", async () => {

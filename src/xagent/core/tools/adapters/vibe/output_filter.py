@@ -255,99 +255,119 @@ class OutputValueFilter:
         characters (which would corrupt the JSON syntax mid-token).
 
         Returns None (falling back to raw character slicing) when the value
-        isn't parseable JSON, contains no list to trim, or can't be brought
-        under max_chars by trimming alone.
+        isn't parseable JSON, contains no list to trim, can't be brought under
+        max_chars by trimming alone, or is nested deep enough that walking or
+        re-serializing it risks a RecursionError - this is a best-effort
+        improvement over raw slicing, never a required step.
         """
         try:
             parsed = json.loads(value)
-        except (json.JSONDecodeError, ValueError, RecursionError):
-            return None
+            if not isinstance(parsed, (dict, list)):
+                return None
 
-        if not isinstance(parsed, (dict, list)):
-            return None
+            target_list = self._find_largest_list(parsed)
+            if not target_list:
+                return None
 
-        target_list = self._find_largest_list(parsed)
-        if not target_list:
-            return None
+            original_items = list(target_list)
+            total = len(original_items)
+            if total == 0:
+                return None
 
-        original_items = list(target_list)
-        total = len(original_items)
-        if total == 0:
-            return None
+            # A compact re-serialization (no pretty-print whitespace) of the
+            # untouched list may already fit, even though the original
+            # (possibly indented) string didn't - check that before dropping
+            # anything.
+            full_serialized = json.dumps(parsed, ensure_ascii=False)
+            if len(full_serialized) <= self.max_chars:
+                logger.info(
+                    f"Tool '{tool_name}' output JSON-compacted (no items "
+                    f"dropped): {len(value)} -> {len(full_serialized)} "
+                    f"characters"
+                )
+                return full_serialized
 
-        # A compact re-serialization (no pretty-print whitespace) of the
-        # untouched list may already fit, even though the original (possibly
-        # indented) string didn't - check that before dropping anything.
-        full_serialized = json.dumps(parsed, ensure_ascii=False)
-        if len(full_serialized) <= self.max_chars:
+            # Binary search the largest prefix of the list (plus a marker for
+            # the dropped remainder) whose re-serialized JSON fits within
+            # max_chars. Every candidate here always carries the marker
+            # (remaining >= 1), so length is monotonic in the prefix size -
+            # each additional kept item only adds characters. (The candidate
+            # with the whole list and no marker was already ruled out above,
+            # since dropping a roughly constant-size marker for the last
+            # couple of items can *shrink* the output, which would otherwise
+            # break that monotonicity.)
+            lo, hi = 0, total - 1
+            best_serialized: str | None = None
+            best_kept = 0
+            try:
+                while lo <= hi:
+                    mid = (lo + hi) // 2
+                    remaining = total - mid
+                    candidate = original_items[:mid] + [
+                        TRUNCATED_ITEMS_TEMPLATE.format(count=remaining)
+                    ]
+                    target_list[:] = candidate
+                    serialized = json.dumps(parsed, ensure_ascii=False)
+                    if len(serialized) <= self.max_chars:
+                        best_serialized = serialized
+                        best_kept = mid
+                        lo = mid + 1
+                    else:
+                        hi = mid - 1
+            finally:
+                target_list[:] = original_items
+
+            if best_serialized is None:
+                return None
+
             logger.info(
-                f"Tool '{tool_name}' output JSON-compacted (no items dropped): "
-                f"{len(value)} -> {len(full_serialized)} characters"
+                f"Tool '{tool_name}' output JSON-truncated: kept "
+                f"{best_kept}/{total} list items ({len(value)} -> "
+                f"{len(best_serialized)} characters)"
             )
-            return full_serialized
-
-        # Binary search the largest prefix of the list (plus a marker for the
-        # dropped remainder) whose re-serialized JSON fits within max_chars.
-        # Every candidate here always carries the marker (remaining >= 1), so
-        # length is monotonic in the prefix size - each additional kept item
-        # only adds characters. (The candidate with the whole list and no
-        # marker was already ruled out above, since dropping a roughly
-        # constant-size marker for the last couple of items can *shrink* the
-        # output, which would otherwise break that monotonicity.)
-        lo, hi = 0, total - 1
-        best_serialized: str | None = None
-        best_kept = 0
-        try:
-            while lo <= hi:
-                mid = (lo + hi) // 2
-                remaining = total - mid
-                candidate = original_items[:mid] + [
-                    TRUNCATED_ITEMS_TEMPLATE.format(count=remaining)
-                ]
-                target_list[:] = candidate
-                serialized = json.dumps(parsed, ensure_ascii=False)
-                if len(serialized) <= self.max_chars:
-                    best_serialized = serialized
-                    best_kept = mid
-                    lo = mid + 1
-                else:
-                    hi = mid - 1
-        finally:
-            target_list[:] = original_items
-
-        if best_serialized is None:
+            return best_serialized
+        except (json.JSONDecodeError, TypeError, ValueError, RecursionError) as e:
+            logger.info(
+                f"Tool '{tool_name}' JSON-aware truncation failed ({e!r}); "
+                f"falling back to raw character slicing."
+            )
             return None
-
-        logger.info(
-            f"Tool '{tool_name}' output JSON-truncated: kept {best_kept}/{total} "
-            f"list items ({len(value)} -> {len(best_serialized)} characters)"
-        )
-        return best_serialized
 
     @staticmethod
     def _find_largest_list(obj: Any) -> list | None:
-        """Find the largest (by serialized size) list nested anywhere in obj."""
+        """Find the largest (by estimated serialized size) list nested
+        anywhere in obj, in a single bottom-up pass.
+
+        This estimates size instead of calling json.dumps on every candidate
+        list, which would make the walk quadratic (or worse) for structures
+        with several nesting levels, since each level would re-serialize
+        everything below it.
+        """
         best: list | None = None
         best_size = -1
 
-        def consider(candidate: list) -> None:
+        def estimate_size(node: Any) -> int:
             nonlocal best, best_size
-            try:
-                size = len(json.dumps(candidate, ensure_ascii=False))
-            except (TypeError, ValueError):
-                return
-            if size > best_size:
-                best_size = size
-                best = candidate
-
-        def walk(node: Any) -> None:
             if isinstance(node, list):
-                consider(node)
+                size = 2 + max(0, len(node) - 1)  # brackets + separators
                 for item in node:
-                    walk(item)
-            elif isinstance(node, dict):
-                for item in node.values():
-                    walk(item)
+                    size += estimate_size(item)
+                if size > best_size:
+                    best_size = size
+                    best = node
+                return size
+            if isinstance(node, dict):
+                size = 2 + max(0, len(node) - 1)  # braces + separators
+                for key, val in node.items():
+                    size += len(str(key)) + 3 + estimate_size(val)  # "key":
+                return size
+            if isinstance(node, str):
+                return len(node) + 2  # quotes
+            if isinstance(node, bool):
+                return 4 if node else 5
+            if node is None:
+                return 4
+            return len(str(node))
 
-        walk(obj)
+        estimate_size(obj)
         return best

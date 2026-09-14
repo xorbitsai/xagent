@@ -516,3 +516,54 @@ def test_json_truncation_root_level_list():
     assert isinstance(parsed, list)
     assert len(parsed) < 200
     assert TRUNCATED_ITEMS_MESSAGE in parsed[-1]
+
+
+def _deeply_nested_list(depth: int) -> str:
+    """A JSON array nested `depth` levels deep: [[[...["leaf"]...]]]."""
+    obj: list = ["leaf"]
+    for _ in range(depth):
+        obj = [obj]
+    return json.dumps(obj)
+
+
+def test_json_truncation_falls_back_gracefully_on_deep_nesting():
+    """Nesting deep enough to risk a RecursionError while walking/re-serializing
+    the parsed structure must fall back to raw slicing, not crash the filter."""
+    payload = _deeply_nested_list(depth=3000)
+    filter = _create_filter(max_chars=10)
+
+    result = filter.filter(payload, "test_tool")
+
+    # Must not raise, and must still fall back to the safe raw-slice path.
+    assert result.endswith(DEFAULT_TRUNCATION_MESSAGE)
+
+
+def test_find_largest_list_is_linear_not_quadratic_in_nesting_depth():
+    """`_find_largest_list` must not re-serialize (json.dumps) whole subtrees
+    at every nesting level - that makes it quadratic (or worse) for JSON with
+    several levels of nesting, which real hierarchical API responses can have."""
+    import time
+
+    def build_chain(levels: int, pad_per_level: int) -> dict:
+        obj = {"pad": list(range(pad_per_level))}
+        node = obj
+        for _ in range(levels):
+            inner = {"pad": list(range(pad_per_level))}
+            node["child"] = [inner]
+            node = inner
+        return obj
+
+    filter = _create_filter()
+    timings = []
+    for levels in (100, 200, 400):
+        parsed = json.loads(json.dumps(build_chain(levels, pad_per_level=2000)))
+        start = time.perf_counter()
+        filter._find_largest_list(parsed)
+        timings.append(time.perf_counter() - start)
+
+    # Quadratic scaling would roughly 4x the time when levels double twice in
+    # a row (~16x total); linear scaling roughly doubles each time. Allow
+    # generous slack for timing noise while still catching an O(N^2) regression.
+    assert timings[2] < timings[0] * 8, (
+        f"_find_largest_list scaled superlinearly with nesting depth: {timings}"
+    )

@@ -2026,7 +2026,12 @@ def google_calendar_update_events(
         # empty regardless of timezone precision (both sides of that
         # comparison fall back to the same assumption consistently), so
         # that case alone still doesn't need the real zone.
-        needs_real_calendar_timezone = existing_is_all_day and (
+        has_all_day_conflict_boundary = (
+            existing_is_all_day
+            or resulting_start_is_all_day
+            or resulting_end_is_all_day
+        )
+        needs_real_calendar_timezone = has_all_day_conflict_boundary and (
             bool(start_time)
             or bool(end_time)
             or bool(attendees_to_check)

@@ -7805,6 +7805,30 @@ def test_update_events_converts_a_timed_event_to_all_day_when_both_are_provided(
     assert kwargs["body"]["end"] == {"date": "2026-08-28"}
 
 
+def test_timed_to_all_day_conversion_checks_the_calendar_timezone(fake_service):
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-26T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-26T10:00:00+08:00"},
+    }
+    fake_service._events._list_result = {"items": []}
+    fake_service._calendars = FakeCalendars(timezone="Asia/Singapore")
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-27",
+            end_time="2026-08-28",
+        )
+    )
+
+    assert result["status"] == "success"
+    assert fake_service._calendars.get_calls
+    conflict_query = fake_service._events.list_calls[0]
+    assert conflict_query["timeMin"] == "2026-08-27T00:00:00+08:00"
+    assert conflict_query["timeMax"] == "2026-08-28T00:00:00+08:00"
+
+
 @pytest.mark.parametrize("all_day", [False, True])
 @pytest.mark.parametrize("replacement", [None, "FREQ=DAILY;COUNT=3"])
 @pytest.mark.parametrize("property_name", ["EXDATE", "RDATE", "EXRULE"])

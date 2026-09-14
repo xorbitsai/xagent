@@ -1531,8 +1531,11 @@ class CollectionInfo(BaseModel):
             }
         )
 
-        # Serialize complex types to JSON strings for LanceDB
-        data["extra_metadata"] = json.dumps(data["extra_metadata"])
+        # Serialize complex types to JSON strings for LanceDB. extra_metadata is
+        # caller-supplied and untyped (Dict[str, Any]), so default=str is the
+        # fallback for values json.dumps() can't otherwise serialize (e.g. an
+        # Enum, datetime, or UUID a caller stuffed in there).
+        data["extra_metadata"] = json.dumps(data["extra_metadata"], default=str)
         data["document_names"] = json.dumps(data["document_names"])
         # Do not persist owners; they are computed from user_id when listing
         data["owners"] = "[]"

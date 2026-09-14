@@ -1467,6 +1467,33 @@ class TestCollectionInfo:
             == collection.ingestion_config
         )
 
+    def test_collection_info_to_storage_serializes_non_json_native_extra_metadata(self):
+        """extra_metadata is a caller-supplied, untyped dict; a non-JSON-native
+        value in it (e.g. an Enum) must not break to_storage().
+
+        Regression test: extra_metadata was serialized with a plain
+        json.dumps(data["extra_metadata"]) call, so any caller-supplied value
+        without a native JSON representation raised the same
+        "Object of type X is not JSON serializable" TypeError that
+        ingestion_config raised before it was fixed.
+        """
+        collection = CollectionInfo(
+            name="test_collection",
+            extra_metadata={"source_parse_method": ParseMethod.PYMUPDF},
+        )
+
+        storage_data = collection.to_storage()
+
+        assert isinstance(storage_data["extra_metadata"], str)
+        stored_metadata = json.loads(storage_data["extra_metadata"])
+        assert stored_metadata["source_parse_method"] == "pymupdf"
+
+        # The write is only useful if reading it back reconstructs the same
+        # dict, not just valid-looking JSON.
+        assert CollectionInfo.from_storage(storage_data).extra_metadata == {
+            "source_parse_method": "pymupdf"
+        }
+
     def test_collection_info_immutability_by_default(self):
         """Test that CollectionInfo is immutable by default after creation."""
         collection = CollectionInfo(name="test")

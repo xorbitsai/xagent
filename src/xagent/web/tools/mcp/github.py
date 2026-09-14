@@ -133,22 +133,21 @@ def _encode_file_path_segment(value: str, *, field: str) -> str:
     return quote(value, safe="")
 
 
-def _encode_file_path(path: str, *, field: str = "path") -> str:
-    """Percent-encode a '/'-separated value for direct interpolation into a
-    request URL ("" for the repo root).
+def _encode_file_path(path: str) -> str:
+    """Percent-encode a repo-relative file path for direct interpolation
+    into a request URL ("" for the repo root).
 
-    Unlike a value sent as a query param (which requests percent-encodes
+    Unlike a path sent as a query param (which requests percent-encodes
     regardless of content), an interpolated one is validated/encoded per
     segment via _encode_file_path_segment: legitimate filename characters
     like '?'/'#' are allowed (percent-encoded away rather than reaching the
     URL raw), while an empty segment (from a leading/trailing/double slash)
-    and dot-segments are rejected. Also reused by _validate_branch_name for
-    the same per-segment check on a branch name, hence the `field` override.
+    and dot-segments are rejected.
     """
     if not path:
         return ""
     return "/".join(
-        _encode_file_path_segment(segment, field=field) for segment in path.split("/")
+        _encode_file_path_segment(segment, field="path") for segment in path.split("/")
     )
 
 
@@ -1415,7 +1414,10 @@ def github_create_or_update_file(
         # named path -- e.g. " README.md" creates a stray file next to the
         # intended one instead of updating it.
         path = _require_nonblank(path, field="path").strip()
-        message = _require_nonblank(message, field="message")
+        # .strip() for the same reason path is stripped above: an unstripped
+        # message would otherwise bake a stray leading/trailing space into
+        # the commit shown in `git log` and GitHub's UI.
+        message = _require_nonblank(message, field="message").strip()
         if content_encoding not in _CONTENT_ENCODINGS:
             raise ValueError(
                 f"content_encoding must be one of {sorted(_CONTENT_ENCODINGS)!r}, "

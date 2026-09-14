@@ -3466,6 +3466,27 @@ def test_create_or_update_file_strips_padded_path(monkeypatch):
     assert mock_request.call_args.kwargs["url"].endswith("/contents/test.txt")
 
 
+def test_create_or_update_file_strips_padded_message(monkeypatch):
+    """Same class of surprise as the path strip above, applied to the
+    commit message: an unstripped value would otherwise bake a stray
+    leading/trailing space into the commit shown in `git log`."""
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={"content": {}, "commit": {}}, status_code=201
+        )
+    )
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    result = json.loads(
+        github.github_create_or_update_file(
+            "octocat/Hello-World", "a.txt", "x", "  chore: ship\n"
+        )
+    )
+
+    assert result["status"] == "success"
+    assert mock_request.call_args.kwargs["json"]["message"] == "chore: ship"
+
+
 def test_create_or_update_file_sends_base64_content_and_reports_created(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(

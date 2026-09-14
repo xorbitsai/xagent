@@ -513,6 +513,7 @@ def test_update_event_recurring_schedule_requires_exception_risk_acknowledgement
     assert result["status"] == "error"
     assert "cannot atomically check instance exceptions" in result["message"]
     assert "acknowledge_recurring_exception_risk=True" in result["message"]
+    assert "retained EXDATE/RDATE/EXRULE values" in result["message"]
     service.events.return_value.update.assert_not_called()
 
 
@@ -2702,7 +2703,7 @@ class FakeEvents:
         return _Exec(self._list_result)
 
     def get(self, **kwargs: Any) -> _Exec:
-        return _Exec(self._get_result)
+        return _Exec(copy.deepcopy(self._get_result))
 
     def insert(self, **kwargs: Any) -> _Exec:
         self.insert_calls.append(kwargs)
@@ -5668,6 +5669,7 @@ def test_update_events_matches_semantically_equivalent_exception_timezone_alias(
 def test_timezone_name_comparison_falls_back_conservatively_for_opaque_names():
     assert calendar._timezone_names_equal("Custom/Zone", "custom/zone")
     assert not calendar._timezone_names_equal("Custom/Zone", "UTC")
+    assert not calendar._timezone_names_equal("Europe/Berlin", "Europe/Paris")
 
 
 def test_update_events_allows_metadata_update_on_mismatched_legacy_times(
@@ -5969,9 +5971,47 @@ def test_update_events_explicit_timezone_on_all_day_event_does_not_send_malforme
     )
 
     assert result["status"] == "success"
-    _, kwargs = service.events.return_value.update.call_args
-    assert kwargs["body"]["start"] == {"date": "2026-08-26"}
-    assert kwargs["body"]["end"] == {"date": "2026-08-27"}
+    service.events.return_value.update.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("dateTime", 12345, "start boundary must be a string"),
+        ("timeZone", 12345, "start.timeZone must be a string"),
+    ],
+)
+def test_update_events_rejects_non_string_stored_boundary_fields(
+    monkeypatch, field, value, message
+):
+    existing_event = {
+        "id": "existing-1",
+        "start": {
+            "dateTime": "2026-08-26T07:00:00",
+            "timeZone": "Asia/Shanghai",
+            field: value,
+        },
+        "end": {
+            "dateTime": "2026-08-26T08:00:00",
+            "timeZone": "Asia/Shanghai",
+        },
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-08-27T07:00:00",
+            end_time="2026-08-27T08:00:00",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert message in result["message"]
+    assert "has no attribute" not in result["message"]
+    service.events.return_value.update.assert_not_called()
 
 
 def test_update_events_explicit_timezone_overrides_existing_one_on_reschedule(
@@ -6286,6 +6326,33 @@ def test_update_events_rejects_a_timezone_conflicting_with_exception_tzid(
     assert result["status"] == "error"
     assert "conflicts with a TZID" in result["message"]
     service.events.return_value.update.assert_not_called()
+
+
+def test_update_events_validates_exception_tzid_before_conflict_checks(fake_service):
+    fake_service._events._get_result = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-09-01T09:00:00", "timeZone": "Asia/Shanghai"},
+        "end": {"dateTime": "2026-09-01T10:00:00", "timeZone": "Asia/Shanghai"},
+        "recurrence": [
+            "RRULE:FREQ=DAILY;COUNT=5",
+            "EXDATE;TZID=Asia/Shanghai:20260902T090000",
+        ],
+    }
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-09-02T09:00:00",
+            end_time="2026-09-02T10:00:00",
+            recurrence="FREQ=WEEKLY;COUNT=3",
+            timezone="UTC",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "conflicts with a TZID" in result["message"]
+    assert fake_service._events.list_calls == []
+    assert fake_service._events.update_calls == []
 
 
 def test_update_events_rejects_adding_timezone_with_floating_exception(monkeypatch):
@@ -7050,6 +7117,52 @@ def test_update_events_reschedules_an_already_recurring_event_with_a_naive_time_
     _, kwargs = service.events.return_value.update.call_args
     assert kwargs["body"]["start"]["timeZone"] == "Asia/Shanghai"
     assert kwargs["body"]["end"]["timeZone"] == "Asia/Shanghai"
+
+
+@pytest.mark.parametrize(
+    ("zone", "start_time", "end_time"),
+    [
+        (
+            "Asia/Shanghai",
+            "2026-09-02T09:00:00+08:00",
+            "2026-09-02T10:00:00+08:00",
+        ),
+        (
+            "America/Los_Angeles",
+            "2026-03-08T03:30:00-07:00",
+            "2026-03-08T04:30:00-07:00",
+        ),
+    ],
+)
+def test_update_events_reuses_matching_zone_for_offset_recurring_reschedule(
+    monkeypatch, zone, start_time, end_time
+):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-03-01T09:00:00-08:00", "timeZone": zone},
+        "end": {"dateTime": "2026-03-01T10:00:00-08:00", "timeZone": zone},
+        "recurrence": ["RRULE:FREQ=DAILY;COUNT=10"],
+    }
+    if zone == "Asia/Shanghai":
+        existing_event["start"]["dateTime"] = "2026-09-01T09:00:00+08:00"
+        existing_event["end"]["dateTime"] = "2026-09-01T10:00:00+08:00"
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time=start_time,
+            end_time=end_time,
+            ignore_conflicts=True,
+            acknowledge_recurring_exception_risk=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    body = service.events.return_value.update.call_args.kwargs["body"]
+    assert body["start"] == {"dateTime": start_time, "timeZone": zone}
+    assert body["end"] == {"dateTime": end_time, "timeZone": zone}
 
 
 def test_update_events_reschedules_an_already_recurring_event_with_an_explicit_timezone(

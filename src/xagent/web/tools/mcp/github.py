@@ -1161,7 +1161,12 @@ def github_create_branch(repo: str, branch: str, from_ref: str = "") -> str:
         if from_ref.strip():
             source = _validate_branch_name(from_ref, field="from_ref")
         else:
-            repository = _request("GET", f"/repos/{owner}/{name}")
+            try:
+                repository = _request("GET", f"/repos/{owner}/{name}")
+            except _GitHubAPIError as exc:
+                if exc.status_code == 404:
+                    return _error(f"{exc} -- repository '{repo}' not found")
+                raise
             _require_object(repository, context=f"repository '{repo}'")
             source = repository.get("default_branch")
             if not isinstance(source, str) or not source:

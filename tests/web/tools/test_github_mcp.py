@@ -3387,6 +3387,22 @@ def test_create_branch_reports_404_on_missing_ref_with_hint(monkeypatch):
     assert mock_request.call_count == 1
 
 
+def test_create_branch_reports_404_on_missing_repo_with_hint(monkeypatch):
+    """The default-branch lookup (from_ref omitted) is a separate GET from
+    the ref lookup covered above -- pin its own 404 handling."""
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"message": "Not Found"}, status_code=404)
+    )
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    result = json.loads(github.github_create_branch("octocat/Hello-World", "feature"))
+
+    assert result["status"] == "error"
+    assert "Not Found" in result["message"]
+    assert "octocat/Hello-World" in result["message"]
+    assert mock_request.call_count == 1
+
+
 def test_create_branch_rejects_missing_default_branch(monkeypatch):
     mock_request = Mock(return_value=MockResponse(json_data={"full_name": "x/y"}))
     monkeypatch.setattr(github.requests, "request", mock_request)

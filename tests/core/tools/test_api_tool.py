@@ -111,6 +111,25 @@ class TestHasAuthCredentials:
             "https://api.hubapi.com/x", None, None, "not-a-real-mode", "tok"
         )
 
+    def test_false_for_auth_type_with_no_auth_token(self):
+        """Regression: str(None) is the non-empty text "None", so a naive
+        blankness check on auth_token=None (auth_type set, auth_token
+        omitted - e.g. the caller forgot it) would wrongly read as "present".
+        _prepare_headers requires both fields truthy, so this combination
+        sends no real credential and must not count as one here either."""
+        assert not has_auth_credentials(
+            "https://api.hubapi.com/x", None, None, "bearer", None
+        )
+
+    def test_false_for_none_valued_query_param(self):
+        """Same root cause as test_false_for_auth_type_with_no_auth_token,
+        different call site: params={"api_key": None} is valid input per
+        APICallArgs' Optional[Dict[str, Any]] typing (pydantic allows a null
+        value), and must not be misread as a present credential."""
+        assert not has_auth_credentials(
+            "https://api.hubapi.com/x", None, {"api_key": None}, None, None
+        )
+
     def test_true_for_authorization_header(self):
         assert has_auth_credentials(
             "https://api.hubapi.com/x",
@@ -283,12 +302,20 @@ def mock_httpbin(monkeypatch: pytest.MonkeyPatch) -> None:
             status_code = 404
             body = {}
 
+        # A "__redirected_to__" query param lets a test simulate httpx
+        # having followed a cross-host redirect before landing on this
+        # response - the real _make_request reports response.url (the
+        # final, post-redirect URL) here, which can differ from the
+        # request's starting url.
+        final_url = _single_value_query_args(url).get("__redirected_to__", url)
+
         return {
             "success": 200 <= status_code < 300,
             "status_code": status_code,
             "headers": {"content-type": "application/json"},
             "body": body,
             "error": None if 200 <= status_code < 300 else f"HTTP {status_code}",
+            "final_url": final_url,
         }
 
     monkeypatch.setattr(APIClientCore, "_make_request", mock_make_request)
@@ -688,15 +715,65 @@ class TestAPITool:
         assert "HubSpot" in result["error"]
 
     @pytest.mark.asyncio
+    async def test_annotates_based_on_the_post_redirect_host_not_the_original(
+        self, mock_httpbin: None
+    ):
+        """Regression: allow_redirects defaults to True, so the response
+        that actually comes back can be from a different host than the URL
+        the caller started with. A request that starts on an unrelated host
+        and redirects to a known connector domain, which then 401s, must
+        still get the hint - matching against the original URL's host
+        (unrelated here) would silently miss it."""
+        tool = APITool()
+        result = await tool.run_json_async(
+            {
+                "url": "https://httpbin.org/status/401"
+                "?__redirected_to__=https://api.hubapi.com/crm/v3/deals/1"
+            }
+        )
+
+        assert "HubSpot" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_does_not_annotate_when_redirected_off_a_known_connector_host(
+        self, mock_httpbin: None
+    ):
+        """Symmetric regression: a request starting on a known connector
+        host that redirects OFF that host to an unrelated 401 must not get
+        a hint naming the original (wrong) service."""
+        tool = APITool()
+        result = await tool.run_json_async(
+            {
+                "url": "https://api.github.com/status/401"
+                "?__redirected_to__=https://httpbin.org/status/401"
+            }
+        )
+
+        assert "connector tools" not in (result.get("error") or "")
+
+    @pytest.mark.asyncio
+    async def test_hint_does_not_produce_a_run_on_sentence(self, mock_httpbin: None):
+        """The existing error text ("HTTP 401") has no trailing punctuation,
+        so appending the hint sentence directly after it would otherwise
+        read as one run-on sentence - a period must be inserted between
+        them."""
+        tool = APITool()
+        result = await tool.run_json_async({"url": "https://api.hubapi.com/status/401"})
+
+        assert result["error"].startswith("HTTP 401. This looks like")
+
+    @pytest.mark.asyncio
     async def test_malformed_url_does_not_crash(self):
         """A malformed URL (invalid IPv6 host syntax) must still come back
-        as a normal structured result - not an uncaught exception - even
-        though extracting a hostname for the connector-hint check can raise
-        ValueError on this input."""
+        as a normal structured result - not an uncaught exception. This URL
+        fails core's own validation (_is_valid_url) before a real request is
+        ever attempted, so status_code is 0 and the connector-hint check
+        never runs at all."""
         tool = APITool()
         result = await tool.run_json_async({"url": "https://[::1"})
 
         assert result["success"] is False
+        assert result["status_code"] == 0
         assert isinstance(result.get("error"), str)
 
     @pytest.mark.asyncio

@@ -12,8 +12,8 @@ from pydantic import BaseModel, Field
 
 from ...core.api_tool import (
     APIClientCore,
+    append_known_connector_domain_hint,
     has_auth_credentials,
-    known_connector_domain_hint,
     match_known_connector_domain,
 )
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
@@ -146,13 +146,22 @@ class APITool(AbstractBaseTool):
         what status_code/body it got, so a public, credential-less endpoint
         on the same host that returns 2xx is entirely unaffected.
         """
-        try:
-            hostname = urlparse(api_args.url).hostname or ""
-        except ValueError:
-            return
-        connector_label = match_known_connector_domain(hostname)
+        # The domain that actually produced this response - not necessarily
+        # api_args.url's host, if a redirect crossed hosts along the way
+        # (allow_redirects defaults to True). call_api's only path to a real
+        # 401/403 always populates final_url from the real response, so this
+        # is never missing here in practice; api_args.url is kept only as a
+        # defensive fallback, not because it's expected to be used.
+        response_url = result.get("final_url") or api_args.url
+        connector_label = match_known_connector_domain(
+            urlparse(response_url).hostname or ""
+        )
         if not connector_label:
             return
+        # Whether the CALLER attached a credential is about what they
+        # supplied, not about where the response ended up - deliberately
+        # still checked against api_args (the original request), including
+        # for Basic-Auth userinfo embedded in the URL the caller wrote.
         if has_auth_credentials(
             api_args.url,
             api_args.headers,
@@ -161,8 +170,9 @@ class APITool(AbstractBaseTool):
             api_args.auth_token,
         ):
             return
-        hint = known_connector_domain_hint(connector_label)
-        result["error"] = f"{result.get('error') or ''}{hint}"
+        result["error"] = append_known_connector_domain_hint(
+            result.get("error"), connector_label
+        )
         logger.info(
             f"ℹ️ API Call {api_args.method} {api_args.url} got "
             f"{result['status_code']} with no recognized credential - "

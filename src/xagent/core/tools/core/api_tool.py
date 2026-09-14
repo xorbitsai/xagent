@@ -86,9 +86,20 @@ _SELF_AUTHENTICATING_SUBDOMAINS = frozenset({"hooks.slack.com"})
 
 
 def _hostname_matches_connector_domain(hostname: str, domain: str) -> bool:
-    hostname = hostname.lower()
-    domain = domain.lower()
-    return hostname == domain or hostname.endswith(f".{domain}")
+    # Deferred import: xagent.web.oauth_provider_quirks.host_matches_suffix
+    # is the one shared implementation of "exact host or dot-anchored
+    # subdomain" (its own docstring says so, and auth.py's Deputy/Employment
+    # Hero endpoint checks already use it) - reusing it here instead of a
+    # second copy avoids the two silently diverging, which already happened
+    # once (this module's trailing-dot handling lives in the caller,
+    # match_known_connector_domain, not duplicated into this function).
+    # core doesn't import from web at module load time elsewhere in this
+    # codebase (see e.g. workspace.py's deferred `from ..web...` imports),
+    # so this follows that same lazy-import precedent rather than adding a
+    # new top-level core->web dependency.
+    from ....web.oauth_provider_quirks import host_matches_suffix
+
+    return host_matches_suffix(hostname.lower(), domain.lower())
 
 
 def match_known_connector_domain(hostname: str) -> Optional[str]:
@@ -142,6 +153,12 @@ _EFFECTIVE_AUTH_TYPES = frozenset({"bearer", "basic", "api_key", "api_key_query"
 
 
 def _is_blank(value: Any) -> bool:
+    # str(None) is the non-empty text "None", so None must be special-cased
+    # here rather than folded into the str(value).strip() check below - every
+    # caller treats "blank" as "nothing was actually provided", and every one
+    # of these Optional fields defaults to None when the caller omits it.
+    if value is None:
+        return True
     return not str(value).strip()
 
 
@@ -216,21 +233,43 @@ def has_auth_credentials(
 
 
 def known_connector_domain_hint(connector_label: str) -> str:
-    """Text appended to an ALREADY-received 401/403 from a domain covered by
-    a dedicated MCP connector, when the request carried no credential this
-    tool recognizes (see has_auth_credentials). Purely informational - it
-    never gates whether the request is made; a public, credential-less
-    endpoint on the same host (e.g. GitHub's public repo reads) still
-    succeeds normally and never sees this text.
+    """A self-contained sentence (no leading/trailing whitespace) appended to
+    an ALREADY-received 401/403 from a domain covered by a dedicated MCP
+    connector, when the request carried no credential this tool recognizes
+    (see has_auth_credentials). Purely informational - it never gates
+    whether the request is made; a public, credential-less endpoint on the
+    same host (e.g. GitHub's public repo reads) still succeeds normally and
+    never sees this text. Callers append it after existing error text - see
+    append_known_connector_domain_hint, which handles the punctuation/
+    spacing needed to avoid a run-on sentence.
     """
     return (
-        f" This looks like a {connector_label} API endpoint with no "
+        f"This looks like a {connector_label} API endpoint with no "
         f"credential attached, which explains a 401/403 here - if the "
         f"dedicated {connector_label} connector tools cover this request, "
         "prefer those (they carry the account's own OAuth credential); "
         "this generic api_call tool needs its own via auth_type/auth_token, "
         "a credential header, or a credential query parameter."
     )
+
+
+def append_known_connector_domain_hint(
+    existing_error: Optional[str], connector_label: str
+) -> str:
+    """Combine `existing_error` (e.g. "HTTP 401", or the size-limit error
+    text `_make_request` also uses on a 401/403) with
+    `known_connector_domain_hint`'s sentence, adding a period + space
+    between them when `existing_error` doesn't already end in sentence
+    punctuation - otherwise the two read as one run-on sentence (e.g.
+    "...download aborted This looks like a HubSpot API endpoint...").
+    """
+    hint = known_connector_domain_hint(connector_label)
+    existing_error = (existing_error or "").strip()
+    if not existing_error:
+        return hint
+    if existing_error[-1] not in ".!?":
+        existing_error += "."
+    return f"{existing_error} {hint}"
 
 
 class APIClientCore:
@@ -417,6 +456,10 @@ class APIClientCore:
                             "headers": dict(response.headers),
                             "body": None,
                             "error": f"Response too large (exceeds {self.max_response_size} bytes), download aborted",
+                            # The URL that actually produced this response,
+                            # which can differ from the request's starting
+                            # URL after a redirect - see final_url below.
+                            "final_url": str(response.url),
                         }
                     content_chunks.append(chunk)
 
@@ -435,6 +478,14 @@ class APIClientCore:
                     "error": None
                     if 200 <= response.status_code < 300
                     else f"HTTP {response.status_code}",
+                    # Internal-only field (not part of APICallResult's public
+                    # schema - callers use dict.get so an extra key is
+                    # harmless). httpx.Response.url is the URL of the final
+                    # request in the redirect chain, which can be a
+                    # different host than the one the caller originally
+                    # asked for; api_call's known-connector-domain hint
+                    # needs this to know which host actually answered.
+                    "final_url": str(response.url),
                 }
 
     def _is_valid_url(self, url: str) -> bool:

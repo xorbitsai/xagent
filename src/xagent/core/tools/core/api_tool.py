@@ -9,7 +9,7 @@ import json
 import logging
 import os
 from typing import Any, Dict, Mapping, Optional, Union
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import ParseResult, parse_qs, urlencode, urlparse
 
 import httpx
 
@@ -182,22 +182,23 @@ def _has_auth_header(headers: Optional[Mapping[str, str]]) -> bool:
     return False
 
 
-def _has_auth_query_param(url: str, params: Optional[Mapping[str, Any]]) -> bool:
+def _has_auth_query_param(
+    parsed_url: ParseResult, params: Optional[Mapping[str, Any]]
+) -> bool:
     if params:
         for key, value in params.items():
             if str(key).lower() in _AUTH_QUERY_PARAM_NAMES and not _is_blank(value):
                 return True
     # parse_qs defaults to keep_blank_values=False, so a blank value here
     # (e.g. "?key=") is already dropped for us - nothing extra to check.
-    query_keys = {key.lower() for key in parse_qs(urlparse(url).query)}
+    query_keys = {key.lower() for key in parse_qs(parsed_url.query)}
     return not _AUTH_QUERY_PARAM_NAMES.isdisjoint(query_keys)
 
 
-def _has_url_embedded_credentials(url: str) -> bool:
-    """Whether ``url`` carries HTTP Basic-Auth userinfo (``user:pass@host``)
+def _has_url_embedded_credentials(parsed_url: ParseResult) -> bool:
+    """Whether the URL carries HTTP Basic-Auth userinfo (``user:pass@host``)
     directly, rather than in a header or query parameter."""
-    parsed = urlparse(url)
-    return bool(parsed.username or parsed.password)
+    return bool(parsed_url.username or parsed_url.password)
 
 
 def has_auth_credentials(
@@ -224,11 +225,12 @@ def has_auth_credentials(
     block a request outright: worst case here is a missed hint, not a
     request that should have succeeded being refused.
     """
+    parsed_url = urlparse(url)
     return bool(
         _has_effective_auth_token(auth_type, auth_token)
         or _has_auth_header(headers)
-        or _has_auth_query_param(url, params)
-        or _has_url_embedded_credentials(url)
+        or _has_auth_query_param(parsed_url, params)
+        or _has_url_embedded_credentials(parsed_url)
     )
 
 

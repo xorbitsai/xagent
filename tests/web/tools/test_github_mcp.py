@@ -3156,6 +3156,10 @@ def test_tool_returns_error_payload_on_missing_token(monkeypatch):
         lambda: github.github_search_repositories("stars:>1"),
         lambda: github.github_get_file_contents("octocat/Hello-World", "README.md"),
         lambda: github.github_list_issues("octocat/Hello-World"),
+        lambda: github.github_create_branch("octocat/Hello-World", "feature", "main"),
+        lambda: github.github_create_or_update_file(
+            "octocat/Hello-World", "README.md", "hi", "docs: update"
+        ),
     ],
     ids=[
         "get_repository",
@@ -3168,14 +3172,15 @@ def test_tool_returns_error_payload_on_missing_token(monkeypatch):
         "search_repositories",
         "get_file_contents",
         "list_issues",
+        "create_branch",
+        "create_or_update_file",
     ],
 )
 def test_tool_wrapper_surfaces_error_response(monkeypatch, call):
-    """Each of these 10 tools previously had no test driving a GitHub error
-    response through the tool wrapper itself (only through the shared
-    _request/_request_raw helpers directly) -- pin that every one reports
-    status: "error" with the upstream message, not an unhandled exception
-    or a silently-swallowed failure."""
+    """Drive a GitHub error response through each tool wrapper itself (not
+    only through the shared _request/_request_raw helpers) -- pin that every
+    one reports status: "error" with the upstream message, not an unhandled
+    exception or a silently-swallowed failure."""
     monkeypatch.setattr(
         github.requests,
         "request",
@@ -3190,3 +3195,558 @@ def test_tool_wrapper_surfaces_error_response(monkeypatch, call):
 
     assert result["status"] == "error"
     assert "Service Unavailable" in result["message"]
+
+
+def test_create_branch_resolves_default_branch_and_posts_ref(monkeypatch):
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data={"default_branch": "main"}),
+            MockResponse(json_data={"object": {"sha": "a" * 40}}),
+            MockResponse(
+                json_data={"ref": "refs/heads/feature", "object": {"sha": "a" * 40}},
+                status_code=201,
+            ),
+        ]
+    )
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    result = json.loads(github.github_create_branch("octocat/Hello-World", "feature"))
+
+    assert result["status"] == "success"
+    assert result["branch"] == "feature"
+    assert result["from_ref"] == "main"
+    assert result["sha"] == "a" * 40
+    calls = mock_request.call_args_list
+    assert [c.kwargs["method"] for c in calls] == ["GET", "GET", "POST"]
+    assert calls[0].kwargs["url"].endswith("/repos/octocat/Hello-World")
+    assert (
+        calls[1].kwargs["url"].endswith("/repos/octocat/Hello-World/git/ref/heads/main")
+    )
+    assert calls[2].kwargs["url"].endswith("/repos/octocat/Hello-World/git/refs")
+    assert calls[2].kwargs["json"] == {"ref": "refs/heads/feature", "sha": "a" * 40}
+
+
+def test_create_branch_uses_explicit_from_ref_without_repo_lookup(monkeypatch):
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data={"object": {"sha": "b" * 40}}),
+            MockResponse(
+                json_data={"ref": "refs/heads/hotfix/x", "object": {"sha": "b" * 40}},
+                status_code=201,
+            ),
+        ]
+    )
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    result = json.loads(
+        github.github_create_branch("octocat/Hello-World", "hotfix/x", "release/v1")
+    )
+
+    assert result["status"] == "success"
+    assert result["from_ref"] == "release/v1"
+    calls = mock_request.call_args_list
+    assert len(calls) == 2
+    assert calls[0].kwargs["url"].endswith("/git/ref/heads/release/v1")
+    assert calls[1].kwargs["json"]["ref"] == "refs/heads/hotfix/x"
+
+
+def test_create_branch_rejects_invalid_from_ref(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    result = json.loads(
+        github.github_create_branch("octocat/Hello-World", "x", "release/v1 rc")
+    )
+
+    assert result["status"] == "error"
+    assert "from_ref" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_create_branch_percent_encodes_from_ref_with_reserved_chars(monkeypatch):
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data={"object": {"sha": "c" * 40}}),
+            MockResponse(
+                json_data={"ref": "refs/heads/x", "object": {}}, status_code=201
+            ),
+        ]
+    )
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    result = json.loads(
+        github.github_create_branch("octocat/Hello-World", "x", "release/v1+rc")
+    )
+
+    assert result["status"] == "success"
+    url = mock_request.call_args_list[0].kwargs["url"]
+    assert url.endswith("/git/ref/heads/release/v1%2Brc")
+
+
+@pytest.mark.parametrize(
+    "branch",
+    [
+        "",
+        "   ",
+        "refs/heads/feature",
+        "/leading",
+        "trailing/",
+        "a//b",
+        "..",
+        "a/../b",
+        "has space",
+        "a?b",
+        "a#b",
+        "a:b",
+        "a~b",
+        "a^b",
+        "a*b",
+        "a[b",
+        "a\\b",
+        "a.lock",
+        "a/b.lock",
+        "a@{b",
+        "@",
+        "a..b",
+        ".hidden",
+        "a/.hidden",
+        "trailing.",
+        "a/trailing.",
+        "a\x01b",
+        "a\x7fb",
+    ],
+)
+def test_create_branch_rejects_invalid_branch_names(monkeypatch, branch):
+    mock_request = Mock()
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    result = json.loads(
+        github.github_create_branch("octocat/Hello-World", branch, "main")
+    )
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
+def test_create_branch_reports_existing_branch_with_hint(monkeypatch):
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data={"object": {"sha": "d" * 40}}),
+            MockResponse(
+                json_data={"message": "Reference already exists"}, status_code=409
+            ),
+        ]
+    )
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    result = json.loads(
+        github.github_create_branch("octocat/Hello-World", "feature", "main")
+    )
+
+    assert result["status"] == "error"
+    assert "Reference already exists" in result["message"]
+    assert "github_create_or_update_file" in result["message"]
+
+
+def test_create_branch_surfaces_unrelated_422_without_hint(monkeypatch):
+    """A 422 (validation failure, distinct from a 409 existing-ref conflict)
+    must not be mistaken for "branch already exists" just because a real
+    422 can occur on this same endpoint (e.g. an abusive/spammy request)."""
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data={"object": {"sha": "d" * 40}}),
+            MockResponse(json_data={"message": "Validation Failed"}, status_code=422),
+        ]
+    )
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    result = json.loads(
+        github.github_create_branch("octocat/Hello-World", "feature", "main")
+    )
+
+    assert result["status"] == "error"
+    assert result["message"] == "Validation Failed"
+
+
+def test_create_branch_rejects_missing_default_branch(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"full_name": "x/y"}))
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    result = json.loads(github.github_create_branch("octocat/Hello-World", "feature"))
+
+    assert result["status"] == "error"
+    assert "default branch" in result["message"]
+    assert mock_request.call_count == 1
+
+
+def test_create_branch_rejects_missing_source_sha(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"object": {}}))
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    result = json.loads(
+        github.github_create_branch("octocat/Hello-World", "feature", "main")
+    )
+
+    assert result["status"] == "error"
+    assert "no commit sha" in result["message"]
+    assert mock_request.call_count == 1
+
+
+def test_create_branch_rejects_non_object_response(monkeypatch):
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data={"object": {"sha": "e" * 40}}),
+            MockResponse(json_data=[], status_code=201),
+        ]
+    )
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    result = json.loads(
+        github.github_create_branch("octocat/Hello-World", "feature", "main")
+    )
+
+    assert result["status"] == "error"
+    assert "non-object value" in result["message"]
+
+
+def test_create_or_update_file_strips_padded_path(monkeypatch):
+    """A path with incidental leading/trailing whitespace (easy for an LLM
+    caller to emit) must resolve to the real file, not a differently-named
+    stray one -- _require_nonblank alone doesn't strip, so this would
+    otherwise create " test.txt" next to the intended "test.txt"."""
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={"content": {"path": "test.txt"}, "commit": {}}, status_code=201
+        )
+    )
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    result = json.loads(
+        github.github_create_or_update_file(
+            "octocat/Hello-World", "  test.txt\n", "x", "msg"
+        )
+    )
+
+    assert result["status"] == "success"
+    assert mock_request.call_args.kwargs["url"].endswith("/contents/test.txt")
+
+
+def test_create_or_update_file_sends_base64_content_and_reports_created(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={
+                "content": {
+                    "path": "docs/README.md",
+                    "sha": "f" * 40,
+                    "html_url": "https://github.com/octocat/Hello-World/blob/main/docs/README.md",
+                },
+                "commit": {
+                    "sha": "0" * 40,
+                    "html_url": "https://github.com/octocat/Hello-World/commit/000",
+                },
+            },
+            status_code=201,
+        )
+    )
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    result = json.loads(
+        github.github_create_or_update_file(
+            "octocat/Hello-World", "docs/README.md", "Production Ready\n", "docs: ship"
+        )
+    )
+
+    assert result["status"] == "success"
+    assert result["action"] == "created"
+    assert result["path"] == "docs/README.md"
+    assert result["content_sha"] == "f" * 40
+    assert result["commit_sha"] == "0" * 40
+    assert result["branch"] is None
+    kwargs = mock_request.call_args.kwargs
+    assert kwargs["method"] == "PUT"
+    assert kwargs["url"].endswith("/repos/octocat/Hello-World/contents/docs/README.md")
+    assert kwargs["json"] == {
+        "message": "docs: ship",
+        "content": base64.b64encode(b"Production Ready\n").decode("ascii"),
+    }
+
+
+def test_create_or_update_file_reports_updated_with_sha_and_branch(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={"content": {"path": "test.txt", "sha": "1" * 40}, "commit": {}},
+            status_code=200,
+        )
+    )
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    result = json.loads(
+        github.github_create_or_update_file(
+            "octocat/Hello-World",
+            "test.txt",
+            "Production Ready",
+            "chore: mark ready",
+            branch="release/v1",
+            sha=" " + "9" * 40 + " ",
+        )
+    )
+
+    assert result["status"] == "success"
+    assert result["action"] == "updated"
+    assert result["branch"] == "release/v1"
+    sent = mock_request.call_args.kwargs["json"]
+    assert sent["branch"] == "release/v1"
+    assert sent["sha"] == "9" * 40
+    assert sent["content"] == base64.b64encode(b"Production Ready").decode("ascii")
+
+
+def test_create_or_update_file_allows_empty_content(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={"content": {}, "commit": {}}, status_code=200
+        )
+    )
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    result = json.loads(
+        github.github_create_or_update_file(
+            "octocat/Hello-World", "empty.txt", "", "chore: truncate", sha="2" * 40
+        )
+    )
+
+    assert result["status"] == "success"
+    assert mock_request.call_args.kwargs["json"]["content"] == ""
+
+
+def test_create_or_update_file_normalizes_base64_input(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={"content": {}, "commit": {}}, status_code=201
+        )
+    )
+    monkeypatch.setattr(github.requests, "request", mock_request)
+    # "hello world", newline-wrapped the way GitHub emits base64 content.
+    wrapped = "aGVs\nbG8gd29y\nbGQ="
+
+    result = json.loads(
+        github.github_create_or_update_file(
+            "octocat/Hello-World",
+            "bin.dat",
+            wrapped,
+            "chore: add blob",
+            content_encoding="base64",
+        )
+    )
+
+    assert result["status"] == "success"
+    assert mock_request.call_args.kwargs["json"]["content"] == base64.b64encode(
+        b"hello world"
+    ).decode("ascii")
+
+
+@pytest.mark.parametrize("content", ["!!!!", "abc", "aGVsbG8"])
+def test_create_or_update_file_rejects_malformed_base64_input(monkeypatch, content):
+    mock_request = Mock()
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    result = json.loads(
+        github.github_create_or_update_file(
+            "octocat/Hello-World", "bin.dat", content, "msg", content_encoding="base64"
+        )
+    )
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
+def test_create_or_update_file_rejects_unknown_content_encoding(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    result = json.loads(
+        github.github_create_or_update_file(
+            "octocat/Hello-World", "a.txt", "x", "msg", content_encoding="latin-1"
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "content_encoding" in result["message"]
+    mock_request.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "path, message",
+    [
+        ("", "msg"),
+        ("   ", "msg"),
+        ("a.txt", ""),
+        ("a.txt", "   "),
+    ],
+)
+def test_create_or_update_file_rejects_blank_required_fields(
+    monkeypatch, path, message
+):
+    mock_request = Mock()
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    result = json.loads(
+        github.github_create_or_update_file("octocat/Hello-World", path, "x", message)
+    )
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "path", ["../secret", "a//b", "/leading", "trailing/", "a/./b"]
+)
+def test_create_or_update_file_rejects_malformed_path(monkeypatch, path):
+    mock_request = Mock()
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    result = json.loads(
+        github.github_create_or_update_file("octocat/Hello-World", path, "x", "msg")
+    )
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
+def test_create_or_update_file_rejects_invalid_branch_name(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    result = json.loads(
+        github.github_create_or_update_file(
+            "octocat/Hello-World", "a.txt", "x", "msg", branch="refs/heads/main"
+        )
+    )
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
+def test_create_or_update_file_percent_encodes_path_segments(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={"content": {}, "commit": {}}, status_code=201
+        )
+    )
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    result = json.loads(
+        github.github_create_or_update_file(
+            "octocat/Hello-World", "dir name/file#1?.txt", "x", "msg"
+        )
+    )
+
+    assert result["status"] == "success"
+    assert mock_request.call_args.kwargs["url"].endswith(
+        "/contents/dir%20name/file%231%3F.txt"
+    )
+
+
+def test_create_or_update_file_hints_when_sha_missing_for_existing_file(monkeypatch):
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={"message": 'Invalid request.\n\n"sha" wasn\'t supplied.'},
+                status_code=409,
+            )
+        ),
+    )
+
+    result = json.loads(
+        github.github_create_or_update_file(
+            "octocat/Hello-World", "test.txt", "x", "msg"
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "wasn't supplied" in result["message"]
+    assert "github_get_file_contents" in result["message"]
+
+
+def test_create_or_update_file_hints_when_sha_is_stale(monkeypatch):
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={"message": "test.txt does not match " + "3" * 40},
+                status_code=409,
+            )
+        ),
+    )
+
+    result = json.loads(
+        github.github_create_or_update_file(
+            "octocat/Hello-World", "test.txt", "x", "msg", sha="4" * 40
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "does not match" in result["message"]
+    assert "re-read" in result["message"]
+
+
+def test_create_or_update_file_surfaces_unrelated_github_error_without_hint(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={"message": "Not Found"}, status_code=404
+            )
+        ),
+    )
+
+    result = json.loads(
+        github.github_create_or_update_file("octocat/Hello-World", "a.txt", "x", "msg")
+    )
+
+    assert result["status"] == "error"
+    assert result["message"] == "Not Found"
+
+
+def test_create_or_update_file_rejects_non_object_response(monkeypatch):
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data=[], status_code=201)),
+    )
+
+    result = json.loads(
+        github.github_create_or_update_file("octocat/Hello-World", "a.txt", "x", "msg")
+    )
+
+    assert result["status"] == "error"
+    assert "non-object value" in result["message"]
+
+
+def test_create_or_update_file_never_retries_on_rate_limit(monkeypatch):
+    """A write rejected by a rate limit must not be replayed -- if the first
+    PUT did reach GitHub, a retry would commit twice."""
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={"message": "API rate limit exceeded"},
+            status_code=429,
+            headers={"Retry-After": "1"},
+        )
+    )
+    sleep_mock = Mock()
+    monkeypatch.setattr(github.requests, "request", mock_request)
+    monkeypatch.setattr(github, "_sleep", sleep_mock)
+
+    result = json.loads(
+        github.github_create_or_update_file("octocat/Hello-World", "a.txt", "x", "msg")
+    )
+
+    assert result["status"] == "error"
+    assert "rate limit" in result["message"]
+    assert mock_request.call_count == 1
+    sleep_mock.assert_not_called()

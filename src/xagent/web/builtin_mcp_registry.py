@@ -1086,7 +1086,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             # can access, not just ones the user picks) rather than leaving
             # it implicit, since this is an OAuth App with no per-repository
             # allowlist (unlike a GitHub App's repository-selection step).
-            "description": "Connect to GitHub to search repositories and code, read and create issues and pull requests, comment, and browse file contents and commit history. Grants access to every repository (public and private) the connected account can access -- there is no per-repository selection.",
+            "description": "Connect to GitHub to search repositories and code, read and create issues and pull requests, comment, browse file contents and commit history, and create branches and commit file changes. Grants access to every repository (public and private) the connected account can access -- there is no per-repository selection.",
             "icon": "https://www.google.com/s2/favicons?domain=github.com&sz=128",
             "transport": "oauth",
             "provider_name": "github",

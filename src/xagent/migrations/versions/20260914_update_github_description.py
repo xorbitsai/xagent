@@ -1,0 +1,100 @@
+"""update GitHub connector description for the new write tools
+
+Revision ID: 20260914_update_github_description
+Revises: 20260914_add_hubspot_deals_write_scope
+Create Date: 2026-09-14
+
+"""
+
+from typing import Sequence, Union
+
+import sqlalchemy as sa
+from alembic import op
+
+revision: str = "20260914_update_github_description"
+down_revision: Union[str, None] = "20260914_add_hubspot_deals_write_scope"
+branch_labels: Union[str, Sequence[str], None] = None
+depends_on: Union[str, Sequence[str], None] = None
+
+
+PUBLIC_MCP_APPS_TABLE = sa.table(
+    "public_mcp_apps",
+    sa.column("app_id", sa.String),
+    sa.column("description", sa.Text),
+)
+
+APP_ID = "github"
+
+PREVIOUS_DESCRIPTION = (
+    "Connect to GitHub to search repositories and code, read and create issues "
+    "and pull requests, comment, and browse file contents and commit history. "
+    "Grants access to every repository (public and private) the connected "
+    "account can access -- there is no per-repository selection."
+)
+CURRENT_DESCRIPTION = (
+    "Connect to GitHub to search repositories and code, read and create issues "
+    "and pull requests, comment, browse file contents and commit history, and "
+    "create branches and commit file changes. Grants access to every "
+    "repository (public and private) the connected account can access -- "
+    "there is no per-repository selection."
+)
+
+
+def _required_columns_present(bind: sa.engine.Connection) -> bool:
+    """Whether the target table has the columns this migration needs.
+
+    This migration must be a no-op (not an error) against a database
+    mid-way through a schema this old, or an admin's reduced-schema table,
+    rather than assume a table shape that matches only the current model.
+    """
+    inspector = sa.inspect(bind)
+    if "public_mcp_apps" not in set(inspector.get_table_names()):
+        return False
+    columns = {c["name"] for c in inspector.get_columns("public_mcp_apps")}
+    return {"app_id", "description"}.issubset(columns)
+
+
+def _set_description_if_unchanged(
+    bind: sa.engine.Connection, expected_current: str, new_value: str
+) -> None:
+    """Refresh the stale registry description on an already-seeded row,
+    without clobbering a customization.
+
+    ``description`` is not in admin_mcp's _BUILTIN_PROTECTED_FIELDS, so an
+    operator can legitimately have edited it via the admin PATCH endpoint.
+    Only overwrite when the persisted value still equals the last-known
+    canonical value (i.e. it was never customized); an edited value matches
+    neither the previous nor the current canonical value and is left alone
+    in either direction.
+
+    ``description`` is also excluded from builtin_mcp_registry.py's own
+    _BUILTIN_EXECUTION_FIELD_NAMES drift sync (unlike oauth_scopes/
+    launch_config/etc., which self-heal on every read), and the seed
+    migration (20260817_seed_github_mcp_app.py) only ever inserts a row
+    once -- so without this migration, an already-provisioned install's
+    github row would keep showing the pre-write-tools description forever,
+    even after upgrading to a build whose source registry has moved on
+    (mirrors 20260911_update_onedrive_description.py's identical
+    rationale).
+    """
+    if not _required_columns_present(bind):
+        return
+
+    bind.execute(
+        sa.update(PUBLIC_MCP_APPS_TABLE)
+        .where(
+            PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID,
+            PUBLIC_MCP_APPS_TABLE.c.description == expected_current,
+        )
+        .values(description=new_value)
+    )
+
+
+def upgrade() -> None:
+    bind = op.get_bind()
+    _set_description_if_unchanged(bind, PREVIOUS_DESCRIPTION, CURRENT_DESCRIPTION)
+
+
+def downgrade() -> None:
+    bind = op.get_bind()
+    _set_description_if_unchanged(bind, CURRENT_DESCRIPTION, PREVIOUS_DESCRIPTION)

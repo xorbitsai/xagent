@@ -187,6 +187,8 @@ def test_list_media_reads_recent_instagram_media(monkeypatch):
         "status": "success",
         "media": [{"id": "media-1", "caption": "hello"}],
         "next_link": "https://graph.facebook.com/next",
+        "after_cursor": None,
+        "has_more": True,
     }
     assert mock_request.call_args.kwargs["url"] == (
         "https://graph.facebook.com/v25.0/ig-1/media"
@@ -196,6 +198,52 @@ def test_list_media_reads_recent_instagram_media(monkeypatch):
             "id,caption,media_type,media_url,permalink,timestamp,username,thumbnail_url"
         ),
         "limit": 5,
+    }
+
+
+def test_list_media_paginates_with_after_cursor(monkeypatch):
+    """First call returns has_more=True and an after_cursor; passing that
+    cursor back sends it as the Graph API's "after" param and fetches the
+    next page; the last page (no paging.next) reports has_more=False.
+    """
+    monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
+    responses = [
+        MockResponse(
+            {
+                "data": [{"id": "media-1", "caption": "first"}],
+                "paging": {
+                    "cursors": {"after": "cursor-1"},
+                    "next": "https://graph.facebook.com/next",
+                },
+            }
+        ),
+        MockResponse(
+            {
+                "data": [{"id": "media-2", "caption": "second"}],
+                "paging": {"cursors": {"after": "cursor-2"}},
+            }
+        ),
+    ]
+    mock_request = Mock(side_effect=responses)
+    monkeypatch.setattr(instagram.requests, "request", mock_request)
+
+    first = _payload(instagram.instagram_list_media("ig-1", limit=1))
+    assert first["has_more"] is True
+    assert first["after_cursor"] == "cursor-1"
+    assert "after" not in mock_request.call_args.kwargs["params"]
+
+    second = _payload(
+        instagram.instagram_list_media(
+            "ig-1", limit=1, after_cursor=first["after_cursor"]
+        )
+    )
+    assert mock_request.call_args.kwargs["params"]["after"] == "cursor-1"
+    assert second == {
+        "status": "success",
+        "media": [{"id": "media-2", "caption": "second"}],
+        "next_link": None,
+        "after_cursor": "cursor-2",
+        "has_more": False,
     }
 
 

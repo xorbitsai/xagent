@@ -56,3 +56,44 @@ def test_response_error_text_truncates_large_body():
     assert meta_graph.response_error_text(response) == (
         "x" * meta_graph.MAX_ERROR_RESPONSE_TEXT_CHARS + "... [truncated]"
     )
+
+
+def test_pagination_fields_reports_has_more_when_next_link_present():
+    result = {
+        "data": [{"id": "1"}],
+        "paging": {
+            "cursors": {"before": "b", "after": "cursor-1"},
+            "next": "https://graph.facebook.com/next",
+        },
+    }
+
+    assert meta_graph.pagination_fields(result) == {
+        "next_link": "https://graph.facebook.com/next",
+        "after_cursor": "cursor-1",
+        "has_more": True,
+    }
+
+
+def test_pagination_fields_reports_no_more_on_last_page():
+    """The Graph API can still return a cursors.after value on the last
+    page -- has_more must key off paging.next, not the mere presence of a
+    cursor, or callers would loop forever passing a cursor that yields no
+    further rows."""
+    result = {
+        "data": [{"id": "1"}],
+        "paging": {"cursors": {"before": "b", "after": "cursor-last"}},
+    }
+
+    assert meta_graph.pagination_fields(result) == {
+        "next_link": None,
+        "after_cursor": "cursor-last",
+        "has_more": False,
+    }
+
+
+def test_pagination_fields_handles_missing_paging():
+    assert meta_graph.pagination_fields({"data": []}) == {
+        "next_link": None,
+        "after_cursor": None,
+        "has_more": False,
+    }

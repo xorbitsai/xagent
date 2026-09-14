@@ -8,11 +8,13 @@ from . import meta_graph
 from .meta_graph import (
     GraphAPIError,
 )
+from .meta_graph import apply_after_cursor as _apply_after_cursor
 from .meta_graph import bounded_limit as _bounded_limit
 from .meta_graph import error_response as _error
 from .meta_graph import graph_error_response as _graph_error
 from .meta_graph import graph_request as _graph_request
 from .meta_graph import is_public_image_url as _is_public_image_url
+from .meta_graph import pagination_fields as _pagination_fields
 from .meta_graph import success_response as _success
 from .utils import setup_proxy_env
 
@@ -147,17 +149,26 @@ def instagram_get_profile(instagram_account_id: str) -> str:
 
 
 @mcp.tool()
-def instagram_list_media(instagram_account_id: str, limit: int = 10) -> str:
-    """List recent media for an Instagram professional account."""
+def instagram_list_media(
+    instagram_account_id: str, limit: int = 10, after_cursor: str | None = None
+) -> str:
+    """List recent media for an Instagram professional account. Pass the
+    after_cursor returned by a previous call (while has_more is true) to
+    fetch the next page."""
     try:
+        params: dict[str, Any] = {
+            "fields": MEDIA_FIELDS,
+            "limit": _bounded_limit(limit),
+        }
+        _apply_after_cursor(params, after_cursor)
         result = _graph_request(
             "GET",
             _graph_path(instagram_account_id, "media"),
-            params={"fields": MEDIA_FIELDS, "limit": _bounded_limit(limit)},
+            params=params,
         )
         return _success(
             media=result.get("data", []),
-            next_link=result.get("paging", {}).get("next"),
+            **_pagination_fields(result),
         )
     except GraphAPIError as e:
         logger.error(

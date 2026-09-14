@@ -70,6 +70,8 @@ def test_list_ad_accounts_returns_data_and_next_link(monkeypatch):
         "status": "success",
         "ad_accounts": [{"id": "act_123", "name": "Launch Ads"}],
         "next_link": "https://graph.facebook.com/next",
+        "after_cursor": None,
+        "has_more": True,
     }
     assert mock_request.call_args.kwargs["url"] == (
         "https://graph.facebook.com/v25.0/me/adaccounts"
@@ -77,6 +79,50 @@ def test_list_ad_accounts_returns_data_and_next_link(monkeypatch):
     assert mock_request.call_args.kwargs["params"] == {
         "fields": meta_ads.AD_ACCOUNT_FIELDS,
         "limit": 5,
+    }
+
+
+def test_list_ad_accounts_paginates_with_after_cursor(monkeypatch):
+    """First call returns has_more=True and an after_cursor; passing that
+    cursor back fetches the next page and sends it as the Graph API's
+    "after" param; the second page (no paging.next) reports has_more=False.
+    """
+    monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
+    responses = [
+        MockResponse(
+            {
+                "data": [{"id": "act_1", "name": "First"}],
+                "paging": {
+                    "cursors": {"before": "cursor-before-1", "after": "cursor-1"},
+                    "next": "https://graph.facebook.com/next",
+                },
+            }
+        ),
+        MockResponse(
+            {
+                "data": [{"id": "act_2", "name": "Second"}],
+                "paging": {"cursors": {"before": "cursor-2", "after": "cursor-2"}},
+            }
+        ),
+    ]
+    mock_request = Mock(side_effect=responses)
+    monkeypatch.setattr(meta_ads.requests, "request", mock_request)
+
+    first = _payload(meta_ads.meta_ads_list_ad_accounts(limit=1))
+    assert first["has_more"] is True
+    assert first["after_cursor"] == "cursor-1"
+    assert "after" not in mock_request.call_args.kwargs["params"]
+
+    second = _payload(
+        meta_ads.meta_ads_list_ad_accounts(limit=1, after_cursor=first["after_cursor"])
+    )
+    assert mock_request.call_args.kwargs["params"]["after"] == "cursor-1"
+    assert second == {
+        "status": "success",
+        "ad_accounts": [{"id": "act_2", "name": "Second"}],
+        "next_link": None,
+        "after_cursor": "cursor-2",
+        "has_more": False,
     }
 
 
@@ -137,11 +183,53 @@ def test_list_campaigns_builds_expected_path(monkeypatch):
         "status": "success",
         "campaigns": [{"id": "campaign-1"}],
         "next_link": None,
+        "after_cursor": None,
+        "has_more": False,
     }
     assert mock_request.call_args.kwargs["url"] == (
         "https://graph.facebook.com/v25.0/act_123/campaigns"
     )
     assert mock_request.call_args.kwargs["params"]["fields"] == meta_ads.CAMPAIGN_FIELDS
+
+
+def test_list_campaigns_forwards_after_cursor(monkeypatch):
+    monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
+    mock_request = Mock(return_value=MockResponse({"data": []}))
+    monkeypatch.setattr(meta_ads.requests, "request", mock_request)
+
+    _payload(meta_ads.meta_ads_list_campaigns("act_123", after_cursor="cursor-1"))
+
+    assert mock_request.call_args.kwargs["params"]["after"] == "cursor-1"
+
+
+def test_list_ad_sets_forwards_after_cursor(monkeypatch):
+    monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
+    mock_request = Mock(return_value=MockResponse({"data": []}))
+    monkeypatch.setattr(meta_ads.requests, "request", mock_request)
+
+    _payload(meta_ads.meta_ads_list_ad_sets("act_123", after_cursor="cursor-1"))
+
+    assert mock_request.call_args.kwargs["params"]["after"] == "cursor-1"
+
+
+def test_list_ads_forwards_after_cursor(monkeypatch):
+    monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
+    mock_request = Mock(return_value=MockResponse({"data": []}))
+    monkeypatch.setattr(meta_ads.requests, "request", mock_request)
+
+    _payload(meta_ads.meta_ads_list_ads("act_123", after_cursor="cursor-1"))
+
+    assert mock_request.call_args.kwargs["params"]["after"] == "cursor-1"
+
+
+def test_get_insights_forwards_after_cursor(monkeypatch):
+    monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
+    mock_request = Mock(return_value=MockResponse({"data": []}))
+    monkeypatch.setattr(meta_ads.requests, "request", mock_request)
+
+    _payload(meta_ads.meta_ads_get_insights("1001", after_cursor="cursor-1"))
+
+    assert mock_request.call_args.kwargs["params"]["after"] == "cursor-1"
 
 
 def test_list_ad_sets_applies_campaign_filter(monkeypatch):
@@ -208,6 +296,8 @@ def test_get_insights_defaults_to_date_preset(monkeypatch):
         "status": "success",
         "insights": [{"impressions": "100"}],
         "next_link": None,
+        "after_cursor": None,
+        "has_more": False,
     }
     assert mock_request.call_args.kwargs["url"] == (
         "https://graph.facebook.com/v25.0/1001/insights"

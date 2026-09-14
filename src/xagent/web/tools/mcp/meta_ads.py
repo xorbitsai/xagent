@@ -8,10 +8,12 @@ from mcp.server.fastmcp import FastMCP
 
 from . import meta_graph
 from .meta_graph import GraphAPIError
+from .meta_graph import apply_after_cursor as _apply_after_cursor
 from .meta_graph import bounded_limit as _bounded_limit
 from .meta_graph import error_response as _error
 from .meta_graph import graph_error_response as _graph_error
 from .meta_graph import graph_request as _graph_request
+from .meta_graph import pagination_fields as _pagination_fields
 from .meta_graph import success_response as _success
 from .utils import setup_proxy_env
 
@@ -133,10 +135,6 @@ def _equal_filter(field: str, value: str) -> dict[str, str]:
     return {"field": field, "operator": "EQUAL", "value": value}
 
 
-def _next_link(result: dict[str, Any]) -> str | None:
-    return (result.get("paging") or {}).get("next")
-
-
 def _log_error(message: str, error: Exception) -> None:
     """Log an exception with token redaction applied to both ``message`` and
     ``error`` -- not just str(error) -- instead of writing the access token
@@ -185,19 +183,21 @@ def meta_ads_auth_status() -> str:
 
 
 @mcp.tool()
-def meta_ads_list_ad_accounts(limit: int = 25) -> str:
+def meta_ads_list_ad_accounts(limit: int = 25, after_cursor: str | None = None) -> str:
     """List Meta ad accounts accessible to the connected user. Use this first
     to discover which ad_account_id values are available for the other
-    meta_ads_* tools."""
+    meta_ads_* tools. Pass the after_cursor returned by a previous call (while
+    has_more is true) to fetch the next page."""
     try:
-        result = _graph_request(
-            "GET",
-            "/me/adaccounts",
-            params={"fields": AD_ACCOUNT_FIELDS, "limit": _bounded_limit(limit)},
-        )
+        params: dict[str, Any] = {
+            "fields": AD_ACCOUNT_FIELDS,
+            "limit": _bounded_limit(limit),
+        }
+        _apply_after_cursor(params, after_cursor)
+        result = _graph_request("GET", "/me/adaccounts", params=params)
         return _success(
             ad_accounts=result.get("data", []),
-            next_link=_next_link(result),
+            **_pagination_fields(result),
         )
     except GraphAPIError as e:
         _log_error("Error listing Meta ad accounts", e)
@@ -226,18 +226,24 @@ def meta_ads_get_ad_account(ad_account_id: str) -> str:
 
 
 @mcp.tool()
-def meta_ads_list_campaigns(ad_account_id: str, limit: int = 25) -> str:
-    """List campaigns for a Meta ad account."""
+def meta_ads_list_campaigns(
+    ad_account_id: str, limit: int = 25, after_cursor: str | None = None
+) -> str:
+    """List campaigns for a Meta ad account. Pass the after_cursor returned by
+    a previous call (while has_more is true) to fetch the next page."""
     try:
         account_id = _normalize_ad_account_id(ad_account_id)
+        params: dict[str, Any] = {
+            "fields": CAMPAIGN_FIELDS,
+            "limit": _bounded_limit(limit),
+        }
+        _apply_after_cursor(params, after_cursor)
         result = _graph_request(
-            "GET",
-            _graph_path(account_id, "campaigns"),
-            params={"fields": CAMPAIGN_FIELDS, "limit": _bounded_limit(limit)},
+            "GET", _graph_path(account_id, "campaigns"), params=params
         )
         return _success(
             campaigns=result.get("data", []),
-            next_link=_next_link(result),
+            **_pagination_fields(result),
         )
     except GraphAPIError as e:
         _log_error(f"Error listing campaigns for {ad_account_id}", e)
@@ -249,10 +255,14 @@ def meta_ads_list_campaigns(ad_account_id: str, limit: int = 25) -> str:
 
 @mcp.tool()
 def meta_ads_list_ad_sets(
-    ad_account_id: str, campaign_id: str | None = None, limit: int = 25
+    ad_account_id: str,
+    campaign_id: str | None = None,
+    limit: int = 25,
+    after_cursor: str | None = None,
 ) -> str:
     """List ad sets for a Meta ad account, optionally filtered to one
-    campaign_id."""
+    campaign_id. Pass the after_cursor returned by a previous call (while
+    has_more is true) to fetch the next page."""
     try:
         account_id = _normalize_ad_account_id(ad_account_id)
         params: dict[str, Any] = {
@@ -263,10 +273,11 @@ def meta_ads_list_ad_sets(
             params["filtering"] = json.dumps(
                 [_equal_filter("campaign.id", _numeric_id(campaign_id, "campaign_id"))]
             )
+        _apply_after_cursor(params, after_cursor)
         result = _graph_request("GET", _graph_path(account_id, "adsets"), params=params)
         return _success(
             ad_sets=result.get("data", []),
-            next_link=_next_link(result),
+            **_pagination_fields(result),
         )
     except GraphAPIError as e:
         _log_error(f"Error listing ad sets for {ad_account_id}", e)
@@ -282,9 +293,11 @@ def meta_ads_list_ads(
     campaign_id: str | None = None,
     ad_set_id: str | None = None,
     limit: int = 25,
+    after_cursor: str | None = None,
 ) -> str:
     """List ads for a Meta ad account, optionally filtered to one campaign_id
-    or ad_set_id."""
+    or ad_set_id. Pass the after_cursor returned by a previous call (while
+    has_more is true) to fetch the next page."""
     try:
         account_id = _normalize_ad_account_id(ad_account_id)
         params: dict[str, Any] = {"fields": AD_FIELDS, "limit": _bounded_limit(limit)}
@@ -299,10 +312,11 @@ def meta_ads_list_ads(
             )
         if filters:
             params["filtering"] = json.dumps(filters)
+        _apply_after_cursor(params, after_cursor)
         result = _graph_request("GET", _graph_path(account_id, "ads"), params=params)
         return _success(
             ads=result.get("data", []),
-            next_link=_next_link(result),
+            **_pagination_fields(result),
         )
     except GraphAPIError as e:
         _log_error(f"Error listing ads for {ad_account_id}", e)
@@ -321,6 +335,7 @@ def meta_ads_get_insights(
     until: str | None = None,
     fields: str | None = None,
     limit: int = 25,
+    after_cursor: str | None = None,
 ) -> str:
     """Get performance insights (impressions, clicks, spend, etc.) for a Meta
     ad account, campaign, ad set, or ad. object_id is an "act_<id>" ad
@@ -328,7 +343,8 @@ def meta_ads_get_insights(
     meta_ads_* tools. level optionally breaks the result down to
     "account", "campaign", "adset", or "ad" rows. Defaults to
     date_preset="last_30d"; pass since and until (both "YYYY-MM-DD") instead
-    for an explicit range.
+    for an explicit range. Pass the after_cursor returned by a previous call
+    (while has_more is true) to fetch the next page.
     """
     try:
         target_id = _insights_object_id(object_id)
@@ -355,12 +371,14 @@ def meta_ads_get_insights(
                 )
             params["date_preset"] = date_preset
 
+        _apply_after_cursor(params, after_cursor)
+
         result = _graph_request(
             "GET", _graph_path(target_id, "insights"), params=params
         )
         return _success(
             insights=result.get("data", []),
-            next_link=_next_link(result),
+            **_pagination_fields(result),
         )
     except GraphAPIError as e:
         _log_error(f"Error getting Meta Ads insights for {object_id}", e)

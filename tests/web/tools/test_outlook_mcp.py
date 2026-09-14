@@ -1607,13 +1607,7 @@ def test_update_event_rejects_single_boundary_on_existing_all_day_event(
 def test_update_event_single_boundary_rejects_unresolvable_caller_timezone(
     monkeypatch,
 ):
-    """Regression test: `timezones_could_differ` treats "can't resolve" as
-    "benefit of the doubt, not confirmed different" - correct for a zone
-    name Graph itself reported (never written verbatim; the PATCH always
-    uses `existing_timezone`), but wrong for the CALLER's own `timezone`
-    argument. A typo'd/unknown zone string must be rejected outright, not
-    silently discarded in favor of the existing zone with no signal to
-    the caller that their argument had no effect."""
+    """A typo in the caller's explicit zone must fail before any Graph call."""
     graph_request = Mock(
         return_value={
             "start": {"dateTime": "2026-08-27T02:00:00", "timeZone": "UTC"},
@@ -1737,6 +1731,53 @@ def test_update_event_single_boundary_requires_timezone_even_when_checks_are_byp
     assert result["status"] == "error"
     assert "timezone is required" in result["message"]
     graph_request.assert_not_called()
+
+
+def test_update_event_rejects_nonexistent_local_time_when_checks_are_bypassed(
+    monkeypatch,
+):
+    graph_request = Mock()
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_update_event(
+            event_id="self-1",
+            end_datetime="2026-03-08T02:30:00",
+            timezone="America/Los_Angeles",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "does not exist" in result["message"]
+    assert "daylight-saving transition" in result["message"]
+    graph_request.assert_not_called()
+
+
+def test_update_event_rejects_incomplete_snapshot_when_checks_are_bypassed(
+    monkeypatch,
+):
+    graph_request = Mock(
+        return_value={
+            "start": {"dateTime": "2026-08-27T09:00:00", "timeZone": "UTC"},
+            "isAllDay": False,
+        }
+    )
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_update_event(
+            event_id="self-1",
+            start_datetime="2026-08-27T10:00:00",
+            timezone="UTC",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "no complete time window" in result["message"]
+    assert "single-boundary update" in result["message"]
+    graph_request.assert_called_once()
 
 
 def test_update_event_single_boundary_with_explicit_timezone_ignores_unusable_stored_zone(

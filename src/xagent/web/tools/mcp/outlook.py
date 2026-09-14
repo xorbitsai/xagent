@@ -8,6 +8,7 @@ from urllib.parse import quote, unquote, urlsplit
 
 import requests
 from dateutil import parser as _date_parser
+from dateutil import tz as _date_tz
 from mcp.server.fastmcp import FastMCP
 
 from .utils import InsufficientScopeError
@@ -238,13 +239,16 @@ def _naive_datetime_in_timezone(value: str, timezone: str) -> str:
             "YYYY-MM-DDTHH:MM:SS, optionally followed by fractional seconds "
             "and a UTC offset or Z suffix."
         ) from exc
+    zone = _resolve_zoneinfo(timezone, allow_windows_names=True)
     if parsed.tzinfo is None:
+        localized = parsed.replace(tzinfo=zone)
+        if not _date_tz.datetime_exists(localized):
+            raise ValueError(
+                f"{value!r} does not exist in timezone {timezone!r} because of "
+                "a daylight-saving transition"
+            )
         return normalized
-    return (
-        parsed.astimezone(_resolve_zoneinfo(timezone, allow_windows_names=True))
-        .replace(tzinfo=None)
-        .isoformat()
-    )
+    return parsed.astimezone(zone).replace(tzinfo=None).isoformat()
 
 
 def _reject_invalid_create_window(
@@ -854,9 +858,9 @@ def outlook_update_event(
     boundary while keeping the other as-is; timezone is required and describes
     the changed boundary. Passing both together fully replaces the window, and
     timezone then describes both new values (defaulting to UTC if also left
-    unset). Creating, changing, or resizing an all-day window requires both
-    boundaries because Graph does not expose a reliable current boundary zone;
-    all-day boundaries must be midnight values in one shared timezone.
+    unset). Changing to or resizing an all-day window requires both boundaries
+    because Graph does not expose a reliable current boundary zone; all-day
+    boundaries are normalized to midnight values in one shared timezone.
     This update path checks the signed-in calendar when the event window
     changes; attendee availability is not checked yet. A detected conflict
     returns status="conflict" without updating the event. An incomplete
@@ -933,9 +937,9 @@ def outlook_update_event(
         if effective_is_all_day != existing_is_all_day and not both_boundaries_supplied:
             raise ValueError(
                 "Changing is_all_day requires both start_datetime and "
-                "end_datetime with an explicit timezone; deriving boundaries "
-                "from an earlier event snapshot could overwrite a concurrent "
-                "schedule change."
+                "end_datetime in one shared timezone; deriving boundaries from "
+                "an earlier event snapshot could overwrite a concurrent schedule "
+                "change."
             )
         if existing_is_all_day and single_boundary_update:
             raise ValueError(
@@ -981,6 +985,11 @@ def outlook_update_event(
 
         existing_end = existing_end_field.get("dateTime")
         existing_start = existing_start_field.get("dateTime")
+        if single_boundary_update and (not existing_start or not existing_end):
+            raise ValueError(
+                "Existing event has no complete time window; cannot safely "
+                "validate a single-boundary update."
+            )
         query_timezone = (
             resolved_timezone
             if (start_datetime is not None or end_datetime is not None)

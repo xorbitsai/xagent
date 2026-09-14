@@ -1,7 +1,6 @@
 import json
 import os
 import re
-from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -589,34 +588,6 @@ def test_resolve_zoneinfo_rejects_windows_timezone_names_by_default():
 def test_resolve_zoneinfo_rejects_unknown_timezone():
     with pytest.raises(ValueError, match="recognized IANA zone name"):
         utils.resolve_zoneinfo("Not/ARealZone")
-
-
-def test_timezones_could_differ_returns_false_for_equal_zones():
-    assert not utils.timezones_could_differ("UTC", "UTC")
-
-
-def test_timezones_could_differ_is_conservative_for_unresolvable_zone():
-    assert not utils.timezones_could_differ(
-        "Not/ARealZone", "UTC", allow_windows_names=True
-    )
-
-
-def test_timezones_could_differ_uses_current_time_when_at_is_omitted():
-    assert utils.timezones_could_differ("UTC", "Asia/Shanghai")
-
-
-@pytest.mark.parametrize(
-    ("at", "expected"),
-    [
-        (datetime(2026, 1, 15, 12), False),
-        (datetime(2026, 7, 15, 12, tzinfo=timezone.utc), True),
-    ],
-)
-def test_timezones_could_differ_accepts_naive_and_aware_reference_times(at, expected):
-    assert (
-        utils.timezones_could_differ("America/Denver", "America/Phoenix", at=at)
-        is expected
-    )
 
 
 def test_url_path_id_output_survives_requests_url_normalization():

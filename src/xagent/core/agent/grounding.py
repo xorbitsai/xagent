@@ -18,6 +18,16 @@ by default and makes reporting the gap the instructed response, but it cannot
 repair a session whose evidence compaction already discarded.
 Proposals B (evidence-preserving compaction) and C (provenance tracking and a
 data-source gate) remain open.
+
+The entity-attribution sentence covers a distinct failure the rest of this
+rule does not: a value that a tool result genuinely returned, reported under
+an entity other than the one that tool call was scoped to. A same-named
+contact belonging to a different company, pulled in by a name search that was
+never scoped to the company being asked about, is a real production instance
+of this -- the fact (a deal's amount and stage) was real, only its reported
+owner was not. This is unconditional (unlike the tool-argument clause, it does
+not depend on ``can_call_tools``): the misattribution happens when the answer
+is composed, which occurs at every call site this module serves.
 """
 
 from __future__ import annotations
@@ -44,12 +54,15 @@ def grounding_rule(*, can_call_tools: bool = True) -> str:
         A prompt fragment forbidding unsupported claims and unsourced values of
         every kind it enumerates, requiring the gap be reported instead, and
         confining unsourced content to a current request that explicitly asks
-        for a template or sample. When ``can_call_tools`` is true it also
-        forbids supplying a fact-carrying tool-call argument that no source
-        provides, while leaving arguments the model is expected to compose
-        untouched -- except for a fact value written literally inside composed
-        code or document text, which the sourcing requirement still covers
-        unless the request explicitly asked for a template or a sample.
+        for a template or sample. It also forbids reporting a genuinely
+        sourced fact under an entity other than the one the tool call was
+        scoped to, regardless of ``can_call_tools``. When ``can_call_tools``
+        is true it also forbids supplying a fact-carrying tool-call argument
+        that no source provides, while leaving arguments the model is
+        expected to compose untouched -- except for a fact value written
+        literally inside composed code or document text, which the sourcing
+        requirement still covers unless the request explicitly asked for a
+        template or a sample.
     """
     insufficient_context_rule = (
         "If available context is insufficient, say so or use an appropriate "
@@ -80,11 +93,23 @@ def grounding_rule(*, can_call_tools: bool = True) -> str:
         if can_call_tools
         else ""
     )
+    entity_attribution_rule = (
+        "A fact can be genuinely present in a tool result and still be "
+        "reported under the wrong entity: attributing it to a company, "
+        "team, project, or account other than the one the tool call was "
+        "actually scoped to is fabrication, even though the fact itself is "
+        "real. Before naming the entity a sourced fact belongs to, confirm "
+        "it came from a tool call scoped to that entity's own id or name, "
+        "not from a same-named or related record found while looking for "
+        "something else; when it did not, report the fact under the record "
+        "it actually came from instead. "
+    )
     return (
         "Do not introduce specific entities, incidents, dates, sources, "
         "causal explanations, or quantitative data (metrics, figures, "
         "statistics, percentages, table rows, or time series) that are not "
         "supported by the conversation, retrieved context, or tool results. "
+        f"{entity_attribution_rule}"
         f"{insufficient_context_rule}"
         f"Never fill a gap with an invented value, whether it is {VALUE_KINDS}: "
         "when nothing in this conversation, the provided context, or a tool "

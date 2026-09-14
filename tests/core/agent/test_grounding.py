@@ -316,3 +316,52 @@ def test_grounding_module_docstring_states_the_default_as_a_prohibition() -> Non
         "tracking and a data-source gate) remain open." in normalized_doc
     )
     assert "illustrative" not in (grounding_rule.__doc__ or "")
+
+
+def test_grounding_rule_forbids_reporting_a_sourced_fact_under_the_wrong_entity() -> (
+    None
+):
+    """A genuinely sourced fact must still be attributed to the right entity.
+
+    Production incident: asked for one company's open deals, the model found
+    a same-named contact belonging to a different company (via an unscoped
+    name search) and reported that company's real deal as if it belonged to
+    the company actually asked about. The deal's amount and stage were real;
+    only the reported owner was fabricated -- a failure mode the rest of this
+    rule, which is about inventing values outright, does not name.
+    """
+    for rule in (grounding_rule(), grounding_rule(can_call_tools=False)):
+        assert (
+            "reported under the wrong entity: attributing it to a company, "
+            "team, project, or account other than the one the tool call was "
+            "actually scoped to is fabrication" in rule
+        )
+        assert "scoped to that entity's own id or name" in rule
+        assert "a same-named or related record found while looking for" in rule
+        assert "report the fact under the record it actually came from" in rule
+
+
+def test_grounding_rule_entity_attribution_is_unconditional() -> None:
+    """Unlike the tool-argument clause, this does not depend on can_call_tools.
+
+    The misattribution happens in how the answer is composed, which every
+    call site -- including the three forced-answer, no-tool sites -- must
+    still guard against.
+    """
+    with_tools = grounding_rule()
+    without_tools = grounding_rule(can_call_tools=False)
+    marker = "reported under the wrong entity"
+    assert marker in with_tools
+    assert marker in without_tools
+    # Identical wording in both variants, not just present in both.
+    start = with_tools.index("A fact can be genuinely present")
+    end = with_tools.index("something else; when it did not,") + len(
+        "something else; when it did not,"
+    )
+    assert with_tools[start:end] == without_tools[start:end]
+
+
+def test_grounding_rule_entity_attribution_precedes_the_pinned_gap_sentence() -> None:
+    """The addition must not disturb the existing insufficient-context pins."""
+    assert "verify. Never fill a gap" in grounding_rule()
+    assert "invented values. Never fill a gap" in grounding_rule(can_call_tools=False)

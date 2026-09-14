@@ -1718,6 +1718,50 @@ def test_update_event_toggling_all_day_alone_still_triggers_a_real_check(monkeyp
     assert result["status"] == "conflict"
 
 
+@pytest.mark.parametrize("with_conflict", [False, True])
+def test_update_event_preserves_partial_results_when_conflict_scan_stops(
+    monkeypatch, with_conflict
+):
+    graph_request = Mock(
+        return_value={
+            "start": {"dateTime": "2026-08-27T09:00:00", "timeZone": "UTC"},
+            "end": {"dateTime": "2026-08-27T09:30:00", "timeZone": "UTC"},
+            "attendees": [],
+            "isAllDay": False,
+            "originalStartTimeZone": "UTC",
+        }
+    )
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+    conflicts = [_busy_event(subject="Board sync")] if with_conflict else []
+    monkeypatch.setattr(
+        outlook,
+        "_find_conflicts",
+        Mock(
+            side_effect=outlook._ConflictCheckIncompleteError(
+                "Outlook calendar conflict check exceeded the pagination limit",
+                conflicts,
+                [],
+            )
+        ),
+    )
+
+    result = json.loads(
+        outlook.outlook_update_event(
+            event_id="self-1",
+            start_datetime="2026-08-27T10:00:00",
+            end_datetime="2026-08-27T10:30:00",
+        )
+    )
+
+    assert result["status"] == (
+        "conflict" if with_conflict else "conflict_check_incomplete"
+    )
+    assert "pagination limit" in result.get("check_error", result["message"])
+    if with_conflict:
+        assert result["conflicts"][0]["subject"] == "Board sync"
+    graph_request.assert_called_once()
+
+
 def test_update_event_rejects_a_reversed_window(monkeypatch):
     graph_request = Mock(
         return_value={

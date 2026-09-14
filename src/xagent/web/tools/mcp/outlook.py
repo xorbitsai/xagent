@@ -1186,17 +1186,37 @@ def outlook_update_event(
                         "Existing event has no timeZone on its start time; cannot "
                         "safely check conflicts for this update."
                     )
-                conflicts, unchecked_attendees = _find_conflicts(
-                    query_start,
-                    query_end,
-                    query_timezone,
-                    [],
-                    exclude_event_id=event_id,
-                    check_organizer=True,
-                )
+                check_error: str | None = None
+                try:
+                    conflicts, unchecked_attendees = _find_conflicts(
+                        query_start,
+                        query_end,
+                        query_timezone,
+                        [],
+                        exclude_event_id=event_id,
+                        check_organizer=True,
+                    )
+                except InsufficientScopeError as exc:
+                    check_error = str(exc)
+                    conflicts, unchecked_attendees = _merge_scope_error(exc, [], [])
+                except _ConflictCheckIncompleteError as exc:
+                    check_error = str(exc)
+                    conflicts = exc.conflicts
+                    unchecked_attendees = exc.unchecked_attendees
                 if conflicts:
                     return _conflict_response(
-                        conflicts, unchecked_attendees, query_start, query_end
+                        conflicts,
+                        unchecked_attendees,
+                        query_start,
+                        query_end,
+                        check_error=check_error,
+                    )
+                if check_error or unchecked_attendees:
+                    return _incomplete_check_response(
+                        unchecked_attendees,
+                        query_start,
+                        query_end,
+                        message=check_error,
                     )
 
         result = _graph_request(

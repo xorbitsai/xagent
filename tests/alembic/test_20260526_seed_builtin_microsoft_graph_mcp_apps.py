@@ -157,3 +157,62 @@ def test_downgrade_preserves_colliding_custom_app(tmp_path):
         assert row[0] == "Custom Teams Bridge"
         assert row[1] == "stdio"
         assert not {"outlook", "onedrive"} & _app_ids(connection)
+
+
+def test_downgrade_preserves_admin_created_microsoft_provider(tmp_path):
+    """A pre-existing admin-created "microsoft" provider (different shape
+    than the seeded row) must survive downgrade even when no microsoft apps
+    remain."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_tables(connection)
+        connection.execute(
+            text(
+                "INSERT INTO oauth_providers"
+                " (provider_name, name, client_id, client_secret, auth_url, token_url)"
+                " VALUES ('microsoft', 'Custom Microsoft', 'cid', 'secret',"
+                " 'https://custom.example.com/authorize',"
+                " 'https://custom.example.com/token')"
+            )
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+            migration.downgrade()
+        assert not {"teams", "outlook", "onedrive"} & _app_ids(connection)
+        assert "microsoft" in _provider_names(connection)
+
+
+def test_downgrade_keeps_provider_when_custom_microsoft_app_exists(tmp_path):
+    """The shared "microsoft" oauth_providers row must survive downgrade if a
+    non-seeded microsoft app is still present."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_tables(connection)
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+            connection.execute(
+                text(
+                    "INSERT INTO public_mcp_apps (app_id, name, transport, provider_name)"
+                    " VALUES ('custom-teams', 'Custom Teams', 'oauth', 'microsoft')"
+                )
+            )
+            migration.downgrade()
+        assert "microsoft" in _provider_names(connection)
+
+
+def test_upgrade_and_downgrade_no_op_without_tables(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+            migration.downgrade()
+        table_names = set(
+            connection.execute(
+                text("SELECT name FROM sqlite_master WHERE type='table'")
+            ).scalars()
+        )
+        assert "oauth_providers" not in table_names
+        assert "public_mcp_apps" not in table_names

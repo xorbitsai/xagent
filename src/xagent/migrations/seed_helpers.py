@@ -62,8 +62,9 @@ def delete_unmodified_seeded_rows(
     the column/key is skipped rather than raising ``KeyError``.
 
     If ``match_columns`` is non-empty but none of its columns exist in the
-    current schema, provenance can no longer be verified at all, so nothing
-    is deleted (matching on ``id_column`` alone would silently reproduce the
+    current schema, or a given seed row supplies none of those columns,
+    provenance can no longer be verified at all, so nothing is deleted for
+    that row (matching on ``id_column`` alone would silently reproduce the
     exact bug this helper exists to prevent). Pass ``match_columns=()``
     explicitly to opt into matching on ``id_column`` only.
 
@@ -115,6 +116,14 @@ def delete_unmodified_seeded_rows(
 
     for row in seed_rows:
         if id_column not in row:
+            continue
+        if match_column_refs and not any(
+            column in row for column, _ in match_column_refs
+        ):
+            # The row supplies none of the columns we'd need to verify
+            # provenance with, so (symmetrically with the schema-side check
+            # above) refuse to delete rather than falling back to matching on
+            # id_column alone.
             continue
 
         delete_conditions = [id_col == row[id_column]]

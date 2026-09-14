@@ -217,16 +217,10 @@ def downgrade() -> None:
     # migration seeded, so an admin-created "hubspot" provider (via
     # POST /admin/mcp/providers) is preserved. client_id/client_secret are
     # env-dependent and intentionally not part of the guard.
-    provider_columns = {
-        column["name"] for column in inspector.get_columns("oauth_providers")
-    }
-    seeded_provider = _hubspot_provider_row()
-    delete_stmt = sa.delete(FULL_OAUTH_PROVIDERS_TABLE).where(
-        FULL_OAUTH_PROVIDERS_TABLE.c.provider_name == "hubspot"
+    delete_unmodified_seeded_rows(
+        bind,
+        FULL_OAUTH_PROVIDERS_TABLE,
+        [_hubspot_provider_row()],
+        match_columns=("name", "auth_url", "token_url"),
+        id_column="provider_name",
     )
-    for column in ("name", "auth_url", "token_url"):
-        if column in provider_columns:
-            delete_stmt = delete_stmt.where(
-                FULL_OAUTH_PROVIDERS_TABLE.c[column] == seeded_provider[column]
-            )
-    bind.execute(delete_stmt)

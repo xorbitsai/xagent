@@ -178,8 +178,14 @@ def downgrade() -> None:
         if remaining_meta_apps:
             return
 
-    bind.execute(
-        sa.delete(OAUTH_PROVIDERS_TABLE).where(
-            OAUTH_PROVIDERS_TABLE.c.provider_name == "meta"
-        )
+    # Only delete the provider row when it still matches the static shape this
+    # migration seeded, so an admin-created/edited "meta" provider (via
+    # POST /admin/mcp/providers) is preserved. client_id/client_secret are
+    # env-dependent and intentionally not part of the guard.
+    delete_unmodified_seeded_rows(
+        bind,
+        FULL_OAUTH_PROVIDERS_TABLE,
+        [_meta_provider_row()],
+        match_columns=("name", "auth_url", "token_url"),
+        id_column="provider_name",
     )

@@ -365,6 +365,79 @@ def test_update_event_recurrence_rejects_an_exception_on_a_later_list_page(
     service.events.return_value.update.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "schedule_change",
+    [
+        {
+            "start_time": "2026-09-02T09:00:00",
+            "end_time": "2026-09-02T10:00:00",
+        },
+        {"timezone": "Europe/Paris"},
+    ],
+)
+def test_update_event_reschedule_rejects_stored_instance_exceptions(
+    monkeypatch, schedule_change
+):
+    existing_event = {
+        "id": "existing-1",
+        "iCalUID": "series@example.com",
+        "start": {"dateTime": "2026-09-01T09:00:00", "timeZone": "UTC"},
+        "end": {"dateTime": "2026-09-01T10:00:00", "timeZone": "UTC"},
+        "recurrence": ["RRULE:FREQ=DAILY;COUNT=5"],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    service.events.return_value.list.return_value.execute.return_value = {
+        "items": [
+            {
+                "id": "exception-1",
+                "recurringEventId": "existing-1",
+            }
+        ]
+    }
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            ignore_conflicts=True,
+            **schedule_change,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "edited or cancelled instances" in result["message"]
+    assert (
+        service.events.return_value.list.call_args.kwargs["iCalUID"]
+        == "series@example.com"
+    )
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_event_duration_change_does_not_scan_stored_instance_exceptions(
+    monkeypatch,
+):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-09-01T09:00:00", "timeZone": "UTC"},
+        "end": {"dateTime": "2026-09-01T10:00:00", "timeZone": "UTC"},
+        "recurrence": ["RRULE:FREQ=DAILY;COUNT=5"],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            end_time="2026-09-01T11:00:00",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    service.events.return_value.list.assert_not_called()
+    service.events.return_value.update.assert_called_once()
+
+
 def test_update_event_recurrence_scans_without_a_malformed_ical_uid(monkeypatch):
     existing_event = {
         "id": "existing-1",
@@ -3155,6 +3228,7 @@ def test_update_events_recurring_master_restriction_can_be_bypassed_with_ignore_
         },
         "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=TH"],
     }
+    fake_service._events._list_result = {"items": [{"id": "series-1"}]}
 
     result = json.loads(
         calendar.google_calendar_update_events(

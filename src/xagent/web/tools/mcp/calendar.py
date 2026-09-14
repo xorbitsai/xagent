@@ -724,7 +724,7 @@ def _series_has_exceptions(
             if not saw_master:
                 raise ValueError(
                     "Google Calendar's exception scan did not return the recurring "
-                    "master event; refusing to replace its rule"
+                    "master event; refusing to change its recurrence schedule"
                 )
             return False
         if not isinstance(next_page_token, str):
@@ -1447,7 +1447,7 @@ def google_calendar_update_events(
                 for line in existing_recurrence
                 if _recurrence_property_name(line) == "RRULE"
             ]
-            if recurrence is not None and isinstance(existing_recurrence, list)
+            if timing_update_requested and isinstance(existing_recurrence, list)
             else []
         )
         if recurrence is not None and len(existing_rrules) > 1:
@@ -2221,6 +2221,7 @@ def google_calendar_update_events(
             old_timezone=None if original_end_is_all_day else existing_end_timezone,
             new_timezone=None if end_is_all_day else own_end_timezone,
         )
+        timezone_changes_schedule_zone = False
         if timing_update_requested and isinstance(existing_recurrence, list):
             auxiliary_recurrence = [
                 line
@@ -2476,21 +2477,30 @@ def google_calendar_update_events(
                         effective_start_timezone,
                     )
 
+        stored_exceptions_may_shift = bool(
+            existing_rrules
+            and (
+                recurrence is not None
+                or (start_time is not None and start_changed)
+                or timezone_changes_schedule_zone
+            )
+        )
+        if stored_exceptions_may_shift and _series_has_exceptions(
+            service,
+            event_id,
+            event.get("iCalUID") if isinstance(event.get("iCalUID"), str) else None,
+        ):
+            raise ValueError(
+                "the existing recurring series has edited or cancelled instances "
+                "whose meaning cannot be safely preserved after changing its "
+                "recurrence rule, start time, or expansion timezone"
+            )
+
         if description:
             event["description"] = description
         if location:
             event["location"] = location
         if recurrence is not None:
-            if existing_rrules and _series_has_exceptions(
-                service,
-                event_id,
-                event.get("iCalUID") if isinstance(event.get("iCalUID"), str) else None,
-            ):
-                raise ValueError(
-                    "the existing recurring series has edited or cancelled "
-                    "instances whose meaning cannot be safely preserved after "
-                    "changing its recurrence rule"
-                )
             # cast(): the earlier "could not determine the event's start
             # time" check already guarantees current_start_value is set
             # whenever recurrence is not None.

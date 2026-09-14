@@ -5293,6 +5293,12 @@ def test_recurrence_tzids_keeps_a_colon_inside_a_quoted_value():
     ) == {"Custom:Zone"}
 
 
+def test_recurrence_tzids_ignores_semicolons_inside_quoted_parameter_values():
+    assert calendar._recurrence_tzids(
+        ['EXDATE;X-TEST="foo;TZID=Asia/Shanghai";TZID=America/New_York:20260902T090000']
+    ) == {"America/New_York"}
+
+
 def test_reject_nonpositive_event_window_reports_malformed_datetime():
     with pytest.raises(ValueError, match="valid ISO 8601 dateTimes"):
         calendar._reject_nonpositive_event_window(

@@ -464,6 +464,23 @@ def _property_header(line: str) -> str:
     return line
 
 
+def _property_parameters(header: str) -> list[str]:
+    """Split an RFC 5545 property header on unquoted semicolons."""
+    parameters: list[str] = []
+    current: list[str] = []
+    quoted = False
+    for character in header:
+        if character == '"':
+            quoted = not quoted
+        if character == ";" and not quoted:
+            parameters.append("".join(current))
+            current = []
+        else:
+            current.append(character)
+    parameters.append("".join(current))
+    return parameters
+
+
 def _recurrence_property_name(line: str) -> str:
     header = _property_header(line)
     if header == line:
@@ -510,7 +527,7 @@ def _recurrence_tzids(recurrence_lines: list[Any]) -> set[str]:
         if not isinstance(line, str):
             continue
         property_header = _property_header(line)
-        for parameter in property_header.split(";")[1:]:
+        for parameter in _property_parameters(property_header)[1:]:
             name, separator, value = parameter.partition("=")
             normalized_value = value.strip().strip('"')
             if separator and name.strip().upper() == "TZID":

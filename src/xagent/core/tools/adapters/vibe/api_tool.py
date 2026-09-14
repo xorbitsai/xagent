@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field
 
+from ....utils.security import redact_url_credentials_for_logging
 from ...core.api_tool import (
     APIClientCore,
     append_known_connector_domain_hint,
@@ -173,7 +174,8 @@ class APITool(AbstractBaseTool):
             result.get("error"), connector_label
         )
         logger.info(
-            f"ℹ️ API Call {api_args.method} {api_args.url} got "
+            f"ℹ️ API Call {api_args.method} "
+            f"{redact_url_credentials_for_logging(api_args.url)} got "
             f"{result['status_code']} with no recognized credential - "
             f"hinting at the {connector_label} connector"
         )

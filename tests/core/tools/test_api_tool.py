@@ -612,6 +612,64 @@ class TestFinalUrlCredentialGating:
         assert result["final_request_has_credential"] is False
 
 
+class TestCredentialFreeLogging:
+    """Regression: call_api's own request/completion logs, and the
+    adapter's connector-hint log, used to interpolate the raw URL - which
+    can carry a real credential (Basic-Auth userinfo a caller embedded, or
+    an api_key_query auth_token merged into the query string before the
+    request runs). For CustomApiTool in particular, that URL can hold a
+    real decrypted, persisted secret (see api_tool_adapter.py's
+    _replace_secrets/decrypt_value), so this isn't just a hypothetical -
+    every one of these log lines needed the same redaction final_url
+    already got."""
+
+    @pytest.mark.asyncio
+    async def test_startup_log_does_not_leak_basic_auth_userinfo(
+        self, mock_httpbin: None, caplog: pytest.LogCaptureFixture
+    ):
+        caplog.set_level("INFO")
+        await call_api(url="https://user:leaked-secret@httpbin.org/get")
+
+        assert "leaked-secret" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_completion_log_does_not_leak_api_key_query_credential(
+        self, mock_httpbin: None, caplog: pytest.LogCaptureFixture
+    ):
+        caplog.set_level("INFO")
+        await call_api(
+            url="https://httpbin.org/get",
+            auth_type="api_key_query",
+            auth_token="leaked-secret",
+        )
+
+        assert "leaked-secret" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_adapter_hint_log_does_not_leak_url_embedded_credential(
+        self, mock_httpbin: None, caplog: pytest.LogCaptureFixture
+    ):
+        """The hint only fires when the ACTUAL final request carries no
+        credential - so the one realistic way to reach this log line with
+        a credential still sitting in api_args.url is a request that
+        started credentialed (Basic-Auth userinfo) and redirected
+        cross-origin to the connector host, where real httpx drops that
+        userinfo (it isn't part of the redirect target's own URL). The
+        hint correctly fires for the now-uncredentialed final request,
+        but the log line still names the caller's ORIGINAL url."""
+        caplog.set_level("INFO")
+        tool = APITool()
+        result = await tool.run_json_async(
+            {
+                "url": "https://user:leaked-secret@httpbin.org/status/401"
+                "?__redirected_to__=https://api.hubapi.com/crm/v3/deals/1"
+            }
+        )
+
+        assert "HubSpot" in result["error"]
+        assert "leaked-secret" not in caplog.text
+
+
 class TestAPITool:
     """Test APITool adapter"""
 

@@ -13,6 +13,8 @@ from urllib.parse import ParseResult, parse_qs, urlencode, urlparse
 
 import httpx
 
+from ...utils.security import redact_url_credentials_for_logging
+
 logger = logging.getLogger(__name__)
 
 # Fixed or tenant-subdomain API hosts already covered by a dedicated,
@@ -352,10 +354,14 @@ class APIClientCore:
             allow_redirects: Whether to follow redirects
 
         Returns:
-            Dictionary with success status, status_code, headers, body, and error
+            Dictionary with success status, status_code, headers, body, and
+            error. On a 401/403 response, also carries the internal-only
+            final_url/final_request_has_credential keys the adapter's
+            connector-domain hint uses (see _sanitize_final_url /
+            has_auth_credentials) - both are None on every other status.
         """
         logger.info(
-            f"🌐 API Call: {method} {url}"
+            f"🌐 API Call: {method} {redact_url_credentials_for_logging(url)}"
             + (f" (auth: {auth_type})" if auth_type else "")
         )
 
@@ -440,8 +446,17 @@ class APIClientCore:
                     proxy_url=proxy_url,
                     allow_redirects=allow_redirects,
                 )
+                # "Completed" rather than "successful" - _make_request
+                # returning without raising only means a response was
+                # received, not that it was a 2xx (e.g. a 401/403 from a
+                # known connector domain completes normally and is exactly
+                # the case this tool's hint logic needs to see as such,
+                # not as a misleading "successful" log line).
+                status_icon = "✅" if result.get("success") else "⚠️"
                 logger.info(
-                    f"✅ API Call successful: {method} {url} -> {result['status_code']}"
+                    f"{status_icon} API Call completed: {method} "
+                    f"{redact_url_credentials_for_logging(url)} -> "
+                    f"{result['status_code']}"
                 )
                 return result
 
@@ -496,39 +511,61 @@ class APIClientCore:
                 # hint, which only fires for a 401/403 - so this is skipped
                 # entirely for every 2xx/other response rather than
                 # sanitizing a URL and scanning headers no one will read.
+                #
+                # Wrapped in its own try/except, separate from the retry
+                # loop's: an exception here must never be mistaken for a
+                # transient network failure - the response itself already
+                # arrived successfully. Letting it propagate would have
+                # the retry loop retry an already-answered (and possibly
+                # non-idempotent) request, and after exhausting retries
+                # return status_code=0 with no error detail instead of the
+                # real 401/403 - resurrecting exactly the "looks like a
+                # broken connection" misdiagnosis this feature exists to
+                # fix. Worst case here is just a missing hint, same as any
+                # other imprecision in this heuristic.
                 final_url: Optional[str] = None
                 final_request_has_credential: Optional[bool] = None
                 if response.status_code in (401, 403):
-                    final_url = _sanitize_final_url(response.url)
-                    # Whether the request httpx actually sent - after any
-                    # redirect - still carried a credential. Derived from
-                    # the real sent request/headers rather than the
-                    # caller's original args, because httpx strips the
-                    # Authorization header (and a Location without a query
-                    # string drops any api_key_query credential) on a
-                    # cross-origin redirect: a request that started out
-                    # credentialed can still reach a known connector host
-                    # with no credential attached, and the adapter's hint
-                    # decision needs to reflect that, not the original
-                    # request's credential. Checked against the real
-                    # request's own URL/headers only - not `params`/
-                    # `auth_type`/`auth_token`, which describe the
-                    # caller's original intent rather than what actually
-                    # went over the wire after a redirect. Note this can
-                    # also pick up a coincidentally auth-shaped query
-                    # param the redirect target itself appended (outside
-                    # the caller's control) - the same class of imprecision
-                    # `has_auth_credentials` already accepts for its
-                    # caller-supplied case: worst case is a missed hint on
-                    # a genuinely uncredentialed request, never a blocked
-                    # or altered one.
-                    final_request_has_credential = has_auth_credentials(
-                        str(response.request.url),
-                        response.request.headers,
-                        None,
-                        None,
-                        None,
-                    )
+                    try:
+                        final_url = _sanitize_final_url(response.url)
+                        # Whether the request httpx actually sent - after
+                        # any redirect - still carried a credential.
+                        # Derived from the real sent request/headers
+                        # rather than the caller's original args, because
+                        # httpx strips the Authorization header (and a
+                        # Location without a query string drops any
+                        # api_key_query credential) on a cross-origin
+                        # redirect: a request that started out
+                        # credentialed can still reach a known connector
+                        # host with no credential attached, and the
+                        # adapter's hint decision needs to reflect that,
+                        # not the original request's credential. Checked
+                        # against the real request's own URL/headers only
+                        # - not `params`/`auth_type`/`auth_token`, which
+                        # describe the caller's original intent rather
+                        # than what actually went over the wire after a
+                        # redirect. Note this can also pick up a
+                        # coincidentally auth-shaped query param the
+                        # redirect target itself appended (outside the
+                        # caller's control) - the same class of
+                        # imprecision `has_auth_credentials` already
+                        # accepts for its caller-supplied case: worst case
+                        # is a missed hint on a genuinely uncredentialed
+                        # request, never a blocked or altered one.
+                        final_request_has_credential = has_auth_credentials(
+                            str(response.request.url),
+                            response.request.headers,
+                            None,
+                            None,
+                            None,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"⚠️ Failed to derive connector-hint metadata "
+                            f"for a {response.status_code} response: {e}"
+                        )
+                        final_url = None
+                        final_request_has_credential = None
 
                 # Check response size by reading only up to max_response_size
                 response_size = 0
@@ -730,7 +767,10 @@ async def call_api(
         retry_count: Number of retries on failure
 
     Returns:
-        Dictionary with success status, status_code, headers, body, and error
+        Dictionary with success status, status_code, headers, body, and
+        error. On a 401/403 response, also carries the internal-only
+        final_url/final_request_has_credential keys the adapter's
+        connector-domain hint uses - both are None on every other status.
 
     Example:
         >>> # GET request

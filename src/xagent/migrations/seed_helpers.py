@@ -26,7 +26,10 @@ from sqlalchemy.sql.expression import TableClause
 # arbitrary values there even if every other field happens to match. Matching
 # is done in Python (see below), not in the SQL WHERE clause, so these
 # JSON-typed columns compare by value regardless of key order or
-# serialization differences across database backends.
+# serialization differences across database backends. This relies on the
+# caller's ``table`` declaring these two columns with ``sa.JSON`` (as every
+# current caller does); see the function docstring below for what happens
+# if a future caller's table does not.
 DEFAULT_SEED_MATCH_COLUMNS: tuple[str, ...] = (
     "name",
     "description",
@@ -64,10 +67,27 @@ def delete_unmodified_seeded_rows(
     exact bug this helper exists to prevent). Pass ``match_columns=()``
     explicitly to opt into matching on ``id_column`` only.
 
-    Each candidate row is fetched and compared in Python rather than matched
-    via the SQL ``WHERE`` clause, so JSON-typed columns compare structurally
-    (immune to key-order or whitespace differences between the stored value
-    and the seed) instead of relying on backend-specific text/JSON equality.
+    Each candidate row is fetched and its ``match_columns`` compared in
+    Python rather than matched via the SQL ``WHERE`` clause, so JSON-typed
+    columns compare structurally (immune to key-order or whitespace
+    differences between the stored value and the seed) instead of relying
+    on backend-specific text/JSON equality. The final ``DELETE`` then
+    re-asserts every non-JSON match column in its own ``WHERE`` clause too,
+    so the delete does not rely solely on ``id_column`` being unique and the
+    window where a concurrent writer could change the row between the
+    ``SELECT`` and the ``DELETE`` is narrowed for those columns. JSON-typed
+    columns are left out of that re-assertion (SQL equality on them is the
+    same backend-fragile comparison being avoided above), so that specific
+    narrow race remains: a concurrent write that changes only a JSON column
+    between the two statements is not caught.
+
+    A JSON-typed column only compares structurally when ``table`` declares
+    it with ``sa.JSON``. A ``table`` that leaves a JSON column untyped (the
+    "lightweight subset of columns" pattern above) gets that column back as
+    a raw driver value instead of a deserialized Python object, so it will
+    essentially never compare equal to the seed's Python value. That fails
+    safe (the row is preserved, never wrongly deleted) rather than raising,
+    but it does mean such a row is never cleaned up on downgrade either.
     """
     inspector = sa.inspect(bind)
     if table.name not in set(inspector.get_table_names()):
@@ -86,17 +106,25 @@ def delete_unmodified_seeded_rows(
         return table.c[name] if name in table.c else sa.column(name)
 
     id_col = _column(id_column)
+    match_column_refs = [(column, _column(column)) for column in columns_to_match]
+    scalar_column_refs = [
+        (column, ref)
+        for column, ref in match_column_refs
+        if not isinstance(ref.type, sa.JSON)
+    ]
 
     for row in seed_rows:
         if id_column not in row:
             continue
 
-        if columns_to_match:
+        delete_conditions = [id_col == row[id_column]]
+
+        if match_column_refs:
             candidate = (
                 bind.execute(
-                    sa.select(*(_column(column) for column in columns_to_match)).where(
-                        id_col == row[id_column]
-                    )
+                    sa.select(*(ref for _, ref in match_column_refs))
+                    .select_from(table)
+                    .where(id_col == row[id_column])
                 )
                 .mappings()
                 .first()
@@ -105,8 +133,13 @@ def delete_unmodified_seeded_rows(
                 continue
             if any(
                 column in row and candidate[column] != row[column]
-                for column in columns_to_match
+                for column, _ in match_column_refs
             ):
                 continue
+            delete_conditions.extend(
+                ref == row[column]
+                for column, ref in scalar_column_refs
+                if column in row
+            )
 
-        bind.execute(sa.delete(table).where(id_col == row[id_column]))
+        bind.execute(sa.delete(table).where(sa.and_(*delete_conditions)))

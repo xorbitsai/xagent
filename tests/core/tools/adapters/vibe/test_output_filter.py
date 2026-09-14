@@ -2,6 +2,8 @@
 Unit tests for output filter module.
 """
 
+import json
+
 from xagent.config import (
     get_tool_max_field_count,
     get_tool_max_output_length,
@@ -407,3 +409,110 @@ def test_tuple_max_fields_truncation():
     assert result[0] == "item1"
     assert result[1] == "item2"
     assert result[2] == TRUNCATED_ITEMS_TEMPLATE.format(count=2)
+
+
+def _large_json_payload(num_rows: int = 500) -> str:
+    """A realistic large JSON payload: a status envelope wrapping a data list."""
+    data = json.dumps(
+        {
+            "status": "success",
+            "cursor": "opaque-pagination-cursor-abc123",
+            "total_count": num_rows,
+            "data": [
+                {
+                    "id": f"ad_{i:05d}",
+                    "name": f"Ad campaign number {i}",
+                    "impressions": i * 137,
+                    "clicks": i * 3,
+                    "spend": round(i * 0.42, 2),
+                    "notes": "performance summary " * 5,
+                }
+                for i in range(num_rows)
+            ],
+        },
+        ensure_ascii=False,
+    )
+    return data
+
+
+def test_json_truncation_keeps_result_parseable():
+    """A large JSON string exceeding max_chars is trimmed, not char-sliced."""
+    payload = _large_json_payload()
+    filter = _create_filter(max_chars=2000)
+
+    result = filter.filter(payload, "test_tool")
+
+    assert isinstance(result, str)
+    assert len(result) <= 2000
+    parsed = json.loads(result)  # must not raise - still valid JSON
+    assert parsed["status"] == "success"
+
+
+def test_json_truncation_drops_trailing_items_and_preserves_metadata():
+    """Trimming removes whole trailing rows from the largest list field and
+    keeps unrelated fields (pagination cursor, status) untouched."""
+    payload = _large_json_payload()
+    original = json.loads(payload)
+    filter = _create_filter(max_chars=3000)
+
+    result = filter.filter(payload, "test_tool")
+    parsed = json.loads(result)
+
+    assert parsed["status"] == original["status"]
+    assert parsed["cursor"] == original["cursor"]
+    assert parsed["total_count"] == original["total_count"]
+    assert len(parsed["data"]) < len(original["data"])
+    # Kept rows are untouched, real dicts (not raw sliced fragments)
+    for row in parsed["data"][:-1]:
+        assert isinstance(row, dict)
+        assert "id" in row
+    # Last entry communicates how many rows were dropped
+    assert TRUNCATED_ITEMS_MESSAGE in parsed["data"][-1]
+
+
+def test_json_truncation_falls_back_for_invalid_json():
+    """Non-JSON strings still use the raw character-slice fallback."""
+    filter = _create_filter(max_chars=50)
+    result = filter.filter("not json " * 50, "test_tool")
+
+    assert result.startswith("not json ")
+    assert result.endswith(DEFAULT_TRUNCATION_MESSAGE)
+
+
+def test_json_truncation_falls_back_when_no_list_present():
+    """JSON with no list field to trim falls back to raw character slicing."""
+    payload = json.dumps({"message": "x" * 500, "status": "success"})
+    filter = _create_filter(max_chars=50)
+
+    result = filter.filter(payload, "test_tool")
+
+    assert result.endswith(DEFAULT_TRUNCATION_MESSAGE)
+
+
+def test_json_truncation_does_not_drop_items_when_compacting_alone_fits():
+    """A pretty-printed (indented) JSON string can exceed max_chars purely from
+    whitespace; if compacting it (keeping every item) already fits, no items
+    should be dropped and no truncation marker should be added."""
+    data = {"status": "ok", "data": list(range(100))}
+    raw = json.dumps(data, indent=4)
+    compact_full = json.dumps(data, ensure_ascii=False)
+    filter = _create_filter(max_chars=len(compact_full) + 5)
+
+    result = filter.filter(raw, "test_tool")
+    parsed = json.loads(result)
+
+    assert len(parsed["data"]) == 100
+    assert parsed["data"] == list(range(100))
+
+
+def test_json_truncation_root_level_list():
+    """A bare JSON array (no wrapping object) is trimmed in place."""
+    payload = json.dumps([{"id": i, "value": "x" * 50} for i in range(200)])
+    filter = _create_filter(max_chars=1000)
+
+    result = filter.filter(payload, "test_tool")
+    parsed = json.loads(result)
+
+    assert isinstance(parsed, list)
+    assert len(parsed) < 200
+    assert TRUNCATED_ITEMS_MESSAGE in parsed[-1]

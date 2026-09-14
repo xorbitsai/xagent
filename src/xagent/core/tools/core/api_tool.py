@@ -8,12 +8,71 @@ import base64
 import json
 import logging
 import os
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Mapping, Optional, Union
 from urllib.parse import urlencode, urlparse
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+# Fixed or tenant-subdomain API hosts already covered by a dedicated,
+# credentialed MCP connector (see src/xagent/web/tools/mcp/). A caller who
+# reaches this generic, credential-less tool for one of these - typically an
+# agent that couldn't find a write tool on the real connector and fell back
+# to hand-rolling the REST call - has no way to attach that connector's OAuth
+# token here, so the request is guaranteed to 401/403 regardless of whether
+# the connector itself is healthy. That failure was previously indistinguishable
+# from an actually-broken connection (see the HubSpot deal-write incident this
+# guard was added for: reads kept working the whole time via the real
+# connector, but the raw fallback calls' 401s got diagnosed as "HubSpot
+# connection broken"). Entries are the domain as it would be matched by
+# _hostname_matches_connector_domain (exact host or "*.<domain>"), not a
+# literal example hostname - deputy.com/zendesk.com/salesforce.com/
+# myshopify.com/posthog.com/mixpanel.com are multi-tenant services where the
+# real host is a customer-specific subdomain.
+_KNOWN_CONNECTOR_DOMAINS: tuple[tuple[str, str], ...] = (
+    ("hubapi.com", "HubSpot"),
+    ("slack.com", "Slack"),
+    ("api.stripe.com", "Stripe"),
+    ("api.github.com", "GitHub"),
+    ("graph.microsoft.com", "Microsoft Graph (Outlook/OneDrive/Teams)"),
+    ("graph.facebook.com", "Meta (Facebook/Instagram)"),
+    ("api.linkedin.com", "LinkedIn"),
+    ("api.intercom.io", "Intercom"),
+    ("api.linear.app", "Linear"),
+    ("api.zoom.us", "Zoom"),
+    ("googleapis.com", "Google"),
+    ("api.atlassian.com", "Jira"),
+    ("api.chartmogul.com", "ChartMogul"),
+    ("api.employmenthero.com", "Employment Hero"),
+    ("api.myob.com", "MYOB"),
+    ("zendesk.com", "Zendesk"),
+    ("deputy.com", "Deputy"),
+    ("myshopify.com", "Shopify"),
+    ("posthog.com", "PostHog"),
+    ("mixpanel.com", "Mixpanel"),
+)
+
+
+def _hostname_matches_connector_domain(hostname: str, domain: str) -> bool:
+    hostname = hostname.lower()
+    domain = domain.lower()
+    return hostname == domain or hostname.endswith(f".{domain}")
+
+
+def _match_known_connector_domain(hostname: str) -> Optional[str]:
+    """Return the connector name if ``hostname`` belongs to one of
+    ``_KNOWN_CONNECTOR_DOMAINS``, else ``None``."""
+    for domain, label in _KNOWN_CONNECTOR_DOMAINS:
+        if _hostname_matches_connector_domain(hostname, domain):
+            return label
+    return None
+
+
+def _has_authorization_header(headers: Optional[Mapping[str, str]]) -> bool:
+    if not headers:
+        return False
+    return any(key.lower() == "authorization" for key in headers)
 
 
 class APIClientCore:
@@ -83,6 +142,36 @@ class APIClientCore:
                 "headers": {},
                 "body": None,
                 "error": f"Invalid URL: {url}",
+            }
+
+        # Refuse an unauthenticated call to a domain already covered by a
+        # dedicated connector - this tool has no stored credential for it, so
+        # the request would only fail with a misleading 401/403 (see
+        # _KNOWN_CONNECTOR_DOMAINS above). An explicit auth_token or
+        # Authorization header means the caller has their own credential and
+        # genuinely intends a direct call, so that combination is let through.
+        connector_label = _match_known_connector_domain(urlparse(url).hostname or "")
+        if (
+            connector_label
+            and not auth_token
+            and not _has_authorization_header(headers)
+        ):
+            message = (
+                f"{url} is a {connector_label} API endpoint. This generic api_call "
+                f"tool has no stored credential for {connector_label} and this "
+                "request would only fail with an unauthenticated 401/403, not "
+                "indicate a real connection problem - use the dedicated "
+                f"{connector_label} connector tools instead. If you have your own "
+                "API token for this service, pass it via auth_type/auth_token (or "
+                "an Authorization header) to make the call anyway."
+            )
+            logger.warning(f"🚫 API Call blocked: {method} {url} - {message}")
+            return {
+                "success": False,
+                "status_code": 0,
+                "headers": {},
+                "body": None,
+                "error": message,
             }
 
         # Prepare request

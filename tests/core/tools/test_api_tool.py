@@ -9,11 +9,49 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 
 from xagent.core.tools.adapters.vibe.api_tool import APICallArgs, APITool
-from xagent.core.tools.core.api_tool import APIClientCore, call_api
+from xagent.core.tools.core.api_tool import (
+    APIClientCore,
+    _hostname_matches_connector_domain,
+    _match_known_connector_domain,
+    call_api,
+)
 
 
 def _single_value_query_args(url: str) -> dict[str, str]:
     return {key: values[-1] for key, values in parse_qs(urlparse(url).query).items()}
+
+
+class TestMatchKnownConnectorDomain:
+    def test_matches_exact_host(self):
+        assert _match_known_connector_domain("api.github.com") == "GitHub"
+
+    def test_matches_subdomain_of_a_multi_tenant_service(self):
+        assert _match_known_connector_domain("acme.myshopify.com") == "Shopify"
+        assert _match_known_connector_domain("acme.zendesk.com") == "Zendesk"
+
+    def test_matches_any_googleapis_subdomain(self):
+        assert _match_known_connector_domain("gmail.googleapis.com") == "Google"
+        assert _match_known_connector_domain("oauth2.googleapis.com") == "Google"
+
+    def test_is_case_insensitive(self):
+        assert _match_known_connector_domain("API.HUBAPI.COM") == "HubSpot"
+
+    def test_does_not_match_an_unrelated_domain(self):
+        assert _match_known_connector_domain("httpbin.org") is None
+
+    def test_does_not_match_a_lookalike_suffix(self):
+        """"notzendesk.com" shares a suffix with "zendesk.com" as a raw
+        string but is not "*.zendesk.com" - the dot-boundary check in
+        _hostname_matches_connector_domain must reject it, not just do a
+        substring/endswith check on the bare strings."""
+        assert _match_known_connector_domain("notzendesk.com") is None
+
+    def test_does_not_match_domain_as_a_trailing_path_look_alike(self):
+        """A hostname that merely contains the target domain as a substring
+        elsewhere (not as its own suffix) must not match."""
+        assert _hostname_matches_connector_domain(
+            "zendesk.com.evil.example", "zendesk.com"
+        ) is False
 
 
 @pytest.fixture
@@ -167,6 +205,67 @@ class TestAPIClientCore:
 
         assert result["success"] is False
         assert "error" in result
+
+    @pytest.mark.asyncio
+    async def test_blocks_unauthenticated_call_to_known_connector_domain(self):
+        """A raw call to a domain covered by a dedicated connector (e.g. the
+        agent falling back to api_call because it couldn't find a write tool
+        on the real connector) must fail fast with a clear message, not a
+        misleading 401/403 that looks like a broken connection."""
+        client = APIClientCore()
+        result = await client.call_api(
+            url="https://api.hubapi.com/crm/v3/objects/deals/1",
+            method="PATCH",
+        )
+
+        assert result["success"] is False
+        assert result["status_code"] == 0
+        assert "HubSpot" in result["error"]
+        assert "connector tools instead" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_blocks_known_connector_subdomain(self):
+        """Multi-tenant connectors (Zendesk, Shopify, etc.) are matched by
+        domain suffix, not just the exact host."""
+        client = APIClientCore()
+        result = await client.call_api(url="https://acme.zendesk.com/api/v2/tickets")
+
+        assert result["success"] is False
+        assert "Zendesk" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_allows_known_connector_domain_with_explicit_auth_token(
+        self, mock_httpbin: None
+    ):
+        """An explicit auth_token means the caller has their own credential
+        and genuinely intends a direct call - the guard must not block it."""
+        client = APIClientCore()
+        result = await client.call_api(
+            url="https://api.hubapi.com/some/endpoint",
+            auth_type="bearer",
+            auth_token="a-private-app-token",
+        )
+
+        assert "error" not in result or result.get("status_code") != 0
+
+    @pytest.mark.asyncio
+    async def test_allows_known_connector_domain_with_authorization_header(
+        self, mock_httpbin: None
+    ):
+        client = APIClientCore()
+        result = await client.call_api(
+            url="https://api.hubapi.com/some/endpoint",
+            headers={"Authorization": "Bearer a-private-app-token"},
+        )
+
+        assert "error" not in result or result.get("status_code") != 0
+
+    @pytest.mark.asyncio
+    async def test_does_not_block_an_unrelated_domain(self, mock_httpbin: None):
+        client = APIClientCore()
+        result = await client.call_api(url="https://httpbin.org/get")
+
+        assert result["success"] is True
 
     @pytest.mark.asyncio
     async def test_retry_mechanism(self, mock_httpbin: None):

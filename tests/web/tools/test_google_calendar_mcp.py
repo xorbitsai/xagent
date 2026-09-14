@@ -7928,3 +7928,36 @@ def test_kind_conversion_revalidates_retained_rule(monkeypatch, rule):
         assert result["status"] == "error"
         assert "must not be used with an all-day DATE start" in result["message"]
         service.events.return_value.update.assert_not_called()
+
+
+def test_kind_conversion_allows_parameterized_rrule(monkeypatch):
+    event = {
+        "id": "existing-1",
+        "start": {
+            "dateTime": "2026-08-26T09:00:00+08:00",
+            "timeZone": "Asia/Shanghai",
+        },
+        "end": {
+            "dateTime": "2026-08-26T10:00:00+08:00",
+            "timeZone": "Asia/Shanghai",
+        },
+        "recurrence": ["RRULE;X-CUSTOM=provider:FREQ=DAILY;COUNT=3"],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-08-26",
+            end_time="2026-08-27",
+            ignore_conflicts=True,
+            acknowledge_recurring_exception_risk=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    body = service.events.return_value.update.call_args.kwargs["body"]
+    assert body["recurrence"] == event["recurrence"]
+    assert body["start"] == {"date": "2026-08-26"}
+    assert body["end"] == {"date": "2026-08-27"}

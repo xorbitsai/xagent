@@ -468,6 +468,12 @@ def _property_header(line: str) -> str:
     return line
 
 
+def _property_value(line: str) -> str:
+    """Return the content after an RFC 5545 property's first unquoted colon."""
+    header = _property_header(line)
+    return "" if header == line else line[len(header) + 1 :]
+
+
 def _property_parameters(header: str) -> list[str]:
     """Split an RFC 5545 property header on unquoted semicolons."""
     parameters: list[str] = []
@@ -900,7 +906,7 @@ def _validate_kind_conversion(
     """
     lines = event.get("recurrence") or []
     if not isinstance(lines, list) or any(
-        not isinstance(line, str) or not line.strip().upper().startswith("RRULE:")
+        not isinstance(line, str) or _recurrence_property_name(line) != "RRULE"
         for line in lines
     ):
         raise ValueError(
@@ -909,7 +915,7 @@ def _validate_kind_conversion(
             "their conversion is not supported"
         )
     for line in lines:
-        parts = parse_rrule(line, start_value, timezone)
+        parts = parse_rrule(_property_value(line), start_value, timezone)
         until = parts.get("UNTIL")
         if until and (len(until) == 8) != is_all_day:
             raise ValueError(
@@ -2578,7 +2584,7 @@ def google_calendar_update_events(
             for retained_rrule in existing_recurrence:
                 if _recurrence_property_name(retained_rrule) == "RRULE":
                     _normalize_rrule(
-                        retained_rrule,
+                        _property_value(retained_rrule),
                         cast(str, current_start_value),
                         effective_start_timezone,
                     )

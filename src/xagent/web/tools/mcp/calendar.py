@@ -590,7 +590,16 @@ def _event_time_changed(
         old_key = old_key.replace(tzinfo=resolve_zoneinfo(old_timezone))
     if new_key.tzinfo is None and new_timezone:
         new_key = new_key.replace(tzinfo=resolve_zoneinfo(new_timezone))
+    if (old_key.tzinfo is None) != (new_key.tzinfo is None):
+        return True
     return bool(old_key != new_key)
+
+
+def _timezone_names_equal(left: str | None, right: str | None) -> bool:
+    """Compare RFC 5545 timezone parameter values case-insensitively."""
+    if left is None or right is None:
+        return left is right
+    return left.casefold() == right.casefold()
 
 
 def _require_datetime_matches_timezone(
@@ -1525,7 +1534,9 @@ def google_calendar_update_events(
                 if (
                     existing_start_timezone
                     and existing_end_timezone
-                    and existing_start_timezone != existing_end_timezone
+                    and not _timezone_names_equal(
+                        existing_start_timezone, existing_end_timezone
+                    )
                 ):
                     raise ValueError(
                         "the existing event uses different start and end timeZones; "
@@ -1558,7 +1569,8 @@ def google_calendar_update_events(
             and not resulting_start_is_all_day
             and timezone
             and (
-                timezone != existing_start_timezone or timezone != existing_end_timezone
+                not _timezone_names_equal(timezone, existing_start_timezone)
+                or not _timezone_names_equal(timezone, existing_end_timezone)
             )
         )
 
@@ -2219,7 +2231,7 @@ def google_calendar_update_events(
                 not is_all_day
                 and timezone
                 and any(
-                    timezone != existing_timezone
+                    not _timezone_names_equal(timezone, existing_timezone)
                     for existing_timezone in (
                         existing_start_timezone,
                         existing_end_timezone,
@@ -2230,7 +2242,7 @@ def google_calendar_update_events(
                 not is_all_day
                 and timezone
                 and any(
-                    recurrence_tzid != timezone
+                    not _timezone_names_equal(recurrence_tzid, timezone)
                     for recurrence_tzid in _recurrence_tzids(auxiliary_recurrence)
                 )
             )

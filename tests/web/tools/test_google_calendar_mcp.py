@@ -5299,6 +5299,21 @@ def test_recurrence_tzids_ignores_semicolons_inside_quoted_parameter_values():
     ) == {"America/New_York"}
 
 
+def test_event_time_changed_treats_awareness_mismatch_as_a_change():
+    assert calendar._event_time_changed(
+        "2026-09-01T09:00:00Z",
+        "2026-09-01T09:00:00",
+        old_timezone=None,
+        new_timezone=None,
+    )
+
+
+def test_timezone_names_compare_case_insensitively_and_handle_none():
+    assert calendar._timezone_names_equal("Asia/Shanghai", "asia/shanghai")
+    assert calendar._timezone_names_equal(None, None)
+    assert not calendar._timezone_names_equal("UTC", None)
+
+
 def test_reject_nonpositive_event_window_reports_malformed_datetime():
     with pytest.raises(ValueError, match="valid ISO 8601 dateTimes"):
         calendar._reject_nonpositive_event_window(
@@ -5427,6 +5442,34 @@ def test_update_events_allows_fully_specified_change_with_exceptions(monkeypatch
         "RRULE:FREQ=WEEKLY;COUNT=3",
         "EXDATE:20260903T090000Z",
     ]
+
+
+def test_update_events_matches_exception_tzid_case_insensitively(monkeypatch):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-09-01T09:00:00", "timeZone": "Asia/Shanghai"},
+        "end": {"dateTime": "2026-09-01T10:00:00", "timeZone": "Asia/Shanghai"},
+        "recurrence": [
+            "RRULE:FREQ=DAILY;COUNT=5",
+            "EXDATE;TZID=asia/shanghai:20260903T090000",
+        ],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-09-02T09:00:00",
+            end_time="2026-09-02T10:00:00",
+            recurrence="FREQ=WEEKLY;COUNT=3",
+            timezone="Asia/Shanghai",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    service.events.return_value.update.assert_called_once()
 
 
 def test_update_events_allows_metadata_update_on_mismatched_legacy_times(

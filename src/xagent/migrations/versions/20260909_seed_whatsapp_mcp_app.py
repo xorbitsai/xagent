@@ -1,7 +1,7 @@
 """seed built-in WhatsApp Business (Meta OAuth) MCP connector
 
 Revision ID: 20260909_seed_whatsapp_mcp_app
-Revises: 20260912_shared_task_execution
+Revises: 20260914_durable_sandbox_lifecycles
 Create Date: 2026-09-09 00:00:00.000000
 
 """
@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 # revision identifiers, used by Alembic.
 revision: str = "20260909_seed_whatsapp_mcp_app"
-down_revision: Union[str, None] = "20260912_shared_task_execution"
+down_revision: Union[str, None] = "20260914_durable_sandbox_lifecycles"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

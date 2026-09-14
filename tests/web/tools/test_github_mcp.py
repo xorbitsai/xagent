@@ -3652,7 +3652,7 @@ def test_create_or_update_file_hints_when_sha_missing_for_existing_file(monkeypa
         "request",
         Mock(
             return_value=MockResponse(
-                json_data={"message": 'Invalid request.\n\n"sha" wasn\'t supplied.'},
+                json_data={"message": "Invalid request: sha wasn't supplied."},
                 status_code=409,
             )
         ),

@@ -37,6 +37,20 @@ def _load_normalize_migration_module():
     return module
 
 
+def _load_facebook_scope_migration_module():
+    migration_file = (
+        Path(__file__).parent.parent.parent
+        / "src/xagent/migrations/versions/20260728_add_facebook_pages_read_user_content_scope.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "add_facebook_pages_read_user_content_scope_migration", migration_file
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
 def _operations(connection):
     context = MigrationContext.configure(connection)
     return Operations(context)
@@ -123,51 +137,37 @@ def test_upgrade_inserts_meta_provider_and_public_apps(tmp_path):
     }
 
 
-def test_seed_rows_match_registry(tmp_path):
-    """The migration snapshot and the runtime registry must define the same
-    rows. Drift here (e.g. a later normalization migration rewriting these
-    apps' launch_config) means a downgrade chain that passes through the
-    normalization migration would see the seeded rows as "modified" and
-    incorrectly preserve them -- see
-    test_downgrade_cleans_up_after_descendant_normalization_migration."""
-    from xagent.web.builtin_mcp_registry import (
-        get_builtin_oauth_provider_rows,
-        get_builtin_public_mcp_app_rows,
-    )
-
-    migration = _load_migration_module()
-
-    registry_apps = {
-        row["app_id"]: row
-        for row in get_builtin_public_mcp_app_rows()
-        if row["app_id"] in {"facebook", "instagram"}
-    }
-    migration_apps = {row["app_id"]: row for row in migration._meta_app_rows()}
-    assert migration_apps == registry_apps
-
-    registry_provider = next(
-        row
-        for row in get_builtin_oauth_provider_rows()
-        if row["provider_name"] == "meta"
-    )
-    assert migration._meta_provider_row() == registry_provider
-
-
 def test_downgrade_cleans_up_after_descendant_normalization_migration(tmp_path):
     """20260715_normalize_builtin_mcp_launch runs after this migration and
     unconditionally rewrites facebook/instagram's launch_config (its own
-    downgrade is a deliberate no-op). A downgrade chain that passes through
-    it and then back through this migration must still remove the seeded
-    apps and provider, not preserve them as if an operator had edited them."""
+    downgrade is a deliberate no-op).
+    20260728_add_facebook_pages_read_user_content_scope runs later still and
+    adds a scope to facebook's oauth_scopes, but -- unlike 20260715 -- it DOES
+    revert that on its own downgrade. A downgrade chain that runs both of
+    those descendant migrations' downgrades (in reverse revision order, as
+    Alembic would) and then back through this migration must still remove
+    the seeded apps and provider, not preserve them as if an operator had
+    edited them.
+
+    (No test here asserts this migration's frozen snapshot equals the live
+    registry: 20260728 proves that isn't always true by design -- a
+    downstream migration can own a reversible delta on a field this
+    migration seeded, in which case the frozen snapshot correctly stays at
+    the *original* value forever, matching what a full downgrade chain
+    actually restores, not the live registry's current value.)"""
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
     normalize_migration = _load_normalize_migration_module()
+    facebook_scope_migration = _load_facebook_scope_migration_module()
     with engine.begin() as connection:
         _create_tables(connection)
         with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()
         with patch.object(normalize_migration, "op", _operations(connection)):
             normalize_migration.upgrade()
+        with patch.object(facebook_scope_migration, "op", _operations(connection)):
+            facebook_scope_migration.upgrade()
+            facebook_scope_migration.downgrade()
         with patch.object(migration, "op", _operations(connection)):
             migration.downgrade()
         assert not {"facebook", "instagram"} & _app_ids(connection)

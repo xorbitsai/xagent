@@ -37,6 +37,20 @@ def _load_normalize_migration_module():
     return module
 
 
+def _load_onedrive_description_migration_module():
+    migration_file = (
+        Path(__file__).parent.parent.parent
+        / "src/xagent/migrations/versions/20260911_update_onedrive_description.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "update_onedrive_description_migration", migration_file
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
 def _operations(connection):
     return Operations(MigrationContext.configure(connection))
 
@@ -135,51 +149,38 @@ def test_upgrade_is_idempotent(tmp_path):
         assert provider_count == 1
 
 
-def test_seed_rows_match_registry(tmp_path):
-    """The migration snapshot and the runtime registry must define the same
-    rows. Drift here (e.g. a later normalization migration rewriting these
-    apps' launch_config) means a downgrade chain that passes through the
-    normalization migration would see the seeded rows as "modified" and
-    incorrectly preserve them -- see
-    test_downgrade_cleans_up_after_descendant_normalization_migration."""
-    from xagent.web.builtin_mcp_registry import (
-        get_builtin_oauth_provider_rows,
-        get_builtin_public_mcp_app_rows,
-    )
-
-    migration = _load_migration_module()
-
-    registry_apps = {
-        row["app_id"]: row
-        for row in get_builtin_public_mcp_app_rows()
-        if row["app_id"] in {"teams", "outlook", "onedrive"}
-    }
-    migration_apps = {row["app_id"]: row for row in migration._microsoft_app_rows()}
-    assert migration_apps == registry_apps
-
-    registry_provider = next(
-        row
-        for row in get_builtin_oauth_provider_rows()
-        if row["provider_name"] == "microsoft"
-    )
-    assert migration._microsoft_provider_row() == registry_provider
-
-
 def test_downgrade_cleans_up_after_descendant_normalization_migration(tmp_path):
     """20260715_normalize_builtin_mcp_launch runs after this migration and
     unconditionally rewrites teams/outlook/onedrive's launch_config (its own
-    downgrade is a deliberate no-op). A downgrade chain that passes through
-    it and then back through this migration must still remove the seeded
-    apps and provider, not preserve them as if an operator had edited them."""
+    downgrade is a deliberate no-op). 20260911_update_onedrive_description
+    runs later still and rewrites onedrive's description, but -- unlike
+    20260715 -- it DOES revert that on its own downgrade. A downgrade chain
+    that runs both of those descendant migrations' downgrades (in reverse
+    revision order, as Alembic would) and then back through this migration
+    must still remove the seeded apps and provider, not preserve them as if
+    an operator had edited them.
+
+    (No test here asserts this migration's frozen snapshot equals the live
+    registry: 20260911 proves that isn't always true by design -- a
+    downstream migration can own a reversible delta on a field this
+    migration seeded, in which case the frozen snapshot correctly stays at
+    the *original* value forever, matching what a full downgrade chain
+    actually restores, not the live registry's current value.)"""
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
     normalize_migration = _load_normalize_migration_module()
+    onedrive_description_migration = _load_onedrive_description_migration_module()
     with engine.begin() as connection:
         _create_tables(connection)
         with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()
         with patch.object(normalize_migration, "op", _operations(connection)):
             normalize_migration.upgrade()
+        with patch.object(
+            onedrive_description_migration, "op", _operations(connection)
+        ):
+            onedrive_description_migration.upgrade()
+            onedrive_description_migration.downgrade()
         with patch.object(migration, "op", _operations(connection)):
             migration.downgrade()
         assert not {"teams", "outlook", "onedrive"} & _app_ids(connection)

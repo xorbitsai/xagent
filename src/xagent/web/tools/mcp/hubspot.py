@@ -60,8 +60,8 @@ DEFAULT_DEAL_PROPERTIES = [
     "closedate",
     "hs_lastmodifieddate",
     # dealstage/pipeline are opaque IDs on a custom pipeline, and closedate
-    # is set on open deals too (and isn't cleared on reopen), so neither
-    # reliably signals whether a deal is closed. hs_is_closed(_won|_lost)
+    # is set on open deals too (and typically isn't cleared on reopen), so
+    # neither reliably signals whether a deal is closed. hs_is_closed(_won|_lost)
     # are HubSpot's own computed closed-state flags - see
     # https://knowledge.hubspot.com/properties/hubspots-default-deal-properties
     "hs_is_closed",
@@ -487,7 +487,12 @@ def _get_associated_deals(
         max(1, min(limit, 100)),
     )
     if not deal_ids:
-        return {"deals": [], "has_more": has_more}
+        return {
+            "deals": [],
+            "has_more": has_more,
+            "truncated": False,
+            "missing_deal_ids": [],
+        }
 
     batch = _request(
         "POST",
@@ -504,25 +509,52 @@ def _get_associated_deals(
     ]
     # A partial batch-read (e.g. an archived deal dropped between the
     # association listing above and this call) must be surfaced, not
-    # silently returned as if every requested id came back.
-    missing_deal_ids = sorted(set(deal_ids) - {item.get("id") for item in results})
+    # silently returned as if every requested id came back. Sorted by str()
+    # rather than directly: a malformed association result missing its id
+    # puts None into deal_ids, and sorted() can't compare None to str.
+    returned_ids = {item.get("id") for item in results}
+    missing_deal_ids = sorted(set(deal_ids) - returned_ids, key=str)
 
-    def _build(deals_slice: list[Any], truncated: bool) -> dict[str, Any]:
-        payload: dict[str, Any] = {
+    def _build(
+        deals_slice: list[Any], missing_slice: list[Any], truncated: bool
+    ) -> dict[str, Any]:
+        return {
             "deals": deals_slice,
             "has_more": has_more or truncated,
+            "truncated": truncated,
+            "missing_deal_ids": missing_slice,
         }
-        if truncated:
-            payload["truncated"] = True
-        if missing_deal_ids:
-            payload["missing_deal_ids"] = missing_deal_ids
-        return payload
 
     max_output_length = get_tool_max_output_length()
-    payload = _build(deals, False)
-    while len(_success(**payload)) > max_output_length and deals:
-        deals = deals[: len(deals) // 2]
-        payload = _build(deals, True)
+    payload = _build(deals, missing_deal_ids, False)
+    truncated = False
+    # Halve whichever list is still non-empty - missing_deal_ids too, not
+    # just deals, so a large batch-read shortfall can't alone keep the
+    # response over the limit once deals itself has nothing left to give.
+    while len(_success(**payload)) > max_output_length and (deals or missing_deal_ids):
+        truncated = True
+        if deals:
+            deals = deals[: len(deals) // 2]
+        else:
+            missing_deal_ids = missing_deal_ids[: len(missing_deal_ids) // 2]
+        payload = _build(deals, missing_deal_ids, truncated)
+    if truncated and not deals and not missing_deal_ids:
+        # Collapsing everything away means even the single largest
+        # remaining entry didn't fit alone - "retry with a smaller `limit`"
+        # isn't guaranteed to help here, so say so plainly instead of
+        # returning an empty result indistinguishable from "nothing exists".
+        payload_with_message = {
+            **payload,
+            "message": (
+                "Every deal (and/or every id HubSpot's batch lookup didn't "
+                "return) was individually too large to fit the output size "
+                "limit, so none could be returned. Retrying with a smaller "
+                "`limit` may surface different records if more exist, but "
+                "cannot shrink an individually oversized record."
+            ),
+        }
+        if len(_success(**payload_with_message)) <= max_output_length:
+            payload = payload_with_message
     return payload
 
 
@@ -532,13 +564,14 @@ def hubspot_get_contact_deals(contact_id: str, limit: int = 100) -> str:
     List every deal associated with a HubSpot contact - open and closed alike
     - including deal stage, pipeline, amount, close date, and the closed-state
     flags hs_is_closed/hs_is_closed_won/hs_is_closed_lost. Use those flags to
-    tell open from closed, not dealstage/pipeline/closedate (see
-    DEFAULT_DEAL_PROPERTIES in this file for why). Returns at most `limit`
-    deals (max 100). `has_more` is true when there are more deals than
-    returned, either because of `limit` or because the response was trimmed
-    to fit the output size limit (`truncated` is then also true);
-    `missing_deal_ids` lists any requested deal id HubSpot's own batch
-    lookup silently dropped.
+    tell open from closed: dealstage and pipeline are opaque IDs on a custom
+    pipeline, and closedate is set on open deals too (and typically isn't
+    cleared when a deal is reopened), so neither reliably signals closed on
+    its own. Returns at most `limit` deals (max 100). `has_more` is true when
+    there are more deals than returned, either because of `limit` or because
+    the response was trimmed to fit the output size limit (`truncated` is
+    then also true); `missing_deal_ids` lists any requested deal id HubSpot's
+    own batch lookup silently dropped (empty when none were).
 
     A contact's deals are not necessarily the same as its company's deals: two
     contacts can share a name (e.g. the same person with a role at two
@@ -561,12 +594,13 @@ def hubspot_get_company_deals(company_id: str, limit: int = 100) -> str:
     """
     List every deal associated with a HubSpot company - open and closed alike
     - including deal stage, pipeline, amount, close date, and the closed-state
-    flags hs_is_closed/hs_is_closed_won/hs_is_closed_lost. Use those flags to
-    tell open from closed, not dealstage/pipeline/closedate (see
-    DEFAULT_DEAL_PROPERTIES in this file for why). Look up a company_id with
-    `hubspot_search_companies` first if you don't already have one. Returns
-    at most `limit` deals (max 100); `has_more`/`truncated`/`missing_deal_ids`
-    behave as in `hubspot_get_contact_deals`.
+    flags hs_is_closed/hs_is_closed_won/hs_is_closed_lost; use those flags to
+    tell open from closed rather than dealstage/pipeline/closedate (see
+    `hubspot_get_contact_deals` for why those aren't reliable on their own).
+    Look up a company_id with `hubspot_search_companies` first if you don't
+    already have one. Returns at most `limit` deals (max 100);
+    `has_more`/`truncated`/`missing_deal_ids` behave as in
+    `hubspot_get_contact_deals`.
 
     This reads the company-to-deal association directly. Do not substitute a
     contact lookup for this (e.g. searching for a person's name and calling

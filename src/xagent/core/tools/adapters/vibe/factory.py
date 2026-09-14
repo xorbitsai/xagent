@@ -957,11 +957,40 @@ class ToolFactory:
     ) -> TaskWorkspace | None:
         """Return the one workspace shared by every creator in a factory run."""
 
-        workspace = config.get_task_runtime_workspace()
+        config_attributes = getattr(config, "__dict__", {})
+        instance_workspace_getter = config_attributes.get("get_task_runtime_workspace")
+        workspace_getter = getattr(type(config), "get_task_runtime_workspace", None)
+        if callable(instance_workspace_getter):
+            workspace = instance_workspace_getter()
+        elif callable(workspace_getter):
+            workspace = workspace_getter(config)
+        else:
+            workspace = config_attributes.get("_task_runtime_workspace")
         if workspace is None:
-            workspace = ToolFactory.create_workspace(config.get_workspace_config())
+            instance_config_getter = config_attributes.get("get_workspace_config")
+            workspace_config_getter = getattr(
+                type(config), "get_workspace_config", None
+            )
+            if callable(instance_config_getter):
+                workspace_config = instance_config_getter()
+            elif callable(workspace_config_getter):
+                workspace_config = workspace_config_getter(config)
+            else:
+                workspace_config = None
+            workspace = ToolFactory.create_workspace(workspace_config)
             if workspace is not None:
-                config.set_task_runtime_workspace(workspace)
+                instance_workspace_setter = config_attributes.get(
+                    "set_task_runtime_workspace"
+                )
+                workspace_setter = getattr(
+                    type(config), "set_task_runtime_workspace", None
+                )
+                if callable(instance_workspace_setter):
+                    instance_workspace_setter(workspace)
+                elif callable(workspace_setter):
+                    workspace_setter(config, workspace)
+                else:
+                    setattr(config, "_task_runtime_workspace", workspace)
         return workspace
 
     @staticmethod

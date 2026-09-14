@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import mimetypes
 from pathlib import Path, PureWindowsPath
 from typing import Any
@@ -222,10 +223,23 @@ def build_workspace_file_ref(
     else:
         final_file_id = file_id or workspace.get_file_id_from_path(str(resolved_path))
         if not final_file_id:
-            final_file_id = workspace.register_file(
-                str(resolved_path),
-                mime_type=mime_type,
-            )
+            register_file = workspace.register_file
+            try:
+                parameters = inspect.signature(register_file).parameters.values()
+                accepts_mime_type = any(
+                    parameter.name == "mime_type"
+                    or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in parameters
+                )
+            except (TypeError, ValueError):
+                accepts_mime_type = True
+            if accepts_mime_type:
+                final_file_id = register_file(
+                    str(resolved_path),
+                    mime_type=mime_type,
+                )
+            else:
+                final_file_id = register_file(str(resolved_path))
 
     workspace_root = workspace.workspace_dir.resolve()
     file_ref = build_file_ref(

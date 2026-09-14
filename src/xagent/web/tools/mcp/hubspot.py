@@ -60,9 +60,10 @@ DEFAULT_DEAL_PROPERTIES = [
     "closedate",
     "hs_lastmodifieddate",
     # dealstage/pipeline are opaque IDs on a custom pipeline, and closedate
-    # is set on open deals too (and isn't cleared on reopen) - these three
-    # are HubSpot's own authoritative closed-state flags, so a caller can
-    # tell open from closed without guessing at stage semantics.
+    # is set on open deals too (and isn't cleared on reopen), so neither
+    # reliably signals whether a deal is closed. hs_is_closed(_won|_lost)
+    # are HubSpot's own computed closed-state flags - see
+    # https://knowledge.hubspot.com/properties/hubspots-default-deal-properties
     "hs_is_closed",
     "hs_is_closed_won",
     "hs_is_closed_lost",
@@ -475,12 +476,11 @@ def hubspot_update_company(company_id: str, properties_json: str) -> str:
 def _get_associated_deals(
     object_type: str, object_id: str, limit: int
 ) -> dict[str, Any]:
-    """Fetch the deals associated with a HubSpot contact or company record.
+    """Fetch deals associated with a HubSpot contact or company record.
 
-    Shared by ``hubspot_get_contact_deals`` and ``hubspot_get_company_deals``:
-    both associations follow the same shape (list ids, then batch-read the
-    deal properties), and keeping one implementation means a fix to the
-    pagination or batch-read logic does not need to be made twice.
+    Halves the deal list (mirroring _paged_list - see its docstring for why)
+    if the response would otherwise be hard-truncated into invalid JSON past
+    the platform's output limit.
     """
     deal_ids, has_more = _list_association_ids(
         f"/crm/v3/objects/{object_type}/{object_id}/associations/deals",
@@ -489,7 +489,7 @@ def _get_associated_deals(
     if not deal_ids:
         return {"deals": [], "has_more": has_more}
 
-    deals = _request(
+    batch = _request(
         "POST",
         "/crm/v3/objects/deals/batch/read",
         body={
@@ -497,13 +497,33 @@ def _get_associated_deals(
             "inputs": [{"id": deal_id} for deal_id in deal_ids],
         },
     )
-    return {
-        "deals": [
-            {"id": item.get("id"), "properties": item.get("properties", {})}
-            for item in deals.get("results", [])
-        ],
-        "has_more": has_more,
-    }
+    results = batch.get("results", [])
+    deals = [
+        {"id": item.get("id"), "properties": item.get("properties", {})}
+        for item in results
+    ]
+    # A partial batch-read (e.g. an archived deal dropped between the
+    # association listing above and this call) must be surfaced, not
+    # silently returned as if every requested id came back.
+    missing_deal_ids = sorted(set(deal_ids) - {item.get("id") for item in results})
+
+    def _build(deals_slice: list[Any], truncated: bool) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "deals": deals_slice,
+            "has_more": has_more or truncated,
+        }
+        if truncated:
+            payload["truncated"] = True
+        if missing_deal_ids:
+            payload["missing_deal_ids"] = missing_deal_ids
+        return payload
+
+    max_output_length = get_tool_max_output_length()
+    payload = _build(deals, False)
+    while len(_success(**payload)) > max_output_length and deals:
+        deals = deals[: len(deals) // 2]
+        payload = _build(deals, True)
+    return payload
 
 
 @mcp.tool()
@@ -512,11 +532,13 @@ def hubspot_get_contact_deals(contact_id: str, limit: int = 100) -> str:
     List every deal associated with a HubSpot contact - open and closed alike
     - including deal stage, pipeline, amount, close date, and the closed-state
     flags hs_is_closed/hs_is_closed_won/hs_is_closed_lost. Use those flags to
-    tell open from closed: dealstage and pipeline are opaque IDs on a custom
-    pipeline, and closedate is set on open deals too (and typically isn't
-    cleared when a deal is reopened), so neither reliably signals closed on
-    its own. Returns at most `limit` deals (max 100); `has_more` is true when
-    the contact has additional deals beyond the result.
+    tell open from closed, not dealstage/pipeline/closedate (see
+    DEFAULT_DEAL_PROPERTIES in this file for why). Returns at most `limit`
+    deals (max 100). `has_more` is true when there are more deals than
+    returned, either because of `limit` or because the response was trimmed
+    to fit the output size limit (`truncated` is then also true);
+    `missing_deal_ids` lists any requested deal id HubSpot's own batch
+    lookup silently dropped.
 
     A contact's deals are not necessarily the same as its company's deals: two
     contacts can share a name (e.g. the same person with a role at two
@@ -540,11 +562,11 @@ def hubspot_get_company_deals(company_id: str, limit: int = 100) -> str:
     List every deal associated with a HubSpot company - open and closed alike
     - including deal stage, pipeline, amount, close date, and the closed-state
     flags hs_is_closed/hs_is_closed_won/hs_is_closed_lost. Use those flags to
-    tell open from closed: dealstage and pipeline are opaque IDs on a custom
-    pipeline, and closedate is set on open deals too (and typically isn't
-    cleared when a deal is reopened), so neither reliably signals closed on
-    its own. Returns at most `limit` deals (max 100); `has_more` is true when
-    the company has additional deals beyond the result.
+    tell open from closed, not dealstage/pipeline/closedate (see
+    DEFAULT_DEAL_PROPERTIES in this file for why). Look up a company_id with
+    `hubspot_search_companies` first if you don't already have one. Returns
+    at most `limit` deals (max 100); `has_more`/`truncated`/`missing_deal_ids`
+    behave as in `hubspot_get_contact_deals`.
 
     This reads the company-to-deal association directly. Do not substitute a
     contact lookup for this (e.g. searching for a person's name and calling
@@ -567,7 +589,10 @@ def hubspot_create_deal(properties_json: str, contact_id: str | None = None) -> 
     Create a HubSpot deal. properties_json is a JSON object of HubSpot deal
     properties, e.g. {"dealname": "Acme - Onboarding", "amount": "1000",
     "pipeline": "default", "dealstage": "appointmentscheduled"}.
-    If contact_id is given, the new deal is associated with that contact.
+    If contact_id is given, the new deal is associated with that contact -
+    there is no company_id param, so a deal created here won't be found by
+    `hubspot_get_company_deals` unless HubSpot separately associates it
+    with a company (e.g. via the contact's own company association).
     """
     try:
         body: dict[str, Any] = {"properties": _parse_properties(properties_json)}

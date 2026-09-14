@@ -340,13 +340,70 @@ def test_get_associated_deals_requests_authoritative_closed_state_flags(monkeypa
     requested_properties = []
     monkeypatch.setattr(hubspot.requests, "request", Mock(side_effect=fake_request))
 
-    json.loads(hubspot.hubspot_get_contact_deals("c1"))
-    json.loads(hubspot.hubspot_get_company_deals("co1"))
+    contact_result = json.loads(hubspot.hubspot_get_contact_deals("c1"))
+    company_result = json.loads(hubspot.hubspot_get_company_deals("co1"))
 
+    assert contact_result["status"] == "success"
+    assert company_result["status"] == "success"
+    assert len(requested_properties) == 2
     for properties in requested_properties:
         assert "hs_is_closed" in properties
         assert "hs_is_closed_won" in properties
         assert "hs_is_closed_lost" in properties
+
+
+def test_get_associated_deals_reports_ids_batch_read_silently_dropped(monkeypatch):
+    """A partial batch-read (e.g. an archived deal) must be surfaced, not
+    returned as if every requested id came back.
+    """
+
+    def fake_request(method, url, headers, params, json, timeout):
+        if "/associations/deals" in url:
+            return MockResponse(json_data={"results": [{"id": "d1"}, {"id": "d2"}]})
+        assert url.endswith("/crm/v3/objects/deals/batch/read")
+        # HubSpot dropped d2 from the batch-read response entirely.
+        return MockResponse(json_data={"results": [{"id": "d1", "properties": {}}]})
+
+    monkeypatch.setattr(hubspot.requests, "request", Mock(side_effect=fake_request))
+
+    result = json.loads(hubspot.hubspot_get_contact_deals("c1"))
+
+    assert result["status"] == "success"
+    assert [deal["id"] for deal in result["deals"]] == ["d1"]
+    assert result["missing_deal_ids"] == ["d2"]
+
+
+def test_get_associated_deals_halves_response_past_output_limit(monkeypatch):
+    """A large enough deal list must be halved rather than returned whole
+    and hard-truncated into invalid JSON by the platform's output filter.
+    """
+
+    def fake_request(method, url, headers, params, json, timeout):
+        if "/associations/deals" in url:
+            return MockResponse(
+                json_data={"results": [{"id": f"d{i}"} for i in range(8)]}
+            )
+        assert url.endswith("/crm/v3/objects/deals/batch/read")
+        return MockResponse(
+            json_data={
+                "results": [
+                    {"id": item["id"], "properties": {"dealname": "x" * 100}}
+                    for item in json["inputs"]
+                ]
+            }
+        )
+
+    monkeypatch.setattr(hubspot.requests, "request", Mock(side_effect=fake_request))
+    monkeypatch.setattr(hubspot, "get_tool_max_output_length", lambda: 400)
+
+    response = hubspot.hubspot_get_contact_deals("c1", limit=8)
+    result = json.loads(response)
+
+    assert len(response) <= 400
+    assert result["status"] == "success"
+    assert 0 < len(result["deals"]) < 8
+    assert result["truncated"] is True
+    assert result["has_more"] is True
 
 
 def test_create_deal_without_contact_id_sends_no_associations(monkeypatch):

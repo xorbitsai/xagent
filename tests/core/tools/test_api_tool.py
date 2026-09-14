@@ -99,6 +99,32 @@ class TestHasAuthCredentials:
     def test_false_for_no_arguments_at_all(self):
         assert not _has_auth_credentials("https://api.hubapi.com/x", None, None, None)
 
+    def test_false_for_authority_header(self):
+        """ "authority" (the HTTP/2 pseudo-header carrying the target host,
+        set automatically by many HTTP/2 clients and proxies - not a
+        credential) contains "auth" as a substring and must not
+        false-positive here, or it would silently defeat the guard for any
+        request that happens to carry one."""
+        assert not _has_auth_credentials(
+            "https://api.hubapi.com/x",
+            {"Content-Type": "application/json", "authority": "api.hubapi.com"},
+            None,
+            None,
+        )
+
+    def test_ignores_non_string_header_keys(self):
+        assert not _has_auth_credentials(
+            "https://api.hubapi.com/x", {1: "x"}, None, None
+        )  # type: ignore[dict-item]
+
+    def test_ignores_non_string_param_keys(self):
+        assert not _has_auth_credentials(
+            "https://api.hubapi.com/x",
+            None,
+            {1: "x"},
+            None,  # type: ignore[dict-item]
+        )
+
 
 @pytest.fixture
 def mock_httpbin(monkeypatch: pytest.MonkeyPatch) -> None:

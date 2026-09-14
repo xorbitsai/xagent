@@ -92,13 +92,21 @@ _AUTH_QUERY_PARAM_NAMES = frozenset(
 def _has_auth_header(headers: Optional[Mapping[str, str]]) -> bool:
     if not headers:
         return False
-    return any(
-        marker in key.lower() for key in headers for marker in _AUTH_HEADER_NAME_MARKERS
-    )
+    for key in headers:
+        # "authority" (the HTTP/2 pseudo-header carrying the target host,
+        # not a credential) contains "auth" as a substring and would
+        # otherwise false-positive here, silently defeating the guard below
+        # for any client/proxy that sets it.
+        key_lower = str(key).lower()
+        if "authority" in key_lower:
+            continue
+        if any(marker in key_lower for marker in _AUTH_HEADER_NAME_MARKERS):
+            return True
+    return False
 
 
 def _has_auth_query_param(url: str, params: Optional[Mapping[str, Any]]) -> bool:
-    query_keys = {key.lower() for key in params} if params else set()
+    query_keys = {str(key).lower() for key in params} if params else set()
     query_keys.update(key.lower() for key in parse_qs(urlparse(url).query))
     return not _AUTH_QUERY_PARAM_NAMES.isdisjoint(query_keys)
 

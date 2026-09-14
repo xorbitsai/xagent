@@ -340,6 +340,23 @@ def test_create_deal_rejects_whitespace_padded_contact_id(monkeypatch):
     mock_request.assert_not_called()
 
 
+def test_create_deal_wraps_request_errors(monkeypatch):
+    """Regression coverage for the exact incident this PR fixes: a HubSpot
+    write returning 401 must come back as a normal {"status": "error"}
+    result, not an uncaught exception - update_deal already had this test,
+    create_deal did not."""
+    monkeypatch.setattr(
+        hubspot.requests,
+        "request",
+        Mock(return_value=MockResponse(status_code=401, text="Unauthorized")),
+    )
+
+    result = json.loads(hubspot.hubspot_create_deal('{"dealname": "x"}'))
+
+    assert result["status"] == "error"
+    assert "Unauthorized" in result["message"]
+
+
 def test_update_deal_encodes_deal_id_and_sends_properties(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(json_data={"id": "d1", "properties": {}})

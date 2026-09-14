@@ -24,6 +24,20 @@ def _load_migration_module():
     return module
 
 
+def _load_previous_migration_module():
+    migration_file = (
+        Path(__file__).parent.parent.parent
+        / "src/xagent/migrations/versions/20260810_add_hubspot_marketing_scopes.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "add_hubspot_marketing_scopes_migration", migration_file
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
 def _operations(connection):
     return Operations(MigrationContext.configure(connection))
 
@@ -321,3 +335,20 @@ def test_migration_fields_match_registry():
     )
     assert migration.CURRENT_SCOPES == registry_row["oauth_scopes"]
     assert migration.CURRENT_DESCRIPTION == registry_row["description"]
+
+
+def test_previous_fields_chain_from_the_prior_migration():
+    """This migration's PREVIOUS_SCOPES/PREVIOUS_DESCRIPTION must exactly
+    equal 20260810's CURRENT_SCOPES/CURRENT_DESCRIPTION - not just "close
+    enough" - or the two migrations' downgrade() calls stop being inverses
+    of each other. This exact coupling silently broke once already (20260810's
+    constants were bumped forward to match the live registry, which broke
+    its own downgrade() once this migration's downgrade() ran first and left
+    a value 20260810 no longer recognized as "unchanged"); this test pins the
+    invariant directly instead of relying on it only showing up as a
+    full-chain downgrade failure.
+    """
+    migration = _load_migration_module()
+    previous_migration = _load_previous_migration_module()
+    assert migration.PREVIOUS_SCOPES == previous_migration.CURRENT_SCOPES
+    assert migration.PREVIOUS_DESCRIPTION == previous_migration.CURRENT_DESCRIPTION

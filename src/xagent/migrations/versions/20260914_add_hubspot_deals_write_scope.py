@@ -67,9 +67,9 @@ PREVIOUS_DESCRIPTION = (
 )
 CURRENT_DESCRIPTION = (
     "Connect to HubSpot CRM and Marketing Hub to search, create, and update "
-    "contacts, companies, and deals, log notes, read forms and submissions, "
-    "pull traffic analytics reports, and read marketing emails and "
-    "campaigns."
+    "contacts and companies, create and update deals, log notes, read forms "
+    "and submissions, pull traffic analytics reports, and read marketing "
+    "emails and campaigns."
 )
 
 
@@ -153,9 +153,8 @@ def _invalidate_existing_hubspot_grants(bind: sa.engine.Connection) -> None:
     if not _columns_present(bind, "user_oauth", {"provider", "access_token"}):
         return
 
-    columns = {c["name"] for c in sa.inspect(bind).get_columns("user_oauth")}
     values: dict[str, object] = {"access_token": ""}
-    if "refresh_token" in columns:
+    if _columns_present(bind, "user_oauth", {"refresh_token"}):
         values["refresh_token"] = None
 
     result = bind.execute(

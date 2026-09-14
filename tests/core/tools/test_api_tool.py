@@ -6,6 +6,7 @@ import json
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+import httpx
 import pytest
 
 from xagent.core.tools.adapters.vibe.api_tool import APICallArgs, APITool
@@ -275,32 +276,50 @@ class TestSanitizeFinalUrl:
 
     def test_strips_query_string_credential(self):
         assert (
-            _sanitize_final_url("https://api.hubapi.com/crm/v3/deals?api_key=secret")
+            _sanitize_final_url(
+                httpx.URL("https://api.hubapi.com/crm/v3/deals?api_key=secret")
+            )
             == "https://api.hubapi.com/crm/v3/deals"
         )
 
     def test_strips_basic_auth_userinfo(self):
         assert (
-            _sanitize_final_url("https://user:pass@api.hubapi.com/crm/v3/deals")
+            _sanitize_final_url(
+                httpx.URL("https://user:pass@api.hubapi.com/crm/v3/deals")
+            )
             == "https://api.hubapi.com/crm/v3/deals"
         )
 
     def test_strips_both_userinfo_and_query_credential(self):
         assert (
-            _sanitize_final_url("https://user:pass@example.com/path?api_key=secret")
+            _sanitize_final_url(
+                httpx.URL("https://user:pass@example.com/path?api_key=secret")
+            )
             == "https://example.com/path"
         )
 
     def test_preserves_port(self):
         assert (
-            _sanitize_final_url("https://example.com:8443/path?key=secret")
+            _sanitize_final_url(httpx.URL("https://example.com:8443/path?key=secret"))
             == "https://example.com:8443/path"
         )
 
     def test_no_op_for_a_url_with_nothing_to_strip(self):
         assert (
-            _sanitize_final_url("https://api.hubapi.com/crm/v3/deals")
+            _sanitize_final_url(httpx.URL("https://api.hubapi.com/crm/v3/deals"))
             == "https://api.hubapi.com/crm/v3/deals"
+        )
+
+    def test_ipv6_host_stays_bracketed(self):
+        """Regression: a hand-rolled string-based implementation (urlparse
+        + reassembling "host:port" by hand) drops the brackets an IPv6
+        literal needs, producing a URL later code can't even re-parse
+        (urlparse("https://::1:8443/x").hostname is None). Using
+        httpx.URL.copy_with keeps the URL in one already-bracket-aware
+        type throughout."""
+        assert (
+            _sanitize_final_url(httpx.URL("https://[::1]:8443/path?api_key=secret"))
+            == "https://[::1]:8443/path"
         )
 
 
@@ -543,6 +562,54 @@ class TestAPIClientCore:
 
         assert result["success"] is False
         assert result["status_code"] == 404
+
+
+@pytest.fixture
+def mock_transport(monkeypatch: pytest.MonkeyPatch):
+    """Injects an httpx.MockTransport into every httpx.AsyncClient built
+    inside _make_request, exercising the REAL request/response path
+    (unlike mock_httpbin, which monkeypatches _make_request itself away) -
+    needed to verify behavior that depends on the real httpx.Response,
+    like final_url/final_request_has_credential gating below."""
+
+    def _install(handler):
+        original_init = httpx.AsyncClient.__init__
+
+        def patched_init(self, *args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            original_init(self, *args, **kwargs)
+
+        monkeypatch.setattr(httpx.AsyncClient, "__init__", patched_init)
+
+    return _install
+
+
+class TestFinalUrlCredentialGating:
+    """Regression: final_url and final_request_has_credential are only
+    ever read by the adapter's connector-domain hint, which only fires for
+    a 401/403 (see api_tool.py's run_json_async) - _make_request should
+    skip computing them entirely for any other status, not just skip
+    using them once computed."""
+
+    @pytest.mark.asyncio
+    async def test_not_computed_for_a_2xx_response(self, mock_transport):
+        mock_transport(lambda request: httpx.Response(200, json={"ok": True}))
+
+        result = await APIClientCore().call_api(url="https://example.com/ok")
+
+        assert result["success"] is True
+        assert result.get("final_url") is None
+        assert result.get("final_request_has_credential") is None
+
+    @pytest.mark.asyncio
+    async def test_computed_for_a_401_response(self, mock_transport):
+        mock_transport(lambda request: httpx.Response(401, json={"error": "nope"}))
+
+        result = await APIClientCore().call_api(url="https://api.hubapi.com/x")
+
+        assert result["status_code"] == 401
+        assert result["final_url"] == "https://api.hubapi.com/x"
+        assert result["final_request_has_credential"] is False
 
 
 class TestAPITool:
@@ -861,38 +928,6 @@ class TestAPITool:
             {
                 "url": "https://api.hubapi.com/status/401"
                 "?__redirected_to__=https://api.hubapi.com/crm/v3/deals/1",
-                "auth_type": "bearer",
-                "auth_token": "still-valid-token",
-            }
-        )
-
-        assert "connector tools" not in (result.get("error") or "")
-
-    @pytest.mark.asyncio
-    async def test_falls_back_to_original_args_when_final_request_has_credential_is_absent(
-        self, monkeypatch: pytest.MonkeyPatch
-    ):
-        """A result from a core client that predates final_request_has_
-        credential (e.g. an older or differently-mocked call_api) must
-        still work - falling back to checking the original api_args, same
-        as before that field existed."""
-        tool = APITool()
-
-        async def mock_call_api(**kwargs):
-            return {
-                "success": False,
-                "status_code": 401,
-                "headers": {},
-                "body": None,
-                "error": "HTTP 401",
-                "final_url": "https://api.hubapi.com/crm/v3/deals/1",
-            }
-
-        monkeypatch.setattr(tool._client, "call_api", mock_call_api)
-
-        result = await tool.run_json_async(
-            {
-                "url": "https://api.hubapi.com/crm/v3/deals/1",
                 "auth_type": "bearer",
                 "auth_token": "still-valid-token",
             }

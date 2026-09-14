@@ -13,7 +13,6 @@ from pydantic import BaseModel, Field
 from ...core.api_tool import (
     APIClientCore,
     append_known_connector_domain_hint,
-    has_auth_credentials,
     match_known_connector_domain,
 )
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
@@ -165,19 +164,10 @@ class APITool(AbstractBaseTool):
         # cross-origin redirect, so a request that started out
         # credentialed can still land on the connector host with nothing
         # attached. `final_request_has_credential` reflects the request
-        # httpx actually sent, after any redirect; api_args is only a
-        # fallback for a result predating that field (e.g. from a mocked
-        # or older core client in tests).
-        final_request_has_credential = result.get("final_request_has_credential")
-        if final_request_has_credential is None:
-            final_request_has_credential = has_auth_credentials(
-                api_args.url,
-                api_args.headers,
-                api_args.params,
-                api_args.auth_type,
-                api_args.auth_token,
-            )
-        if final_request_has_credential:
+        # httpx actually sent, after any redirect - `call_api`'s only real
+        # implementation (APIClientCore) always sets it, so there's no
+        # caller-args-based case left to fall back to here.
+        if result.get("final_request_has_credential", False):
             return
         result["error"] = append_known_connector_domain_hint(
             result.get("error"), connector_label

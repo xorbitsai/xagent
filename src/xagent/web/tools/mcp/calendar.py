@@ -7,7 +7,7 @@ from functools import cache
 from importlib import resources
 from pathlib import Path
 from typing import Any, cast
-from zoneinfo import TZPATH
+from zoneinfo import TZPATH, available_timezones
 
 from dateutil import parser as _date_parser
 from google.oauth2.credentials import Credentials
@@ -590,9 +590,13 @@ def _event_time_changed(
     except ValueError:
         return old_value != new_value
     if old_key.tzinfo is None and old_timezone:
-        old_key = old_key.replace(tzinfo=resolve_zoneinfo(old_timezone))
+        old_key = _date_parser.isoparse(
+            _offset_datetime_string(old_value, old_timezone)
+        )
     if new_key.tzinfo is None and new_timezone:
-        new_key = new_key.replace(tzinfo=resolve_zoneinfo(new_timezone))
+        new_key = _date_parser.isoparse(
+            _offset_datetime_string(new_value, new_timezone)
+        )
     if (old_key.tzinfo is None) != (new_key.tzinfo is None):
         return True
     return bool(old_key != new_key)
@@ -632,17 +636,21 @@ def _iana_timezone_link_targets() -> dict[str, str]:
 
 def _canonical_timezone_name(name: str) -> str | None:
     """Return a canonical IANA key without conflating equal rule tables."""
-    try:
-        resolve_zoneinfo(name)
-    except ValueError:
-        return None
     current = name.casefold()
+    if current not in _iana_timezone_names():
+        return None
     targets = _iana_timezone_link_targets()
     seen: set[str] = set()
     while current in targets and current not in seen:
         seen.add(current)
         current = targets[current]
     return current
+
+
+@cache
+def _iana_timezone_names() -> frozenset[str]:
+    """Return case-normalized names loadable by the active IANA database."""
+    return frozenset(name.casefold() for name in available_timezones())
 
 
 def _timezone_names_equal(left: str | None, right: str | None) -> bool:
@@ -703,9 +711,13 @@ def _reject_nonpositive_event_window(
             "start_time and end_time must be valid ISO 8601 dateTimes"
         ) from exc
     if start_key.tzinfo is None and start_timezone:
-        start_key = start_key.replace(tzinfo=resolve_zoneinfo(start_timezone))
+        start_key = _date_parser.isoparse(
+            _offset_datetime_string(start_value, start_timezone)
+        )
     if end_key.tzinfo is None and end_timezone:
-        end_key = end_key.replace(tzinfo=resolve_zoneinfo(end_timezone))
+        end_key = _date_parser.isoparse(
+            _offset_datetime_string(end_value, end_timezone)
+        )
     try:
         reversed_window = end_key <= start_key
     except TypeError as exc:
@@ -1485,23 +1497,20 @@ def google_calendar_update_events(
             start_time is not None or end_time is not None or timezone is not None
         )
         timing_update_requested = schedule_update_requested or recurrence is not None
-        if timing_update_requested:
-            for field_name, value in (
-                ("start", original_start_value),
-                ("end", original_end_value),
-            ):
-                if value is not None and not isinstance(value, str):
-                    raise ValueError(
-                        f"the existing event {field_name} boundary must be a string"
-                    )
-            for field_name, value in (
-                ("start.timeZone", existing_start_timezone),
-                ("end.timeZone", existing_end_timezone),
-            ):
-                if value is not None and not isinstance(value, str):
-                    raise ValueError(
-                        f"the existing event {field_name} must be a string"
-                    )
+        for field_name, value in (
+            ("start", original_start_value),
+            ("end", original_end_value),
+        ):
+            if value is not None and not isinstance(value, str):
+                raise ValueError(
+                    f"the existing event {field_name} boundary must be a string"
+                )
+        for field_name, value in (
+            ("start.timeZone", existing_start_timezone),
+            ("end.timeZone", existing_end_timezone),
+        ):
+            if value is not None and not isinstance(value, str):
+                raise ValueError(f"the existing event {field_name} must be a string")
         existing_recurrence = (
             _validated_recurrence_lines(raw_existing_recurrence)
             if timing_update_requested
@@ -1713,11 +1722,16 @@ def google_calendar_update_events(
                 ),
             )
 
-        start_changed = _event_time_changed(
-            original_start_value,
-            prospective_start_value,
-            old_timezone=(None if original_is_all_day else existing_start_timezone),
-            new_timezone=(None if resulting_start_is_all_day else own_start_timezone),
+        start_changed = bool(
+            timing_update_requested
+            and _event_time_changed(
+                original_start_value,
+                prospective_start_value,
+                old_timezone=(None if original_is_all_day else existing_start_timezone),
+                new_timezone=(
+                    None if resulting_start_is_all_day else own_start_timezone
+                ),
+            )
         )
         timezone_changes_schedule_zone = False
         if timing_update_requested and isinstance(existing_recurrence, list):
@@ -1970,11 +1984,12 @@ def google_calendar_update_events(
             or bool(attendees_to_check)
             or organizer_newly_added
         )
+        conflict_window_needed = bool(schedule_update_requested or added_attendees)
 
         def _normalized_boundary(
             value: str | None, is_all_day: bool, side_timezone: str | None
         ) -> str | None:
-            if value is None:
+            if not conflict_window_needed or value is None:
                 return None
             field = {"date" if is_all_day else "dateTime": value}
             if side_timezone and not is_all_day:

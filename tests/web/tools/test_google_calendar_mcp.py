@@ -5670,6 +5670,7 @@ def test_timezone_name_comparison_falls_back_conservatively_for_opaque_names():
     assert calendar._timezone_names_equal("Custom/Zone", "custom/zone")
     assert not calendar._timezone_names_equal("Custom/Zone", "UTC")
     assert not calendar._timezone_names_equal("Europe/Berlin", "Europe/Paris")
+    assert calendar._timezone_names_equal("utc", "Etc/UTC")
 
 
 def test_update_events_allows_metadata_update_on_mismatched_legacy_times(
@@ -5694,6 +5695,36 @@ def test_update_events_allows_metadata_update_on_mismatched_legacy_times(
     _, kwargs = service.events.return_value.update.call_args
     assert kwargs["body"]["start"] == existing_event["start"]
     assert kwargs["body"]["end"] == existing_event["end"]
+
+
+def test_update_events_metadata_only_does_not_validate_a_legacy_dst_gap(
+    monkeypatch,
+):
+    existing_event = {
+        "id": "existing-1",
+        "start": {
+            "dateTime": "2026-03-08T02:30:00",
+            "timeZone": "America/Los_Angeles",
+        },
+        "end": {
+            "dateTime": "2026-03-08T03:30:00",
+            "timeZone": "America/Los_Angeles",
+        },
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            summary="Metadata only",
+        )
+    )
+
+    assert result["status"] == "success"
+    body = service.events.return_value.update.call_args.kwargs["body"]
+    assert body["start"] == existing_event["start"]
+    assert body["end"] == existing_event["end"]
 
 
 def test_update_events_allows_metadata_update_with_malformed_recurrence(
@@ -6010,6 +6041,28 @@ def test_update_events_rejects_non_string_stored_boundary_fields(
 
     assert result["status"] == "error"
     assert message in result["message"]
+    assert "has no attribute" not in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_events_metadata_only_reports_non_string_boundary_cleanly(monkeypatch):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": 12345},
+        "end": {"dateTime": "2026-08-26T08:00:00Z"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            summary="Metadata only",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "start boundary must be a string" in result["message"]
     assert "has no attribute" not in result["message"]
     service.events.return_value.update.assert_not_called()
 
@@ -7163,6 +7216,38 @@ def test_update_events_reuses_matching_zone_for_offset_recurring_reschedule(
     body = service.events.return_value.update.call_args.kwargs["body"]
     assert body["start"] == {"dateTime": start_time, "timeZone": zone}
     assert body["end"] == {"dateTime": end_time, "timeZone": zone}
+
+
+def test_update_events_rejects_a_nonexistent_dst_gap_reschedule(monkeypatch):
+    existing_event = {
+        "id": "existing-1",
+        "start": {
+            "dateTime": "2026-03-01T09:00:00",
+            "timeZone": "America/Los_Angeles",
+        },
+        "end": {
+            "dateTime": "2026-03-01T10:00:00",
+            "timeZone": "America/Los_Angeles",
+        },
+        "recurrence": ["RRULE:FREQ=DAILY;COUNT=10"],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-03-08T02:30:00",
+            end_time="2026-03-08T03:30:00",
+            ignore_conflicts=True,
+            acknowledge_recurring_exception_risk=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "does not exist" in result["message"]
+    assert "daylight-saving transition" in result["message"]
+    service.events.return_value.update.assert_not_called()
 
 
 def test_update_events_reschedules_an_already_recurring_event_with_an_explicit_timezone(

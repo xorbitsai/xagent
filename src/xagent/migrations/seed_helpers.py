@@ -19,14 +19,14 @@ import sqlalchemy as sa
 from sqlalchemy.engine import Connection
 from sqlalchemy.sql.expression import TableClause
 
-# Includes every public_mcp_apps field an operator can actually edit on an
-# otherwise-builtin row (description/icon/category/is_visible_in_connector;
-# see admin_mcp.py's _BUILTIN_PROTECTED_FIELDS), so an admin who customizes
-# just one of those fields is still detected as "modified" and preserved.
-# oauth_scopes/launch_config are left out: the admin API treats them as
-# protected/code-managed for a builtin row (so they can't diverge from the
-# seed on their own), and JSON-value equality is comparison-fragile across DB
-# backends.
+# Every public_mcp_apps field a pre-existing row can plausibly differ on from
+# the migration's seed snapshot, including the two JSON-typed columns
+# (oauth_scopes, launch_config): a row that predates a migration's app_id
+# being seeded (or predates the admin API's built-in protections) can carry
+# arbitrary values there even if every other field happens to match. Matching
+# is done in Python (see below), not in the SQL WHERE clause, so these
+# JSON-typed columns compare by value regardless of key order or
+# serialization differences across database backends.
 DEFAULT_SEED_MATCH_COLUMNS: tuple[str, ...] = (
     "name",
     "description",
@@ -35,6 +35,8 @@ DEFAULT_SEED_MATCH_COLUMNS: tuple[str, ...] = (
     "category",
     "icon",
     "is_visible_in_connector",
+    "oauth_scopes",
+    "launch_config",
 )
 
 
@@ -61,6 +63,11 @@ def delete_unmodified_seeded_rows(
     is deleted (matching on ``id_column`` alone would silently reproduce the
     exact bug this helper exists to prevent). Pass ``match_columns=()``
     explicitly to opt into matching on ``id_column`` only.
+
+    Each candidate row is fetched and compared in Python rather than matched
+    via the SQL ``WHERE`` clause, so JSON-typed columns compare structurally
+    (immune to key-order or whitespace differences between the stored value
+    and the seed) instead of relying on backend-specific text/JSON equality.
     """
     inspector = sa.inspect(bind)
     if table.name not in set(inspector.get_table_names()):
@@ -78,13 +85,28 @@ def delete_unmodified_seeded_rows(
     def _column(name: str) -> Any:
         return table.c[name] if name in table.c else sa.column(name)
 
+    id_col = _column(id_column)
+
     for row in seed_rows:
         if id_column not in row:
             continue
-        conditions = [_column(id_column) == row[id_column]]
-        conditions.extend(
-            _column(column) == row[column]
-            for column in columns_to_match
-            if column in row
-        )
-        bind.execute(sa.delete(table).where(sa.and_(*conditions)))
+
+        if columns_to_match:
+            candidate = (
+                bind.execute(
+                    sa.select(*(_column(column) for column in columns_to_match)).where(
+                        id_col == row[id_column]
+                    )
+                )
+                .mappings()
+                .first()
+            )
+            if candidate is None:
+                continue
+            if any(
+                column in row and candidate[column] != row[column]
+                for column in columns_to_match
+            ):
+                continue
+
+        bind.execute(sa.delete(table).where(id_col == row[id_column]))

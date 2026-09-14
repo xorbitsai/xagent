@@ -217,6 +217,120 @@ def test_preserves_row_when_only_icon_or_visibility_differs(tmp_path):
         assert "widget" in _app_ids(connection)
 
 
+def test_preserves_row_when_only_launch_config_or_oauth_scopes_differ(tmp_path):
+    """A row that predates this app_id being seeded (or predates the admin
+    API's built-in protections) can carry arbitrary oauth_scopes/launch_config
+    even if every scalar field happens to match the seed. That JSON-only
+    difference alone must be enough to preserve the row on downgrade."""
+    full_table = sa.table(
+        "public_mcp_apps",
+        sa.column("app_id", sa.String),
+        sa.column("name", sa.String),
+        sa.column("description", sa.Text),
+        sa.column("transport", sa.String),
+        sa.column("provider_name", sa.String),
+        sa.column("category", sa.String),
+        sa.column("oauth_scopes", sa.JSON),
+        sa.column("launch_config", sa.JSON),
+    )
+    seed_rows = [
+        {
+            **SEED_ROWS[0],
+            "oauth_scopes": ["widget.read"],
+            "launch_config": {"command": "python", "args": ["-m", "widget"]},
+        }
+    ]
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE public_mcp_apps (
+                    id INTEGER PRIMARY KEY,
+                    app_id VARCHAR(100) NOT NULL UNIQUE,
+                    name VARCHAR(200) NOT NULL,
+                    description TEXT,
+                    transport VARCHAR(50) NOT NULL,
+                    provider_name VARCHAR(50),
+                    category VARCHAR(100),
+                    oauth_scopes JSON,
+                    launch_config JSON
+                )
+                """
+            )
+        )
+        connection.execute(
+            sa.insert(full_table),
+            [
+                {
+                    "app_id": "widget",
+                    "name": "Widget",
+                    "description": "A seeded widget connector.",
+                    "transport": "oauth",
+                    "provider_name": "widget-co",
+                    "category": "Productivity",
+                    "oauth_scopes": ["widget.read", "widget.write"],
+                    "launch_config": {"command": "custom-runner"},
+                }
+            ],
+        )
+        delete_unmodified_seeded_rows(connection, full_table, seed_rows)
+        assert "widget" in _app_ids(connection)
+
+
+def test_deletes_row_when_json_columns_match_with_different_key_order(tmp_path):
+    """JSON-typed columns compare by value in Python, not by raw SQL/text
+    equality, so a stored value that serializes with a different key order
+    than the seed's dict still matches and the row is deleted."""
+    full_table = sa.table(
+        "public_mcp_apps",
+        sa.column("app_id", sa.String),
+        sa.column("name", sa.String),
+        sa.column("description", sa.Text),
+        sa.column("transport", sa.String),
+        sa.column("provider_name", sa.String),
+        sa.column("category", sa.String),
+        sa.column("launch_config", sa.JSON),
+    )
+    seed_rows = [
+        {
+            **SEED_ROWS[0],
+            "launch_config": {"command": "python", "args": ["-m", "widget"]},
+        }
+    ]
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE public_mcp_apps (
+                    id INTEGER PRIMARY KEY,
+                    app_id VARCHAR(100) NOT NULL UNIQUE,
+                    name VARCHAR(200) NOT NULL,
+                    description TEXT,
+                    transport VARCHAR(50) NOT NULL,
+                    provider_name VARCHAR(50),
+                    category VARCHAR(100),
+                    launch_config JSON
+                )
+                """
+            )
+        )
+        # Raw JSON text with keys in the opposite order from the seed dict
+        # above; a raw SQL/text equality comparison would not match this.
+        connection.execute(
+            text(
+                "INSERT INTO public_mcp_apps (app_id, name, description, transport,"
+                " provider_name, category, launch_config)"
+                " VALUES ('widget', 'Widget', 'A seeded widget connector.', 'oauth',"
+                " 'widget-co', 'Productivity',"
+                ' \'{"args": ["-m", "widget"], "command": "python"}\')'
+            )
+        )
+        delete_unmodified_seeded_rows(connection, full_table, seed_rows)
+        assert "widget" not in _app_ids(connection)
+
+
 def test_noop_when_no_match_columns_exist_in_schema(tmp_path):
     """If none of match_columns exist in the current schema, provenance can't
     be verified at all, so nothing is deleted (matching on id_column alone

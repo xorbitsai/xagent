@@ -11,6 +11,7 @@ import pytest
 from xagent.core.tools.adapters.vibe.api_tool import APICallArgs, APITool
 from xagent.core.tools.core.api_tool import (
     APIClientCore,
+    _has_auth_credentials,
     _hostname_matches_connector_domain,
     _match_known_connector_domain,
     call_api,
@@ -40,7 +41,7 @@ class TestMatchKnownConnectorDomain:
         assert _match_known_connector_domain("httpbin.org") is None
 
     def test_does_not_match_a_lookalike_suffix(self):
-        """"notzendesk.com" shares a suffix with "zendesk.com" as a raw
+        """ "notzendesk.com" shares a suffix with "zendesk.com" as a raw
         string but is not "*.zendesk.com" - the dot-boundary check in
         _hostname_matches_connector_domain must reject it, not just do a
         substring/endswith check on the bare strings."""
@@ -49,9 +50,46 @@ class TestMatchKnownConnectorDomain:
     def test_does_not_match_domain_as_a_trailing_path_look_alike(self):
         """A hostname that merely contains the target domain as a substring
         elsewhere (not as its own suffix) must not match."""
-        assert _hostname_matches_connector_domain(
-            "zendesk.com.evil.example", "zendesk.com"
-        ) is False
+        assert (
+            _hostname_matches_connector_domain("zendesk.com.evil.example", "zendesk.com") is False
+        )
+
+
+class TestHasAuthCredentials:
+    def test_true_for_explicit_auth_token(self):
+        assert _has_auth_credentials("https://api.hubapi.com/x", None, None, "tok")
+
+    def test_true_for_authorization_header(self):
+        assert _has_auth_credentials(
+            "https://api.hubapi.com/x", {"Authorization": "Bearer tok"}, None, None
+        )
+
+    def test_true_for_service_specific_credential_header(self):
+        """Not every connector's direct-call convention uses the literal
+        "Authorization" header name - matching must key off any header
+        whose name looks credential-shaped, not an exact-name allowlist."""
+        assert _has_auth_credentials(
+            "https://acme.myshopify.com/x",
+            {"X-Shopify-Access-Token": "shpat_abc"},
+            None,
+            None,
+        )
+
+    def test_true_for_auth_query_param_in_params_dict(self):
+        assert _has_auth_credentials(
+            "https://maps.googleapis.com/x", None, {"key": "AIza123"}, None
+        )
+
+    def test_true_for_auth_query_param_in_url_itself(self):
+        assert _has_auth_credentials("https://maps.googleapis.com/x?key=AIza123", None, None, None)
+
+    def test_false_when_nothing_looks_like_a_credential(self):
+        assert not _has_auth_credentials(
+            "https://api.hubapi.com/x?limit=10", {"Content-Type": "application/json"}, None, None
+        )
+
+    def test_false_for_no_arguments_at_all(self):
+        assert not _has_auth_credentials("https://api.hubapi.com/x", None, None, None)
 
 
 @pytest.fixture
@@ -76,9 +114,7 @@ def mock_httpbin(monkeypatch: pytest.MonkeyPatch) -> None:
         if path == "/get":
             body = {"args": _single_value_query_args(url)}
         elif path == "/post":
-            parsed_data = json.loads(
-                data.decode() if isinstance(data, bytes) else data or "{}"
-            )
+            parsed_data = json.loads(data.decode() if isinstance(data, bytes) else data or "{}")
             body = {"json": parsed_data}
         elif path == "/bearer":
             token = headers.get("Authorization", "").removeprefix("Bearer ")
@@ -234,9 +270,7 @@ class TestAPIClientCore:
         assert "Zendesk" in result["error"]
 
     @pytest.mark.asyncio
-    async def test_allows_known_connector_domain_with_explicit_auth_token(
-        self, mock_httpbin: None
-    ):
+    async def test_allows_known_connector_domain_with_explicit_auth_token(self, mock_httpbin: None):
         """An explicit auth_token means the caller has their own credential
         and genuinely intends a direct call - the guard must not block it."""
         client = APIClientCore()
@@ -259,6 +293,58 @@ class TestAPIClientCore:
         )
 
         assert "error" not in result or result.get("status_code") != 0
+
+    @pytest.mark.asyncio
+    async def test_allows_known_connector_domain_with_service_specific_header(
+        self, mock_httpbin: None
+    ):
+        """Not every connector uses a plain "Authorization" header - Shopify
+        uses X-Shopify-Access-Token, so the guard must recognize that too,
+        not just the one header name."""
+        client = APIClientCore()
+        result = await client.call_api(
+            url="https://acme.myshopify.com/admin/api/2024-01/products.json",
+            headers={"X-Shopify-Access-Token": "shpat_abc123"},
+        )
+
+        assert "error" not in result or result.get("status_code") != 0
+
+    @pytest.mark.asyncio
+    async def test_allows_known_connector_domain_with_query_param_in_url(self, mock_httpbin: None):
+        """Google APIs commonly carry the API key as a "key" query
+        parameter directly in the URL rather than a header."""
+        client = APIClientCore()
+        result = await client.call_api(
+            url="https://maps.googleapis.com/maps/api/geocode/json?key=AIzaSy_123",
+        )
+
+        assert "error" not in result or result.get("status_code") != 0
+
+    @pytest.mark.asyncio
+    async def test_allows_known_connector_domain_with_query_param_in_params(
+        self, mock_httpbin: None
+    ):
+        client = APIClientCore()
+        result = await client.call_api(
+            url="https://maps.googleapis.com/maps/api/geocode/json",
+            params={"key": "AIzaSy_123"},
+        )
+
+        assert "error" not in result or result.get("status_code") != 0
+
+    @pytest.mark.asyncio
+    async def test_still_blocks_known_connector_domain_with_unrelated_query_param(
+        self, mock_httpbin: None
+    ):
+        """A query param that isn't one of the recognized auth-carrying
+        names must not itself count as evidence of a credential."""
+        client = APIClientCore()
+        result = await client.call_api(
+            url="https://api.hubapi.com/some/endpoint?limit=10",
+        )
+
+        assert result["success"] is False
+        assert "HubSpot" in result["error"]
 
     @pytest.mark.asyncio
     async def test_does_not_block_an_unrelated_domain(self, mock_httpbin: None):

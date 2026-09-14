@@ -9,7 +9,7 @@ import json
 import logging
 import os
 from typing import Any, Dict, Mapping, Optional, Union
-from urllib.parse import urlencode, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
 
@@ -69,10 +69,40 @@ def _match_known_connector_domain(hostname: str) -> Optional[str]:
     return None
 
 
-def _has_authorization_header(headers: Optional[Mapping[str, str]]) -> bool:
+# Substrings of a header name that indicate the caller already attached
+# their own credential - not just the standard "Authorization" header, since
+# several of the services in _KNOWN_CONNECTOR_DOMAINS use a service-specific
+# one instead (e.g. Shopify's "X-Shopify-Access-Token").
+_AUTH_HEADER_NAME_MARKERS = ("authorization", "token", "api-key", "apikey", "auth", "signature")
+
+# Query parameter names (case-insensitive) commonly used to carry an API key
+# instead of a header - e.g. Google APIs' "key" parameter.
+_AUTH_QUERY_PARAM_NAMES = frozenset({"key", "api_key", "apikey", "token", "access_token"})
+
+
+def _has_auth_header(headers: Optional[Mapping[str, str]]) -> bool:
     if not headers:
         return False
-    return any(key.lower() == "authorization" for key in headers)
+    return any(marker in key.lower() for key in headers for marker in _AUTH_HEADER_NAME_MARKERS)
+
+
+def _has_auth_query_param(url: str, params: Optional[Mapping[str, Any]]) -> bool:
+    query_keys = {key.lower() for key in params} if params else set()
+    query_keys.update(key.lower() for key in parse_qs(urlparse(url).query))
+    return not _AUTH_QUERY_PARAM_NAMES.isdisjoint(query_keys)
+
+
+def _has_auth_credentials(
+    url: str,
+    headers: Optional[Mapping[str, str]],
+    params: Optional[Mapping[str, Any]],
+    auth_token: Optional[str],
+) -> bool:
+    """Whether the caller appears to already have their own credential for
+    this call, by any of the mechanisms api_call or a typical direct REST
+    call supports: the auth_token argument, an auth-looking header, or an
+    auth-looking query parameter (in either `params` or the URL itself)."""
+    return bool(auth_token or _has_auth_header(headers) or _has_auth_query_param(url, params))
 
 
 class APIClientCore:
@@ -129,10 +159,7 @@ class APIClientCore:
         Returns:
             Dictionary with success status, status_code, headers, body, and error
         """
-        logger.info(
-            f"🌐 API Call: {method} {url}"
-            + (f" (auth: {auth_type})" if auth_type else "")
-        )
+        logger.info(f"🌐 API Call: {method} {url}" + (f" (auth: {auth_type})" if auth_type else ""))
 
         # Validate URL
         if not self._is_valid_url(url):
@@ -147,23 +174,22 @@ class APIClientCore:
         # Refuse an unauthenticated call to a domain already covered by a
         # dedicated connector - this tool has no stored credential for it, so
         # the request would only fail with a misleading 401/403 (see
-        # _KNOWN_CONNECTOR_DOMAINS above). An explicit auth_token or
-        # Authorization header means the caller has their own credential and
-        # genuinely intends a direct call, so that combination is let through.
+        # _KNOWN_CONNECTOR_DOMAINS above). A caller that already attached its
+        # own credential - via auth_token, an auth-looking header (not just
+        # "Authorization" - e.g. Shopify's X-Shopify-Access-Token), or an
+        # auth-looking query parameter (e.g. Google's "key") - genuinely
+        # intends a direct call, so that combination is let through untouched.
         connector_label = _match_known_connector_domain(urlparse(url).hostname or "")
-        if (
-            connector_label
-            and not auth_token
-            and not _has_authorization_header(headers)
-        ):
+        if connector_label and not _has_auth_credentials(url, headers, params, auth_token):
             message = (
                 f"{url} is a {connector_label} API endpoint. This generic api_call "
                 f"tool has no stored credential for {connector_label} and this "
                 "request would only fail with an unauthenticated 401/403, not "
                 "indicate a real connection problem - use the dedicated "
                 f"{connector_label} connector tools instead. If you have your own "
-                "API token for this service, pass it via auth_type/auth_token (or "
-                "an Authorization header) to make the call anyway."
+                "API token for this service, pass it via auth_type/auth_token, a "
+                "credential header, or a credential query parameter to make the "
+                "call anyway."
             )
             logger.warning(f"🚫 API Call blocked: {method} {url} - {message}")
             return {
@@ -177,9 +203,7 @@ class APIClientCore:
         # Prepare request
         method = method.upper()
         timeout = timeout or self.default_timeout
-        retry_count = (
-            retry_count if retry_count is not None else self.default_retry_count
-        )
+        retry_count = retry_count if retry_count is not None else self.default_retry_count
         # Ensure retry_count is non-negative to avoid empty range
         retry_count = max(0, retry_count)
 
@@ -222,9 +246,7 @@ class APIClientCore:
                     proxy_url=proxy_url,
                     allow_redirects=allow_redirects,
                 )
-                logger.info(
-                    f"✅ API Call successful: {method} {url} -> {result['status_code']}"
-                )
+                logger.info(f"✅ API Call successful: {method} {url} -> {result['status_code']}")
                 return result
 
             except Exception as e:
@@ -234,9 +256,7 @@ class APIClientCore:
                         f"⚠️ API Call failed (attempt {attempt + 1}/{retry_count + 1}): {str(e)}"
                     )
                 else:
-                    logger.error(
-                        f"❌ API Call failed after {retry_count + 1} attempts: {str(e)}"
-                    )
+                    logger.error(f"❌ API Call failed after {retry_count + 1} attempts: {str(e)}")
 
         # All retries failed
         return {
@@ -388,9 +408,7 @@ class APIClientCore:
         else:
             return str(body)
 
-    def _parse_response_body_from_content(
-        self, content: bytes, headers: Dict[str, str]
-    ) -> Any:
+    def _parse_response_body_from_content(self, content: bytes, headers: Dict[str, str]) -> Any:
         """Parse response body from raw content based on content type"""
         if not content:
             return None

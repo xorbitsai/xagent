@@ -55,8 +55,12 @@ _VALID_DATE_PRESETS = frozenset(
         "last_week_sun_sat",
         "last_quarter",
         "last_year",
-        "this_week_mon_sun",
-        "this_week_sun_sat",
+        # Meta's actual enum has no "this_week_mon_sun"/"this_week_sun_sat"
+        # variant (only "last_week_*" does) -- the current-week presets are
+        # named "_today", confirmed against the AdsInsights.DatePreset enum
+        # in facebook/facebook-python-business-sdk.
+        "this_week_mon_today",
+        "this_week_sun_today",
         "this_year",
     }
 )
@@ -130,14 +134,17 @@ def _equal_filter(field: str, value: str) -> dict[str, str]:
 
 
 def _log_error(message: str, error: Exception) -> None:
-    """Log an exception with the same token redaction the JSON response
-    gets, instead of the raw str(error) -- which can otherwise write the
-    access token straight to application logs (the Graph API can echo it
-    back in an OAuth error message, and a non-GraphAPIError failure could
-    still be wrapping raw response text). Covers both GraphAPIError (whose
-    sensitive_values may include a page-scoped token beyond the env one)
-    and plain exceptions (getattr falls back to just the env token via
-    redact_secrets's own default).
+    """Log an exception with token redaction applied to the entire composed
+    line -- not just str(error) -- instead of writing the access token
+    straight to application logs (the Graph API can echo it back in an
+    OAuth error message, and a non-GraphAPIError failure could still be
+    wrapping raw response text). ``message`` itself can also embed
+    caller-supplied dynamic text (e.g. an id parameter interpolated by the
+    caller before this is invoked), which would leak the same way if it
+    happened to be secret-shaped and only ``error`` were redacted. Covers
+    both GraphAPIError (whose sensitive_values may include a page-scoped
+    token beyond the env one) and plain exceptions (getattr falls back to
+    just the env token via redact_secrets's own default).
 
     Deliberately does NOT pass exc_info=True: logging's exception formatter
     renders the traceback from the original exception object itself, whose
@@ -147,9 +154,9 @@ def _log_error(message: str, error: Exception) -> None:
     """
     sensitive_values = getattr(error, "sensitive_values", None)
     logger.error(
-        "%s: %s",
-        message,
-        meta_graph.redact_secrets(str(error), sensitive_values=sensitive_values),
+        meta_graph.redact_secrets(
+            f"{message}: {error}", sensitive_values=sensitive_values
+        )
     )
 
 

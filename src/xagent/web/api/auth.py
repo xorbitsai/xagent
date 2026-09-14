@@ -380,7 +380,32 @@ def _merged_oauth_scopes(
     return scopes, scope_str
 
 
-def _meta_login_config_id() -> str:
+# Under Facebook Login for Business (config_id mode), the Meta Login
+# Configuration named by config_id is the *sole* source of truth for granted
+# permissions -- see _generic_oauth_login below, which sends config_id
+# instead of scope/optional_scope entirely. Every provider="meta" app that
+# doesn't have its own entry here falls back to the one shared META_CONFIG_ID,
+# so a deployment that adds a new permission to that shared Login
+# Configuration for one app (e.g. ads_read for Meta Ads) hands that same
+# permission to every other meta app's authorize request too -- not merely
+# offered, since the resulting token is capable of it regardless of which app
+# the user thought they were connecting. Give an app its own env var here (a
+# dedicated Login Configuration scoped to just its own permissions) to avoid
+# sharing a token's capability across connectors that don't ask for it.
+_META_APP_CONFIG_ID_ENV_VARS = {
+    "facebook": "META_FACEBOOK_CONFIG_ID",
+    "instagram": "META_INSTAGRAM_CONFIG_ID",
+    "meta-ads": "META_ADS_CONFIG_ID",
+}
+
+
+def _meta_login_config_id(app_id: str | None = None) -> str:
+    if app_id:
+        app_env_var = _META_APP_CONFIG_ID_ENV_VARS.get(app_id.lower())
+        if app_env_var:
+            app_config_id = os.environ.get(app_env_var)
+            if app_config_id:
+                return app_config_id
     return os.environ.get("META_CONFIG_ID", "")
 
 
@@ -2549,7 +2574,7 @@ def _generic_oauth_login(
         # consent screen. Without this, the callback's businessId guard
         # (see _normalize_myob_business_id) would reject every connection.
         params["prompt"] = "consent"
-    meta_config_id = _meta_login_config_id() if provider.lower() == "meta" else ""
+    meta_config_id = _meta_login_config_id(app_id) if provider.lower() == "meta" else ""
     if meta_config_id:
         params["config_id"] = meta_config_id
     else:

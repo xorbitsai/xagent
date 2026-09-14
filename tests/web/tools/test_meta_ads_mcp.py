@@ -261,6 +261,34 @@ def test_get_insights_accepts_data_maximum_date_preset(monkeypatch):
     assert mock_request.call_args.kwargs["params"]["date_preset"] == "data_maximum"
 
 
+def test_get_insights_accepts_current_week_to_date_presets(monkeypatch):
+    """Meta's real enum names the current-week presets "*_today"
+    (this_week_mon_today/this_week_sun_today) -- not "*_sun"/"*_mon", which
+    don't exist and were mistakenly allow-listed in an earlier version."""
+    monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
+    mock_request = Mock(return_value=MockResponse({"data": []}))
+    monkeypatch.setattr(meta_ads.requests, "request", mock_request)
+
+    for preset in ("this_week_mon_today", "this_week_sun_today"):
+        result = _payload(meta_ads.meta_ads_get_insights("1001", date_preset=preset))
+        assert result["status"] == "success"
+        assert mock_request.call_args.kwargs["params"]["date_preset"] == preset
+
+
+def test_get_insights_rejects_nonexistent_this_week_preset(monkeypatch):
+    monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
+    mock_request = Mock()
+    monkeypatch.setattr(meta_ads.requests, "request", mock_request)
+
+    result = _payload(
+        meta_ads.meta_ads_get_insights("1001", date_preset="this_week_mon_sun")
+    )
+
+    assert result["status"] == "error"
+    assert "date_preset must be one of" in result["message"]
+    mock_request.assert_not_called()
+
+
 def test_get_insights_rejects_invalid_date_preset(monkeypatch):
     monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
     mock_request = Mock()
@@ -392,5 +420,23 @@ def test_generic_exception_logging_also_redacts_the_token(monkeypatch, caplog):
         result = _payload(meta_ads.meta_ads_auth_status())
 
     assert result["status"] == "error"
+    assert "user-token" not in caplog.text
+    assert "[redacted]" in caplog.text
+
+
+def test_caller_supplied_id_in_log_message_is_also_redacted(monkeypatch, caplog):
+    """_log_error's `message` argument embeds the caller-supplied id
+    (e.g. "Error getting Meta ad account <id>") -- if that id happens to be
+    secret-shaped, it must not leak into logs just because the exception
+    object itself (a plain validation ValueError here) doesn't carry it."""
+    monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
+    mock_request = Mock()
+    monkeypatch.setattr(meta_ads.requests, "request", mock_request)
+
+    with caplog.at_level("ERROR", logger="meta-ads-mcp"):
+        result = _payload(meta_ads.meta_ads_get_ad_account("user-token"))
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
     assert "user-token" not in caplog.text
     assert "[redacted]" in caplog.text

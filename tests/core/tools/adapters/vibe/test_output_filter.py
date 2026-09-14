@@ -538,32 +538,20 @@ def test_json_truncation_falls_back_gracefully_on_deep_nesting():
     assert result.endswith(DEFAULT_TRUNCATION_MESSAGE)
 
 
-def test_find_largest_list_is_linear_not_quadratic_in_nesting_depth():
-    """`_find_largest_list` must not re-serialize (json.dumps) whole subtrees
-    at every nesting level - that makes it quadratic (or worse) for JSON with
-    several levels of nesting, which real hierarchical API responses can have."""
-    import time
+def test_find_largest_list_does_not_reserialize_subtrees():
+    """`_find_largest_list` must size candidate lists without calling
+    `json.dumps` on them - re-serializing whole subtrees at every nesting
+    level is what made the previous implementation quadratic (or worse) for
+    JSON with several levels of nesting, which real hierarchical API
+    responses can have. Asserting the call count directly (rather than
+    comparing wall-clock timings across input sizes) keeps this deterministic
+    instead of depending on CI machine speed/noise."""
+    from unittest import mock
 
-    def build_chain(levels: int, pad_per_level: int) -> dict:
-        obj = {"pad": list(range(pad_per_level))}
-        node = obj
-        for _ in range(levels):
-            inner = {"pad": list(range(pad_per_level))}
-            node["child"] = [inner]
-            node = inner
-        return obj
+    nested = {"a": [1, 2], "b": {"c": list(range(50)), "d": [{"e": [1]}]}}
 
-    filter = _create_filter()
-    timings = []
-    for levels in (100, 200, 400):
-        parsed = json.loads(json.dumps(build_chain(levels, pad_per_level=2000)))
-        start = time.perf_counter()
-        filter._find_largest_list(parsed)
-        timings.append(time.perf_counter() - start)
+    with mock.patch("json.dumps") as mocked_dumps:
+        result = _create_filter()._find_largest_list(nested)
 
-    # Quadratic scaling would roughly 4x the time when levels double twice in
-    # a row (~16x total); linear scaling roughly doubles each time. Allow
-    # generous slack for timing noise while still catching an O(N^2) regression.
-    assert timings[2] < timings[0] * 8, (
-        f"_find_largest_list scaled superlinearly with nesting depth: {timings}"
-    )
+    mocked_dumps.assert_not_called()
+    assert result == list(range(50))

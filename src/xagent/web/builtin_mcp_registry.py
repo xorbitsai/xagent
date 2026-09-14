@@ -815,6 +815,20 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                 "command": "python",
                 "args": ["-m", "xagent.web.tools.mcp.whatsapp"],
                 "env_mapping": {"META_ACCESS_TOKEN": "access_token"},
+                # Stable ownership marker used by the seed migration, same
+                # mechanism the shopify row further below adopts. It is intentionally
+                # inside launch_config because current main has no dedicated
+                # catalog-provenance column; a pre-existing custom app_id
+                # "whatsapp" (created via POST /admin/mcp/apps before this
+                # migration ran) lacks this marker, so the builtin execution
+                # overlay (_matches_builtin_provenance) leaves it alone as
+                # the operator's own row instead of silently reinterpreting
+                # it as the Meta OAuth connector.
+                "builtin_provenance": {
+                    "registry": "xagent",
+                    "app_id": "whatsapp",
+                    "version": 1,
+                },
             },
         },
         {

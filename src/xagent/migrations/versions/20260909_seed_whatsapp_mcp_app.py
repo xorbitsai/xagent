@@ -6,10 +6,18 @@ Create Date: 2026-09-09 00:00:00.000000
 
 """
 
+import logging
 from typing import Sequence, Union
 
 import sqlalchemy as sa
 from alembic import op
+
+from xagent.builtin_identity import (
+    builtin_provenance_identity,
+    canonicalize_builtin_identity,
+)
+
+logger = logging.getLogger(__name__)
 
 # revision identifiers, used by Alembic.
 revision: str = "20260909_seed_whatsapp_mcp_app"
@@ -32,6 +40,11 @@ PUBLIC_MCP_APPS_TABLE = sa.table(
 )
 
 APP_ID = "whatsapp"
+BUILTIN_PROVENANCE = {
+    "registry": "xagent",
+    "app_id": APP_ID,
+    "version": 1,
+}
 
 ROW = {
     "app_id": APP_ID,
@@ -51,21 +64,8 @@ ROW = {
         "command": "python",
         "args": ["-m", "xagent.web.tools.mcp.whatsapp"],
         "env_mapping": {"META_ACCESS_TOKEN": "access_token"},
+        "builtin_provenance": BUILTIN_PROVENANCE,
     },
-}
-
-# Every non-env-dependent column of ROW; see downgrade() for why all of them
-# (not just a structural few) take part in the "is this our row" match.
-APP_ROW_GUARD_COLUMNS = {
-    "name",
-    "description",
-    "icon",
-    "transport",
-    "provider_name",
-    "category",
-    "oauth_scopes",
-    "is_visible_in_connector",
-    "launch_config",
 }
 
 # The "meta" oauth_providers row is NOT seeded here, unlike a migration that
@@ -78,43 +78,96 @@ APP_ROW_GUARD_COLUMNS = {
 # meta-ads connector) leaves oauth_providers alone rather than re-seeding it
 # defensively. Following that precedent instead of adding a second, drifting
 # copy of the frozen provider row here.
+#
+# No mcp_servers-table provenance check (unlike the sibling shopify seed
+# migration): that check guards shopify's key-based connect_mcp_app path,
+# whose MCPServer.auth carries this same builtin_provenance marker. OAuth
+# apps activate through a different path (generic_oauth_callback in
+# api/auth.py) whose MCPServer.auth already carries its own
+# app_id/provider identity (_oauth_auth_metadata) and is already guarded
+# against a mismatched custom server by _ensure_server_matches_oauth_app --
+# an independent, pre-existing mechanism every oauth-transport builtin app
+# (including facebook/instagram) already relies on, so this migration adds
+# no new server-level guard.
 
 
 def _filter_row(row: dict[str, object], allowed_columns: set[str]) -> dict[str, object]:
     return {key: value for key, value in row.items() if key in allowed_columns}
 
 
-def _row_matches_seeded_shape(
-    row: sa.engine.Row, seeded: dict[str, object], compare_columns: set[str]
-) -> bool:
-    """Compare a fetched row against the seeded row dict in Python.
+def _has_provenance(launch_config: object) -> bool:
+    return isinstance(launch_config, dict) and builtin_provenance_identity(
+        launch_config.get("builtin_provenance")
+    ) == builtin_provenance_identity(BUILTIN_PROVENANCE)
 
-    Deliberately not pushed into the SQL WHERE clause: PostgreSQL's plain
-    ``json`` column type (what oauth_scopes/launch_config actually are) has
-    no ``=`` operator, so ``.where(json_column == python_value)`` compiles
-    fine but raises ``UndefinedFunction: operator does not exist: json =
-    json`` at execute time on Postgres. Comparing in Python after a plain
-    SELECT works identically on every backend.
-    """
-    return all(row._mapping[column] == seeded[column] for column in compare_columns)
+
+def _collides_with_whatsapp_identity(value: object) -> bool:
+    return canonicalize_builtin_identity(value) in {
+        canonicalize_builtin_identity(APP_ID),
+        canonicalize_builtin_identity(ROW["name"]),
+    }
 
 
 def upgrade() -> None:
     bind = op.get_bind()
     inspector = sa.inspect(bind)
-    if "public_mcp_apps" not in set(inspector.get_table_names()):
+    tables = set(inspector.get_table_names())
+    if "public_mcp_apps" not in tables:
         return
 
-    app_columns = {c["name"] for c in inspector.get_columns("public_mcp_apps")}
-    existing_app_ids = set(
-        bind.execute(sa.select(PUBLIC_MCP_APPS_TABLE.c.app_id)).scalars()
+    columns = {column["name"] for column in inspector.get_columns("public_mcp_apps")}
+    if "launch_config" not in columns:
+        raise RuntimeError(
+            "Cannot seed builtin WhatsApp identity: public_mcp_apps.launch_config "
+            "is required for provenance"
+        )
+
+    catalog_rows = list(
+        bind.execute(
+            sa.select(
+                PUBLIC_MCP_APPS_TABLE.c.app_id,
+                PUBLIC_MCP_APPS_TABLE.c.name,
+                PUBLIC_MCP_APPS_TABLE.c.launch_config,
+            )
+        ).mappings()
     )
-    # A pre-existing row with this app_id (e.g. hand-created by an operator
-    # before this migration deployed) is left exactly as it is; the builtin
-    # registry overlays the canonical execution fields onto any row sharing
-    # a builtin app_id at read time anyway.
-    if APP_ID not in existing_app_ids:
-        bind.execute(sa.insert(PUBLIC_MCP_APPS_TABLE), [_filter_row(ROW, app_columns)])
+    colliding_catalog_rows = [
+        row
+        for row in catalog_rows
+        if _collides_with_whatsapp_identity(row["app_id"])
+        or _collides_with_whatsapp_identity(row["name"])
+    ]
+    exact_app_rows = [row for row in catalog_rows if row["app_id"] == APP_ID]
+    if exact_app_rows:
+        existing = exact_app_rows[0]
+        # Idempotent re-run over a row this migration (or a prior version of
+        # it) already owns: accept and stop, whether or not it's also the
+        # only collision on record.
+        if _has_provenance(existing["launch_config"]) and colliding_catalog_rows == [
+            existing
+        ]:
+            return
+        raise RuntimeError(
+            "Cannot seed builtin WhatsApp connector: custom or ambiguous "
+            "public_mcp_apps identity collides with 'whatsapp'"
+        )
+    if colliding_catalog_rows:
+        raise RuntimeError(
+            "Cannot seed builtin WhatsApp connector: custom public_mcp_apps "
+            "identity collides with 'whatsapp'"
+        )
+
+    dropped_keys = sorted(set(ROW) - columns)
+    if dropped_keys:
+        logger.warning(
+            "public_mcp_apps is missing columns %s; seeding %r without them",
+            dropped_keys,
+            APP_ID,
+        )
+    bind.execute(
+        sa.insert(PUBLIC_MCP_APPS_TABLE),
+        [{key: value for key, value in ROW.items() if key in columns}],
+    )
 
 
 def downgrade() -> None:
@@ -122,43 +175,16 @@ def downgrade() -> None:
     inspector = sa.inspect(bind)
     if "public_mcp_apps" not in set(inspector.get_table_names()):
         return
-
-    # Only the catalog entry is removed. The meta oauth_providers row is
-    # shared with the Facebook Pages and Instagram connectors and is owned by
-    # 20260627_seed_meta_connectors, so this migration never touches it. Any
-    # MCPServer/UserMCPServer rows created by users who already connected are
-    # intentionally left in place -- connect-driven rows are not owned by
-    # this migration and are cleaned up through the normal disconnect path.
-    #
-    # Only delete the catalog entry when it still matches the FULL static
-    # shape this migration seeded -- an unconditional delete-by-app_id would
-    # remove a pre-existing operator row that happened to already occupy
-    # app_id "whatsapp" before this migration ever ran (upgrade()'s own
-    # `if APP_ID not in existing_app_ids` check would have skipped inserting
-    # over it, so upgrade and downgrade must agree on what "this migration's
-    # row" means). Matching only a structural few (name/transport/
-    # provider_name) isn't enough: description/is_visible_in_connector are
-    # freely PATCHable by admins today, and a raw DB edit could diverge any
-    # column -- so every non-env-dependent column is compared. A row that
-    # doesn't match is left in place: restored rather than destroyed. Same
-    # guard as the salesforce seed migration.
-    #
-    # A reduced-schema table missing one of the guard columns (mid-chain,
-    # before the column-adding migration ran) would otherwise make the SELECT
-    # reference a nonexistent column and raise; no-op instead rather than
-    # fall back to a weaker match on whatever columns remain.
-    columns = {c["name"] for c in inspector.get_columns("public_mcp_apps")}
-    if not APP_ROW_GUARD_COLUMNS.issubset(columns):
+    columns = {column["name"] for column in inspector.get_columns("public_mcp_apps")}
+    if "launch_config" not in columns:
         return
-
-    app_row = bind.execute(
-        sa.select(PUBLIC_MCP_APPS_TABLE).where(PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID)
-    ).first()
-    if app_row is not None and _row_matches_seeded_shape(
-        app_row, ROW, APP_ROW_GUARD_COLUMNS
-    ):
-        bind.execute(
-            sa.delete(PUBLIC_MCP_APPS_TABLE).where(
-                PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID
-            )
+    existing = bind.execute(
+        sa.select(PUBLIC_MCP_APPS_TABLE.c.launch_config).where(
+            PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID
         )
+    ).scalar_one_or_none()
+    if not _has_provenance(existing):
+        return
+    bind.execute(
+        sa.delete(PUBLIC_MCP_APPS_TABLE).where(PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID)
+    )

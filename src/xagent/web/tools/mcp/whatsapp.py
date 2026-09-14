@@ -59,13 +59,14 @@ BUSINESS_FIELDS = (
     f"client_whatsapp_business_accounts.limit(100){{{WABA_FIELDS}}}"
 )
 PHONE_NUMBER_FIELDS = (
-    "id,display_phone_number,verified_name,quality_rating,"
+    "id,display_phone_number,verified_name,quality_rating,status,"
     "code_verification_status,name_status,platform_type"
 )
 BUSINESS_PROFILE_FIELDS = (
     "about,address,description,email,profile_picture_url,websites,vertical"
 )
-TEMPLATE_FIELDS = "id,name,status,category,language,components,quality_score"
+TEMPLATE_FIELDS = "id,name,status,category,language,quality_score"
+TEMPLATE_FIELDS_WITH_COMPONENTS = f"{TEMPLATE_FIELDS},components"
 
 # Cloud API limits (per Meta's messages reference).
 MAX_TEXT_BODY_CHARS = 4096
@@ -151,36 +152,45 @@ def _graph_path(object_id: str, suffix: str | None = None) -> str:
 
 
 def _normalize_recipient(to: str) -> str:
-    """Normalize a recipient into the digits-only form the Cloud API takes.
+    """Normalize a recipient to a leading-"+" E.164 value for the Cloud API.
 
     Accepts an E.164 number with or without a leading ``+`` -- or the ``00``
     international dialing prefix used in its place in many countries (e.g.
     the UK's ``"0044 20 7946 0958"``) -- and tolerates the spaces, dashes,
     dots and parentheses people paste from address books
-    (``"+1 (555) 123-4567"`` -> ``"15551234567"``). A WhatsApp ``wa_id`` is
-    already digits-only and passes through unchanged. Anything else -- a
-    non-digit character, or a length outside E.164's bounds -- is rejected
-    up front so a malformed value fails here rather than as a confusing
-    Graph API error.
+    (``"+1 (555) 123-4567"`` -> ``"+15551234567"``). A bare digit string
+    (e.g. a WhatsApp ``wa_id`` from a prior response) is treated the same
+    way and also comes back with a "+" added.
+
+    The "+" is always restored on the way out, never just stripped: Meta's
+    own Cloud API formatting guidance warns that a `to` value without a
+    leading "+" has the *business's own* country code prepended by the
+    API, which can misdeliver the message to the wrong recipient -- and
+    that risk applies even to an already-correct digit string, not only to
+    an obviously incomplete one. Anything else -- a non-digit character, or
+    a length outside E.164's bounds -- is rejected up front so a malformed
+    value fails here rather than as a confusing Graph API error.
     """
     if not to or not str(to).strip():
         raise ValueError("to (recipient phone number) is required")
     cleaned = re.sub(r"[\s().-]", "", str(to).strip())
     if cleaned.startswith("+"):
-        cleaned = cleaned[1:]
+        digits = cleaned[1:]
     elif cleaned.startswith("00"):
-        cleaned = cleaned[2:]
-    if not cleaned.isdigit():
+        digits = cleaned[2:]
+    else:
+        digits = cleaned
+    if not digits.isdigit():
         raise ValueError(
             "to must be a phone number in international format (digits with an "
             "optional leading +), e.g. +15551234567"
         )
-    if not MIN_RECIPIENT_DIGITS <= len(cleaned) <= MAX_RECIPIENT_DIGITS:
+    if not MIN_RECIPIENT_DIGITS <= len(digits) <= MAX_RECIPIENT_DIGITS:
         raise ValueError(
             f"to must contain between {MIN_RECIPIENT_DIGITS} and "
             f"{MAX_RECIPIENT_DIGITS} digits including the country code"
         )
-    return cleaned
+    return f"+{digits}"
 
 
 def _data_list(result: Any) -> list[dict[str, Any]]:
@@ -198,13 +208,35 @@ def _first_dict(items: Any) -> dict[str, Any]:
     return {}
 
 
-def _next_link(result: Any) -> str | None:
+def _next_cursor(result: Any) -> str | None:
+    """The opaque `after` cursor for the next page, if there is one.
+
+    Deliberately not Meta's raw `paging.next` URL: that URL is otherwise
+    unusable by anything except a literal HTTP GET (this connector's tools
+    take structured arguments, not a URL to fetch), and forwarding it
+    verbatim would mean serializing an entire Graph API URL into
+    model-visible output on every paginated call for no actionable benefit.
+    The bare cursor is compact, is exactly what `params["after"]` expects
+    on the next call, and (unlike a full URL) carries no query parameters
+    to reason about at all.
+    """
     if not isinstance(result, dict):
         return None
     paging = result.get("paging")
     if not isinstance(paging, dict):
         return None
-    return paging.get("next")
+    cursors = paging.get("cursors")
+    if not isinstance(cursors, dict):
+        return None
+    after = cursors.get("after")
+    return after if isinstance(after, str) and after else None
+
+
+def _normalize_after(after: str | None) -> str | None:
+    if after is None:
+        return None
+    stripped = after.strip()
+    return stripped or None
 
 
 def _error_code(error: GraphAPIError) -> int | None:
@@ -251,18 +283,23 @@ def _normalize_waba(
     }
 
 
-def _list_business_accounts() -> tuple[list[dict[str, Any]], str | None]:
-    """Returns (accounts, next_link).
+def _list_business_accounts(
+    after: str | None = None,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Returns (accounts, next_after).
 
-    next_link is the outer /me/businesses page's own "next" cursor (a user
-    who is a member of more than 100 businesses); it does not cover a single
-    business owning more than 100 WABAs, which BUSINESS_FIELDS's nested
-    .limit(100) already treats as the practical ceiling for one connector
-    call rather than paginating recursively per-business.
+    next_after is the outer /me/businesses page's own continuation cursor
+    (a user who is a member of more than 100 businesses); feed it back in
+    as `after` to fetch the next page. It does not cover a single business
+    owning more than 100 WABAs, which BUSINESS_FIELDS's nested .limit(100)
+    already treats as the practical ceiling for one connector call rather
+    than paginating recursively per-business.
     """
-    result = _graph_request(
-        "GET", "/me/businesses", params={"fields": BUSINESS_FIELDS, "limit": 100}
-    )
+    params: dict[str, Any] = {"fields": BUSINESS_FIELDS, "limit": 100}
+    normalized_after = _normalize_after(after)
+    if normalized_after is not None:
+        params["after"] = normalized_after
+    result = _graph_request("GET", "/me/businesses", params=params)
     accounts: list[dict[str, Any]] = []
     seen: set[str] = set()
     for business in _data_list(result):
@@ -279,7 +316,7 @@ def _list_business_accounts() -> tuple[list[dict[str, Any]], str | None]:
                     continue
                 seen.add(waba_id)
                 accounts.append(_normalize_waba(waba, business, relationship))
-    return accounts, _next_link(result)
+    return accounts, _next_cursor(result)
 
 
 def _send_message(phone_number_id: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -329,20 +366,21 @@ def whatsapp_auth_status() -> str:
 
 
 @mcp.tool()
-def whatsapp_list_business_accounts() -> str:
+def whatsapp_list_business_accounts(after: str | None = None) -> str:
     """List the WhatsApp Business Accounts (WABAs) reachable from the connected
     Meta user, across every business they belong to.
 
     Each entry carries the owning business and whether the WABA is "owned" by
     that business or shared with it as a "client" account. Use the WABA id
     with whatsapp_list_phone_numbers and whatsapp_list_message_templates.
-    next_link is non-null only if the user belongs to more than 100
-    businesses -- WABAs of a single business beyond the first 100 aren't
-    signaled here (see BUSINESS_FIELDS).
+    next_after is non-null only if the user belongs to more than 100
+    businesses -- pass it back in as `after` to fetch the next page. WABAs of
+    a single business beyond the first 100 aren't signaled here (see
+    BUSINESS_FIELDS).
     """
     try:
-        accounts, next_link = _list_business_accounts()
-        return _success(accounts=accounts, next_link=next_link)
+        accounts, next_after = _list_business_accounts(after)
+        return _success(accounts=accounts, next_after=next_after)
     except GraphAPIError as e:
         logger.error("Error listing WhatsApp Business Accounts: %s", e)
         return _graph_error(e)
@@ -352,21 +390,27 @@ def whatsapp_list_business_accounts() -> str:
 
 
 @mcp.tool()
-def whatsapp_list_phone_numbers(waba_id: str) -> str:
+def whatsapp_list_phone_numbers(waba_id: str, after: str | None = None) -> str:
     """List the phone numbers registered under a WhatsApp Business Account.
 
     Messages are sent from a phone number's *id* (the "id" field here), not
-    from its display number. quality_rating (GREEN/YELLOW/RED) and
-    code_verification_status tell you whether a number is healthy and
-    verified before you send from it.
+    from its display number. status must be "CONNECTED" for a number to
+    send or receive messages; quality_rating (GREEN/YELLOW/RED) and
+    code_verification_status are separate health/verification signals.
+    next_after, when returned, can be passed back in as `after` to fetch
+    the next page.
     """
     try:
+        params: dict[str, Any] = {"fields": PHONE_NUMBER_FIELDS}
+        normalized_after = _normalize_after(after)
+        if normalized_after is not None:
+            params["after"] = normalized_after
         result = _graph_request(
-            "GET",
-            _graph_path(waba_id, "phone_numbers"),
-            params={"fields": PHONE_NUMBER_FIELDS},
+            "GET", _graph_path(waba_id, "phone_numbers"), params=params
         )
-        return _success(phone_numbers=_data_list(result), next_link=_next_link(result))
+        return _success(
+            phone_numbers=_data_list(result), next_after=_next_cursor(result)
+        )
     except GraphAPIError as e:
         logger.error("Error listing WhatsApp phone numbers for %s: %s", waba_id, e)
         return _graph_error(e)
@@ -404,19 +448,30 @@ def whatsapp_list_message_templates(
     waba_id: str,
     status: str | None = None,
     limit: int = 25,
+    after: str | None = None,
+    include_components: bool = False,
 ) -> str:
     """List message templates defined on a WhatsApp Business Account.
 
     Templates are the only way to start a conversation or message someone
     outside the 24-hour customer service window. Filter with status
-    (e.g. "APPROVED" -- only approved templates can be sent). Each template's
-    "components" shows which header/body/button parameters
-    whatsapp_send_template_message must fill in, and "language" is the exact
-    code to pass as language_code.
+    (e.g. "APPROVED" -- only approved templates can be sent). "language" is
+    the exact code to pass as language_code. next_after, when returned, can
+    be passed back in as `after` to fetch the next page.
+
+    include_components is off by default -- a template's "components" (the
+    header/body/button parameters whatsapp_send_template_message must fill
+    in) can be large, and a full page of rich templates can otherwise
+    balloon the response. Once you've found the template you want by name
+    here, call this again with include_components=True (optionally
+    filtering to just that name's language) to see its parameter shape
+    before sending.
     """
     try:
         params: dict[str, Any] = {
-            "fields": TEMPLATE_FIELDS,
+            "fields": TEMPLATE_FIELDS_WITH_COMPONENTS
+            if include_components
+            else TEMPLATE_FIELDS,
             "limit": _bounded_limit(limit),
         }
         if status is not None and status.strip():
@@ -426,10 +481,13 @@ def whatsapp_list_message_templates(
                     "status must be one of: " + ", ".join(sorted(TEMPLATE_STATUSES))
                 )
             params["status"] = normalized_status
+        normalized_after = _normalize_after(after)
+        if normalized_after is not None:
+            params["after"] = normalized_after
         result = _graph_request(
             "GET", _graph_path(waba_id, "message_templates"), params=params
         )
-        return _success(templates=_data_list(result), next_link=_next_link(result))
+        return _success(templates=_data_list(result), next_after=_next_cursor(result))
     except GraphAPIError as e:
         logger.error("Error listing WhatsApp templates for %s: %s", waba_id, e)
         return _graph_error(e)
@@ -448,12 +506,17 @@ def whatsapp_send_text_message(
 ) -> str:
     """Send a free-form text message from a business phone number.
 
-    Free-form messages are only delivered inside the 24-hour customer service
-    window that opens when the recipient last messaged this number; outside it
-    use whatsapp_send_template_message. `to` is the recipient's phone number
-    in international format (e.g. +15551234567). preview_url renders a link
-    preview for the first URL in the body. reply_to_message_id quotes an
-    earlier message (a "wamid..." id) so the reply threads under it.
+    Only send to a recipient who has opted in to receive messages from this
+    business -- WhatsApp's messaging policy requires prior opt-in for every
+    message, independent of the 24-hour window below. Free-form messages are
+    only delivered inside the 24-hour customer service window that opens
+    when the recipient last messaged this number; outside it use
+    whatsapp_send_template_message (which still requires the same opt-in --
+    it lifts the 24-hour restriction, not the consent requirement). `to` is
+    the recipient's phone number in international format (e.g.
+    +15551234567). preview_url renders a link preview for the first URL in
+    the body. reply_to_message_id quotes an earlier message (a "wamid..."
+    id) so the reply threads under it.
     """
     try:
         if not body or not body.strip():
@@ -487,10 +550,14 @@ def whatsapp_send_template_message(
 ) -> str:
     """Send an approved message template from a business phone number.
 
-    Templates work at any time, including to start a conversation. Find the
-    template with whatsapp_list_message_templates; language_code must match
-    the template's "language" exactly (e.g. "en_US"). components fills the
-    template's placeholders using the Cloud API shape, e.g.
+    Only send to a recipient who has opted in to receive messages from this
+    business -- WhatsApp's messaging policy requires prior opt-in for every
+    message, including templates. A template lifts the 24-hour
+    customer-service-window restriction (it can start a conversation or
+    reach someone outside that window), not the opt-in requirement itself.
+    Find the template with whatsapp_list_message_templates; language_code
+    must match the template's "language" exactly (e.g. "en_US"). components
+    fills the template's placeholders using the Cloud API shape, e.g.
     [{"type": "body", "parameters": [{"type": "text", "text": "Alice"}]}];
     omit it for templates with no variables.
     """
@@ -547,11 +614,14 @@ def whatsapp_send_media_message(
 ) -> str:
     """Send an image, video, audio clip, or document by public URL.
 
-    media_type is one of image, video, audio, document. media_url must be a
-    publicly reachable http(s) URL that Meta's servers can download. caption
-    applies to image, video and document (not audio); filename is the name a
-    document shows with (documents only). Like text messages, media is only
-    delivered inside the 24-hour customer service window.
+    Only send to a recipient who has opted in to receive messages from this
+    business -- WhatsApp's messaging policy requires prior opt-in for every
+    message, independent of the 24-hour window below. media_type is one of
+    image, video, audio, document. media_url must be a publicly reachable
+    http(s) URL that Meta's servers can download. caption applies to image,
+    video and document (not audio); filename is the name a document shows
+    with (documents only). Like text messages, media is only delivered
+    inside the 24-hour customer service window.
     """
     try:
         normalized_type = (media_type or "").strip().lower()

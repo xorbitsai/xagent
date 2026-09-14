@@ -1,22 +1,22 @@
-"""Tests for the WhatsApp Business MCP connector seed migration."""
+"""Tests for the provenance-safe WhatsApp Business MCP connector seed."""
 
 import importlib.util
+import json
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from sqlalchemy import create_engine, text
 
 
-def _load_migration_module():
-    migration_file = (
-        Path(__file__).parent.parent.parent
+def _load_migration():
+    path = (
+        Path(__file__).parents[2]
         / "src/xagent/migrations/versions/20260909_seed_whatsapp_mcp_app.py"
     )
-    spec = importlib.util.spec_from_file_location(
-        "seed_whatsapp_migration", migration_file
-    )
+    spec = importlib.util.spec_from_file_location("seed_whatsapp_migration", path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
@@ -59,9 +59,9 @@ def _run(connection, migration, *steps):
             getattr(migration, step)()
 
 
-def test_upgrade_inserts_whatsapp(tmp_path):
+def test_upgrade_inserts_whatsapp_with_provenance(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
-    migration = _load_migration_module()
+    migration = _load_migration()
     with engine.begin() as connection:
         _create_apps_table(connection)
         _run(connection, migration, "upgrade")
@@ -83,25 +83,100 @@ def test_upgrade_inserts_whatsapp(tmp_path):
             assert scope in str(row[2])
         assert "xagent.web.tools.mcp.whatsapp" in str(row[3])
         assert "META_ACCESS_TOKEN" in str(row[3])
+        assert '"builtin_provenance"' in str(row[3])
         assert row[4] == 1
         assert row[5] == "Communication"
 
 
-def test_upgrade_is_idempotent(tmp_path):
+def test_upgrade_is_idempotent_for_provenance_owned_row(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
-    migration = _load_migration_module()
+    migration = _load_migration()
     with engine.begin() as connection:
         _create_apps_table(connection)
         _run(connection, migration, "upgrade", "upgrade")
-        rows = connection.execute(
+        count = connection.execute(
             text("SELECT COUNT(*) FROM public_mcp_apps WHERE app_id='whatsapp'")
-        ).scalar()
-        assert rows == 1
+        ).scalar_one()
+    assert count == 1
+
+
+def test_upgrade_accepts_owned_row_from_an_older_provenance_version(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration()
+    with engine.begin() as connection:
+        _create_apps_table(connection)
+        launch_config = dict(migration.ROW["launch_config"])
+        marker = dict(migration.BUILTIN_PROVENANCE)
+        marker["version"] = 0
+        launch_config["builtin_provenance"] = marker
+        connection.execute(
+            text(
+                "INSERT INTO public_mcp_apps "
+                "(app_id, name, transport, launch_config) "
+                "VALUES ('whatsapp', 'WhatsApp Business', 'oauth', :launch_config)"
+            ),
+            {"launch_config": json.dumps(launch_config)},
+        )
+        _run(connection, migration, "upgrade")
+        count = connection.execute(
+            text("SELECT COUNT(*) FROM public_mcp_apps WHERE app_id='whatsapp'")
+        ).scalar_one()
+    assert count == 1
+
+
+def test_upgrade_refuses_custom_catalog_collision(tmp_path):
+    """A pre-existing custom app_id='whatsapp' row (e.g. hand-created by an
+    operator via POST /admin/mcp/apps before this migration deployed) has no
+    provenance marker, so this must fail closed rather than silently leaving
+    the row in place for the builtin execution overlay to potentially
+    misidentify later."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration()
+    with engine.begin() as connection:
+        _create_apps_table(connection)
+        connection.execute(
+            text(
+                "INSERT INTO public_mcp_apps "
+                "(app_id, name, description, transport, is_visible_in_connector) "
+                "VALUES ('whatsapp', 'Operator WhatsApp', 'hand-made', 'oauth', 0)"
+            )
+        )
+        with pytest.raises(RuntimeError, match="public_mcp_apps"):
+            _run(connection, migration, "upgrade")
+        row = connection.execute(
+            text("SELECT name FROM public_mcp_apps WHERE app_id='whatsapp'")
+        ).scalar_one()
+    assert row == "Operator WhatsApp"
+
+
+@pytest.mark.parametrize(
+    "app_id,name",
+    [
+        (" WHATSAPP ", "Unrelated"),
+        ("other", " whatsapp business "),
+        ("WhAtSaPp", "Unrelated"),
+    ],
+)
+def test_upgrade_refuses_normalized_custom_catalog_collision(tmp_path, app_id, name):
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration()
+    with engine.begin() as connection:
+        _create_apps_table(connection)
+        connection.execute(
+            text(
+                "INSERT INTO public_mcp_apps "
+                "(app_id, name, transport, is_visible_in_connector) "
+                "VALUES (:app_id, :name, 'oauth', 0)"
+            ),
+            {"app_id": app_id, "name": name},
+        )
+        with pytest.raises(RuntimeError, match="public_mcp_apps"):
+            _run(connection, migration, "upgrade")
 
 
 def test_upgrade_skips_columns_missing_from_a_reduced_schema(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
-    migration = _load_migration_module()
+    migration = _load_migration()
     with engine.begin() as connection:
         connection.execute(
             text(
@@ -120,26 +195,28 @@ def test_upgrade_skips_columns_missing_from_a_reduced_schema(tmp_path):
         assert "whatsapp" in _app_ids(connection)
 
 
-def test_upgrade_preserves_a_preexisting_row_with_the_same_app_id(tmp_path):
+def test_upgrade_raises_when_launch_config_column_is_missing(tmp_path):
+    """launch_config is where the provenance marker lives; without the
+    column there is no way to prove ownership of any existing row, so this
+    must fail loudly instead of seeding (or skipping) silently."""
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
-    migration = _load_migration_module()
+    migration = _load_migration()
     with engine.begin() as connection:
-        _create_apps_table(connection)
         connection.execute(
             text(
-                "INSERT INTO public_mcp_apps "
-                "(app_id, name, description, transport, is_visible_in_connector) "
-                "VALUES ('whatsapp', 'Operator WhatsApp', 'hand-made', 'oauth', 0)"
+                """
+                CREATE TABLE public_mcp_apps (
+                    id INTEGER PRIMARY KEY,
+                    app_id VARCHAR(100) NOT NULL UNIQUE,
+                    name VARCHAR(200) NOT NULL,
+                    transport VARCHAR(50) NOT NULL DEFAULT 'oauth'
+                )
+                """
             )
         )
-        _run(connection, migration, "upgrade")
-        row = connection.execute(
-            text(
-                "SELECT COUNT(*), MIN(name), MIN(is_visible_in_connector) "
-                "FROM public_mcp_apps WHERE app_id='whatsapp'"
-            )
-        ).first()
-        assert row == (1, "Operator WhatsApp", 0)
+        with pytest.raises(RuntimeError, match="launch_config"):
+            _run(connection, migration, "upgrade")
+        assert "whatsapp" not in _app_ids(connection)
 
 
 def test_seed_row_matches_registry():
@@ -147,7 +224,7 @@ def test_seed_row_matches_registry():
     whatsapp row (the migration is a frozen copy; this catches drift)."""
     from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
 
-    migration = _load_migration_module()
+    migration = _load_migration()
     registry_row = next(
         r for r in get_builtin_public_mcp_app_rows() if r["app_id"] == "whatsapp"
     )
@@ -155,9 +232,9 @@ def test_seed_row_matches_registry():
     assert registry_row["is_visible_in_connector"] is True
 
 
-def test_downgrade_removes_whatsapp(tmp_path):
+def test_downgrade_only_deletes_provenance_owned_row(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
-    migration = _load_migration_module()
+    migration = _load_migration()
     with engine.begin() as connection:
         _create_apps_table(connection)
         _run(connection, migration, "upgrade", "downgrade")
@@ -165,10 +242,10 @@ def test_downgrade_removes_whatsapp(tmp_path):
 
 
 def test_downgrade_preserves_a_preexisting_operator_row(tmp_path):
-    """upgrade() skips a row that already occupies the app_id, so downgrade()
-    must not delete it either -- it is the operator's, not this migration's."""
+    """A pre-existing operator row makes upgrade() raise (it never gets
+    inserted/adopted), so downgrade() must never delete it either."""
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
-    migration = _load_migration_module()
+    migration = _load_migration()
     with engine.begin() as connection:
         _create_apps_table(connection)
         connection.execute(
@@ -179,7 +256,7 @@ def test_downgrade_preserves_a_preexisting_operator_row(tmp_path):
                 "'oauth', 'meta')"
             )
         )
-        _run(connection, migration, "upgrade", "downgrade")
+        _run(connection, migration, "downgrade")
         row = connection.execute(
             text(
                 "SELECT name, description FROM public_mcp_apps WHERE app_id='whatsapp'"
@@ -188,31 +265,9 @@ def test_downgrade_preserves_a_preexisting_operator_row(tmp_path):
         assert row == ("WhatsApp Business", "hand-made")
 
 
-def test_downgrade_preserves_row_admin_edited_beyond_structural_fields(tmp_path):
-    """description and is_visible_in_connector are admin-PATCHable on builtin
-    rows; a migration-created row an admin then hid must survive downgrade
-    rather than be treated as still 'ours' on a name/transport-only match."""
+def test_downgrade_is_a_noop_when_launch_config_column_is_missing(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
-    migration = _load_migration_module()
-    with engine.begin() as connection:
-        _create_apps_table(connection)
-        _run(connection, migration, "upgrade")
-        connection.execute(
-            text(
-                "UPDATE public_mcp_apps SET is_visible_in_connector=0 "
-                "WHERE app_id='whatsapp'"
-            )
-        )
-        _run(connection, migration, "downgrade")
-        assert "whatsapp" in _app_ids(connection)
-
-
-def test_downgrade_is_a_noop_when_a_guard_column_is_missing(tmp_path):
-    """A reduced-schema table missing a guard column must not make the guard
-    SELECT reference a nonexistent column and raise, and must not fall back
-    to a weaker match on the remaining columns either."""
-    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
-    migration = _load_migration_module()
+    migration = _load_migration()
     with engine.begin() as connection:
         connection.execute(
             text(
@@ -221,19 +276,24 @@ def test_downgrade_is_a_noop_when_a_guard_column_is_missing(tmp_path):
                     id INTEGER PRIMARY KEY,
                     app_id VARCHAR(100) NOT NULL UNIQUE,
                     name VARCHAR(200) NOT NULL,
-                    transport VARCHAR(50) NOT NULL DEFAULT 'oauth',
-                    launch_config JSON
+                    transport VARCHAR(50) NOT NULL DEFAULT 'oauth'
                 )
                 """
             )
         )
-        _run(connection, migration, "upgrade", "downgrade")
+        connection.execute(
+            text(
+                "INSERT INTO public_mcp_apps (app_id, name, transport) "
+                "VALUES ('whatsapp', 'WhatsApp Business', 'oauth')"
+            )
+        )
+        _run(connection, migration, "downgrade")
         assert "whatsapp" in _app_ids(connection)
 
 
 def test_upgrade_and_downgrade_no_op_without_table(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
-    migration = _load_migration_module()
+    migration = _load_migration()
     with engine.begin() as connection:
         _run(connection, migration, "upgrade", "downgrade")
         table_names = set(

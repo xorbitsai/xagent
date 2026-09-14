@@ -157,7 +157,7 @@ def test_list_business_accounts_expands_owned_and_client_wabas(token, monkeypatc
                 "business": {"id": "biz-1", "name": "Acme"},
             },
         ],
-        "next_link": None,
+        "next_after": None,
     }
     mock.assert_called_once()
     assert mock.call_args.kwargs["url"] == f"{GRAPH}/me/businesses"
@@ -178,34 +178,48 @@ def test_list_business_accounts_with_no_businesses(token, monkeypatch):
 
     result = _payload(whatsapp.whatsapp_list_business_accounts())
 
-    assert result == {"status": "success", "accounts": [], "next_link": None}
+    assert result == {"status": "success", "accounts": [], "next_after": None}
     mock.assert_called_once()
 
 
-def test_list_business_accounts_surfaces_next_link_past_100_businesses(
+def test_list_business_accounts_surfaces_next_after_past_100_businesses(
     token, monkeypatch
 ):
-    """A user in more than 100 businesses gets a next_link signal rather than
-    a silent truncation to the first page (see BUSINESS_FIELDS's .limit(100)
-    on the nested WABA edges for the corresponding per-business ceiling)."""
+    """A user in more than 100 businesses gets a next_after cursor rather
+    than a silent truncation to the first page (see BUSINESS_FIELDS's
+    .limit(100) on the nested WABA edges for the corresponding
+    per-business ceiling)."""
     mock = _mock_request(
         monkeypatch,
         MockResponse(
             {
                 "data": [{"id": "biz-1", "name": "Acme"}],
-                "paging": {
-                    "next": "https://graph.facebook.com/v25.0/me/businesses?after=x"
-                },
+                "paging": {"cursors": {"after": "biz-cursor-1"}},
             }
         ),
     )
 
     result = _payload(whatsapp.whatsapp_list_business_accounts())
 
-    assert result["next_link"] == (
-        "https://graph.facebook.com/v25.0/me/businesses?after=x"
-    )
+    assert result["next_after"] == "biz-cursor-1"
     mock.assert_called_once()
+
+
+def test_list_business_accounts_forwards_after_cursor(token, monkeypatch):
+    mock = _mock_request(monkeypatch, MockResponse({"data": []}))
+
+    whatsapp.whatsapp_list_business_accounts(after=" biz-cursor-1 ")
+
+    assert mock.call_args.kwargs["params"]["after"] == "biz-cursor-1"
+
+
+@pytest.mark.parametrize("after", [None, "", "   "])
+def test_list_business_accounts_omits_blank_after_cursor(token, monkeypatch, after):
+    mock = _mock_request(monkeypatch, MockResponse({"data": []}))
+
+    whatsapp.whatsapp_list_business_accounts(after=after)
+
+    assert "after" not in mock.call_args.kwargs["params"]
 
 
 def test_list_business_accounts_surfaces_graph_error(token, monkeypatch):
@@ -231,9 +245,10 @@ def test_list_phone_numbers(token, monkeypatch):
                         "display_phone_number": "+1 555-123-4567",
                         "verified_name": "Acme",
                         "quality_rating": "GREEN",
+                        "status": "CONNECTED",
                     }
                 ],
-                "paging": {"next": "https://graph.facebook.com/next"},
+                "paging": {"cursors": {"after": "phone-cursor-1"}},
             }
         ),
     )
@@ -242,9 +257,21 @@ def test_list_phone_numbers(token, monkeypatch):
 
     assert result["status"] == "success"
     assert result["phone_numbers"][0]["id"] == "pn-1"
-    assert result["next_link"] == "https://graph.facebook.com/next"
+    assert result["next_after"] == "phone-cursor-1"
     assert mock.call_args.kwargs["url"] == f"{GRAPH}/waba-1/phone_numbers"
     assert mock.call_args.kwargs["params"] == {"fields": whatsapp.PHONE_NUMBER_FIELDS}
+    assert "status" in whatsapp.PHONE_NUMBER_FIELDS
+
+
+def test_list_phone_numbers_forwards_after_cursor(token, monkeypatch):
+    mock = _mock_request(monkeypatch, MockResponse({"data": []}))
+
+    whatsapp.whatsapp_list_phone_numbers("waba-1", after=" phone-cursor-1 ")
+
+    assert mock.call_args.kwargs["params"] == {
+        "fields": whatsapp.PHONE_NUMBER_FIELDS,
+        "after": "phone-cursor-1",
+    }
 
 
 def test_list_phone_numbers_url_encodes_waba_id(token, monkeypatch):
@@ -304,7 +331,7 @@ def test_list_message_templates_defaults(token, monkeypatch):
         MockResponse(
             {
                 "data": [{"id": "t1", "name": "hello", "status": "APPROVED"}],
-                "paging": {"cursors": {"after": "x"}},
+                "paging": {"cursors": {"after": "tpl-cursor-1"}},
             }
         ),
     )
@@ -314,13 +341,33 @@ def test_list_message_templates_defaults(token, monkeypatch):
     assert result == {
         "status": "success",
         "templates": [{"id": "t1", "name": "hello", "status": "APPROVED"}],
-        "next_link": None,
+        "next_after": "tpl-cursor-1",
     }
     assert mock.call_args.kwargs["url"] == f"{GRAPH}/waba-1/message_templates"
     assert mock.call_args.kwargs["params"] == {
         "fields": whatsapp.TEMPLATE_FIELDS,
         "limit": 25,
     }
+    assert "components" not in whatsapp.TEMPLATE_FIELDS
+
+
+def test_list_message_templates_include_components(token, monkeypatch):
+    mock = _mock_request(monkeypatch, MockResponse({"data": []}))
+
+    whatsapp.whatsapp_list_message_templates("waba-1", include_components=True)
+
+    assert mock.call_args.kwargs["params"]["fields"] == (
+        whatsapp.TEMPLATE_FIELDS_WITH_COMPONENTS
+    )
+    assert "components" in whatsapp.TEMPLATE_FIELDS_WITH_COMPONENTS
+
+
+def test_list_message_templates_forwards_after_cursor(token, monkeypatch):
+    mock = _mock_request(monkeypatch, MockResponse({"data": []}))
+
+    whatsapp.whatsapp_list_message_templates("waba-1", after=" tpl-cursor-1 ")
+
+    assert mock.call_args.kwargs["params"]["after"] == "tpl-cursor-1"
 
 
 def test_list_message_templates_normalizes_status_and_bounds_limit(token, monkeypatch):
@@ -388,7 +435,7 @@ def test_send_text_message_posts_json_payload(token, monkeypatch):
         json={
             "messaging_product": "whatsapp",
             "recipient_type": "individual",
-            "to": "15551234567",
+            "to": "+15551234567",
             "type": "text",
             "text": {"preview_url": True, "body": "Hello there"},
         },
@@ -442,15 +489,20 @@ def test_send_text_message_errors_when_no_message_id_returned(token, monkeypatch
 @pytest.mark.parametrize(
     ("to", "expected"),
     [
-        ("+15551234567", "15551234567"),
-        ("15551234567", "15551234567"),
-        ("+44 20 7946 0958", "442079460958"),
-        ("+1 (555) 123-4567", "15551234567"),
-        ("+49.30.123456", "4930123456"),
+        ("+15551234567", "+15551234567"),
+        # A bare digit string (e.g. a wa_id echoed back by a prior response)
+        # gets a "+" added too -- Meta's own Cloud API formatting guidance
+        # warns that a `to` value missing the "+" has the *business's*
+        # country code prepended by the API itself, even when the digits
+        # already form a complete, correct international number.
+        ("15551234567", "+15551234567"),
+        ("+44 20 7946 0958", "+442079460958"),
+        ("+1 (555) 123-4567", "+15551234567"),
+        ("+49.30.123456", "+4930123456"),
         # "00" is the international access code many countries (e.g. the
         # UK) use in place of "+" when dialing abroad.
-        ("0044 20 7946 0958", "442079460958"),
-        ("00 1 555 123 4567", "15551234567"),
+        ("0044 20 7946 0958", "+442079460958"),
+        ("00 1 555 123 4567", "+15551234567"),
     ],
 )
 def test_normalize_recipient_accepts_common_formats(to, expected):
@@ -566,7 +618,7 @@ def test_send_template_message_with_components(token, monkeypatch):
     assert mock.call_args.kwargs["json"] == {
         "messaging_product": "whatsapp",
         "recipient_type": "individual",
-        "to": "15551234567",
+        "to": "+15551234567",
         "type": "template",
         "template": {
             "name": "order_update",
@@ -640,7 +692,7 @@ def test_send_media_message_image_with_caption(token, monkeypatch):
     assert mock.call_args.kwargs["json"] == {
         "messaging_product": "whatsapp",
         "recipient_type": "individual",
-        "to": "15551234567",
+        "to": "+15551234567",
         "type": "image",
         "image": {"link": "https://cdn.example.com/a.png", "caption": "Look"},
     }
@@ -916,5 +968,10 @@ def test_whatsapp_app_registry_row():
         "command": "python",
         "args": ["-m", "xagent.web.tools.mcp.whatsapp"],
         "env_mapping": {"META_ACCESS_TOKEN": "access_token"},
+        "builtin_provenance": {
+            "registry": "xagent",
+            "app_id": "whatsapp",
+            "version": 1,
+        },
     }
     assert row["is_visible_in_connector"] is True

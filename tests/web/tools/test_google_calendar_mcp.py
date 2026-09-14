@@ -514,6 +514,7 @@ def test_update_event_recurring_schedule_requires_exception_risk_acknowledgement
     assert "cannot atomically check instance exceptions" in result["message"]
     assert "acknowledge_recurring_exception_risk=True" in result["message"]
     assert "retained EXDATE/RDATE/EXRULE values" in result["message"]
+    service.events.return_value.list.assert_not_called()
     service.events.return_value.update.assert_not_called()
 
 
@@ -619,6 +620,7 @@ def test_update_event_recurrence_rejects_a_repeated_exception_page_token(monkeyp
             event_id="existing-1",
             recurrence="FREQ=WEEKLY;COUNT=2",
             ignore_conflicts=True,
+            acknowledge_recurring_exception_risk=True,
         )
     )
 
@@ -6006,6 +6008,38 @@ def test_update_events_explicit_timezone_on_all_day_event_does_not_send_malforme
 
 
 @pytest.mark.parametrize(
+    "extra_kwargs",
+    [
+        {"notify_attendees": True},
+        {"attendees": []},
+        {"attendees": ["existing@example.com"]},
+    ],
+)
+def test_update_events_all_day_timezone_noop_variants_do_not_write(
+    monkeypatch, extra_kwargs
+):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"date": "2026-08-26"},
+        "end": {"date": "2026-08-27"},
+        "attendees": [{"email": "existing@example.com"}],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            timezone="Asia/Shanghai",
+            **extra_kwargs,
+        )
+    )
+
+    assert result["status"] == "success"
+    service.events.return_value.update.assert_not_called()
+
+
+@pytest.mark.parametrize(
     ("field", "value", "message"),
     [
         ("dateTime", 12345, "start boundary must be a string"),
@@ -6199,9 +6233,9 @@ def test_update_events_ignores_timezone_when_comparing_all_day_start(monkeypatch
     )
 
     assert result["status"] == "success"
-    _, kwargs = service.events.return_value.update.call_args
-    assert kwargs["body"]["start"] == {"date": "2026-09-01"}
-    assert kwargs["body"]["recurrence"] == existing_event["recurrence"]
+    assert result["event"]["start"] == {"date": "2026-09-01"}
+    assert result["event"]["recurrence"] == existing_event["recurrence"]
+    service.events.return_value.update.assert_not_called()
 
 
 def test_update_events_preserves_existing_exdate_when_replacing_the_rrule(

@@ -1,3 +1,4 @@
+import copy
 import json
 import logging
 import os
@@ -1138,7 +1139,8 @@ def google_calendar_create_events(
     with timezone must use a UTC UNTIL ending in Z.
     timezone is an IANA name such as 'America/Los_Angeles' and is required
     for timed recurring events, including when start_time/end_time carry
-    their own offsets. It is ignored for all-day events.
+    their own offsets. For all-day events, it is validated when supplied
+    but is not written to the event boundaries.
     google_calendar_update_events can reschedule an event while preserving
     its existing all-day or timed kind, and can update recurrence rules.
     attendees is a list of email addresses to add to the event. Adding attendees does not, by
@@ -1377,8 +1379,8 @@ def google_calendar_update_events(
     rejected rather than sending a contradictory EventDateTime. timezone is
     otherwise optional. When changing a non-recurring event, do not combine timezone
     with offset-bearing start/end values, whether newly supplied or already
-    stored, because the two zone representations may disagree. timezone has no
-    validated when supplied but is not written to an all-day event.
+    stored, because the two zone representations may disagree. For an all-day
+    event, timezone is validated when supplied but is not written to its boundaries.
     If the update moves the event to a new time, or adds attendees, that change is checked for
     conflicts the same way google_calendar_create_events is; pass ignore_conflicts=True to skip the
     check once the user has explicitly confirmed a conflict is fine. If an individual required
@@ -1460,6 +1462,7 @@ def google_calendar_update_events(
 
         # First get the existing event
         event = service.events().get(calendarId="primary", eventId=event_id).execute()
+        fetched_event = copy.deepcopy(event)
         if recurrence is not None and event.get("recurringEventId"):
             # A single occurrence of a recurring series (e.g. one row
             # from google_calendar_search_events, which lists occurrences
@@ -2555,6 +2558,15 @@ def google_calendar_update_events(
             )
         )
         if stored_exceptions_may_shift:
+            if not acknowledge_recurring_exception_risk:
+                raise ValueError(
+                    "Google Calendar cannot atomically check instance exceptions "
+                    "and update their recurring master; pass "
+                    "acknowledge_recurring_exception_risk=True only after the user "
+                    "accepts that retained EXDATE/RDATE/EXRULE values may need "
+                    "separate adjustment and that another client could create, "
+                    "edit, or cancel an exception between the check and update"
+                )
             if _series_has_exceptions(
                 service,
                 event_id,
@@ -2568,15 +2580,6 @@ def google_calendar_update_events(
                     "the existing recurring series has edited or cancelled "
                     "instances whose meaning cannot be safely preserved after "
                     "changing its recurrence rule, start time, or expansion timezone"
-                )
-            if not acknowledge_recurring_exception_risk:
-                raise ValueError(
-                    "Google Calendar cannot atomically check instance exceptions "
-                    "and update their recurring master; pass "
-                    "acknowledge_recurring_exception_risk=True only after the user "
-                    "accepts that retained EXDATE/RDATE/EXRULE values may need "
-                    "separate adjustment and that another client could create, "
-                    "edit, or cancel an exception between the check and update"
                 )
 
         if description:
@@ -2602,23 +2605,9 @@ def google_calendar_update_events(
         requested_conference = _apply_conference_request(event, add_google_meet)
 
         # `timezone` is validated but never belongs on an all-day boundary.
-        # Avoid a byte-identical full-resource write for this one supported
-        # no-op, since it could still bump metadata or notify attendees.
-        all_day_timezone_only = bool(
-            timezone
-            and is_all_day
-            and start_time is None
-            and end_time is None
-            and recurrence is None
-            and not summary
-            and not description
-            and not location
-            and attendees is None
-            and not notify_attendees
-            and not added_attendees
-            and not add_google_meet
-        )
-        if all_day_timezone_only:
+        # Base the no-op decision on the effective body so syntactic attendee
+        # arguments and notification flags cannot re-enable an unchanged PUT.
+        if timezone and is_all_day and event == fetched_event:
             return _event_response(event)
 
         request = service.events().update(

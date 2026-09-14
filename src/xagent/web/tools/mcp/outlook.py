@@ -12,7 +12,6 @@ from mcp.server.fastmcp import FastMCP
 
 from .utils import InsufficientScopeError
 from .utils import conflict_response as _conflict_response
-from .utils import datetime_key_for_comparison as _datetime_key_for_comparison
 from .utils import incomplete_check_response as _incomplete_check_response
 from .utils import merge_scope_error as _merge_scope_error
 from .utils import naive_day_bounds as _naive_day_bounds
@@ -21,7 +20,6 @@ from .utils import offset_datetime_string as _offset_datetime_string
 from .utils import reject_reversed_window as _reject_reversed_window
 from .utils import resolve_zoneinfo as _resolve_zoneinfo
 from .utils import setup_proxy_env
-from .utils import timezones_could_differ as _timezones_could_differ
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("outlook-mcp")
@@ -153,15 +151,10 @@ def _utc_field_in_zone(field: dict[str, Any], zone_name: str) -> dict[str, Any]:
     into the equivalent wall-clock value in `zone_name`, computed locally
     rather than by re-fetching with a Prefer header.
 
-    Needed anywhere `zone_name` comes from `originalStartTimeZone` (the
-    event's real configured zone) rather than from this same field's own
-    "timeZone" (always "UTC" here): pairing that real zone name with the
-    UTC clock value unchanged - e.g. via `_offset_datetime_string` - would
-    silently mislabel a UTC instant as if it were already expressed in
-    the real zone, off by the real zone's UTC offset. This also matters
-    for is_all_day day-bounds widening, which operates on the naive
-    clock value's own date - a UTC-denominated date can name a different
-    calendar day than the instant's real local one, near a day boundary.
+    Pairing a caller-supplied zone name with the UTC clock value unchanged
+    would silently mislabel the instant by the zone's UTC offset. This also
+    matters for all-day bounds, whose local date can differ from the UTC date
+    near a day boundary.
 
     Falls back to `field` unchanged when there's nothing to convert (no
     dateTime) or `zone_name` doesn't resolve - a wrong zone name here is
@@ -857,14 +850,13 @@ def outlook_update_event(
     address already on the event that's left out is removed, and passing
     an explicit empty list clears every attendee. Leave attendees unset to
     keep the existing list untouched.
-    Passing only one of start_datetime/end_datetime nudges that boundary
-    while keeping the other as-is. timezone describes the changed boundary;
-    when omitted, that boundary's existing timezone is reused. Passing both
-    together fully replaces the window, and timezone then describes both
-    new values (defaulting to UTC if also left unset). All-day boundaries
-    must continue to use one shared timezone.
-    When neither boundary is supplied, omit timezone; a flag-only all-day
-    change interprets the stored boundaries in the event's existing timezone.
+    Passing only one of start_datetime/end_datetime nudges a timed event
+    boundary while keeping the other as-is; timezone is required and describes
+    the changed boundary. Passing both together fully replaces the window, and
+    timezone then describes both new values (defaulting to UTC if also left
+    unset). Creating, changing, or resizing an all-day window requires both
+    boundaries because Graph does not expose a reliable current boundary zone;
+    all-day boundaries must be midnight values in one shared timezone.
     This update path checks the signed-in calendar when the event window
     changes; attendee availability is not checked yet. A detected conflict
     returns status="conflict" without updating the event. An incomplete
@@ -882,10 +874,13 @@ def outlook_update_event(
             or end_datetime is not None
             or is_all_day is not None
         )
-        if timezone is not None:
-            # Validate every explicit value, including flag-only all-day
-            # updates, before enforcing whether the value is meaningful for
-            # this input shape.
+        single_boundary_update = (start_datetime is not None) != (
+            end_datetime is not None
+        )
+        both_boundaries_supplied = (
+            start_datetime is not None and end_datetime is not None
+        )
+        if timezone is not None and touches_schedule:
             _resolve_zoneinfo(timezone, allow_windows_names=True)
             if start_datetime is None and end_datetime is None:
                 raise ValueError(
@@ -894,239 +889,102 @@ def outlook_update_event(
                     "update so the event's existing timezone is reused."
                 )
 
-        # A single-boundary update needs the stored event so the untouched
-        # endpoint can be included in validation and conflict checks. Graph
-        # stores start/end as independent dateTimeTimeZone values for timed
-        # events, so an explicit caller timezone may legitimately differ
-        # from the untouched endpoint's zone.
-        single_boundary_update = (start_datetime is not None) != (
-            end_datetime is not None
-        )
-        if start_datetime is not None and end_datetime is not None:
+        if single_boundary_update:
+            supplied_boundary = (
+                start_datetime if start_datetime is not None else end_datetime
+            )
+            assert supplied_boundary is not None
+            _naive_datetime_in_timezone(supplied_boundary, timezone or "UTC")
+            if timezone is None:
+                raise ValueError(
+                    "timezone is required when updating only start_datetime or "
+                    "only end_datetime because Graph exposes original creation "
+                    "zones, not the boundary's current timezone."
+                )
+        if both_boundaries_supplied:
+            assert start_datetime is not None and end_datetime is not None
             _reject_invalid_create_window(
                 start_datetime,
                 end_datetime,
                 is_all_day=is_all_day is True,
             )
 
-        # Needed for the conflict check below, for resolving the timezone
-        # a single-boundary update must be written in, and for determining
-        # whether an update that omits `is_all_day` is still modifying an
-        # existing all-day event. `ignore_conflicts` only skips availability
-        # calls; it must not skip the reads required to construct a valid
-        # Graph payload.
+        # Existing state is needed for conflict checks and for enforcing the
+        # all-day and recurrence restrictions even when conflict checks are
+        # explicitly bypassed.
         existing: dict[str, Any] = {}
         needs_existing = (
             single_boundary_update
             or (not ignore_conflicts and touches_schedule)
-            or (is_all_day is True and (start_datetime is None or end_datetime is None))
-            or (
-                is_all_day is None
-                and (start_datetime is not None or end_datetime is not None)
-            )
+            or is_all_day is not None
+            or (is_all_day is None and both_boundaries_supplied)
         )
         if needs_existing:
             existing = _graph_request(
                 "GET",
                 f"/me/events/{quote(event_id, safe='')}",
-                params={
-                    "$select": (
-                        "start,end,attendees,isAllDay,type,"
-                        "originalStartTimeZone,originalEndTimeZone"
-                    )
-                },
+                params={"$select": "start,end,isAllDay,type"},
             )
 
         existing_is_all_day = bool(existing.get("isAllDay"))
         effective_is_all_day = (
             is_all_day if is_all_day is not None else existing_is_all_day
         )
-        existing_zone: str | None
-        if single_boundary_update:
-            # A plain GET (no Prefer header, as above) always returns
-            # start/end in UTC regardless of the event's actual configured
-            # zone - Microsoft's own docs for both properties: "By
-            # default, the start/end time is in UTC." So start.timeZone
-            # here is always "UTC", never useful as "the event's real
-            # timezone". originalStartTimeZone is the one field that
-            # reports the zone the event was actually created in,
-            # unaffected by any Prefer header.
-            original_timezone_field = (
-                "originalStartTimeZone"
-                if start_datetime is not None
-                else "originalEndTimeZone"
+        if effective_is_all_day != existing_is_all_day and not both_boundaries_supplied:
+            raise ValueError(
+                "Changing is_all_day requires both start_datetime and "
+                "end_datetime with an explicit timezone; deriving boundaries "
+                "from an earlier event snapshot could overwrite a concurrent "
+                "schedule change."
             )
-            existing_timezone_value = existing.get(original_timezone_field)
-            existing_timezone = (
-                existing_timezone_value
-                if isinstance(existing_timezone_value, str) and existing_timezone_value
-                else None
+        if existing_is_all_day and single_boundary_update:
+            raise ValueError(
+                "Updating an existing all-day event requires both start_datetime "
+                "and end_datetime with one shared timezone because Graph does "
+                "not expose the boundaries' reliable current timezone."
             )
-            if (
-                not existing_timezone
-                and original_timezone_field == "originalEndTimeZone"
-            ):
-                # Older Graph payloads and existing connector fixtures may omit
-                # originalEndTimeZone when both boundaries share the start zone.
-                fallback_timezone = existing.get("originalStartTimeZone")
-                existing_timezone = (
-                    fallback_timezone
-                    if isinstance(fallback_timezone, str) and fallback_timezone
-                    else None
-                )
-            # When the caller supplies a timezone for a timed endpoint, the
-            # changed boundary is self-contained and the UTC values returned
-            # by the plain GET can represent the untouched endpoint in
-            # that same comparison zone. Reusing the stored zone is required
-            # only when the caller omitted one, or when the effective event
-            # remains all-day (Graph requires both all-day boundaries to use
-            # exactly one timezone).
-            needs_stored_timezone = timezone is None or effective_is_all_day
-            if needs_stored_timezone:
-                if existing_timezone is None:
-                    raise ValueError(
-                        "Existing event has no originalStartTimeZone/"
-                        "originalEndTimeZone; cannot "
-                        "safely update only one of start_datetime/end_datetime "
-                        "without it."
-                    )
-                if existing_timezone.startswith("tzone://"):
-                    # A legacy custom timezone set in desktop Outlook (Graph's
-                    # own docs call this out specifically for this field) -
-                    # not a real IANA/Windows zone name, so it can't be used as
-                    # a Prefer header value or a dateTimeTimeZone.timeZone on
-                    # write. There's no value this code could resolve to here
-                    # that Graph would actually accept.
-                    raise ValueError(
-                        "Existing event uses a legacy custom timezone "
-                        f"({existing_timezone!r}) that can't be reused for a "
-                        "single-boundary update; pass both start_datetime and "
-                        "end_datetime together with an explicit timezone."
-                    )
-                try:
-                    _resolve_zoneinfo(existing_timezone, allow_windows_names=True)
-                except ValueError as exc:
-                    raise ValueError(
-                        "Existing event uses an unrecognized timezone "
-                        f"({existing_timezone!r}); pass both start_datetime and "
-                        "end_datetime together with an explicit timezone."
-                    ) from exc
-            if (
-                timezone is not None
-                and effective_is_all_day
-                and existing_timezone is not None
-                and _timezones_could_differ(
-                    timezone,
-                    existing_timezone,
-                    at=(start_datetime if start_datetime is not None else end_datetime),
-                    allow_windows_names=True,
-                )
-            ):
-                raise ValueError(
-                    "All-day event boundaries must use one timezone; omit "
-                    "timezone to reuse the existing event timezone, or pass "
-                    "both start_datetime and end_datetime together."
-                )
-            resolved_timezone = (
-                existing_timezone
-                if effective_is_all_day
-                else (timezone or existing_timezone)
+
+        schedule_semantics_supplied = (
+            start_datetime is not None
+            or end_datetime is not None
+            or effective_is_all_day != existing_is_all_day
+        )
+        if (
+            not ignore_conflicts
+            and existing.get("type") == "seriesMaster"
+            and schedule_semantics_supplied
+        ):
+            raise ValueError(
+                "Cannot safely conflict-check a schedule or timezone change to "
+                "a recurring series master because it can affect multiple "
+                "occurrences. Update a specific occurrence, or pass "
+                "ignore_conflicts=True only after the user confirms every "
+                "occurrence is safe."
             )
-            assert resolved_timezone is not None
-            existing_start_field = existing.get("start") or {}
-            existing_end_field = existing.get("end") or {}
-            if not existing.get("isAllDay"):
-                # A plain GET reports timed boundaries in UTC. Re-express
-                # those instants as the event's wall-clock values locally so
-                # the untouched boundary and PATCH share one timezone.
-                existing_start_field = _utc_field_in_zone(
-                    existing_start_field, resolved_timezone
-                )
-                existing_end_field = _utc_field_in_zone(
-                    existing_end_field, resolved_timezone
-                )
-            existing_zone = resolved_timezone
-        else:
-            resolved_timezone = timezone or "UTC"
-            existing_start_field = existing.get("start") or {}
-            existing_end_field = existing.get("end") or {}
-            # A plain GET (no Prefer header) reports start/end in UTC by
-            # default, so its own "timeZone" field is never useful as
-            # "the event's real timezone" - same caveat as the
-            # single-boundary branch above. originalStartTimeZone is the
-            # field that actually reports it (used here, unlike the
-            # single-boundary branch, without erroring on a legacy
-            # `tzone://` custom zone or an absent value - this branch
-            # doesn't always need the real zone at all, e.g. a plain
-            # attendees-only edit on a timed event never widens anything
-            # with it, so fall back to the UTC-normalized field, the
-            # prior behavior, rather than failing a call that may not
-            # need this value to be exact).
-            existing_timezone = existing.get("originalStartTimeZone")
-            existing_timezone_resolves = False
-            if existing_timezone and not existing_timezone.startswith("tzone://"):
-                try:
-                    _resolve_zoneinfo(existing_timezone, allow_windows_names=True)
-                    existing_timezone_resolves = True
-                except ValueError:
-                    # An unmapped/legacy Windows zone id (the same gap
-                    # `_WINDOWS_TO_IANA` can't ever fully close) - using it
-                    # as existing_zone anyway would crash the later _key()
-                    # comparison instead of leaving this branch's original
-                    # "may not need this value to be exact" guarantee
-                    # intact, so fall back to the UTC-normalized field
-                    # exactly as if originalStartTimeZone were absent.
-                    pass
-            if existing_timezone_resolves:
-                assert existing_timezone is not None  # narrows for mypy
-                existing_zone = existing_timezone
-                # existing_start_field/existing_end_field are still the
-                # plain-GET UTC values above - re-express them as the real
-                # zone's own wall-clock reading (computed locally, no
-                # extra round trip) so they're not a UTC clock value
-                # mislabeled with a different zone's name. That mismatch
-                # would misjudge a same-instant resubmission as "moved" in
-                # _key() below, and - separately - would widen an
-                # is_all_day toggle to the wrong calendar day whenever the
-                # real zone's offset pushes the instant across a day
-                # boundary from its UTC date.
-                # Graph's UTC-labelled midnight values for an all-day event
-                # are date boundaries, not instants. Converting them by the
-                # zone offset can roll a negative-offset event back one day.
-                if not existing.get("isAllDay"):
-                    existing_start_field = _utc_field_in_zone(
-                        existing_start_field, existing_timezone
-                    )
-                    existing_end_field = _utc_field_in_zone(
-                        existing_end_field, existing_timezone
-                    )
-            else:
-                if (
-                    start_datetime is None
-                    and end_datetime is None
-                    and is_all_day is not None
-                    and is_all_day != existing_is_all_day
-                ):
-                    timezone_description = (
-                        repr(existing_timezone)
-                        if existing_timezone
-                        else "no original timezone"
-                    )
-                    raise ValueError(
-                        "Existing event uses an unavailable or unrecognized "
-                        f"timezone ({timezone_description}); cannot safely "
-                        "change is_all_day without knowing its local calendar "
-                        "dates. Pass both start_datetime and end_datetime "
-                        "together with an explicit timezone."
-                    )
-                existing_zone = existing_start_field.get("timeZone")
+
+        resolved_timezone = timezone or "UTC"
+        existing_start_field = existing.get("start") or {}
+        existing_end_field = existing.get("end") or {}
+        if not existing_is_all_day and (
+            start_datetime is not None or end_datetime is not None
+        ):
+            # A plain GET returns timed boundaries in UTC. Convert both
+            # snapshot instants to the caller's explicit comparison zone;
+            # only the supplied boundary is included in the PATCH.
+            existing_start_field = _utc_field_in_zone(
+                existing_start_field, resolved_timezone
+            )
+            existing_end_field = _utc_field_in_zone(
+                existing_end_field, resolved_timezone
+            )
+        existing_zone = existing_start_field.get("timeZone") or "UTC"
 
         existing_end = existing_end_field.get("dateTime")
         existing_start = existing_start_field.get("dateTime")
         query_timezone = (
             resolved_timezone
             if (start_datetime is not None or end_datetime is not None)
-            else (existing_zone or resolved_timezone)
+            else existing_zone
         )
         if start_datetime is not None or end_datetime is not None or is_all_day is True:
             _resolve_zoneinfo(query_timezone, allow_windows_names=True)
@@ -1183,25 +1041,6 @@ def outlook_update_event(
         if is_all_day is not None:
             payload["isAllDay"] = is_all_day
 
-        # Graph requires an all-day event's boundaries to be midnight in one
-        # timezone. A flag-only timed -> all-day conversion therefore has to
-        # update the normalized boundaries too; changing only `isAllDay`
-        # leaves the stored timed boundaries invalid for the new event shape.
-        if is_all_day is True and not existing_is_all_day:
-            if not effective_start or not effective_end:
-                raise ValueError(
-                    "Existing event has no complete time window; cannot safely "
-                    "convert it to an all-day event."
-                )
-            payload["start"] = {
-                "dateTime": effective_start,
-                "timeZone": query_timezone,
-            }
-            payload["end"] = {
-                "dateTime": effective_end,
-                "timeZone": query_timezone,
-            }
-
         if not payload:
             raise ValueError("at least one field must be provided to update the event")
 
@@ -1225,47 +1064,19 @@ def outlook_update_event(
 
         unchecked_attendees: list[str] = []
         if not ignore_conflicts and touches_schedule:
-
-            def _key(value: str | None, tz_name: str) -> datetime | str | None:
-                return _datetime_key_for_comparison(
-                    _offset_datetime_string(value, tz_name, allow_windows_names=True)
-                    if value
-                    else None
-                )
-
-            existing_start_key = _key(existing_start, existing_zone or "UTC")
-            existing_end_key = _key(existing_end, existing_zone or "UTC")
-            effective_start_key = _key(effective_start, query_timezone)
-            effective_end_key = _key(effective_end, query_timezone)
-            window_changed = (effective_start_key, effective_end_key) != (
-                existing_start_key,
-                existing_end_key,
-            ) or effective_is_all_day != existing_is_all_day
+            # Graph does not expose a reliable current boundary timezone: a
+            # no-Prefer GET returns UTC, while original*TimeZone is historical.
+            # Therefore every supplied boundary is schedule-significant even
+            # when its represented instant matches the snapshot.
+            window_changed = schedule_semantics_supplied
 
             query_start, query_end = effective_start, effective_end
 
             if window_changed:
-                if existing.get("type") == "seriesMaster":
-                    raise ValueError(
-                        "Cannot safely conflict-check a schedule change to a "
-                        "recurring series master because it can affect multiple "
-                        "occurrences. Update a specific occurrence, or pass "
-                        "ignore_conflicts=True only after the user confirms "
-                        "every occurrence is safe."
-                    )
                 if not query_start or not query_end:
                     raise ValueError(
                         "Existing event has no complete time window; cannot safely "
                         "check conflicts for this update."
-                    )
-                if (
-                    start_datetime is None
-                    and end_datetime is None
-                    and not existing_zone
-                ):
-                    raise ValueError(
-                        "Existing event has no timeZone on its start time; cannot "
-                        "safely check conflicts for this update."
                     )
                 check_error: str | None = None
                 try:

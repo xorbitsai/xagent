@@ -1462,18 +1462,17 @@ def test_update_event_allows_confirmed_series_master_schedule_change(monkeypatch
     )
 
 
-def test_update_event_allows_series_master_schedule_noop(monkeypatch):
+def test_update_event_rejects_series_master_when_only_the_current_instant_matches(
+    monkeypatch,
+):
+    """Equal snapshot instants do not prove recurrence timezone semantics match."""
     graph_request = Mock(
-        side_effect=[
-            {
-                "start": {"dateTime": "2026-08-27T09:00:00", "timeZone": "UTC"},
-                "end": {"dateTime": "2026-08-27T09:30:00", "timeZone": "UTC"},
-                "isAllDay": False,
-                "type": "seriesMaster",
-                "originalStartTimeZone": "UTC",
-            },
-            {"id": "series-master-1"},
-        ]
+        return_value={
+            "start": {"dateTime": "2026-08-27T09:00:00", "timeZone": "UTC"},
+            "end": {"dateTime": "2026-08-27T09:30:00", "timeZone": "UTC"},
+            "isAllDay": False,
+            "type": "seriesMaster",
+        }
     )
     monkeypatch.setattr(outlook, "_graph_request", graph_request)
 
@@ -1482,12 +1481,13 @@ def test_update_event_allows_series_master_schedule_noop(monkeypatch):
             event_id="series-master-1",
             start_datetime="2026-08-27T09:00:00",
             end_datetime="2026-08-27T09:30:00",
+            timezone="UTC",
         )
     )
 
-    assert result["status"] == "success"
-    assert graph_request.call_count == 2
-    assert graph_request.call_args_list[1].args[0] == "PATCH"
+    assert result["status"] == "error"
+    assert "timezone change" in result["message"]
+    graph_request.assert_called_once()
 
 
 def test_update_event_metadata_only_edit_never_checks_conflicts(monkeypatch):
@@ -1508,6 +1508,24 @@ def test_update_event_metadata_only_edit_never_checks_conflicts(monkeypatch):
     assert result["status"] == "success"
     graph_request.assert_called_once()
     assert graph_request.call_args.args[:2] == ("PATCH", "/me/events/self-1")
+
+
+def test_update_event_metadata_only_edit_ignores_legacy_timezone_argument(monkeypatch):
+    graph_request = Mock(return_value={"id": "updated"})
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_update_event(
+            event_id="self-1",
+            subject="New Subject",
+            timezone="UTC",
+        )
+    )
+
+    assert result["status"] == "success"
+    graph_request.assert_called_once()
+    assert graph_request.call_args.args[:2] == ("PATCH", "/me/events/self-1")
+    assert graph_request.call_args.kwargs["body"] == {"subject": "New Subject"}
 
 
 def test_update_event_single_boundary_accepts_independent_timezone(monkeypatch):
@@ -1557,6 +1575,33 @@ def test_update_event_single_boundary_accepts_independent_timezone(monkeypatch):
         "dateTime": "2026-08-27T11:00:00",
         "timeZone": "America/Los_Angeles",
     }
+
+
+def test_update_event_rejects_single_boundary_on_existing_all_day_event(
+    monkeypatch,
+):
+    graph_request = Mock(
+        return_value={
+            "start": {"dateTime": "2027-01-15T00:00:00", "timeZone": "UTC"},
+            "end": {"dateTime": "2027-01-16T00:00:00", "timeZone": "UTC"},
+            "isAllDay": True,
+            "originalStartTimeZone": "America/Denver",
+        }
+    )
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_update_event(
+            event_id="self-1",
+            end_datetime="2027-01-17T00:00:00",
+            timezone="America/Phoenix",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "existing all-day event" in result["message"]
+    assert "both start_datetime and end_datetime" in result["message"]
+    graph_request.assert_called_once()
 
 
 def test_update_event_single_boundary_rejects_unresolvable_caller_timezone(
@@ -1657,33 +1702,9 @@ def test_update_event_single_boundary_change_with_matching_timezone_succeeds(
     assert result["status"] == "success"
 
 
-def test_update_event_single_boundary_change_with_unset_timezone_reuses_existing(
-    monkeypatch,
-):
-    """Regression test: timezone's default must not look like an explicit
-    "UTC" request - omitting it entirely (the common case: the caller just
-    wants to nudge one boundary) must reuse the existing event's timezone
-    rather than being treated as a UTC/existing-timezone mismatch.
-
-    A plain GET (no Prefer header) always returns start/end in UTC
-    regardless of the event's actual zone (Microsoft's documented default),
-    so the real timezone comes from originalStartTimeZone instead and the
-    untouched boundary's UTC instant must be converted to that wall-clock
-    zone before checking or writing it.
-    """
-    graph_request = Mock(
-        side_effect=[
-            {
-                "start": {"dateTime": "2026-08-27T02:00:00", "timeZone": "UTC"},
-                "end": {"dateTime": "2026-08-27T02:30:00", "timeZone": "UTC"},
-                "attendees": [],
-                "isAllDay": False,
-                "originalStartTimeZone": "Asia/Singapore",
-            },
-            {"value": []},
-            {"id": "updated"},
-        ]
-    )
+def test_update_event_single_boundary_requires_explicit_current_timezone(monkeypatch):
+    """Creation-time zones cannot safely stand in for the current boundary zone."""
+    graph_request = Mock()
     monkeypatch.setattr(outlook, "_graph_request", graph_request)
 
     result = json.loads(
@@ -1693,41 +1714,16 @@ def test_update_event_single_boundary_change_with_unset_timezone_reuses_existing
         )
     )
 
-    assert result["status"] == "success"
-    calendar_view_call = graph_request.call_args_list[1]
-    assert calendar_view_call.kwargs["extra_headers"] == {
-        "Prefer": 'outlook.timezone="Asia/Singapore"'
-    }
-    # Regression test: the conflict check running in the existing event's
-    # timezone is only meaningful if the actual PATCH is written in that
-    # same timezone - writing it as "UTC" instead would silently move the
-    # event by the zone offset despite the check having just verified a
-    # different, correct instant.
-    patch_call = graph_request.call_args_list[2]
-    assert patch_call.kwargs["body"]["end"] == {
-        "dateTime": "2026-08-27T11:00:00",
-        "timeZone": "Asia/Singapore",
-    }
+    assert result["status"] == "error"
+    assert "timezone is required" in result["message"]
+    assert "current timezone" in result["message"]
+    graph_request.assert_not_called()
 
 
-def test_update_event_single_boundary_writes_the_checked_timezone_even_with_ignore_conflicts(
+def test_update_event_single_boundary_requires_timezone_even_when_checks_are_bypassed(
     monkeypatch,
 ):
-    """The same timezone-resolution bug is reachable with ignore_conflicts=
-    True too, since the PATCH write itself (not just the skipped check)
-    needs the existing event's timezone for a single-boundary change."""
-    graph_request = Mock(
-        side_effect=[
-            {
-                "start": {"dateTime": "2026-08-27T02:00:00", "timeZone": "UTC"},
-                "end": {"dateTime": "2026-08-27T02:30:00", "timeZone": "UTC"},
-                "attendees": [],
-                "isAllDay": False,
-                "originalStartTimeZone": "Asia/Singapore",
-            },
-            {"id": "updated"},
-        ]
-    )
+    graph_request = Mock()
     monkeypatch.setattr(outlook, "_graph_request", graph_request)
 
     result = json.loads(
@@ -1738,97 +1734,9 @@ def test_update_event_single_boundary_writes_the_checked_timezone_even_with_igno
         )
     )
 
-    assert result["status"] == "success"
-    assert graph_request.call_count == 2
-    patch_call = graph_request.call_args_list[1]
-    assert patch_call.kwargs["body"]["end"] == {
-        "dateTime": "2026-08-27T11:00:00",
-        "timeZone": "Asia/Singapore",
-    }
-
-
-def test_update_event_single_boundary_fails_loudly_without_original_timezone(
-    monkeypatch,
-):
-    """Regression test: a plain GET always reports start.timeZone as "UTC"
-    (Microsoft's documented default) - that must never be mistaken for the
-    event's real zone. Only originalStartTimeZone can answer that, so its
-    absence must fail loudly rather than silently resolve to "UTC"."""
-    graph_request = Mock(
-        return_value={
-            "start": {"dateTime": "2026-08-27T02:00:00", "timeZone": "UTC"},
-            "end": {"dateTime": "2026-08-27T02:30:00", "timeZone": "UTC"},
-            "attendees": [],
-            "isAllDay": False,
-        }
-    )
-    monkeypatch.setattr(outlook, "_graph_request", graph_request)
-
-    result = json.loads(
-        outlook.outlook_update_event(
-            event_id="self-1",
-            end_datetime="2026-08-27T11:00:00",
-        )
-    )
-
     assert result["status"] == "error"
-    assert "originalStartTimeZone" in result["message"]
-
-
-def test_update_event_single_boundary_rejects_legacy_custom_timezone(monkeypatch):
-    """Regression test: a `tzone://Microsoft/Custom` originalStartTimeZone
-    (Microsoft's own docs: set for events created in a legacy custom
-    Outlook-desktop timezone) is not a real IANA/Windows zone name Graph
-    would accept as a Prefer header or a written timeZone - must fail
-    loudly rather than pass it straight through to another API call."""
-    graph_request = Mock(
-        return_value={
-            "start": {"dateTime": "2026-08-27T02:00:00", "timeZone": "UTC"},
-            "end": {"dateTime": "2026-08-27T02:30:00", "timeZone": "UTC"},
-            "attendees": [],
-            "isAllDay": False,
-            "originalStartTimeZone": "tzone://Microsoft/Custom",
-        }
-    )
-    monkeypatch.setattr(outlook, "_graph_request", graph_request)
-
-    result = json.loads(
-        outlook.outlook_update_event(
-            event_id="self-1",
-            end_datetime="2026-08-27T11:00:00",
-        )
-    )
-
-    assert result["status"] == "error"
-    assert "custom timezone" in result["message"].lower()
-    assert graph_request.call_count == 1
-
-
-def test_update_event_single_boundary_rejects_unrecognized_existing_timezone(
-    monkeypatch,
-):
-    graph_request = Mock(
-        return_value={
-            "start": {"dateTime": "2026-08-27T02:00:00", "timeZone": "UTC"},
-            "end": {"dateTime": "2026-08-27T02:30:00", "timeZone": "UTC"},
-            "attendees": [],
-            "isAllDay": False,
-            "originalStartTimeZone": "Unknown Existing Standard Time",
-        }
-    )
-    monkeypatch.setattr(outlook, "_graph_request", graph_request)
-
-    result = json.loads(
-        outlook.outlook_update_event(
-            event_id="self-1",
-            end_datetime="2026-08-27T11:00:00",
-        )
-    )
-
-    assert result["status"] == "error"
-    assert "Existing event" in result["message"]
-    assert "Unknown Existing Standard Time" in result["message"]
-    graph_request.assert_called_once()
+    assert "timezone is required" in result["message"]
+    graph_request.assert_not_called()
 
 
 def test_update_event_single_boundary_with_explicit_timezone_ignores_unusable_stored_zone(
@@ -1896,57 +1804,36 @@ def test_update_event_both_boundaries_changed_ignores_missing_existing_timezone(
     assert result["status"] == "success"
 
 
-def test_update_event_toggling_all_day_alone_still_triggers_a_real_check(monkeypatch):
-    """Regression test: is_all_day changes the event's effective span even
-    when the literal start/end clock values don't move (a 30-minute meeting
-    becoming an all-day event now overlaps the organizer's whole day). An
-    earlier version of this fix only added is_all_day to the "should we
-    even look" gate without teaching window_changed about it, so the
-    literal-string comparison stayed unchanged and the check was silently
-    skipped anyway - this must now actually run the organizer check."""
+def test_update_event_all_day_transition_requires_caller_boundaries(monkeypatch):
+    """Reject before a stale snapshot can be materialized back into the PATCH."""
     graph_request = Mock(
-        side_effect=[
-            {
-                "start": {"dateTime": "2026-08-27T10:00:00", "timeZone": "UTC"},
-                "end": {"dateTime": "2026-08-27T10:30:00", "timeZone": "UTC"},
-                "attendees": [],
-                "isAllDay": False,
-                "originalStartTimeZone": "UTC",
-            },
-            {"value": [_busy_event(event_id="other-1", subject="Board sync")]},
-            {"id": "updated"},
-        ]
+        return_value={
+            "start": {"dateTime": "2026-08-27T10:00:00", "timeZone": "UTC"},
+            "end": {"dateTime": "2026-08-27T10:30:00", "timeZone": "UTC"},
+            "isAllDay": False,
+        }
     )
     monkeypatch.setattr(outlook, "_graph_request", graph_request)
 
     result = json.loads(
-        outlook.outlook_update_event(
-            event_id="self-1",
-            is_all_day=True,
-        )
+        outlook.outlook_update_event(event_id="self-1", is_all_day=True)
     )
 
-    assert result["status"] == "conflict"
+    assert result["status"] == "error"
+    assert "both start_datetime and end_datetime" in result["message"]
+    assert "concurrent schedule change" in result["message"]
+    graph_request.assert_called_once()
 
 
-def test_update_event_existing_all_day_keeps_graphs_date_boundaries(monkeypatch):
-    """Graph represents all-day boundaries as UTC-labelled date midnights.
-    They must retain those dates when the event's original timezone has a
-    negative offset, rather than being converted as UTC instants and rolled
-    back to the previous local day."""
+def test_update_event_all_day_to_timed_transition_requires_caller_boundaries(
+    monkeypatch,
+):
     graph_request = Mock(
-        side_effect=[
-            {
-                "start": {"dateTime": "2026-08-27T00:00:00", "timeZone": "UTC"},
-                "end": {"dateTime": "2026-08-28T00:00:00", "timeZone": "UTC"},
-                "attendees": [],
-                "isAllDay": True,
-                "originalStartTimeZone": "America/Los_Angeles",
-                "originalEndTimeZone": "America/Los_Angeles",
-            },
-            {"value": []},
-            {"id": "updated"},
-        ]
+        return_value={
+            "start": {"dateTime": "2026-08-27T00:00:00", "timeZone": "UTC"},
+            "end": {"dateTime": "2026-08-28T00:00:00", "timeZone": "UTC"},
+            "isAllDay": True,
+        }
     )
     monkeypatch.setattr(outlook, "_graph_request", graph_request)
 
@@ -1954,14 +1841,9 @@ def test_update_event_existing_all_day_keeps_graphs_date_boundaries(monkeypatch)
         outlook.outlook_update_event(event_id="self-1", is_all_day=False)
     )
 
-    assert result["status"] == "success"
-    calendar_view_call = graph_request.call_args_list[1]
-    assert calendar_view_call.kwargs["params"]["startDateTime"] == (
-        "2026-08-27T00:00:00-07:00"
-    )
-    assert calendar_view_call.kwargs["params"]["endDateTime"] == (
-        "2026-08-28T00:00:00-07:00"
-    )
+    assert result["status"] == "error"
+    assert "both start_datetime and end_datetime" in result["message"]
+    graph_request.assert_called_once()
 
 
 @pytest.mark.parametrize("with_conflict", [False, True])
@@ -2083,7 +1965,7 @@ def test_update_event_rejects_an_explicit_empty_boundary(monkeypatch):
 
     assert result["status"] == "error"
     assert "extended ISO format" in result["message"]
-    graph_request.assert_called_once()
+    graph_request.assert_not_called()
 
 
 def test_all_day_events_are_no_longer_exempt_from_conflict_checks(monkeypatch):
@@ -2158,16 +2040,20 @@ def test_update_event_rejects_a_reversed_window_even_with_ignore_conflicts(
     graph_request.assert_not_called()
 
 
-def test_update_event_treats_equivalent_timestamp_formats_as_unchanged(monkeypatch):
-    """A same-instant resubmission written with different fractional-second
-    precision must not be treated as a real time change."""
+def test_update_event_checks_resubmitted_boundaries_when_current_zone_is_unknown(
+    monkeypatch,
+):
+    """Equal UTC instants do not prove that boundary timezone semantics match."""
     graph_request = Mock(
-        return_value={
-            "start": {"dateTime": "2026-08-27T10:00:00.0000000", "timeZone": "UTC"},
-            "end": {"dateTime": "2026-08-27T10:30:00.0000000", "timeZone": "UTC"},
-            "attendees": [],
-            "isAllDay": False,
-        }
+        side_effect=[
+            {
+                "start": {"dateTime": "2026-08-27T10:00:00.0000000", "timeZone": "UTC"},
+                "end": {"dateTime": "2026-08-27T10:30:00.0000000", "timeZone": "UTC"},
+                "isAllDay": False,
+            },
+            {"value": []},
+            {"id": "updated"},
+        ]
     )
     monkeypatch.setattr(outlook, "_graph_request", graph_request)
 
@@ -2181,8 +2067,8 @@ def test_update_event_treats_equivalent_timestamp_formats_as_unchanged(monkeypat
     )
 
     assert result["status"] == "success"
-    # Only the existing-event GET and the PATCH - no calendarView/getSchedule.
-    assert graph_request.call_count == 2
+    assert graph_request.call_count == 3
+    assert graph_request.call_args_list[1].args[:2] == ("GET", "/me/calendarView")
 
 
 def test_update_event_subject_only_edit_never_revalidates_the_existing_window(
@@ -2293,40 +2179,6 @@ def test_update_event_timed_boundary_accepts_timezone_that_differs_on_event_date
     }
 
 
-def test_update_event_uses_original_end_timezone_for_end_only_change(monkeypatch):
-    graph_request = Mock(
-        side_effect=[
-            {
-                "start": {"dateTime": "2026-08-27T10:00:00", "timeZone": "UTC"},
-                "end": {"dateTime": "2026-08-27T10:30:00", "timeZone": "UTC"},
-                "attendees": [],
-                "isAllDay": False,
-                "originalStartTimeZone": "UTC",
-                "originalEndTimeZone": "Asia/Singapore",
-            },
-            {"value": []},
-            {"id": "updated"},
-        ]
-    )
-    monkeypatch.setattr(outlook, "_graph_request", graph_request)
-
-    result = json.loads(
-        outlook.outlook_update_event(
-            event_id="self-1",
-            end_datetime="2026-08-27T19:00:00",
-        )
-    )
-
-    assert result["status"] == "success"
-    assert graph_request.call_args_list[1].kwargs["extra_headers"] == {
-        "Prefer": 'outlook.timezone="Asia/Singapore"'
-    }
-    assert graph_request.call_args_list[2].kwargs["body"]["end"] == {
-        "dateTime": "2026-08-27T19:00:00",
-        "timeZone": "Asia/Singapore",
-    }
-
-
 def test_update_event_normalizes_offset_boundaries_before_check_and_write(monkeypatch):
     graph_request = Mock(
         side_effect=[
@@ -2415,31 +2267,23 @@ def test_update_event_moving_to_all_day_widens_query_to_the_full_day(monkeypatch
     }
 
 
-def test_update_event_rejects_equal_exclusive_end_on_existing_all_day_event(
-    monkeypatch,
-):
-    graph_request = Mock(
-        return_value={
-            "start": {"dateTime": "2026-08-27T00:00:00", "timeZone": "UTC"},
-            "end": {"dateTime": "2026-08-28T00:00:00", "timeZone": "UTC"},
-            "attendees": [],
-            "isAllDay": True,
-            "originalStartTimeZone": "UTC",
-            "originalEndTimeZone": "UTC",
-        }
-    )
+def test_update_event_rejects_equal_exclusive_end_on_all_day_replacement(monkeypatch):
+    graph_request = Mock()
     monkeypatch.setattr(outlook, "_graph_request", graph_request)
 
     result = json.loads(
         outlook.outlook_update_event(
             event_id="self-1",
+            start_datetime="2026-08-27",
             end_datetime="2026-08-27",
+            timezone="UTC",
+            is_all_day=True,
         )
     )
 
     assert result["status"] == "error"
     assert "exclusive" in result["message"]
-    graph_request.assert_called_once()
+    graph_request.assert_not_called()
 
 
 def test_update_event_moving_to_all_day_does_not_double_widen_a_boundary_already_at_midnight(
@@ -2486,92 +2330,23 @@ def test_update_event_moving_to_all_day_does_not_double_widen_a_boundary_already
     )
 
 
-def test_update_event_flag_only_all_day_toggle_widens_in_the_events_real_timezone(
+def test_update_event_flag_only_all_day_toggle_never_uses_creation_timezone(
     monkeypatch,
 ):
-    """Regression test: a plain GET (no Prefer header) always reports
-    start/end in UTC regardless of the event's actual configured zone -
-    using that UTC clock value's own date as "the event's real calendar
-    day" for a flag-only is_all_day toggle silently widens the query to
-    the wrong day whenever the real zone's offset pushes the instant
-    across a day boundary from its UTC date. originalStartTimeZone
-    reports the real zone; 20:00 UTC is 04:00 the *next* day in
-    Asia/Singapore (+08:00), so the correct widened day is the 28th, not
-    the UTC date's 27th."""
-    graph_request = Mock(
-        side_effect=[
-            {
-                "start": {"dateTime": "2026-08-27T20:00:00", "timeZone": "UTC"},
-                "end": {"dateTime": "2026-08-27T20:30:00", "timeZone": "UTC"},
-                "attendees": [],
-                "isAllDay": False,
-                "originalStartTimeZone": "Asia/Singapore",
-            },
-            {"value": []},
-            {"id": "updated"},
-        ]
-    )
-    monkeypatch.setattr(outlook, "_graph_request", graph_request)
-
-    result = json.loads(
-        outlook.outlook_update_event(
-            event_id="self-1",
-            is_all_day=True,
-        )
-    )
-
-    assert result["status"] == "success"
-    calendar_view_call = graph_request.call_args_list[1]
-    assert calendar_view_call.kwargs["params"]["startDateTime"] == (
-        "2026-08-28T00:00:00+08:00"
-    )
-    assert calendar_view_call.kwargs["params"]["endDateTime"] == (
-        "2026-08-29T00:00:00+08:00"
-    )
-    payload = graph_request.call_args_list[2].kwargs["body"]
-    assert payload["isAllDay"] is True
-    assert payload["start"] == {
-        "dateTime": "2026-08-28T00:00:00",
-        "timeZone": "Asia/Singapore",
-    }
-    assert payload["end"] == {
-        "dateTime": "2026-08-29T00:00:00",
-        "timeZone": "Asia/Singapore",
-    }
-
-
-@pytest.mark.parametrize(
-    "stored_timezone",
-    ["Some Exotic Legacy Standard Time", "tzone://Microsoft/Custom"],
-)
-def test_update_event_all_day_toggle_rejects_unresolvable_original_timezone(
-    monkeypatch, stored_timezone
-):
-    """A flag-only all-day conversion needs the stored local calendar date.
-
-    A plain GET labels timed boundaries as UTC, so falling back to those
-    labels when the original timezone cannot be resolved can silently choose
-    the wrong day. Require explicit replacement boundaries instead.
-    """
     graph_request = Mock(
         return_value={
-            "start": {"dateTime": "2026-08-27T10:00:00", "timeZone": "UTC"},
-            "end": {"dateTime": "2026-08-27T10:30:00", "timeZone": "UTC"},
-            "attendees": [],
+            "start": {"dateTime": "2026-08-27T20:00:00", "timeZone": "UTC"},
+            "end": {"dateTime": "2026-08-27T20:30:00", "timeZone": "UTC"},
             "isAllDay": False,
-            "originalStartTimeZone": stored_timezone,
+            "originalStartTimeZone": "Asia/Singapore",
         }
     )
     monkeypatch.setattr(outlook, "_graph_request", graph_request)
 
     result = json.loads(
-        outlook.outlook_update_event(
-            event_id="self-1",
-            is_all_day=True,
-        )
+        outlook.outlook_update_event(event_id="self-1", is_all_day=True)
     )
 
     assert result["status"] == "error"
-    assert "cannot safely change is_all_day" in result["message"]
     assert "both start_datetime and end_datetime" in result["message"]
     graph_request.assert_called_once()

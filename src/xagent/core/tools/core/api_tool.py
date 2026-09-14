@@ -350,21 +350,42 @@ class APIClientCore:
         # Ensure retry_count is non-negative to avoid empty range
         retry_count = max(0, retry_count)
 
-        # Handle API key in query parameters
+        # Handle API key in query parameters. Case-insensitive to match
+        # _prepare_headers' auth_type.lower() convention for bearer/basic/
+        # api_key below, and _has_effective_auth_token's - a caller sending
+        # auth_type="API_KEY_QUERY" would otherwise get no credential
+        # attached here while has_auth_credentials (which does lower()
+        # first) wrongly reports one was, suppressing the connector hint
+        # for exactly the resulting unauthenticated 401/403.
         request_params: Dict[str, Any] = dict(params) if params else {}
-        if auth_type == "api_key_query" and auth_token:
+        if auth_type and auth_type.lower() == "api_key_query" and auth_token:
             request_params[api_key_param] = auth_token
 
-        final_request_params: Optional[Dict[str, Any]] = request_params
-
-        # Merge params directly into URL to prevent httpx from stripping existing query strings
-        if final_request_params:
-            url = str(httpx.URL(url).copy_merge_params(final_request_params))
-            final_request_params = None
-
-        # If request_params is empty, set to None
-        if not final_request_params:
-            final_request_params = None
+        # Merge params directly into the URL string (rather than passing
+        # them separately to httpx) to prevent httpx from stripping any
+        # query string already present in `url` - so every param ends up
+        # merged into `url` here, and `_make_request` never receives a
+        # non-None `params` of its own.
+        #
+        # httpx.URL(...) can raise for a URL _is_valid_url's cheap
+        # scheme/netloc check lets through but httpx itself rejects (e.g. a
+        # non-numeric port, "http://example.com:abc/path") - only reachable
+        # once request_params is non-empty, since a request with no query
+        # params at all never reaches this line. Caught here so call_api
+        # keeps its documented dict-return contract instead of letting an
+        # exception escape uncaught before the retry loop's own try/except
+        # ever gets a chance to handle it.
+        if request_params:
+            try:
+                url = str(httpx.URL(url).copy_merge_params(request_params))
+            except Exception as e:
+                return {
+                    "success": False,
+                    "status_code": 0,
+                    "headers": {},
+                    "body": None,
+                    "error": f"Invalid URL: {url} ({e})",
+                }
 
         # Prepare headers
         request_headers = self._prepare_headers(headers, auth_type, auth_token, body)
@@ -383,7 +404,9 @@ class APIClientCore:
                     url=url,
                     method=method,
                     headers=request_headers,
-                    params=final_request_params,
+                    # Always None: every param was already merged into
+                    # `url` above, precisely so it isn't passed here too.
+                    params=None,
                     data=request_body,
                     timeout=timeout,
                     proxy_url=proxy_url,

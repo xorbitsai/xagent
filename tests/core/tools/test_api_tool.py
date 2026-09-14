@@ -402,6 +402,27 @@ class TestAPIClientCore:
         assert result["body"]["args"]["token"] == "test-key-123"
 
     @pytest.mark.asyncio
+    async def test_api_key_query_auth_type_is_case_insensitive(
+        self, mock_httpbin: None
+    ):
+        """Regression: this check used to be an exact-case string compare,
+        unlike _prepare_headers' auth_type.lower() handling of bearer/
+        basic/api_key just below it and has_auth_credentials' own lower()
+        call - auth_type="API_KEY_QUERY" (or any non-lowercase spelling)
+        would silently attach no credential here while has_auth_credentials
+        reported one was present, suppressing the connector hint for
+        exactly the resulting unauthenticated 401/403."""
+        result = await call_api(
+            url="https://httpbin.org/get",
+            method="GET",
+            auth_type="API_KEY_QUERY",
+            auth_token="test-key-123",
+        )
+
+        assert result["success"] is True
+        assert result["body"]["args"]["api_key"] == "test-key-123"
+
+    @pytest.mark.asyncio
     async def test_custom_headers(self, mock_httpbin: None):
         """Test custom headers"""
         client = APIClientCore()
@@ -423,6 +444,24 @@ class TestAPIClientCore:
 
         assert result["success"] is False
         assert "error" in result
+
+    @pytest.mark.asyncio
+    async def test_url_httpx_rejects_after_merging_params_does_not_raise(self):
+        """Regression: _is_valid_url's cheap urlparse-based check (scheme +
+        non-empty netloc) lets through a URL httpx.URL() itself later
+        rejects (e.g. a non-numeric port) - only reachable once query
+        params get merged into the URL, since a request with none never
+        reaches that merge step. That merge used to run outside the retry
+        loop's try/except, so it raised straight out of call_api instead of
+        returning the documented dict shape."""
+        client = APIClientCore()
+        result = await client.call_api(
+            url="http://example.com:abc/path", params={"q": "1"}
+        )
+
+        assert result["success"] is False
+        assert result["status_code"] == 0
+        assert isinstance(result["error"], str)
 
     @pytest.mark.asyncio
     async def test_does_not_block_known_connector_domains(self, mock_httpbin: None):

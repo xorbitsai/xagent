@@ -43,21 +43,23 @@ PREVIOUS_SCOPES = [
     "crm.objects.companies.write",
     "crm.objects.deals.read",
 ]
-# Kept in sync with the registry's current oauth_scopes (not just this
-# migration's own point-in-time addition of "forms") because
-# test_migration_fields_match_registry compares against the live registry;
-# see 20260914_add_hubspot_deals_write_scope.py, which is the migration that
-# actually owns adding crm.objects.deals.write to the DB - this constant is
-# bumped forward alongside it purely to keep that equality test green,
-# following the same precedent already set for
-# 20260720_seed_docs_slides_hubspot.py's hubspot seed row.
+# This migration's own point-in-time change (adds "forms" only). Deliberately
+# NOT kept in sync with the registry's current oauth_scopes: an earlier
+# revision of this file bumped both this and CURRENT_DESCRIPTION forward to
+# the crm.objects.deals.write-era values purely to keep
+# test_migration_fields_match_registry passing against the live registry, but
+# that broke downgrade() - 20260914_add_hubspot_deals_write_scope.py's
+# downgrade() reverts description to ITS PREVIOUS_DESCRIPTION (this
+# migration's original CURRENT_DESCRIPTION) before this migration's own
+# downgrade() runs, so bumping this file's CURRENT_DESCRIPTION forward made
+# its "only revert if unchanged" guard silently no-op, leaving a downgraded
+# database advertising Marketing Hub/forms/analytics support with none of
+# the scopes to back it up. See test_migration_fields_match_registry below
+# for the subset check (mirroring the precedent already established in
+# 20260812_add_slack_history_reactions_files_scopes.py) that replaces the
+# exact-match assertion this reverts.
 CURRENT_SCOPES = [
-    "crm.objects.contacts.read",
-    "crm.objects.contacts.write",
-    "crm.objects.companies.read",
-    "crm.objects.companies.write",
-    "crm.objects.deals.read",
-    "crm.objects.deals.write",
+    *PREVIOUS_SCOPES,
     "forms",
 ]
 # business-intelligence, marketing-email, and marketing.campaigns.read are
@@ -74,14 +76,11 @@ PREVIOUS_DESCRIPTION = (
     "Connect to HubSpot CRM to search, create, and update contacts and "
     "companies, read deals, and log notes."
 )
-# Bumped forward to the final (crm.objects.deals.write-era) description for
-# the same live-registry-sync reason as CURRENT_SCOPES above, not because
-# this migration itself grants deal-write access.
 CURRENT_DESCRIPTION = (
     "Connect to HubSpot CRM and Marketing Hub to search, create, and update "
-    "contacts, companies, and deals, log notes, read forms and submissions, "
-    "pull traffic analytics reports, and read marketing emails and "
-    "campaigns."
+    "contacts and companies, read deals, log notes, read forms and "
+    "submissions, pull traffic analytics reports, and read marketing emails "
+    "and campaigns."
 )
 
 

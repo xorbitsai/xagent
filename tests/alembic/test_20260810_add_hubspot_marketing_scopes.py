@@ -335,11 +335,30 @@ def test_downgrade_does_not_touch_user_oauth(tmp_path):
 
 
 def test_migration_fields_match_registry():
+    """This migration's CURRENT_SCOPES and CURRENT_DESCRIPTION are historical
+    snapshots, not the app's final values - 20260914_add_hubspot_deals_write_scope
+    layers another scope and description update on top of them, so only a
+    subset check on scopes (every scope this migration granted is still
+    present) holds going forward; the live description is no longer this
+    migration's CURRENT_DESCRIPTION but 20260914's (see that migration's own
+    test_migration_fields_match_registry for the exact-match check). Mirrors
+    the same precedent already established in
+    20260812_add_slack_history_reactions_files_scopes.py.
+
+    An earlier revision of this file bumped both constants forward to match
+    the live registry exactly, to keep this exact-match assertion passing -
+    but that broke downgrade(): 20260914's downgrade() reverts description to
+    its own PREVIOUS_DESCRIPTION (this migration's true CURRENT_DESCRIPTION)
+    before this migration's downgrade() runs, so a bumped-forward
+    CURRENT_DESCRIPTION here no longer matched what was actually in the row
+    at that point, silently no-opping the "only revert if unchanged" guard
+    and leaving a downgraded database advertising Marketing Hub/forms/
+    analytics support with none of the granting scopes.
+    """
     from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
 
     migration = _load_migration_module()
     registry_row = next(
         r for r in get_builtin_public_mcp_app_rows() if r["app_id"] == "hubspot"
     )
-    assert migration.CURRENT_SCOPES == registry_row["oauth_scopes"]
-    assert migration.CURRENT_DESCRIPTION == registry_row["description"]
+    assert set(migration.CURRENT_SCOPES) <= set(registry_row["oauth_scopes"])

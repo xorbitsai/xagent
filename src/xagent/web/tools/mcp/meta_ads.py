@@ -133,18 +133,25 @@ def _equal_filter(field: str, value: str) -> dict[str, str]:
     return {"field": field, "operator": "EQUAL", "value": value}
 
 
+def _next_link(result: dict[str, Any]) -> str | None:
+    return (result.get("paging") or {}).get("next")
+
+
 def _log_error(message: str, error: Exception) -> None:
-    """Log an exception with token redaction applied to the entire composed
-    line -- not just str(error) -- instead of writing the access token
+    """Log an exception with token redaction applied to both ``message`` and
+    ``error`` -- not just str(error) -- instead of writing the access token
     straight to application logs (the Graph API can echo it back in an
     OAuth error message, and a non-GraphAPIError failure could still be
     wrapping raw response text). ``message`` itself can also embed
     caller-supplied dynamic text (e.g. an id parameter interpolated by the
     caller before this is invoked), which would leak the same way if it
-    happened to be secret-shaped and only ``error`` were redacted. Covers
-    both GraphAPIError (whose sensitive_values may include a page-scoped
-    token beyond the env one) and plain exceptions (getattr falls back to
-    just the env token via redact_secrets's own default).
+    happened to be secret-shaped and only ``error`` were redacted. Kept as
+    two lazy %s args (each redacted independently) rather than one
+    pre-formatted string, so a log consumer that groups/dedupes on the
+    message template still can. Covers both GraphAPIError (whose
+    sensitive_values may include a page-scoped token beyond the env one)
+    and plain exceptions (getattr falls back to just the env token via
+    redact_secrets's own default).
 
     Deliberately does NOT pass exc_info=True: logging's exception formatter
     renders the traceback from the original exception object itself, whose
@@ -154,9 +161,9 @@ def _log_error(message: str, error: Exception) -> None:
     """
     sensitive_values = getattr(error, "sensitive_values", None)
     logger.error(
-        meta_graph.redact_secrets(
-            f"{message}: {error}", sensitive_values=sensitive_values
-        )
+        "%s: %s",
+        meta_graph.redact_secrets(message, sensitive_values=sensitive_values),
+        meta_graph.redact_secrets(str(error), sensitive_values=sensitive_values),
     )
 
 
@@ -190,7 +197,7 @@ def meta_ads_list_ad_accounts(limit: int = 25) -> str:
         )
         return _success(
             ad_accounts=result.get("data", []),
-            next_link=(result.get("paging") or {}).get("next"),
+            next_link=_next_link(result),
         )
     except GraphAPIError as e:
         _log_error("Error listing Meta ad accounts", e)
@@ -230,7 +237,7 @@ def meta_ads_list_campaigns(ad_account_id: str, limit: int = 25) -> str:
         )
         return _success(
             campaigns=result.get("data", []),
-            next_link=(result.get("paging") or {}).get("next"),
+            next_link=_next_link(result),
         )
     except GraphAPIError as e:
         _log_error(f"Error listing campaigns for {ad_account_id}", e)
@@ -259,7 +266,7 @@ def meta_ads_list_ad_sets(
         result = _graph_request("GET", _graph_path(account_id, "adsets"), params=params)
         return _success(
             ad_sets=result.get("data", []),
-            next_link=(result.get("paging") or {}).get("next"),
+            next_link=_next_link(result),
         )
     except GraphAPIError as e:
         _log_error(f"Error listing ad sets for {ad_account_id}", e)
@@ -295,7 +302,7 @@ def meta_ads_list_ads(
         result = _graph_request("GET", _graph_path(account_id, "ads"), params=params)
         return _success(
             ads=result.get("data", []),
-            next_link=(result.get("paging") or {}).get("next"),
+            next_link=_next_link(result),
         )
     except GraphAPIError as e:
         _log_error(f"Error listing ads for {ad_account_id}", e)
@@ -353,7 +360,7 @@ def meta_ads_get_insights(
         )
         return _success(
             insights=result.get("data", []),
-            next_link=(result.get("paging") or {}).get("next"),
+            next_link=_next_link(result),
         )
     except GraphAPIError as e:
         _log_error(f"Error getting Meta Ads insights for {object_id}", e)

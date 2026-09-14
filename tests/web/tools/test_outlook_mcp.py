@@ -50,6 +50,16 @@ def test_graph_request_preserves_http_status(monkeypatch):
     assert "rate limited" in str(exc_info.value)
 
 
+def test_utc_field_in_zone_converts_an_aware_instant_instead_of_relabeling_it():
+    assert outlook._utc_field_in_zone(
+        {"dateTime": "2026-08-27T10:00:00.0000000-04:00", "timeZone": "UTC"},
+        "Asia/Singapore",
+    ) == {
+        "dateTime": "2026-08-27T22:00:00",
+        "timeZone": "Asia/Singapore",
+    }
+
+
 def test_find_conflicts_can_skip_the_organizer_calendar(monkeypatch):
     graph_request = Mock(
         return_value={
@@ -1785,6 +1795,36 @@ def test_update_event_rejects_a_reversed_window(monkeypatch):
     assert "must be after" in result["message"]
     # A complete caller-supplied window can be rejected before any read or write.
     graph_request.assert_not_called()
+
+
+def test_update_event_rejects_an_explicit_empty_boundary(monkeypatch):
+    graph_request = Mock(
+        side_effect=[
+            {
+                "start": {"dateTime": "2026-08-27T09:00:00", "timeZone": "UTC"},
+                "end": {"dateTime": "2026-08-27T09:30:00", "timeZone": "UTC"},
+                "attendees": [],
+                "isAllDay": False,
+                "originalStartTimeZone": "UTC",
+            },
+            {
+                "start": {"dateTime": "2026-08-27T09:00:00", "timeZone": "UTC"},
+                "end": {"dateTime": "2026-08-27T09:30:00", "timeZone": "UTC"},
+            },
+        ]
+    )
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_update_event(
+            event_id="self-1",
+            start_datetime="",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "extended ISO format" in result["message"]
+    assert graph_request.call_count == 2
 
 
 def test_all_day_events_are_no_longer_exempt_from_conflict_checks(monkeypatch):

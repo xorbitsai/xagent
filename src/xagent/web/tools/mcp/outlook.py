@@ -175,7 +175,15 @@ def _utc_field_in_zone(field: dict[str, Any], zone_name: str) -> dict[str, Any]:
         zone = _resolve_zoneinfo(zone_name, allow_windows_names=True)
     except ValueError:
         return field
-    utc_instant = datetime.fromisoformat(date_time).replace(tzinfo=dt_timezone.utc)
+    try:
+        parsed = _date_parser.isoparse(date_time)
+    except (TypeError, ValueError):
+        return field
+    utc_instant = (
+        parsed.replace(tzinfo=dt_timezone.utc)
+        if parsed.tzinfo is None
+        else parsed.astimezone(dt_timezone.utc)
+    )
     local_instant = utc_instant.astimezone(zone).replace(tzinfo=None)
     return {"dateTime": local_instant.isoformat(), "timeZone": zone_name}
 
@@ -961,7 +969,7 @@ def outlook_update_event(
             if timezone is not None and _timezones_could_differ(
                 timezone,
                 existing_timezone,
-                at=start_datetime or end_datetime,
+                at=(start_datetime if start_datetime is not None else end_datetime),
                 allow_windows_names=True,
             ):
                 # Only one boundary is moving, and the caller explicitly
@@ -1064,8 +1072,10 @@ def outlook_update_event(
         if start_datetime is not None or end_datetime is not None or is_all_day is True:
             _resolve_zoneinfo(query_timezone, allow_windows_names=True)
 
-        raw_effective_start = start_datetime or existing_start
-        raw_effective_end = end_datetime or existing_end
+        raw_effective_start = (
+            start_datetime if start_datetime is not None else existing_start
+        )
+        raw_effective_end = end_datetime if end_datetime is not None else existing_end
         if (
             (start_datetime is not None or end_datetime is not None)
             and raw_effective_start
@@ -1147,7 +1157,11 @@ def outlook_update_event(
         # would otherwise re-validate the event's already-stored,
         # unchanged start/end and could reject an unrelated field edit
         # over pre-existing data this call never touches.
-        if (start_datetime or end_datetime) and effective_start and effective_end:
+        if (
+            (start_datetime is not None or end_datetime is not None)
+            and effective_start
+            and effective_end
+        ):
             _reject_reversed_window(effective_start, effective_end)
 
         unchecked_attendees: list[str] = []

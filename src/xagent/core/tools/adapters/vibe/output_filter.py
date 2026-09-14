@@ -523,6 +523,3 @@ class OutputValueFilter:
 
         walk(obj)
         return best
-
-        walk(obj)
-        return best

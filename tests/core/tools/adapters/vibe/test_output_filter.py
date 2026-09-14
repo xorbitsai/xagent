@@ -557,6 +557,26 @@ def test_find_largest_list_does_not_reserialize_subtrees():
     assert result == list(range(50))
 
 
+def test_find_largest_list_prefers_item_count_over_size():
+    """A direct unit test on the selector itself, not just end-to-end through
+    `.filter()`: when a list with fewer (but individually larger) items and a
+    list with more (but individually smaller) items disagree, item count
+    must win, not estimated byte size. This is the specific property that
+    distinguishes the current selection rule from the earlier size-primary
+    rules that caused two separate real regressions (an envelope wrapper
+    winning over its nested data list, and a records list losing to a lone
+    record's small nested array) - a fixture where item count and size
+    happen to agree (like the sibling test above) would not catch a
+    regression back to either of those."""
+    few_but_big = ["x" * 1000, "y" * 1000]  # 2 items, ~2000 chars
+    many_but_small = [str(i) for i in range(20)]  # 20 items, ~30 chars total
+    data = {"few_but_big": few_but_big, "many_but_small": many_but_small}
+
+    result = _create_filter()._find_largest_list(data)
+
+    assert result is many_but_small
+
+
 def test_json_truncation_ignores_single_item_envelope_wrapper():
     """A one-item envelope wrapper around the real data list must not be
     picked as the trim target - by bottom-up size it always looks "largest"

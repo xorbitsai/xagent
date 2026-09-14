@@ -9,7 +9,7 @@ import json
 import logging
 import os
 from typing import Any, Dict, Mapping, Optional, Union
-from urllib.parse import ParseResult, parse_qs, urlencode, urlparse
+from urllib.parse import ParseResult, parse_qs, urlencode, urlparse, urlunparse
 
 import httpx
 
@@ -201,6 +201,26 @@ def _has_url_embedded_credentials(parsed_url: ParseResult) -> bool:
     return bool(parsed_url.username or parsed_url.password)
 
 
+def _sanitize_final_url(url: str) -> str:
+    """Strip query string and userinfo from a response URL, keeping only
+    scheme/host/port/path.
+
+    ``_make_request`` reports the actual post-redirect response URL so the
+    connector-domain hint can match the host that really answered - but the
+    raw URL can itself carry a credential: an api_key_query auth_token gets
+    merged into the query string before the request is made, and a caller
+    can embed Basic-Auth userinfo directly (``user:pass@host``). The only
+    thing any consumer of this value needs is which host answered, so
+    everything else is dropped here rather than trusting every call site
+    that ever reads this field to remember not to log or forward it whole.
+    """
+    parsed = urlparse(url)
+    netloc = parsed.hostname or ""
+    if parsed.port:
+        netloc = f"{netloc}:{parsed.port}"
+    return urlunparse((parsed.scheme, netloc, parsed.path, "", "", ""))
+
+
 def has_auth_credentials(
     url: str,
     headers: Optional[Mapping[str, str]],
@@ -246,12 +266,14 @@ def known_connector_domain_hint(connector_label: str) -> str:
     spacing needed to avoid a run-on sentence.
     """
     return (
-        f"This looks like a {connector_label} API endpoint with no "
-        f"credential attached, which explains a 401/403 here - if the "
-        f"dedicated {connector_label} connector tools cover this request, "
-        "prefer those (they carry the account's own OAuth credential); "
-        "this generic api_call tool needs its own via auth_type/auth_token, "
-        "a credential header, or a credential query parameter."
+        f"This looks like a {connector_label} API endpoint, and this call "
+        f"carried no credential in a form this tool recognizes "
+        f"(auth_type/auth_token, a credential-shaped header, or a "
+        f"credential-shaped query parameter), which would explain a "
+        f"401/403 here - if the dedicated {connector_label} connector "
+        "tools cover this request, prefer those (they carry the account's "
+        "own OAuth credential); otherwise pass your own credential via one "
+        "of those mechanisms."
     )
 
 
@@ -466,6 +488,24 @@ class APIClientCore:
                 content=data,
                 follow_redirects=allow_redirects,
             ) as response:
+                # Whether the request httpx actually sent - after any
+                # redirect - still carried a credential. Derived from the
+                # real sent request/headers rather than the caller's
+                # original args, because httpx strips the Authorization
+                # header (and a Location without a query string drops any
+                # api_key_query credential) on a cross-origin redirect: a
+                # request that started out credentialed can still reach a
+                # known connector host with no credential attached, and the
+                # adapter's hint decision needs to reflect that, not the
+                # original request's credential.
+                final_request_has_credential = has_auth_credentials(
+                    str(response.request.url),
+                    response.request.headers,
+                    None,
+                    None,
+                    None,
+                )
+
                 # Check response size by reading only up to max_response_size
                 response_size = 0
                 content_chunks = []
@@ -484,7 +524,8 @@ class APIClientCore:
                             # The URL that actually produced this response,
                             # which can differ from the request's starting
                             # URL after a redirect - see final_url below.
-                            "final_url": str(response.url),
+                            "final_url": _sanitize_final_url(str(response.url)),
+                            "final_request_has_credential": final_request_has_credential,
                         }
                     content_chunks.append(chunk)
 
@@ -510,7 +551,13 @@ class APIClientCore:
                     # different host than the one the caller originally
                     # asked for; api_call's known-connector-domain hint
                     # needs this to know which host actually answered.
-                    "final_url": str(response.url),
+                    # Sanitized (see _sanitize_final_url) because the raw
+                    # URL can carry a credential: an api_key_query
+                    # auth_token is merged into the query string before the
+                    # request runs, and a caller can embed Basic-Auth
+                    # userinfo directly in the URL.
+                    "final_url": _sanitize_final_url(str(response.url)),
+                    "final_request_has_credential": final_request_has_credential,
                 }
 
     def _is_valid_url(self, url: str) -> bool:

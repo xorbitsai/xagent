@@ -12,6 +12,7 @@ from xagent.core.tools.adapters.vibe.api_tool import APICallArgs, APITool
 from xagent.core.tools.core.api_tool import (
     APIClientCore,
     _hostname_matches_connector_domain,
+    _sanitize_final_url,
     call_api,
     has_auth_credentials,
     match_known_connector_domain,
@@ -264,6 +265,45 @@ class TestHasAuthCredentials:
         )
 
 
+class TestSanitizeFinalUrl:
+    """Regression: final_url reports the real post-redirect response URL,
+    but the raw URL can itself carry a credential - an api_key_query
+    auth_token merged into the query string, or Basic-Auth userinfo a
+    caller embedded directly in the URL. Only the host identifies which
+    connector answered, so everything else must be stripped before this
+    value leaves _make_request."""
+
+    def test_strips_query_string_credential(self):
+        assert (
+            _sanitize_final_url("https://api.hubapi.com/crm/v3/deals?api_key=secret")
+            == "https://api.hubapi.com/crm/v3/deals"
+        )
+
+    def test_strips_basic_auth_userinfo(self):
+        assert (
+            _sanitize_final_url("https://user:pass@api.hubapi.com/crm/v3/deals")
+            == "https://api.hubapi.com/crm/v3/deals"
+        )
+
+    def test_strips_both_userinfo_and_query_credential(self):
+        assert (
+            _sanitize_final_url("https://user:pass@example.com/path?api_key=secret")
+            == "https://example.com/path"
+        )
+
+    def test_preserves_port(self):
+        assert (
+            _sanitize_final_url("https://example.com:8443/path?key=secret")
+            == "https://example.com:8443/path"
+        )
+
+    def test_no_op_for_a_url_with_nothing_to_strip(self):
+        assert (
+            _sanitize_final_url("https://api.hubapi.com/crm/v3/deals")
+            == "https://api.hubapi.com/crm/v3/deals"
+        )
+
+
 @pytest.fixture
 def mock_httpbin(monkeypatch: pytest.MonkeyPatch) -> None:
     async def mock_make_request(
@@ -309,6 +349,19 @@ def mock_httpbin(monkeypatch: pytest.MonkeyPatch) -> None:
         # request's starting url.
         final_url = _single_value_query_args(url).get("__redirected_to__", url)
 
+        # Mirror httpx's own redirect behavior (see
+        # httpx.Client._redirect_headers) closely enough for these tests:
+        # Authorization is dropped when the redirect crosses hosts, and a
+        # redirect target's own query string (not the original request's)
+        # is what the final request carries - final_url above already is
+        # that target URL, so no extra query handling is needed here.
+        final_headers = dict(headers)
+        if urlparse(final_url).hostname != parsed.hostname:
+            final_headers.pop("Authorization", None)
+        final_request_has_credential = has_auth_credentials(
+            final_url, final_headers, None, None, None
+        )
+
         return {
             "success": 200 <= status_code < 300,
             "status_code": status_code,
@@ -316,6 +369,7 @@ def mock_httpbin(monkeypatch: pytest.MonkeyPatch) -> None:
             "body": body,
             "error": None if 200 <= status_code < 300 else f"HTTP {status_code}",
             "final_url": final_url,
+            "final_request_has_credential": final_request_has_credential,
         }
 
     monkeypatch.setattr(APIClientCore, "_make_request", mock_make_request)
@@ -772,6 +826,79 @@ class TestAPITool:
         )
 
         assert "HubSpot" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_annotates_when_a_cross_origin_redirect_drops_the_original_credential(
+        self, mock_httpbin: None
+    ):
+        """Regression: httpx strips the Authorization header when a
+        redirect crosses hosts (see httpx.Client._redirect_headers). A
+        request that started out credentialed can still land on a known
+        connector host with nothing attached on the actual final request -
+        the hint must reflect that, not the caller's original (now-
+        stripped) credential."""
+        tool = APITool()
+        result = await tool.run_json_async(
+            {
+                "url": "https://httpbin.org/status/401"
+                "?__redirected_to__=https://api.hubapi.com/crm/v3/deals/1",
+                "auth_type": "bearer",
+                "auth_token": "original-host-token",
+            }
+        )
+
+        assert "HubSpot" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_does_not_annotate_when_a_same_origin_redirect_keeps_the_credential(
+        self, mock_httpbin: None
+    ):
+        """Control for the cross-origin case above: a same-origin redirect
+        does not strip Authorization, so a genuinely still-credentialed
+        request must keep suppressing the hint."""
+        tool = APITool()
+        result = await tool.run_json_async(
+            {
+                "url": "https://api.hubapi.com/status/401"
+                "?__redirected_to__=https://api.hubapi.com/crm/v3/deals/1",
+                "auth_type": "bearer",
+                "auth_token": "still-valid-token",
+            }
+        )
+
+        assert "connector tools" not in (result.get("error") or "")
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_original_args_when_final_request_has_credential_is_absent(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A result from a core client that predates final_request_has_
+        credential (e.g. an older or differently-mocked call_api) must
+        still work - falling back to checking the original api_args, same
+        as before that field existed."""
+        tool = APITool()
+
+        async def mock_call_api(**kwargs):
+            return {
+                "success": False,
+                "status_code": 401,
+                "headers": {},
+                "body": None,
+                "error": "HTTP 401",
+                "final_url": "https://api.hubapi.com/crm/v3/deals/1",
+            }
+
+        monkeypatch.setattr(tool._client, "call_api", mock_call_api)
+
+        result = await tool.run_json_async(
+            {
+                "url": "https://api.hubapi.com/crm/v3/deals/1",
+                "auth_type": "bearer",
+                "auth_token": "still-valid-token",
+            }
+        )
+
+        assert "connector tools" not in (result.get("error") or "")
 
     @pytest.mark.asyncio
     async def test_does_not_annotate_when_redirected_off_a_known_connector_host(

@@ -158,17 +158,26 @@ class APITool(AbstractBaseTool):
         )
         if not connector_label:
             return
-        # Whether the CALLER attached a credential is about what they
-        # supplied, not about where the response ended up - deliberately
-        # still checked against api_args (the original request), including
-        # for Basic-Auth userinfo embedded in the URL the caller wrote.
-        if has_auth_credentials(
-            api_args.url,
-            api_args.headers,
-            api_args.params,
-            api_args.auth_type,
-            api_args.auth_token,
-        ):
+        # Whether a credential actually reached the connector host - not
+        # necessarily the same as what the caller originally attached.
+        # httpx strips the Authorization header (and a Location with no
+        # query string drops any api_key_query credential) on a
+        # cross-origin redirect, so a request that started out
+        # credentialed can still land on the connector host with nothing
+        # attached. `final_request_has_credential` reflects the request
+        # httpx actually sent, after any redirect; api_args is only a
+        # fallback for a result predating that field (e.g. from a mocked
+        # or older core client in tests).
+        final_request_has_credential = result.get("final_request_has_credential")
+        if final_request_has_credential is None:
+            final_request_has_credential = has_auth_credentials(
+                api_args.url,
+                api_args.headers,
+                api_args.params,
+                api_args.auth_type,
+                api_args.auth_token,
+            )
+        if final_request_has_credential:
             return
         result["error"] = append_known_connector_domain_hint(
             result.get("error"), connector_label

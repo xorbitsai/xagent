@@ -3368,6 +3368,25 @@ def test_create_branch_surfaces_unrelated_422_without_hint(monkeypatch):
     assert result["message"] == "Validation Failed"
 
 
+def test_create_branch_reports_404_on_missing_ref_with_hint(monkeypatch):
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data={"message": "Not Found"}, status_code=404),
+        ]
+    )
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    result = json.loads(
+        github.github_create_branch("octocat/Hello-World", "feature", "main")
+    )
+
+    assert result["status"] == "error"
+    assert "Not Found" in result["message"]
+    assert "octocat/Hello-World" in result["message"]
+    assert "main" in result["message"]
+    assert mock_request.call_count == 1
+
+
 def test_create_branch_rejects_missing_default_branch(monkeypatch):
     mock_request = Mock(return_value=MockResponse(json_data={"full_name": "x/y"}))
     monkeypatch.setattr(github.requests, "request", mock_request)
@@ -3700,6 +3719,25 @@ def test_create_or_update_file_surfaces_unrelated_github_error_without_hint(
         "request",
         Mock(
             return_value=MockResponse(
+                json_data={"message": "Forbidden"}, status_code=403
+            )
+        ),
+    )
+
+    result = json.loads(
+        github.github_create_or_update_file("octocat/Hello-World", "a.txt", "x", "msg")
+    )
+
+    assert result["status"] == "error"
+    assert result["message"] == "Forbidden"
+
+
+def test_create_or_update_file_reports_404_with_repo_only_hint(monkeypatch):
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
                 json_data={"message": "Not Found"}, status_code=404
             )
         ),
@@ -3710,7 +3748,31 @@ def test_create_or_update_file_surfaces_unrelated_github_error_without_hint(
     )
 
     assert result["status"] == "error"
-    assert result["message"] == "Not Found"
+    assert "Not Found" in result["message"]
+    assert "octocat/Hello-World" in result["message"]
+    assert "branch" not in result["message"]
+
+
+def test_create_or_update_file_reports_404_with_branch_hint(monkeypatch):
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={"message": "Branch not found"}, status_code=404
+            )
+        ),
+    )
+
+    result = json.loads(
+        github.github_create_or_update_file(
+            "octocat/Hello-World", "a.txt", "x", "msg", branch="missing-branch"
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "octocat/Hello-World" in result["message"]
+    assert "missing-branch" in result["message"]
 
 
 def test_create_or_update_file_rejects_non_object_response(monkeypatch):

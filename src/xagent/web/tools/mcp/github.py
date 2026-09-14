@@ -1169,9 +1169,20 @@ def github_create_branch(repo: str, branch: str, from_ref: str = "") -> str:
                     f"Could not determine the default branch of '{repo}'; pass "
                     "from_ref explicitly"
                 )
-        ref = _request(
-            "GET", f"/repos/{owner}/{name}/git/ref/heads/{_encode_file_path(source)}"
-        )
+        try:
+            ref = _request(
+                "GET",
+                f"/repos/{owner}/{name}/git/ref/heads/{_encode_file_path(source)}",
+            )
+        except _GitHubAPIError as exc:
+            # GitHub answers both a missing repo and a missing ref with 404
+            # (it doesn't distinguish the two here), so the message stays
+            # honestly ambiguous between them rather than picking one.
+            if exc.status_code == 404:
+                return _error(
+                    f"{exc} -- repository '{repo}' or branch '{source}' not found"
+                )
+            raise
         _require_object(ref, context=f"ref 'heads/{source}' in '{repo}'")
         source_sha = (ref.get("object") or {}).get("sha")
         if not isinstance(source_sha, str) or not source_sha:
@@ -1446,6 +1457,13 @@ def github_create_or_update_file(
                     f"{exc} -- '{path}' changed since it was read; re-read it with "
                     "github_get_file_contents and retry with the current `sha`"
                 )
+            if exc.status_code == 404:
+                if "branch" in json_data:
+                    return _error(
+                        f"{exc} -- repository '{repo}' or branch "
+                        f"'{json_data['branch']}' not found"
+                    )
+                return _error(f"{exc} -- repository '{repo}' not found")
             raise
         result = response.json() if response.content else {}
         _require_object(result, context=f"file write to '{repo}:{path}'")

@@ -219,7 +219,7 @@ def _sanitize_final_url(url: httpx.URL) -> str:
     Takes the ``httpx.URL`` object directly (``response.url`` /
     ``response.request.url``) rather than a string: reconstructing a
     string-form URL by hand (stdlib ``urlparse``/``urlunparse``) needs its
-    own IPv6-literal bracketing to avoid producing something unparseable
+    own IPv6-literal bracketing to avoid producing something unparsable
     (``https://::1:8443/...``); ``httpx.URL.copy_with`` already handles
     that correctly since it's the same type this module already merges
     query params through elsewhere (``copy_merge_params``).

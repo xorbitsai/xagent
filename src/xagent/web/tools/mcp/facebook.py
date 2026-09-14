@@ -29,6 +29,7 @@ REQUIRED_PERMISSIONS = (
     "pages_show_list",
     "pages_read_engagement",
     "pages_manage_posts",
+    "pages_read_user_content",
 )
 
 

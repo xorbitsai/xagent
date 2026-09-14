@@ -693,6 +693,7 @@ def test_meta_callback_exchanges_short_lived_token_and_connects_selected_app(
                         {"permission": "pages_show_list", "status": "granted"},
                         {"permission": "pages_read_engagement", "status": "granted"},
                         {"permission": "pages_manage_posts", "status": "granted"},
+                        {"permission": "pages_read_user_content", "status": "granted"},
                     ]
                 }
             )
@@ -772,6 +773,7 @@ def test_meta_callback_uses_short_lived_token_when_long_lived_exchange_is_not_js
                         {"permission": "pages_show_list", "status": "granted"},
                         {"permission": "pages_read_engagement", "status": "granted"},
                         {"permission": "pages_manage_posts", "status": "granted"},
+                        {"permission": "pages_read_user_content", "status": "granted"},
                     ]
                 }
             )
@@ -838,6 +840,7 @@ def test_meta_callback_uses_short_lived_token_when_long_lived_exchange_fails(
                         {"permission": "pages_show_list", "status": "granted"},
                         {"permission": "pages_read_engagement", "status": "granted"},
                         {"permission": "pages_manage_posts", "status": "granted"},
+                        {"permission": "pages_read_user_content", "status": "granted"},
                     ]
                 }
             )
@@ -1142,6 +1145,24 @@ def test_bare_meta_login_skips_facebook_but_still_connects_instagram(
                     "expires_in": 5184000,
                 }
             )
+        if url == "https://graph.facebook.com/v25.0/me/permissions":
+            # Instagram's required scopes are all granted; Facebook is
+            # already excluded from this bare flow by
+            # requires_app_scoped_oauth_grant before scopes are even
+            # checked, so its own scopes need not be granted here.
+            return MockResponse(
+                {
+                    "data": [
+                        {"permission": "pages_show_list", "status": "granted"},
+                        {"permission": "pages_read_engagement", "status": "granted"},
+                        {"permission": "instagram_basic", "status": "granted"},
+                        {
+                            "permission": "instagram_content_publish",
+                            "status": "granted",
+                        },
+                    ]
+                }
+            )
         return MockResponse({"id": "meta-user-1", "email": "alice@example.com"})
 
     monkeypatch.setattr(auth_api.requests, "post", post)
@@ -1205,6 +1226,28 @@ async def test_disconnecting_facebook_preserves_shared_bare_meta_grant_for_insta
                     "access_token": "long-token",
                     "token_type": "bearer",
                     "expires_in": 5184000,
+                }
+            )
+        if url == "https://graph.facebook.com/v25.0/me/permissions":
+            # Covers both the bare Instagram connect and the app-scoped
+            # Facebook connect below -- all of both apps' required scopes
+            # are granted on this token.
+            return MockResponse(
+                {
+                    "data": [
+                        {"permission": "pages_show_list", "status": "granted"},
+                        {"permission": "pages_read_engagement", "status": "granted"},
+                        {"permission": "pages_manage_posts", "status": "granted"},
+                        {
+                            "permission": "pages_read_user_content",
+                            "status": "granted",
+                        },
+                        {"permission": "instagram_basic", "status": "granted"},
+                        {
+                            "permission": "instagram_content_publish",
+                            "status": "granted",
+                        },
+                    ]
                 }
             )
         return MockResponse({"id": "meta-user-1", "email": "alice@example.com"})
@@ -1633,19 +1676,41 @@ def test_generic_oauth_batch_skips_meta_app_missing_permission(db_session, monke
     """Bare "meta" connect (no app_id) can satisfy some apps under the
     provider but not others whose oauth_scopes it doesn't carry -- the app
     missing a permission must be skipped rather than marked connected,
-    without aborting the rest of the batch."""
+    without aborting the rest of the batch.
+
+    Uses a custom (non-builtin) app rather than the real "instagram"/
+    "facebook" app_ids: those are covered by their own dedicated tests, and
+    "facebook" is unconditionally skipped in a bare connect for the
+    unrelated requires_app_scoped_oauth_grant reason regardless of
+    permissions, which would make it a poor example of the permission-skip
+    path specifically."""
     db, user = db_session
     db.add(
         PublicMCPApp(
-            app_id="instagram",
-            name="Instagram",
+            app_id="meta-notes",
+            name="Meta Notes",
             transport="oauth",
             provider_name="meta",
-            oauth_scopes=["instagram_content_publish"],
+            oauth_scopes=["notes_write"],
             is_visible_in_connector=True,
             launch_config={
                 "command": "uv",
-                "args": ["run", "python", "-m", "xagent.web.tools.mcp.instagram"],
+                "args": ["run", "python", "-m", "xagent.web.tools.mcp.meta_notes"],
+                "env_mapping": {"META_ACCESS_TOKEN": "access_token"},
+            },
+        )
+    )
+    db.add(
+        PublicMCPApp(
+            app_id="meta-events",
+            name="Meta Events",
+            transport="oauth",
+            provider_name="meta",
+            oauth_scopes=[],
+            is_visible_in_connector=True,
+            launch_config={
+                "command": "uv",
+                "args": ["run", "python", "-m", "xagent.web.tools.mcp.meta_events"],
                 "env_mapping": {"META_ACCESS_TOKEN": "access_token"},
             },
         )
@@ -1676,17 +1741,10 @@ def test_generic_oauth_batch_skips_meta_app_missing_permission(db_session, monke
         if url.endswith("/oauth/access_token"):
             raise auth_api.requests.RequestException("skip long-lived exchange")
         if url == "https://graph.facebook.com/v25.0/me/permissions":
-            # facebook's pages_show_list/pages_manage_posts are granted, but
-            # instagram's instagram_content_publish was declined.
-            return MockResponse(
-                {
-                    "data": [
-                        {"permission": "pages_show_list", "status": "granted"},
-                        {"permission": "pages_read_engagement", "status": "granted"},
-                        {"permission": "pages_manage_posts", "status": "granted"},
-                    ]
-                }
-            )
+            # Nothing carries "notes_write" -- Meta Notes must be skipped.
+            # Meta Events requires no scopes at all, so it must still connect
+            # even though Meta Notes right before it in the batch was skipped.
+            return MockResponse({"data": []})
         assert url == "https://graph.facebook.com/v25.0/me?fields=id,email"
         return MockResponse({"id": "meta-user-1", "email": "alice@example.com"})
 
@@ -1696,5 +1754,6 @@ def test_generic_oauth_batch_skips_meta_app_missing_permission(db_session, monke
 
     assert response.status_code == 200
     server_names = {s.name for s in db.query(MCPServer).all()}
-    assert "Facebook Pages" in server_names
-    assert "Instagram" not in server_names
+    assert "Meta Events" in server_names
+    assert "Meta Notes" not in server_names
+    assert "Facebook Pages" not in server_names

@@ -86,6 +86,10 @@ def test_auth_status_reports_missing_permissions(monkeypatch):
                         {"permission": "pages_show_list", "status": "granted"},
                         {"permission": "pages_read_engagement", "status": "granted"},
                         {"permission": "pages_manage_posts", "status": "declined"},
+                        {
+                            "permission": "pages_read_user_content",
+                            "status": "granted",
+                        },
                     ]
                 }
             )

@@ -528,15 +528,17 @@ def _get_associated_deals(
     max_output_length = get_tool_max_output_length()
     payload = _build(deals, missing_deal_ids, False)
     truncated = False
-    # Halve whichever list is still non-empty - missing_deal_ids too, not
-    # just deals, so a large batch-read shortfall can't alone keep the
-    # response over the limit once deals itself has nothing left to give.
+    # Shrink missing_deal_ids before deals: it's a diagnostic list of ids
+    # HubSpot didn't return, strictly less valuable than the deals the
+    # caller actually asked for, so a batch-read shortfall large enough to
+    # need trimming on its own shouldn't cost the caller real deal data
+    # that already fit.
     while len(_success(**payload)) > max_output_length and (deals or missing_deal_ids):
         truncated = True
-        if deals:
-            deals = deals[: len(deals) // 2]
-        else:
+        if missing_deal_ids:
             missing_deal_ids = missing_deal_ids[: len(missing_deal_ids) // 2]
+        else:
+            deals = deals[: len(deals) // 2]
         payload = _build(deals, missing_deal_ids, truncated)
     if truncated and not deals and not missing_deal_ids:
         # Collapsing everything away means even the single largest
@@ -571,7 +573,9 @@ def hubspot_get_contact_deals(contact_id: str, limit: int = 100) -> str:
     there are more deals than returned, either because of `limit` or because
     the response was trimmed to fit the output size limit (`truncated` is
     then also true); `missing_deal_ids` lists any requested deal id HubSpot's
-    own batch lookup silently dropped (empty when none were).
+    own batch lookup silently dropped (empty when none were) - though when
+    `truncated` is also true, this list may itself have been trimmed, so
+    it's not a complete accounting in that case.
 
     A contact's deals are not necessarily the same as its company's deals: two
     contacts can share a name (e.g. the same person with a role at two

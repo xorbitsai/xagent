@@ -94,7 +94,10 @@ def _hostname_matches_connector_domain(hostname: str, domain: str) -> bool:
 def match_known_connector_domain(hostname: str) -> Optional[str]:
     """Return the connector name if ``hostname`` belongs to one of
     ``_KNOWN_CONNECTOR_DOMAINS``, else ``None``."""
-    hostname = hostname.lower()
+    # A trailing "." is a valid DNS root-label marker (api.hubapi.com. is the
+    # same host as api.hubapi.com) that a caller could legitimately send;
+    # without stripping it, that spelling would silently skip this check.
+    hostname = hostname.lower().rstrip(".")
     if hostname in _SELF_AUTHENTICATING_SUBDOMAINS:
         return None
     for domain, label in _KNOWN_CONNECTOR_DOMAINS:
@@ -128,11 +131,34 @@ _AUTH_QUERY_PARAM_NAMES = frozenset(
     {"key", "api_key", "api-key", "apikey", "token", "access_token"}
 )
 
+# auth_type values _prepare_headers()/call_api() actually know how to turn
+# into a real credential on the outgoing request. auth_token alone (without
+# one of these) is inert - _prepare_headers only attaches an Authorization
+# header when both auth_type and auth_token are set, and api_key_query is
+# handled separately in call_api's query-param step - so counting a bare
+# auth_token as "has a credential" would be wrong: the request that
+# actually goes out would carry none.
+_EFFECTIVE_AUTH_TYPES = frozenset({"bearer", "basic", "api_key", "api_key_query"})
+
+
+def _is_blank(value: Any) -> bool:
+    return not str(value).strip()
+
+
+def _has_effective_auth_token(
+    auth_type: Optional[str], auth_token: Optional[str]
+) -> bool:
+    if _is_blank(auth_token) or not auth_type:
+        return False
+    return auth_type.lower() in _EFFECTIVE_AUTH_TYPES
+
 
 def _has_auth_header(headers: Optional[Mapping[str, str]]) -> bool:
     if not headers:
         return False
-    for key in headers:
+    for key, value in headers.items():
+        if _is_blank(value):
+            continue
         key_lower = str(key).lower()
         if any(marker in key_lower for marker in _AUTH_HEADER_NAME_MARKERS):
             return True
@@ -140,8 +166,13 @@ def _has_auth_header(headers: Optional[Mapping[str, str]]) -> bool:
 
 
 def _has_auth_query_param(url: str, params: Optional[Mapping[str, Any]]) -> bool:
-    query_keys = {str(key).lower() for key in params} if params else set()
-    query_keys.update(key.lower() for key in parse_qs(urlparse(url).query))
+    if params:
+        for key, value in params.items():
+            if str(key).lower() in _AUTH_QUERY_PARAM_NAMES and not _is_blank(value):
+                return True
+    # parse_qs defaults to keep_blank_values=False, so a blank value here
+    # (e.g. "?key=") is already dropped for us - nothing extra to check.
+    query_keys = {key.lower() for key in parse_qs(urlparse(url).query)}
     return not _AUTH_QUERY_PARAM_NAMES.isdisjoint(query_keys)
 
 
@@ -156,40 +187,49 @@ def has_auth_credentials(
     url: str,
     headers: Optional[Mapping[str, str]],
     params: Optional[Mapping[str, Any]],
+    auth_type: Optional[str],
     auth_token: Optional[str],
 ) -> bool:
     """Whether the caller appears to already have their own credential for
     this call, by any of the mechanisms api_call or a typical direct REST
-    call supports: the auth_token argument, an auth-looking header, an
-    auth-looking query parameter (in either `params` or the URL itself), or
-    a credential embedded directly in the URL (Basic-Auth userinfo, or a
-    self-authenticating webhook path)."""
+    call supports: auth_token paired with a supported auth_type, a
+    non-blank auth-looking header, a non-blank auth-looking query
+    parameter (in either `params` or the URL itself), or a credential
+    embedded directly in the URL (Basic-Auth userinfo).
+
+    A name-shaped match alone isn't enough for the header/param cases - an
+    empty value (e.g. {"Authorization": ""}) or a name that merely
+    resembles a credential without being one (e.g. "X-Idempotency-Token",
+    a request-deduplication id, not a secret) both look credential-shaped
+    by name. That imprecision is why this is used only to decide whether
+    to append an informational hint to an ALREADY-received 401/403 (see
+    known_connector_domain_hint / adapters/vibe/api_tool.py), never to
+    block a request outright: worst case here is a missed hint, not a
+    request that should have succeeded being refused.
+    """
     return bool(
-        auth_token
+        _has_effective_auth_token(auth_type, auth_token)
         or _has_auth_header(headers)
         or _has_auth_query_param(url, params)
         or _has_url_embedded_credentials(url)
     )
 
 
-def known_connector_domain_block_message(url: str, connector_label: str) -> str:
-    """Error text for a request blocked by the known-connector-domain guard.
-
-    A shared builder so every caller of this guard (currently just the
-    `api_call` tool adapter - see adapters/vibe/api_tool.py) presents the
-    same message, rather than each caller writing its own slightly
-    different wording.
+def known_connector_domain_hint(connector_label: str) -> str:
+    """Text appended to an ALREADY-received 401/403 from a domain covered by
+    a dedicated MCP connector, when the request carried no credential this
+    tool recognizes (see has_auth_credentials). Purely informational - it
+    never gates whether the request is made; a public, credential-less
+    endpoint on the same host (e.g. GitHub's public repo reads) still
+    succeeds normally and never sees this text.
     """
     return (
-        f"{url} is a {connector_label} API endpoint. This generic api_call "
-        f"tool has no stored credential for {connector_label} and this "
-        "request would only fail with an unauthenticated 401/403, not "
-        "indicate a real connection problem - use the dedicated "
-        f"{connector_label} connector tools instead if one covers this "
-        "request (some of these hosts serve more products/endpoints than "
-        "xagent has a connector for). If you have your own API token for "
-        "this service, pass it via auth_type/auth_token, a credential "
-        "header, or a credential query parameter to make the call anyway."
+        f" This looks like a {connector_label} API endpoint with no "
+        f"credential attached, which explains a 401/403 here - if the "
+        f"dedicated {connector_label} connector tools cover this request, "
+        "prefer those (they carry the account's own OAuth credential); "
+        "this generic api_call tool needs its own via auth_type/auth_token, "
+        "a credential header, or a credential query parameter."
     )
 
 

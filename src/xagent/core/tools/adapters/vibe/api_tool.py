@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 from ...core.api_tool import (
     APIClientCore,
     has_auth_credentials,
-    known_connector_domain_block_message,
+    known_connector_domain_hint,
     match_known_connector_domain,
 )
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
@@ -87,7 +87,8 @@ class APITool(AbstractBaseTool):
         Supports GET, POST, PUT, DELETE, PATCH methods with custom headers, body, and authentication.
         Authentication types: 'bearer' (Bearer token), 'basic' (Basic auth), 'api_key' (X-API-Key header), 'api_key_query' (API key in query params).
         Returns parsed JSON response or text content with status code and headers.
-        Useful for integrating with external services, APIs, and webhooks."""
+        Useful for integrating with external services, APIs, and webhooks.
+        This tool has no stored credential for any external service. A 401/403 from a host with its own dedicated MCP connector (e.g. HubSpot, Slack, GitHub) comes back with a hint to use that connector's tools instead - pass your own credential via auth_type/auth_token, a header, or a query parameter if you have one."""
 
     @property
     def tags(self) -> list[str]:
@@ -105,32 +106,14 @@ class APITool(AbstractBaseTool):
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
         api_args = APICallArgs.model_validate(args)
 
-        # Refuse an unauthenticated call to a domain already covered by a
-        # dedicated MCP connector - this generic tool has no stored
-        # credential for it, so the request would only fail with a
-        # misleading 401/403, not indicate a real connection problem (see
-        # the HubSpot deal-write incident this guard was added for). Scoped
-        # to this agent-facing tool specifically, not the underlying
-        # APIClientCore/call_api, which is also used by the user-configured
-        # Custom API tool (CustomApiTool) - an unrelated feature this guard
-        # must not affect.
-        connector_label = match_known_connector_domain(
-            urlparse(api_args.url).hostname or ""
-        )
-        if connector_label and not has_auth_credentials(
-            api_args.url, api_args.headers, api_args.params, api_args.auth_token
-        ):
-            message = known_connector_domain_block_message(
-                api_args.url, connector_label
-            )
-            logger.warning(
-                f"🚫 API Call blocked: {api_args.method} {api_args.url} - {message}"
-            )
-            return APICallResult(
-                success=False, status_code=0, headers={}, body=None, error=message
-            ).model_dump()
-
-        # Make API call - api_key_query logic is now handled in core client
+        # Make API call - api_key_query logic is now handled in core client.
+        # Always actually attempted, even against a domain a dedicated MCP
+        # connector also covers: a domain-based preflight block was tried
+        # first here and reverted (see git history) because it couldn't
+        # distinguish a request that needs that connector's credential from
+        # one that doesn't need any - e.g. GitHub's public, credential-less
+        # repo-read endpoints, which must still succeed normally. Only a
+        # REAL 401/403 this call actually received gets annotated below.
         result = await self._client.call_api(
             url=api_args.url,
             method=api_args.method,
@@ -145,7 +128,46 @@ class APITool(AbstractBaseTool):
             allow_redirects=api_args.allow_redirects,
         )
 
+        if result.get("status_code") in (401, 403):
+            self._hint_known_connector_if_uncredentialed(result, api_args)
+
         return APICallResult.model_validate(result).model_dump()
+
+    def _hint_known_connector_if_uncredentialed(
+        self, result: Dict[str, Any], api_args: APICallArgs
+    ) -> None:
+        """Append a hint to `result["error"]` in place when a request that
+        already received a real 401/403 targeted a domain covered by a
+        dedicated MCP connector and carried no credential this tool
+        recognizes - see the HubSpot deal-write incident this exists for
+        (reads worked via the real connector throughout; an unauthenticated
+        raw fallback call's 401 got diagnosed as "connection broken").
+        Purely informational: it never affects whether the call was made or
+        what status_code/body it got, so a public, credential-less endpoint
+        on the same host that returns 2xx is entirely unaffected.
+        """
+        try:
+            hostname = urlparse(api_args.url).hostname or ""
+        except ValueError:
+            return
+        connector_label = match_known_connector_domain(hostname)
+        if not connector_label:
+            return
+        if has_auth_credentials(
+            api_args.url,
+            api_args.headers,
+            api_args.params,
+            api_args.auth_type,
+            api_args.auth_token,
+        ):
+            return
+        hint = known_connector_domain_hint(connector_label)
+        result["error"] = f"{result.get('error') or ''}{hint}"
+        logger.info(
+            f"ℹ️ API Call {api_args.method} {api_args.url} got "
+            f"{result['status_code']} with no recognized credential - "
+            f"hinting at the {connector_label} connector"
+        )
 
     def return_value_as_string(self, value: Any) -> str:
         """Format API response as readable string"""

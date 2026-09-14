@@ -94,6 +94,9 @@ TEMPLATE_STATUSES = frozenset(
 MEDIA_TYPES = frozenset({"image", "video", "audio", "document"})
 CAPTIONLESS_MEDIA_TYPES = frozenset({"audio"})
 
+# Separators tolerated (and stripped) in a pasted recipient number.
+_RECIPIENT_SEPARATOR_PATTERN = re.compile(r"[\s().-]")
+
 # Actionable hints for the Cloud API error codes an agent is most likely to
 # hit when sending. The raw error is still returned in full; this only adds
 # a "hint" so the model doesn't have to know Meta's error catalogue. Codes
@@ -173,7 +176,7 @@ def _normalize_recipient(to: str) -> str:
     """
     if not to or not str(to).strip():
         raise ValueError("to (recipient phone number) is required")
-    cleaned = re.sub(r"[\s().-]", "", str(to).strip())
+    cleaned = _RECIPIENT_SEPARATOR_PATTERN.sub("", str(to).strip())
     if cleaned.startswith("+"):
         digits = cleaned[1:]
     elif cleaned.startswith("00"):
@@ -232,11 +235,18 @@ def _next_cursor(result: Any) -> str | None:
     return after if isinstance(after, str) and after else None
 
 
-def _normalize_after(after: str | None) -> str | None:
+def _apply_after_cursor(params: dict[str, Any], after: str | None) -> None:
+    """Set params["after"] from a caller-supplied cursor, if it's non-blank.
+
+    Shared by every paginated list tool instead of each repeating its own
+    strip-and-maybe-set -- see _next_cursor's docstring for why a bare
+    cursor (not a full URL) is what round-trips here.
+    """
     if after is None:
-        return None
+        return
     stripped = after.strip()
-    return stripped or None
+    if stripped:
+        params["after"] = stripped
 
 
 def _error_code(error: GraphAPIError) -> int | None:
@@ -296,9 +306,7 @@ def _list_business_accounts(
     than paginating recursively per-business.
     """
     params: dict[str, Any] = {"fields": BUSINESS_FIELDS, "limit": 100}
-    normalized_after = _normalize_after(after)
-    if normalized_after is not None:
-        params["after"] = normalized_after
+    _apply_after_cursor(params, after)
     result = _graph_request("GET", "/me/businesses", params=params)
     accounts: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -402,9 +410,7 @@ def whatsapp_list_phone_numbers(waba_id: str, after: str | None = None) -> str:
     """
     try:
         params: dict[str, Any] = {"fields": PHONE_NUMBER_FIELDS}
-        normalized_after = _normalize_after(after)
-        if normalized_after is not None:
-            params["after"] = normalized_after
+        _apply_after_cursor(params, after)
         result = _graph_request(
             "GET", _graph_path(waba_id, "phone_numbers"), params=params
         )
@@ -463,9 +469,9 @@ def whatsapp_list_message_templates(
     header/body/button parameters whatsapp_send_template_message must fill
     in) can be large, and a full page of rich templates can otherwise
     balloon the response. Once you've found the template you want by name
-    here, call this again with include_components=True (optionally
-    filtering to just that name's language) to see its parameter shape
-    before sending.
+    here, call this again with include_components=True to see its
+    parameter shape before sending -- there is no name/language filter, so
+    a small page (e.g. status="APPROVED") is the way to narrow results.
     """
     try:
         params: dict[str, Any] = {
@@ -481,9 +487,7 @@ def whatsapp_list_message_templates(
                     "status must be one of: " + ", ".join(sorted(TEMPLATE_STATUSES))
                 )
             params["status"] = normalized_status
-        normalized_after = _normalize_after(after)
-        if normalized_after is not None:
-            params["after"] = normalized_after
+        _apply_after_cursor(params, after)
         result = _graph_request(
             "GET", _graph_path(waba_id, "message_templates"), params=params
         )

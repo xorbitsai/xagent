@@ -100,6 +100,32 @@ def test_upgrade_is_idempotent_for_provenance_owned_row(tmp_path):
     assert count == 1
 
 
+def test_upgrade_is_idempotent_even_with_an_unrelated_later_collision(tmp_path):
+    """A later, wholly unrelated custom app that happens to normalize to the
+    same identity (e.g. an admin literally names a different connector
+    "WhatsApp") must not retroactively block every future `alembic upgrade
+    head` over the already-seeded, correctly-owned whatsapp row -- that
+    ambiguity belongs to the unrelated row's own creation path, not to an
+    idempotent re-run of this migration."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration()
+    with engine.begin() as connection:
+        _create_apps_table(connection)
+        _run(connection, migration, "upgrade")
+        connection.execute(
+            text(
+                "INSERT INTO public_mcp_apps "
+                "(app_id, name, transport, is_visible_in_connector) "
+                "VALUES ('unrelated-app', 'WhatsApp', 'stdio', 1)"
+            )
+        )
+        _run(connection, migration, "upgrade")
+        count = connection.execute(
+            text("SELECT COUNT(*) FROM public_mcp_apps WHERE app_id='whatsapp'")
+        ).scalar_one()
+    assert count == 1
+
+
 def test_upgrade_accepts_owned_row_from_an_older_provenance_version(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration()

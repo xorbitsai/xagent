@@ -141,15 +141,20 @@ def upgrade() -> None:
     if exact_app_rows:
         existing = exact_app_rows[0]
         # Idempotent re-run over a row this migration (or a prior version of
-        # it) already owns: accept and stop, whether or not it's also the
-        # only collision on record.
-        if _has_provenance(existing["launch_config"]) and colliding_catalog_rows == [
-            existing
-        ]:
+        # it) already owns: accept and stop. This does NOT also require
+        # colliding_catalog_rows to contain nothing else -- an unrelated
+        # row created *after* this one was seeded (e.g. an admin later
+        # names an entirely different custom connector "WhatsApp") is a
+        # separate ambiguity to police at that row's own creation time
+        # (POST /admin/mcp/apps), not a reason for every subsequent
+        # `alembic upgrade head` to unconditionally fail closed against an
+        # already-correctly-owned row it never touches.
+        if _has_provenance(existing["launch_config"]):
             return
         raise RuntimeError(
-            "Cannot seed builtin WhatsApp connector: custom or ambiguous "
-            "public_mcp_apps identity collides with 'whatsapp'"
+            "Cannot seed builtin WhatsApp connector: an existing "
+            "public_mcp_apps row with app_id='whatsapp' has no matching "
+            "builtin_provenance"
         )
     if colliding_catalog_rows:
         raise RuntimeError(
@@ -164,10 +169,7 @@ def upgrade() -> None:
             dropped_keys,
             APP_ID,
         )
-    bind.execute(
-        sa.insert(PUBLIC_MCP_APPS_TABLE),
-        [{key: value for key, value in ROW.items() if key in columns}],
-    )
+    bind.execute(sa.insert(PUBLIC_MCP_APPS_TABLE), [_filter_row(ROW, columns)])
 
 
 def downgrade() -> None:

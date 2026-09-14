@@ -1537,18 +1537,10 @@ class CollectionInfo(BaseModel):
         # Do not persist owners; they are computed from user_id when listing
         data["owners"] = "[]"
 
-        # Serialize ingestion_config via Pydantic's own JSON encoder rather
-        # than json.dumps() on the already-model_dump()'d dict above: that
-        # dict (mode="python") still holds ParseMethod/ChunkStrategy enum
-        # members, and json.dumps() can't serialize them on its own - it
-        # raised "Object of type ParseMethod is not JSON serializable",
-        # aborting collection save/rebuild for any collection with a
-        # non-default ingestion config. model_dump_json() serializes every
-        # field to its .value the way the type annotations declare, so it
-        # doesn't depend on each enum happening to override __str__ to
-        # return .value (as ParseMethod/ChunkStrategy currently do) and
-        # won't silently mis-serialize a differently-behaved enum added
-        # to IngestionConfig later.
+        # model_dump_json() serializes ingestion_config's enum fields to their
+        # .value per the type annotation, unlike json.dumps() on the
+        # model_dump()'d dict above (which left them as ParseMethod/
+        # ChunkStrategy instances and crashed on any non-null ingestion_config).
         if self.ingestion_config is not None:
             data["ingestion_config"] = self.ingestion_config.model_dump_json()
         else:

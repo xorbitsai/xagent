@@ -1,5 +1,6 @@
 """Tests for core data schemas."""
 
+import json
 from datetime import datetime
 
 import pytest
@@ -1434,14 +1435,15 @@ class TestCollectionInfo:
         assert storage_data["processed_documents"] == 3
         assert storage_data["ingestion_config"] == ""
 
-    def test_collection_info_to_storage_serializes_non_default_ingestion_config(self):
-        """A non-default parse_method/chunk_strategy must not break to_storage().
+    def test_collection_info_to_storage_serializes_any_non_null_ingestion_config(self):
+        """A non-null ingestion_config must not break to_storage().
 
         Regression test for a production incident: model_dump() leaves these
         enum fields as ParseMethod/ChunkStrategy instances, and a plain Enum
         (not mixed with str) raises "Object of type ParseMethod is not JSON
         serializable" from the json.dumps() call below, aborting collection
-        save/rebuild for any collection with a non-default ingestion config.
+        save/rebuild for any collection with a non-null ingestion_config -
+        including one holding only default field values.
         """
         collection = CollectionInfo(
             name="test_collection",
@@ -1454,11 +1456,16 @@ class TestCollectionInfo:
         storage_data = collection.to_storage()
 
         assert isinstance(storage_data["ingestion_config"], str)
-        import json
-
         stored_config = json.loads(storage_data["ingestion_config"])
         assert stored_config["parse_method"] == "pymupdf"
         assert stored_config["chunk_strategy"] == "markdown"
+
+        # The write is only useful if reading it back reconstructs the same
+        # enum-bearing config, not just valid-looking JSON.
+        assert (
+            CollectionInfo.from_storage(storage_data).ingestion_config
+            == collection.ingestion_config
+        )
 
     def test_collection_info_immutability_by_default(self):
         """Test that CollectionInfo is immutable by default after creation."""

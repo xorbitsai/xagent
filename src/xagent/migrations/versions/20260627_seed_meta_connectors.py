@@ -12,6 +12,8 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
+from xagent.migrations.seed_helpers import delete_unmodified_seeded_rows
+
 # revision identifiers, used by Alembic.
 revision: str = "20260627_seed_meta_connectors"
 down_revision: Union[str, None] = "20260624_add_mcp_concurrency_config"
@@ -51,8 +53,6 @@ PUBLIC_MCP_APPS_TABLE = sa.table(
     sa.column("is_visible_in_connector", sa.Boolean),
     sa.column("launch_config", sa.JSON),
 )
-
-META_APP_IDS = ("facebook", "instagram")
 
 
 def _filter_row(row: dict[str, object], allowed_columns: set[str]) -> dict[str, object]:
@@ -161,11 +161,10 @@ def downgrade() -> None:
     existing_tables = set(inspector.get_table_names())
 
     if "public_mcp_apps" in existing_tables:
-        bind.execute(
-            sa.delete(PUBLIC_MCP_APPS_TABLE).where(
-                PUBLIC_MCP_APPS_TABLE.c.app_id.in_(META_APP_IDS)
-            )
-        )
+        # Only rows still matching this migration's seed snapshot are removed,
+        # so an operator's pre-existing custom "facebook"/"instagram" app_id is
+        # left in place.
+        delete_unmodified_seeded_rows(bind, PUBLIC_MCP_APPS_TABLE, _meta_app_rows())
 
     if "oauth_providers" not in existing_tables:
         return

@@ -11,6 +11,8 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
+from xagent.migrations.seed_helpers import delete_unmodified_seeded_rows
+
 # revision identifiers, used by Alembic.
 revision: str = "20260724_seed_google_ads_mcp_app"
 down_revision: Union[str, None] = "20260722_add_workforce_id_to_agent_api_keys"
@@ -69,14 +71,12 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     bind = op.get_bind()
-    inspector = sa.inspect(bind)
-    if "public_mcp_apps" not in set(inspector.get_table_names()):
-        return
-    # Only the catalog entry is removed. The shared "google" oauth_providers row
-    # is left untouched since it is reused by Gmail/Drive/Calendar/Docs/Slides.
-    # Any MCPServer/UserMCPServer rows created by users who already connected are
-    # intentionally left in place — connect-driven rows are not owned by this
-    # migration and are cleaned up through the normal disconnect path.
-    bind.execute(
-        sa.delete(PUBLIC_MCP_APPS_TABLE).where(PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID)
-    )
+    # Only the catalog entry is removed, and only if it still matches this
+    # migration's seed snapshot — an operator's pre-existing custom
+    # app_id="google-ads" row is left in place. The shared "google"
+    # oauth_providers row is left untouched since it is reused by
+    # Gmail/Drive/Calendar/Docs/Slides. Any MCPServer/UserMCPServer rows
+    # created by users who already connected are intentionally left in place —
+    # connect-driven rows are not owned by this migration and are cleaned up
+    # through the normal disconnect path.
+    delete_unmodified_seeded_rows(bind, PUBLIC_MCP_APPS_TABLE, [ROW])

@@ -261,6 +261,25 @@ def _reject_invalid_create_window(
         raise
 
 
+def _normalize_all_day_window(
+    start_datetime: str, end_datetime: str, timezone: str
+) -> tuple[str, str]:
+    """Normalize an all-day window to Graph's exclusive midnight bounds."""
+    effective_start, _ = _naive_day_bounds(
+        start_datetime, timezone, allow_windows_names=True
+    )
+    end_of_its_day, next_day_start = _naive_day_bounds(
+        end_datetime, timezone, allow_windows_names=True
+    )
+    end_is_midnight = _is_midnight_in_timezone(end_datetime, timezone)
+    effective_end = (
+        end_of_its_day
+        if end_is_midnight or end_of_its_day != effective_start
+        else next_day_start
+    )
+    return effective_start, effective_end
+
+
 # Defensive cap on calendarView pages followed for one organizer-side
 # conflict check - comfortably more than any single-window query should
 # ever need, just bounding the loop against an unexpected/pathological
@@ -737,20 +756,8 @@ def outlook_create_event(
         # same timezone. Normalize both the availability query and the eventual
         # write, including when ignore_conflicts bypasses the query.
         if is_all_day:
-            effective_start, _ = _naive_day_bounds(
-                start_datetime, timezone, allow_windows_names=True
-            )
-            end_of_its_day, next_day_start = _naive_day_bounds(
-                end_datetime, timezone, allow_windows_names=True
-            )
-            end_is_midnight = _is_midnight_in_timezone(end_datetime, timezone)
-            # end_datetime is an exclusive date boundary. A same-day time
-            # range still denotes one all-day event, while a later date is
-            # already the exclusive boundary even if its clock is non-midnight.
-            effective_end = (
-                end_of_its_day
-                if end_is_midnight or end_of_its_day != effective_start
-                else next_day_start
+            effective_start, effective_end = _normalize_all_day_window(
+                start_datetime, end_datetime, timezone
             )
         else:
             effective_start = _naive_datetime_in_timezone(start_datetime, timezone)
@@ -861,26 +868,38 @@ def outlook_update_event(
         single_boundary_update = (start_datetime is not None) != (
             end_datetime is not None
         )
+        if start_datetime is not None and end_datetime is not None:
+            _reject_invalid_create_window(
+                start_datetime,
+                end_datetime,
+                is_all_day=is_all_day is True,
+            )
 
         # Needed for the conflict check below, for resolving the timezone
-        # a single-boundary update must be written in, and (when attendees
-        # is given) to merge into rather than replace the existing attendee
-        # array - fetch it once up front whenever any of those is actually
-        # needed. ignore_conflicts only skips the check itself, not the
-        # timezone-resolution or attendee-merge uses, so those still need
-        # this even then; a plain is_all_day-only edit (or a full
-        # start_datetime+end_datetime replace) with ignore_conflicts=True
-        # needs none of them and stays a single PATCH.
+        # a single-boundary update must be written in, and for determining
+        # whether an update that omits `is_all_day` is still modifying an
+        # existing all-day event. `ignore_conflicts` only skips availability
+        # calls; it must not skip the reads required to construct a valid
+        # Graph payload.
         existing: dict[str, Any] = {}
-        needs_existing = single_boundary_update or (
-            not ignore_conflicts and touches_schedule
+        needs_existing = (
+            single_boundary_update
+            or (not ignore_conflicts and touches_schedule)
+            or (is_all_day is True and (start_datetime is None or end_datetime is None))
+            or (
+                is_all_day is None
+                and (start_datetime is not None or end_datetime is not None)
+            )
         )
         if needs_existing:
             existing = _graph_request(
                 "GET",
                 f"/me/events/{quote(event_id, safe='')}",
                 params={
-                    "$select": "start,end,attendees,isAllDay,originalStartTimeZone"
+                    "$select": (
+                        "start,end,attendees,isAllDay,"
+                        "originalStartTimeZone,originalEndTimeZone"
+                    )
                 },
             )
 
@@ -893,10 +912,23 @@ def outlook_update_event(
             # timezone". originalStartTimeZone is the one field that
             # reports the zone the event was actually created in,
             # unaffected by any Prefer header.
-            existing_timezone = existing.get("originalStartTimeZone")
+            original_timezone_field = (
+                "originalStartTimeZone"
+                if start_datetime is not None
+                else "originalEndTimeZone"
+            )
+            existing_timezone = existing.get(original_timezone_field)
+            if (
+                not existing_timezone
+                and original_timezone_field == "originalEndTimeZone"
+            ):
+                # Older Graph payloads and existing connector fixtures may omit
+                # originalEndTimeZone when both boundaries share the start zone.
+                existing_timezone = existing.get("originalStartTimeZone")
             if not existing_timezone:
                 raise ValueError(
-                    "Existing event has no originalStartTimeZone; cannot "
+                    "Existing event has no originalStartTimeZone/"
+                    "originalEndTimeZone; cannot "
                     "safely update only one of start_datetime/end_datetime "
                     "without it."
                 )
@@ -927,7 +959,10 @@ def outlook_update_event(
                     # discarded in favor of the existing zone.
                     raise ValueError(f"Unknown timezone {timezone!r}.") from exc
             if timezone is not None and _timezones_could_differ(
-                timezone, existing_timezone, allow_windows_names=True
+                timezone,
+                existing_timezone,
+                at=start_datetime or end_datetime,
+                allow_windows_names=True,
             ):
                 # Only one boundary is moving, and the caller explicitly
                 # gave a timezone that positively denotes a different real
@@ -1015,16 +1050,61 @@ def outlook_update_event(
             else:
                 existing_zone = existing_start_field.get("timeZone")
 
+        existing_end = existing_end_field.get("dateTime")
+        existing_start = existing_start_field.get("dateTime")
+        existing_is_all_day = bool(existing.get("isAllDay"))
+        effective_is_all_day = (
+            is_all_day if is_all_day is not None else existing_is_all_day
+        )
+        query_timezone = (
+            resolved_timezone
+            if (start_datetime is not None or end_datetime is not None)
+            else (existing_zone or resolved_timezone)
+        )
+        if start_datetime is not None or end_datetime is not None or is_all_day is True:
+            _resolve_zoneinfo(query_timezone, allow_windows_names=True)
+
+        raw_effective_start = start_datetime or existing_start
+        raw_effective_end = end_datetime or existing_end
+        if (
+            (start_datetime is not None or end_datetime is not None)
+            and raw_effective_start
+            and raw_effective_end
+        ):
+            _reject_invalid_create_window(
+                raw_effective_start,
+                raw_effective_end,
+                is_all_day=effective_is_all_day,
+            )
+        effective_start = raw_effective_start
+        effective_end = raw_effective_end
+        if effective_is_all_day and raw_effective_start and raw_effective_end:
+            effective_start, effective_end = _normalize_all_day_window(
+                raw_effective_start, raw_effective_end, query_timezone
+            )
+        else:
+            if start_datetime is not None:
+                effective_start = _naive_datetime_in_timezone(
+                    start_datetime, query_timezone
+                )
+            if end_datetime is not None:
+                effective_end = _naive_datetime_in_timezone(
+                    end_datetime, query_timezone
+                )
+
         payload: dict[str, Any] = {}
         if subject is not None:
             payload["subject"] = subject
         if start_datetime is not None:
             payload["start"] = {
-                "dateTime": start_datetime,
-                "timeZone": resolved_timezone,
+                "dateTime": effective_start,
+                "timeZone": query_timezone,
             }
         if end_datetime is not None:
-            payload["end"] = {"dateTime": end_datetime, "timeZone": resolved_timezone}
+            payload["end"] = {
+                "dateTime": effective_end,
+                "timeZone": query_timezone,
+            }
         if body is not None:
             payload["body"] = _message_body(body, "text")
         if location is not None:
@@ -1033,6 +1113,25 @@ def outlook_update_event(
             payload["attendees"] = _attendee_list(attendees)
         if is_all_day is not None:
             payload["isAllDay"] = is_all_day
+
+        # Graph requires an all-day event's boundaries to be midnight in one
+        # timezone. A flag-only timed -> all-day conversion therefore has to
+        # update the normalized boundaries too; changing only `isAllDay`
+        # leaves the stored timed boundaries invalid for the new event shape.
+        if is_all_day is True and not existing_is_all_day:
+            if not effective_start or not effective_end:
+                raise ValueError(
+                    "Existing event has no complete time window; cannot safely "
+                    "convert it to an all-day event."
+                )
+            payload["start"] = {
+                "dateTime": effective_start,
+                "timeZone": query_timezone,
+            }
+            payload["end"] = {
+                "dateTime": effective_end,
+                "timeZone": query_timezone,
+            }
 
         if not payload:
             raise ValueError("at least one field must be provided to update the event")
@@ -1048,20 +1147,11 @@ def outlook_update_event(
         # would otherwise re-validate the event's already-stored,
         # unchanged start/end and could reject an unrelated field edit
         # over pre-existing data this call never touches.
-        existing_end = existing_end_field.get("dateTime")
-        existing_start = existing_start_field.get("dateTime")
-        effective_start = start_datetime or existing_start
-        effective_end = end_datetime or existing_end
         if (start_datetime or end_datetime) and effective_start and effective_end:
             _reject_reversed_window(effective_start, effective_end)
 
         unchecked_attendees: list[str] = []
         if not ignore_conflicts and touches_schedule:
-            query_timezone = (
-                resolved_timezone
-                if (start_datetime is not None or end_datetime is not None)
-                else (existing_zone or "UTC")
-            )
 
             def _key(value: str | None, tz_name: str) -> datetime | str | None:
                 return _datetime_key_for_comparison(
@@ -1074,31 +1164,12 @@ def outlook_update_event(
             existing_end_key = _key(existing_end, existing_zone or "UTC")
             effective_start_key = _key(effective_start, query_timezone)
             effective_end_key = _key(effective_end, query_timezone)
-            existing_is_all_day = bool(existing.get("isAllDay"))
-            effective_is_all_day = (
-                is_all_day if is_all_day is not None else existing_is_all_day
-            )
             check_organizer = (effective_start_key, effective_end_key) != (
                 existing_start_key,
                 existing_end_key,
             ) or effective_is_all_day != existing_is_all_day
 
             query_start, query_end = effective_start, effective_end
-            if effective_is_all_day and effective_start and effective_end:
-                query_start, _ = _naive_day_bounds(
-                    effective_start,
-                    query_timezone,
-                    allow_windows_names=True,
-                )
-                end_of_its_day, next_day_start = _naive_day_bounds(
-                    effective_end,
-                    query_timezone,
-                    allow_windows_names=True,
-                )
-                end_is_midnight = _is_midnight_in_timezone(
-                    effective_end, query_timezone
-                )
-                query_end = end_of_its_day if end_is_midnight else next_day_start
 
             if check_organizer:
                 if not query_start or not query_end:

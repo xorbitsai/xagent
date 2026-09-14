@@ -1348,10 +1348,15 @@ def naive_day_bounds(
 
 
 def timezones_could_differ(
-    a: str, b: str, *, allow_windows_names: bool = False
+    a: str,
+    b: str,
+    *,
+    at: str | datetime | None = None,
+    allow_windows_names: bool = False,
 ) -> bool:
     """True only when two Graph timeZone values can be POSITIVELY
-    confirmed to denote different zones (compared by current UTC offset,
+    confirmed to denote different zones (compared by UTC offset at the
+    relevant event boundary,
     not just the zone key, so e.g. a Windows name and the IANA name Graph
     also accepts for the same real zone compare equal).
 
@@ -1373,5 +1378,15 @@ def timezones_could_differ(
         zone_b = resolve_zoneinfo(b, allow_windows_names=allow_windows_names)
     except ValueError:
         return False
-    now = datetime.now(dt_timezone.utc)
-    return now.astimezone(zone_a).utcoffset() != now.astimezone(zone_b).utcoffset()
+    reference = _date_parser.isoparse(at) if isinstance(at, str) else at
+    if reference is None:
+        reference = datetime.now(dt_timezone.utc)
+    if reference.tzinfo is not None:
+        return (
+            reference.astimezone(zone_a).utcoffset()
+            != reference.astimezone(zone_b).utcoffset()
+        )
+    return (
+        reference.replace(tzinfo=zone_a).utcoffset()
+        != reference.replace(tzinfo=zone_b).utcoffset()
+    )

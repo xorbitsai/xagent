@@ -862,6 +862,8 @@ def outlook_update_event(
     the event's own existing timezone is reused automatically. Passing
     both together fully replaces the window, and timezone then describes
     both new values (defaulting to UTC if also left unset).
+    When neither boundary is supplied, omit timezone; a flag-only all-day
+    change interprets the stored boundaries in the event's existing timezone.
     This update path checks the signed-in calendar when the event window
     changes; attendee availability is not checked yet. A detected conflict
     returns status="conflict" without updating the event. An incomplete
@@ -878,8 +880,15 @@ def outlook_update_event(
         )
         if timezone is not None:
             # Validate every explicit value, including flag-only all-day
-            # updates that reuse the existing zone for stored boundaries.
+            # updates, before enforcing whether the value is meaningful for
+            # this input shape.
             _resolve_zoneinfo(timezone, allow_windows_names=True)
+            if start_datetime is None and end_datetime is None:
+                raise ValueError(
+                    "timezone can only be supplied when start_datetime or "
+                    "end_datetime is also supplied; omit it for a flag-only "
+                    "update so the event's existing timezone is reused."
+                )
 
         # A single boundary changing without the other means the untouched
         # one keeps its existing clock value - but Graph needs ONE timeZone

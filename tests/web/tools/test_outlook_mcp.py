@@ -1471,6 +1471,24 @@ def test_update_event_flag_only_rejects_unresolvable_caller_timezone(monkeypatch
     graph_request.assert_not_called()
 
 
+def test_update_event_flag_only_rejects_unused_valid_timezone(monkeypatch):
+    graph_request = Mock()
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_update_event(
+            event_id="self-1",
+            is_all_day=True,
+            timezone="America/Los_Angeles",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "can only be supplied" in result["message"]
+    assert "existing timezone" in result["message"]
+    graph_request.assert_not_called()
+
+
 def test_update_event_single_boundary_change_with_matching_timezone_succeeds(
     monkeypatch,
 ):

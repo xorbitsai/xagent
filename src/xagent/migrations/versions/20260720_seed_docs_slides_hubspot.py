@@ -118,7 +118,7 @@ def _new_app_rows() -> list[dict[str, object]]:
         {
             "app_id": "hubspot",
             "name": "HubSpot",
-            "description": "Connect to HubSpot CRM and Marketing Hub to search, create, and update contacts and companies, read deals, log notes, read forms and submissions, pull traffic analytics reports, and read marketing emails and campaigns.",
+            "description": "Connect to HubSpot CRM and Marketing Hub to search, create, and update contacts and companies, create and update deals, log notes, read forms and submissions, pull traffic analytics reports, and read marketing emails and campaigns.",
             "icon": "https://www.google.com/s2/favicons?domain=hubspot.com&sz=128",
             "transport": "oauth",
             "provider_name": "hubspot",
@@ -129,6 +129,7 @@ def _new_app_rows() -> list[dict[str, object]]:
                 "crm.objects.companies.read",
                 "crm.objects.companies.write",
                 "crm.objects.deals.read",
+                "crm.objects.deals.write",
                 "forms",
             ],
             # Not a public_mcp_apps column - _filter_row strips this before

@@ -73,6 +73,9 @@ _MAX_EMAIL_IDS_PER_STATISTICS_REQUEST = 100
 # HUBSPOT_DEFINED association type ids for notes.
 _NOTE_ASSOCIATION_TYPE_IDS = {"contact": 202, "company": 190, "deal": 214}
 
+# HUBSPOT_DEFINED association type id for deal -> contact.
+_DEAL_TO_CONTACT_ASSOCIATION_TYPE_ID = 3
+
 _ASSOCIATION_PAGE_SIZE = 100
 
 # Per HubSpot's OpenAPI spec for this endpoint, time_period also accepts a
@@ -495,6 +498,59 @@ def hubspot_get_contact_deals(contact_id: str, limit: int = 100) -> str:
         )
     except Exception as e:
         logger.error(f"Error getting contact deals: {e}")
+        return _error(str(e))
+
+
+@mcp.tool()
+def hubspot_create_deal(properties_json: str, contact_id: str | None = None) -> str:
+    """
+    Create a HubSpot deal. properties_json is a JSON object of HubSpot deal
+    properties, e.g. {"dealname": "Acme - Onboarding", "amount": "1000",
+    "pipeline": "default", "dealstage": "appointmentscheduled"}.
+    If contact_id is given, the new deal is associated with that contact.
+    """
+    try:
+        body: dict[str, Any] = {"properties": _parse_properties(properties_json)}
+        if contact_id:
+            # contact_id goes into the JSON body below, not a URL path, so
+            # only reject a malformed id (url_path_id's percent-encoding
+            # would send HubSpot the encoded string instead of the real id).
+            contact_id = _require_clean_identifier(contact_id, "contact_id")
+            body["associations"] = [
+                {
+                    "to": {"id": contact_id},
+                    "types": [
+                        {
+                            "associationCategory": "HUBSPOT_DEFINED",
+                            "associationTypeId": _DEAL_TO_CONTACT_ASSOCIATION_TYPE_ID,
+                        }
+                    ],
+                }
+            ]
+        deal = _request("POST", "/crm/v3/objects/deals", body=body)
+        return _success(deal=deal)
+    except Exception as e:
+        logger.error(f"Error creating deal: {e}")
+        return _error(str(e))
+
+
+@mcp.tool()
+def hubspot_update_deal(deal_id: str, properties_json: str) -> str:
+    """
+    Update properties on an existing HubSpot deal, e.g. to move it to a new
+    pipeline stage: {"dealstage": "qualifiedtobuy"}.
+    properties_json is a JSON object of the properties to change.
+    """
+    try:
+        deal_id = _url_path_id(deal_id, "deal_id")
+        deal = _request(
+            "PATCH",
+            f"/crm/v3/objects/deals/{deal_id}",
+            body={"properties": _parse_properties(properties_json)},
+        )
+        return _success(deal=deal)
+    except Exception as e:
+        logger.error(f"Error updating deal: {e}")
         return _error(str(e))
 
 

@@ -277,6 +277,134 @@ def test_get_contact_deals_empty_returns_no_more(monkeypatch):
     assert result == {"status": "success", "deals": [], "has_more": False}
 
 
+def test_create_deal_without_contact_id_sends_no_associations(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"id": "d1"}))
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(
+        hubspot.hubspot_create_deal('{"dealname": "Acme - Onboarding"}')
+    )
+
+    assert result == {"status": "success", "deal": {"id": "d1"}}
+    body = mock_request.call_args.kwargs["json"]
+    assert body == {"properties": {"dealname": "Acme - Onboarding"}}
+    assert mock_request.call_args.kwargs["url"].endswith("/crm/v3/objects/deals")
+    assert mock_request.call_args.kwargs["method"] == "POST"
+
+
+def test_create_deal_with_contact_id_assembles_association(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"id": "d1"}))
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(
+        hubspot.hubspot_create_deal(
+            '{"dealname": "Acme - Onboarding"}', contact_id="c1"
+        )
+    )
+
+    assert result["status"] == "success"
+    body = mock_request.call_args.kwargs["json"]
+    assert body["associations"] == [
+        {
+            "to": {"id": "c1"},
+            "types": [
+                {"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": 3}
+            ],
+        }
+    ]
+
+
+def test_create_deal_sends_contact_id_verbatim_not_url_encoded(monkeypatch):
+    """contact_id is placed in the JSON request body, not a URL path -
+    percent-encoding it (as url_path_id would) sends HubSpot a mangled id
+    that doesn't match any real contact instead of the real one."""
+    mock_request = Mock(return_value=MockResponse(json_data={"id": "d1"}))
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    hubspot.hubspot_create_deal('{"dealname": "x"}', contact_id="c1/2")
+
+    body = mock_request.call_args.kwargs["json"]
+    assert body["associations"][0]["to"]["id"] == "c1/2"
+
+
+def test_create_deal_rejects_whitespace_padded_contact_id(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(
+        hubspot.hubspot_create_deal('{"dealname": "x"}', contact_id=" c1 ")
+    )
+
+    assert result["status"] == "error"
+    assert "contact_id" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_create_deal_wraps_request_errors(monkeypatch):
+    """Regression coverage for the exact incident this PR fixes: a HubSpot
+    write returning 401 must come back as a normal {"status": "error"}
+    result, not an uncaught exception - update_deal already had this test,
+    create_deal did not."""
+    monkeypatch.setattr(
+        hubspot.requests,
+        "request",
+        Mock(return_value=MockResponse(status_code=401, text="Unauthorized")),
+    )
+
+    result = json.loads(hubspot.hubspot_create_deal('{"dealname": "x"}'))
+
+    assert result["status"] == "error"
+    assert "Unauthorized" in result["message"]
+
+
+def test_update_deal_encodes_deal_id_and_sends_properties(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"id": "d1", "properties": {}})
+    )
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(
+        hubspot.hubspot_update_deal("d 1/2", '{"dealstage": "qualifiedtobuy"}')
+    )
+
+    assert result["status"] == "success"
+    assert mock_request.call_args.kwargs["url"].endswith(
+        "/crm/v3/objects/deals/d%201%2F2"
+    )
+    assert mock_request.call_args.kwargs["method"] == "PATCH"
+    assert mock_request.call_args.kwargs["json"] == {
+        "properties": {"dealstage": "qualifiedtobuy"}
+    }
+
+
+def test_update_deal_rejects_whitespace_padded_deal_id(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(
+        hubspot.hubspot_update_deal(" d1 ", '{"dealstage": "qualifiedtobuy"}')
+    )
+
+    assert result["status"] == "error"
+    assert "deal_id" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_update_deal_wraps_request_errors(monkeypatch):
+    monkeypatch.setattr(
+        hubspot.requests,
+        "request",
+        Mock(return_value=MockResponse(status_code=401, text="Unauthorized")),
+    )
+
+    result = json.loads(
+        hubspot.hubspot_update_deal("d1", '{"dealstage": "qualifiedtobuy"}')
+    )
+
+    assert result["status"] == "error"
+    assert "Unauthorized" in result["message"]
+
+
 def test_list_forms_projects_summary_fields(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(

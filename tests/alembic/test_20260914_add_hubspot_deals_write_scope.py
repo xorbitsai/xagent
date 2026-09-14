@@ -1,4 +1,4 @@
-"""Tests for adding HubSpot Marketing Hub OAuth scopes and description."""
+"""Tests for adding the HubSpot crm.objects.deals.write OAuth scope."""
 
 import importlib.util
 import json
@@ -11,6 +11,20 @@ from sqlalchemy import create_engine, text
 
 
 def _load_migration_module():
+    migration_file = (
+        Path(__file__).parent.parent.parent
+        / "src/xagent/migrations/versions/20260914_add_hubspot_deals_write_scope.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "add_hubspot_deals_write_scope_migration", migration_file
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_previous_migration_module():
     migration_file = (
         Path(__file__).parent.parent.parent
         / "src/xagent/migrations/versions/20260810_add_hubspot_marketing_scopes.py"
@@ -57,6 +71,7 @@ def _create_table(connection, description: str, with_description_column: bool = 
                     "crm.objects.companies.read",
                     "crm.objects.companies.write",
                     "crm.objects.deals.read",
+                    "forms",
                 ]
             ),
             "description": description,
@@ -114,7 +129,7 @@ def _row(connection):
     return description, json.loads(scopes) if isinstance(scopes, str) else scopes
 
 
-def test_upgrade_adds_marketing_scopes_and_description(tmp_path):
+def test_upgrade_adds_deals_write_scope_and_description(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
     with engine.begin() as connection:
@@ -163,30 +178,6 @@ def test_upgrade_downgrade_upgrade_round_trip(tmp_path):
             migration.upgrade()
         description, scopes = _row(connection)
         assert description == migration.CURRENT_DESCRIPTION
-        assert scopes == migration.CURRENT_SCOPES
-
-
-def test_upgrade_preserves_customized_description_already_at_current_scopes(tmp_path):
-    """A row already migrated once (CURRENT_SCOPES) with a since-customized
-    description must not have that customization overwritten on a repeat
-    upgrade (e.g. a second alembic run, or upgrade-downgrade-upgrade landing
-    back on CURRENT_SCOPES with the customization still in place)."""
-    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
-    migration = _load_migration_module()
-    with engine.begin() as connection:
-        _create_table(connection, description=migration.PREVIOUS_DESCRIPTION)
-        with patch.object(migration, "op", _operations(connection)):
-            migration.upgrade()
-            connection.execute(
-                text(
-                    "UPDATE public_mcp_apps SET description = :d "
-                    "WHERE app_id = 'hubspot'"
-                ),
-                {"d": "Our internal HubSpot connector"},
-            )
-            migration.upgrade()
-        description, scopes = _row(connection)
-        assert description == "Our internal HubSpot connector"
         assert scopes == migration.CURRENT_SCOPES
 
 
@@ -283,7 +274,8 @@ def test_upgrade_logs_a_warning_when_grants_are_disconnected(tmp_path, caplog):
             with caplog.at_level("WARNING", logger=migration.logger.name):
                 migration.upgrade()
     assert any(
-        "Disconnected" in r.message and "forms" in r.message for r in caplog.records
+        "Disconnected" in r.message and "crm.objects.deals.write" in r.message
+        for r in caplog.records
     )
 
 
@@ -295,39 +287,6 @@ def test_upgrade_does_not_log_when_no_grants_exist(tmp_path, caplog):
         with patch.object(migration, "op", _operations(connection)):
             with caplog.at_level("WARNING", logger=migration.logger.name):
                 migration.upgrade()  # no user_oauth table at all
-    assert caplog.records == []
-
-
-def test_upgrade_does_not_log_when_table_exists_with_no_hubspot_rows(tmp_path, caplog):
-    """The no-table case above only exercises _columns_present's table-missing
-    branch. A table that exists but has zero matching rows takes a different
-    path (result.rowcount == 0 after the UPDATE), so needs its own case."""
-    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
-    migration = _load_migration_module()
-    with engine.begin() as connection:
-        _create_table(connection, description=migration.PREVIOUS_DESCRIPTION)
-        connection.execute(
-            text(
-                """
-                CREATE TABLE user_oauth (
-                    id INTEGER PRIMARY KEY,
-                    user_id INTEGER NOT NULL,
-                    provider VARCHAR(50) NOT NULL,
-                    refresh_token VARCHAR,
-                    access_token VARCHAR NOT NULL
-                )
-                """
-            )
-        )
-        connection.execute(
-            text(
-                "INSERT INTO user_oauth (user_id, provider, access_token) "
-                "VALUES (1, 'salesforce', 'old-salesforce-token')"
-            )
-        )
-        with patch.object(migration, "op", _operations(connection)):
-            with caplog.at_level("WARNING", logger=migration.logger.name):
-                migration.upgrade()
     assert caplog.records == []
 
 
@@ -354,10 +313,7 @@ def test_upgrade_without_user_oauth_table_is_a_noop(tmp_path):
 
 def test_downgrade_does_not_touch_user_oauth(tmp_path):
     """Cleared access tokens are gone for good; downgrade only reverts
-    public_mcp_apps, mirroring the Facebook scope migration's approach. A
-    provider row that was never touched (salesforce here) must also come
-    through both upgrade and downgrade completely untouched, matching the
-    equivalent assertion already made on the upgrade side."""
+    public_mcp_apps, mirroring the earlier HubSpot scope migration."""
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
     with engine.begin() as connection:
@@ -368,36 +324,31 @@ def test_downgrade_does_not_touch_user_oauth(tmp_path):
             migration.downgrade()
         tokens = _access_tokens(connection)
         assert tokens["hubspot"] == ""
-        assert tokens["salesforce"] == "old-salesforce-token"
-        refresh_tokens = _refresh_tokens(connection)
-        assert refresh_tokens["salesforce"] == "old-salesforce-refresh"
 
 
 def test_migration_fields_match_registry():
-    """This migration's CURRENT_SCOPES and CURRENT_DESCRIPTION are historical
-    snapshots, not the app's final values - 20260914_add_hubspot_deals_write_scope
-    layers another scope and description update on top of them, so only a
-    subset check on scopes (every scope this migration granted is still
-    present) holds going forward; the live description is no longer this
-    migration's CURRENT_DESCRIPTION but 20260914's (see that migration's own
-    test_migration_fields_match_registry for the exact-match check). Mirrors
-    the same precedent already established in
-    20260812_add_slack_history_reactions_files_scopes.py.
-
-    An earlier revision of this file bumped both constants forward to match
-    the live registry exactly, to keep this exact-match assertion passing -
-    but that broke downgrade(): 20260914's downgrade() reverts description to
-    its own PREVIOUS_DESCRIPTION (this migration's true CURRENT_DESCRIPTION)
-    before this migration's downgrade() runs, so a bumped-forward
-    CURRENT_DESCRIPTION here no longer matched what was actually in the row
-    at that point, silently no-opping the "only revert if unchanged" guard
-    and leaving a downgraded database advertising Marketing Hub/forms/
-    analytics support with none of the granting scopes.
-    """
     from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
 
     migration = _load_migration_module()
     registry_row = next(
         r for r in get_builtin_public_mcp_app_rows() if r["app_id"] == "hubspot"
     )
-    assert set(migration.CURRENT_SCOPES) <= set(registry_row["oauth_scopes"])
+    assert migration.CURRENT_SCOPES == registry_row["oauth_scopes"]
+    assert migration.CURRENT_DESCRIPTION == registry_row["description"]
+
+
+def test_previous_fields_chain_from_the_prior_migration():
+    """This migration's PREVIOUS_SCOPES/PREVIOUS_DESCRIPTION must exactly
+    equal 20260810's CURRENT_SCOPES/CURRENT_DESCRIPTION - not just "close
+    enough" - or the two migrations' downgrade() calls stop being inverses
+    of each other. This exact coupling silently broke once already (20260810's
+    constants were bumped forward to match the live registry, which broke
+    its own downgrade() once this migration's downgrade() ran first and left
+    a value 20260810 no longer recognized as "unchanged"); this test pins the
+    invariant directly instead of relying on it only showing up as a
+    full-chain downgrade failure.
+    """
+    migration = _load_migration_module()
+    previous_migration = _load_previous_migration_module()
+    assert migration.PREVIOUS_SCOPES == previous_migration.CURRENT_SCOPES
+    assert migration.PREVIOUS_DESCRIPTION == previous_migration.CURRENT_DESCRIPTION

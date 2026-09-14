@@ -23,6 +23,7 @@ from xagent.core.tools.core.RAG_tools.core.schemas import (
     IndexOperation,
     IndexStatus,
     IndexType,
+    IngestionConfig,
     ParseDocumentRequest,
     ParseDocumentResponse,
     ParsedParagraph,
@@ -1432,6 +1433,32 @@ class TestCollectionInfo:
         assert storage_data["documents"] == 5
         assert storage_data["processed_documents"] == 3
         assert storage_data["ingestion_config"] == ""
+
+    def test_collection_info_to_storage_serializes_non_default_ingestion_config(self):
+        """A non-default parse_method/chunk_strategy must not break to_storage().
+
+        Regression test for a production incident: model_dump() leaves these
+        enum fields as ParseMethod/ChunkStrategy instances, and a plain Enum
+        (not mixed with str) raises "Object of type ParseMethod is not JSON
+        serializable" from the json.dumps() call below, aborting collection
+        save/rebuild for any collection with a non-default ingestion config.
+        """
+        collection = CollectionInfo(
+            name="test_collection",
+            ingestion_config=IngestionConfig(
+                parse_method=ParseMethod.PYMUPDF,
+                chunk_strategy=ChunkStrategy.MARKDOWN,
+            ),
+        )
+
+        storage_data = collection.to_storage()
+
+        assert isinstance(storage_data["ingestion_config"], str)
+        import json
+
+        stored_config = json.loads(storage_data["ingestion_config"])
+        assert stored_config["parse_method"] == "pymupdf"
+        assert stored_config["chunk_strategy"] == "markdown"
 
     def test_collection_info_immutability_by_default(self):
         """Test that CollectionInfo is immutable by default after creation."""

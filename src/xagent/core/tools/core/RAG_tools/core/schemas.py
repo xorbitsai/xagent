@@ -1537,9 +1537,20 @@ class CollectionInfo(BaseModel):
         # Do not persist owners; they are computed from user_id when listing
         data["owners"] = "[]"
 
-        # Serialize ingestion_config if present
+        # Serialize ingestion_config if present. model_dump() (mode="python",
+        # the default) leaves IngestionConfig.parse_method/chunk_strategy as
+        # ParseMethod/ChunkStrategy enum members rather than their plain
+        # string .value - neither is mixed with str (deliberately, so
+        # ParseMethod.PYPDF != "pypdf": see TestParseMethod/TestChunkStrategy
+        # .test_enum_value_access), so json.dumps() cannot serialize them on
+        # its own and raised "Object of type ParseMethod is not JSON
+        # serializable", aborting collection save/rebuild for any collection
+        # with a non-default ingestion config. default=str falls back to
+        # each enum's __str__ (already defined to return .value) only for
+        # values json.dumps cannot otherwise handle; every other field stays
+        # serialized exactly as before.
         if data.get("ingestion_config"):
-            data["ingestion_config"] = json.dumps(data["ingestion_config"])
+            data["ingestion_config"] = json.dumps(data["ingestion_config"], default=str)
         else:
             # Use empty string sentinel instead of None to prevent LanceDB non-null schema errors
             data["ingestion_config"] = LANCEDB_NULL_STR_SENTINEL

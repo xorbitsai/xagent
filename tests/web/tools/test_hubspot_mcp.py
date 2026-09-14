@@ -314,6 +314,19 @@ def test_create_deal_with_contact_id_assembles_association(monkeypatch):
     ]
 
 
+def test_create_deal_sends_contact_id_verbatim_not_url_encoded(monkeypatch):
+    """contact_id is placed in the JSON request body, not a URL path -
+    percent-encoding it (as url_path_id would) sends HubSpot a mangled id
+    that doesn't match any real contact instead of the real one."""
+    mock_request = Mock(return_value=MockResponse(json_data={"id": "d1"}))
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    hubspot.hubspot_create_deal('{"dealname": "x"}', contact_id="c1/2")
+
+    body = mock_request.call_args.kwargs["json"]
+    assert body["associations"][0]["to"]["id"] == "c1/2"
+
+
 def test_create_deal_rejects_whitespace_padded_contact_id(monkeypatch):
     mock_request = Mock()
     monkeypatch.setattr(hubspot.requests, "request", mock_request)

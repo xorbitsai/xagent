@@ -512,7 +512,10 @@ def hubspot_create_deal(properties_json: str, contact_id: str | None = None) -> 
     try:
         body: dict[str, Any] = {"properties": _parse_properties(properties_json)}
         if contact_id:
-            contact_id = _url_path_id(contact_id, "contact_id")
+            # contact_id goes into the JSON body below, not a URL path, so
+            # only reject a malformed id (url_path_id's percent-encoding
+            # would send HubSpot the encoded string instead of the real id).
+            contact_id = _require_clean_identifier(contact_id, "contact_id")
             body["associations"] = [
                 {
                     "to": {"id": contact_id},

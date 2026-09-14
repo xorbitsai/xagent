@@ -185,6 +185,29 @@ def test_skips_row_missing_the_id_column(tmp_path):
         assert "widget" in _app_ids(connection)
 
 
+def test_preserves_row_when_seed_row_supplies_no_match_columns(tmp_path):
+    """A seed row that has the id_column but none of match_columns can't have
+    its provenance verified at all, so (symmetrically with the schema-side
+    no-match-columns-exist case) nothing is deleted for it, rather than
+    silently falling back to matching on id_column alone."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    with engine.begin() as connection:
+        _create_table(connection)
+        connection.execute(
+            text(
+                "INSERT INTO public_mcp_apps (app_id, name, description, transport,"
+                " provider_name, category)"
+                " VALUES ('widget', 'Widget', 'A seeded widget connector.', 'oauth',"
+                " 'widget-co', 'Productivity')"
+            )
+        )
+        rows_with_only_id = [{"app_id": "widget"}]
+        delete_unmodified_seeded_rows(
+            connection, PUBLIC_MCP_APPS_TABLE, rows_with_only_id
+        )
+        assert "widget" in _app_ids(connection)
+
+
 def test_preserves_row_when_only_icon_or_visibility_differs(tmp_path):
     """An admin can edit a builtin row's icon/is_visible_in_connector without
     touching name/description/transport/provider_name/category (see

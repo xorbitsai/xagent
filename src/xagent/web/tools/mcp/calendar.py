@@ -7,6 +7,7 @@ from functools import cache
 from typing import Any, cast
 
 from dateutil import parser as _date_parser
+from dateutil import tz as _date_tz
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build  # type: ignore
 from googleapiclient.errors import HttpError  # type: ignore
@@ -596,10 +597,14 @@ def _event_time_changed(
 
 
 def _timezone_names_equal(left: str | None, right: str | None) -> bool:
-    """Compare RFC 5545 timezone parameter values case-insensitively."""
+    """Compare RFC 5545 timezone names, including resolvable IANA aliases."""
     if left is None or right is None:
         return left is right
-    return left.casefold() == right.casefold()
+    if left.casefold() == right.casefold():
+        return True
+    left_zone = _date_tz.gettz(left)
+    right_zone = _date_tz.gettz(right)
+    return left_zone is not None and right_zone is not None and left_zone == right_zone
 
 
 def _require_datetime_matches_timezone(
@@ -1260,6 +1265,7 @@ def google_calendar_update_events(
     timezone: str | None = None,
     recurrence: str | None = None,
     ignore_conflicts: bool = False,
+    acknowledge_recurring_exception_risk: bool = False,
 ) -> str:
     """
     Update an existing event in Google Calendar.
@@ -1277,7 +1283,13 @@ def google_calendar_update_events(
     recurrence, start_time, and timezone together when its rule, series start,
     or timezone changes (an all-day event does not require timezone). The caller
     must ensure the retained absolute EXDATE/RDATE values still identify the
-    intended occurrences after that fully-specified change. event_id must be the series' own id,
+    intended occurrences after that fully-specified change. Google does not
+    offer an atomic operation that checks separately stored instance exceptions
+    and updates their recurring master together. Therefore, changing an existing
+    series' rule, start time, or expansion timezone also requires
+    acknowledge_recurring_exception_risk=True after the user accepts that another
+    client could create, edit, or cancel an exception in the brief interval between
+    the check and update. event_id must be the series' own id,
     not one of its individual occurrences - google_calendar_search_events
     lists occurrences (each carrying a recurringEventId pointing at the
     actual series), and passing one of those here with recurrence set is
@@ -1286,23 +1298,20 @@ def google_calendar_update_events(
     timezone is an IANA timezone name; Google requires one for a
     non-all-day recurring event - and does so unconditionally, even when
     start_time/end_time (or the event's existing values) already carry
-    their own UTC offset. If recurrence is set and timezone is omitted,
-    the event's existing start timeZone is used as the single recurrence-
-    expansion zone on both boundaries; when start has none, end's zone is
-    used instead. If neither side has one, this call is rejected with a
+    their own UTC offset. If timezone is omitted, each boundary keeps its own
+    existing timeZone; a missing side falls back to the other boundary's zone.
+    If neither side has one, this call is rejected with a
     clear error rather than sending an incomplete request to Google. Passing
     timezone without also passing start_time/end_time reinterprets the
     event's existing wall-clock time under the new zone rather than
     converting the underlying instant - e.g. an event stored as
     07:00/Asia/Manila becomes 07:00/America/New_York, a ~12h shift in
     absolute time, not a same-instant re-labeling; pass start_time/
-    end_time as well to actually convert the instant. Exception: for a
-    recurring event whose stored value already carries its own UTC
-    offset, timezone is stamped alongside that untouched offset rather
-    than reinterpreting anything (Google requires timeZone unconditionally
-    for a recurring event regardless of any offset already present), so
-    no wall-clock shift happens in that specific case. timezone is otherwise
-    optional. When changing a non-recurring event, do not combine timezone
+    end_time as well to actually convert the instant. For a recurring event
+    whose stored value already carries its own UTC offset, that offset must
+    agree with an explicitly supplied timezone; otherwise the update is
+    rejected rather than sending a contradictory EventDateTime. timezone is
+    otherwise optional. When changing a non-recurring event, do not combine timezone
     with offset-bearing start/end values, whether newly supplied or already
     stored, because the two zone representations may disagree. timezone has no
     effect on an all-day event.
@@ -1517,11 +1526,9 @@ def google_calendar_update_events(
         own_start_timezone = timezone or existing_start_timezone
         own_end_timezone = timezone or existing_end_timezone
         if event_is_recurring:
-            # Google expands every occurrence in one timezone. A single event
-            # may legitimately have different start/end zones (for example, a
-            # flight), but once recurrence is added both boundaries must use
-            # the same expansion zone. Prefer the explicitly requested zone,
-            # then the start side, which defines the series' wall-clock time.
+            # Each EventDateTime has its own timeZone. Preserve both stored
+            # boundary zones on an existing cross-zone series unless the caller
+            # explicitly requests one replacement zone for both sides.
             recurrence_timezone = (
                 timezone or existing_start_timezone or existing_end_timezone
             )
@@ -1559,8 +1566,12 @@ def google_calendar_update_events(
                     )
                 if missing_start_zone and missing_end_zone:
                     recurrence_timezone = primary_calendar_info()[1]
-            effective_start_timezone = recurrence_timezone
-            effective_end_timezone = recurrence_timezone
+            effective_start_timezone = (
+                timezone or existing_start_timezone or recurrence_timezone
+            )
+            effective_end_timezone = (
+                timezone or existing_end_timezone or recurrence_timezone
+            )
         else:
             effective_start_timezone = own_start_timezone
             effective_end_timezone = own_end_timezone
@@ -1582,13 +1593,26 @@ def google_calendar_update_events(
             and not schedule_update_requested
         )
 
-        if event_is_recurring and timezone and recurrence is not None:
-            _require_datetime_matches_timezone(
-                cast(str, prospective_start_value), timezone, "start_time"
+        if event_is_recurring and not resulting_start_is_all_day:
+            adding_first_recurrence = bool(
+                recurrence is not None and not raw_existing_recurrence
             )
-            _require_datetime_matches_timezone(
-                cast(str, prospective_end_value), timezone, "end_time"
-            )
+            if (timezone or start_time is not None or adding_first_recurrence) and (
+                effective_start_timezone
+            ):
+                _require_datetime_matches_timezone(
+                    cast(str, prospective_start_value),
+                    effective_start_timezone,
+                    "start_time",
+                )
+            if (timezone or end_time is not None or adding_first_recurrence) and (
+                effective_end_timezone
+            ):
+                _require_datetime_matches_timezone(
+                    cast(str, prospective_end_value),
+                    effective_end_timezone,
+                    "end_time",
+                )
 
         # Validate the prospective window before any availability lookup. A
         # malformed or mixed aware/naive pair is an input error, not an
@@ -2478,23 +2502,36 @@ def google_calendar_update_events(
                     )
 
         stored_exceptions_may_shift = bool(
-            existing_rrules
+            raw_existing_recurrence
             and (
                 recurrence is not None
                 or (start_time is not None and start_changed)
                 or timezone_changes_schedule_zone
             )
         )
-        if stored_exceptions_may_shift and _series_has_exceptions(
-            service,
-            event_id,
-            event.get("iCalUID") if isinstance(event.get("iCalUID"), str) else None,
-        ):
-            raise ValueError(
-                "the existing recurring series has edited or cancelled instances "
-                "whose meaning cannot be safely preserved after changing its "
-                "recurrence rule, start time, or expansion timezone"
-            )
+        if stored_exceptions_may_shift:
+            if _series_has_exceptions(
+                service,
+                event_id,
+                (
+                    event.get("iCalUID")
+                    if isinstance(event.get("iCalUID"), str)
+                    else None
+                ),
+            ):
+                raise ValueError(
+                    "the existing recurring series has edited or cancelled "
+                    "instances whose meaning cannot be safely preserved after "
+                    "changing its recurrence rule, start time, or expansion timezone"
+                )
+            if not acknowledge_recurring_exception_risk:
+                raise ValueError(
+                    "Google Calendar cannot atomically check instance exceptions "
+                    "and update their recurring master; pass "
+                    "acknowledge_recurring_exception_risk=True only after the user "
+                    "accepts that another client could create, edit, or cancel an "
+                    "exception between the check and update"
+                )
 
         if description:
             event["description"] = description

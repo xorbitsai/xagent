@@ -6,10 +6,16 @@ HTTP client for making arbitrary API calls with support for various auth methods
 import json
 import logging
 from typing import Any, Dict, Mapping, Optional, Type, Union
+from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field
 
-from ...core.api_tool import APIClientCore
+from ...core.api_tool import (
+    APIClientCore,
+    has_auth_credentials,
+    known_connector_domain_block_message,
+    match_known_connector_domain,
+)
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
 
 logger = logging.getLogger(__name__)
@@ -98,6 +104,31 @@ class APITool(AbstractBaseTool):
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
         api_args = APICallArgs.model_validate(args)
+
+        # Refuse an unauthenticated call to a domain already covered by a
+        # dedicated MCP connector - this generic tool has no stored
+        # credential for it, so the request would only fail with a
+        # misleading 401/403, not indicate a real connection problem (see
+        # the HubSpot deal-write incident this guard was added for). Scoped
+        # to this agent-facing tool specifically, not the underlying
+        # APIClientCore/call_api, which is also used by the user-configured
+        # Custom API tool (CustomApiTool) - an unrelated feature this guard
+        # must not affect.
+        connector_label = match_known_connector_domain(
+            urlparse(api_args.url).hostname or ""
+        )
+        if connector_label and not has_auth_credentials(
+            api_args.url, api_args.headers, api_args.params, api_args.auth_token
+        ):
+            message = known_connector_domain_block_message(
+                api_args.url, connector_label
+            )
+            logger.warning(
+                f"🚫 API Call blocked: {api_args.method} {api_args.url} - {message}"
+            )
+            return APICallResult(
+                success=False, status_code=0, headers={}, body=None, error=message
+            ).model_dump()
 
         # Make API call - api_key_query logic is now handled in core client
         result = await self._client.call_api(

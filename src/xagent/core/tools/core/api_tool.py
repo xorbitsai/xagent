@@ -30,18 +30,39 @@ logger = logging.getLogger(__name__)
 # literal example hostname - deputy.com/zendesk.com/salesforce.com/
 # myshopify.com/posthog.com/mixpanel.com are multi-tenant services where the
 # real host is a customer-specific subdomain.
+#
+# Google, Microsoft Graph, and Meta Graph are each only PARTIALLY covered:
+# xagent's connectors wrap specific product APIs, not every API a customer
+# could reach on that host. Google's per-product hosts below (Ads, Analytics,
+# Search Console, Gmail, Docs, Sheets, Slides) are each dedicated to one
+# product, so listing them is precise. Calendar and Drive are deliberately
+# NOT listed: both share the general-purpose "www.googleapis.com" host with
+# many unrelated Google APIs xagent has no connector for, and guarding that
+# host would block those unrelated APIs too. graph.microsoft.com (Outlook /
+# OneDrive / Teams) and graph.facebook.com (Facebook / Instagram - also the
+# WhatsApp Business Cloud API's host, which xagent does not implement) can't
+# be narrowed the same way since Microsoft/Meta multiplex many products onto
+# one host with no separate hostname per product; the warning message below
+# says so explicitly rather than claiming full coverage for either.
 _KNOWN_CONNECTOR_DOMAINS: tuple[tuple[str, str], ...] = (
     ("hubapi.com", "HubSpot"),
     ("slack.com", "Slack"),
     ("api.stripe.com", "Stripe"),
     ("api.github.com", "GitHub"),
     ("graph.microsoft.com", "Microsoft Graph (Outlook/OneDrive/Teams)"),
-    ("graph.facebook.com", "Meta (Facebook/Instagram)"),
+    ("graph.facebook.com", "Meta Graph (Facebook/Instagram)"),
     ("api.linkedin.com", "LinkedIn"),
     ("api.intercom.io", "Intercom"),
     ("api.linear.app", "Linear"),
     ("api.zoom.us", "Zoom"),
-    ("googleapis.com", "Google"),
+    ("googleads.googleapis.com", "Google Ads"),
+    ("analyticsdata.googleapis.com", "Google Analytics"),
+    ("analyticsadmin.googleapis.com", "Google Analytics"),
+    ("searchconsole.googleapis.com", "Google Search Console"),
+    ("gmail.googleapis.com", "Gmail"),
+    ("docs.googleapis.com", "Google Docs"),
+    ("sheets.googleapis.com", "Google Sheets"),
+    ("slides.googleapis.com", "Google Slides"),
     ("api.atlassian.com", "Jira"),
     ("api.chartmogul.com", "ChartMogul"),
     ("api.employmenthero.com", "Employment Hero"),
@@ -51,7 +72,17 @@ _KNOWN_CONNECTOR_DOMAINS: tuple[tuple[str, str], ...] = (
     ("myshopify.com", "Shopify"),
     ("posthog.com", "PostHog"),
     ("mixpanel.com", "Mixpanel"),
+    ("salesforce.com", "Salesforce"),
+    ("api.xero.com", "Xero"),
 )
+
+# Domains that match one of _KNOWN_CONNECTOR_DOMAINS by suffix but are
+# actually a different, self-authenticating product the guard must not
+# touch: hooks.slack.com (Slack incoming webhooks) carries its secret in the
+# URL path itself, not in a header/param/token, and is unrelated to the
+# credentialed Slack Web API at slack.com/api that the guard is meant to
+# protect.
+_SELF_AUTHENTICATING_SUBDOMAINS = frozenset({"hooks.slack.com"})
 
 
 def _hostname_matches_connector_domain(hostname: str, domain: str) -> bool:
@@ -60,9 +91,12 @@ def _hostname_matches_connector_domain(hostname: str, domain: str) -> bool:
     return hostname == domain or hostname.endswith(f".{domain}")
 
 
-def _match_known_connector_domain(hostname: str) -> Optional[str]:
+def match_known_connector_domain(hostname: str) -> Optional[str]:
     """Return the connector name if ``hostname`` belongs to one of
     ``_KNOWN_CONNECTOR_DOMAINS``, else ``None``."""
+    hostname = hostname.lower()
+    if hostname in _SELF_AUTHENTICATING_SUBDOMAINS:
+        return None
     for domain, label in _KNOWN_CONNECTOR_DOMAINS:
         if _hostname_matches_connector_domain(hostname, domain):
             return label
@@ -72,20 +106,26 @@ def _match_known_connector_domain(hostname: str) -> Optional[str]:
 # Substrings of a header name that indicate the caller already attached
 # their own credential - not just the standard "Authorization" header, since
 # several of the services in _KNOWN_CONNECTOR_DOMAINS use a service-specific
-# one instead (e.g. Shopify's "X-Shopify-Access-Token").
+# one instead (e.g. Shopify's "X-Shopify-Access-Token"). Deliberately does
+# NOT include the bare "auth" or "signature" substrings: "auth" alone also
+# matches non-credential headers like "X-Author" or the HTTP/2 ":authority"
+# pseudo-header, and "signature" matches non-credential headers like
+# GitHub's outbound "X-Hub-Signature-256" webhook-verification header - both
+# would silently defeat the guard below for a call that has no real
+# credential. "authorization" alone already covers the real "Authorization"
+# case (it's a superset match of that word), so nothing is lost by dropping
+# the broader "auth".
 _AUTH_HEADER_NAME_MARKERS = (
     "authorization",
     "token",
     "api-key",
     "apikey",
-    "auth",
-    "signature",
 )
 
 # Query parameter names (case-insensitive) commonly used to carry an API key
 # instead of a header - e.g. Google APIs' "key" parameter.
 _AUTH_QUERY_PARAM_NAMES = frozenset(
-    {"key", "api_key", "apikey", "token", "access_token"}
+    {"key", "api_key", "api-key", "apikey", "token", "access_token"}
 )
 
 
@@ -93,13 +133,7 @@ def _has_auth_header(headers: Optional[Mapping[str, str]]) -> bool:
     if not headers:
         return False
     for key in headers:
-        # "authority" (the HTTP/2 pseudo-header carrying the target host,
-        # not a credential) contains "auth" as a substring and would
-        # otherwise false-positive here, silently defeating the guard below
-        # for any client/proxy that sets it.
         key_lower = str(key).lower()
-        if "authority" in key_lower:
-            continue
         if any(marker in key_lower for marker in _AUTH_HEADER_NAME_MARKERS):
             return True
     return False
@@ -111,7 +145,14 @@ def _has_auth_query_param(url: str, params: Optional[Mapping[str, Any]]) -> bool
     return not _AUTH_QUERY_PARAM_NAMES.isdisjoint(query_keys)
 
 
-def _has_auth_credentials(
+def _has_url_embedded_credentials(url: str) -> bool:
+    """Whether ``url`` carries HTTP Basic-Auth userinfo (``user:pass@host``)
+    directly, rather than in a header or query parameter."""
+    parsed = urlparse(url)
+    return bool(parsed.username or parsed.password)
+
+
+def has_auth_credentials(
     url: str,
     headers: Optional[Mapping[str, str]],
     params: Optional[Mapping[str, Any]],
@@ -119,10 +160,36 @@ def _has_auth_credentials(
 ) -> bool:
     """Whether the caller appears to already have their own credential for
     this call, by any of the mechanisms api_call or a typical direct REST
-    call supports: the auth_token argument, an auth-looking header, or an
-    auth-looking query parameter (in either `params` or the URL itself)."""
+    call supports: the auth_token argument, an auth-looking header, an
+    auth-looking query parameter (in either `params` or the URL itself), or
+    a credential embedded directly in the URL (Basic-Auth userinfo, or a
+    self-authenticating webhook path)."""
     return bool(
-        auth_token or _has_auth_header(headers) or _has_auth_query_param(url, params)
+        auth_token
+        or _has_auth_header(headers)
+        or _has_auth_query_param(url, params)
+        or _has_url_embedded_credentials(url)
+    )
+
+
+def known_connector_domain_block_message(url: str, connector_label: str) -> str:
+    """Error text for a request blocked by the known-connector-domain guard.
+
+    A shared builder so every caller of this guard (currently just the
+    `api_call` tool adapter - see adapters/vibe/api_tool.py) presents the
+    same message, rather than each caller writing its own slightly
+    different wording.
+    """
+    return (
+        f"{url} is a {connector_label} API endpoint. This generic api_call "
+        f"tool has no stored credential for {connector_label} and this "
+        "request would only fail with an unauthenticated 401/403, not "
+        "indicate a real connection problem - use the dedicated "
+        f"{connector_label} connector tools instead if one covers this "
+        "request (some of these hosts serve more products/endpoints than "
+        "xagent has a connector for). If you have your own API token for "
+        "this service, pass it via auth_type/auth_token, a credential "
+        "header, or a credential query parameter to make the call anyway."
     )
 
 
@@ -193,37 +260,6 @@ class APIClientCore:
                 "headers": {},
                 "body": None,
                 "error": f"Invalid URL: {url}",
-            }
-
-        # Refuse an unauthenticated call to a domain already covered by a
-        # dedicated connector - this tool has no stored credential for it, so
-        # the request would only fail with a misleading 401/403 (see
-        # _KNOWN_CONNECTOR_DOMAINS above). A caller that already attached its
-        # own credential - via auth_token, an auth-looking header (not just
-        # "Authorization" - e.g. Shopify's X-Shopify-Access-Token), or an
-        # auth-looking query parameter (e.g. Google's "key") - genuinely
-        # intends a direct call, so that combination is let through untouched.
-        connector_label = _match_known_connector_domain(urlparse(url).hostname or "")
-        if connector_label and not _has_auth_credentials(
-            url, headers, params, auth_token
-        ):
-            message = (
-                f"{url} is a {connector_label} API endpoint. This generic api_call "
-                f"tool has no stored credential for {connector_label} and this "
-                "request would only fail with an unauthenticated 401/403, not "
-                "indicate a real connection problem - use the dedicated "
-                f"{connector_label} connector tools instead. If you have your own "
-                "API token for this service, pass it via auth_type/auth_token, a "
-                "credential header, or a credential query parameter to make the "
-                "call anyway."
-            )
-            logger.warning(f"🚫 API Call blocked: {method} {url} - {message}")
-            return {
-                "success": False,
-                "status_code": 0,
-                "headers": {},
-                "body": None,
-                "error": message,
             }
 
         # Prepare request

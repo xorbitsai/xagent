@@ -114,3 +114,79 @@ def test_skips_missing_match_columns(tmp_path):
         )
         delete_unmodified_seeded_rows(connection, PUBLIC_MCP_APPS_TABLE, SEED_ROWS)
         assert "widget" not in _app_ids(connection)
+
+
+def test_handles_table_clause_missing_a_matched_column(tmp_path):
+    """A caller-supplied sa.table() that declares fewer columns than the real
+    schema (a common lightweight pattern) must not raise KeyError; the column
+    is still matched by name via sa.column()."""
+    narrow_table = sa.table(
+        "public_mcp_apps",
+        sa.column("app_id", sa.String),
+        sa.column("name", sa.String),
+        # "category" exists in the DB and in match_columns, but is not
+        # declared on this TableClause.
+    )
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    with engine.begin() as connection:
+        _create_table(connection)
+        connection.execute(
+            text(
+                "INSERT INTO public_mcp_apps (app_id, name, description, transport,"
+                " provider_name, category)"
+                " VALUES ('widget', 'Widget', 'A seeded widget connector.', 'oauth',"
+                " 'widget-co', 'Productivity')"
+            )
+        )
+        delete_unmodified_seeded_rows(connection, narrow_table, SEED_ROWS)
+        assert "widget" not in _app_ids(connection)
+
+
+def test_skips_row_missing_the_id_column(tmp_path):
+    """A seed row without the id_column key is skipped rather than raising
+    KeyError, and other rows are still processed normally."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    with engine.begin() as connection:
+        _create_table(connection)
+        connection.execute(
+            text(
+                "INSERT INTO public_mcp_apps (app_id, name, description, transport,"
+                " provider_name, category)"
+                " VALUES ('widget', 'Widget', 'A seeded widget connector.', 'oauth',"
+                " 'widget-co', 'Productivity')"
+            )
+        )
+        rows_without_id = [{"name": "Widget", "transport": "oauth"}]
+        delete_unmodified_seeded_rows(
+            connection, PUBLIC_MCP_APPS_TABLE, rows_without_id
+        )
+        assert "widget" in _app_ids(connection)
+
+
+def test_skips_row_missing_a_match_column_key(tmp_path):
+    """A seed row missing one of the match_columns keys still matches on the
+    remaining fields instead of raising KeyError."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    with engine.begin() as connection:
+        _create_table(connection)
+        connection.execute(
+            text(
+                "INSERT INTO public_mcp_apps (app_id, name, description, transport,"
+                " provider_name, category)"
+                " VALUES ('widget', 'Widget', 'A seeded widget connector.', 'oauth',"
+                " 'widget-co', 'Productivity')"
+            )
+        )
+        rows_without_category = [
+            {
+                "app_id": "widget",
+                "name": "Widget",
+                "description": "A seeded widget connector.",
+                "transport": "oauth",
+                "provider_name": "widget-co",
+            }
+        ]
+        delete_unmodified_seeded_rows(
+            connection, PUBLIC_MCP_APPS_TABLE, rows_without_category
+        )
+        assert "widget" not in _app_ids(connection)

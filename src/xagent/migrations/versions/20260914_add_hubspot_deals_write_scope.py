@@ -1,7 +1,7 @@
 """add HubSpot crm.objects.deals.write scope
 
 Revision ID: 20260914_add_hubspot_deals_write_scope
-Revises: 20260909_seed_shopify_mcp_app
+Revises: 20260912_shared_task_execution
 Create Date: 2026-09-14
 
 """
@@ -15,7 +15,7 @@ from alembic import op
 logger = logging.getLogger(__name__)
 
 revision: str = "20260914_add_hubspot_deals_write_scope"
-down_revision: Union[str, None] = "20260909_seed_shopify_mcp_app"
+down_revision: Union[str, None] = "20260912_shared_task_execution"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

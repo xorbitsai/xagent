@@ -659,24 +659,26 @@ def test_json_truncation_falls_back_on_out_of_range_float():
     """A payload containing an out-of-range number (json.loads happily parses
     `1e400` to float('inf')) must not be re-serialized with the non-RFC8259
     `Infinity` token; allow_nan=False turns that into a ValueError that's
-    caught, falling back to raw slicing instead."""
-    data = {"data": [1e400, 2, 3]}
-    payload = json.dumps(data)
-    filter = _create_filter(max_chars=10)
+    caught, falling back to raw slicing instead. Uses a bounded fixture large
+    enough for max_chars to still land past the structured (not just raw)
+    path, so a mutant that dropped allow_nan=False and let Infinity leak
+    through the structured serializer would actually be caught here."""
+    data = {"data": list(range(100)) + [1e400]}
+    payload = json.dumps(data, indent=2)
+    filter = _create_filter(max_chars=500, max_fields=200)
 
     result = filter.filter(payload, "test_tool")
 
     assert "Infinity" not in result
-    assert result.endswith(DEFAULT_TRUNCATION_MESSAGE)
+    assert "NaN" not in result
 
 
 def test_json_truncation_ignores_multi_item_envelope_wrapper():
-    """A >= 2 items floor alone is not enough: an outer wrapper with 2+
-    elements, each wrapping its own real nested list, still "wins" by
-    bottom-up size over either nested list unless ancestors containing a
-    qualifying descendant are excluded from candidacy entirely. Reproduces a
-    common paginated-envelope shape: two result pages, each with its own
-    100-row "items" array."""
+    """Selecting the trim target by item count (not total size) means an
+    outer wrapper with 2+ elements, each wrapping its own real nested list,
+    no longer "wins" over either nested list just by containing more bytes.
+    Reproduces a common paginated-envelope shape: two result pages, each
+    with its own 100-row "items" array."""
     data = {
         "results": [
             {"items": [{"id": i, "name": f"row-{i}"} for i in range(100)]},
@@ -690,13 +692,43 @@ def test_json_truncation_ignores_multi_item_envelope_wrapper():
     result = filter.filter(payload, "test_tool")
     parsed = json.loads(result)
 
+    assert len(result) <= 3100
     assert parsed["status"] == "ok"
     assert len(parsed["results"]) == 2
-    # Neither page should be entirely discarded - at least one real row from
-    # each survives (rather than one page being replaced by a bare marker).
+    # Neither page should be entirely discarded, and at least one page must
+    # actually have been trimmed (not just re-compacted) - a regression that
+    # left both pages fully intact, or that dropped a page wholesale to a
+    # bare marker, must fail this.
+    kept_counts = []
     for page in parsed["results"]:
         assert isinstance(page, dict), "a whole page must not be dropped wholesale"
-        assert len(page["items"]) > 0
+        assert 0 < len(page["items"]) <= 100
+        kept_counts.append(len(page["items"]))
+    assert min(kept_counts) < 100, "expected real trimming, not just compaction"
+
+
+def test_json_truncation_prefers_primary_records_list_over_nested_tag_arrays():
+    """A regression found via review: excluding every list that contains a
+    qualifying nested list (an earlier attempt at fixing the envelope-wrapper
+    bug) incorrectly excludes an ordinary records list whenever each record
+    carries its own small nested array (e.g. per-record "tags") - the exact
+    opposite failure, where the *real* data-bearing list gets skipped in
+    favor of one lone record's tiny tags array. Item-count-based selection
+    (this list has far more items than any single "tags" list) avoids both
+    failure modes without needing to track ancestor/descendant relationships
+    at all."""
+    data = {"data": [{"id": i, "tags": ["a", "b", "c"]} for i in range(180)]}
+    payload = json.dumps(data)
+    filter = _create_filter(max_chars=2000, max_fields=1000)
+
+    result = filter.filter(payload, "test_tool")
+    parsed = json.loads(result)
+
+    assert len(result) <= 2000
+    assert 0 < len(parsed["data"]) < 180
+    for record in parsed["data"][:-1]:
+        assert isinstance(record, dict)
+        assert record["tags"] == ["a", "b", "c"]
 
 
 def test_json_truncation_enforces_max_fields_like_native_objects():
@@ -793,4 +825,42 @@ def test_json_truncation_skips_pathologically_large_input():
         OutputValueFilter._MAX_STRUCTURED_TRUNCATE_INPUT_CHARS = original_limit
 
     mocked_loads.assert_not_called()
+    assert result.endswith(DEFAULT_TRUNCATION_MESSAGE)
+
+
+def test_json_truncation_reports_true_count_after_field_cap_and_char_trim():
+    """A regression found via review: when max_fields caps a list first (say
+    to 10 items + a marker) and max_chars *then* trims that same
+    already-capped list further (down to, say, 7 items), the final marker
+    must report how many of the ORIGINAL items are missing in total (50 - 7
+    = 43), not how many were dropped relative to the already-capped
+    intermediate list (10 - 7 = 3) - the latter drastically understates real
+    data loss."""
+    total_items = 50
+    data = {"data": [f"item-{i:04d}" for i in range(total_items)]}
+    payload = json.dumps(data)
+    # Chosen so the field-capped form (10 items + marker) doesn't fit, but a
+    # further char-budget trim does.
+    filter = _create_filter(max_chars=140, max_fields=10)
+
+    result = filter.filter(payload, "test_tool")
+    parsed = json.loads(result)
+
+    kept = [x for x in parsed["data"] if not x.startswith("...")]
+    marker = next(x for x in parsed["data"] if x.startswith("..."))
+    assert 0 < len(kept) < 10  # char budget trimmed below the max_fields cap
+    assert TRUNCATED_ITEMS_TEMPLATE.format(count=total_items - len(kept)) == marker
+
+
+def test_json_truncation_survives_oversized_integer():
+    """A JSON integer literal long enough to hit Python's int-to-str
+    conversion digit limit makes json.loads raise a plain ValueError (not a
+    json.JSONDecodeError). This must be caught and fall back to raw slicing
+    like any other unparsable/unrepresentable input, not propagate and
+    crash the caller."""
+    payload = '{"n":' + "1" * 4301 + "}"
+    filter = _create_filter(max_chars=10)
+
+    result = filter.filter(payload, "test_tool")  # must not raise
+
     assert result.endswith(DEFAULT_TRUNCATION_MESSAGE)

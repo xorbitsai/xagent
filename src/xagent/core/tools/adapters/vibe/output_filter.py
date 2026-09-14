@@ -286,8 +286,14 @@ class OutputValueFilter:
 
             # Cap cardinality the same way _filter_with_depth caps native
             # lists/dicts, so a tool that happens to pre-serialize its result
-            # to a JSON string doesn't bypass max_fields entirely.
-            parsed = self._cap_max_fields(parsed)
+            # to a JSON string doesn't bypass max_fields entirely. Track each
+            # capped list's true original length (keyed by the new list's
+            # id()) so that if max_chars *also* ends up trimming this same
+            # list further below, its marker can report how much was
+            # dropped in total instead of understating it relative to the
+            # already-capped length.
+            field_cap_true_lengths: dict[int, int] = {}
+            parsed = self._cap_max_fields(parsed, field_cap_true_lengths)
 
             # A fully compact re-serialization (tightest separators, no
             # pretty-print whitespace) may already fit. Try this first,
@@ -308,8 +314,18 @@ class OutputValueFilter:
             if not target_list:
                 return None
 
-            original_items = list(target_list)
+            restore_state = list(target_list)  # target_list's current contents
+            # If field-capping already truncated this exact list, its last
+            # element is a synthetic marker string, not a real item - it
+            # isn't eligible to be "kept" by the search below, and the
+            # search needs the list's true pre-capping length (not its
+            # already-capped length) to report accurate remaining counts.
+            true_length = field_cap_true_lengths.get(id(target_list))
+            original_items = (
+                restore_state[:-1] if true_length is not None else restore_state
+            )
             total = len(original_items)
+            true_total = true_length if true_length is not None else total
 
             # Binary search the largest prefix of the list (plus a marker for
             # the dropped remainder) whose re-serialized JSON fits within
@@ -330,7 +346,7 @@ class OutputValueFilter:
             try:
                 while lo <= hi:
                     mid = (lo + hi) // 2
-                    remaining = total - mid
+                    remaining = true_total - mid
                     candidate = original_items[:mid] + [
                         TRUNCATED_ITEMS_TEMPLATE.format(count=remaining)
                     ]
@@ -343,7 +359,7 @@ class OutputValueFilter:
                     else:
                         hi = mid - 1
             finally:
-                target_list[:] = original_items
+                target_list[:] = restore_state
 
             # Keeping zero real items (marker only) discards every real
             # element of the chosen list - strictly less real content than
@@ -354,7 +370,7 @@ class OutputValueFilter:
 
             logger.info(
                 f"Tool '{tool_name}' output JSON-truncated: kept "
-                f"{best_kept}/{total} list items ({len(value)} -> "
+                f"{best_kept}/{true_total} list items ({len(value)} -> "
                 f"{len(best_serialized)} characters)"
             )
             return best_serialized
@@ -367,7 +383,11 @@ class OutputValueFilter:
                 f"falling back to raw character slicing."
             )
             return None
-        except (TypeError, RecursionError) as e:
+        except (TypeError, ValueError, RecursionError) as e:
+            # ValueError also covers json.loads raising on an oversized
+            # integer literal (Python's int-to-str conversion limit, PEP
+            # 3151-era safeguard) - a plain ValueError, not a
+            # json.JSONDecodeError, so it isn't caught by the branch above.
             logger.warning(
                 f"Tool '{tool_name}' JSON-aware truncation failed unexpectedly "
                 f"({e!r}); falling back to raw character slicing."
@@ -394,99 +414,115 @@ class OutputValueFilter:
         except ValueError:
             return None
 
-    def _cap_max_fields(self, node: Any, depth: int = 0) -> Any:
+    def _cap_max_fields(
+        self, node: Any, true_lengths: dict[int, int], depth: int = 0
+    ) -> Any:
         """Recursively cap every list/dict in a JSON-parsed structure to
         max_fields items, mirroring _filter_with_depth's cardinality cap on
         native lists/dicts - so the same data returns the same item count
         whether a tool hands it back as a native object or as a pre-
         serialized JSON string.
+
+        Records each capped list's true (pre-capping) length in
+        true_lengths, keyed by id() of the new, already-capped list. This
+        lets a later max_chars-driven trim of the *same* list (see
+        _try_json_truncate) report how much was dropped in total, instead of
+        understating it relative to the already-capped length.
         """
         if depth > self.max_recursion:
             return node
         if isinstance(node, list):
             if len(node) > self.max_fields:
                 kept = [
-                    self._cap_max_fields(item, depth + 1)
+                    self._cap_max_fields(item, true_lengths, depth + 1)
                     for item in node[: self.max_fields]
                 ]
+                true_lengths[id(kept)] = len(node)
                 kept.append(
                     TRUNCATED_ITEMS_TEMPLATE.format(count=len(node) - self.max_fields)
                 )
                 return kept
-            return [self._cap_max_fields(item, depth + 1) for item in node]
+            return [
+                self._cap_max_fields(item, true_lengths, depth + 1) for item in node
+            ]
         if isinstance(node, dict):
             if len(node) > self.max_fields:
                 kept_dict = {
-                    k: self._cap_max_fields(v, depth + 1)
+                    k: self._cap_max_fields(v, true_lengths, depth + 1)
                     for k, v in list(node.items())[: self.max_fields]
                 }
                 kept_dict[
                     TRUNCATED_DICT_TEMPLATE.format(count=len(node) - self.max_fields)
                 ] = TRUNCATED_FIELDS_MESSAGE
                 return kept_dict
-            return {k: self._cap_max_fields(v, depth + 1) for k, v in node.items()}
+            return {
+                k: self._cap_max_fields(v, true_lengths, depth + 1)
+                for k, v in node.items()
+            }
         return node
 
     @staticmethod
     def _find_largest_list(obj: Any) -> list | None:
-        """Find the largest (by estimated serialized size) *leaf* list nested
-        anywhere in obj - a list with >= 2 items that does not itself
-        contain another >= 2 item list anywhere inside it - in a single
-        bottom-up pass.
+        """Find the list (with >= 2 items) most worth trimming, in a single
+        bottom-up pass: the one with the most items, breaking ties by
+        estimated serialized size.
 
-        Size is estimated instead of calling json.dumps on every candidate
-        list, which would make the walk quadratic (or worse) for structures
-        with several nesting levels, since each level would re-serialize
-        everything below it.
+        Item count, not total serialized size, is what makes this safe to
+        select regardless of nesting: a list with few items (an envelope
+        wrapper, e.g. {"results": [{"items": [...100 rows...]}]}) can only
+        be trimmed by discarding a whole element at a time - there's no
+        graceful partial reduction - so it should lose to any list with more
+        items, including one nested inside it. A pure total-size comparison
+        gets this backwards, since an ancestor's size is always its
+        descendants' size plus more, so it would "win" by size regardless of
+        how few items it has. Item count also correctly handles the common
+        shape where a large records list's *individual* records each carry
+        their own small nested list (e.g. per-record "tags"): a 180-item
+        records list beats each record's 3-item "tags" list on item count,
+        so the actual data-bearing list is chosen either way - no
+        ancestor/descendant relationship needs to be tracked at all, unlike
+        a pure-size comparison (which would have to explicitly exclude
+        ancestors to avoid picking the wrapper, and then risks incorrectly
+        excluding this records list too, since it also "contains" >= 2 item
+        lists nested inside its records).
 
-        Restricting candidates to leaves (not just requiring >= 2 items) is
-        what actually avoids the ancestor bias: since this is a bottom-up
-        sum, an ancestor list's estimated size always exceeds any list
-        nested inside it (it's that list's size plus more), no matter how
-        many items the ancestor itself has. A two-page envelope like
-        {"results": [{"items": [...100 rows...]}, {"items": [...100 more
-        rows...]}]} has 2 items at the outer "results" level, satisfying a
-        plain ">= 2" floor, and would still "win" by size over either
-        "items" list if ancestors were left eligible - discarding one whole
-        real page instead of trimming rows. Excluding any list that contains
-        a qualifying descendant list (at any depth) forces selection down to
-        the actual data-bearing leaf list, regardless of how many wrapper
-        levels or wrapper elements surround it.
+        Size is estimated (only used to break exact ties in item count)
+        instead of calling json.dumps on every candidate list, which would
+        make the walk quadratic (or worse) for structures with several
+        nesting levels, since each level would re-serialize everything
+        below it.
         """
         best: list | None = None
-        best_size = -1
+        best_key: tuple[int, int] = (-1, -1)
 
-        def walk(node: Any) -> tuple[int, bool]:
-            """Returns (estimated size, whether this subtree is or contains
-            a list with >= 2 items)."""
-            nonlocal best, best_size
+        def walk(node: Any) -> int:
+            """Returns the estimated serialized size of node."""
+            nonlocal best, best_key
             if isinstance(node, list):
                 size = 2 + max(0, len(node) - 1)  # brackets + separators
-                contains_qualifying = False
                 for item in node:
-                    item_size, item_has_qualifying = walk(item)
-                    size += item_size
-                    contains_qualifying = contains_qualifying or item_has_qualifying
-                is_qualifying = len(node) >= 2
-                if is_qualifying and not contains_qualifying and size > best_size:
-                    best_size = size
-                    best = node
-                return size, is_qualifying or contains_qualifying
+                    size += walk(item)
+                if len(node) >= 2:
+                    candidate_key = (len(node), size)
+                    if candidate_key > best_key:
+                        best_key = candidate_key
+                        best = node
+                return size
             if isinstance(node, dict):
                 size = 2 + max(0, len(node) - 1)  # braces + separators
-                contains_qualifying = False
-                for key, val in node.items():
-                    val_size, val_has_qualifying = walk(val)
-                    size += len(str(key)) + 3 + val_size  # "key":
-                    contains_qualifying = contains_qualifying or val_has_qualifying
-                return size, contains_qualifying
+                for dict_key, val in node.items():
+                    size += len(str(dict_key)) + 3 + walk(val)  # "key":
+                return size
             if isinstance(node, str):
-                return len(node) + 2, False  # quotes
+                return len(node) + 2  # quotes
             if isinstance(node, bool):
-                return (4 if node else 5), False
+                return 4 if node else 5
             if node is None:
-                return 4, False
-            return len(str(node)), False
+                return 4
+            return len(str(node))
+
+        walk(obj)
+        return best
 
         walk(obj)
         return best

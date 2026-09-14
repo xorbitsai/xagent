@@ -668,3 +668,129 @@ def test_json_truncation_falls_back_on_out_of_range_float():
 
     assert "Infinity" not in result
     assert result.endswith(DEFAULT_TRUNCATION_MESSAGE)
+
+
+def test_json_truncation_ignores_multi_item_envelope_wrapper():
+    """A >= 2 items floor alone is not enough: an outer wrapper with 2+
+    elements, each wrapping its own real nested list, still "wins" by
+    bottom-up size over either nested list unless ancestors containing a
+    qualifying descendant are excluded from candidacy entirely. Reproduces a
+    common paginated-envelope shape: two result pages, each with its own
+    100-row "items" array."""
+    data = {
+        "results": [
+            {"items": [{"id": i, "name": f"row-{i}"} for i in range(100)]},
+            {"items": [{"id": i, "name": f"row-{i}"} for i in range(100, 200)]},
+        ],
+        "status": "ok",
+    }
+    payload = json.dumps(data)
+    filter = _create_filter(max_chars=3100)
+
+    result = filter.filter(payload, "test_tool")
+    parsed = json.loads(result)
+
+    assert parsed["status"] == "ok"
+    assert len(parsed["results"]) == 2
+    # Neither page should be entirely discarded - at least one real row from
+    # each survives (rather than one page being replaced by a bare marker).
+    for page in parsed["results"]:
+        assert isinstance(page, dict), "a whole page must not be dropped wholesale"
+        assert len(page["items"]) > 0
+
+
+def test_json_truncation_enforces_max_fields_like_native_objects():
+    """A JSON string that needs truncating (exceeds max_chars) must respect
+    max_fields the same way the native dict/list path does - previously the
+    JSON-aware path only consulted max_chars, so a string pre-serialized by
+    a tool could return far more items than the same data returned as a
+    native object would."""
+    data = {
+        "status": "ok",
+        "data": [f"item-number-{i:06d}-padding-padding" for i in range(3000)],
+    }
+    payload = json.dumps(data)
+    filter = _create_filter(max_chars=60000, max_fields=1000)
+
+    result_from_string = filter.filter(payload, "test_tool")
+    result_from_native = filter.filter(data, "test_tool")
+
+    assert len(json.loads(result_from_string)["data"]) == len(
+        result_from_native["data"]
+    )
+
+
+def test_json_truncation_survives_unrelated_nan_elsewhere_in_payload():
+    """A non-finite float (NaN/Infinity) that ends up trimmed away by the
+    binary search must not abort the whole JSON-aware attempt - only a
+    candidate that would actually *keep* the offending value should be
+    treated as not fitting."""
+    data = {"data": [float("nan") if i == 35 else i for i in range(40)]}
+    payload = json.dumps(data)
+    filter = _create_filter(max_chars=100)
+
+    result = filter.filter(payload, "test_tool")
+    parsed = json.loads(result)
+
+    assert "nan" not in [str(x).lower() for x in parsed["data"]]
+    assert len(parsed["data"]) > 1  # a real trim happened, not just the marker
+
+
+def test_json_truncation_compacts_pretty_printed_payload_with_no_list():
+    """A pretty-printed (indented) JSON object with no list at all must still
+    get the cheap "just compact it" win when compacting alone fits - falling
+    straight through to a corrupting raw slice here would defeat the point
+    of this whole feature for exactly the payloads that don't happen to
+    contain a list."""
+    obj = {f"field_{i}": f"value_{i}" for i in range(20)}
+    pretty = json.dumps(obj, indent=2)
+    compact = json.dumps(obj)
+    filter = _create_filter(max_chars=(len(pretty) + len(compact)) // 2)
+
+    result = filter.filter(pretty, "test_tool")
+    parsed = json.loads(result)
+
+    assert parsed == obj
+
+
+def test_json_truncation_uses_tight_separators():
+    """The "does it already fit" and binary-search re-serializations must use
+    minimal separators (no space after ','/':' ), not just "no indentation" -
+    otherwise wasted separator bytes can force dropping items that a truly
+    compact encoding wouldn't have needed to drop."""
+    data = {"data": [{"v": i} for i in range(50)]}
+    pretty = json.dumps(data, indent=2)
+    minimal_full = json.dumps(data, separators=(",", ":"))
+    filter = _create_filter(max_chars=len(minimal_full))
+
+    result = filter.filter(pretty, "test_tool")
+    parsed = json.loads(result)
+
+    assert len(parsed["data"]) == 50, "true-minimal encoding should fit everything"
+
+
+def test_json_truncation_skips_pathologically_large_input():
+    """Above the structured-truncation size safety valve, the JSON-aware path
+    must bail out before ever parsing the input, rather than pay the
+    repeated re-serialization cost a large structure would incur. Asserting
+    that `json.loads` is never called (with the threshold patched down, so
+    the test doesn't need a real multi-megabyte payload) is deterministic,
+    unlike a wall-clock timing assertion."""
+    from unittest import mock
+
+    data = {"data": list(range(50))}
+    payload = json.dumps(data)
+    filter = _create_filter(max_chars=20)
+    assert 10 < len(payload)  # sanity: bigger than max_chars and the patched
+    # threshold below, so _try_json_truncate is actually entered.
+
+    original_limit = OutputValueFilter._MAX_STRUCTURED_TRUNCATE_INPUT_CHARS
+    OutputValueFilter._MAX_STRUCTURED_TRUNCATE_INPUT_CHARS = 10
+    try:
+        with mock.patch("json.loads") as mocked_loads:
+            result = filter.filter(payload, "test_tool")
+    finally:
+        OutputValueFilter._MAX_STRUCTURED_TRUNCATE_INPUT_CHARS = original_limit
+
+    mocked_loads.assert_not_called()
+    assert result.endswith(DEFAULT_TRUNCATION_MESSAGE)

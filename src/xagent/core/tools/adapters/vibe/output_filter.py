@@ -4,7 +4,11 @@ Tool Output Value Filtering Module
 Provides multi-layered output limiting for all tools to prevent excessive output.
 
 This module implements a three-pronged approach to control tool output size:
-1. Per-string length limit: Truncates individual string values
+1. Per-string length limit: Truncates individual string values. When a
+   too-long string is itself JSON, this first tries structure-aware
+   trimming (drop items from its largest data-bearing list, enforcing the
+   same field-count cap as #2) so the result stays valid JSON, falling
+   back to a raw character slice only when that isn't achievable.
 2. Field count limit: Limits the number of items in dicts/lists
 3. Recursion depth limit: Prevents excessively deep nesting
 
@@ -56,6 +60,14 @@ class OutputValueFilter:
     of these limits provides practical protection for token usage without the
     performance cost of calculating total serialized size.
     """
+
+    # Above this raw string length, skip the JSON-aware truncation attempt
+    # entirely and go straight to the O(1) raw character slice. Structure-aware
+    # trimming re-serializes the whole parsed structure repeatedly (see
+    # _try_json_truncate), which is worth it for the moderately-oversized
+    # payloads this feature targets but would cost real CPU time (seconds, for
+    # multi-million-item lists) on pathologically large input.
+    _MAX_STRUCTURED_TRUNCATE_INPUT_CHARS = 10_000_000
 
     def __init__(self, max_chars: int, max_fields: int, max_recursion: int):
         """
@@ -250,22 +262,47 @@ class OutputValueFilter:
 
     def _try_json_truncate(self, value: str, tool_name: str) -> str | None:
         """
-        Truncate an oversized JSON string by dropping trailing items from its
-        largest list, keeping the result valid JSON in the common case
-        instead of slicing raw characters (which would corrupt the JSON
-        syntax mid-token).
+        Truncate an oversized JSON string without corrupting its syntax, by
+        (in order): capping list/dict cardinality the same way
+        _filter_with_depth caps native structures, trying a fully compact
+        re-serialization, and - only if that's still too long - binary
+        searching how much of the largest genuinely data-bearing list can be
+        kept.
 
         Returns None (falling back to raw character slicing) when the value
-        isn't parseable JSON, contains no list worth trimming, can't be
-        brought under max_chars by trimming alone (e.g. a large non-list
-        field dominates the payload), or is nested deep enough that walking
-        or re-serializing it risks a RecursionError - this is a best-effort
+        isn't parseable JSON, is too large to be worth the repeated
+        re-serialization this involves, contains no list worth trimming, or
+        can't be brought under max_chars by trimming alone (e.g. a large
+        non-list field dominates the payload) - this is a best-effort
         improvement over raw slicing, never a guaranteed one.
         """
+        if len(value) > self._MAX_STRUCTURED_TRUNCATE_INPUT_CHARS:
+            return None
+
         try:
             parsed = json.loads(value)
             if not isinstance(parsed, (dict, list)):
                 return None
+
+            # Cap cardinality the same way _filter_with_depth caps native
+            # lists/dicts, so a tool that happens to pre-serialize its result
+            # to a JSON string doesn't bypass max_fields entirely.
+            parsed = self._cap_max_fields(parsed)
+
+            # A fully compact re-serialization (tightest separators, no
+            # pretty-print whitespace) may already fit. Try this first,
+            # regardless of whether there's a list to trim - it's the
+            # cheapest possible win, and it's the only chance a payload with
+            # no list (or with a stray NaN/Infinity that doesn't actually
+            # need to survive) gets to end up as valid JSON instead of
+            # falling straight through to a raw, corrupting slice.
+            compact = self._safe_compact_dumps(parsed)
+            if compact is not None and len(compact) <= self.max_chars:
+                logger.info(
+                    f"Tool '{tool_name}' output JSON-compacted (no items "
+                    f"dropped): {len(value)} -> {len(compact)} characters"
+                )
+                return compact
 
             target_list = self._find_largest_list(parsed)
             if not target_list:
@@ -273,19 +310,6 @@ class OutputValueFilter:
 
             original_items = list(target_list)
             total = len(original_items)
-
-            # A compact re-serialization (no pretty-print whitespace) of the
-            # untouched list may already fit, even though the original
-            # (possibly indented) string didn't - check that before dropping
-            # anything.
-            full_serialized = json.dumps(parsed, ensure_ascii=False, allow_nan=False)
-            if len(full_serialized) <= self.max_chars:
-                logger.info(
-                    f"Tool '{tool_name}' output JSON-compacted (no items "
-                    f"dropped): {len(value)} -> {len(full_serialized)} "
-                    f"characters"
-                )
-                return full_serialized
 
             # Binary search the largest prefix of the list (plus a marker for
             # the dropped remainder) whose re-serialized JSON fits within
@@ -295,7 +319,11 @@ class OutputValueFilter:
             # with the whole list and no marker was already ruled out above,
             # since dropping a roughly constant-size marker for the last
             # couple of items can *shrink* the output, which would otherwise
-            # break that monotonicity.)
+            # break that monotonicity.) A candidate that still contains a
+            # non-finite float makes _safe_compact_dumps return None, which
+            # is treated the same as "too long" - once a kept prefix reaches
+            # that item, every longer prefix keeps it too, so this stays
+            # monotonic as well.
             lo, hi = 0, total - 1
             best_serialized: str | None = None
             best_kept = 0
@@ -307,8 +335,8 @@ class OutputValueFilter:
                         TRUNCATED_ITEMS_TEMPLATE.format(count=remaining)
                     ]
                     target_list[:] = candidate
-                    serialized = json.dumps(parsed, ensure_ascii=False, allow_nan=False)
-                    if len(serialized) <= self.max_chars:
+                    serialized = self._safe_compact_dumps(parsed)
+                    if serialized is not None and len(serialized) <= self.max_chars:
                         best_serialized = serialized
                         best_kept = mid
                         lo = mid + 1
@@ -339,7 +367,7 @@ class OutputValueFilter:
                 f"falling back to raw character slicing."
             )
             return None
-        except (TypeError, ValueError, RecursionError) as e:
+        except (TypeError, RecursionError) as e:
             logger.warning(
                 f"Tool '{tool_name}' JSON-aware truncation failed unexpectedly "
                 f"({e!r}); falling back to raw character slicing."
@@ -347,48 +375,118 @@ class OutputValueFilter:
             return None
 
     @staticmethod
+    def _safe_compact_dumps(obj: Any) -> str | None:
+        """json.dumps with the tightest valid separators, or None if obj
+        contains a non-finite float (NaN/Infinity/-Infinity).
+
+        json.loads happily parses those tokens (Python's non-standard
+        extension - common in pandas/numpy-derived tool output), but they
+        aren't valid per RFC 8259, so allow_nan=False is used to catch and
+        reject re-emitting them rather than let them leak into supposedly
+        valid JSON output. Returning None instead of raising lets callers
+        treat "would need a non-finite float to represent this candidate" as
+        just another reason a candidate doesn't fit.
+        """
+        try:
+            return json.dumps(
+                obj, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+            )
+        except ValueError:
+            return None
+
+    def _cap_max_fields(self, node: Any, depth: int = 0) -> Any:
+        """Recursively cap every list/dict in a JSON-parsed structure to
+        max_fields items, mirroring _filter_with_depth's cardinality cap on
+        native lists/dicts - so the same data returns the same item count
+        whether a tool hands it back as a native object or as a pre-
+        serialized JSON string.
+        """
+        if depth > self.max_recursion:
+            return node
+        if isinstance(node, list):
+            if len(node) > self.max_fields:
+                kept = [
+                    self._cap_max_fields(item, depth + 1)
+                    for item in node[: self.max_fields]
+                ]
+                kept.append(
+                    TRUNCATED_ITEMS_TEMPLATE.format(count=len(node) - self.max_fields)
+                )
+                return kept
+            return [self._cap_max_fields(item, depth + 1) for item in node]
+        if isinstance(node, dict):
+            if len(node) > self.max_fields:
+                kept_dict = {
+                    k: self._cap_max_fields(v, depth + 1)
+                    for k, v in list(node.items())[: self.max_fields]
+                }
+                kept_dict[
+                    TRUNCATED_DICT_TEMPLATE.format(count=len(node) - self.max_fields)
+                ] = TRUNCATED_FIELDS_MESSAGE
+                return kept_dict
+            return {k: self._cap_max_fields(v, depth + 1) for k, v in node.items()}
+        return node
+
+    @staticmethod
     def _find_largest_list(obj: Any) -> list | None:
-        """Find the largest (by estimated serialized size) list nested
-        anywhere in obj that has at least 2 items, in a single bottom-up pass.
+        """Find the largest (by estimated serialized size) *leaf* list nested
+        anywhere in obj - a list with >= 2 items that does not itself
+        contain another >= 2 item list anywhere inside it - in a single
+        bottom-up pass.
 
         Size is estimated instead of calling json.dumps on every candidate
         list, which would make the walk quadratic (or worse) for structures
         with several nesting levels, since each level would re-serialize
         everything below it.
 
-        The >= 2 items requirement matters because this is a bottom-up sum:
-        an ancestor list's estimated size always exceeds any list nested
-        inside it (it's that list's size plus more), so without a floor, a
-        one-item envelope wrapper (e.g. {"results": [{"items": [...100
-        rows...]}]}) would always "win" over the real data list nested
-        inside it - trimming it away would silently discard the entire
-        payload instead of the intended rows.
+        Restricting candidates to leaves (not just requiring >= 2 items) is
+        what actually avoids the ancestor bias: since this is a bottom-up
+        sum, an ancestor list's estimated size always exceeds any list
+        nested inside it (it's that list's size plus more), no matter how
+        many items the ancestor itself has. A two-page envelope like
+        {"results": [{"items": [...100 rows...]}, {"items": [...100 more
+        rows...]}]} has 2 items at the outer "results" level, satisfying a
+        plain ">= 2" floor, and would still "win" by size over either
+        "items" list if ancestors were left eligible - discarding one whole
+        real page instead of trimming rows. Excluding any list that contains
+        a qualifying descendant list (at any depth) forces selection down to
+        the actual data-bearing leaf list, regardless of how many wrapper
+        levels or wrapper elements surround it.
         """
         best: list | None = None
         best_size = -1
 
-        def estimate_size(node: Any) -> int:
+        def walk(node: Any) -> tuple[int, bool]:
+            """Returns (estimated size, whether this subtree is or contains
+            a list with >= 2 items)."""
             nonlocal best, best_size
             if isinstance(node, list):
                 size = 2 + max(0, len(node) - 1)  # brackets + separators
+                contains_qualifying = False
                 for item in node:
-                    size += estimate_size(item)
-                if len(node) >= 2 and size > best_size:
+                    item_size, item_has_qualifying = walk(item)
+                    size += item_size
+                    contains_qualifying = contains_qualifying or item_has_qualifying
+                is_qualifying = len(node) >= 2
+                if is_qualifying and not contains_qualifying and size > best_size:
                     best_size = size
                     best = node
-                return size
+                return size, is_qualifying or contains_qualifying
             if isinstance(node, dict):
                 size = 2 + max(0, len(node) - 1)  # braces + separators
+                contains_qualifying = False
                 for key, val in node.items():
-                    size += len(str(key)) + 3 + estimate_size(val)  # "key":
-                return size
+                    val_size, val_has_qualifying = walk(val)
+                    size += len(str(key)) + 3 + val_size  # "key":
+                    contains_qualifying = contains_qualifying or val_has_qualifying
+                return size, contains_qualifying
             if isinstance(node, str):
-                return len(node) + 2  # quotes
+                return len(node) + 2, False  # quotes
             if isinstance(node, bool):
-                return 4 if node else 5
+                return (4 if node else 5), False
             if node is None:
-                return 4
-            return len(str(node))
+                return 4, False
+            return len(str(node)), False
 
-        estimate_size(obj)
+        walk(obj)
         return best

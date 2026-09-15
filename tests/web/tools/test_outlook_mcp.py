@@ -1630,6 +1630,31 @@ def test_update_event_rejects_ambiguous_untouched_snapshot_boundary(monkeypatch)
     )
 
 
+def test_update_event_rejects_ambiguous_untouched_snapshot_start(monkeypatch):
+    graph_request = Mock(
+        return_value={
+            "start": {"dateTime": "2026-11-01T06:30:00", "timeZone": "UTC"},
+            "end": {"dateTime": "2026-11-01T08:00:00", "timeZone": "UTC"},
+            "isAllDay": False,
+            "type": "singleInstance",
+        }
+    )
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_update_event(
+            event_id="self-1",
+            end_datetime="2026-11-01T03:30:00",
+            timezone="America/New_York",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "local time is ambiguous" in result["message"]
+    graph_request.assert_called_once()
+
+
 def test_update_event_rejects_single_boundary_on_existing_all_day_event(
     monkeypatch,
 ):

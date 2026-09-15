@@ -427,7 +427,9 @@ def test_run_report_flags_note_when_a_date_range_ends_today(monkeypatch):
     )
 
     assert result["status"] == "success"
-    assert "today" in result["note"]
+    # A substring specific to the actual warning text, not just the word
+    # "today" -- which would also pass if the message were garbled.
+    assert "still-processing" in result["note"]
 
 
 def test_run_report_omits_note_when_no_date_range_ends_today(monkeypatch):
@@ -478,10 +480,72 @@ def test_run_report_flags_note_when_compared_date_ranges_have_unequal_length(
     assert "last_week=7d" in result["note"]
     # Both gotchas apply here (this_week also ends at "today") -- both notes
     # must surface, not just whichever check runs last.
-    assert "today" in result["note"]
+    assert "still-processing" in result["note"]
+
+
+def test_run_report_flags_length_note_without_touching_today_or_overlap(monkeypatch):
+    """Isolates the length-mismatch note from the other two checks: neither
+    range here ends at "today", and the ranges are far enough apart not to
+    overlap -- only the length note should fire."""
+    mock_request = Mock(return_value=MockResponse(json_data={"rowCount": 0}))
+    monkeypatch.setattr(google_analytics.requests, "request", mock_request)
+
+    result = json.loads(
+        google_analytics.google_analytics_run_report(
+            "42",
+            metrics=["activeUsers"],
+            date_ranges=[
+                {"start_date": "7daysAgo", "end_date": "yesterday", "name": "current"},
+                {
+                    "start_date": "60daysAgo",
+                    "end_date": "40daysAgo",
+                    "name": "baseline",
+                },
+            ],
+        )
+    )
+
+    assert result["status"] == "success"
+    assert "different numbers of days" in result["note"]
+    assert "current=7d" in result["note"]
+    assert "baseline=21d" in result["note"]
+    assert "still-processing" not in result["note"]
+    assert "overlap" not in result["note"]
+
+
+def test_run_report_flags_note_when_date_ranges_overlap(monkeypatch):
+    """Regression for a gap the length check alone misses: "7daysAgo"/
+    "today" (8 days) and "14daysAgo"/"7daysAgo" (8 days) are equal length
+    but share day -7 -- a period comparison needs both, not just equal
+    lengths."""
+    mock_request = Mock(return_value=MockResponse(json_data={"rowCount": 0}))
+    monkeypatch.setattr(google_analytics.requests, "request", mock_request)
+
+    result = json.loads(
+        google_analytics.google_analytics_run_report(
+            "42",
+            metrics=["activeUsers"],
+            date_ranges=[
+                {"start_date": "7daysAgo", "end_date": "today", "name": "this_week"},
+                {
+                    "start_date": "14daysAgo",
+                    "end_date": "7daysAgo",
+                    "name": "last_week",
+                },
+            ],
+        )
+    )
+
+    assert result["status"] == "success"
+    assert "different numbers of days" not in result["note"]
+    assert "overlap" in result["note"]
+    assert '"this_week" and "last_week"' in result["note"]
 
 
 def test_run_report_omits_length_note_when_compared_date_ranges_match(monkeypatch):
+    """Also covers the overlap check via the same fixture: "yesterday" and
+    "8daysAgo" are adjacent, distinct days, so this correct back-to-back
+    pairing must not false-positive into an overlap note either."""
     mock_request = Mock(return_value=MockResponse(json_data={"rowCount": 0}))
     monkeypatch.setattr(google_analytics.requests, "request", mock_request)
 
@@ -509,10 +573,11 @@ def test_run_report_omits_length_note_when_compared_date_ranges_match(monkeypatc
 
 
 def test_run_report_omits_length_note_when_a_bound_is_unrecognized(monkeypatch):
-    """A date_range mixing a relative term with an explicit date (or any
-    other value _relative_day_offset/date.fromisoformat can't parse) can't
-    be compared without knowing "today"'s actual date -- must not false-
-    positive into a spurious mismatch note."""
+    """The second date_range genuinely mixes a relative term (start_date)
+    with an explicit date (end_date), so its span can't be computed without
+    knowing "today"'s actual date -- it must not be false-compared against
+    the first range's real 7-day span (which, if it were, would report a
+    mismatch here since the two clearly differ in practice)."""
     mock_request = Mock(return_value=MockResponse(json_data={"rowCount": 0}))
     monkeypatch.setattr(google_analytics.requests, "request", mock_request)
 
@@ -522,7 +587,7 @@ def test_run_report_omits_length_note_when_a_bound_is_unrecognized(monkeypatch):
             metrics=["activeUsers"],
             date_ranges=[
                 {"start_date": "7daysAgo", "end_date": "yesterday"},
-                {"start_date": "2026-08-01", "end_date": "2026-08-07"},
+                {"start_date": "60daysAgo", "end_date": "2026-08-01"},
             ],
         )
     )
@@ -703,7 +768,11 @@ def test_run_report_trims_rows_and_flags_truncated_when_still_over_budget(monkey
     RUN_REPORT_MAX_LIMIT rows crosses the output threshold even after the
     default/max regression test's mix stays under it. The tool must trim
     rows and set truncated=True rather than return an oversized payload that
-    the platform would hard-truncate into invalid JSON."""
+    the platform would hard-truncate into invalid JSON. Also uses an
+    "end_date": "today" range so the note survives the trim loop's repeated
+    re-serialization (google_analytics.py's `while` loop rebuilds `response`
+    from `extra_kwargs` on every iteration) -- otherwise that path stays
+    uncovered for a non-empty note."""
     row = {
         "dimensionValues": [
             {"value": f"dim-value-{i:02d}".ljust(35, "x")} for i in range(5)
@@ -726,7 +795,7 @@ def test_run_report_trims_rows_and_flags_truncated_when_still_over_budget(monkey
     response = google_analytics.google_analytics_run_report(
         "42",
         metrics=[f"metric{i}" for i in range(5)],
-        date_ranges=[{"start_date": "7daysAgo", "end_date": "yesterday"}],
+        date_ranges=[{"start_date": "7daysAgo", "end_date": "today"}],
         dimensions=[f"dim{i}" for i in range(5)],
         limit=google_analytics.RUN_REPORT_MAX_LIMIT,
     )
@@ -736,6 +805,7 @@ def test_run_report_trims_rows_and_flags_truncated_when_still_over_budget(monkey
     assert result["truncated"] is True
     assert len(result["rows"]) < google_analytics.RUN_REPORT_MAX_LIMIT
     assert len(response) < get_tool_max_output_length()
+    assert "still-processing" in result["note"]
 
 
 def test_run_report_passes_metric_filter_and_offset(monkeypatch):

@@ -54,7 +54,8 @@ dependencies = [
   "defusedxml>=0.7.1",
   "pypinyin>=0.53.0",
   "cairosvg >= 2.7.1",
-  "lancedb>=0.24.2",
+  # CI representatives cover the minimum, lockfile, and newest supported minor.
+  "lancedb>=0.24.2,<0.38",
   "pyarrow>=16.1.0",
   # Basic document processing (keep pypdf for basic PDF support)
   "pypdf>=4.0.0",

@@ -227,7 +227,7 @@ class TestCreateDockerService:
         ):
             _create_docker_service()
 
-        mock_store_cls.assert_called_once_with()
+        mock_store_cls.assert_called_once_with(namespace=None)
         assert mock_service_cls.call_args[1]["store"] is mock_store_cls.return_value
         assert mock_service_cls.call_args[1]["namespace"] == "test"
 

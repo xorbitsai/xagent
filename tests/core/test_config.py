@@ -2883,9 +2883,9 @@ def test_toby_personal_stdio_explicit_opt_in(monkeypatch, value):
 
 
 @pytest.mark.parametrize(
-    "value,expected", [(None, False), ("true", True), ("false", False)]
+    "value,expected", [(None, True), ("true", True), ("false", False)]
 )
-def test_shared_task_execution_is_dormant_by_default(monkeypatch, value, expected):
+def test_shared_task_execution_is_enabled_by_default(monkeypatch, value, expected):
     monkeypatch.delenv(config.SHARED_TASK_EXECUTION_ENABLED, raising=False)
     if value is not None:
         monkeypatch.setenv(config.SHARED_TASK_EXECUTION_ENABLED, value)
@@ -2934,3 +2934,63 @@ def test_task_reply_wait_timeout(value, expected, monkeypatch):
     if value is not None:
         monkeypatch.setenv("XAGENT_TASK_REPLY_WAIT_TIMEOUT_SECONDS", value)
     assert get_task_reply_wait_timeout_seconds() == expected
+
+
+@pytest.mark.parametrize(
+    "shared,role,override,expected",
+    [
+        (False, "combined", None, True),
+        (True, "combined", None, False),
+        (True, "web", "true", True),
+        (True, "web", "false", False),
+        (True, "worker", "true", False),
+    ],
+)
+def test_designated_channel_ingress(monkeypatch, shared, role, override, expected):
+    monkeypatch.setenv(config.SHARED_TASK_EXECUTION_ENABLED, str(shared).lower())
+    monkeypatch.setenv(config.TASK_EXECUTION_ROLE, role)
+    monkeypatch.delenv(config.CHANNEL_INGRESS_ENABLED, raising=False)
+    if override is not None:
+        monkeypatch.setenv(config.CHANNEL_INGRESS_ENABLED, override)
+    assert config.get_channel_ingress_enabled() is expected
+
+
+@pytest.mark.parametrize("role", ["combined", "web", "worker"])
+def test_shared_host_configuration(monkeypatch, role):
+    from cryptography.fernet import Fernet
+
+    monkeypatch.setenv(config.SHARED_TASK_EXECUTION_ENABLED, "true")
+    monkeypatch.setenv(config.TASK_EXECUTION_ROLE, role)
+    monkeypatch.setenv(config.REDIS_URL, "redis://localhost:6379/0")
+    monkeypatch.setenv(config.ENCRYPTION_KEY, Fernet.generate_key().decode())
+    config.validate_task_execution_host_config()
+    monkeypatch.setenv(config.ENCRYPTION_KEY, config.DEV_FALLBACK_ENCRYPTION_KEY)
+    with pytest.raises(ValueError, match="private common ENCRYPTION_KEY"):
+        config.validate_task_execution_host_config()
+    monkeypatch.setenv(config.SHARED_TASK_EXECUTION_ENABLED, "false")
+    if role == "combined":
+        config.validate_task_execution_host_config()
+    else:
+        with pytest.raises(ValueError, match="requires"):
+            config.validate_task_execution_host_config()
+
+
+def test_unknown_task_execution_role_rejected(monkeypatch):
+    monkeypatch.setenv(config.TASK_EXECUTION_ROLE, "other")
+    with pytest.raises(ValueError, match="combined, web or worker"):
+        config.validate_task_execution_host_config()
+
+
+@pytest.mark.parametrize("configured_home", [None, "/custom/boxlite"])
+def test_shared_boxlite_home_is_scoped_to_worker(
+    monkeypatch, tmp_path, configured_home
+):
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    monkeypatch.setenv("XAGENT_SANDBOX_WORKER_ID", "worker-1")
+    monkeypatch.setenv("XAGENT_STORAGE_ROOT", str(tmp_path))
+    if configured_home is None:
+        monkeypatch.delenv(BOXLITE_HOME_DIR, raising=False)
+    else:
+        monkeypatch.setenv(BOXLITE_HOME_DIR, configured_home)
+    expected_root = Path(configured_home) if configured_home else tmp_path / "boxlite"
+    assert get_boxlite_home_dir() == expected_root / "worker-1"

@@ -733,7 +733,21 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     needs: [changes, pre-commit]
-    timeout-minutes: 30
+    timeout-minutes: 45
+
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      XAGENT_TEST_REDIS_URL: redis://localhost:6379/0
 
     steps:
       - name: Skip tests
@@ -790,7 +804,7 @@ jobs:
         shell: bash
         run: |
           set -e
-          python3 -m uv run python -m pytest tests/e2e --run-special -q
+          python3 -m uv run python -m pytest tests/e2e --run-special -v --durations=20
 
   frontend-build:
     runs-on: ubuntu-latest

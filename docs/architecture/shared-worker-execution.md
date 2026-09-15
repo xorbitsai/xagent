@@ -1,5 +1,9 @@
 # Shared task execution foundations
 
+This document records the earlier foundations stage. The deployed activation
+contract is now described in [Shared worker deployment](../shared-worker-deployment.md),
+including the worker roles and the runtime-credential retention policy.
+
 This change contains the acceptance/data and event/recovery foundations for shared task execution. Application startup and task execution remain on the existing path. It does not start a shared worker or the Redis event bridge.
 
 ## Acceptance and persistence
@@ -8,7 +12,15 @@ This change contains the acceptance/data and event/recovery foundations for shar
 
 `task_runtime_secrets` stores encrypted, single-turn connector secrets and auth selectors. Reads verify task, turn, run and the owner's stable subject. Storage, binding and cleanup operations are available to later ingress/worker integration; existing connector runtime paths do not use this store yet. No secret values are added to task APIs or event payloads. The store requires a valid, explicitly configured `ENCRYPTION_KEY` and rejects the published development key, including when copied from `example.env`. Unavailable key configuration returns `connector_runtime_unavailable` before writing and also when reading an existing, correctly scoped row. If a different valid key cannot decrypt that row, the read returns `runtime_secret_unavailable` instead; both errors are HTTP 503, and neither returns credential contents.
 
-These inputs belong to one execution, not the lifetime of a paused conversation. After its lease is released into `paused` or `waiting_for_user`, cleanup removes them. A subsequent resume must supply fresh secret/auth-selector values through ingress; missing required values fail with `runtime_secret_unavailable`. Resuming must not silently reuse or omit an earlier execution's credentials. The integration that first enables staging must wire terminal deletion and the compensation sweep in the same change. There is no TTL or running sweep in this foundation PR.
+The original foundation proposal deleted these inputs on pause and required
+fresh values on resume. During activation review, the maintainer approved
+retaining encrypted inputs for a paused/waiting run so it can resume, with a
+bounded lifetime. The active policy uses
+`XAGENT_TASK_RUNTIME_SECRETS_TTL_SECONDS` (24 hours by default), measured from
+acceptance; resume does not extend it. Reads reject expired values before the
+cleanup sweep, and finished/replaced runs are cleaned up. See the deployment
+guide above for the current recovery and expiration contract. This supersedes
+the foundation proposal's delete-on-pause rule.
 
 Nullable `reply_host_id` and `reply_origin` fields identify the creating ingress and its exact socket registration. They are stored when a command is created; duplicate submissions cannot overwrite the route. The migration preserves existing commands and can be downgraded independently.
 

@@ -4,11 +4,15 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 
-from ...config import get_shared_task_execution_enabled
+from ...config import get_shared_task_execution_enabled, get_task_execution_role
 
 _in_claimed_command: ContextVar[bool] = ContextVar(
     "xagent_claimed_command", default=False
 )
+
+
+def consumes_task_commands() -> bool:
+    return not get_shared_task_execution_enabled() or get_task_execution_role() != "web"
 
 
 def enqueues_task_turns() -> bool:

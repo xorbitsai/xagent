@@ -74,8 +74,11 @@ def _web_host(pipe, env, task_id, command_id):
 
 def _execution_host(pipe, env, task_id):
     os.environ.update(env)
+    os.environ["XAGENT_TASK_EXECUTION_ROLE"] = "worker"
 
     async def run():
+        from unittest.mock import AsyncMock
+
         from xagent.core.agent.trace import (
             TraceAction,
             TraceCategory,
@@ -83,26 +86,16 @@ def _execution_host(pipe, env, task_id):
             TraceEventType,
             TraceScope,
         )
+        from xagent.web import worker
         from xagent.web.models.database import configure_db, get_session_local
         from xagent.web.models.task import Task, TaskStatus
         from xagent.web.services import agent_service_manager, task_orchestrator
-        from xagent.web.services.task_command_execution import (
-            execute_durable_task_command,
-        )
-        from xagent.web.services.task_command_transport import claim_task_command
-        from xagent.web.services.task_coordinator_runtime import close_task_coordinators
-        from xagent.web.services.task_event_bridge import (
-            start_task_event_bridge,
-            stop_task_event_bridge,
-        )
-        from xagent.web.services.task_execution import background_task_manager
+        from xagent.web.services.task_event_bridge import get_task_event_bridge
         from xagent.web.services.task_execution_context_service import (
             TaskExecutionRecoverySnapshot,
         )
-        from xagent.web.services.task_lease_service import get_runner_id
 
         configure_db()
-        bridge = await start_task_event_bridge()
         with get_session_local()() as db:
             owner_id = db.get(Task, task_id).user_id
         snapshot = SimpleNamespace(
@@ -127,11 +120,16 @@ def _execution_host(pipe, env, task_id):
             set_recovered_skill_context=lambda *args: None,
         )
 
+        executions = 0
+
         class ModelBoundary:
             async def get_agent_for_task(self, *args, **kwargs):
                 return service
 
             async def execute_task(self, **kwargs):
+                nonlocal executions
+                executions += 1
+                bridge = get_task_event_bridge()
                 for text in ("hello ", "world"):
                     await bridge.publish({"type": "delta", "text": text}, task_id)
                 event = TraceEvent(
@@ -145,23 +143,34 @@ def _execution_host(pipe, env, task_id):
                 return {"success": True, "status": "completed", "output": "hello world"}
 
         agent_service_manager.get_agent_manager = lambda: ModelBoundary()
-        background_task_manager.start_accepting()
+        worker.create_skill_manager = lambda: SimpleNamespace(initialize=AsyncMock())
+        worker.create_template_manager = lambda: SimpleNamespace(initialize=AsyncMock())
+        worker.get_sandbox_manager = lambda: None
+        worker.initialize_langfuse = lambda: None
+        worker.flush_langfuse = lambda: None
         pipe.send({"ready": True})
         await asyncio.to_thread(pipe.recv)
-        with get_session_local()() as db:
-            command = claim_task_command(db, runner_id=get_runner_id())
+        stop = asyncio.Event()
+        running = asyncio.create_task(worker.run_worker(stop=stop))
         try:
-            if command is not None:
-                await execute_durable_task_command(command)
-                pending = background_task_manager.running_tasks.get(task_id)
-                if pending is not None:
-                    await pending
-            pipe.send({"executed": command is not None})
+            async with asyncio.timeout(30):
+                while True:
+                    if running.done():
+                        await running
+                    with get_session_local()() as db:
+                        task = db.get(Task, task_id)
+                        done = (
+                            task.status == TaskStatus.COMPLETED
+                            and task.runner_id is None
+                        )
+                    if done:
+                        break
+                    await asyncio.sleep(0.05)
+            pipe.send({"executed": executions == 1})
             await asyncio.to_thread(pipe.recv)
         finally:
-            await close_task_coordinators()
-            await background_task_manager.shutdown()
-            await stop_task_event_bridge()
+            stop.set()
+            await running
 
     asyncio.run(run())
 
@@ -201,7 +210,10 @@ async def test_two_web_two_worker_delivery_and_single_execution(
         db.commit()
         task_id, owner_id = task.id, owner.id
     payload = TaskTurnPayload("hello")
+    from cryptography.fernet import Fernet
+
     env = {
+        "ENCRYPTION_KEY": Fernet.generate_key().decode(),
         "DATABASE_URL": db_url,
         "XAGENT_REDIS_URL": redis_url,
         "XAGENT_TASK_EVENT_CHANNEL_PREFIX": f"integration:{uuid4().hex}",

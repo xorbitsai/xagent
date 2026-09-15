@@ -608,7 +608,7 @@ async def stream_message(
     return _task_stream_response(bound_agent_id, task)
 
 
-@router.get("/agents/{agent_id}/tasks/{task_id}")
+@router.get("/agents/{agent_id}/tasks/{task_id:int}")
 async def get_task(
     agent_id: int,
     task_id: int,

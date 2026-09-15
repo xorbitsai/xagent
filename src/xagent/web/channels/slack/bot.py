@@ -9,7 +9,7 @@ import re
 from collections import deque
 from contextlib import suppress
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, cast
 from uuid import uuid4
 
 import httpx
@@ -19,14 +19,22 @@ from slack_sdk.socket_mode.request import SocketModeRequest
 from slack_sdk.socket_mode.response import SocketModeResponse
 from slack_sdk.web.async_client import AsyncWebClient
 
-from ....config import get_slack_app_token, get_storage_root
+from ....config import (
+    get_channel_ingress_enabled,
+    get_shared_task_execution_enabled,
+    get_slack_app_token,
+    get_storage_root,
+)
 from ....core.file_ref import build_file_id_ref
 from ...models.task import TaskStatus
 from ...services.agent_service_manager import get_agent_manager
+from ...services.channel_delivery import ChannelDelivery, recover_channel_results
 from ...services.channel_runtime import (
     ChannelAuthorizationError,
     ChannelConfigurationError,
+    ClaimedChannelTask,
     DownloadedChannelFile,
+    SelectedChannelTask,
     authorize_channel_sender,
     deactivate_channel_sync,
     load_active_channel_configs,
@@ -50,10 +58,15 @@ from ...services.file_turn import (
 )
 from ...services.llm_utils import AutoModelUnavailableError
 from ...services.managed_task_lease import ManagedTaskLease
+from ...services.shared_channel_execution import (
+    SharedChannelTurn,
+    prepare_shared_channel_turn,
+)
 from ...services.task_execution_context_service import (
     materialize_task_execution_recovery_state,
 )
 from ...services.task_lease_service import TaskLeaseLostError
+from ...services.task_orchestrator import TaskTurnPayload
 from ...services.task_setup_snapshot import load_task_setup_snapshot_sync
 from .trace_handler import SlackTraceHandler
 from .utils import (
@@ -449,12 +462,19 @@ class SlackBotInstance:
 
         claimed_task_id: int | None = None
         managed_lease: ManagedTaskLease | None = None
+        shared_turn: SharedChannelTurn | None = None
+        agent_service = None
         loading_ts: str | None = None
         try:
             prompt_text = text or "Please process the attached Slack file(s)."
             active_task_id = self.active_tasks.get(conversation_key)
             try:
-                prepared_task = await prepare_channel_task(
+                prepare = (
+                    prepare_shared_channel_turn
+                    if get_shared_task_execution_enabled()
+                    else prepare_channel_task
+                )
+                prepared_task = await prepare(
                     channel_id=self.channel_id,
                     external_user_id=slack_user_id,
                     active_task_id=active_task_id,
@@ -485,41 +505,48 @@ class SlackBotInstance:
                 )
                 return
 
-            managed_lease = prepared_task.managed_lease
-            task_id = prepared_task.task_id
+            selected_task: SelectedChannelTask | ClaimedChannelTask
+            if isinstance(prepared_task, SharedChannelTurn):
+                shared_turn = prepared_task
+                selected_task = shared_turn.selection
+            else:
+                selected_task = prepared_task
+                managed_lease = prepared_task.managed_lease
+            task_id = selected_task.task_id
             claimed_task_id = task_id
-            owner_user_id = prepared_task.user_id
-            is_new_task = prepared_task.is_new_task
+            owner_user_id = selected_task.user_id
+            is_new_task = selected_task.is_new_task
             if is_new_task:
                 self.active_tasks[conversation_key] = task_id
                 self._save_active_tasks()
 
-            setup_snapshot = await run_db_io_cancellation_safe(
-                lambda: load_task_setup_snapshot_sync(task_id, owner_user_id)
-            )
-            if setup_snapshot is None:
-                raise RuntimeError(f"Task {task_id} disappeared before execution")
+            if shared_turn is None:
+                setup_snapshot = await run_db_io_cancellation_safe(
+                    lambda: load_task_setup_snapshot_sync(task_id, owner_user_id)
+                )
+                if setup_snapshot is None:
+                    raise RuntimeError(f"Task {task_id} disappeared before execution")
 
-            agent_manager = get_agent_manager()
-            agent_service = await agent_manager.get_agent_for_task(
-                task_id,
-                user=setup_snapshot.runtime_user,
-                task_setup_snapshot=setup_snapshot,
-                task_owner_user_id=owner_user_id,
-            )
-            agent_service.set_conversation_history(
-                [dict(message) for message in setup_snapshot.conversation_history],
-                watermark=setup_snapshot.conversation_watermark,
-            )
-            recovery_state = await materialize_task_execution_recovery_state(
-                setup_snapshot.execution_recovery
-            )
-            agent_service.set_execution_context_messages(
-                recovery_state.get("messages", [])
-            )
-            agent_service.set_recovered_skill_context(
-                recovery_state.get("skill_context")
-            )
+                agent_manager = get_agent_manager()
+                agent_service = await agent_manager.get_agent_for_task(
+                    task_id,
+                    user=setup_snapshot.runtime_user,
+                    task_setup_snapshot=setup_snapshot,
+                    task_owner_user_id=owner_user_id,
+                )
+                agent_service.set_conversation_history(
+                    [dict(message) for message in setup_snapshot.conversation_history],
+                    watermark=setup_snapshot.conversation_watermark,
+                )
+                recovery_state = await materialize_task_execution_recovery_state(
+                    setup_snapshot.execution_recovery
+                )
+                agent_service.set_execution_context_messages(
+                    recovery_state.get("messages", [])
+                )
+                agent_service.set_recovered_skill_context(
+                    recovery_state.get("skill_context")
+                )
 
             turn_id = str(uuid4())
             context: dict[str, Any] = {"turn_id": turn_id}
@@ -533,6 +560,7 @@ class SlackBotInstance:
                     agent_service=agent_service,
                     task_id=task_id,
                     user_id=owner_user_id,
+                    **({"workspace": shared_turn.workspace} if shared_turn else {}),
                 )
                 if not uploaded_info:
                     raise SlackFileDownloadError(
@@ -562,13 +590,14 @@ class SlackBotInstance:
                 context["files"] = persisted_attachments
                 context["display_message"] = display_message
 
-            await persist_channel_user_message(
-                task_id=task_id,
-                user_id=owner_user_id,
-                content=display_message or prompt_text,
-                attachments=persisted_attachments or None,
-                turn_id=turn_id,
-            )
+            if shared_turn is None:
+                await persist_channel_user_message(
+                    task_id=task_id,
+                    user_id=owner_user_id,
+                    content=display_message or prompt_text,
+                    attachments=persisted_attachments or None,
+                    turn_id=turn_id,
+                )
 
             loading_ts = await self._send_text(
                 slack_channel_id,
@@ -584,33 +613,59 @@ class SlackBotInstance:
                     slack_channel_id,
                     loading_ts,
                 )
-                agent_service.tracer.add_handler(trace_handler)
+                if agent_service is not None:
+                    agent_service.tracer.add_handler(trace_handler)
 
-            from ...user_isolated_memory import UserContext
+            if shared_turn is not None:
+                shared_turn.delivery_destination = {
+                    "chat_id": slack_channel_id,
+                    "thread_ts": thread_ts,
+                    "loading_ts": loading_ts,
+                }
+                result = await shared_turn.execute(
+                    TaskTurnPayload(
+                        transcript_message=display_message or prompt_text,
+                        execution_message=execution_text,
+                        attachments=persisted_attachments or None,
+                        file_ids=tuple(
+                            item["file_id"] for item in persisted_attachments
+                        ),
+                    ),
+                    trace_handler,
+                )
+                await shared_turn.deliver(
+                    self._deliver_shared_result,
+                    pending_notice=result.get("status") == "accepted",
+                )
+                return
+            else:
+                local_service: Any = agent_service
+                local_lease = cast(ManagedTaskLease, managed_lease)
+                from ...user_isolated_memory import UserContext
 
-            actual_task_id = str(task_id)
-            try:
-                with UserContext(owner_user_id):
-                    result = await agent_manager.execute_task(
-                        agent_service=agent_service,
-                        task=execution_text,
-                        context=context,
-                        task_id=actual_task_id,
-                        tracking_task_id=actual_task_id,
-                        db_session=None,
-                        manage_task_lease=False,
-                        task_lease=managed_lease.lease,
-                        task_lease_heartbeat_task=managed_lease.heartbeat_task,
-                    )
-            finally:
-                if (
-                    trace_handler is not None
-                    and trace_handler in agent_service.tracer.handlers
-                ):
-                    agent_service.tracer.handlers.remove(trace_handler)
+                actual_task_id = str(task_id)
+                try:
+                    with UserContext(owner_user_id):
+                        result = await agent_manager.execute_task(
+                            agent_service=local_service,
+                            task=execution_text,
+                            context=context,
+                            task_id=actual_task_id,
+                            tracking_task_id=actual_task_id,
+                            db_session=None,
+                            manage_task_lease=False,
+                            task_lease=local_lease.lease,
+                            task_lease_heartbeat_task=local_lease.heartbeat_task,
+                        )
+                finally:
+                    if (
+                        trace_handler is not None
+                        and trace_handler in local_service.tracer.handlers
+                    ):
+                        local_service.tracer.handlers.remove(trace_handler)
 
             projection = project_execution_result_for_channel(result)
-            if not await managed_lease.finalize_result(
+            if managed_lease is not None and not await managed_lease.finalize_result(
                 status=projection.task_status,
                 assistant_content=projection.transcript_content,
                 interactions=projection.interactions,
@@ -692,6 +747,8 @@ class SlackBotInstance:
                     thread_ts=thread_ts,
                 )
         finally:
+            if shared_turn is not None:
+                await shared_turn.close()
             if managed_lease is not None:
                 close_task = asyncio.create_task(managed_lease.close())
                 await drain_async_task_cancellation_safe(close_task)
@@ -733,6 +790,33 @@ class SlackBotInstance:
             text = "Started a new task. Please describe your request."
         await self._send_text(channel_id, text, thread_ts=thread_ts)
 
+    async def _deliver_shared_result(
+        self, delivery: ChannelDelivery, result: dict[str, Any]
+    ) -> None:
+        projection = project_execution_result_for_channel(result)
+        destination = delivery.destination
+        output, output_files = strip_slack_file_refs(projection.visible_text)
+        await self._send_final_text(
+            channel_id=destination["chat_id"],
+            thread_ts=destination["thread_ts"],
+            loading_ts=destination["loading_ts"],
+            text=output or "Task completed.",
+        )
+        if output_files:
+            failed = await self._send_output_files(
+                refs=output_files,
+                channel_id=destination["chat_id"],
+                thread_ts=destination["thread_ts"],
+                user_id=delivery.user_id,
+                task_id=delivery.task_id,
+            )
+            if failed:
+                await self._send_file_fallback_message(
+                    refs=failed,
+                    channel_id=destination["chat_id"],
+                    thread_ts=destination["thread_ts"],
+                )
+
     async def _download_and_register_files(
         self,
         *,
@@ -740,14 +824,16 @@ class SlackBotInstance:
         agent_service: Any,
         task_id: int,
         user_id: int,
+        workspace: Any = None,
     ) -> list[dict[str, Any]]:
-        if not agent_service.workspace:
+        workspace = workspace if workspace is not None else agent_service.workspace
+        if not workspace:
             logger.warning("Agent service workspace is unavailable for Slack upload")
             return []
         target_dir = getattr(
-            agent_service.workspace,
+            workspace,
             "input_dir",
-            agent_service.workspace.workspace_dir / "input",
+            workspace.workspace_dir / "input",
         )
 
         downloaded_files: list[DownloadedChannelFile] = []
@@ -765,7 +851,7 @@ class SlackBotInstance:
                 downloaded_files.append(downloaded)
 
         registered = await register_channel_uploaded_files(
-            workspace=agent_service.workspace,
+            workspace=workspace,
             task_id=task_id,
             user_id=user_id,
             files=tuple(downloaded_files),
@@ -1193,7 +1279,21 @@ class SlackChannelManager:
         self._sync_lock = asyncio.Lock()
 
     async def start(self) -> None:
-        await self._sync_bots_async()
+        if not get_channel_ingress_enabled():
+            logger.info("Slack channel ingress disabled on this host")
+            return
+        while get_channel_ingress_enabled():
+            await self._sync_bots_async()
+            if not get_shared_task_execution_enabled():
+                return
+            for bot in (*self.bots.values(), *self.oauth_bots.values()):
+                if bot.channel_id is not None:
+                    await recover_channel_results(
+                        bot.channel_id, bot._deliver_shared_result
+                    )
+            # CRUD may reach another web replica. The designated ingress
+            # observes its committed configuration without opening extra bots.
+            await asyncio.sleep(30)
 
     async def stop(self) -> None:
         await self._stop_oauth_gateway()
@@ -1203,6 +1303,8 @@ class SlackChannelManager:
             await self._stop_bot_for_token(bot_token)
 
     async def _sync_bots_async(self) -> None:
+        if not get_channel_ingress_enabled():
+            return
         async with self._sync_lock:
             try:
                 # One load, partitioned on the declared installation_mode.

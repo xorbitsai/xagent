@@ -14,7 +14,7 @@ import logging
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Sequence, cast
 from uuid import uuid4
 
 from sqlalchemy import or_
@@ -102,6 +102,20 @@ class ClaimedChannelTask:
     task_id: int
     is_new_task: bool
     managed_lease: ManagedTaskLease
+    requested_agent_missing: bool = False
+
+
+@dataclass(frozen=True)
+class SelectedChannelTask:
+    """Authorized file-preparation target; no execution has been accepted."""
+
+    user_id: int
+    task_id: int
+    is_new_task: bool
+    channel_id: int
+    external_user_id: str
+    previous_run_id: str | None
+    state_version: int
     requested_agent_missing: bool = False
 
 
@@ -730,7 +744,8 @@ def _prepare_channel_task_sync(
     mcp_runtime_authorization_policy_identity: str | None = None,
     task_mode: ChannelTaskMode = ChannelTaskMode.DEFAULT,
     resume_run_id: str | None = None,
-) -> _ChannelTaskClaimSnapshot | None:
+    defer_execution: bool = False,
+) -> _ChannelTaskClaimSnapshot | SelectedChannelTask | None:
     if not isinstance(task_mode, ChannelTaskMode):
         raise ValueError("Unsupported channel task mode")
     if task_mode is ChannelTaskMode.ACTOR_INTERACTION:
@@ -914,6 +929,26 @@ def _prepare_channel_task_sync(
                 db.flush()
 
             task_id = int(task.id)
+            if defer_execution:
+                if task.status == TaskStatus.RUNNING:
+                    db.rollback()
+                    return None
+                if task_mode != ChannelTaskMode.DEFAULT:
+                    raise ValueError(
+                        "Actor interactions require their explicit recovery command"
+                    )
+                selection = SelectedChannelTask(
+                    user_id=owner_id,
+                    task_id=task_id,
+                    is_new_task=is_new_task,
+                    channel_id=cast(int, channel_id),
+                    external_user_id=external_user_id,
+                    previous_run_id=cast(str | None, task.run_id),
+                    state_version=int(task.state_version or 0),
+                    requested_agent_missing=requested_agent_missing,
+                )
+                db.commit()
+                return selection
             claim_predicates = ()
             if task_mode is ChannelTaskMode.ACTOR_INTERACTION:
                 assert agent_id is not None
@@ -1045,6 +1080,7 @@ async def prepare_channel_task(
         )
     )
     snapshot, cancellation = await await_task_settlement(worker)
+    assert snapshot is None or isinstance(snapshot, _ChannelTaskClaimSnapshot)
     if cancellation is not None:
         if snapshot is not None:
             try:
@@ -1069,6 +1105,7 @@ async def prepare_channel_task(
 
     if snapshot is None:
         return None
+    assert isinstance(snapshot, _ChannelTaskClaimSnapshot)
 
     try:
         managed_lease = start_managed_task_lease(snapshot.lease)

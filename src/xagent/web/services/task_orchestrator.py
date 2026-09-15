@@ -97,6 +97,7 @@ from .mcp_runtime import (
     MCPBuiltinOAuthActorPolicy,
     MCPBuiltinOAuthActorPolicyRequiredError,
 )
+from .task_command_transport import ClaimedTaskCommand
 from .task_execution_controller import (
     TaskControlState,
     apply_task_control_transition,
@@ -1952,6 +1953,7 @@ def _schedule_bg(
     context: Optional[Dict[str, Any]],
     before_message_id: Optional[int] = None,
     mcp_runtime_authorization_policy: MCPBuiltinOAuthActorPolicy | None = None,
+    channel_command: ClaimedTaskCommand | None = None,
 ) -> "asyncio.Task[None]":
     """Lease-aware bg scheduler.
 
@@ -2096,7 +2098,11 @@ def _schedule_bg(
                     execution_context = _execution_context_with_turn_id(
                         context, payload.turn_id, files=payload.attachments
                     )
-                    if get_shared_task_execution_enabled() and payload.file_ids:
+                    if (
+                        channel_command is None
+                        and get_shared_task_execution_enabled()
+                        and payload.file_ids
+                    ):
                         from ..models.database import get_session_local
                         from .file_turn import (
                             normalize_attachments_for_persistence,
@@ -2123,22 +2129,33 @@ def _schedule_bg(
                                 "files": normalize_attachments_for_persistence(infos),
                             }
                         )
-                    await execute_task_background(
-                        task_id=task_id,
-                        user_message=payload.transcript_message,
-                        context=execution_context,
-                        agent_manager=_get_agent_manager(),
-                        task_owner_user_id=task_owner_user_id,
-                        before_message_id=before_message_id,
-                        llm_user_message=payload.execution_message,
-                        task_setup_snapshot=snapshot,
-                        expected_run_id=lease.run_id,
-                        task_lease=lease,
-                        resolved_execution_scope=scope,
-                        mcp_runtime_authorization_policy=(
-                            mcp_runtime_authorization_policy
-                        ),
-                    )
+                    if channel_command is not None:
+                        from .shared_channel_execution import execute_channel_background
+
+                        await execute_channel_background(
+                            command=channel_command,
+                            lease=lease,
+                            heartbeat_task=hb_task,
+                            snapshot=snapshot,
+                            payload=payload,
+                        )
+                    else:
+                        await execute_task_background(
+                            task_id=task_id,
+                            user_message=payload.transcript_message,
+                            context=execution_context,
+                            agent_manager=_get_agent_manager(),
+                            task_owner_user_id=task_owner_user_id,
+                            before_message_id=before_message_id,
+                            llm_user_message=payload.execution_message,
+                            task_setup_snapshot=snapshot,
+                            expected_run_id=lease.run_id,
+                            task_lease=lease,
+                            resolved_execution_scope=scope,
+                            mcp_runtime_authorization_policy=(
+                                mcp_runtime_authorization_policy
+                            ),
+                        )
 
                 await run_while_task_lease_owned(
                     execute_owned_run(),

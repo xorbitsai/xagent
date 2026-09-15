@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, cast
 
 from cryptography.fernet import Fernet, InvalidToken
@@ -11,7 +11,10 @@ from sqlalchemy import delete, exists, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 
-from ...config import get_task_runtime_secrets_encryption_key
+from ...config import (
+    get_task_runtime_secrets_encryption_key,
+    get_task_runtime_secrets_ttl_seconds,
+)
 from ...core.tools.adapters.vibe.connector_runtime import (
     ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
     ERROR_RUNTIME_SECRET_UNAVAILABLE,
@@ -64,7 +67,7 @@ def stage_runtime_values(
     Bind them to the accepted run with ``bind_runtime_values_to_run`` before
     committing this same transaction. Unbound inputs must not be committed.
     Terminal settlement and the recovery sweep remove finished or replaced
-    runs; paused and waiting runs retain their inputs without an independent TTL.
+    runs; paused and waiting runs retain their inputs until the configured TTL.
     """
     if not values_by_ref:
         return
@@ -142,6 +145,13 @@ def load_runtime_values(
         if required:
             raise _unavailable()
         return None
+    created_at = row.created_at
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+    if created_at + timedelta(
+        seconds=get_task_runtime_secrets_ttl_seconds()
+    ) <= datetime.now(timezone.utc):
+        raise _unavailable()
     owner = db.execute(
         select(User.actor_subject).where(User.id == task.user_id)
     ).scalar_one_or_none()
@@ -193,7 +203,7 @@ def clean_finished_runtime_values(
     """Remove a bounded page of finished or replaced runs; return the next cursor.
 
     Page before filtering lifecycle state so active inputs cannot make a sweep
-    unbounded. Paused and waiting runs retain their values without a TTL.
+    unbounded. Paused and waiting runs retain values only until the configured TTL.
     Scope and lifecycle are checked again by DELETE in the same transaction.
     """
     page = select(TaskRuntimeSecret.id).order_by(TaskRuntimeSecret.id).limit(batch_size)
@@ -224,12 +234,16 @@ def clean_finished_runtime_values(
             ),
         )
     )
+    expired = TaskRuntimeSecret.created_at <= (
+        datetime.now(timezone.utc)
+        - timedelta(seconds=get_task_runtime_secrets_ttl_seconds())
+    )
     with get_session_local()() as db:
         rows = db.execute(page).scalars().all()
         if rows:
             db.execute(
                 delete(TaskRuntimeSecret)
-                .where(TaskRuntimeSecret.id.in_(rows), finished)
+                .where(TaskRuntimeSecret.id.in_(rows), finished | expired)
                 .execution_options(synchronize_session=False)
             )
         db.commit()

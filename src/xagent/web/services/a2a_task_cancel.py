@@ -8,6 +8,8 @@ from ..models.database import get_session_local
 from ..models.task import Task, TaskStatus
 from .a2a_protocol import A2ATaskSnapshot, a2a_error
 from .db_runtime import run_db_io_cancellation_safe
+from .task_coordinator_runtime import current_task_coordinator
+from .task_coordinator_service import lock_task_lease_no_commit, task_lease_predicate
 from .task_execution_controller import StaleTaskRunError, TaskControlState
 from .task_lease_service import task_settlement_ownership_values
 
@@ -119,6 +121,11 @@ def _finalize_a2a_cancel_sync(
 
     SessionLocal = get_session_local()
     with SessionLocal() as db:
+        coordinator = current_task_coordinator(task_id)
+        if coordinator is not None:
+            assert coordinator.lease is not None
+            if not lock_task_lease_no_commit(db, coordinator.lease):
+                raise StaleTaskRunError(f"task {task_id} cancellation owner changed")
         task = (
             db.query(Task)
             .filter(
@@ -149,8 +156,12 @@ def _finalize_a2a_cancel_sync(
             and current_state_version == expected_state_version + 1
             and task.status == TaskStatus.FAILED
             and task.control_state == TaskControlState.FAILED.value
-            and task.runner_id is None
-            and task.lease_expires_at is None
+            # Shared execution retains the coordinator lease until this
+            # command and the cancelled execution have both drained.
+            and (
+                coordinator is not None
+                or (task.runner_id is None and task.lease_expires_at is None)
+            )
         )
         direct_cancel = (
             same_run
@@ -198,11 +209,17 @@ def _finalize_a2a_cancel_sync(
             statement = statement.where(
                 Task.status == TaskStatus.FAILED,
                 Task.control_state == TaskControlState.FAILED.value,
-                Task.runner_id.is_(None),
-                Task.lease_expires_at.is_(None),
             )
         else:
             statement = statement.where(Task.status.notin_(_TERMINAL_STATUSES))
+
+        if coordinator is not None:
+            assert coordinator.lease is not None
+            statement = statement.where(task_lease_predicate(coordinator.lease))
+        elif settled_local_cancel:
+            statement = statement.where(
+                Task.runner_id.is_(None), Task.lease_expires_at.is_(None)
+            )
 
         updated = db.execute(
             statement.returning(Task).execution_options(synchronize_session=False)

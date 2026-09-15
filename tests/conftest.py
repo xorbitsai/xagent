@@ -62,6 +62,17 @@ else:
     print("Warning: Neither .env nor example.env file found")
 
 
+@pytest.fixture(autouse=True)
+def local_execution_unless_selected(monkeypatch):
+    """Existing suites select local execution; shared suites opt in explicitly."""
+    # A reachable CI Redis must not silently enable shared caches or rate limits.
+    # Tests that exercise Redis opt in explicitly after this fixture.
+    monkeypatch.delenv("XAGENT_REDIS_URL", raising=False)
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "false")
+    monkeypatch.setenv("XAGENT_TASK_EXECUTION_ROLE", "combined")
+    monkeypatch.delenv("XAGENT_CHANNEL_INGRESS_ENABLED", raising=False)
+
+
 def pytest_addoption(parser):
     parser.addoption(
         "--run-special",

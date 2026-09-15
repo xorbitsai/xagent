@@ -501,3 +501,81 @@ async def test_shutdown_drains_command_waiting_for_execution_cleanup(host):
     with get_session_local()() as db:
         assert db.get(Task, first.task_id).runner_id is None
         assert db.get(TaskExecutionCommand, command.id).status == "processing"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["start", "resume_input"])
+async def test_real_claim_during_committed_handoff_keeps_lease_and_waits(
+    host, monkeypatch, kind
+):
+    from xagent.web.services import (
+        task_command_execution,
+    )
+    from xagent.web.services import task_command_transport as transport
+    from xagent.web.services import task_coordinator_runtime as runtime
+    from xagent.web.services import (
+        task_resume_command,
+        task_start_consumer,
+    )
+
+    first = await create(host)
+    coordinator = await runtime.get_task_coordinator_registry().ensure(first.task_id)
+    initial = claim(first.task_id)
+    committed, register, child_end, applied = (asyncio.Event() for _ in range(4))
+
+    async def handoff():
+        result = await asyncio.to_thread(
+            task_start_consumer._commit_handoff, initial, coordinator.lease
+        )
+        assert result.claimed.task_lease is not None
+        committed.set()
+        await register.wait()
+        coordinator.track_execution(asyncio.create_task(child_end.wait()))
+
+    original = asyncio.create_task(coordinator.execute_command(initial, handoff))
+    await asyncio.wait_for(committed.wait(), 5)
+    with get_session_local()() as db:
+        row = db.get(Task, first.task_id)
+        before = (row.run_id, row.runner_id, row.lease_attempt_id)
+        transport.stage_task_command(
+            db,
+            task_id=first.task_id,
+            actor_user_id=host.owner,
+            command_id="competing",
+            kind=transport.TaskCommandKind(kind),
+            payload={},
+            target_run_id=row.run_id,
+        )
+        db.commit()
+    competitor = claim(first.task_id)
+    assert competitor is not None
+    with get_session_local()() as db:
+        row = db.get(Task, first.task_id)
+        assert (row.run_id, row.runner_id, row.lease_attempt_id) == before
+
+    async def apply(command):
+        applied.set()
+
+    module, name = (
+        (task_start_consumer, "execute_task_start")
+        if kind == "start"
+        else (task_resume_command, "execute_resume_input")
+    )
+    monkeypatch.setattr(module, name, apply)
+    competing = asyncio.create_task(
+        task_command_execution.execute_durable_task_command(competitor)
+    )
+    try:
+        await asyncio.sleep(0.05)
+        assert not applied.is_set()
+        register.set()
+        await original
+        await asyncio.sleep(0.05)
+        assert not applied.is_set()
+        child_end.set()
+        await asyncio.wait_for(competing, 5)
+        assert applied.is_set()
+    finally:
+        register.set()
+        child_end.set()
+        await asyncio.gather(original, competing, return_exceptions=True)

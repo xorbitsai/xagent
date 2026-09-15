@@ -272,6 +272,26 @@ def _commit_handoff(
             or (start.kind == "create" and task.status != TaskStatus.PENDING)
         ):
             return _reject_start(db, row, "start_state_changed")
+        if start.channel is not None:
+            from .channel_runtime import (
+                ChannelAuthorizationError,
+                ChannelConfigurationError,
+                _load_channel_owner_sync,
+            )
+
+            try:
+                channel_owner = _load_channel_owner_sync(
+                    db,
+                    channel_id=start.channel.channel_id,
+                    external_user_id=start.channel.external_user_id,
+                )
+            except (ChannelAuthorizationError, ChannelConfigurationError):
+                return _reject_start(db, row, "channel_unavailable")
+            if (
+                task.channel_id != start.channel.channel_id
+                or channel_owner.user_id != task.user_id
+            ):
+                return _reject_start(db, row, "channel_identity_changed")
         try:
             actor_policy = load_shared_actor_policy(
                 task, is_create=start.kind == "create"
@@ -399,6 +419,36 @@ async def _execute_task_start(command: ClaimedTaskCommand) -> SettledTaskCommand
         for key in ("trigger_id", "trigger_run_id", "trigger_type", "trigger_test"):
             if key in config:
                 context[key] = config[key]
+        if start.kind == "channel":
+            from .task_orchestrator import _schedule_bg, settle_task_lease_isolated
+
+            try:
+                _schedule_bg(
+                    task_id=command.task_id,
+                    task_owner_user_id=handoff.task_owner_user_id,
+                    task_source=handoff.claimed.task_source,
+                    run_id=start.run_id,
+                    task_lease=handoff.claimed.task_lease,
+                    payload=TaskTurnPayload(
+                        transcript_message=start.message,
+                        execution_message=start.execution_message,
+                        file_ids=tuple(start.file_ids),
+                        turn_id=start.turn_id,
+                    ),
+                    force_fresh=False,
+                    context=None,
+                    before_message_id=start.before_message_id,
+                    channel_command=command,
+                )
+            except BaseException:
+                await run_db_io_cancellation_safe(
+                    lambda: settle_task_lease_isolated(
+                        handoff.claimed.task_lease,
+                        error_message="Channel execution scheduling failed",
+                    )
+                )
+                raise
+            return SettledTaskCommand({"run_id": start.run_id})
         if start.kind == "existing":
             from .task_orchestrator import _schedule_bg, settle_task_lease_isolated
 

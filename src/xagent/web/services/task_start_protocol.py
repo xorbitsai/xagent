@@ -36,6 +36,14 @@ class ExistingExecutionContext(BaseModel):
     examples: list[JsonValue] | None = None
 
 
+class ChannelExecutionContext(BaseModel):
+    """Trusted channel and sender identity, revalidated on the worker."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+    channel_id: Annotated[int, Field(gt=0)]
+    external_user_id: Annotated[str, Field(min_length=1)]
+
+
 class TaskStartPayload(BaseModel):
     """JSON-only inputs not recoverable from the task configuration alone.
 
@@ -60,7 +68,7 @@ class TaskStartPayload(BaseModel):
     state_version: Annotated[int, Field(ge=0)]
     expected_run_id: _Identity | None = None
     turn_id: _Identity
-    kind: Literal["create", "append", "existing"]
+    kind: Literal["create", "append", "existing", "channel"]
     message: str
     execution_message: str | None = None
     file_ids: list[_FileId] = Field(default_factory=list)
@@ -69,6 +77,7 @@ class TaskStartPayload(BaseModel):
     force_fresh: bool = False
     runtime_values_ref: _Identity | None = None
     existing_context: ExistingExecutionContext | None = None
+    channel: ChannelExecutionContext | None = None
 
     @model_validator(mode="after")
     def validate_turn_kind(self) -> Self:
@@ -77,6 +86,10 @@ class TaskStartPayload(BaseModel):
             and self.runtime_values_ref != self.turn_id
         ):
             raise ValueError("Runtime values must belong to the accepted turn")
+        if (self.kind == "channel") != (self.channel is not None):
+            raise ValueError(
+                "Channel execution requires its explicit channel reference"
+            )
         if self.kind == "existing":
             if (
                 self.file_ids
@@ -103,6 +116,8 @@ def stage_task_start_command(
     task_id: int,
     actor_user_id: int,
     start: TaskStartPayload,
+    reply_host_id: str | None = None,
+    reply_origin: str | None = None,
 ) -> StagedTaskCommand:
     """Stage START as the last write of the caller's acceptance transaction.
 
@@ -149,6 +164,8 @@ def stage_task_start_command(
         kind=TaskCommandKind.START,
         payload=start.model_dump(mode="json"),
         target_run_id=start.run_id,
+        reply_host_id=reply_host_id,
+        reply_origin=reply_origin,
     )
 
 

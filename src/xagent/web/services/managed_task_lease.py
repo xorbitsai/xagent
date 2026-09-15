@@ -54,6 +54,7 @@ def finalize_managed_task_lease_result(
     # closure across that thread boundary for a while, and it can carry
     # large structures such as file_outputs with no truncation applied.
     execution_result: Mapping[str, Any] | None = None,
+    completion: tuple[int, dict[str, Any]] | None = None,
 ) -> bool:
     """Atomically persist one inline transport result under its exact lease."""
 
@@ -98,6 +99,28 @@ def finalize_managed_task_lease_result(
                 interactions=(interactions if status != TaskStatus.FAILED else None),
                 message_type=history_message_type,
                 turn_id=turn_id,
+            )
+        if completion is not None:
+            from ..models.task_command import TaskExecutionCommand
+
+            command_id, channel_result = completion
+            command = db.get(TaskExecutionCommand, command_id)
+            if (
+                command is None
+                or command.task_id != lease.task_id
+                or command.status != "completed"
+                or command.result
+                != {"run_id": lease.run_id, "lease_attempt_id": lease.attempt_id}
+            ):
+                db.rollback()
+                return False
+            setattr(
+                command, "result", {**command.result, "channel_result": channel_result}
+            )
+            setattr(
+                task,
+                "output",
+                history_content if status == TaskStatus.COMPLETED else None,
             )
         db.commit()
     except Exception:

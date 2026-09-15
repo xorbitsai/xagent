@@ -210,15 +210,16 @@ async def test_failed_admission_with_due_trigger_launches_no_background_work(
 
 
 @pytest.mark.asyncio
-async def test_unwired_shared_execution_refuses_startup_before_database(monkeypatch):
+async def test_unconfigured_shared_execution_refuses_startup_before_database(
+    monkeypatch,
+):
     monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    monkeypatch.delenv("XAGENT_REDIS_URL", raising=False)
     initialize = AsyncMock()
     monkeypatch.setattr(
         app_module, "_initialize_database_and_admit_runtime", initialize
     )
-    with pytest.raises(
-        RuntimeError, match="XAGENT_SHARED_TASK_EXECUTION_ENABLED must remain false"
-    ):
+    with pytest.raises(ValueError, match="requires XAGENT_REDIS_URL"):
         await app_module.startup_event()
     initialize.assert_not_awaited()
 

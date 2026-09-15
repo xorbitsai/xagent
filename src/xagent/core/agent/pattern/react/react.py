@@ -90,9 +90,13 @@ from ...context.enrichment import (
     pending_user_response_lifecycle,
     pending_user_response_marker,
 )
+from ...context.execution import (
+    note_compaction_evidence_loss,
+    tool_evidence_state,
+)
 from ...context.memory_tool import build_memory_tools
 from ...context.skill_tool import build_load_skill_tool
-from ...grounding import grounding_rule
+from ...grounding import evidence_facts, grounding_rule
 from ...language import final_answer_language_rule
 from ...result import (
     CONTROL_TOOL_NAMES,
@@ -746,25 +750,55 @@ class ReActPattern(AgentPattern):
                 "iteration": iteration,
                 **resolved_llm_metadata(call_llm),
             }
-            await runtime.compact_context_if_needed(
-                context=context,
-                # Fall back to the main model when no compact model is
-                # configured. PatternRuntime skips summarization entirely
-                # without one and drops all but the last few messages
-                # instead, losing what the agent actually did; agent preview
-                # and delegated sub-agents resolve the compact slot on their
-                # own and validate only the default model, so an empty slot
-                # is ordinary rather than exceptional.
-                #
-                # Substituting here, rather than defaulting the field further
-                # up, keeps "unset" distinguishable from "explicitly set to
-                # the main model" -- and hands compaction the *resolved*
-                # per-call model, so a virtual model reuses this turn's
-                # routing decision instead of routing again on the compaction
-                # prompt, whose only user message is the whole transcript.
-                llm=compact_llm if compact_llm is not None else call_llm,
-                metadata={"iteration": iteration},
-            )
+            # A forced turn's schema is already down to final_answer alone,
+            # so compacting here deletes the values it must answer from and
+            # closes the only route back to them in the same breath. Every
+            # other turn still holds its tools and can fetch a compacted-away
+            # value again. The cost is deliberate: this turn can now exceed
+            # the model's window and fail instead of answering.
+            if force_final_answer_now:
+                # Measures the one new failure mode this change introduces,
+                # so it carries no switch. Numbers and ids only -- never
+                # message text, a tool name, or a tool argument. The estimate
+                # counts what this turn actually sends -- the same messages
+                # and the one tool schema handed to the call below -- so it is
+                # comparable with the threshold logged beside it.
+                context_tokens = context.estimate_context_tokens(
+                    route_messages, tool_schemas
+                )
+                threshold = context.compact_config.threshold
+                logger.info(
+                    "Forced-answer turn did not compact. execution_id=%s "
+                    "iteration=%s context_tokens=%s threshold=%s "
+                    "over_threshold=%s",
+                    context.execution_id,
+                    iteration,
+                    context_tokens,
+                    threshold,
+                    context_tokens > threshold,
+                )
+            else:
+                compact_result = await runtime.compact_context_if_needed(
+                    context=context,
+                    # Fall back to the main model when no compact model is
+                    # configured. PatternRuntime skips summarization entirely
+                    # without one and drops all but the last few messages
+                    # instead, losing what the agent actually did; agent
+                    # preview and delegated sub-agents resolve the compact
+                    # slot on their own and validate only the default model,
+                    # so an empty slot is ordinary rather than exceptional.
+                    #
+                    # Substituting here, rather than defaulting the field
+                    # further up, keeps "unset" distinguishable from
+                    # "explicitly set to the main model" -- and hands
+                    # compaction the *resolved* per-call model, so a virtual
+                    # model reuses this turn's routing decision instead of
+                    # routing again on the compaction prompt, whose only user
+                    # message is the whole transcript.
+                    llm=compact_llm if compact_llm is not None else call_llm,
+                    metadata={"iteration": iteration},
+                )
+                note_compaction_evidence_loss(context, compact_result)
 
             messages = self._messages_for_llm(
                 context,
@@ -1165,13 +1199,48 @@ class ReActPattern(AgentPattern):
     ) -> list[dict[str, Any]]:
         messages = list(context.get_messages_for_llm())
         if force_final_answer:
+            # One body with switched phrases: hand-written duplicates would
+            # drift, and the weaker copy lands on the turn that invents a
+            # value. The outcome rule stays a conditional, because a removed
+            # observation is not a removed action -- a write whose result
+            # message was dropped still happened. A summary standing above
+            # says to re-query the source, which this turn cannot do; the
+            # sentence right after it in that summary -- report the value as
+            # unavailable -- is the branch a forced turn lands on. The third
+            # branch states that the engine cannot tell, because a payload
+            # written before the marker existed supports neither answer.
+            state = tool_evidence_state(context)
+            if state == "intact":
+                source_phrase = " using the accumulated conversation and tool results"
+                outcome_rule = (
+                    "Set outcome=completed only when "
+                    "every requested action or verification succeeded; otherwise set "
+                    "outcome=partial or outcome=blocked and say what remains. "
+                )
+            elif state == "removed":
+                source_phrase = ""
+                outcome_rule = (
+                    "Do not rest an outcome=completed claim on an observation "
+                    "that was removed; set outcome=partial when part of the "
+                    "request is still answerable from what remains and "
+                    "outcome=blocked when none of it is. "
+                )
+            else:
+                source_phrase = ""
+                outcome_rule = (
+                    "Do not rest an outcome=completed claim on an observation "
+                    "you cannot read in this context; set outcome=partial when "
+                    "part of the request is still answerable from what you can "
+                    "read and outcome=blocked when none of it is. "
+                )
+            evidence_facts_text = evidence_facts(state)
             instruction = (
                 "Produce the final user-facing answer by calling the final_answer "
-                "control tool exactly once using the accumulated conversation and "
-                "tool results. Do not call any other tool and do not output "
-                "tool-call markup as plain text. Set outcome=completed only when "
-                "every requested action or verification succeeded; otherwise set "
-                "outcome=partial or outcome=blocked and say what remains. If a "
+                f"control tool exactly once{source_phrase}. "
+                f"{evidence_facts_text}"
+                "Do not call any other tool and do not output "
+                f"tool-call markup as plain text. {outcome_rule}"
+                "If a "
                 "previous ask_user_question narrowed the request to a selected "
                 "subset of items or resources, the final answer must cover only "
                 "that subset — leave out anything outside it even if an earlier "
@@ -3389,14 +3458,43 @@ class ReActPattern(AgentPattern):
                 pattern=self,
                 metadata={**metadata, "decision": decision},
             )
+            # This text lands in the context, not in a per-turn prompt, so
+            # the forced turn that reads it next would otherwise be told to
+            # answer from results a compaction may already have removed.
+            state = tool_evidence_state(context)
+            source_phrase = (
+                "the accumulated conversation and tool results"
+                if state == "intact"
+                else "what this conversation still contains"
+            )
+            if state == "intact":
+                evidence_note = ""
+            elif state == "removed":
+                evidence_note = (
+                    "Compaction has removed tool observations from this run, so "
+                    "some earlier results are no longer readable; do not "
+                    "reconstruct them. "
+                )
+            else:
+                evidence_note = (
+                    "Whether compaction removed tool observations from this run "
+                    "cannot be determined, so do not reconstruct a value you "
+                    "cannot read here. "
+                )
+            shortfall_clause = (
+                "the accumulated results are insufficient or show the "
+                "task is incomplete"
+                if state == "intact"
+                else "what remains is insufficient or shows the task is incomplete"
+            )
             context.add_system_message(
                 "Repeated tool decision completion guidance:\n"
                 "The repeated-tool decision selected final_answer, so the next "
                 "normal ReAct step must produce the final user-facing answer from "
-                "the accumulated conversation and tool results. Do not call more "
+                f"{source_phrase}. {evidence_note}Do not call more "
                 "tools in that final step. Do not send a progress update or promise "
-                "future work as the final answer; if the accumulated results are "
-                "insufficient or show the task is incomplete, say that directly.",
+                f"future work as the final answer; if {shortfall_clause}, "
+                "say that directly.",
                 metadata={
                     "source": "repeated_tool_decision",
                     **metadata,
@@ -3500,20 +3598,38 @@ class ReActPattern(AgentPattern):
             latest_user_text(context) or "",
             limit=400,
         )
+        # This call decides whether the run goes to a forced answer turn at
+        # all, so it must not be asked whether accumulated results suffice
+        # while a compaction has already removed some of them.
+        state = tool_evidence_state(context)
+        completion_clause = (
+            "the accumulated tool results have completed the user's requested work"
+            if state == "intact"
+            else "what this conversation still contains has completed the user's "
+            "requested work"
+        )
+        sufficiency_clause = (
+            "the conversation and accumulated tool results are "
+            "sufficient to answer the latest user request"
+            if state == "intact"
+            else "what this conversation still contains is sufficient to answer "
+            "the latest user request"
+        )
+        evidence_facts_text = evidence_facts(state)
         request_anchor = (
             "Latest user request text:\n"
             f"{current_request or '(unavailable)'}\n\n"
-            "Use this as the controlling request when deciding whether the "
-            "accumulated tool results have completed the user's requested work."
+            "Use this as the controlling request when deciding whether "
+            f"{completion_clause}."
         )
         prompt = (
             f"You must call {REACT_DECISION_TOOL_NAME} exactly once. Decide whether "
             "the current ReAct run should finish or make another work-tool call. "
             f"{request_anchor} "
+            f"{evidence_facts_text}"
             f"You have just made {call_context} action must be "
             f"{REACT_DECISION_FINAL_ANSWER} or {REACT_DECISION_TOOL_CALL}. Choose "
-            f"{REACT_DECISION_FINAL_ANSWER} when the conversation and accumulated "
-            "tool results are sufficient to answer the latest user request. A "
+            f"{REACT_DECISION_FINAL_ANSWER} when {sufficiency_clause}. A "
             "final answer means the latest user request is already completed; if "
             "the next user-facing answer would describe a future tool action or "
             "say work is still in progress, choose tool_call instead. Choose "

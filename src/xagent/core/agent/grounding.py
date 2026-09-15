@@ -15,9 +15,14 @@ pattern, which owns the user-interaction policy this module cannot see.
 
 This is the proposal-A mitigation from issue #1235. It forbids unsourced values
 by default and makes reporting the gap the instructed response, but it cannot
-repair a session whose evidence compaction already discarded.
-Proposals B (evidence-preserving compaction) and C (provenance tracking and a
-data-source gate) remain open.
+repair a session whose evidence compaction already discarded. ReAct's forced
+answer turn no longer compacts, so that turn's tool observations survive to be
+answered from; no other turn's compaction behavior is changed, and
+``EVIDENCE_REMOVED_FACTS`` below is what a prompt states once a compaction on
+this context has removed observations, and ``EVIDENCE_UNKNOWN_FACTS`` is what
+it states for a payload old enough that the engine cannot tell either way;
+``evidence_facts`` selects between them. Proposal C (provenance tracking and a
+data-source gate) remains open.
 
 The entity-attribution sentence covers a distinct failure the rest of this
 rule does not: a value that a tool result genuinely returned, reported under
@@ -36,6 +41,48 @@ VALUE_KINDS = (
     "a number, a person or organization name, an identifier or reference "
     "code, a date, a status, or a row of a table"
 )
+
+# What a prompt states once a compaction on this context has removed tool
+# observations: what happened, and what the model may not do about it. Held as
+# one shared literal because every prompt that carries it must state the same
+# facts -- two hand-written copies would drift, and the call that got the
+# weaker copy is exactly the one that invents a value.
+EVIDENCE_REMOVED_FACTS = (
+    "Compaction removed tool observations from this run's context and their "
+    "values can no longer be read. If a compaction summary stands above, "
+    "treat any value not literally present in that summary -- "
+    f"{VALUE_KINDS} -- as unavailable rather than recalled. Do not "
+    "reconstruct, estimate, or illustrate a removed value, and do not "
+    "present one as an example. "
+)
+
+# The same statement for a run whose payload never carried the marker: the
+# engine cannot tell a lossless old run from a lossy one, so this states the
+# uncertainty instead of either answer, and then imposes the same prohibition.
+# Held beside EVIDENCE_REMOVED_FACTS for the same reason that one is shared:
+# the call that got the weaker copy is the one that invents a value.
+EVIDENCE_UNKNOWN_FACTS = (
+    "This context carries no record of whether compaction removed tool "
+    "observations from it, so that cannot be determined. Treat any value "
+    "not literally present in the context -- "
+    f"{VALUE_KINDS} -- as unavailable rather than recalled. Do not "
+    "reconstruct, estimate, or illustrate such a value, and do not present "
+    "one as an example. "
+)
+
+
+def evidence_facts(state: str) -> str:
+    """The statement a tool-less answer prompt carries for one evidence state.
+
+    Empty only for ``"intact"``. An unrecognized state falls to the removed
+    wording rather than to silence: silence is the branch that puts the
+    fabricated answer back.
+    """
+    if state == "intact":
+        return ""
+    if state == "unknown":
+        return EVIDENCE_UNKNOWN_FACTS
+    return EVIDENCE_REMOVED_FACTS
 
 
 def grounding_rule(*, can_call_tools: bool = True) -> str:

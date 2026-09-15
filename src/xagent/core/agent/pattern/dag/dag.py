@@ -19,8 +19,9 @@ from ...context.enrichment import (
     pending_user_response_marker,
     top_level_user_request,
 )
+from ...context.execution import tool_evidence_state
 from ...frame import ExecutionFrame, ExecutionSnapshot, ExecutionStatus
-from ...grounding import grounding_rule
+from ...grounding import evidence_facts, grounding_rule
 from ...language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
     effective_output_language,
@@ -1570,6 +1571,11 @@ class DAGPattern(AgentPattern):
             "candidate_output": self._final_output(),
             "previous_completion_feedback": self.completion_feedback,
         }
+        # This call writes the answer the user receives, with no tool to fetch
+        # anything back, and its payload filters out system messages -- so the
+        # compaction summary never reaches it and this is the only place the
+        # loss can be stated.
+        evidence_rule = evidence_facts(tool_evidence_state(context))
         return [
             {
                 "role": "system",
@@ -1588,6 +1594,7 @@ class DAGPattern(AgentPattern):
                     "missing, choose status=incomplete, leave answer empty, and "
                     "state the missing work plus concise replan instructions. Put "
                     "status before answer in the tool arguments. "
+                    f"{evidence_rule}"
                     "When writing the answer field, including any content carried "
                     "over from candidate_output or step_results: "
                     f"{grounding_rule(can_call_tools=False)}\n\n"

@@ -18,6 +18,11 @@ from ...context.enrichment import (
     SKILL_CONTEXT_METADATA_KEY,
     enrich_context_with_memory,
 )
+from ...context.execution import (
+    EvidenceState,
+    note_compaction_evidence_loss,
+    tool_evidence_state,
+)
 from ...context.skill_tool import (
     LOAD_SKILL_TOOL_NAME,
     LOADED_SKILLS_METADATA_KEY,
@@ -26,7 +31,7 @@ from ...context.skill_tool import (
     build_load_skill_tool,
 )
 from ...frame import ExecutionFrame, ExecutionSnapshot, ExecutionStatus
-from ...grounding import VALUE_KINDS, grounding_rule
+from ...grounding import VALUE_KINDS, evidence_facts, grounding_rule
 from ...language import (
     final_answer_language_rule,
     reset_metadata_output_language,
@@ -794,12 +799,13 @@ class AutoPattern(AgentPattern):
             messages=context.get_messages_for_llm(),
             context=context,
         )
-        await runtime.compact_context_if_needed(
+        compact_result = await runtime.compact_context_if_needed(
             context=context,
             # See ReActPattern for why the fallback lives at the call site.
             llm=compact_llm if compact_llm is not None else route_llm,
             metadata={"phase": "auto_decision"},
         )
+        note_compaction_evidence_loss(context, compact_result)
 
         retry_feedback: str | None = None
         attempt = 0
@@ -814,6 +820,10 @@ class AutoPattern(AgentPattern):
                 tools,
                 memory_tools_available=memory_tools_available,
                 skill_loading_available=skill_loading_available,
+                # Recomputed on every parse retry on purpose: the state only
+                # ever moves toward removed, so a compaction between two
+                # attempts must not be missed.
+                evidence_state=tool_evidence_state(context),
             )
             routing_tools = [self._decision_tool_schema()]
             if skill_loading_available and load_skill_tool is not None:
@@ -1245,6 +1255,7 @@ class AutoPattern(AgentPattern):
         *,
         memory_tools_available: bool = False,
         skill_loading_available: bool = False,
+        evidence_state: EvidenceState,
     ) -> str:
         memory_rule = (
             "If the latest user message asks to remember, store, forget, or "
@@ -1301,6 +1312,7 @@ class AutoPattern(AgentPattern):
             "when action is final_answer, you must include a complete non-empty "
             "answer field in the same tool call. Put action before answer in the "
             "tool arguments. "
+            f"{evidence_facts(evidence_state)}"
             f"When writing that answer field: {grounding_rule(can_call_tools=False)} "
             "If the answer would need any value the rule above forbids you to "
             f"supply -- {VALUE_KINDS} -- that no source here supports, set "

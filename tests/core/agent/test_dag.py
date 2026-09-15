@@ -22,6 +22,10 @@ from xagent.core.agent import (
     PlanStep,
     PlanValidationError,
 )
+from xagent.core.agent.checkpoint import (
+    CheckpointPersistenceError,
+    TraceCheckpointStore,
+)
 from xagent.core.agent.clarification import (
     ClarificationDraft,
     draft_from_waiting_request,
@@ -39,6 +43,7 @@ from xagent.core.agent.pattern.dag.plan_generator import (
     PLAN_GENERATION_REQUIRED_TOOL_MESSAGE,
     PlanLanguageMismatchError,
 )
+from xagent.core.agent.pattern.react import ReActPattern
 from xagent.core.memory.core import MemoryNote as StoredMemoryNote
 from xagent.core.memory.core import MemoryResponse
 from xagent.core.model.chat.types import ChunkType, StreamChunk
@@ -683,6 +688,163 @@ async def test_dag_step_runtime_forwards_llm_error_with_step_metadata() -> None:
             },
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_dag_step_checkpoint_rolls_back_child_snapshot_on_failure() -> None:
+    class FailingRuntime(PatternRuntime):
+        async def checkpoint(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            raise CheckpointPersistenceError("checkpoint unavailable")
+
+    dag = DAGPattern(lambda **_: build_plan())
+    dag._set_active_step_context("creative", {"marker": "old-context"})
+    dag._set_active_step_pattern_state("creative", {"marker": "old-state"})
+    runtime = _DAGStepRuntime(
+        parent=FailingRuntime(),
+        dag_pattern=dag,
+        root_context=ExecutionContext(execution_id="dag-root"),
+        step_id="creative",
+    )
+
+    with pytest.raises(CheckpointPersistenceError, match="checkpoint unavailable"):
+        await runtime.checkpoint(
+            "tool_interaction_response_delivered",
+            context=ExecutionContext(execution_id="dag-root:creative"),
+            pattern=ReActPattern(),
+        )
+
+    assert dag.active_step_contexts["creative"] == {"marker": "old-context"}
+    assert dag.active_step_pattern_states["creative"] == {"marker": "old-state"}
+
+
+@pytest.mark.asyncio
+async def test_dag_step_checkpoint_rollback_preserves_concurrent_step_progress() -> (
+    None
+):
+    checkpoint_started = asyncio.Event()
+    release_checkpoint = asyncio.Event()
+
+    class FailingRuntime(PatternRuntime):
+        async def checkpoint(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            checkpoint_started.set()
+            await release_checkpoint.wait()
+            raise CheckpointPersistenceError("checkpoint unavailable")
+
+    class MustNotBeCopied:
+        def __deepcopy__(self, _memo: dict[int, Any]) -> Any:
+            raise AssertionError("an unrelated step must not be deep-copied")
+
+    dag = DAGPattern(lambda **_: build_plan())
+    dag._set_active_step_context("a", {"marker": "a-old"})
+    dag._set_active_step_pattern_state("a", {"marker": "a-old"})
+    dag._set_active_step_context("b", {"marker": "b-old"})
+    dag._set_active_step_pattern_state("b", MustNotBeCopied())
+    runtime = _DAGStepRuntime(
+        parent=FailingRuntime(),
+        dag_pattern=dag,
+        root_context=ExecutionContext(execution_id="dag-root"),
+        step_id="a",
+    )
+
+    checkpoint_task = asyncio.create_task(
+        runtime.checkpoint(
+            "child_checkpoint",
+            context=ExecutionContext(execution_id="dag-root:a"),
+            pattern=ReActPattern(),
+        )
+    )
+    await checkpoint_started.wait()
+    concurrent_state = {"marker": "b-new"}
+    dag._set_active_step_context("b", {"marker": "b-new"})
+    dag._set_active_step_pattern_state("b", concurrent_state)
+    release_checkpoint.set()
+
+    with pytest.raises(CheckpointPersistenceError, match="checkpoint unavailable"):
+        await checkpoint_task
+
+    assert dag.active_step_contexts["a"] == {"marker": "a-old"}
+    assert dag.active_step_pattern_states["a"] == {"marker": "a-old"}
+    assert dag.active_step_contexts["b"] == {"marker": "b-new"}
+    assert dag.active_step_pattern_states["b"] is concurrent_state
+
+
+@pytest.mark.asyncio
+async def test_dag_step_does_not_convert_checkpoint_failure_into_step_failure(
+    monkeypatch,
+) -> None:
+    failure = CheckpointPersistenceError("checkpoint unavailable")
+
+    async def fail_run(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        raise failure
+
+    monkeypatch.setattr(ReActPattern, "run", fail_run)
+    dag = DAGPattern(lambda **_: build_plan())
+    step = PlanStep(id="creative", task="Create", tool_names=[])
+
+    with pytest.raises(CheckpointPersistenceError) as caught:
+        await dag._execute_step_impl(
+            step=step,
+            root_context=ExecutionContext(execution_id="dag-root"),
+            tools=[],
+            llm=object(),
+            runtime=PatternRuntime(),
+        )
+
+    assert caught.value is failure
+    assert step.status == "running"
+    assert "creative" in dag.active_step_ids
+
+
+@pytest.mark.asyncio
+async def test_dag_step_preserves_state_on_raw_checkpoint_writer_failure(
+    monkeypatch,
+) -> None:
+    class FailingWriter:
+        def __init__(self) -> None:
+            self.persisted_labels: list[str] = []
+
+        async def checkpoint(self, **payload: Any) -> str:
+            if payload["label"] == "dag_child_checkpoint":
+                raise RuntimeError("database unavailable")
+            self.persisted_labels.append(payload["label"])
+            return f"checkpoint-{len(self.persisted_labels)}"
+
+    async def checkpoint_run(
+        _pattern: ReActPattern,
+        *,
+        context: Any,
+        runtime: Any,
+        **_kwargs: Any,
+    ) -> dict[str, Any]:
+        await runtime.checkpoint(
+            "child_checkpoint",
+            context=context,
+            pattern=_pattern,
+        )
+        raise AssertionError("checkpoint failure must stop the step")
+
+    monkeypatch.setattr(ReActPattern, "run", checkpoint_run)
+    writer = FailingWriter()
+    runtime = PatternRuntime(
+        tracer=TraceCheckpointStore(writer),
+        execution_id="dag-root",
+    )
+    dag = DAGPattern(lambda **_: build_plan())
+    step = PlanStep(id="creative", task="Create", tool_names=[])
+
+    with pytest.raises(CheckpointPersistenceError) as exc_info:
+        await dag._execute_step_impl(
+            step=step,
+            root_context=ExecutionContext(execution_id="dag-root"),
+            tools=[],
+            llm=object(),
+            runtime=runtime,
+        )
+
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+    assert step.status == "running"
+    assert "creative" in dag.active_step_ids
+    assert writer.persisted_labels == ["dag_before_step"]
 
 
 @pytest.mark.asyncio

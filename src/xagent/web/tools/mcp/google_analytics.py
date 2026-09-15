@@ -141,7 +141,10 @@ def _date_range_body(date_range: dict[str, Any]) -> dict[str, Any]:
     if not date_range.get("start_date") or not date_range.get("end_date"):
         raise ValueError(
             'Each date range needs "start_date" and "end_date" (YYYY-MM-DD or '
-            'GA4 relative terms like "7daysAgo"/"today")'
+            'GA4 relative terms like "7daysAgo"/"yesterday"). Both bounds are '
+            'inclusive, so to match the GA UI\'s "Last N days" (N complete '
+            'days, not including today) pair "NdaysAgo" with "yesterday" — '
+            'using "today" as end_date adds an extra, still-processing day.'
         )
     body = {
         "startDate": date_range["start_date"],
@@ -150,6 +153,10 @@ def _date_range_body(date_range: dict[str, Any]) -> dict[str, Any]:
     if date_range.get("name"):
         body["name"] = date_range["name"]
     return body
+
+
+def _ends_today(date_range: dict[str, Any]) -> bool:
+    return str(date_range.get("end_date", "")).strip().lower() == "today"
 
 
 @mcp.tool()
@@ -282,10 +289,16 @@ def google_analytics_run_report(
     metrics: metric names, e.g. ["sessions", "conversions", "totalRevenue"].
     date_ranges: one dict per period to compare (max 4), each with
       "start_date" and "end_date" (YYYY-MM-DD, or GA4 relative terms like
-      "7daysAgo"/"today"), and an optional "name" to label the period
+      "7daysAgo"/"yesterday"), and an optional "name" to label the period
       (e.g. "current", "previous") — pass two date_ranges to compare a
       period against a prior one in a single call; the response's rows are
-      tagged with the matching name.
+      tagged with the matching name. Both bounds are inclusive: to match the
+      GA UI's "Last N days" (N complete days, not including today), pair
+      "NdaysAgo" with "yesterday" — e.g. "7daysAgo"/"yesterday" for a true
+      trailing week. Ending a range at "today" instead adds an extra,
+      still-processing day on top and will read higher than the GA UI's
+      report for the same nominal period. Only end at "today" when the user
+      explicitly wants data including today, and call that out as partial.
     dimensions: dimension names, e.g. ["sessionDefaultChannelGroup",
       "landingPagePlusQueryString"]. Use google_analytics_get_metadata to
       discover valid names for this property.
@@ -293,7 +306,10 @@ def google_analytics_run_report(
       (e.g. to one campaign or landing page). Optional.
     metric_filter: a raw GA4 FilterExpression dict applied to metric values
       (e.g. "sessions > 100"). Optional.
-    order_bys: a raw GA4 OrderBy list, e.g. to sort by a metric descending.
+    order_bys: a raw GA4 OrderBy list, e.g. to sort by sessions descending:
+      [{"metric": {"metricName": "sessions"}, "desc": true}]. Note the field
+      is "metricName" (camelCase); for a dimension it's
+      [{"dimension": {"dimensionName": "date"}, "desc": true}].
     limit: max rows to return (default 100, max 150 — keeps a wide report's
       serialized response under the MCP output size limit).
     offset: row offset for paging — if row_count in the response exceeds
@@ -341,6 +357,20 @@ def google_analytics_run_report(
         rows = result.get("rows") or []
         row_count = result.get("rowCount") or 0
 
+        # Surface the inclusive-range gotcha in the result itself, so the
+        # LLM catches it even if it never reads the docstring: a date_range
+        # ending at "today" pulls in a partial, still-processing day that
+        # the GA UI's equivalent "last N days" report excludes.
+        extra_kwargs: dict[str, Any] = {}
+        if any(_ends_today(dr) for dr in date_ranges):
+            extra_kwargs["note"] = (
+                'One or more date_ranges end at "today", which includes '
+                "partial, still-processing data for the current day. This "
+                "will not exactly match a GA UI report for the same nominal "
+                "period, which uses only complete days. To match GA UI's "
+                '"Last N days", use "yesterday" as the end_date instead.'
+            )
+
         # RUN_REPORT_MAX_LIMIT bounds row count, not bytes: several long
         # dimension values (e.g. full URLs) at once can still cross the
         # platform's output truncation threshold. Halve the returned rows
@@ -354,6 +384,7 @@ def google_analytics_run_report(
             rows=rows,
             row_count=row_count,
             truncated=False,
+            **extra_kwargs,
         )
         while len(response) > max_output_length and len(rows) > 1:
             rows = rows[: len(rows) // 2]
@@ -363,6 +394,7 @@ def google_analytics_run_report(
                 rows=rows,
                 row_count=row_count,
                 truncated=True,
+                **extra_kwargs,
             )
         if len(rows) < original_row_count:
             logger.warning(

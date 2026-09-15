@@ -406,6 +406,44 @@ def test_run_report_builds_body_and_returns_rows(monkeypatch):
     assert body["limit"] == "50"
     assert "dimensionFilter" not in body
     assert "orderBys" not in body
+    assert "note" not in result
+
+
+def test_run_report_flags_note_when_a_date_range_ends_today(monkeypatch):
+    """A date_range ending at "today" includes a partial, still-processing
+    day that a GA UI report for the same nominal period excludes (e.g.
+    "7daysAgo"/"today" spans 8 inclusive days, not 7) — the response must
+    call this out so the caller doesn't read the numbers as an exact match
+    to GA UI's "Last N days"."""
+    mock_request = Mock(return_value=MockResponse(json_data={"rowCount": 0}))
+    monkeypatch.setattr(google_analytics.requests, "request", mock_request)
+
+    result = json.loads(
+        google_analytics.google_analytics_run_report(
+            "42",
+            metrics=["sessions"],
+            date_ranges=[{"start_date": "7daysAgo", "end_date": "today"}],
+        )
+    )
+
+    assert result["status"] == "success"
+    assert "today" in result["note"]
+
+
+def test_run_report_omits_note_when_no_date_range_ends_today(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"rowCount": 0}))
+    monkeypatch.setattr(google_analytics.requests, "request", mock_request)
+
+    result = json.loads(
+        google_analytics.google_analytics_run_report(
+            "42",
+            metrics=["sessions"],
+            date_ranges=[{"start_date": "7daysAgo", "end_date": "yesterday"}],
+        )
+    )
+
+    assert result["status"] == "success"
+    assert "note" not in result
 
 
 def test_run_report_passes_through_filter_and_order(monkeypatch):
@@ -424,7 +462,7 @@ def test_run_report_passes_through_filter_and_order(monkeypatch):
         google_analytics.google_analytics_run_report(
             "42",
             metrics=["sessions"],
-            date_ranges=[{"start_date": "7daysAgo", "end_date": "today"}],
+            date_ranges=[{"start_date": "7daysAgo", "end_date": "yesterday"}],
             dimension_filter=dimension_filter,
             order_bys=order_bys,
         )
@@ -435,7 +473,7 @@ def test_run_report_passes_through_filter_and_order(monkeypatch):
     body = mock_request.call_args.kwargs["json"]
     assert body["dimensionFilter"] == dimension_filter
     assert body["orderBys"] == order_bys
-    assert body["dateRanges"] == [{"startDate": "7daysAgo", "endDate": "today"}]
+    assert body["dateRanges"] == [{"startDate": "7daysAgo", "endDate": "yesterday"}]
 
 
 def test_run_report_sends_default_limit_and_omits_zero_offset(monkeypatch):
@@ -449,7 +487,7 @@ def test_run_report_sends_default_limit_and_omits_zero_offset(monkeypatch):
     google_analytics.google_analytics_run_report(
         "42",
         metrics=["sessions"],
-        date_ranges=[{"start_date": "7daysAgo", "end_date": "today"}],
+        date_ranges=[{"start_date": "7daysAgo", "end_date": "yesterday"}],
     )
 
     body = mock_request.call_args.kwargs["json"]
@@ -465,7 +503,7 @@ def test_run_report_rejects_empty_metrics(monkeypatch):
         google_analytics.google_analytics_run_report(
             "42",
             metrics=[],
-            date_ranges=[{"start_date": "7daysAgo", "end_date": "today"}],
+            date_ranges=[{"start_date": "7daysAgo", "end_date": "yesterday"}],
         )
     )
 
@@ -486,7 +524,7 @@ def test_run_report_rejects_out_of_range_limit(monkeypatch, bad_limit):
         google_analytics.google_analytics_run_report(
             "42",
             metrics=["sessions"],
-            date_ranges=[{"start_date": "7daysAgo", "end_date": "today"}],
+            date_ranges=[{"start_date": "7daysAgo", "end_date": "yesterday"}],
             limit=bad_limit,
         )
     )
@@ -504,7 +542,7 @@ def test_run_report_rejects_negative_offset(monkeypatch):
         google_analytics.google_analytics_run_report(
             "42",
             metrics=["sessions"],
-            date_ranges=[{"start_date": "7daysAgo", "end_date": "today"}],
+            date_ranges=[{"start_date": "7daysAgo", "end_date": "yesterday"}],
             offset=-1,
         )
     )
@@ -548,7 +586,7 @@ def test_run_report_keeps_serialized_response_under_truncation_threshold(
     response = google_analytics.google_analytics_run_report(
         "42",
         metrics=[f"metric{i}" for i in range(5)],
-        date_ranges=[{"start_date": "7daysAgo", "end_date": "today"}],
+        date_ranges=[{"start_date": "7daysAgo", "end_date": "yesterday"}],
         dimensions=[f"dim{i}" for i in range(5)],
         limit=limit,
     )
@@ -586,7 +624,7 @@ def test_run_report_trims_rows_and_flags_truncated_when_still_over_budget(monkey
     response = google_analytics.google_analytics_run_report(
         "42",
         metrics=[f"metric{i}" for i in range(5)],
-        date_ranges=[{"start_date": "7daysAgo", "end_date": "today"}],
+        date_ranges=[{"start_date": "7daysAgo", "end_date": "yesterday"}],
         dimensions=[f"dim{i}" for i in range(5)],
         limit=google_analytics.RUN_REPORT_MAX_LIMIT,
     )
@@ -615,7 +653,7 @@ def test_run_report_passes_metric_filter_and_offset(monkeypatch):
     google_analytics.google_analytics_run_report(
         "42",
         metrics=["sessions"],
-        date_ranges=[{"start_date": "7daysAgo", "end_date": "today"}],
+        date_ranges=[{"start_date": "7daysAgo", "end_date": "yesterday"}],
         metric_filter=metric_filter,
         offset=1000,
     )
@@ -630,7 +668,7 @@ def test_run_report_passes_metric_filter_and_offset(monkeypatch):
     [
         ([], "at least one"),
         (
-            [{"start_date": "7daysAgo", "end_date": "today"}] * 5,
+            [{"start_date": "7daysAgo", "end_date": "yesterday"}] * 5,
             "at most 4",
         ),
     ],
@@ -701,7 +739,7 @@ def test_run_report_rejects_date_range_missing_required_keys(monkeypatch):
     mock_request = Mock()
     monkeypatch.setattr(google_analytics.requests, "request", mock_request)
 
-    for bad_range in [{}, {"startDate": "7daysAgo", "endDate": "today"}]:
+    for bad_range in [{}, {"startDate": "7daysAgo", "endDate": "yesterday"}]:
         result = json.loads(
             google_analytics.google_analytics_run_report(
                 "42", metrics=["sessions"], date_ranges=[bad_range]
@@ -720,7 +758,7 @@ def test_run_report_rejects_invalid_property_id(monkeypatch):
         google_analytics.google_analytics_run_report(
             "42; DROP TABLE",
             metrics=["sessions"],
-            date_ranges=[{"start_date": "7daysAgo", "end_date": "today"}],
+            date_ranges=[{"start_date": "7daysAgo", "end_date": "yesterday"}],
         )
     )
 
@@ -745,7 +783,7 @@ def test_run_report_returns_error_payload_on_api_failure(monkeypatch):
         google_analytics.google_analytics_run_report(
             "42",
             metrics=["not-real"],
-            date_ranges=[{"start_date": "7daysAgo", "end_date": "today"}],
+            date_ranges=[{"start_date": "7daysAgo", "end_date": "yesterday"}],
         )
     )
 

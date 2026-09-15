@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import replace
 from datetime import datetime, timezone
 
@@ -2649,3 +2650,90 @@ def test_oversized_content_is_replaced_whole_not_sliced() -> None:
     # Byte-identical across builds: nothing in the notice comes from the
     # clock or a request id.
     assert transcript == second["messages"][-1]["content"]
+
+
+# ---------------------------------------------------------------------------
+# Supersedes-scope resilience (xorbitsai/xagent#2238)
+# ---------------------------------------------------------------------------
+
+
+def _tool_result_message(
+    ctx: ExecutionContext, payload: dict, call_id: str = "call-1"
+) -> Message:
+    ctx.add_assistant_message(
+        "",
+        tool_calls=[
+            {"id": call_id, "type": "function", "function": {"name": "computer"}}
+        ],
+    )
+    return ctx.add_tool_result("computer", payload, call_id)
+
+
+def test_malformed_supersedes_scope_is_dropped_not_fatal(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A too-long scope must not kill the turn.
+
+    The scope is internal bookkeeping for compacting superseded
+    observations; losing it degrades compaction, not the execution. The
+    reserved key must also be stripped from the model-facing result, and a
+    warning is logged once with the tool name.
+    """
+    ctx = ExecutionContext()
+    oversized = "x" * 513
+
+    with caplog.at_level(logging.WARNING, logger="xagent.core.agent.context.execution"):
+        message = _tool_result_message(
+            ctx, {"success": True, "output": "ok", SUPERSEDES_SCOPE_KEY: oversized}
+        )
+
+    # The turn continues: a tool message is recorded as usual.
+    assert message.role == "tool"
+    assert "success" in message.metadata["raw_result"]
+    # The malformed scope key never reaches the model-facing result.
+    assert SUPERSEDES_SCOPE_KEY not in message.metadata["raw_result"]
+    # No compacting metadata was attached.
+    assert "supersedes_scope" not in message.metadata
+    # A warning mentions the tool name.
+    assert any(
+        "computer" in r.message and "Dropping invalid" in r.message
+        for r in caplog.records
+    )
+
+
+def test_control_char_supersedes_scope_is_dropped_not_fatal(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A scope containing a control character must also degrade to none."""
+    ctx = ExecutionContext()
+    control_scope = "computer:task-\x01"
+
+    with caplog.at_level(logging.WARNING, logger="xagent.core.agent.context.execution"):
+        message = _tool_result_message(
+            ctx, {"success": True, "output": "ok", SUPERSEDES_SCOPE_KEY: control_scope}
+        )
+
+    assert message.role == "tool"
+    assert SUPERSEDES_SCOPE_KEY not in message.metadata["raw_result"]
+    assert "supersedes_scope" not in message.metadata
+
+
+def test_well_formed_supersedes_scope_still_compacts() -> None:
+    """A valid scope keeps its existing behavior: bookkeeping attached and
+    earlier same-scope observations superseded.
+    """
+    ctx = ExecutionContext()
+    _tool_result_message(
+        ctx,
+        {"success": True, "output": "old", SUPERSEDES_SCOPE_KEY: "computer:task-1"},
+        "call-1",
+    )
+    _tool_result_message(
+        ctx,
+        {"success": True, "output": "new", SUPERSEDES_SCOPE_KEY: "computer:task-1"},
+        "call-2",
+    )
+
+    superseded = [m for m in ctx.messages if (m.metadata or {}).get("superseded")]
+    assert len(superseded) == 1
+    assert "superseded" in superseded[0].content

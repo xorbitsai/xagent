@@ -7,7 +7,13 @@ from typing import Any, List, Optional
 
 import aiohttp
 
-from .base import BaseImageModel
+from ..chat.token_context import MediaCallType
+from .base import (
+    BaseImageModel,
+    InvalidImageResponseError,
+    invalid_response_from,
+)
+from .usage import record_image_usage
 
 
 class DashScopeImageModel(BaseImageModel):
@@ -23,8 +29,12 @@ class DashScopeImageModel(BaseImageModel):
         base_url: str = "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
         timeout: float = 60.0,
         abilities: Optional[List[str]] = None,
+        model_id: str = "",
     ):
         self.model_name = model_name
+        # See OpenAIImageModel: this provider records its own usage, so the
+        # configured id must live here rather than on the retry wrapper.
+        self.model_id = model_id
         self.api_key = api_key or os.getenv("DASHSCOPE_API_KEY")
         self.base_url = base_url
         self.timeout = timeout
@@ -200,46 +210,107 @@ class DashScopeImageModel(BaseImageModel):
 
                     response_data = await response.json()
 
+            # Meter before validating the response body. DashScope has already
+            # billed this 200, and the `usage` payload sits at the top level —
+            # independent of the `output` structure the checks below walk. A
+            # billed-but-unparseable response would otherwise go unmetered.
+            # Read defensively: this runs before the metering call, in the same
+            # try as the structural checks, so a 200 whose body is a JSON array
+            # would otherwise raise AttributeError here and lose the row for a
+            # call DashScope did charge for.
+            usage = (
+                response_data.get("usage", {})
+                if isinstance(response_data, dict)
+                else {}
+            )
+            record_image_usage(
+                {"usage": usage},
+                model_name=self.model_name,
+                model_id=self.model_id,
+                call_type=MediaCallType.GENERATE_IMAGE,
+                # `n` genuinely reaches DashScope -- **kwargs is spread into
+                # the request `parameters` below, so the provider generates and
+                # bills for n images -- but a partially successful 200 bills
+                # fewer than it was asked for, and only `usage` knows that. So
+                # `n` is the fallback and the reported count wins.
+                # Note the parser only returns content[0], so images 2..n are
+                # paid for and discarded — a separate defect from metering.
+                image_count=kwargs.get("n", 1),
+                # `*` -> `x`: the reported pair is `WxH`, so passing DashScope's
+                # own `W*H` vocabulary through unchanged would file one physical
+                # resolution under two aggregate keys.
+                resolution=str(size or "").replace("*", "x")
+                if isinstance(size, str)
+                else "",
+                # Walked inside the helper's swallow, not here: a payload whose
+                # `get` raises would otherwise fail this whole call and record
+                # nothing, even for a 200 that returned a real image.
+                reported_count_from=usage,
+                reported_size_from=usage,
+            )
+
             # Extract the image URL from the response
             if "output" not in response_data:
-                raise RuntimeError("Invalid response format: missing 'output' field")
+                raise InvalidImageResponseError(
+                    "Invalid response format: missing 'output' field"
+                )
 
             output = response_data["output"]
             if "choices" not in output or not output["choices"]:
-                raise RuntimeError("Invalid response format: missing 'choices' field")
+                raise InvalidImageResponseError(
+                    "Invalid response format: missing 'choices' field"
+                )
 
             choice = output["choices"][0]
             if "message" not in choice:
-                raise RuntimeError("Invalid response format: missing 'message' field")
+                raise InvalidImageResponseError(
+                    "Invalid response format: missing 'message' field"
+                )
 
             message = choice["message"]
             if "content" not in message or not message["content"]:
-                raise RuntimeError("Invalid response format: missing 'content' field")
+                raise InvalidImageResponseError(
+                    "Invalid response format: missing 'content' field"
+                )
 
             content = message["content"]
             if not isinstance(content, list) or not content:
-                raise RuntimeError(
+                raise InvalidImageResponseError(
                     "Invalid response format: content should be a non-empty list"
                 )
 
             image_item = content[0]
             if "image" not in image_item:
-                raise RuntimeError("Invalid response format: missing 'image' field")
+                raise InvalidImageResponseError(
+                    "Invalid response format: missing 'image' field"
+                )
 
             image_url = image_item["image"]
 
-            # Extract usage information
-            usage = response_data.get("usage", {})
-            task_metric = output.get("task_metric", {})
-
+            # Usage was already recorded above, before validation.
             return {
                 "image_url": image_url,
                 "usage": usage,
-                "task_metric": task_metric,
+                "task_metric": output.get("task_metric", {}),
                 "request_id": response_data.get("request_id"),
                 "raw_response": response_data,
             }
 
+        except InvalidImageResponseError:
+            # Re-raised unchanged: the blanket handler below would wrap it in a
+            # plain RuntimeError and erase the non-retryable classification,
+            # re-billing an already-billed and already-metered response.
+            raise
+        except (TypeError, AttributeError, KeyError, IndexError) as e:
+            # Same classification, reached implicitly. The structural checks
+            # above validate container shapes but not element types, so a 200
+            # whose content is `[null]` or `[123]` fails on `"image" not in
+            # image_item` with a TypeError rather than a raise. Enumerating
+            # every malformed shape a provider could send is a losing game, so
+            # anything that fails walking an already-metered body is classified
+            # positionally. The request half of this try raises aiohttp and JSON
+            # errors, matched by the clauses below, not these types.
+            raise invalid_response_from(e, "Invalid response format") from e
         except aiohttp.ClientError as e:
             raise RuntimeError(
                 f"Network error during image generation: {str(e)}"
@@ -332,46 +403,96 @@ class DashScopeImageModel(BaseImageModel):
 
                     response_data = await response.json()
 
+            # Meter before validating the response body — see generate_image.
+            # Read defensively: this runs before the metering call, in the same
+            # try as the structural checks, so a 200 whose body is a JSON array
+            # would otherwise raise AttributeError here and lose the row for a
+            # call DashScope did charge for.
+            usage = (
+                response_data.get("usage", {})
+                if isinstance(response_data, dict)
+                else {}
+            )
+            record_image_usage(
+                {"usage": usage},
+                model_name=self.model_name,
+                model_id=self.model_id,
+                call_type=MediaCallType.EDIT_IMAGE,
+                # Same rule as generate_image: prefer what DashScope reports
+                # it billed, fall back to the request's `n`/`size`. A non-string
+                # size is dropped rather than stringified -- this path reads it
+                # straight from caller kwargs with no normalisation, and an int
+                # would become a half-resolution key joining no price table.
+                image_count=kwargs.get("n", 1),
+                resolution=str(kwargs.get("size") or "").replace("*", "x")
+                if isinstance(kwargs.get("size"), str)
+                else "",
+                reported_count_from=usage,
+                reported_size_from=usage,
+            )
+
             # Extract the image URL from the response (same structure as generation)
             if "output" not in response_data:
-                raise RuntimeError("Invalid response format: missing 'output' field")
+                raise InvalidImageResponseError(
+                    "Invalid response format: missing 'output' field"
+                )
 
             output = response_data["output"]
             if "choices" not in output or not output["choices"]:
-                raise RuntimeError("Invalid response format: missing 'choices' field")
+                raise InvalidImageResponseError(
+                    "Invalid response format: missing 'choices' field"
+                )
 
             choice = output["choices"][0]
             if "message" not in choice:
-                raise RuntimeError("Invalid response format: missing 'message' field")
+                raise InvalidImageResponseError(
+                    "Invalid response format: missing 'message' field"
+                )
 
             message = choice["message"]
             if "content" not in message or not message["content"]:
-                raise RuntimeError("Invalid response format: missing 'content' field")
+                raise InvalidImageResponseError(
+                    "Invalid response format: missing 'content' field"
+                )
 
             content = message["content"]
             if not isinstance(content, list) or not content:
-                raise RuntimeError(
+                raise InvalidImageResponseError(
                     "Invalid response format: content should be a non-empty list"
                 )
 
             image_item = content[0]
             if "image" not in image_item:
-                raise RuntimeError("Invalid response format: missing 'image' field")
+                raise InvalidImageResponseError(
+                    "Invalid response format: missing 'image' field"
+                )
 
             image_url = image_item["image"]
 
-            # Extract usage information
-            usage = response_data.get("usage", {})
-            task_metric = output.get("task_metric", {})
-
+            # Usage was already recorded above, before validation.
             return {
                 "image_url": image_url,
                 "usage": usage,
-                "task_metric": task_metric,
+                "task_metric": output.get("task_metric", {}),
                 "request_id": response_data.get("request_id"),
                 "raw_response": response_data,
             }
 
+        except InvalidImageResponseError:
+            # Re-raised unchanged: the blanket handler below would wrap it in a
+            # plain RuntimeError and erase the non-retryable classification,
+            # re-billing an already-billed and already-metered response.
+            raise
+        except (TypeError, AttributeError, KeyError, IndexError) as e:
+            # Same classification, reached implicitly. The structural checks
+            # above validate container shapes but not element types, so a 200
+            # whose content is `[null]` or `[123]` fails on `"image" not in
+            # image_item` with a TypeError rather than a raise. Enumerating
+            # every malformed shape a provider could send is a losing game, so
+            # anything that fails walking an already-metered body is classified
+            # positionally. The request half of this try raises aiohttp and JSON
+            # errors, matched by the clauses below, not these types.
+            raise invalid_response_from(e, "Invalid response format") from e
         except aiohttp.ClientError as e:
             raise RuntimeError(f"Network error during image editing: {str(e)}") from e
         except json.JSONDecodeError as e:

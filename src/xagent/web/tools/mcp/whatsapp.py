@@ -16,7 +16,6 @@ usual flow is ``whatsapp_list_business_accounts`` ->
 import logging
 import re
 from typing import Any
-from urllib.parse import quote
 
 from mcp.server.fastmcp import FastMCP
 
@@ -24,9 +23,11 @@ from . import meta_graph
 from .meta_graph import (
     GraphAPIError,
 )
+from .meta_graph import auth_status as _auth_status
 from .meta_graph import bounded_limit as _bounded_limit
 from .meta_graph import error_response as _error
 from .meta_graph import graph_error_response as _graph_error
+from .meta_graph import graph_path as _graph_path
 from .meta_graph import graph_request as _graph_request
 from .meta_graph import is_public_image_url as _is_public_http_url
 from .meta_graph import redact_secrets as _redact_secrets
@@ -74,25 +75,10 @@ MAX_MEDIA_CAPTION_CHARS = 1024
 MIN_RECIPIENT_DIGITS = 5
 MAX_RECIPIENT_DIGITS = 15
 
-TEMPLATE_STATUSES = frozenset(
-    {
-        "APPROVED",
-        "PENDING",
-        "REJECTED",
-        "PAUSED",
-        "DISABLED",
-        "IN_APPEAL",
-        "PENDING_DELETION",
-        "DELETED",
-        "LIMIT_EXCEEDED",
-    }
-)
-
 # Media types the Cloud API accepts by public link. "sticker" is deliberately
 # left out: it needs a WebP of an exact size and no caption, and is rarely
 # what an agent means by "send a file".
 MEDIA_TYPES = frozenset({"image", "video", "audio", "document"})
-CAPTIONLESS_MEDIA_TYPES = frozenset({"audio"})
 
 # Separators tolerated (and stripped) in a pasted recipient number.
 _RECIPIENT_SEPARATOR_PATTERN = re.compile(r"[\s().-]")
@@ -145,15 +131,6 @@ _SEND_ERROR_HINTS: dict[int, str] = {
 }
 
 
-def _graph_path(object_id: str, suffix: str | None = None) -> str:
-    if not object_id or not str(object_id).strip():
-        raise ValueError("object id is required")
-    path = f"/{quote(str(object_id).strip(), safe='')}"
-    if suffix:
-        path = f"{path}/{suffix}"
-    return path
-
-
 def _normalize_recipient(to: str) -> str:
     """Normalize a recipient to a leading-"+" E.164 value for the Cloud API.
 
@@ -170,9 +147,12 @@ def _normalize_recipient(to: str) -> str:
     leading "+" has the *business's own* country code prepended by the
     API, which can misdeliver the message to the wrong recipient -- and
     that risk applies even to an already-correct digit string, not only to
-    an obviously incomplete one. Anything else -- a non-digit character, or
-    a length outside E.164's bounds -- is rejected up front so a malformed
-    value fails here rather than as a confusing Graph API error.
+    an obviously incomplete one. Anything else -- a non-digit character, a
+    leading 0 (no E.164 country code starts with one, so this is always a
+    national-format number missing its country code, e.g. the UK's
+    "07911123456"), or a length outside E.164's bounds -- is rejected up
+    front so a malformed value fails here rather than as a confusing Graph
+    API error (or worse, an accepted-looking but undeliverable "to" value).
     """
     if not to or not str(to).strip():
         raise ValueError("to (recipient phone number) is required")
@@ -187,6 +167,12 @@ def _normalize_recipient(to: str) -> str:
         raise ValueError(
             "to must be a phone number in international format (digits with an "
             "optional leading +), e.g. +15551234567"
+        )
+    if digits.startswith("0"):
+        raise ValueError(
+            "to looks like a national number, not an international one -- no "
+            "E.164 country code starts with 0. Include the country code, e.g. "
+            "the UK's 07911123456 -> +447911123456"
         )
     if not MIN_RECIPIENT_DIGITS <= len(digits) <= MAX_RECIPIENT_DIGITS:
         raise ValueError(
@@ -212,21 +198,30 @@ def _first_dict(items: Any) -> dict[str, Any]:
 
 
 def _next_cursor(result: Any) -> str | None:
-    """The opaque `after` cursor for the next page, if there is one.
+    """The opaque `after` cursor for the next page, if Graph says there is one.
 
     Deliberately not Meta's raw `paging.next` URL: that URL is otherwise
     unusable by anything except a literal HTTP GET (this connector's tools
     take structured arguments, not a URL to fetch), and forwarding it
     verbatim would mean serializing an entire Graph API URL into
     model-visible output on every paginated call for no actionable benefit.
-    The bare cursor is compact, is exactly what `params["after"]` expects
-    on the next call, and (unlike a full URL) carries no query parameters
-    to reason about at all.
+    The bare cursor is compact and is exactly what `params["after"]`
+    expects on the next call.
+
+    Gated on `paging.next` actually being present, not merely on
+    `cursors.after` having a value: Meta's own pagination guidance says
+    the presence of `next` is the sole authoritative "more data exists"
+    signal, and explicitly warns not to infer that from anything else --
+    `cursors.after` can still be populated on the true last page. A caller
+    (or SDK) that loops on `cursors.after` alone can end up re-requesting
+    the same, now-empty page forever.
     """
     if not isinstance(result, dict):
         return None
     paging = result.get("paging")
     if not isinstance(paging, dict):
+        return None
+    if not isinstance(paging.get("next"), str) or not paging["next"]:
         return None
     cursors = paging.get("cursors")
     if not isinstance(cursors, dict):
@@ -355,22 +350,7 @@ def _send_message(phone_number_id: str, payload: dict[str, Any]) -> dict[str, An
 @mcp.tool()
 def whatsapp_auth_status() -> str:
     """Check whether the injected Meta access token is usable."""
-    try:
-        me = _graph_request("GET", "/me", params={"fields": "id,name,email"})
-        return _success(
-            authenticated=True,
-            user={
-                "id": me.get("id"),
-                "name": me.get("name"),
-                "email": me.get("email"),
-            },
-        )
-    except GraphAPIError as e:
-        logger.error("Error checking WhatsApp auth status: %s", e)
-        return _graph_error(e)
-    except Exception as e:
-        logger.error("Error checking WhatsApp auth status: %s", e)
-        return _error(str(e))
+    return _auth_status(logger, "WhatsApp")
 
 
 @mcp.tool()
@@ -481,12 +461,7 @@ def whatsapp_list_message_templates(
             "limit": _bounded_limit(limit),
         }
         if status is not None and status.strip():
-            normalized_status = status.strip().upper()
-            if normalized_status not in TEMPLATE_STATUSES:
-                raise ValueError(
-                    "status must be one of: " + ", ".join(sorted(TEMPLATE_STATUSES))
-                )
-            params["status"] = normalized_status
+            params["status"] = status.strip().upper()
         _apply_after_cursor(params, after)
         result = _graph_request(
             "GET", _graph_path(waba_id, "message_templates"), params=params
@@ -635,16 +610,21 @@ def whatsapp_send_media_message(
             )
         media_url = (media_url or "").strip()
         if not _is_public_http_url(media_url):
-            raise ValueError("media_url must be a public http or https URL")
+            raise ValueError(
+                "media_url must be an http or https URL that Meta's servers "
+                "can reach and download (a bare local path or non-http "
+                "scheme won't work)"
+            )
         media: dict[str, Any] = {"link": media_url}
-        if caption is not None and caption.strip():
-            if normalized_type in CAPTIONLESS_MEDIA_TYPES:
-                raise ValueError(f"{normalized_type} messages do not support a caption")
-            if len(caption) > MAX_MEDIA_CAPTION_CHARS:
+        stripped_caption = caption.strip() if caption is not None else ""
+        if stripped_caption:
+            if normalized_type == "audio":
+                raise ValueError("audio messages do not support a caption")
+            if len(stripped_caption) > MAX_MEDIA_CAPTION_CHARS:
                 raise ValueError(
                     f"caption must be at most {MAX_MEDIA_CAPTION_CHARS} characters"
                 )
-            media["caption"] = caption
+            media["caption"] = stripped_caption
         if filename is not None and filename.strip():
             if normalized_type != "document":
                 raise ValueError("filename is only supported for document messages")
@@ -673,7 +653,10 @@ def whatsapp_mark_message_read(phone_number_id: str, message_id: str) -> str:
     """Mark an inbound message as read (shows blue ticks to the sender).
 
     message_id is the "wamid..." id of a message the customer sent to this
-    phone number, as delivered by the WhatsApp webhook.
+    phone number. WhatsApp delivers inbound messages (and their ids) via a
+    webhook callback; this xagent deployment does not yet implement a
+    WhatsApp webhook receiver, so message_id has to come from wherever the
+    caller is currently getting inbound message data from.
     """
     try:
         if not message_id or not message_id.strip():

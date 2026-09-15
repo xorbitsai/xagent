@@ -183,7 +183,13 @@ def test_upgrade_refuses_custom_catalog_collision(tmp_path):
         ("WhAtSaPp", "Unrelated"),
     ],
 )
-def test_upgrade_refuses_normalized_custom_catalog_collision(tmp_path, app_id, name):
+def test_upgrade_skips_seeding_on_a_name_only_collision(tmp_path, app_id, name):
+    """None of these rows claim app_id="whatsapp" itself -- the identifier
+    the builtin execution overlay actually keys off of -- so a display-name
+    (or look-alike app_id) collision under a *different* app_id must not
+    abort the whole `alembic upgrade head` run the way an exact app_id
+    collision does. It only means the builtin row doesn't get seeded this
+    run; nothing else in the migration chain is affected."""
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration()
     with engine.begin() as connection:
@@ -196,8 +202,14 @@ def test_upgrade_refuses_normalized_custom_catalog_collision(tmp_path, app_id, n
             ),
             {"app_id": app_id, "name": name},
         )
-        with pytest.raises(RuntimeError, match="public_mcp_apps"):
-            _run(connection, migration, "upgrade")
+        _run(connection, migration, "upgrade")  # must not raise
+        assert "whatsapp" not in _app_ids(connection)
+        # The unrelated row itself is left completely untouched.
+        row = connection.execute(
+            text("SELECT app_id, name FROM public_mcp_apps WHERE app_id = :app_id"),
+            {"app_id": app_id},
+        ).one()
+        assert row == (app_id, name)
 
 
 def test_upgrade_skips_columns_missing_from_a_reduced_schema(tmp_path):

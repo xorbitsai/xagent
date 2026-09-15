@@ -131,18 +131,12 @@ def upgrade() -> None:
             )
         ).mappings()
     )
-    colliding_catalog_rows = [
-        row
-        for row in catalog_rows
-        if _collides_with_whatsapp_identity(row["app_id"])
-        or _collides_with_whatsapp_identity(row["name"])
-    ]
     exact_app_rows = [row for row in catalog_rows if row["app_id"] == APP_ID]
     if exact_app_rows:
         existing = exact_app_rows[0]
         # Idempotent re-run over a row this migration (or a prior version of
-        # it) already owns: accept and stop. This does NOT also require
-        # colliding_catalog_rows to contain nothing else -- an unrelated
+        # it) already owns: accept and stop. This does NOT also require the
+        # row to be the only identity collision on record -- an unrelated
         # row created *after* this one was seeded (e.g. an admin later
         # names an entirely different custom connector "WhatsApp") is a
         # separate ambiguity to police at that row's own creation time
@@ -151,16 +145,43 @@ def upgrade() -> None:
         # already-correctly-owned row it never touches.
         if _has_provenance(existing["launch_config"]):
             return
+        # app_id="whatsapp" itself is the identifier the builtin execution
+        # overlay actually keys off of (get_builtin_execution_fields /
+        # _matches_builtin_provenance both look up by exact app_id, never
+        # by name), so an unprovenanced row squatting on it is a genuine
+        # misidentification risk worth failing the whole run over: seeding
+        # our own row alongside it, or silently skipping, would both leave
+        # an ambiguous app_id="whatsapp" row for the overlay to reason
+        # about with no way to tell which one is "ours".
         raise RuntimeError(
             "Cannot seed builtin WhatsApp connector: an existing "
             "public_mcp_apps row with app_id='whatsapp' has no matching "
             "builtin_provenance"
         )
-    if colliding_catalog_rows:
-        raise RuntimeError(
-            "Cannot seed builtin WhatsApp connector: custom public_mcp_apps "
-            "identity collides with 'whatsapp'"
+
+    # No row claims app_id "whatsapp" -- the identifier that actually
+    # matters to the overlay is free. A *different* app_id whose display
+    # name (or, via typo/casing, its app_id) happens to normalize to the
+    # same identity is a one-time cosmetic collision in the connector
+    # picker, not a misidentification risk, so it doesn't warrant the same
+    # blast radius: failing this migration would abort every migration in
+    # the same `alembic upgrade head` run (this one or any added after it),
+    # not just skip seeding whatsapp. Skip with a warning instead; an
+    # operator who wants the builtin row seeded can rename the conflicting
+    # app and re-run.
+    colliding_rows = [
+        row
+        for row in catalog_rows
+        if _collides_with_whatsapp_identity(row["app_id"])
+        or _collides_with_whatsapp_identity(row["name"])
+    ]
+    if colliding_rows:
+        logger.warning(
+            "Skipping builtin WhatsApp seed: public_mcp_apps row(s) with "
+            "app_id %s share its identity under a different app_id",
+            sorted({row["app_id"] for row in colliding_rows}),
         )
+        return
 
     dropped_keys = sorted(set(ROW) - columns)
     if dropped_keys:

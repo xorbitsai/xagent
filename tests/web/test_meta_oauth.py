@@ -1195,13 +1195,23 @@ def test_bare_meta_login_skips_meta_ads(db_session, monkeypatch):
     assert "Facebook Pages" not in server_names
 
 
-def test_bare_meta_login_skips_whatsapp(db_session, monkeypatch):
+def test_bare_meta_login_skips_whatsapp_but_still_connects_instagram(
+    db_session, monkeypatch
+):
     """None of WhatsApp's scopes (business_management, whatsapp_business_*)
     is in the meta provider's default_scopes; they live solely on the app row
     -- same situation as Facebook's pages_read_user_content -- so a bare Meta
     login must not activate its UserMCPServer, or every WhatsApp tool call
     would fail against an under-scoped grant while reporting "connected"
-    (APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT)."""
+    (APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT).
+
+    Instagram is registered alongside it as a positive control (mirroring
+    test_bare_meta_login_skips_facebook_but_still_connects_instagram): its
+    required scopes haven't changed, so it must still connect via this same
+    bare flow. Without this, a callback that skipped *every* app-scoped and
+    bare-eligible server alike (e.g. a bug that stopped creating any
+    UserMCPServer at all) would make the assertions below pass vacuously.
+    """
     db, user = db_session
     db.add(
         PublicMCPApp(
@@ -1220,6 +1230,23 @@ def test_bare_meta_login_skips_whatsapp(db_session, monkeypatch):
             launch_config={
                 "command": "python",
                 "args": ["-m", "xagent.web.tools.mcp.whatsapp"],
+                "env_mapping": {"META_ACCESS_TOKEN": "access_token"},
+            },
+        )
+    )
+    db.add(
+        PublicMCPApp(
+            app_id="instagram",
+            name="Instagram",
+            description="Instagram connector",
+            transport="oauth",
+            provider_name="meta",
+            category="Marketing",
+            oauth_scopes=["instagram_basic", "instagram_content_publish"],
+            is_visible_in_connector=True,
+            launch_config={
+                "command": "uv",
+                "args": ["run", "python", "-m", "xagent.web.tools.mcp.instagram"],
                 "env_mapping": {"META_ACCESS_TOKEN": "access_token"},
             },
         )
@@ -1265,7 +1292,7 @@ def test_bare_meta_login_skips_whatsapp(db_session, monkeypatch):
 
     server_names = {s.name for s in db.query(MCPServer).all()}
     assert "WhatsApp Business" not in server_names
-    assert "Facebook Pages" not in server_names
+    assert "Instagram" in server_names
 
 
 async def test_disconnecting_facebook_preserves_shared_bare_meta_grant_for_instagram(

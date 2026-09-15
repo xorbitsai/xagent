@@ -1,7 +1,8 @@
 import json
+import logging
 import os
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import requests
 
@@ -75,17 +76,20 @@ def user_token() -> str:
     return token
 
 
-def graph_headers(
-    token: str, *, form: bool = False, as_json: bool = False
-) -> dict[str, str]:
+def graph_headers(token: str, *, content_type: str | None = None) -> dict[str, str]:
+    """Bearer + Accept headers, plus an explicit Content-Type when given.
+
+    One parameter instead of the earlier ``form``/``as_json`` pair: there
+    is exactly one body shape per call (form, JSON, or none for GET), so a
+    single ``content_type`` says which without the two flags needing to
+    stay mutually exclusive by convention.
+    """
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/json",
     }
-    if as_json:
-        headers["Content-Type"] = "application/json"
-    elif form:
-        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    if content_type:
+        headers["Content-Type"] = content_type
     return headers
 
 
@@ -120,14 +124,16 @@ def graph_request(
     if data is not None and json_body is not None:
         raise ValueError("graph_request takes either data or json_body, not both")
     request_token = token or user_token()
+    if json_body is not None:
+        content_type = "application/json"
+    elif method.upper() != "GET":
+        content_type = "application/x-www-form-urlencoded"
+    else:
+        content_type = None
     response = requests.request(
         method=method,
         url=f"{GRAPH_BASE_URL}{path}",
-        headers=graph_headers(
-            request_token,
-            form=method.upper() != "GET",
-            as_json=json_body is not None,
-        ),
+        headers=graph_headers(request_token, content_type=content_type),
         params=params,
         data=data,
         json=json_body,
@@ -166,3 +172,31 @@ def bounded_limit(limit: int, maximum: int = 100) -> int:
 def is_public_image_url(image_url: str) -> bool:
     parsed = urlparse(image_url)
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def graph_path(object_id: str, suffix: str | None = None) -> str:
+    """URL-quote a Graph node id and optionally append an edge suffix."""
+    if not object_id or not str(object_id).strip():
+        raise ValueError("object id is required")
+    path = f"/{quote(str(object_id).strip(), safe='')}"
+    if suffix:
+        path = f"{path}/{suffix}"
+    return path
+
+
+def auth_status(logger: logging.Logger, connector_label: str) -> str:
+    """Shared body for a connector's `<x>_auth_status` tool: check whether
+    the injected Meta access token is usable at all (an identity read, not
+    a check of any connector-specific scope)."""
+    try:
+        me = graph_request("GET", "/me", params={"fields": "id,name,email"})
+        return success_response(
+            authenticated=True,
+            user={"id": me.get("id"), "name": me.get("name"), "email": me.get("email")},
+        )
+    except GraphAPIError as e:
+        logger.error("Error checking %s auth status: %s", connector_label, e)
+        return graph_error_response(e)
+    except Exception as e:
+        logger.error("Error checking %s auth status: %s", connector_label, e)
+        return error_response(str(e))

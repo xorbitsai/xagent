@@ -1,5 +1,8 @@
 import json
+import logging
+from unittest.mock import Mock
 
+import pytest
 import requests
 
 from xagent.web.tools.mcp import meta_graph
@@ -105,19 +108,81 @@ def test_graph_request_sends_null_json_for_form_posts(monkeypatch):
 
 def test_graph_request_rejects_data_and_json_body_together(monkeypatch):
     monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
-    called = False
-
-    def request(**kwargs):
-        nonlocal called
-        called = True
-        return MockResponse()
-
+    request = Mock()
     monkeypatch.setattr(meta_graph.requests, "request", request)
 
-    try:
+    with pytest.raises(ValueError, match="either data or json_body"):
         meta_graph.graph_request("POST", "/x", data={"a": 1}, json_body={"b": 2})
-    except ValueError as exc:
-        assert "either data or json_body" in str(exc)
-    else:
-        raise AssertionError("expected ValueError")
-    assert called is False
+
+    request.assert_not_called()
+
+
+def test_graph_headers_omits_content_type_by_default():
+    assert meta_graph.graph_headers("tok") == {
+        "Authorization": "Bearer tok",
+        "Accept": "application/json",
+    }
+
+
+def test_graph_headers_sets_given_content_type():
+    assert meta_graph.graph_headers("tok", content_type="application/json") == {
+        "Authorization": "Bearer tok",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+
+
+def test_graph_path_quotes_and_appends_suffix():
+    assert meta_graph.graph_path("waba/../evil", "phone_numbers") == (
+        "/waba%2F..%2Fevil/phone_numbers"
+    )
+    assert meta_graph.graph_path("pn-1") == "/pn-1"
+
+
+def test_graph_path_requires_object_id():
+    with pytest.raises(ValueError, match="object id is required"):
+        meta_graph.graph_path("   ")
+
+
+def test_auth_status_success(monkeypatch):
+    monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
+    monkeypatch.setattr(
+        meta_graph.requests,
+        "request",
+        lambda **kwargs: MockResponse({"id": "u1", "name": "Alice"}),
+    )
+
+    result = json.loads(meta_graph.auth_status(logging.getLogger(__name__), "Test"))
+
+    assert result == {
+        "status": "success",
+        "authenticated": True,
+        "user": {"id": "u1", "name": "Alice", "email": None},
+    }
+
+
+def test_auth_status_surfaces_graph_error(monkeypatch):
+    monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
+    body = {"error": {"message": "bad token", "code": 190}}
+    monkeypatch.setattr(
+        meta_graph.requests,
+        "request",
+        lambda **kwargs: MockResponse(body, text=json.dumps(body), status_code=401),
+    )
+
+    result = json.loads(meta_graph.auth_status(logging.getLogger(__name__), "Test"))
+
+    assert result["status"] == "error"
+    assert result["details"]["error"]["code"] == 190
+
+
+def test_auth_status_without_token_returns_error(monkeypatch):
+    monkeypatch.delenv("META_ACCESS_TOKEN", raising=False)
+    request = Mock()
+    monkeypatch.setattr(meta_graph.requests, "request", request)
+
+    result = json.loads(meta_graph.auth_status(logging.getLogger(__name__), "Test"))
+
+    assert result["status"] == "error"
+    assert "META_ACCESS_TOKEN" in result["message"]
+    request.assert_not_called()

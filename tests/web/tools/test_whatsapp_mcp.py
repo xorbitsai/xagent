@@ -194,7 +194,10 @@ def test_list_business_accounts_surfaces_next_after_past_100_businesses(
         MockResponse(
             {
                 "data": [{"id": "biz-1", "name": "Acme"}],
-                "paging": {"cursors": {"after": "biz-cursor-1"}},
+                "paging": {
+                    "cursors": {"after": "biz-cursor-1"},
+                    "next": "https://graph.facebook.com/v25.0/me/businesses?after=biz-cursor-1",
+                },
             }
         ),
     )
@@ -202,6 +205,31 @@ def test_list_business_accounts_surfaces_next_after_past_100_businesses(
     result = _payload(whatsapp.whatsapp_list_business_accounts())
 
     assert result["next_after"] == "biz-cursor-1"
+    mock.assert_called_once()
+
+
+def test_list_business_accounts_ignores_cursor_without_next_on_last_page(
+    token, monkeypatch
+):
+    """Meta's own pagination guidance: `paging.next`'s presence is the sole
+    authoritative "more data exists" signal. `cursors.after` can still be
+    populated on the true last page -- a documented Graph API gotcha -- so
+    a lone `cursors.after` with no `next` must not be reported as a
+    continuation, or a caller looping on it would re-request the same
+    empty/identical last page forever."""
+    mock = _mock_request(
+        monkeypatch,
+        MockResponse(
+            {
+                "data": [{"id": "biz-1", "name": "Acme"}],
+                "paging": {"cursors": {"after": "stale-cursor"}},
+            }
+        ),
+    )
+
+    result = _payload(whatsapp.whatsapp_list_business_accounts())
+
+    assert result["next_after"] is None
     mock.assert_called_once()
 
 
@@ -248,7 +276,10 @@ def test_list_phone_numbers(token, monkeypatch):
                         "status": "CONNECTED",
                     }
                 ],
-                "paging": {"cursors": {"after": "phone-cursor-1"}},
+                "paging": {
+                    "cursors": {"after": "phone-cursor-1"},
+                    "next": "https://graph.facebook.com/v25.0/waba-1/phone_numbers?after=phone-cursor-1",
+                },
             }
         ),
     )
@@ -331,7 +362,10 @@ def test_list_message_templates_defaults(token, monkeypatch):
         MockResponse(
             {
                 "data": [{"id": "t1", "name": "hello", "status": "APPROVED"}],
-                "paging": {"cursors": {"after": "tpl-cursor-1"}},
+                "paging": {
+                    "cursors": {"after": "tpl-cursor-1"},
+                    "next": "https://graph.facebook.com/v25.0/waba-1/message_templates?after=tpl-cursor-1",
+                },
             }
         ),
     )
@@ -391,14 +425,17 @@ def test_list_message_templates_ignores_blank_status(token, monkeypatch, status)
     assert "status" not in mock.call_args.kwargs["params"]
 
 
-def test_list_message_templates_rejects_unknown_status(token, monkeypatch):
-    mock = _mock_request(monkeypatch)
+def test_list_message_templates_passes_any_status_through_to_graph(token, monkeypatch):
+    """No client-side status whitelist: Meta's own template-status enum is
+    server-validated and can grow (e.g. a new lifecycle state) without this
+    connector needing an update to keep accepting it -- Graph itself
+    rejects a genuinely invalid value, surfaced through the normal
+    GraphAPIError path like any other bad parameter."""
+    mock = _mock_request(monkeypatch, MockResponse({"data": []}))
 
-    result = _payload(whatsapp.whatsapp_list_message_templates("waba-1", status="live"))
+    whatsapp.whatsapp_list_message_templates("waba-1", status="a_future_status")
 
-    assert result["status"] == "error"
-    assert "status must be one of" in result["message"]
-    mock.assert_not_called()
+    assert mock.call_args.kwargs["params"]["status"] == "A_FUTURE_STATUS"
 
 
 # --------------------------------------------------------------------------
@@ -511,7 +548,21 @@ def test_normalize_recipient_accepts_common_formats(to, expected):
 
 @pytest.mark.parametrize(
     "to",
-    ["", "   ", "abc", "+1555abc", "1234", "1" * 16, "1555+1234567", "+1 555 1234;"],
+    [
+        "",
+        "   ",
+        "abc",
+        "+1555abc",
+        "1234",
+        "1" * 16,
+        "1555+1234567",
+        "+1 555 1234;",
+        # A national-format number with a leading 0 and no country code --
+        # no E.164 country code starts with 0, so this must be rejected
+        # rather than silently sent as an invalid "+0..." value.
+        "07911123456",
+        "0 7911 123456",
+    ],
 )
 def test_normalize_recipient_rejects_malformed(to):
     with pytest.raises(ValueError):
@@ -582,6 +633,35 @@ def test_send_text_message_unknown_error_code_has_no_hint(token, monkeypatch):
         "error": {"message": "weird", "type": "OAuthException", "code": 999999}
     }
     assert "hint" not in result["details"]
+
+
+@pytest.mark.parametrize(
+    ("code", "expected_substring"),
+    [
+        (131047, "whatsapp_send_template_message"),
+        (131026, "blocked this business"),
+        (131030, "test mode"),
+        (131031, "locked by Meta"),
+        (131051, "media_type"),
+        (132000, "components do not match"),
+        (132001, "whatsapp_list_message_templates"),
+        (132012, "wrong format"),
+        (133010, "not registered with the Cloud API"),
+    ],
+)
+def test_send_error_hint_text_for_every_documented_code(code, expected_substring):
+    """Every _SEND_ERROR_HINTS entry actually attaches its own hint, not a
+    neighboring one -- catches a copy-paste or mis-keyed mapping the two
+    single-code tests above (131047, and the no-hint case) wouldn't."""
+    error = whatsapp.GraphAPIError(
+        f"HTTP 400 - code {code}",
+        details={"error": {"message": "boom", "code": code}},
+    )
+
+    result = _payload(whatsapp._send_error(error))
+
+    assert result["status"] == "error"
+    assert expected_substring in result["details"]["hint"]
 
 
 def test_send_error_redacts_tokens(token, monkeypatch):
@@ -696,6 +776,44 @@ def test_send_media_message_image_with_caption(token, monkeypatch):
         "type": "image",
         "image": {"link": "https://cdn.example.com/a.png", "caption": "Look"},
     }
+
+
+def test_send_media_message_strips_caption_before_sending_and_measuring(
+    token, monkeypatch
+):
+    """caption's emptiness check must use the same stripped value that gets
+    sent and length-checked -- otherwise a whitespace-padded caption could
+    be sent with the padding intact, or padding could push it over
+    MAX_MEDIA_CAPTION_CHARS even though the real content fits."""
+    mock = _mock_request(monkeypatch, MockResponse(SEND_OK))
+
+    whatsapp.whatsapp_send_media_message(
+        "pn-1",
+        "15551234567",
+        "image",
+        "https://cdn.example.com/a.png",
+        caption="  Look  ",
+    )
+
+    assert mock.call_args.kwargs["json"]["image"]["caption"] == "Look"
+
+
+def test_send_media_message_caption_length_checked_after_stripping(token, monkeypatch):
+    mock = _mock_request(monkeypatch, MockResponse(SEND_OK))
+    padded_caption = "  " + ("x" * whatsapp.MAX_MEDIA_CAPTION_CHARS) + "  "
+
+    result = _payload(
+        whatsapp.whatsapp_send_media_message(
+            "pn-1",
+            "15551234567",
+            "image",
+            "https://cdn.example.com/a.png",
+            caption=padded_caption,
+        )
+    )
+
+    assert result["status"] == "success"
+    mock.assert_called_once()
 
 
 def test_send_media_message_strips_media_url(token, monkeypatch):
@@ -826,7 +944,7 @@ def test_send_media_message_requires_public_http_url(token, monkeypatch, media_u
     )
 
     assert result["status"] == "error"
-    assert "public http or https URL" in result["message"]
+    assert "http or https URL" in result["message"]
     mock.assert_not_called()
 
 

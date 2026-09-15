@@ -306,6 +306,14 @@ class LanceDBMemoryStore(MemoryStore):
         Unlike the vector rebuild, this preserves the existing ``vector`` column
         as-is (no re-embedding) — it only projects ``user_id`` / ``scope_dims``
         out of each row's metadata JSON.
+
+        Schema- and field-level Arrow metadata is preserved: the output table
+        is rebuilt with an explicit schema that reuses every pre-existing
+        field verbatim (type and field metadata) and carries over the
+        schema-level metadata. Any identity metadata already present on the
+        schema or fields is therefore preserved verbatim; no identity
+        metadata is synthesized, copied from elsewhere, or validated when
+        absent.
         """
         columns: dict[str, Any] = {
             name: existing.column(name) for name in existing.schema.names
@@ -317,7 +325,14 @@ class LanceDBMemoryStore(MemoryStore):
         user_ids, scope_dims = self._derive_scope_arrays(metadata_column)
         columns[USER_ID_COLUMN] = user_ids
         columns[SCOPE_DIMS_COLUMN] = scope_dims
-        return pa.table(columns)
+        fields: list[Any] = []
+        for name, column in columns.items():
+            if name in existing.schema.names:
+                fields.append(existing.schema.field(name))
+            else:
+                fields.append(pa.field(name, column.type))
+        schema = pa.schema(fields, metadata=existing.schema.metadata)
+        return pa.table(columns, schema=schema)
 
     def _ensure_scope_columns(self, conn: Any) -> None:
         """Promote user_id + scope_dims to real columns on an existing table (#822).

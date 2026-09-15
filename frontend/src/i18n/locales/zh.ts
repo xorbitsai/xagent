@@ -357,6 +357,7 @@ const zh = {
     clarification: {
       yes: "是",
       no: "否",
+      answerLine: "对「{label}」的回答：{value}",
       required: "请至少填写一项",
       uploadedFiles: "已上传文件",
       confirmed: "已确认",

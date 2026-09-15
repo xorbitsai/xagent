@@ -357,6 +357,7 @@ const en = {
     clarification: {
       yes: "Yes",
       no: "No",
+      answerLine: "Answer to \"{label}\": {value}",
       required: "Please fill in at least one field",
       uploadedFiles: "Uploaded files",
       confirmed: "Confirmed",

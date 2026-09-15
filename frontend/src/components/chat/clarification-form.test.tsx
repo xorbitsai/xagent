@@ -135,7 +135,7 @@ describe("ClarificationForm Session file capability", () => {
 
     await waitFor(() => {
       expect(onSend).toHaveBeenCalledWith(
-        "Note: Continue without a file",
+        'chatPage.clarification.answerLine:{"label":"Note","value":"Continue without a file"}',
         [],
         {},
       )
@@ -196,7 +196,11 @@ describe("ClarificationForm Session file capability", () => {
     )
 
     await waitFor(() => {
-      expect(onSend).toHaveBeenCalledWith("Source: Skip upload", [], {})
+      expect(onSend).toHaveBeenCalledWith(
+        'chatPage.clarification.answerLine:{"label":"Source","value":"Skip upload"}',
+        [],
+        {},
+      )
     })
   })
 
@@ -763,7 +767,7 @@ describe("ClarificationForm interaction identity", () => {
     )
 
     await waitFor(() => expect(onSend).toHaveBeenCalledWith(
-      "City: Sydney",
+      'chatPage.clarification.answerLine:{"label":"City","value":"Sydney"}',
       [],
       { request_id: "inputreq_0011223344556677889900aabbccddee" },
     ))
@@ -918,5 +922,46 @@ describe("ClarificationForm blank option filtering", () => {
 
     expect(screen.getByText("Import")).toBeInTheDocument()
     expect(blankOptionSpans(container)).toHaveLength(0)
+  })
+})
+
+describe("ClarificationForm answer framing", () => {
+  // A bare "label: value" join turned a Cancel pick into
+  // "How should I publish this LinkedIn post?: Cancel", which the agent read
+  // as the user asking how to publish - and it published. Both locales carry
+  // the framing, so both are pinned: an untested one can silently regress.
+  it.each([
+    ["en", 'Answer to "How should I publish this LinkedIn post?": Cancel'],
+    ["zh", "对「How should I publish this LinkedIn post?」的回答：Cancel"],
+  ] as const)("submits a picked option as an answer in %s", async (locale, expected) => {
+    i18nMock.translate = (key, vars) =>
+      resolveTranslation(locale, key as Parameters<typeof resolveTranslation>[1], vars)
+    const onSend = vi.fn()
+    render(
+      <ClarificationForm
+        interactions={[
+          {
+            type: "select_one" as const,
+            field: "publish_decision",
+            label: "How should I publish this LinkedIn post?",
+            options: [
+              { label: "Publish text only", value: "text_only" },
+              { label: "Cancel", value: "cancel" },
+            ],
+          },
+        ]}
+        onSend={onSend}
+      />,
+    )
+
+    fireEvent.click(screen.getByText(resolveTranslation(locale, "chatPage.clarification.selectOption")))
+    fireEvent.click(screen.getByText("Cancel"))
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: resolveTranslation(locale, "chatPage.clarification.submit"),
+      }),
+    )
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledWith(expected, [], {}))
   })
 })

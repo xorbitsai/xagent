@@ -305,7 +305,11 @@ export function ClarificationForm({
     }
 
     // Separate files and text
-    const textParts = lines.filter(l => !l.isFile).map(l => `${l.label}: ${l.value}`)
+    // A bare "label: value" join reads a question label back to the agent as
+    // the user asking it rather than answering it.
+    const textParts = lines.filter(l => !l.isFile).map(
+      l => t("chatPage.clarification.answerLine", { label: l.label, value: l.value }),
+    )
     const fileParts = lines.filter(l => l.isFile)
 
     const textMessage = textParts.join("\n")

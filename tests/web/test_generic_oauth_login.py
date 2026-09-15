@@ -1285,6 +1285,52 @@ def test_meta_ads_login_config_id_override_survives_admin_app_id_casing(
     assert qs["config_id"] == ["ads-only-config-id"]
 
 
+def test_whatsapp_login_uses_its_own_config_id_override(db_session, monkeypatch):
+    """A dedicated META_WHATSAPP_CONFIG_ID must take precedence over the
+    shared META_CONFIG_ID for the whatsapp app -- otherwise widening the one
+    shared Login Configuration to include WhatsApp's business_management /
+    whatsapp_business_management / whatsapp_business_messaging scopes would
+    also hand those permissions to Facebook/Instagram/Meta Ads tokens issued
+    from the same configuration."""
+    db, user = db_session
+    token = _token_for(user)
+    monkeypatch.setenv("META_CONFIG_ID", "shared-config-id")
+    monkeypatch.setenv("META_WHATSAPP_CONFIG_ID", "whatsapp-only-config-id")
+    db.add(
+        PublicMCPApp(
+            app_id="whatsapp",
+            name="WhatsApp Business",
+            description="WhatsApp connector",
+            transport="oauth",
+            provider_name="meta",
+            category="Marketing",
+            oauth_scopes=["whatsapp_business_messaging"],
+            is_visible_in_connector=True,
+            launch_config={},
+        )
+    )
+    db.commit()
+
+    provider = _provider(
+        auth_url="https://www.facebook.com/v25.0/dialog/oauth",
+        default_scopes=["public_profile"],
+        redirect_uri="https://app.example.com/api/auth/meta/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="meta",
+        token=token,
+        app_id="whatsapp",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert qs["config_id"] == ["whatsapp-only-config-id"]
+    assert "scope" not in qs
+
+
 def test_meta_login_ignores_undocumented_legacy_config_id_alias(
     db_session, monkeypatch
 ):

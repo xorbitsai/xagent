@@ -26,7 +26,9 @@ from xagent.web.mcp_apps import requires_app_scoped_oauth_grant
 # Apps already known (from mcp_apps.py's own comment) to need this guard,
 # pinned here so a regression in any of them -- not just whatsapp -- is
 # caught the same way.
-_EXPECTED_APP_SCOPED_APPS = frozenset({"facebook", "github", "myob", "whatsapp"})
+_EXPECTED_APP_SCOPED_APPS = frozenset(
+    {"facebook", "github", "myob", "meta-ads", "whatsapp"}
+)
 
 
 def test_expected_apps_require_app_scoped_oauth_grant():

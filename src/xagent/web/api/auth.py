@@ -408,6 +408,7 @@ _META_APP_CONFIG_ID_ENV_VARS = {
     "facebook": "META_FACEBOOK_CONFIG_ID",
     "instagram": "META_INSTAGRAM_CONFIG_ID",
     "meta-ads": "META_ADS_CONFIG_ID",
+    "whatsapp": "META_WHATSAPP_CONFIG_ID",
 }
 
 

@@ -4945,6 +4945,8 @@ const zh = {
     objectInvalid: "请输入合法的 JSON 对象。",
     onlyUnsupportedNotice: "这个连接器还缺少这个弹窗填不了的输入，当前版本请改用 SDK 或外部 API。",
     onlyUnsupportedRemaining: "这个连接器还需要 {keys}，当前版本请改用 SDK 或外部 API。",
+    savedNotResentUnsupported: "值已保存，但这条消息没有重发：这个连接器还需要 {keys}，当前版本请改用 SDK 或外部 API。",
+    savedNotResentUnavailable: "值已保存，但这条消息没有重发：这个连接器仍然不可用。",
     stillMissingAfterSave: "保存后这个连接器仍然不可用，还缺 {keys}。",
     sendFailed: "值已保存，但消息没有发出去。",
     actions: {

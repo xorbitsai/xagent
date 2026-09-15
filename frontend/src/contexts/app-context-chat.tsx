@@ -9,6 +9,7 @@ import { ReplayScheduler } from '@/lib/replay-scheduler'
 import { CollapsibleSection } from "@/components/collapsible-section"
 import { Badge } from "@/components/ui/badge"
 import { ClarificationForm } from "@/components/chat/clarification-form"
+import { ConnectorRuntimeDialog } from "@/components/chat/connector-runtime-dialog"
 import {
   AgentCardPresentationCapability,
   LinksOpenInNewTabCapability,
@@ -18,6 +19,8 @@ import {
   FileAccessProvider,
   type FileAccessPolicy,
 } from "@/contexts/file-access-context"
+import { useConnectorRuntimeDialogActions } from "@/contexts/connector-runtime-dialog-context"
+import { isConnectorRuntimeDialogTriggerCode } from "@/lib/connector-runtime-api"
 
 interface WebSocketMessage {
   type: string
@@ -63,7 +66,7 @@ type TaskControlEnvelope = {
   status?: TaskStatus
 }
 
-const VERSIONED_TASK_EVENT_TYPES = new Set([
+export const VERSIONED_TASK_EVENT_TYPES = new Set([
   "task_stream_snapshot",
   "agent_error",
   "error",
@@ -361,7 +364,7 @@ import {
 } from "@/hooks/use-websocket"
 import { generateClientMessageId, getApiUrl, getUploadApiUrl, shouldAutoOpenTaskPreview } from "@/lib/utils"
 import { apiRequest, classifyUploadError, getApiErrorMessage, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper"
-import { clientErrorTranslationKey, readClientErrorCode } from "@/lib/client-errors"
+import { clientErrorTranslationKey, readClientErrorCode, type ClientErrorCode } from "@/lib/client-errors"
 import { normalizeUploadFileIds } from "@/lib/upload-file-ids"
 import { useI18n, type Translate } from "@/contexts/i18n-context"
 import { normalizeTimestampMs } from "@/lib/time-utils"
@@ -984,14 +987,21 @@ export type ErrorFrameDisplay = {
   occurrenceIdentity: string | undefined
   bubbleContent: string
   isResult: boolean
+  /** The frame's own code, once it has cleared the client error table --
+   *  null on a non-terminal frame, a terminal frame with no code, or a code
+   *  the table does not list (e.g. auto_model_unavailable). Reuses the same
+   *  `projectedCode` this function already derives for the bubble; a caller
+   *  must not call getTaskErrorProjection a second time to get it. */
+  terminalErrorCode: ClientErrorCode | null
 }
 
-// One place where a frame on the error/task_error handler becomes the five
+// One place where a frame on the error/task_error handler becomes the six
 // values the handler needs: the bubble's wording, the dedup text, the dedup
-// identity, the result flag, and the task status to dispatch. Each of those
-// needs a different subset of "is this terminal / is legacy prose trusted /
-// did a code survive / is there a state version", and deriving each subset at
-// its own use site is what let five separate defects land in this handler.
+// identity, the result flag, the task status to dispatch, and the code that
+// opens the connector-runtime dialog. Each of those needs a different subset
+// of "is this terminal / is legacy prose trusted / did a code survive / is
+// there a state version", and deriving each subset at its own use site is
+// what let five separate defects land in this handler.
 // Pure on purpose: no dispatch, no refs, nothing
 // outside its arguments, so every cell of that matrix is unit-testable
 // without rendering the provider -- the same shape extractTaskControlEnvelope
@@ -1078,6 +1088,7 @@ export const projectErrorFrameForDisplay = (
     // ADD_MESSAGE reducer case's isResult branch, which merges
     // state.traceEvents into the message and clears it).
     isResult: isTerminal,
+    terminalErrorCode: projectedCode,
   }
 }
 
@@ -2160,6 +2171,14 @@ export function AppProvider({
   )
   const pendingTaskToExecuteRef = useRef<{ description: string } | null>(null)
   const startDelayedPlaybackRef = useRef<() => void>(() => {})
+  // Read through a ref, not a useCallback dependency, so the dialog
+  // provider's state changes never change handleMessage's or sendMessage's
+  // identity -- the same shape sessionMessageHandlerRef uses.
+  const connectorRuntimeDialogActions = useConnectorRuntimeDialogActions()
+  const connectorRuntimeDialogRef = useRef(connectorRuntimeDialogActions)
+  useLayoutEffect(() => {
+    connectorRuntimeDialogRef.current = connectorRuntimeDialogActions
+  }, [connectorRuntimeDialogActions])
   const isHistoricalDataLoadingRef = useRef(false)
   const historicalDataRequestMapRef = useRef(new Map<number, boolean>())
   const recentMessagesRef = useRef(new Map<string, ReturnType<typeof setTimeout>>())
@@ -5587,6 +5606,13 @@ export function AppProvider({
         dispatch({ type: "TRIGGER_TASK_UPDATE" })
         dispatch({ type: "SET_PROCESSING", payload: false })  // Stop processing on task completion
 
+        if (!isMessageForOtherTask && currentState.taskId) {
+          // A settled turn can no longer be resent, whether it succeeded or
+          // failed for a reason other than a missing connector input; see
+          // the stash lifecycle in connector-runtime-api.ts's docs.
+          connectorRuntimeDialogRef.current.forgetDelivery(currentState.taskId)
+        }
+
         if (!taskData.success) {
           // error_details carries the structured reason ({code, ..., message});
           // fall back to its message when the terminal event omits output. The
@@ -5989,6 +6015,20 @@ export function AppProvider({
               isResult: errorFrame.isResult,
             },
           })
+
+          if (errorFrame.isTerminal && !isMessageForOtherTask && currentState.taskId) {
+            if (
+              errorFrame.terminalErrorCode !== null
+              && isConnectorRuntimeDialogTriggerCode(errorFrame.terminalErrorCode)
+            ) {
+              // Hands this tab's stash to the dialog request and clears it in
+              // the same update: this frame both opens the dialog and settles
+              // the turn. Never forget the stash before this call.
+              connectorRuntimeDialogRef.current.openForTask(currentState.taskId)
+            } else {
+              connectorRuntimeDialogRef.current.forgetDelivery(currentState.taskId)
+            }
+          }
         }
         break
       }
@@ -6326,6 +6366,10 @@ export function AppProvider({
     // invisible until a reload replays the persisted transcript row. The
     // reducer reconciles by turn id / content, keeping the persisted event
     // when it already arrived and replacing this copy when it arrives later.
+    // Also the one place that stashes this turn as the connector-runtime
+    // dialog's resend candidate: this guard is exactly "delivered, and the
+    // user is still looking at this task", which is the stash's own
+    // definition (see connector-runtime-api.ts's docs).
     const addOptimisticUserMessage = (intendedTaskId: number | null) => {
       // Delivery acknowledgement can arrive after the user has navigated to a
       // different task. Never append this turn to whichever task happens to be
@@ -6346,6 +6390,14 @@ export function AppProvider({
         || stateRef.current.taskId !== intendedTaskId
       ) {
         return
+      }
+      if (typeof intendedTaskId === "number") {
+        connectorRuntimeDialogRef.current.recordDelivery({
+          taskId: intendedTaskId,
+          clientMessageId,
+          text: message,
+          files: files ?? [],
+        })
       }
       let content: React.ReactNode = message
       if (files && files.length > 0) {
@@ -7130,6 +7182,7 @@ export function AppProvider({
           }}
         >
           {children}
+          <ConnectorRuntimeDialog />
           </AppContext.Provider>
         </FileAccessProvider>
       </LinksOpenInNewTabCapability.Provider>

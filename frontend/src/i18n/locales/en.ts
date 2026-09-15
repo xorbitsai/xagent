@@ -4950,6 +4950,8 @@ Build when you need.`,
     objectInvalid: "Enter a valid JSON object.",
     onlyUnsupportedNotice: "This connector is missing input this dialog cannot collect yet. Use the SDK or the external API instead.",
     onlyUnsupportedRemaining: "This connector still needs {keys}. For now, use the SDK or the external API instead.",
+    savedNotResentUnsupported: "The values were saved, but this message was not resent: this connector still needs {keys}. For now, use the SDK or the external API instead.",
+    savedNotResentUnavailable: "The values were saved, but this message was not resent: this connector is still unavailable.",
     stillMissingAfterSave: "This connector will still be unavailable after saving; it still needs {keys}.",
     sendFailed: "The values were saved, but the message was not sent.",
     actions: {

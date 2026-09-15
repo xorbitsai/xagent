@@ -3,7 +3,7 @@ import logging
 import os
 from collections.abc import Callable
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 
 import requests
 from mcp.server.fastmcp import FastMCP
@@ -294,34 +294,45 @@ def _request(
     return response.json()
 
 
-def _list_association_ids(path: str, max_results: int) -> tuple[list[Any], bool]:
+def _list_association_ids(
+    path: str, max_results: int, after: str | None = None
+) -> tuple[list[str], str | None]:
     """Collect associated object ids across pages, up to ``max_results``.
 
-    Follows the ``paging.next.after`` cursor so results beyond the API's
-    default page size are not silently dropped. Returns the collected ids and
-    whether more associations remain on the server.
+    Starts at ``after`` and follows HubSpot's ``paging.next.after`` cursor so
+    results beyond the API's default page size are not silently dropped.
+    Invalid ids are ignored and duplicate ids are collapsed while preserving
+    order. Returns the collected ids and the cursor for the next unread page.
     """
-    ids: list[Any] = []
-    after: str | None = None
+    ids: list[str] = []
+    seen_ids: set[str] = set()
+    cursor = after
     while True:
         params: dict[str, Any] = {
             "limit": min(_ASSOCIATION_PAGE_SIZE, max_results - len(ids))
         }
-        if after:
-            params["after"] = after
+        if cursor:
+            params["after"] = cursor
         page = _request(
             "GET", path, params=params, timeout=ASSOCIATION_LISTING_TIMEOUT_SECONDS
         )
         results = page.get("results", [])
-        ids.extend(item.get("id") for item in results)
-        after = ((page.get("paging") or {}).get("next") or {}).get("after")
+        for item in results:
+            raw_id = item.get("id")
+            if not raw_id:
+                continue
+            association_id = str(raw_id)
+            if association_id not in seen_ids:
+                ids.append(association_id)
+                seen_ids.add(association_id)
+        cursor = ((page.get("paging") or {}).get("next") or {}).get("after")
         if len(ids) >= max_results:
-            return ids[:max_results], bool(after) or len(ids) > max_results
-        if not after:
-            return ids, False
+            return ids[:max_results], cursor
+        if not cursor:
+            return ids, None
         if not results:
             # A page with no results but a next cursor would loop forever.
-            return ids, True
+            return ids, cursor
 
 
 def _parse_properties(properties_json: str) -> dict[str, Any]:
@@ -474,7 +485,10 @@ def hubspot_update_company(company_id: str, properties_json: str) -> str:
 
 
 def _get_associated_deals(
-    object_type: str, object_id: str, limit: int
+    object_type: Literal["contacts", "companies"],
+    object_id: str,
+    limit: int,
+    after: str | None,
 ) -> dict[str, Any]:
     """Fetch deals associated with a HubSpot contact or company record.
 
@@ -482,14 +496,16 @@ def _get_associated_deals(
     if the response would otherwise be hard-truncated into invalid JSON past
     the platform's output limit.
     """
-    deal_ids, has_more = _list_association_ids(
+    deal_ids, next_after = _list_association_ids(
         f"/crm/v3/objects/{object_type}/{object_id}/associations/deals",
         max(1, min(limit, 100)),
+        after,
     )
     if not deal_ids:
         return {
             "deals": [],
-            "has_more": has_more,
+            "has_more": bool(next_after),
+            "after": next_after,
             "truncated": False,
             "missing_deal_ids": [],
         }
@@ -509,25 +525,31 @@ def _get_associated_deals(
     ]
     # A partial batch-read (e.g. an archived deal dropped between the
     # association listing above and this call) must be surfaced, not
-    # silently returned as if every requested id came back. Sorted by str()
-    # rather than directly: a malformed association result missing its id
-    # puts None into deal_ids, and sorted() can't compare None to str.
-    returned_ids = {item.get("id") for item in results}
-    missing_deal_ids = sorted(set(deal_ids) - returned_ids, key=str)
+    # silently returned as if every requested id came back. Normalize ids to
+    # strings on both sides because HubSpot record ids are string identifiers.
+    returned_ids = {str(item["id"]) for item in results if item.get("id")}
+    missing_deal_ids = sorted(set(deal_ids) - returned_ids)
 
     def _build(
-        deals_slice: list[Any], missing_slice: list[Any], truncated: bool
+        deals_slice: list[Any],
+        missing_slice: list[Any],
+        truncated: bool,
+        deals_truncated: bool,
     ) -> dict[str, Any]:
         return {
             "deals": deals_slice,
-            "has_more": has_more or truncated,
+            "has_more": bool(next_after) or deals_truncated,
+            # When deal data was trimmed, retry this same association page
+            # with a smaller limit. Otherwise advance to HubSpot's next page.
+            "after": after if deals_truncated else next_after,
             "truncated": truncated,
             "missing_deal_ids": missing_slice,
         }
 
     max_output_length = get_tool_max_output_length()
-    payload = _build(deals, missing_deal_ids, False)
+    payload = _build(deals, missing_deal_ids, False, False)
     truncated = False
+    deals_truncated = False
     # Shrink missing_deal_ids before deals: it's a diagnostic list of ids
     # HubSpot didn't return, strictly less valuable than the deals the
     # caller actually asked for, so a batch-read shortfall large enough to
@@ -539,7 +561,8 @@ def _get_associated_deals(
             missing_deal_ids = missing_deal_ids[: len(missing_deal_ids) // 2]
         else:
             deals = deals[: len(deals) // 2]
-        payload = _build(deals, missing_deal_ids, truncated)
+            deals_truncated = True
+        payload = _build(deals, missing_deal_ids, truncated, deals_truncated)
     if truncated and not deals and not missing_deal_ids:
         # Collapsing everything away means even the single largest
         # remaining entry didn't fit alone - "retry with a smaller `limit`"
@@ -550,9 +573,9 @@ def _get_associated_deals(
             "message": (
                 "Every deal (and/or every id HubSpot's batch lookup didn't "
                 "return) was individually too large to fit the output size "
-                "limit, so none could be returned. Retrying with a smaller "
-                "`limit` may surface different records if more exist, but "
-                "cannot shrink an individually oversized record."
+                "limit, so none could be returned from this page. Retrying "
+                "with a smaller `limit` cannot shrink an individually "
+                "oversized record."
             ),
         }
         if len(_success(**payload_with_message)) <= max_output_length:
@@ -561,7 +584,9 @@ def _get_associated_deals(
 
 
 @mcp.tool()
-def hubspot_get_contact_deals(contact_id: str, limit: int = 100) -> str:
+def hubspot_get_contact_deals(
+    contact_id: str, limit: int = 100, after: str | None = None
+) -> str:
     """
     List every deal associated with a HubSpot contact - open and closed alike
     - including deal stage, pipeline, amount, close date, and the closed-state
@@ -572,7 +597,9 @@ def hubspot_get_contact_deals(contact_id: str, limit: int = 100) -> str:
     its own. Returns at most `limit` deals (max 100). `has_more` is true when
     there are more deals than returned, either because of `limit` or because
     the response was trimmed to fit the output size limit (`truncated` is
-    then also true); `missing_deal_ids` lists any requested deal id HubSpot's
+    then also true). Pass the returned `after` cursor to retrieve the next
+    page; if `truncated` is true because deals were trimmed, retry that cursor
+    with a smaller `limit`. `missing_deal_ids` lists any requested deal id HubSpot's
     own batch lookup silently dropped (empty when none were) - though when
     `truncated` is also true, this list may itself have been trimmed, so
     it's not a complete accounting in that case.
@@ -587,14 +614,16 @@ def hubspot_get_contact_deals(contact_id: str, limit: int = 100) -> str:
     """
     try:
         contact_id = _url_path_id(contact_id, "contact_id")
-        return _success(**_get_associated_deals("contacts", contact_id, limit))
+        return _success(**_get_associated_deals("contacts", contact_id, limit, after))
     except Exception as e:
         logger.error(f"Error getting contact deals: {e}")
         return _error(str(e))
 
 
 @mcp.tool()
-def hubspot_get_company_deals(company_id: str, limit: int = 100) -> str:
+def hubspot_get_company_deals(
+    company_id: str, limit: int = 100, after: str | None = None
+) -> str:
     """
     List every deal associated with a HubSpot company - open and closed alike
     - including deal stage, pipeline, amount, close date, and the closed-state
@@ -615,7 +644,7 @@ def hubspot_get_company_deals(company_id: str, limit: int = 100) -> str:
     """
     try:
         company_id = _url_path_id(company_id, "company_id")
-        return _success(**_get_associated_deals("companies", company_id, limit))
+        return _success(**_get_associated_deals("companies", company_id, limit, after))
     except Exception as e:
         logger.error(f"Error getting company deals: {e}")
         return _error(str(e))
@@ -686,12 +715,12 @@ def hubspot_get_contact_notes(contact_id: str, limit: int = 20) -> str:
     """
     try:
         contact_id = _url_path_id(contact_id, "contact_id")
-        note_ids, has_more = _list_association_ids(
+        note_ids, next_after = _list_association_ids(
             f"/crm/v3/objects/contacts/{contact_id}/associations/notes",
             max(1, min(limit, 100)),
         )
         if not note_ids:
-            return _success(notes=[], has_more=has_more)
+            return _success(notes=[], has_more=bool(next_after))
 
         notes = _request(
             "POST",
@@ -706,7 +735,7 @@ def hubspot_get_contact_notes(contact_id: str, limit: int = 20) -> str:
                 {"id": item.get("id"), "properties": item.get("properties", {})}
                 for item in notes.get("results", [])
             ],
-            has_more=has_more,
+            has_more=bool(next_after),
         )
     except Exception as e:
         logger.error(f"Error getting contact notes: {e}")

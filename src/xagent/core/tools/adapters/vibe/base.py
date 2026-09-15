@@ -56,7 +56,7 @@ BINDING_AUTHORIZED_CATEGORIES: frozenset[str] = frozenset({ToolCategory.SSH.valu
 # excludes them. Legacy allow-list / per-user override paths do a plain name
 # intersection and are not aware of this set, so they can still drop these.
 INTRINSIC_TOOL_NAMES: frozenset[str] = frozenset(
-    {"get_current_time", "validate_local_time"}
+    {"get_current_time", "validate_local_time", "resolve_datetime"}
 )
 
 

@@ -12,6 +12,8 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
+from xagent.migrations.seed_helpers import delete_unmodified_seeded_rows
+
 # revision identifiers, used by Alembic.
 revision: str = "20260720_seed_docs_slides_hubspot"
 down_revision: Union[str, None] = "20260715_add_public_mcp_app_audits"
@@ -192,14 +194,12 @@ def downgrade() -> None:
     existing_tables = set(inspector.get_table_names())
 
     if "public_mcp_apps" in existing_tables:
-        # Only the catalog entries are removed. Any user OAuth connections created
-        # against these apps are not owned by this migration and are cleaned up
-        # through the normal disconnect path.
-        bind.execute(
-            sa.delete(PUBLIC_MCP_APPS_TABLE).where(
-                PUBLIC_MCP_APPS_TABLE.c.app_id.in_(NEW_APP_IDS)
-            )
-        )
+        # Only rows still matching this migration's seed snapshot are removed,
+        # so an operator's pre-existing custom app_id reusing one of these ids
+        # is left in place. Any user OAuth connections created against these
+        # apps are not owned by this migration and are cleaned up through the
+        # normal disconnect path.
+        delete_unmodified_seeded_rows(bind, PUBLIC_MCP_APPS_TABLE, _new_app_rows())
 
     if "oauth_providers" not in existing_tables:
         return
@@ -217,16 +217,10 @@ def downgrade() -> None:
     # migration seeded, so an admin-created "hubspot" provider (via
     # POST /admin/mcp/providers) is preserved. client_id/client_secret are
     # env-dependent and intentionally not part of the guard.
-    provider_columns = {
-        column["name"] for column in inspector.get_columns("oauth_providers")
-    }
-    seeded_provider = _hubspot_provider_row()
-    delete_stmt = sa.delete(FULL_OAUTH_PROVIDERS_TABLE).where(
-        FULL_OAUTH_PROVIDERS_TABLE.c.provider_name == "hubspot"
+    delete_unmodified_seeded_rows(
+        bind,
+        FULL_OAUTH_PROVIDERS_TABLE,
+        [_hubspot_provider_row()],
+        match_columns=("name", "auth_url", "token_url"),
+        id_column="provider_name",
     )
-    for column in ("name", "auth_url", "token_url"):
-        if column in provider_columns:
-            delete_stmt = delete_stmt.where(
-                FULL_OAUTH_PROVIDERS_TABLE.c[column] == seeded_provider[column]
-            )
-    bind.execute(delete_stmt)

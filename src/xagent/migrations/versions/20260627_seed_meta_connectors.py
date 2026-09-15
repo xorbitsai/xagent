@@ -12,6 +12,8 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
+from xagent.migrations.seed_helpers import delete_unmodified_seeded_rows
+
 # revision identifiers, used by Alembic.
 revision: str = "20260627_seed_meta_connectors"
 down_revision: Union[str, None] = "20260624_add_mcp_concurrency_config"
@@ -52,8 +54,6 @@ PUBLIC_MCP_APPS_TABLE = sa.table(
     sa.column("launch_config", sa.JSON),
 )
 
-META_APP_IDS = ("facebook", "instagram")
-
 
 def _filter_row(row: dict[str, object], allowed_columns: set[str]) -> dict[str, object]:
     return {key: value for key, value in row.items() if key in allowed_columns}
@@ -92,8 +92,8 @@ def _meta_app_rows() -> list[dict[str, object]]:
             ],
             "is_visible_in_connector": True,
             "launch_config": {
-                "command": "uv",
-                "args": ["run", "python", "-m", "xagent.web.tools.mcp.facebook"],
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.facebook"],
                 "env_mapping": {"META_ACCESS_TOKEN": "access_token"},
             },
         },
@@ -113,8 +113,8 @@ def _meta_app_rows() -> list[dict[str, object]]:
             ],
             "is_visible_in_connector": True,
             "launch_config": {
-                "command": "uv",
-                "args": ["run", "python", "-m", "xagent.web.tools.mcp.instagram"],
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.instagram"],
                 "env_mapping": {"META_ACCESS_TOKEN": "access_token"},
             },
         },
@@ -161,11 +161,10 @@ def downgrade() -> None:
     existing_tables = set(inspector.get_table_names())
 
     if "public_mcp_apps" in existing_tables:
-        bind.execute(
-            sa.delete(PUBLIC_MCP_APPS_TABLE).where(
-                PUBLIC_MCP_APPS_TABLE.c.app_id.in_(META_APP_IDS)
-            )
-        )
+        # Only rows still matching this migration's seed snapshot are removed,
+        # so an operator's pre-existing custom "facebook"/"instagram" app_id is
+        # left in place.
+        delete_unmodified_seeded_rows(bind, PUBLIC_MCP_APPS_TABLE, _meta_app_rows())
 
     if "oauth_providers" not in existing_tables:
         return
@@ -179,8 +178,14 @@ def downgrade() -> None:
         if remaining_meta_apps:
             return
 
-    bind.execute(
-        sa.delete(OAUTH_PROVIDERS_TABLE).where(
-            OAUTH_PROVIDERS_TABLE.c.provider_name == "meta"
-        )
+    # Only delete the provider row when it still matches the static shape this
+    # migration seeded, so an admin-created/edited "meta" provider (via
+    # POST /admin/mcp/providers) is preserved. client_id/client_secret are
+    # env-dependent and intentionally not part of the guard.
+    delete_unmodified_seeded_rows(
+        bind,
+        FULL_OAUTH_PROVIDERS_TABLE,
+        [_meta_provider_row()],
+        match_columns=("name", "auth_url", "token_url"),
+        id_column="provider_name",
     )

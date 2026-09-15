@@ -12,6 +12,8 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
+from xagent.migrations.seed_helpers import delete_unmodified_seeded_rows
+
 # revision identifiers, used by Alembic.
 revision: str = "20260526_seed_builtin_microsoft_graph_mcp_apps"
 down_revision: Union[str, None] = "20260525_add_task_visibility"
@@ -51,8 +53,6 @@ OAUTH_PROVIDERS_TABLE = sa.table(
     "oauth_providers",
     sa.column("provider_name", sa.String),
 )
-
-MICROSOFT_APP_IDS = ("teams", "outlook", "onedrive")
 
 
 def _filter_row(row: dict[str, object], allowed_columns: set[str]) -> dict[str, object]:
@@ -95,8 +95,8 @@ def _microsoft_app_rows() -> list[dict[str, object]]:
             ],
             "is_visible_in_connector": True,
             "launch_config": {
-                "command": "uv",
-                "args": ["run", "python", "-m", "xagent.web.tools.mcp.teams"],
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.teams"],
                 "env_mapping": {"AUTH_TOKEN": "access_token"},
             },
         },
@@ -116,8 +116,8 @@ def _microsoft_app_rows() -> list[dict[str, object]]:
             ],
             "is_visible_in_connector": True,
             "launch_config": {
-                "command": "uv",
-                "args": ["run", "python", "-m", "xagent.web.tools.mcp.outlook"],
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.outlook"],
                 "env_mapping": {"AUTH_TOKEN": "access_token"},
             },
         },
@@ -132,8 +132,8 @@ def _microsoft_app_rows() -> list[dict[str, object]]:
             "oauth_scopes": ["Files.ReadWrite"],
             "is_visible_in_connector": True,
             "launch_config": {
-                "command": "uv",
-                "args": ["run", "python", "-m", "xagent.web.tools.mcp.onedrive"],
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.onedrive"],
                 "env_mapping": {"AUTH_TOKEN": "access_token"},
             },
         },
@@ -180,10 +180,11 @@ def downgrade() -> None:
     existing_tables = set(inspector.get_table_names())
 
     if "public_mcp_apps" in existing_tables:
-        bind.execute(
-            sa.delete(PUBLIC_MCP_APPS_TABLE).where(
-                PUBLIC_MCP_APPS_TABLE.c.app_id.in_(MICROSOFT_APP_IDS)
-            )
+        # Only rows still matching this migration's seed snapshot are removed,
+        # so an operator's pre-existing custom "teams"/"outlook"/"onedrive"
+        # app_id is left in place.
+        delete_unmodified_seeded_rows(
+            bind, PUBLIC_MCP_APPS_TABLE, _microsoft_app_rows()
         )
 
     if "oauth_providers" not in existing_tables:
@@ -198,8 +199,14 @@ def downgrade() -> None:
         if remaining_microsoft_apps:
             return
 
-    bind.execute(
-        sa.delete(OAUTH_PROVIDERS_TABLE).where(
-            OAUTH_PROVIDERS_TABLE.c.provider_name == "microsoft"
-        )
+    # Only delete the provider row when it still matches the static shape this
+    # migration seeded, so an admin-created/edited "microsoft" provider (via
+    # POST /admin/mcp/providers) is preserved. client_id/client_secret are
+    # env-dependent and intentionally not part of the guard.
+    delete_unmodified_seeded_rows(
+        bind,
+        FULL_OAUTH_PROVIDERS_TABLE,
+        [_microsoft_provider_row()],
+        match_columns=("name", "auth_url", "token_url"),
+        id_column="provider_name",
     )

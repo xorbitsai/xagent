@@ -181,6 +181,34 @@ def test_downgrade_removes_provider_and_apps(tmp_path):
         assert "hubspot" not in _provider_names(connection)
 
 
+def test_downgrade_preserves_colliding_custom_app(tmp_path):
+    """An operator's custom app that reuses one of this migration's app_ids
+    (e.g. a hand-created "google-docs" connector with a different config) must
+    survive downgrade, since upgrade() itself no-ops on that collision."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_tables(connection)
+        connection.execute(
+            text(
+                "INSERT INTO public_mcp_apps (app_id, name, transport, provider_name)"
+                " VALUES ('google-docs', 'Custom Docs Bridge', 'stdio', NULL)"
+            )
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+            migration.downgrade()
+        assert "google-docs" in _app_ids(connection)
+        row = connection.execute(
+            text(
+                "SELECT name, transport FROM public_mcp_apps WHERE app_id='google-docs'"
+            )
+        ).first()
+        assert row[0] == "Custom Docs Bridge"
+        assert row[1] == "stdio"
+        assert not {"google-slides", "hubspot"} & _app_ids(connection)
+
+
 def test_downgrade_keeps_provider_when_custom_hubspot_app_exists(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()

@@ -76,6 +76,14 @@ def test_utc_field_in_zone_rejects_non_utc_plain_get_boundary():
         )
 
 
+def test_utc_field_in_zone_rejects_ambiguous_snapshot_boundary():
+    with pytest.raises(ValueError, match="local time is ambiguous"):
+        outlook._utc_field_in_zone(
+            {"dateTime": "2026-11-01T06:30:00", "timeZone": "UTC"},
+            "America/New_York",
+        )
+
+
 @pytest.mark.parametrize(
     ("start_datetime", "end_datetime", "expected_path"),
     [
@@ -1591,6 +1599,35 @@ def test_update_event_single_boundary_accepts_independent_timezone(monkeypatch):
         "dateTime": "2026-08-27T11:00:00",
         "timeZone": "America/Los_Angeles",
     }
+
+
+def test_update_event_rejects_ambiguous_untouched_snapshot_boundary(monkeypatch):
+    graph_request = Mock(
+        return_value={
+            "start": {"dateTime": "2026-11-01T04:30:00", "timeZone": "UTC"},
+            "end": {"dateTime": "2026-11-01T06:30:00", "timeZone": "UTC"},
+            "isAllDay": False,
+            "type": "singleInstance",
+        }
+    )
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_update_event(
+            event_id="self-1",
+            start_datetime="2026-11-01T00:30:00",
+            timezone="America/New_York",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "local time is ambiguous" in result["message"]
+    assert "provide both boundaries" in result["message"]
+    graph_request.assert_called_once_with(
+        "GET",
+        "/me/events/self-1",
+        params={"$select": "start,end,isAllDay,type"},
+    )
 
 
 def test_update_event_rejects_single_boundary_on_existing_all_day_event(

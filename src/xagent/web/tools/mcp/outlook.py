@@ -153,9 +153,10 @@ def _utc_field_in_zone(field: dict[str, Any], zone_name: str) -> dict[str, Any]:
     rather than by re-fetching with a Prefer header.
 
     Pairing a caller-supplied zone name with the UTC clock value unchanged
-    would silently mislabel the instant by the zone's UTC offset. This also
-    matters for all-day bounds, whose local date can differ from the UTC date
-    near a day boundary.
+    would silently mislabel the instant by the zone's UTC offset. Reject a
+    conversion into a repeated daylight-saving wall time because Graph's
+    naive dateTime plus timeZone shape cannot preserve which fold represented
+    the snapshot instant.
 
     The sole caller uses a plain event GET without a Prefer header, so a naive
     response value must be UTC. Reject a contradictory zone label or malformed
@@ -181,8 +182,17 @@ def _utc_field_in_zone(field: dict[str, Any], zone_name: str) -> dict[str, Any]:
         if parsed.tzinfo is None
         else parsed.astimezone(dt_timezone.utc)
     )
-    local_instant = utc_instant.astimezone(zone).replace(tzinfo=None)
-    return {"dateTime": local_instant.isoformat(), "timeZone": zone_name}
+    local_instant = utc_instant.astimezone(zone)
+    if _date_tz.datetime_ambiguous(local_instant):
+        raise ValueError(
+            "Outlook returned an event boundary whose local time is ambiguous "
+            f"in timezone {zone_name!r} because of a daylight-saving transition; "
+            "provide both boundaries in an unambiguous timezone such as UTC."
+        )
+    return {
+        "dateTime": local_instant.replace(tzinfo=None).isoformat(),
+        "timeZone": zone_name,
+    }
 
 
 def _next_link_path(next_link: Any) -> str:
@@ -987,18 +997,19 @@ def outlook_update_event(
         resolved_timezone = timezone or "UTC"
         existing_start_field = existing.get("start") or {}
         existing_end_field = existing.get("end") or {}
-        if not existing_is_all_day and (
-            start_datetime is not None or end_datetime is not None
-        ):
-            # A plain GET returns timed boundaries in UTC. Convert both
-            # snapshot instants to the caller's explicit comparison zone;
-            # only the supplied boundary is included in the PATCH.
-            existing_start_field = _utc_field_in_zone(
-                existing_start_field, resolved_timezone
-            )
-            existing_end_field = _utc_field_in_zone(
-                existing_end_field, resolved_timezone
-            )
+        if not existing_is_all_day and single_boundary_update:
+            # A plain GET returns timed boundaries in UTC. Convert only the
+            # untouched snapshot boundary to the caller's explicit comparison
+            # zone; the supplied boundary is normalized separately below and
+            # is the only one included in the PATCH.
+            if start_datetime is None:
+                existing_start_field = _utc_field_in_zone(
+                    existing_start_field, resolved_timezone
+                )
+            else:
+                existing_end_field = _utc_field_in_zone(
+                    existing_end_field, resolved_timezone
+                )
         existing_zone = existing_start_field.get("timeZone") or "UTC"
 
         existing_end = existing_end_field.get("dateTime")
